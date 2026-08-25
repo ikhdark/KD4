@@ -2372,6 +2372,59 @@ fn prepared_prompt_cache_updates_only_for_safe_reasoning_append() {
 }
 
 #[test]
+fn prepared_prompt_cache_extends_complete_tool_result_tail_without_rebuilding_prefix() {
+    let mut history = create_history_with_items(vec![agent_message("hello")]);
+    let first = history
+        .clone()
+        .prepare_for_prompt(&default_input_modalities());
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "read_resource".to_string(),
+        namespace: None,
+        arguments: r#"{"id":"one"}"#.to_string(),
+        call_id: "call-tail".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "call-tail".to_string(),
+        output: FunctionCallOutputPayload::from_text("result".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    // Calls and outputs are normally recorded at different lifecycle boundaries.
+    // Keep the bounded tail dormant until it is a complete normalization-safe pair.
+    history.record_items([&call], TruncationPolicy::Tokens(10_000));
+    let pending = history
+        .prepared_history
+        .lock()
+        .expect("prepared history lock")
+        .clone()
+        .expect("incomplete tool tail should remain bounded and pending");
+    assert_eq!(pending.pending_append, vec![call.clone()]);
+
+    history.record_items([&output], TruncationPolicy::Tokens(10_000));
+    let cached = history
+        .prepared_history
+        .lock()
+        .expect("prepared history lock")
+        .clone()
+        .expect("completed tool tail should extend the prepared cache");
+    assert!(cached.pending_append.is_empty());
+    assert_eq!(
+        &cached.prepared.items()[..first.items().len()],
+        first.items()
+    );
+    assert_eq!(
+        &cached.prepared.items()[first.items().len()..],
+        &[call.clone(), output.clone()]
+    );
+
+    let prepared = history.prepare_for_prompt(&default_input_modalities());
+    assert_eq!(prepared.items(), &[agent_message("hello"), call, output]);
+}
+
+#[test]
 fn tool_history_mutation_advances_projection_revision_once() {
     let mut history = ContextManager::new();
     let initial_revision = history.projection_revision;

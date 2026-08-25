@@ -1,6 +1,7 @@
 use super::AuthRequestTelemetryContext;
 use super::CanonicalPrefixHash;
 use super::CompactConversationRequestSettings;
+use super::HTTP_TRANSPORT_CACHE_CAPACITY;
 use super::LastResponse;
 use super::MODEL_ATTEMPT_RECONCILIATION_TOLERANCE_BYTES;
 use super::ModelAttemptClock;
@@ -145,6 +146,37 @@ fn test_model_client_with_thread_id(
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     )
+}
+
+#[tokio::test]
+async fn model_http_transport_cache_reuses_client_and_is_bounded() {
+    let client = test_model_client(SessionSource::Cli);
+    let setup = client
+        .current_client_setup()
+        .await
+        .expect("test provider setup should resolve");
+
+    client
+        .build_api_transport(&setup.api_provider, "responses")
+        .expect("first transport should build");
+    client
+        .build_api_transport(&setup.api_provider, "responses")
+        .expect("same route should reuse the cached transport");
+    for index in 0..=HTTP_TRANSPORT_CACHE_CAPACITY {
+        client
+            .build_api_transport(&setup.api_provider, &format!("route-{index}"))
+            .expect("bounded transport cache should accept another route");
+    }
+
+    let cache = client
+        .state
+        .http_transport_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (hits, misses, len) = cache.diagnostics();
+    assert!(hits >= 1, "the repeated route should be a cache hit");
+    assert_eq!(misses, HTTP_TRANSPORT_CACHE_CAPACITY as u64 + 2);
+    assert_eq!(len, HTTP_TRANSPORT_CACHE_CAPACITY);
 }
 
 fn websocket_test_model_client() -> ModelClient {

@@ -110,6 +110,19 @@ impl Request {
         self
     }
 
+    /// Returns the exact number of body bytes when the request has already
+    /// been prepared for dispatch.
+    pub fn prepared_body_len(&self) -> Option<u64> {
+        let len = match self.body.as_ref()? {
+            RequestBody::EncodedJson(body) if body.prepared => body.bytes.len(),
+            RequestBody::Raw(body) if self.compression == RequestCompression::None => body.len(),
+            RequestBody::Json(_) | RequestBody::EncodedJson(_) | RequestBody::Raw(_) => {
+                return None;
+            }
+        };
+        u64::try_from(len).ok()
+    }
+
     /// Prepares the body once and stores the exact bytes that will be sent.
     ///
     /// Cloning the returned request shares the body bytes, so retry attempts do
@@ -317,6 +330,14 @@ mod tests {
         assert_eq!(
             request.headers.get(http::header::CONTENT_TYPE),
             Some(&HeaderValue::from_static("application/json"))
+        );
+        assert_eq!(
+            request.prepared_body_len(),
+            request
+                .prepare_body_for_send()
+                .expect("prepared body should remain readable")
+                .body
+                .map(|body| body.len() as u64)
         );
     }
 }

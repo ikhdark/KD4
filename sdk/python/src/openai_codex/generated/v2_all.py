@@ -5043,12 +5043,36 @@ class TurnTimingMilestones(BaseModel):
         int | None, Field(alias="firstActionableOutputMs", ge=0)
     ] = None
     first_agent_message_ms: Annotated[int | None, Field(alias="firstAgentMessageMs", ge=0)] = None
+    first_domain_action_ms: Annotated[
+        int | None,
+        Field(
+            alias="firstDomainActionMs",
+            description="Time from turn start until the first authorized domain-work handler is entered.",
+            ge=0,
+        ),
+    ] = None
+    first_infrastructure_action_ms: Annotated[
+        int | None,
+        Field(
+            alias="firstInfrastructureActionMs",
+            description="Time from turn start until the first authorized control/plumbing tool handler is entered.",
+            ge=0,
+        ),
+    ] = None
     first_model_output_ms: Annotated[int | None, Field(alias="firstModelOutputMs", ge=0)] = None
+    first_successful_domain_action_ms: Annotated[
+        int | None,
+        Field(
+            alias="firstSuccessfulDomainActionMs",
+            description="Time from turn start until the first domain-work tool completes successfully.",
+            ge=0,
+        ),
+    ] = None
     first_successful_useful_action_ms: Annotated[
         int | None,
         Field(
             alias="firstSuccessfulUsefulActionMs",
-            description="Time from turn start until the first non-control tool completes successfully.",
+            description="Time from turn start until the first domain-work tool completes successfully.",
             ge=0,
         ),
     ] = None
@@ -5057,6 +5081,14 @@ class TurnTimingMilestones(BaseModel):
         Field(
             alias="firstToolAcceptedMs",
             description="Time from turn start until the first tool call is accepted for dispatch.",
+            ge=0,
+        ),
+    ] = None
+    first_tool_discovery_action_ms: Annotated[
+        int | None,
+        Field(
+            alias="firstToolDiscoveryActionMs",
+            description="Time from turn start until the first authorized tool-schema discovery handler is entered.",
             ge=0,
         ),
     ] = None
@@ -5080,7 +5112,7 @@ class TurnTimingMilestones(BaseModel):
         int | None,
         Field(
             alias="firstUsefulActionMs",
-            description="Time from turn start until the first authorized non-control tool handler is entered.",
+            description="Time from turn start until the first authorized domain-work tool handler is entered.",
             ge=0,
         ),
     ] = None
@@ -5088,7 +5120,7 @@ class TurnTimingMilestones(BaseModel):
         int | None,
         Field(
             alias="firstUsefulToolAcceptedMs",
-            description="Time from turn start until the first non-control tool is accepted for dispatch.",
+            description="Time from turn start until the first domain-work tool is accepted for dispatch.",
             ge=0,
         ),
     ] = None
@@ -5096,7 +5128,7 @@ class TurnTimingMilestones(BaseModel):
         int | None,
         Field(
             alias="firstUsefulToolGateAdmittedMs",
-            description="Time from turn start until the first non-control tool passes the parallel gate.",
+            description="Time from turn start until the first domain-work tool passes the parallel gate.",
             ge=0,
         ),
     ] = None
@@ -8553,12 +8585,34 @@ class TurnTimingToolCall(BaseModel):
         int | None, Field(alias="parallelGateAdmittedAtMs", ge=0)
     ] = None
     parallel_gate_wait_ms: Annotated[int | None, Field(alias="parallelGateWaitMs", ge=0)] = None
+    parent_call_id: Annotated[
+        str | None,
+        Field(
+            alias="parentCallId",
+            description="Model-visible outer tool call that owns this nested call, when any.",
+        ),
+    ] = None
+    parent_cell_id: Annotated[
+        str | None,
+        Field(
+            alias="parentCellId",
+            description="Runtime cell that issued this nested tool request, when any.",
+        ),
+    ] = None
     post_handler_ms: Annotated[int | None, Field(alias="postHandlerMs", ge=0)] = None
     post_tool_hook_ms: Annotated[int | None, Field(alias="postToolHookMs", ge=0)] = None
     pre_tool_hook_ms: Annotated[int | None, Field(alias="preToolHookMs", ge=0)] = None
     process_alive_at_delivery: Annotated[bool | None, Field(alias="processAliveAtDelivery")] = False
     process_exited_at_ms: Annotated[int | None, Field(alias="processExitedAtMs", ge=0)] = None
     process_spawned_at_ms: Annotated[int | None, Field(alias="processSpawnedAtMs", ge=0)] = None
+    ready_to_sample_to_dispatch_ns: Annotated[
+        int | None,
+        Field(
+            alias="readyToSampleToDispatchNs",
+            description="Monotonic latency from the host proving that sampling is unblocked to the provider request reaching its transport dispatch boundary.",
+            ge=0,
+        ),
+    ] = None
     reentry_count: Annotated[int | None, Field(alias="reentryCount", ge=0)] = 0
     retry_count: Annotated[int | None, Field(alias="retryCount", ge=0)] = 0
     running_process_after_cleanup: Annotated[
@@ -8568,6 +8622,13 @@ class TurnTimingToolCall(BaseModel):
             description="The process manager still retained this call after foreground cleanup.",
         ),
     ] = False
+    runtime_tool_call_id: Annotated[
+        str | None,
+        Field(
+            alias="runtimeToolCallId",
+            description="Code-mode's payload-free per-cell invocation id, when any.",
+        ),
+    ] = None
     sampling_generation_id: Annotated[str | None, Field(alias="samplingGenerationId")] = ""
     source: TurnTimingToolCallSource | None = "direct"
     timer_waits: Annotated[list[ToolLifecycleTimerWait] | None, Field(alias="timerWaits")] = []
@@ -8576,9 +8637,23 @@ class TurnTimingToolCall(BaseModel):
     workspace_evidence_after_ms: Annotated[
         int | None, Field(alias="workspaceEvidenceAfterMs", ge=0)
     ] = None
+    workspace_evidence_before_cache_hit: Annotated[
+        bool | None,
+        Field(
+            alias="workspaceEvidenceBeforeCacheHit",
+            description="Whether the pre-handler workspace identity came from the latest authoritative capture instead of running a fresh capture.",
+        ),
+    ] = None
     workspace_evidence_before_ms: Annotated[
         int | None, Field(alias="workspaceEvidenceBeforeMs", ge=0)
     ] = None
+    workspace_evidence_before_timed_out_git_dependencies: Annotated[
+        list[str] | None,
+        Field(
+            alias="workspaceEvidenceBeforeTimedOutGitDependencies",
+            description="Git dependencies that crossed the bounded capture deadline during a fresh pre-handler workspace capture.",
+        ),
+    ] = []
 
 
 class SpecialV2FileSystemPath(BaseModel):

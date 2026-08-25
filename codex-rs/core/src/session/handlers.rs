@@ -643,6 +643,7 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     if let Err(err) = sess.services.code_mode_service.shutdown().await {
         warn!("failed to shutdown code mode session: {err}");
     }
+    sess.flush_tool_history_persistence().await;
     sess.services
         .latest_mcp_runtime()
         .manager_arc()

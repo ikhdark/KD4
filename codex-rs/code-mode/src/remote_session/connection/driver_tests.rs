@@ -163,6 +163,7 @@ impl DriverHarness {
                 request: DelegateRequest::InvokeTool {
                     invocation: WireNestedToolCall {
                         cell_id: CellId::new("1".to_string()).into(),
+                        parent_tool_call_id: None,
                         runtime_tool_call_id: "tool-1".to_string(),
                         tool_name: ToolName::plain("slow").into(),
                         tool_kind: codex_code_mode_protocol::CodeModeToolKind::Function.into(),
@@ -421,6 +422,7 @@ async fn delegate_cancel_is_best_effort_and_sends_no_late_response() {
             request: DelegateRequest::InvokeTool {
                 invocation: WireNestedToolCall {
                     cell_id: CellId::new("1".to_string()).into(),
+                    parent_tool_call_id: None,
                     runtime_tool_call_id: "tool-1".to_string(),
                     tool_name: ToolName::plain("slow").into(),
                     tool_kind: codex_code_mode_protocol::CodeModeToolKind::Function.into(),
@@ -700,6 +702,7 @@ async fn delegate_task_panic_becomes_tool_error_without_killing_connection() {
             request: DelegateRequest::InvokeTool {
                 invocation: WireNestedToolCall {
                     cell_id: CellId::new("1".to_string()).into(),
+                    parent_tool_call_id: None,
                     runtime_tool_call_id: "tool-1".to_string(),
                     tool_name: ToolName::plain("panic").into(),
                     tool_kind: codex_code_mode_protocol::CodeModeToolKind::Function.into(),
@@ -740,6 +743,7 @@ async fn delegate_for_unknown_cell_fails_connection_without_invocation() {
             request: DelegateRequest::InvokeTool {
                 invocation: WireNestedToolCall {
                     cell_id: CellId::new("missing".to_string()).into(),
+                    parent_tool_call_id: None,
                     runtime_tool_call_id: "tool-1".to_string(),
                     tool_name: ToolName::plain("slow").into(),
                     tool_kind: codex_code_mode_protocol::CodeModeToolKind::Function.into(),

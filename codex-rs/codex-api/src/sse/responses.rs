@@ -4,6 +4,8 @@ use crate::error::ApiError;
 use crate::responses_stream::ResponsesEventError;
 use crate::responses_stream::ResponsesEventInterpreter;
 use crate::responses_stream::ResponsesStreamMetadata;
+use crate::telemetry::SseCleanupOutcome;
+use crate::telemetry::SsePollPhase;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
@@ -91,18 +93,40 @@ async fn process_sse_with_metadata(
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
     let mut interpreter = ResponsesEventInterpreter::new(&metadata, turn_state);
+    let mut poll_ordinal = 0_u64;
 
     loop {
         let start = Instant::now();
-        let response = timeout(idle_timeout, stream.next()).await;
+        let response = tokio::select! {
+            _ = tx_event.closed() => {
+                if let Some(t) = telemetry.as_ref() {
+                    t.on_sse_cleanup(SseCleanupOutcome::ConsumerCancelled, start.elapsed());
+                }
+                return;
+            }
+            response = timeout(idle_timeout, stream.next()) => response,
+        };
         if let Some(t) = telemetry.as_ref() {
             t.on_sse_poll(&response, start.elapsed());
+            t.on_sse_phase(
+                if poll_ordinal == 0 {
+                    SsePollPhase::FirstEvent
+                } else {
+                    SsePollPhase::SubsequentEvent
+                },
+                poll_ordinal,
+                start.elapsed(),
+            );
         }
+        poll_ordinal = poll_ordinal.saturating_add(1);
         let sse = match response {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
                 debug!("SSE Error: {e:#}");
                 let _ = tx_event.send(Err(ApiError::Stream(e.to_string()))).await;
+                if let Some(t) = telemetry.as_ref() {
+                    t.on_sse_cleanup(SseCleanupOutcome::TransportError, start.elapsed());
+                }
                 return;
             }
             Ok(None) => {
@@ -110,12 +134,21 @@ async fn process_sse_with_metadata(
                     "stream closed before response.completed".into(),
                 ));
                 let _ = tx_event.send(Err(error)).await;
+                if let Some(t) = telemetry.as_ref() {
+                    t.on_sse_cleanup(
+                        SseCleanupOutcome::CarrierEofBeforeCompleted,
+                        start.elapsed(),
+                    );
+                }
                 return;
             }
             Err(_) => {
                 let _ = tx_event
                     .send(Err(ApiError::Stream("idle timeout waiting for SSE".into())))
                     .await;
+                if let Some(t) = telemetry.as_ref() {
+                    t.on_sse_cleanup(SseCleanupOutcome::IdleTimeout, start.elapsed());
+                }
                 return;
             }
         };
@@ -126,6 +159,9 @@ async fn process_sse_with_metadata(
             Ok(events) => events,
             Err(ResponsesEventError::Parse(error)) => {
                 debug!("Failed to parse SSE event: {error}, data: {}", &sse.data);
+                if let Some(t) = telemetry.as_ref() {
+                    t.on_sse_cleanup(SseCleanupOutcome::ProtocolError, start.elapsed());
+                }
                 continue;
             }
             Err(ResponsesEventError::Api(error)) => {
@@ -139,9 +175,32 @@ async fn process_sse_with_metadata(
         for event in events {
             let is_completed = matches!(event, ResponseEvent::Completed { .. });
             if tx_event.send(Ok(event)).await.is_err() {
+                if let Some(t) = telemetry.as_ref() {
+                    t.on_sse_cleanup(SseCleanupOutcome::ConsumerCancelled, start.elapsed());
+                }
                 return;
             }
             if is_completed {
+                // Deliver completion immediately, then keep the carrier alive
+                // only for a bounded drain so the pool can reclaim reusable
+                // connections without delaying the consumer.
+                drop(tx_event);
+                let cleanup_start = Instant::now();
+                let cleanup_timeout = idle_timeout.min(Duration::from_secs(1));
+                let drain = timeout(cleanup_timeout, async {
+                    while stream.next().await.is_some() {}
+                })
+                .await;
+                if let Some(t) = telemetry.as_ref() {
+                    t.on_sse_cleanup(
+                        if drain.is_ok() {
+                            SseCleanupOutcome::CompletedAndDrained
+                        } else {
+                            SseCleanupOutcome::CompletedDrainTimeout
+                        },
+                        cleanup_start.elapsed(),
+                    );
+                }
                 return;
             }
         }
@@ -461,6 +520,25 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_response_stream_cancels_upstream_without_idle_timeout() {
+        let stream: ByteStream = Box::pin(stream::pending());
+        let (tx, rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1);
+        let task = tokio::spawn(process_sse(
+            stream,
+            tx,
+            Duration::from_secs(30),
+            /*telemetry*/ None,
+        ));
+
+        drop(rx);
+
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("dropping the consumer should wake the SSE task")
+            .expect("SSE task should exit cleanly");
     }
 
     #[tokio::test]

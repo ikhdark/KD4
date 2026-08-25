@@ -179,6 +179,19 @@ fn duplicate_repository_reads_untracked_paths_are_owned_in_one_parse() {
     assert_eq!(candidate_untracked_paths(b"valid\0\xff\0"), None);
 }
 
+#[test]
+fn workspace_evidence_timeout_attribution_names_each_git_dependency() {
+    let timed_out = CandidateGitOutput::TimedOut;
+    let completed = CandidateGitOutput::Output(Vec::new());
+
+    let dependencies = candidate_git_timeouts(&timed_out, &completed, &timed_out, &timed_out)
+        .into_iter()
+        .map(WorkspaceEvidenceGitDependency::as_str)
+        .collect::<Vec<_>>();
+
+    assert_eq!(dependencies, vec!["head", "worktree", "untracked"]);
+}
+
 #[tokio::test]
 async fn duplicate_repository_reads_require_two_matching_captures() {
     let mut observations = [Some(1), Some(2), Some(2)].into_iter();
@@ -739,6 +752,54 @@ async fn workspace_evidence_identity_recaptures_without_waiting_for_watcher_deli
         .expect("identity after external edit");
     assert_ne!(after_external_edit, first);
     assert_eq!(cache.workspace_evidence_capture_count(), 3);
+}
+
+#[tokio::test]
+async fn concurrent_workspace_evidence_capture_coalesces_without_crossing_mutation_epoch() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+    let pause = cache.pause_next_workspace_evidence_capture();
+
+    let first_cache = Arc::clone(&cache);
+    let first_repo = repo.clone();
+    let first = tokio::spawn(async move {
+        first_cache
+            .workspace_evidence_identity(first_repo.as_path())
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), pause.started.notified())
+        .await
+        .expect("first workspace evidence capture should reach its test boundary");
+
+    let joined = cache.workspace_evidence_waiter_joined.notified();
+    let second_cache = Arc::clone(&cache);
+    let second_repo = repo.clone();
+    let second = tokio::spawn(async move {
+        second_cache
+            .workspace_evidence_identity(second_repo.as_path())
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), joined)
+        .await
+        .expect("same-epoch workspace evidence capture should join the in-flight capture");
+    assert_eq!(cache.workspace_evidence_capture_count(), 1);
+
+    cache.note_host_workspace_mutation_paths(repo.as_path(), &["README.md".to_string()]);
+    let third_cache = Arc::clone(&cache);
+    let third_repo = repo.clone();
+    let third = tokio::spawn(async move {
+        third_cache
+            .workspace_evidence_identity(third_repo.as_path())
+            .await
+    });
+    let third_identity = third.await.expect("new-epoch capture task joins");
+    assert_eq!(cache.workspace_evidence_capture_count(), 2);
+
+    pause.release.notify_one();
+    let first_identity = first.await.expect("first capture task joins");
+    let second_identity = second.await.expect("coalesced capture task joins");
+    assert_eq!(second_identity, first_identity);
+    assert_eq!(third_identity, first_identity);
 }
 
 #[tokio::test]

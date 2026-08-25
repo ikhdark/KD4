@@ -129,6 +129,7 @@ impl CodeModeDispatchBroker {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn has_waitable_cells(&self) -> bool {
         self.cells
             .lock()

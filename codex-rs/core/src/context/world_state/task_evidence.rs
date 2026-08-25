@@ -6,6 +6,7 @@ use serde::Serialize;
 
 pub(crate) const TASK_EVIDENCE_STATE_OPEN_TAG: &str = "<kd4_task_state_v1>";
 pub(crate) const TASK_EVIDENCE_STATE_CLOSE_TAG: &str = "</kd4_task_state_v1>";
+const COMMAND_MUTATION_FOLLOW_UP: &str = "Unresolved command-mutation warnings require immediate follow-up before unrelated work or finalization: inspect a scoped repository status/diff, attribute every changed path and required hash, then reconcile the ledger signal. Do not merely acknowledge or repeatedly carry the warning.";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TaskEvidenceState {
@@ -81,7 +82,13 @@ impl ContextualUserFragment for TaskEvidenceContext {
     }
 
     fn body(&self) -> String {
-        self.summary.clone()
+        if self.summary.contains("unknown-command-mutation-")
+            || self.summary.contains("uninspected-command-mutation-")
+        {
+            format!("{COMMAND_MUTATION_FOLLOW_UP}\n\n{}", self.summary)
+        } else {
+            self.summary.clone()
+        }
     }
 
     fn type_markers() -> (&'static str, &'static str) {
@@ -100,5 +107,18 @@ mod tests {
         assert!(rendered.starts_with(TASK_EVIDENCE_STATE_OPEN_TAG));
         assert!(rendered.ends_with(TASK_EVIDENCE_STATE_CLOSE_TAG));
         assert!(TaskEvidenceContext::matches_text(&rendered));
+    }
+
+    #[test]
+    fn command_mutation_warning_requires_scoped_attribution() {
+        let rendered = TaskEvidenceContext::new(
+            "## Warnings\n- risk unknown-command-mutation-4: workspace changed".to_string(),
+        )
+        .render();
+
+        assert!(rendered.contains("immediate follow-up before unrelated work or finalization"));
+        assert!(rendered.contains("inspect a scoped repository status/diff"));
+        assert!(rendered.contains("attribute every changed path and required hash"));
+        assert!(rendered.contains("Do not merely acknowledge"));
     }
 }

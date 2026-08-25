@@ -14,6 +14,26 @@ from scripts.generated_output_lock import source_map_lock  # noqa: E402
 
 
 class SourceOwnersTest(unittest.TestCase):
+    def test_list_command_exposes_valid_owner_ids_before_slice(self) -> None:
+        argv = [
+            "source_owners.py",
+            "list",
+            "--manifest",
+            str(source_owners.DEFAULT_MANIFEST),
+            "--repo-root",
+            str(source_owners.REPO_ROOT),
+        ]
+
+        with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print") as emit:
+            self.assertEqual(source_owners.main(), 0)
+
+        catalog = json.loads(emit.call_args.args[0])
+        owner_ids = {owner["id"] for owner in catalog["owners"]}
+        self.assertIn("source-owner-index", owner_ids)
+        self.assertIn("code-mode-protocol-contracts", owner_ids)
+        self.assertIn("source_owners.py slice --owner <owner-id>", catalog["next"])
+        self.assertLess(len(emit.call_args.args[0]), 10_000)
+
     def test_task_continuity_workflow_has_a_dedicated_source_owner(self) -> None:
         manifest, _ = source_owners.load_and_validate(
             source_owners.DEFAULT_MANIFEST, source_owners.REPO_ROOT
@@ -818,6 +838,21 @@ evidence = [{ path = "src/lib.rs", symbol = "item" }]
         self.assertEqual(
             {item["target"] for item in graph["relationships"]},
             {"path:src/duplicate.rs", "path:src/unique.rs"},
+        )
+
+    def test_query_rejects_focus_instead_of_ignoring_it(self) -> None:
+        argv = ["source_owners.py", "query", "--focus", "exact routing task"]
+
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch("builtins.print") as print_output,
+        ):
+            self.assertEqual(source_owners.main(), 2)
+
+        print_output.assert_called_once_with(
+            "--focus is only valid with slice; select an owner with query, then run "
+            "slice --owner <id> --focus <task>",
+            file=sys.stderr,
         )
 
     def test_architecture_slice_counts_actual_manifest_bytes(self) -> None:

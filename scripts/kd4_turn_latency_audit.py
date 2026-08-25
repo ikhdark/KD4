@@ -23,7 +23,9 @@ except ImportError:
     from rollout_snapshot import read_rollout_snapshot
 
 
-REPORT_SCHEMA_VERSION = 10
+REPORT_SCHEMA_VERSION = 16
+_OUTPUT_COLLECTED_LIFECYCLE_SCHEMA_VERSION = 25
+_CORRELATED_NESTED_LIFECYCLE_SCHEMA_VERSION = 25
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 _SLOW_TOOL_CALL_NS = 5 * _NANOSECONDS_PER_SECOND
@@ -34,6 +36,9 @@ _MAX_SUMMARY_TURNS = 20
 _MAX_SUMMARY_TOKEN_INTERVALS = 16
 _SAMPLING_PASS_TARGET_PER_COMPLETED_TURN = 8
 _MAX_OPEN_TURN_DETAILS = 100
+_MAX_SOURCE_DISCOVERY_EVENTS = 64
+_MAX_SOURCE_DISCOVERY_PATHS = 16
+_MAX_RENDERED_SOURCE_DISCOVERY_EVENTS = 8
 _CHILD_WALL_TIME_PATTERN = re.compile(
     r'"wall_time_seconds"\s*:\s*([0-9]+(?:\.[0-9]+)?)'
 )
@@ -42,6 +47,22 @@ _EXEC_WALL_TIME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _NESTED_TOOL_PATTERN = re.compile(r"\btools\.([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_SOURCE_DISCOVERY_SEARCH_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?:rg(?:\.exe)?|grep|findstr|fd|select-string)\b"
+)
+_SOURCE_DISCOVERY_READ_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?:get-content|read_mcp_resource)\b"
+)
+_SOURCE_DISCOVERY_PATH_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9_.-])(?:"
+    r"(?:codex-rs|scripts|docs|\.codex)(?:[\\/][A-Za-z0-9_.@+\-]+)+"
+    r"|(?:[A-Za-z0-9_.@+\-]+[\\/])*AGENTS\.md"
+    r"|SOURCEMAP\.md|source_owners\.toml|architecture_index\.json"
+    r")(?:\:\d+(?:\:\d+)?)?"
+)
+_SOURCE_DISCOVERY_RG_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?:rg(?:\.exe)?|grep)\s+([^\r\n;]+)"
+)
 _TOOL_PHASE_OWNERS = {
     "itemToFirstPollMs": "ToolDispatchQueue",
     "parallelGateWaitMs": "ExclusiveGate",
@@ -121,6 +142,259 @@ def _tool_status(output: str) -> str:
     return "completed"
 
 
+def _tool_input_text(payload: dict[str, Any]) -> str:
+    for key in ("input", "arguments"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            return json.dumps(value, sort_keys=True)
+    return ""
+
+
+def _ordered_unique(values: Iterable[str]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _source_discovery_paths(text: str) -> list[str]:
+    paths = []
+    for match in _SOURCE_DISCOVERY_PATH_PATTERN.finditer(text):
+        value = re.sub(r":\d+(?::\d+)?$", "", match.group(0)).replace("\\", "/")
+        paths.append(value.removeprefix("./"))
+    return _ordered_unique(paths)
+
+
+def _safe_source_discovery_queries(text: str) -> list[str]:
+    queries: list[str] = []
+    options_with_values = {
+        "-a",
+        "-b",
+        "-c",
+        "-g",
+        "-m",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--glob",
+        "--max-count",
+        "--type",
+        "--type-add",
+    }
+    for match in _SOURCE_DISCOVERY_RG_PATTERN.finditer(text):
+        tokens = [
+            next(group for group in token if group != "")
+            for token in re.findall(
+                r'"([^"\r\n]*)"|\'([^\'\r\n]*)\'|([^\s,"\'\)\]}]+)',
+                match.group(1),
+            )
+        ]
+        skip_value = False
+        for token in tokens:
+            lowered = token.casefold()
+            if skip_value:
+                skip_value = False
+                continue
+            if lowered in options_with_values:
+                skip_value = True
+                continue
+            if token.startswith("-"):
+                continue
+            if _SOURCE_DISCOVERY_PATH_PATTERN.fullmatch(token):
+                continue
+            if re.fullmatch(r"[A-Za-z0-9_:.@+*?^$|()\[\]{}\\/-]{1,120}", token):
+                queries.append(token)
+            else:
+                queries.append("<redacted>")
+            break
+    return _ordered_unique(queries)
+
+
+def _source_discovery_event(
+    pending: dict[str, Any], output: str, ordinal: int
+) -> dict[str, Any] | None:
+    source = str(pending.get("input") or "")
+    operations: list[str] = []
+    if _SOURCE_DISCOVERY_SEARCH_PATTERN.search(source):
+        operations.append("search")
+    if _SOURCE_DISCOVERY_READ_PATTERN.search(source):
+        operations.append("read")
+    if re.search(r"(?i)source_owners\.py\s+slice\b", source):
+        operations.append("owner_slice")
+    if not operations:
+        return None
+
+    requested_paths = _source_discovery_paths(source)
+    result_paths = [
+        path for path in _source_discovery_paths(output) if path not in requested_paths
+    ]
+    queries = _safe_source_discovery_queries(source)
+    source_folded = source.casefold()
+    evidence: list[str] = []
+    if any(path.casefold().endswith("agents.md") for path in requested_paths):
+        evidence.append("instructions")
+    if "owner_slice" in operations or any(
+        path.casefold() in {"sourcemap.md", "source_owners.toml"}
+        or path.casefold().endswith("/source_owners.py")
+        for path in requested_paths + result_paths
+    ):
+        evidence.append("ownership")
+    combined_paths = requested_paths + result_paths
+    if any(
+        re.search(r"(?:^|/)(?:tests?|test_[^/]+|[^/]+_tests?)(?:/|\.|$)", path, re.I)
+        for path in combined_paths
+    ) or any("test" in query.casefold() for query in queries):
+        evidence.append("tests")
+    if any(
+        term in source_folded
+        for term in ("caller", "consumer", "callers_consumers", "calls")
+    ):
+        evidence.append("callers")
+    if any(
+        term in source_folded
+        for term in ("contract", "invariant", "schema", "protocol")
+    ) or any(
+        term in path.casefold()
+        for path in combined_paths
+        for term in ("schema", "protocol", "sourcemap.md")
+    ):
+        evidence.append("contracts")
+
+    is_search = "search" in operations
+    is_broad = is_search and not requested_paths
+    signature = "|".join(
+        (
+            "+".join(operations),
+            ",".join(queries),
+            ",".join(requested_paths),
+        )
+    )
+    return {
+        "ordinal": ordinal,
+        "turnId": pending.get("turnId"),
+        "callId": pending.get("callId"),
+        "timestamp": pending.get("timestamp"),
+        "tool": pending.get("tool"),
+        "operations": operations,
+        "queries": queries,
+        "requestedPaths": requested_paths[:_MAX_SOURCE_DISCOVERY_PATHS],
+        "resultPaths": result_paths[:_MAX_SOURCE_DISCOVERY_PATHS],
+        "omittedResultPaths": max(0, len(result_paths) - _MAX_SOURCE_DISCOVERY_PATHS),
+        "scope": "repository" if is_broad else "path_scoped",
+        "evidence": _ordered_unique(evidence),
+        "signature": signature,
+    }
+
+
+def _source_discovery_report(events: list[dict[str, Any]]) -> dict[str, Any]:
+    events = sorted(events, key=lambda event: int(event["ordinal"]))
+    signatures: collections.Counter[str] = collections.Counter()
+    signals: list[dict[str, Any]] = []
+    by_turn: dict[Any, list[dict[str, Any]]] = collections.defaultdict(list)
+    for event in events:
+        by_turn[event.get("turnId")].append(event)
+        if "search" in event["operations"]:
+            signatures[event["signature"]] += 1
+            if event["scope"] == "repository":
+                signals.append(
+                    {
+                        "code": "broad_search_without_path_scope",
+                        "turnId": event.get("turnId"),
+                        "ordinal": event["ordinal"],
+                    }
+                )
+
+    for turn_id, turn_events in by_turn.items():
+        searches = [event for event in turn_events if "search" in event["operations"]]
+        if not searches:
+            continue
+        first_search = searches[0]
+        instructions = [
+            event for event in turn_events if "instructions" in event["evidence"]
+        ]
+        if not instructions or instructions[0]["ordinal"] > first_search["ordinal"]:
+            signals.append(
+                {
+                    "code": "search_before_repository_instructions",
+                    "turnId": turn_id,
+                    "ordinal": first_search["ordinal"],
+                }
+            )
+        owner_slices = [
+            event for event in turn_events if "owner_slice" in event["operations"]
+        ]
+        broad_map_reads = [
+            event
+            for event in turn_events
+            if any(
+                path.casefold() == "sourcemap.md" for path in event["requestedPaths"]
+            )
+        ]
+        if broad_map_reads and (
+            not owner_slices
+            or broad_map_reads[0]["ordinal"] < owner_slices[0]["ordinal"]
+        ):
+            signals.append(
+                {
+                    "code": "broad_source_map_before_owner_slice",
+                    "turnId": turn_id,
+                    "ordinal": broad_map_reads[0]["ordinal"],
+                }
+            )
+        for evidence_kind in ("ownership", "callers", "tests", "contracts"):
+            evidence_events = [
+                event for event in turn_events if evidence_kind in event["evidence"]
+            ]
+            if not evidence_events:
+                signals.append(
+                    {
+                        "code": f"{evidence_kind}_evidence_not_observed",
+                        "turnId": turn_id,
+                        "ordinal": first_search["ordinal"],
+                    }
+                )
+            elif evidence_events[0]["ordinal"] - first_search["ordinal"] >= 3:
+                signals.append(
+                    {
+                        "code": f"{evidence_kind}_evidence_late",
+                        "turnId": turn_id,
+                        "ordinal": evidence_events[0]["ordinal"],
+                    }
+                )
+
+    repeated_signatures = {key for key, count in signatures.items() if count > 1}
+    for event in events:
+        if event["signature"] in repeated_signatures:
+            signals.append(
+                {
+                    "code": "repeated_discovery",
+                    "turnId": event.get("turnId"),
+                    "ordinal": event["ordinal"],
+                }
+            )
+    signal_counts = collections.Counter(signal["code"] for signal in signals)
+    bounded_events = events[:_MAX_SOURCE_DISCOVERY_EVENTS]
+    return {
+        "events": bounded_events,
+        "omittedEvents": max(0, len(events) - len(bounded_events)),
+        "eventCount": len(events),
+        "searchCount": sum("search" in event["operations"] for event in events),
+        "readCount": sum("read" in event["operations"] for event in events),
+        "broadSearchCount": sum(
+            "search" in event["operations"] and event["scope"] == "repository"
+            for event in events
+        ),
+        "repeatedSearchSignatureCount": len(repeated_signatures),
+        "candidateSignalCounts": dict(sorted(signal_counts.items())),
+        "candidateSignals": signals[:_MAX_SOURCE_DISCOVERY_EVENTS],
+        "omittedCandidateSignals": max(0, len(signals) - _MAX_SOURCE_DISCOVERY_EVENTS),
+        "measurementNote": (
+            "Candidate signals are deterministic discovery heuristics, not defect "
+            "verdicts; ordered events retain only recognized operations, safe query "
+            "tokens, and repository-relative paths, never arbitrary command/output text."
+        ),
+    }
+
+
 def _reported_runtime_seconds(output: str) -> tuple[list[float], float | None]:
     child_runtime = [float(value) for value in _CHILD_WALL_TIME_PATTERN.findall(output)]
     exec_wall_matches = _EXEC_WALL_TIME_PATTERN.findall(output)
@@ -133,6 +407,9 @@ def _command_orchestration_report(records: list[dict[str, Any]]) -> dict[str, An
     evidence_counts = collections.Counter(
         str(record.get("timingSource") or "responseOutputWallTimeFallback")
         for record in covered
+    )
+    detailed_match_counts = collections.Counter(
+        str(record.get("detailedTimingMatch") or "unmatched") for record in records
     )
     if not evidence_counts:
         evidence_source = "none"
@@ -149,6 +426,12 @@ def _command_orchestration_report(records: list[dict[str, Any]]) -> dict[str, An
     orchestration_gap_upper_bound_ns = sum(
         record["orchestrationGapUpperBoundNs"] for record in covered
     )
+    unattributed_remainder_lower_bound_ns = sum(
+        int(record.get("unattributedRemainderLowerBoundNs", 0)) for record in covered
+    )
+    unattributed_remainder_upper_bound_ns = sum(
+        int(record.get("unattributedRemainderUpperBoundNs", 0)) for record in covered
+    )
     slow_calls = sorted(
         (
             {
@@ -159,9 +442,14 @@ def _command_orchestration_report(records: list[dict[str, Any]]) -> dict[str, An
                 "reportedExecWallNs": record["reportedExecWallNs"],
                 "reportedChildWorkNs": record["reportedChildWorkNs"],
                 "orchestrationGapLowerBoundNs": record["orchestrationGapLowerBoundNs"],
+                "unattributedRemainderLowerBoundNs": record.get(
+                    "unattributedRemainderLowerBoundNs", 0
+                ),
                 "timingSource": record.get(
                     "timingSource", "responseOutputWallTimeFallback"
                 ),
+                "timingConfidence": record.get("timingConfidence", "low"),
+                "timingDetailSource": record.get("timingDetailSource"),
             }
             for record in records
             if record["roundTripNs"] >= _SLOW_TOOL_CALL_NS
@@ -184,11 +472,24 @@ def _command_orchestration_report(records: list[dict[str, Any]]) -> dict[str, An
         "responseOutputWallTimeFallbackRecords": evidence_counts[
             "responseOutputWallTimeFallback"
         ],
+        "lowConfidenceRecords": sum(
+            record.get("timingConfidence") == "low" for record in covered
+        ),
+        "persistedNestedLifecycleRecords": sum(
+            record.get("timingDetailSource") == "persistedNestedLifecycle"
+            for record in covered
+        ),
+        "detailedTimingMatchCounts": dict(sorted(detailed_match_counts.items())),
+        "detailedTimingAmbiguousRecords": sum(
+            bool(record.get("detailedTimingAmbiguous")) for record in records
+        ),
         "coverage": len(covered) / len(records) if records else None,
         "roundTripNs": round_trip_ns,
         "reportedChildWorkNs": reported_child_work_ns,
         "orchestrationGapLowerBoundNs": orchestration_gap_lower_bound_ns,
         "orchestrationGapUpperBoundNs": orchestration_gap_upper_bound_ns,
+        "unattributedRemainderLowerBoundNs": unattributed_remainder_lower_bound_ns,
+        "unattributedRemainderUpperBoundNs": unattributed_remainder_upper_bound_ns,
         "orchestrationShareLowerBound": orchestration_gap_lower_bound_ns / round_trip_ns
         if round_trip_ns
         else None,
@@ -203,7 +504,8 @@ def _command_orchestration_report(records: list[dict[str, Any]]) -> dict[str, An
 def _audit_decision(report: dict[str, Any]) -> dict[str, Any]:
     coverage = report["coverage"]
     population = report["populations"]["all"]
-    orchestration = report["commandOrchestration"]
+    command_orchestration = report["commandOrchestration"]
+    tool_relay = report.get("toolRelay", {})
     phases = {
         "orchestration": int(population.get("orchestrationNs", 0)),
         "model": int(population.get("modelOnlyNs", 0)),
@@ -227,6 +529,10 @@ def _audit_decision(report: dict[str, Any]) -> dict[str, Any]:
         blockers.append("rollout_parse_errors")
     if coverage.get("terminalTurnsWithUnresolvedToolCalls", 0):
         blockers.append("terminal_turn_with_unresolved_tool_call")
+    if int(tool_relay.get("timingOverflowCalls", 0)):
+        blockers.append("tool_lifecycle_timing_overflow")
+    if int(tool_relay.get("incompleteLifecycleCalls", 0)):
+        blockers.append("incomplete_tool_lifecycle_attribution")
     if coverage["startedTurnsWithoutTerminal"]:
         reasons.append("active_tail_excluded")
         reasons.extend(
@@ -241,9 +547,9 @@ def _audit_decision(report: dict[str, Any]) -> dict[str, Any]:
 
     representative_evidence = False
     if dominant_phase == "orchestration":
-        representative_evidence = orchestration["slowToolCallCount"] >= 2
+        representative_evidence = population.get("orchestrationMajorityTurns", 0) >= 2
         if representative_evidence:
-            reasons.append("repeated_slow_tool_round_trips")
+            reasons.append("repeated_orchestration_majority_turns")
     elif dominant_phase == "model":
         representative_evidence = (
             population["decisionLatency"]["decisionReadyAttempts"] >= 2
@@ -251,7 +557,7 @@ def _audit_decision(report: dict[str, Any]) -> dict[str, Any]:
         if representative_evidence:
             reasons.append("repeated_model_decision_latency")
     elif dominant_phase == "tool":
-        representative_evidence = orchestration["slowToolCallCount"] >= 2
+        representative_evidence = command_orchestration["slowToolCallCount"] >= 2
         if representative_evidence:
             reasons.append("repeated_slow_tool_execution")
     else:
@@ -285,15 +591,31 @@ def _terminal_record(
 ) -> dict[str, Any]:
     payload_type = payload.get("type")
     abort_reason = str(payload.get("reason") or "").casefold()
+    completion = payload.get("completion")
+    completion_gate = None
+    completion_status = None
+    if isinstance(completion, dict):
+        completion_status = completion.get("status")
+        completion_reasons = completion.get("reasons")
+        if not isinstance(completion_reasons, list):
+            completion_reasons = []
+        completion_gate = {
+            "status": completion_status,
+            "reasons": [
+                reason
+                for reason in completion_reasons
+                if isinstance(reason, str)
+            ],
+            "evidencePath": completion.get(
+                "evidence_path", completion.get("evidencePath")
+            ),
+        }
     if payload_type == "turn_aborted":
         lifecycle = "abandoned" if abort_reason == "replaced" else "canceled"
     elif payload.get("error"):
         lifecycle = "failed"
-    elif (
-        isinstance(payload.get("completion"), dict)
-        and payload["completion"].get("status") == "blocked"
-    ):
-        lifecycle = "blocked"
+    elif completion_status in ("partial", "blocked"):
+        lifecycle = completion_status
     else:
         lifecycle = "completed"
     return {
@@ -303,6 +625,7 @@ def _terminal_record(
         "turn_id": payload.get("turn_id"),
         "status": payload.get("type"),
         "lifecycle": lifecycle,
+        "completion_gate": completion_gate,
         "cwd": cwd,
         "timing": payload.get("timing"),
     }
@@ -622,40 +945,173 @@ def _dominant_tool_phase(phases: dict[str, int]) -> tuple[str | None, str | None
 
 def _apply_detailed_tool_timing(
     command_records: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
-) -> None:
-    detailed_by_call = {
-        (call.get("_turnId"), str(call.get("callId") or "")): call
-        for call in tool_calls
-        if call.get("callId")
-    }
+) -> dict[str, int]:
+    records_by_call: dict[tuple[Any, str], list[dict[str, Any]]] = (
+        collections.defaultdict(list)
+    )
+    details_by_call: dict[tuple[Any, str], list[dict[str, Any]]] = (
+        collections.defaultdict(list)
+    )
     for record in command_records:
-        call = detailed_by_call.get((record.get("turnId"), record.get("callId")))
-        if call is None:
-            continue
+        records_by_call[(record.get("turnId"), str(record.get("callId") or ""))].append(
+            record
+        )
+    for call in tool_calls:
+        if call.get("callId"):
+            details_by_call[
+                (call.get("_turnId"), str(call.get("callId") or ""))
+            ].append(call)
+    nested_by_parent: dict[tuple[Any, str], list[dict[str, Any]]] = (
+        collections.defaultdict(list)
+    )
+    for call in tool_calls:
+        parent_call_id = call.get("parentCallId")
+        if parent_call_id:
+            nested_by_parent[(call.get("_turnId"), str(parent_call_id))].append(call)
+
+    stats = collections.Counter()
+
+    def apply(
+        call_key: tuple[Any, str],
+        record: dict[str, Any],
+        call: dict[str, Any],
+        match: str,
+    ) -> None:
+        record["detailedTimingMatch"] = match
         accepted_at = call.get("acceptedAtMs")
         model_visible_at = _tool_model_visible_at_ms(call)
-        process_spawned_at = call.get("processSpawnedAtMs")
-        process_exited_at = call.get("processExitedAtMs")
-        if not (
-            isinstance(accepted_at, int)
-            and model_visible_at is not None
-            and isinstance(process_spawned_at, int)
-            and isinstance(process_exited_at, int)
-        ):
-            continue
+        if not (isinstance(accepted_at, int) and model_visible_at is not None):
+            stats["matchedWithoutCompleteTiming"] += 1
+            return
+
+        nested_process_calls = nested_by_parent.get(call_key)
+        process_calls = nested_process_calls or [call]
+        process_runtime_ns = 0
+        reported_child_calls = 0
+        for process_call in process_calls:
+            process_spawned_at = process_call.get("processSpawnedAtMs")
+            process_exited_at = process_call.get("processExitedAtMs")
+            if not (
+                isinstance(process_spawned_at, int)
+                and isinstance(process_exited_at, int)
+            ):
+                continue
+            process_runtime_ns += (
+                max(0, process_exited_at - process_spawned_at) * 1_000_000
+            )
+            reported_child_calls += 1
+        if reported_child_calls == 0:
+            stats["matchedWithoutCompleteTiming"] += 1
+            return
+
         round_trip_ns = max(0, model_visible_at - accepted_at) * 1_000_000
-        process_runtime_ns = max(0, process_exited_at - process_spawned_at) * 1_000_000
         orchestration_gap_ns = max(0, round_trip_ns - process_runtime_ns)
         record.update(
             {
                 "roundTripNs": round_trip_ns,
-                "reportedChildCalls": 1,
+                "reportedChildCalls": reported_child_calls,
                 "reportedChildWorkNs": process_runtime_ns,
                 "orchestrationGapLowerBoundNs": orchestration_gap_ns,
                 "orchestrationGapUpperBoundNs": orchestration_gap_ns,
                 "timingSource": "toolCalls",
+                "timingConfidence": "high",
+                "timingDetailSource": (
+                    "persistedNestedLifecycle"
+                    if nested_process_calls
+                    else "persistedDirectLifecycle"
+                ),
+                "unattributedRemainderLowerBoundNs": 0,
+                "unattributedRemainderUpperBoundNs": 0,
             }
         )
+        stats[f"{match}Matches"] += 1
+
+    for call_key in sorted(set(records_by_call) | set(details_by_call), key=str):
+        records = list(records_by_call.get(call_key, []))
+        details = list(details_by_call.get(call_key, []))
+        if not records or not details:
+            continue
+
+        detail_by_execution = {
+            str(call.get("executionId")): call
+            for call in details
+            if call.get("executionId") not in (None, "")
+        }
+        remaining_records = []
+        matched_detail_ids: set[int] = set()
+        for record in records:
+            execution_id = record.get("executionId")
+            call = (
+                detail_by_execution.get(str(execution_id))
+                if execution_id not in (None, "")
+                else None
+            )
+            if call is None:
+                remaining_records.append(record)
+                continue
+            apply(call_key, record, call, "execution_id")
+            matched_detail_ids.add(id(call))
+        remaining_details = [
+            call for call in details if id(call) not in matched_detail_ids
+        ]
+
+        if len(remaining_records) == len(remaining_details) == 1:
+            apply(call_key, remaining_records[0], remaining_details[0], "unambiguous")
+        elif remaining_records and len(remaining_records) == len(remaining_details):
+            for record, call in zip(remaining_records, remaining_details, strict=True):
+                apply(call_key, record, call, "ordered")
+        elif remaining_records or remaining_details:
+            stats["ambiguousGroups"] += 1
+            stats["ambiguousRecords"] += len(remaining_records)
+            for record in remaining_records:
+                record["detailedTimingAmbiguous"] = True
+
+    return dict(stats)
+
+
+def _tool_lifecycle_missing_boundaries(call: dict[str, Any]) -> list[str]:
+    source = call.get("source", "direct")
+    timing_schema_version = call.get("_timingSchemaVersion")
+    legacy_nested_lifecycle = (
+        source != "direct"
+        and isinstance(timing_schema_version, int)
+        and 0 < timing_schema_version < _OUTPUT_COLLECTED_LIFECYCLE_SCHEMA_VERSION
+    )
+    required = ["acceptedAtMs"]
+    if not legacy_nested_lifecycle:
+        required.append("outputCollectedAtMs")
+    missing = [field for field in required if not isinstance(call.get(field), int)]
+    if source == "direct":
+        direct_required = ["deliveredAtMs"]
+        if call.get("_turnStatus") != "turn_aborted":
+            direct_required.append("outputModelVisibleAtMs")
+        missing.extend(
+            field for field in direct_required if not isinstance(call.get(field), int)
+        )
+    elif (
+        isinstance(timing_schema_version, int)
+        and timing_schema_version >= _CORRELATED_NESTED_LIFECYCLE_SCHEMA_VERSION
+    ):
+        missing.extend(
+            field
+            for field in ("parentCallId", "parentCellId", "runtimeToolCallId")
+            if not isinstance(call.get(field), str) or not call[field]
+        )
+    return missing
+
+
+def _expected_terminal_abort_model_visibility_truncation(
+    call: dict[str, Any],
+) -> bool:
+    return (
+        call.get("source", "direct") == "direct"
+        and call.get("_turnStatus") == "turn_aborted"
+        and not isinstance(call.get("outputModelVisibleAtMs"), int)
+        and all(
+            isinstance(call.get(field), int)
+            for field in ("acceptedAtMs", "outputCollectedAtMs", "deliveredAtMs")
+        )
+    )
 
 
 def _tool_relay_report(
@@ -667,6 +1123,10 @@ def _tool_relay_report(
         collections.defaultdict(list)
     )
     incomplete = 0
+    incomplete_reasons = collections.Counter()
+    incomplete_direct = 0
+    incomplete_nested = 0
+    expected_terminal_abort_truncations = 0
     for call in calls:
         model_visible_at = _tool_model_visible_at_ms(call)
         generation_index = call.get("generationIndex")
@@ -721,12 +1181,16 @@ def _tool_relay_report(
             totals["modelVisibleToModelResumeMs"] += max(
                 0, model_resumed_at - model_visible_at
             )
-        if (
-            call.get("acceptedAtMs") is None
-            or call.get("outputCollectedAtMs") is None
-            or model_visible_at is None
-        ):
+        missing_boundaries = _tool_lifecycle_missing_boundaries(call)
+        if _expected_terminal_abort_model_visibility_truncation(call):
+            expected_terminal_abort_truncations += 1
+        if missing_boundaries:
             incomplete += 1
+            incomplete_reasons.update(missing_boundaries)
+            if call.get("source", "direct") == "direct":
+                incomplete_direct += 1
+            else:
+                incomplete_nested += 1
 
     dominant_phase, dominant_owner, dominant_phase_ms = _dominant_tool_phase(
         {phase: int(totals.get(phase, 0)) for phase in _TOOL_PHASE_OWNERS}
@@ -805,6 +1269,12 @@ def _tool_relay_report(
             isinstance(call.get("outputModelVisibleAtMs"), int) for call in calls
         ),
         "incompleteLifecycleCalls": incomplete,
+        "incompleteDirectLifecycleCalls": incomplete_direct,
+        "incompleteNestedLifecycleCalls": incomplete_nested,
+        "incompleteLifecycleReasonCounts": dict(sorted(incomplete_reasons.items())),
+        "expectedTerminalAbortModelVisibilityTruncations": (
+            expected_terminal_abort_truncations
+        ),
         "generationGroups": len(generation_counts),
         "batchGroups": batch_groups,
         "batchedCalls": batched_calls,
@@ -869,8 +1339,131 @@ def _sum_metric(target: dict[str, int], source: dict[str, Any]) -> None:
         target[key] += int(source.get(key, 0))
 
 
+def _generation_purpose_latency_report(
+    requests: Iterable[dict[str, Any]],
+) -> dict[str, dict[str, int]]:
+    by_purpose: dict[str, collections.Counter[str]] = collections.defaultdict(
+        collections.Counter
+    )
+    for request in requests:
+        purpose = str(request.get("generationPurpose") or "unknown")
+        metrics = by_purpose[purpose]
+        metrics["logicalGenerations"] += int(
+            request.get("attemptKind", "primary") == "primary"
+        )
+        metrics["physicalAttempts"] += _physical_attempt_count(request)
+        metrics["modelStreamWaitNs"] += max(0, int(request.get("modelStreamWaitNs", 0)))
+        decision_latency = request.get("decisionLatencyNs")
+        if decision_latency is not None:
+            metrics["decisionReadyAttempts"] += 1
+            metrics["decisionLatencyNs"] += max(0, int(decision_latency))
+        metrics["toolCalls"] += max(0, int(request.get("toolCallCount", 0)))
+
+    report: dict[str, dict[str, int]] = {}
+    for purpose, metrics in sorted(
+        by_purpose.items(),
+        key=lambda item: (-item[1]["modelStreamWaitNs"], item[0]),
+    ):
+        metrics["retryAttempts"] = max(
+            0, metrics["physicalAttempts"] - metrics["logicalGenerations"]
+        )
+        report[purpose] = dict(metrics)
+    return report
+
+
+def _latency_breakdown(
+    population: dict[str, Any],
+    command_orchestration: dict[str, Any],
+    tool_relay: dict[str, Any],
+) -> dict[str, Any]:
+    machine_ns = int(population.get("machineDurationNs", 0))
+    orchestration_ns = int(population.get("orchestrationNs", 0))
+    model_only_ns = int(population.get("modelOnlyNs", 0))
+    phase_totals_ms = tool_relay["phaseTotalsMs"]
+    tool_relay_overhead_ns = {
+        key: int(phase_totals_ms.get(source, 0)) * 1_000_000
+        for key, source in (
+            ("dispatchQueueNs", "itemToFirstPollMs"),
+            ("exclusiveGateWaitNs", "parallelGateWaitMs"),
+            (
+                "authorizationStateCoordinationNs",
+                "authorizationStateCoordinationMs",
+            ),
+            ("workspaceEvidenceBeforeNs", "workspaceEvidenceBeforeMs"),
+            ("preToolHookNs", "preToolHookMs"),
+            ("workspaceEvidenceAfterNs", "workspaceEvidenceAfterMs"),
+            ("postToolHookNs", "postToolHookMs"),
+            ("outputProjectionNs", "outputProjectionMs"),
+            ("historyPersistenceNs", "historyPersistenceMs"),
+        )
+    }
+    model_requests = population["decisionLatency"]["physicalAttempts"]
+    logical_generations = int(population.get("logicalGenerations", 0))
+    return {
+        "orchestration": {
+            "exclusiveTotalNs": orchestration_ns,
+            "shareOfAgentActive": orchestration_ns / machine_ns if machine_ns else None,
+            "localActivityUnionsNs": population["localActivityUnionsNs"],
+            "preFirstModelOutput": population["preFirstModelOutput"],
+            "toolRelayOverheadNs": tool_relay_overhead_ns,
+            "toolRelayTimingCalls": tool_relay["calls"],
+            "toolRelayTimingOverflowCalls": tool_relay["timingOverflowCalls"],
+            "commandRoundTrip": {
+                "coveredCalls": command_orchestration["reportedChildRuntimeCalls"],
+                "roundTripNs": command_orchestration["roundTripNs"],
+                "childWorkNs": command_orchestration["reportedChildWorkNs"],
+                "gapLowerBoundNs": command_orchestration[
+                    "orchestrationGapLowerBoundNs"
+                ],
+                "gapUpperBoundNs": command_orchestration[
+                    "orchestrationGapUpperBoundNs"
+                ],
+            },
+            "measurementNote": (
+                "Local activity, pre-first-output, tool-relay, and command-gap "
+                "values are overlapping diagnostics; they do not form an additive "
+                "partition of exclusiveTotalNs."
+            ),
+        },
+        "modelInference": {
+            "exclusiveTotalNs": model_only_ns,
+            "shareOfAgentActive": model_only_ns / machine_ns if machine_ns else None,
+            "concurrentWithToolNs": int(population.get("modelPlusToolNs", 0)),
+            "activeUnionNs": int(population.get("modelActiveUnionNs", 0)),
+            "requestPhaseUnionsNs": {
+                "requestWaitNs": int(population.get("modelRequestWaitNs", 0)),
+                "streamWaitNs": int(population.get("modelStreamWaitNs", 0)),
+                "streamProcessingNs": int(population.get("modelStreamProcessingNs", 0)),
+            },
+            "logicalGenerations": logical_generations,
+            "physicalAttempts": model_requests,
+            "retryAttempts": max(0, model_requests - logical_generations),
+            "decisionLatency": population["decisionLatency"],
+            "generationPurposes": population["generationPurposeLatency"],
+            "tokenCache": {
+                key: population["tokens"][key]
+                for key in (
+                    "inputTokens",
+                    "cachedInputTokens",
+                    "nonCachedInputTokens",
+                    "outputTokens",
+                    "reasoningTokens",
+                    "cacheShare",
+                )
+            },
+            "measurementNote": (
+                "Request phases and generation-purpose latency are overlapping "
+                "diagnostics; decision latency is dispatch to first actionable "
+                "output and is not additive with stream wait."
+            ),
+        },
+    }
+
+
 def _population_report(records: list[dict[str, Any]]) -> dict[str, Any]:
     totals = collections.Counter()
+    local_totals = collections.Counter()
+    pre_first_output_totals = collections.Counter()
     nonprogress = {
         "logicalGenerations": 0,
         "physicalAttempts": 0,
@@ -894,11 +1487,16 @@ def _population_report(records: list[dict[str, Any]]) -> dict[str, Any]:
         timing = record["timing"]
         exclusive = timing.get("exclusive", {})
         unions = timing.get("unions", {})
+        local = timing.get("local", {})
         counters = timing.get("counters", {})
         requests = _selected_requests(timing)
         all_requests.extend(requests)
         all_tool_calls.extend(
-            {**call, "_turnId": record["turn_id"]}
+            {
+                **call,
+                "_turnId": record["turn_id"],
+                "_timingSchemaVersion": timing.get("schemaVersion"),
+            }
             for call in timing.get("toolCalls", [])
             if isinstance(call, dict)
         )
@@ -909,21 +1507,26 @@ def _population_report(records: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(recorded_nonprogress_tokens, dict):
             nonprogress_token_aggregates.append(recorded_nonprogress_tokens)
         status_counts[record["status"]] += 1
-        totals["inclusiveDurationNs"] += int(timing.get("inclusiveDurationNs", 0))
-        totals["machineDurationNs"] += int(
+        inclusive_ns = int(timing.get("inclusiveDurationNs", 0))
+        machine_ns = int(
             timing.get(
                 "machineDurationNs",
                 max(
                     0,
-                    int(timing.get("inclusiveDurationNs", 0))
-                    - int(exclusive.get("interactiveOnlyWaitNs", 0)),
+                    inclusive_ns - int(exclusive.get("interactiveOnlyWaitNs", 0)),
                 ),
             )
         )
+        orchestration_ns = int(exclusive.get("orchestrationNs", 0))
+        totals["inclusiveDurationNs"] += inclusive_ns
+        totals["machineDurationNs"] += machine_ns
         totals["modelOnlyNs"] += int(exclusive.get("modelOnlyNs", 0))
         totals["toolOnlyNs"] += int(exclusive.get("toolOnlyNs", 0))
         totals["modelPlusToolNs"] += int(exclusive.get("modelPlusToolNs", 0))
-        totals["orchestrationNs"] += int(exclusive.get("orchestrationNs", 0))
+        totals["orchestrationNs"] += orchestration_ns
+        totals["orchestrationMajorityTurns"] += int(
+            machine_ns > 0 and orchestration_ns * 2 >= machine_ns
+        )
         totals["retryOnlyNs"] += int(exclusive.get("retryOnlyNs", 0))
         totals["interactiveOnlyWaitNs"] += int(
             exclusive.get("interactiveOnlyWaitNs", 0)
@@ -941,8 +1544,40 @@ def _population_report(records: list[dict[str, Any]]) -> dict[str, Any]:
         totals["finalizationNs"] += int(exclusive.get("finalizationNs", 0))
         totals["standaloneWorkNs"] += int(exclusive.get("standaloneWorkNs", 0))
         totals["unclassifiedNs"] += int(exclusive.get("unclassifiedNs", 0))
+        totals["modelActiveUnionNs"] += int(unions.get("modelActiveUnionNs", 0))
         totals["modelRequestWaitNs"] += int(unions.get("modelRequestWaitUnionNs", 0))
         totals["modelStreamWaitNs"] += int(unions.get("modelStreamWaitUnionNs", 0))
+        totals["modelStreamProcessingNs"] += int(
+            unions.get("modelStreamProcessingUnionNs", 0)
+        )
+        for key in (
+            "preparationUnionNs",
+            "planningUnionNs",
+            "planningExclusiveUnionNs",
+            "planningCompactionOverlapUnionNs",
+            "compactionUnionNs",
+            "persistenceUnionNs",
+            "serializationUnionNs",
+            "routerBuildUnionNs",
+            "startupPrewarmWaitUnionNs",
+            "executorReadinessWaitUnionNs",
+        ):
+            local_totals[key] += int(local.get(key, 0))
+        pre_first_output = timing.get("preFirstModelOutput")
+        if isinstance(pre_first_output, dict):
+            pre_first_output_totals["profiles"] += 1
+            for key in (
+                "clientCriticalPathNs",
+                "attributedClientUnionNs",
+                "unattributedPreOutputNs",
+                "historySnapshotNs",
+                "normalizationNs",
+                "promptConstructionNs",
+                "requestTransformationNs",
+                "serializationNs",
+                "transportReadinessNs",
+            ):
+                pre_first_output_totals[key] += int(pre_first_output.get(key, 0))
         totals["logicalGenerations"] += int(counters.get("logicalGenerationCount", 0))
         totals["toolCallCount"] += int(counters.get("toolCallCount", 0))
         totals["samePurposeContinuationCount"] += int(
@@ -1031,6 +1666,38 @@ def _population_report(records: list[dict[str, Any]]) -> dict[str, Any]:
             else None,
             "totalNs": decision_latency_ns,
         },
+        "localActivityUnionsNs": {
+            "preparationNs": local_totals["preparationUnionNs"],
+            "planningNs": local_totals["planningUnionNs"],
+            "planningExclusiveNs": local_totals["planningExclusiveUnionNs"],
+            "planningCompactionOverlapNs": local_totals[
+                "planningCompactionOverlapUnionNs"
+            ],
+            "compactionNs": local_totals["compactionUnionNs"],
+            "persistenceNs": local_totals["persistenceUnionNs"],
+            "serializationNs": local_totals["serializationUnionNs"],
+            "routerBuildNs": local_totals["routerBuildUnionNs"],
+            "startupPrewarmWaitNs": local_totals["startupPrewarmWaitUnionNs"],
+            "executorReadinessWaitNs": local_totals["executorReadinessWaitUnionNs"],
+        },
+        "preFirstModelOutput": {
+            "profiles": pre_first_output_totals["profiles"],
+            **{
+                key: pre_first_output_totals[key]
+                for key in (
+                    "clientCriticalPathNs",
+                    "attributedClientUnionNs",
+                    "unattributedPreOutputNs",
+                    "historySnapshotNs",
+                    "normalizationNs",
+                    "promptConstructionNs",
+                    "requestTransformationNs",
+                    "serializationNs",
+                    "transportReadinessNs",
+                )
+            },
+        },
+        "generationPurposeLatency": _generation_purpose_latency_report(all_requests),
         "tokens": _token_report(all_requests),
         "observationalNonprogressTokens": _diagnostic_token_report(
             nonprogress_token_aggregates
@@ -1052,7 +1719,13 @@ def _turn_report(
     counters = timing.get("counters", {})
     requests = _selected_requests(timing)
     tool_calls = [
-        call for call in timing.get("toolCalls", []) if isinstance(call, dict)
+        {
+            **call,
+            "_timingSchemaVersion": timing.get("schemaVersion"),
+            "_turnStatus": record["status"],
+        }
+        for call in timing.get("toolCalls", [])
+        if isinstance(call, dict)
     ]
     tokens = _token_report(requests)
     token_intervals = _token_intervals(requests, tool_calls)
@@ -1096,6 +1769,8 @@ def _turn_report(
         signals.append("incomplete_tool_lifecycle")
     if record.get("unresolvedTools"):
         signals.append("terminal_with_unresolved_tool_call")
+    if record["lifecycle"] == "partial":
+        signals.append("partial_completion")
     if requests and tokens["providerUsageAttempts"] < len(requests):
         signals.append("partial_token_coverage")
     if int(nonprogress.get("logicalGenerations", 0)):
@@ -1108,6 +1783,7 @@ def _turn_report(
         "turnId": record["turn_id"],
         "status": record["status"],
         "lifecycle": record["lifecycle"],
+        "completionGate": record.get("completion_gate"),
         "timestamp": record["timestamp"],
         "file": record["file"],
         "line": record["line"],
@@ -1186,6 +1862,7 @@ def _behavior_report(
         "abortedTurns": sum(turn["status"] == "turn_aborted" for turn in per_turn),
         "canceledTurns": sum(turn["lifecycle"] == "canceled" for turn in per_turn),
         "failedTurns": sum(turn["lifecycle"] == "failed" for turn in per_turn),
+        "partialTurns": sum(turn["lifecycle"] == "partial" for turn in per_turn),
         "blockedTurns": sum(turn["lifecycle"] == "blocked" for turn in per_turn),
         "abandonedTurns": sum(turn["lifecycle"] == "abandoned" for turn in per_turn),
         "terminalTurnsWithUnresolvedToolCalls": coverage.get(
@@ -1240,6 +1917,7 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
     snapshots: list[dict[str, str | int]] = []
     captured_snapshots = []
     command_orchestration_records: list[dict[str, Any]] = []
+    source_discovery_events: list[dict[str, Any]] = []
     execution_loop_counts: collections.Counter[str] = collections.Counter()
     execution_loop_ns: collections.Counter[str] = collections.Counter()
     first_timestamp_ns: int | None = None
@@ -1334,6 +2012,8 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
                             "cwd": cwd,
                             "tool": _tool_label(payload),
                             "turnId": active_turn_id,
+                            "timestamp": item.get("timestamp"),
+                            "input": _tool_input_text(payload),
                         }
                 elif item.get("type") == "response_item" and payload_type in (
                     "custom_tool_call_output",
@@ -1350,6 +2030,13 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
                             last_tool_output_ns or timestamp_ns, timestamp_ns
                         )
                         output = _tool_output_text(payload)
+                        discovery_event = _source_discovery_event(
+                            pending,
+                            output,
+                            len(source_discovery_events) + 1,
+                        )
+                        if discovery_event is not None:
+                            source_discovery_events.append(discovery_event)
                         child_wall_seconds, exec_wall_seconds = (
                             _reported_runtime_seconds(output)
                         )
@@ -1375,14 +2062,22 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
                                 ),
                                 "reportedChildCalls": len(child_wall_seconds),
                                 "reportedChildWorkNs": reported_child_work_ns,
-                                "orchestrationGapLowerBoundNs": max(
+                                "orchestrationGapLowerBoundNs": 0,
+                                "orchestrationGapUpperBoundNs": 0,
+                                "unattributedRemainderLowerBoundNs": max(
                                     0, round_trip_ns - reported_child_work_ns
                                 ),
-                                "orchestrationGapUpperBoundNs": max(
+                                "unattributedRemainderUpperBoundNs": max(
                                     0,
                                     round_trip_ns - reported_child_critical_path_ns,
                                 ),
                                 "timingSource": "responseOutputWallTimeFallback",
+                                "timingConfidence": "low",
+                                "attributionNote": (
+                                    "Output-reported child wall time is low-confidence; "
+                                    "the round-trip remainder is unattributed and is not "
+                                    "classified as wrapper orchestration."
+                                ),
                             }
                         )
                 turn_id = payload.get("turn_id")
@@ -1469,7 +2164,12 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
         ),
     }
     valid_tool_calls = [
-        {**call, "_turnId": record["turn_id"]}
+        {
+            **call,
+            "_turnId": record["turn_id"],
+            "_timingSchemaVersion": record["timing"].get("schemaVersion"),
+            "_turnStatus": record["status"],
+        }
         for record in valid
         for call in record["timing"].get("toolCalls", [])
         if isinstance(call, dict)
@@ -1595,6 +2295,7 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
         "executionLoop": execution_loop,
         "commandOrchestration": command_orchestration,
         "toolRelay": tool_relay,
+        "sourceDiscovery": _source_discovery_report(source_discovery_events),
         "firstUsefulActionAnalysis": (
             kd4_first_useful_action_analysis.analyze_snapshots(captured_snapshots)
         ),
@@ -1610,6 +2311,11 @@ def analyze_session_path(source: Path, repo_root: Path) -> dict[str, Any]:
             for name, population_records in populations.items()
         },
     }
+    report["latencyBreakdown"] = _latency_breakdown(
+        report["populations"]["all"],
+        command_orchestration,
+        tool_relay,
+    )
     report["auditDecision"] = _audit_decision(report)
     return report
 
@@ -1648,8 +2354,12 @@ def render_report(report: dict[str, Any]) -> str:
             f"{orchestration['pairedToolCalls']} paired calls with child runtime; "
             f"round-trip={orchestration['roundTripNs'] / 1e9:.1f}s "
             f"child-work={orchestration['reportedChildWorkNs'] / 1e9:.1f}s "
-            f"gap={orchestration['orchestrationGapLowerBoundNs'] / 1e9:.1f}-"
+            f"persisted-gap={orchestration['orchestrationGapLowerBoundNs'] / 1e9:.1f}-"
             f"{orchestration['orchestrationGapUpperBoundNs'] / 1e9:.1f}s "
+            f"unattributed-remainder="
+            f"{orchestration['unattributedRemainderLowerBoundNs'] / 1e9:.1f}-"
+            f"{orchestration['unattributedRemainderUpperBoundNs'] / 1e9:.1f}s "
+            f"low-confidence={orchestration['lowConfidenceRecords']} "
             f"source={orchestration['evidenceSource']}"
         )
     if orchestration["slowToolCallCount"]:
@@ -1689,13 +2399,156 @@ def render_report(report: dict[str, Any]) -> str:
             f"{relay.get('dominantPhaseMs', 0) / 1e3:.1f}s; "
             f"exclusive-gate-convoys={relay.get('exclusiveGateConvoyCount', 0)}"
         )
+    discovery = report.get("sourceDiscovery", {})
+    if discovery.get("eventCount"):
+        signal_counts = discovery.get("candidateSignalCounts", {})
+        signal_text = (
+            ",".join(f"{code}={count}" for code, count in signal_counts.items())
+            or "none"
+        )
+        lines.append(
+            "source discovery: "
+            f"events={discovery['eventCount']} searches={discovery['searchCount']} "
+            f"reads={discovery['readCount']} broad={discovery['broadSearchCount']} "
+            f"repeated-signatures={discovery['repeatedSearchSignatureCount']}; "
+            f"candidate-signals={signal_text}"
+        )
+        for event in discovery["events"][:_MAX_RENDERED_SOURCE_DISCOVERY_EVENTS]:
+            lines.append(
+                f"discovery {event['ordinal']}: turn={event.get('turnId') or 'unknown'} "
+                f"ops={'+'.join(event['operations'])} scope={event['scope']} "
+                f"queries={','.join(event['queries']) or 'none'} "
+                f"requested={','.join(event['requestedPaths']) or 'none'} "
+                f"results={','.join(event['resultPaths'][:4]) or 'none'}"
+            )
+        omitted_discovery = discovery["eventCount"] - min(
+            _MAX_RENDERED_SOURCE_DISCOVERY_EVENTS, len(discovery["events"])
+        )
+        if omitted_discovery:
+            lines.append(
+                f"source discovery detail: {omitted_discovery} additional events in JSON output"
+            )
+    latency_breakdown = report["latencyBreakdown"]
+    orchestration_breakdown = latency_breakdown["orchestration"]
+    orchestration_share = orchestration_breakdown["shareOfAgentActive"]
+    orchestration_share_text = (
+        f"{orchestration_share:.1%}"
+        if orchestration_share is not None
+        else "unavailable"
+    )
+    local_labels = {
+        "preparationNs": "preparation",
+        "planningExclusiveNs": "planning",
+        "planningCompactionOverlapNs": "planning+compaction overlap",
+        "compactionNs": "compaction",
+        "persistenceNs": "persistence",
+        "serializationNs": "serialization",
+        "routerBuildNs": "router-build",
+        "startupPrewarmWaitNs": "startup-prewarm",
+        "executorReadinessWaitNs": "executor-readiness",
+    }
+    local_text = (
+        ", ".join(
+            f"{local_labels[key]}={value / 1e9:.1f}s"
+            for key, value in orchestration_breakdown["localActivityUnionsNs"].items()
+            if key in local_labels and value
+        )
+        or "none recorded"
+    )
+    relay_labels = {
+        "dispatchQueueNs": "dispatch-queue",
+        "exclusiveGateWaitNs": "gate-wait",
+        "authorizationStateCoordinationNs": "authorization",
+        "workspaceEvidenceBeforeNs": "evidence-before",
+        "preToolHookNs": "pre-hook",
+        "workspaceEvidenceAfterNs": "evidence-after",
+        "postToolHookNs": "post-hook",
+        "outputProjectionNs": "output-projection",
+        "historyPersistenceNs": "history-persistence",
+    }
+    relay_text = (
+        ", ".join(
+            f"{relay_labels[key]}={value / 1e9:.1f}s"
+            for key, value in orchestration_breakdown["toolRelayOverheadNs"].items()
+            if value
+        )
+        or "none recorded"
+    )
+    pre_output = orchestration_breakdown["preFirstModelOutput"]
+    command_round_trip = orchestration_breakdown.get("commandRoundTrip")
+    if not isinstance(command_round_trip, dict):
+        command_round_trip = {
+            "coveredCalls": orchestration["reportedChildRuntimeCalls"],
+            "gapLowerBoundNs": orchestration["orchestrationGapLowerBoundNs"],
+            "gapUpperBoundNs": orchestration["orchestrationGapUpperBoundNs"],
+        }
+    lines.append(
+        "orchestration breakdown (overlapping diagnostics; non-additive): "
+        f"exclusive={orchestration_breakdown['exclusiveTotalNs'] / 1e9:.1f}s/"
+        f"{orchestration_share_text}; "
+        f"local=[{local_text}]; "
+        f"pre-first-output={pre_output['clientCriticalPathNs'] / 1e9:.1f}s "
+        f"unattributed={pre_output['unattributedPreOutputNs'] / 1e9:.1f}s "
+        f"profiles={pre_output['profiles']}; "
+        f"tool-relay=[{relay_text}]; "
+        f"command-gap={command_round_trip['gapLowerBoundNs'] / 1e9:.1f}-"
+        f"{command_round_trip['gapUpperBoundNs'] / 1e9:.1f}s/"
+        f"{command_round_trip['coveredCalls']} calls"
+    )
+    model_breakdown = latency_breakdown["modelInference"]
+    model_share = model_breakdown["shareOfAgentActive"]
+    model_share_text = (
+        f"{model_share:.1%}" if model_share is not None else "unavailable"
+    )
+    request_phases = model_breakdown["requestPhaseUnionsNs"]
+    decision_latency = model_breakdown["decisionLatency"]
+    purposes = sorted(
+        model_breakdown["generationPurposes"].items(),
+        key=lambda item: (-item[1]["modelStreamWaitNs"], item[0]),
+    )
+    purpose_text = (
+        ", ".join(
+            f"{purpose}={metrics['modelStreamWaitNs'] / 1e9:.1f}s/"
+            f"{metrics['logicalGenerations']}g/{metrics['physicalAttempts']}a"
+            for purpose, metrics in purposes[:6]
+        )
+        or "none recorded"
+    )
+    omitted_purposes = max(0, len(purposes) - 6)
+    if omitted_purposes:
+        purpose_text += f", +{omitted_purposes} more"
+    model_concurrent_with_tool_ns = int(
+        model_breakdown.get(
+            "concurrentWithToolNs",
+            report["populations"].get("all", {}).get("modelPlusToolNs", 0),
+        )
+    )
+    lines.append(
+        "model inference breakdown (overlapping diagnostics; non-additive): "
+        f"exclusive={model_breakdown['exclusiveTotalNs'] / 1e9:.1f}s/"
+        f"{model_share_text}; "
+        f"active-union={model_breakdown['activeUnionNs'] / 1e9:.1f}s "
+        f"with-tool={model_concurrent_with_tool_ns / 1e9:.1f}s; "
+        f"request-wait={request_phases['requestWaitNs'] / 1e9:.1f}s "
+        f"stream-wait={request_phases['streamWaitNs'] / 1e9:.1f}s "
+        f"stream-processing={request_phases['streamProcessingNs'] / 1e9:.1f}s; "
+        f"generations/attempts/retries={model_breakdown['logicalGenerations']}/"
+        f"{model_breakdown['physicalAttempts']}/{model_breakdown['retryAttempts']}; "
+        f"actionable={decision_latency['totalNs'] / 1e9:.1f}s "
+        f"coverage={decision_latency['decisionReadyAttempts']}/"
+        f"{decision_latency['physicalAttempts']}; "
+        f"purposes=[{purpose_text}]"
+    )
     first_useful = report["firstUsefulActionAnalysis"]
-    canonical_first_useful = first_useful["canonical"]["startToFirstUsefulActionMs"]
+    canonical_actions = first_useful["canonical"]
+    canonical_first_useful = canonical_actions.get(
+        "startToFirstDomainActionMs", canonical_actions.get("firstDomainActionMs")
+    )
     legacy_first_useful = first_useful["legacyReconstructed"][
         "startToUsefulToolEmittedMs"
     ]
     lines.append(
-        "first useful action: "
+        "first domain action: "
         f"canonical={canonical_first_useful['count']} "
         f"p50={canonical_first_useful['p50']}ms; "
         f"legacy={legacy_first_useful['count']} "
@@ -1738,8 +2591,9 @@ def render_report(report: dict[str, Any]) -> str:
     lines.append(
         "behavior signals: "
         f"active-excluded={behavior['activeTurnsExcluded']} "
-        f"canceled/failed/blocked/abandoned="
+        f"canceled/failed/partial/blocked/abandoned="
         f"{behavior['canceledTurns']}/{behavior['failedTurns']}/"
+        f"{behavior['partialTurns']}/"
         f"{behavior['blockedTurns']}/"
         f"{behavior['abandonedTurns']} "
         f"unresolved-tool/user-waiting/no-pending="
@@ -1858,6 +2712,7 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
                 "turnId",
                 "status",
                 "lifecycle",
+                "completionGate",
                 "startedAt",
                 "completedAt",
                 "boundarySource",
@@ -1895,19 +2750,63 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         if not population["turns"]:
             continue
         bounded_population = dict(population)
+        for key in (
+            "localActivityUnionsNs",
+            "preFirstModelOutput",
+            "generationPurposeLatency",
+        ):
+            bounded_population.pop(key, None)
         if name == "all":
             bounded_population.pop("toolRelay", None)
+        else:
+            bounded_population = {
+                key: bounded_population[key]
+                for key in (
+                    "turns",
+                    "statusCounts",
+                    "machineDurationNs",
+                    "modelOnlyNs",
+                    "toolOnlyNs",
+                    "orchestrationNs",
+                    "interactiveOnlyWaitNs",
+                    "interactiveWaitUnionNs",
+                    "modelToolRatio",
+                    "decisionLatency",
+                    "tokens",
+                    "observationalNonprogressLatency",
+                    "observationalNonprogressTokens",
+                    "waitOnlyGenerationCount",
+                    "internallyDrainedWaitCount",
+                    "provenLoopActivationCount",
+                )
+                if key in bounded_population
+            }
         bounded_populations[name] = bounded_population
     first_useful = report["firstUsefulActionAnalysis"]
+    canonical_actions = first_useful["canonical"]
+
+    def canonical_action(long_name: str, bounded_name: str) -> dict:
+        if long_name in canonical_actions:
+            return canonical_actions[long_name]
+        return canonical_actions[bounded_name]
+
     bounded_first_useful = {
-        "schemaVersion": first_useful["schemaVersion"],
-        "completedTurnCount": first_useful["completedTurnCount"],
         "canonicalTurnCount": first_useful["canonicalTurnCount"],
         "legacyReconstructedTurnCount": first_useful["legacyReconstructedTurnCount"],
         "canonical": {
-            "startToFirstUsefulActionMs": first_useful["canonical"][
-                "startToFirstUsefulActionMs"
-            ]
+            "firstInfrastructureActionMs": canonical_action(
+                "startToFirstInfrastructureActionMs", "firstInfrastructureActionMs"
+            ),
+            "firstToolDiscoveryActionMs": canonical_action(
+                "startToFirstToolDiscoveryActionMs", "firstToolDiscoveryActionMs"
+            ),
+            "firstDomainActionMs": canonical_action(
+                "startToFirstDomainActionMs", "firstDomainActionMs"
+            ),
+            "firstSuccessfulDomainActionMs": canonical_action(
+                "startToFirstSuccessfulDomainActionMs",
+                "firstSuccessfulDomainActionMs",
+            ),
         },
         "legacyReconstructed": {
             "startToUsefulToolEmittedMs": first_useful["legacyReconstructed"][
@@ -1916,15 +2815,79 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
         },
         "exclusions": first_useful["exclusions"],
     }
+    latency_breakdown = report["latencyBreakdown"]
+    orchestration_breakdown = latency_breakdown["orchestration"]
+    model_breakdown = latency_breakdown["modelInference"]
+    bounded_latency_breakdown = {
+        "orchestration": {
+            "exclusiveTotalNs": orchestration_breakdown["exclusiveTotalNs"],
+            "shareOfAgentActive": orchestration_breakdown["shareOfAgentActive"],
+            "localActivityUnionsNs": {
+                key: value
+                for key, value in orchestration_breakdown[
+                    "localActivityUnionsNs"
+                ].items()
+                if value
+            },
+            "preFirstModelOutput": {
+                key: value
+                for key, value in orchestration_breakdown["preFirstModelOutput"].items()
+                if value
+                and key
+                in (
+                    "profiles",
+                    "clientCriticalPathNs",
+                    "unattributedPreOutputNs",
+                )
+            },
+            "toolRelayOverheadNs": {
+                key: value
+                for key, value in orchestration_breakdown["toolRelayOverheadNs"].items()
+                if value
+            },
+        },
+        "modelInference": {
+            key: model_breakdown[key]
+            for key in (
+                "exclusiveTotalNs",
+                "shareOfAgentActive",
+                "activeUnionNs",
+                "requestPhaseUnionsNs",
+                "logicalGenerations",
+                "physicalAttempts",
+                "retryAttempts",
+                "decisionLatency",
+                "generationPurposes",
+            )
+        },
+    }
     return {
         "schemaVersion": report["schemaVersion"],
-        "observedAt": report["observedAt"],
+        "observedAt": report["observedAt"].replace("+00:00", "Z"),
         "source": report["source"],
         "repoRoot": report["repoRoot"],
         "coverage": bounded_coverage,
         "executionLoop": report["executionLoop"],
         "commandOrchestration": report["commandOrchestration"],
         "toolRelay": report["toolRelay"],
+        "sourceDiscovery": {
+            **{
+                key: value
+                for key, value in report["sourceDiscovery"].items()
+                if key not in ("events", "candidateSignals")
+            },
+            "events": [
+                {
+                    **{
+                        key: value for key, value in event.items() if key != "signature"
+                    },
+                    "resultPaths": event["resultPaths"][:4],
+                }
+                for event in report["sourceDiscovery"]["events"][:12]
+            ],
+            "candidateSignals": report["sourceDiscovery"]["candidateSignals"][:12],
+        },
+        "latencyBreakdown": bounded_latency_breakdown,
         "firstUsefulActionAnalysis": bounded_first_useful,
         "perTurn": bounded_turns,
         "omittedPerTurnRecords": max(0, len(report["perTurn"]) - len(bounded_turns)),
@@ -2009,7 +2972,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     elif args.summary_json:
-        print(json.dumps(bounded_summary(report), sort_keys=True))
+        print(
+            json.dumps(
+                bounded_summary(report),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
     else:
         print(render_report(report))
     return 0

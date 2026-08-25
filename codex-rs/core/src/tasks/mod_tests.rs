@@ -1,4 +1,5 @@
 use super::DurableSideEffectStep;
+use super::FINAL_PROOF_CANDIDATE_CAPTURE_TIMEOUT;
 use super::FINAL_PROOF_CANDIDATE_SEAL_TIMEOUT;
 use super::SessionTask;
 use super::SessionTaskResult;
@@ -26,6 +27,7 @@ use super::protocol_terminalization_receipt;
 use super::select_terminal_authority;
 use super::terminal_publication_decision;
 use super::terminal_rollout_structure_ready;
+use super::within_final_proof_candidate_capture_budget;
 use crate::session::TurnInput;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
@@ -354,11 +356,29 @@ async fn abort_all_tasks_clears_empty_active_turn() {
 
 #[test]
 fn final_proof_candidate_seal_timeout_is_dedicated() {
+    assert_eq!(
+        FINAL_PROOF_CANDIDATE_CAPTURE_TIMEOUT,
+        Duration::from_secs(2)
+    );
+    assert!(FINAL_PROOF_CANDIDATE_CAPTURE_TIMEOUT < FINAL_PROOF_CANDIDATE_SEAL_TIMEOUT);
     assert_eq!(FINAL_PROOF_CANDIDATE_SEAL_TIMEOUT, Duration::from_secs(5));
     assert_eq!(
         TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
         Duration::from_secs(1)
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_final_proof_candidate_capture_falls_back_before_seal_timeout() {
+    let started = tokio::time::Instant::now();
+    let capture = within_final_proof_candidate_capture_budget(async {
+        tokio::time::sleep(FINAL_PROOF_CANDIDATE_SEAL_TIMEOUT).await;
+        Some("late capture")
+    })
+    .await;
+
+    assert_eq!(capture, None);
+    assert_eq!(started.elapsed(), FINAL_PROOF_CANDIDATE_CAPTURE_TIMEOUT);
 }
 
 #[tokio::test(start_paused = true)]

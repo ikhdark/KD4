@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use codex_api::AgentIdentityTelemetry;
@@ -55,6 +56,8 @@ use codex_api::ResponsesWebsocketClient as ApiWebSocketResponsesClient;
 use codex_api::ResponsesWebsocketConnection as ApiWebSocketConnection;
 use codex_api::ResponsesWsRequest;
 use codex_api::SharedAuthProvider;
+use codex_api::SseCleanupOutcome;
+use codex_api::SsePollPhase;
 use codex_api::SseTelemetry;
 use codex_api::StreamOptions;
 use codex_api::TextControls;
@@ -65,6 +68,7 @@ use codex_api::auth_header_telemetry;
 use codex_api::build_session_headers;
 use codex_api::create_text_param_for_request;
 use codex_api::response_create_client_metadata;
+use codex_client::TransportPhaseObservation;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
@@ -1268,6 +1272,7 @@ struct ModelClientState {
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
     disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
+    http_transport_cache: StdMutex<HttpTransportCache>,
     cached_websocket_transport: StdMutex<WebsocketTransportCache>,
     request_schema_cache: StdMutex<RequestSchemaSerializationCache>,
 }
@@ -1298,6 +1303,55 @@ struct WebsocketCachePublicationPermit {
 }
 
 const REQUEST_SCHEMA_CACHE_CAPACITY: usize = 8;
+const HTTP_TRANSPORT_CACHE_CAPACITY: usize = 8;
+
+#[derive(Debug)]
+struct HttpTransportCache {
+    entries: LruCache<String, ReqwestTransport>,
+    #[cfg(test)]
+    hits: u64,
+    #[cfg(test)]
+    misses: u64,
+}
+
+impl Default for HttpTransportCache {
+    fn default() -> Self {
+        Self {
+            entries: LruCache::new(
+                NonZeroUsize::new(HTTP_TRANSPORT_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN),
+            ),
+            #[cfg(test)]
+            hits: 0,
+            #[cfg(test)]
+            misses: 0,
+        }
+    }
+}
+
+impl HttpTransportCache {
+    fn get(&mut self, request_url: &str) -> Option<ReqwestTransport> {
+        let transport = self.entries.get(request_url)?.clone();
+        #[cfg(test)]
+        {
+            self.hits = self.hits.saturating_add(1);
+        }
+        Some(transport)
+    }
+
+    #[cfg(test)]
+    fn record_miss(&mut self) {
+        self.misses = self.misses.saturating_add(1);
+    }
+
+    fn insert(&mut self, request_url: String, transport: ReqwestTransport) {
+        self.entries.put(request_url, transport);
+    }
+
+    #[cfg(test)]
+    fn diagnostics(&self) -> (u64, u64, usize) {
+        (self.hits, self.misses, self.entries.len())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct RequestSchemaCacheKey([u8; 32]);
@@ -1801,6 +1855,7 @@ impl ModelClient {
                 attestation_provider,
                 disable_websockets: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
+                http_transport_cache: StdMutex::new(HttpTransportCache::default()),
                 cached_websocket_transport: StdMutex::new(WebsocketTransportCache::default()),
                 request_schema_cache: StdMutex::new(RequestSchemaSerializationCache::default()),
             }),
@@ -2431,13 +2486,36 @@ impl ModelClient {
         endpoint: &str,
     ) -> Result<ReqwestTransport> {
         let request_url = api_provider.url_for_path(endpoint);
+        {
+            let mut cache = self
+                .state
+                .http_transport_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(transport) = cache.get(&request_url) {
+                trace!(request_url, "HTTP transport cache hit");
+                return Ok(transport);
+            }
+            #[cfg(test)]
+            cache.record_miss();
+        }
         let client = create_client_for_route(
             &self.http_client_factory,
             &request_url,
             ClientRouteClass::Api,
         )
         .map_err(std::io::Error::from)?;
-        Ok(ReqwestTransport::from_http_client(client))
+        let transport = ReqwestTransport::from_http_client(client);
+        let mut cache = self
+            .state
+            .http_transport_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = cache.get(&request_url) {
+            return Ok(existing);
+        }
+        cache.insert(request_url, transport.clone());
+        Ok(transport)
     }
 
     pub(crate) async fn prewarm_auth(&self) -> Result<()> {
@@ -4575,6 +4653,8 @@ struct ApiTelemetry {
     auth_context: AuthRequestTelemetryContext,
     request_route_telemetry: RequestRouteTelemetry,
     auth_env_telemetry: AuthEnvTelemetry,
+    logical_request_id: String,
+    last_attempt: AtomicU64,
 }
 
 impl ApiTelemetry {
@@ -4589,11 +4669,26 @@ impl ApiTelemetry {
             auth_context,
             request_route_telemetry,
             auth_env_telemetry,
+            logical_request_id: new_sampling_request_id(),
+            last_attempt: AtomicU64::new(0),
         }
     }
 }
 
 impl RequestTelemetry for ApiTelemetry {
+    fn on_transport_phase(&self, attempt: u64, observation: TransportPhaseObservation) {
+        self.last_attempt.store(attempt, Ordering::Relaxed);
+        self.session_telemetry.record_transport_phase(
+            &self.logical_request_id,
+            attempt,
+            observation.phase.as_str(),
+            observation.duration,
+            observation.wire_bytes,
+            observation.provenance,
+            observation.unavailable_reason,
+        );
+    }
+
     fn on_request(
         &self,
         attempt: u64,
@@ -4601,6 +4696,7 @@ impl RequestTelemetry for ApiTelemetry {
         error: Option<&TransportError>,
         duration: Duration,
     ) {
+        self.last_attempt.store(attempt, Ordering::Relaxed);
         let error_message = error.map(telemetry_transport_error_message);
         let status = status.map(|s| s.as_u16());
         let debug = error
@@ -4662,6 +4758,26 @@ impl SseTelemetry for ApiTelemetry {
         duration: Duration,
     ) {
         self.session_telemetry.log_sse_event(result, duration);
+    }
+
+    fn on_sse_phase(&self, phase: SsePollPhase, ordinal: u64, duration: Duration) {
+        self.session_telemetry.record_sse_phase(
+            &self.logical_request_id,
+            self.last_attempt.load(Ordering::Relaxed),
+            phase.as_str(),
+            Some(ordinal),
+            duration,
+        );
+    }
+
+    fn on_sse_cleanup(&self, outcome: SseCleanupOutcome, duration: Duration) {
+        self.session_telemetry.record_sse_phase(
+            &self.logical_request_id,
+            self.last_attempt.load(Ordering::Relaxed),
+            outcome.as_str(),
+            None,
+            duration,
+        );
     }
 }
 

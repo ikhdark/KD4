@@ -1415,9 +1415,30 @@ def write_text_atomic(path: Path, content: str) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
+def owner_catalog(manifest: dict) -> dict:
+    """Return the compact owner identifiers needed to bootstrap a slice."""
+    return {
+        "schema_version": manifest["schema_version"],
+        "owners": [
+            {
+                "id": owner["id"],
+                "aliases": owner.get("aliases", []),
+                "phrases": owner.get("phrases", []),
+            }
+            for owner in manifest["owners"]
+        ],
+        "next": "python scripts/source_owners.py slice --owner <owner-id> --focus <task> --max-relationships 32",
+    }
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("generate", "check", "query", "slice"))
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="Use `list` before `slice` when the owner ID is not already known.",
+    )
+    parser.add_argument(
+        "command", choices=("generate", "check", "list", "query", "slice")
+    )
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--source-map", type=Path, default=DEFAULT_SOURCEMAP)
     parser.add_argument(
@@ -1437,7 +1458,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--focus",
-        help="Task description used to rank relationships within each architecture facet.",
+        help="Slice-only task description used to rank architecture relationships.",
     )
     parser.add_argument(
         "--repo-root",
@@ -1445,6 +1466,13 @@ def main() -> int:
         help="Repository root for declared paths (defaults to the manifest directory).",
     )
     args = parser.parse_args()
+    if args.command == "query" and args.focus is not None:
+        print(
+            "--focus is only valid with slice; select an owner with query, then run "
+            "slice --owner <id> --focus <task>",
+            file=sys.stderr,
+        )
+        return 2
     root = (args.repo_root or args.manifest.resolve().parent).resolve()
     if args.command == "generate":
         try:
@@ -1459,6 +1487,14 @@ def main() -> int:
                 write_text_atomic(args.architecture_index, expected_index)
             return 0
         except (GenerationLockError, OSError, ValueError, tomllib.TOMLDecodeError) as error:
+            print(error, file=sys.stderr)
+            return 1
+    if args.command == "list":
+        try:
+            manifest, _ = load_and_validate(args.manifest, root)
+            print(json.dumps(owner_catalog(manifest), indent=2, sort_keys=True))
+            return 0
+        except (OSError, ValueError, tomllib.TOMLDecodeError) as error:
             print(error, file=sys.stderr)
             return 1
     try:

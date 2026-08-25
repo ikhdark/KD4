@@ -105,6 +105,10 @@ const GRACEFUL_INTERRUPTION_TIMEOUT: Duration =
         .saturating_add(GRACEFUL_INTERRUPTION_MARGIN);
 const TERMINAL_MUTATION_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(1);
 const INTERRUPT_HOOK_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(3);
+// Repository capture is optional input to final-proof sealing. Bound it below
+// the terminal phase budget so a slow Git probe can fall back without consuming
+// the time needed to persist the seal and flush its rollout event.
+const FINAL_PROOF_CANDIDATE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 // Sealing is the only terminal phase that may need to collect and persist the
 // complete proof bundle. Give it a little more room without lengthening every
 // terminal cleanup operation.
@@ -546,6 +550,15 @@ enum TurnTerminalOutcome {
     WorkerJoinFailed(WorkerJoinFailure),
 }
 
+async fn within_final_proof_candidate_capture_budget<T>(
+    capture: impl Future<Output = Option<T>>,
+) -> Option<T> {
+    tokio::time::timeout(FINAL_PROOF_CANDIDATE_CAPTURE_TIMEOUT, capture)
+        .await
+        .ok()
+        .flatten()
+}
+
 impl TurnTerminalOutcome {
     fn abort_reason(&self) -> Option<TurnAbortReason> {
         match self {
@@ -708,8 +721,10 @@ async fn seal_terminal_final_proof(
         .await?;
     let workspace_path_snapshot_identity =
         identity_snapshot.workspace_path_snapshot_identity.clone();
-    let capture =
-        crate::git_workspace::capture_candidate_diff(turn_context.config.cwd.as_path()).await;
+    let capture = within_final_proof_candidate_capture_budget(
+        crate::git_workspace::capture_candidate_diff(turn_context.config.cwd.as_path()),
+    )
+    .await;
     let observed_workspace_identity = capture
         .as_ref()
         .map(crate::git_workspace::CandidateDiffCapture::workspace_evidence_identity);

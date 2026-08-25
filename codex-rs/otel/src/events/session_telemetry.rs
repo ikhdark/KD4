@@ -822,6 +822,70 @@ impl SessionTelemetry {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn record_transport_phase(
+        &self,
+        logical_request_id: &str,
+        attempt: u64,
+        phase: &str,
+        duration: Option<Duration>,
+        wire_bytes: Option<u64>,
+        provenance: &str,
+        unavailable_reason: Option<&str>,
+    ) {
+        let available = unavailable_reason.is_none();
+        let available_str = if available { "true" } else { "false" };
+        let tags = [("phase", phase), ("available", available_str)];
+        self.counter("codex.transport_phase.count", 1, &tags);
+        if let Some(duration) = duration {
+            self.record_duration("codex.transport_phase.duration", duration, &tags);
+        }
+        if let Some(wire_bytes) = wire_bytes.and_then(|value| i64::try_from(value).ok()) {
+            self.histogram("codex.transport_phase.wire_bytes", wire_bytes, &tags);
+        }
+        log_and_trace_event!(
+            self,
+            common: {
+                event.name = "codex.transport_phase",
+                logical_request_id = logical_request_id,
+                attempt = attempt,
+                phase = phase,
+                duration_ms = duration.map(|value| value.as_millis()),
+                wire_bytes = wire_bytes,
+                provenance = provenance,
+                unavailable_reason = unavailable_reason,
+            },
+            log: {},
+            trace: {},
+        );
+    }
+
+    pub fn record_sse_phase(
+        &self,
+        logical_request_id: &str,
+        attempt: u64,
+        phase: &str,
+        ordinal: Option<u64>,
+        duration: Duration,
+    ) {
+        let tags = [("phase", phase)];
+        self.counter("codex.sse_phase.count", 1, &tags);
+        self.record_duration("codex.sse_phase.duration", duration, &tags);
+        log_and_trace_event!(
+            self,
+            common: {
+                event.name = "codex.sse_phase",
+                logical_request_id = logical_request_id,
+                attempt = attempt,
+                phase = phase,
+                ordinal = ordinal,
+                duration_ms = %duration.as_millis(),
+            },
+            log: {},
+            trace: {},
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn record_websocket_connect(
         &self,
         duration: Duration,

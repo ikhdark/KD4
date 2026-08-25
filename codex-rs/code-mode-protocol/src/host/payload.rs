@@ -381,6 +381,8 @@ impl From<WireWaitOutcome> for WaitOutcome {
 #[serde(deny_unknown_fields)]
 pub struct WireNestedToolCall {
     pub cell_id: WireCellId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
     pub runtime_tool_call_id: String,
     pub tool_name: WireToolName,
     pub tool_kind: WireToolKind,
@@ -391,6 +393,7 @@ impl From<CodeModeNestedToolCall> for WireNestedToolCall {
     fn from(value: CodeModeNestedToolCall) -> Self {
         Self {
             cell_id: value.cell_id.into(),
+            parent_tool_call_id: value.parent_tool_call_id,
             runtime_tool_call_id: value.runtime_tool_call_id,
             tool_name: value.tool_name.into(),
             tool_kind: value.tool_kind.into(),
@@ -403,6 +406,7 @@ impl From<WireNestedToolCall> for CodeModeNestedToolCall {
     fn from(value: WireNestedToolCall) -> Self {
         Self {
             cell_id: value.cell_id.into(),
+            parent_tool_call_id: value.parent_tool_call_id,
             runtime_tool_call_id: value.runtime_tool_call_id,
             tool_name: value.tool_name.into(),
             tool_kind: value.tool_kind.into(),

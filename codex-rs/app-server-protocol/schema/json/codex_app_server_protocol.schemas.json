@@ -22400,6 +22400,26 @@
               "null"
             ]
           },
+          "firstDomainActionMs": {
+            "default": null,
+            "description": "Time from turn start until the first authorized domain-work handler is entered.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "firstInfrastructureActionMs": {
+            "default": null,
+            "description": "Time from turn start until the first authorized control/plumbing tool handler is entered.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "firstModelOutputMs": {
             "default": null,
             "format": "uint64",
@@ -22409,9 +22429,19 @@
               "null"
             ]
           },
+          "firstSuccessfulDomainActionMs": {
+            "default": null,
+            "description": "Time from turn start until the first domain-work tool completes successfully.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "firstSuccessfulUsefulActionMs": {
             "default": null,
-            "description": "Time from turn start until the first non-control tool completes successfully.",
+            "description": "Time from turn start until the first domain-work tool completes successfully.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -22422,6 +22452,16 @@
           "firstToolAcceptedMs": {
             "default": null,
             "description": "Time from turn start until the first tool call is accepted for dispatch.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "firstToolDiscoveryActionMs": {
+            "default": null,
+            "description": "Time from turn start until the first authorized tool-schema discovery handler is entered.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -22451,7 +22491,7 @@
           },
           "firstUsefulActionMs": {
             "default": null,
-            "description": "Time from turn start until the first authorized non-control tool handler is entered.",
+            "description": "Time from turn start until the first authorized domain-work tool handler is entered.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -22461,7 +22501,7 @@
           },
           "firstUsefulToolAcceptedMs": {
             "default": null,
-            "description": "Time from turn start until the first non-control tool is accepted for dispatch.",
+            "description": "Time from turn start until the first domain-work tool is accepted for dispatch.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -22471,7 +22511,7 @@
           },
           "firstUsefulToolGateAdmittedMs": {
             "default": null,
-            "description": "Time from turn start until the first non-control tool passes the parallel gate.",
+            "description": "Time from turn start until the first domain-work tool passes the parallel gate.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -23102,7 +23142,7 @@
         "type": "string"
       },
       "TurnTimingToolCall": {
-        "description": "Relay and persistence lifecycle for one model-issued or nested tool call.\n\nAll `*_at_ms` values are monotonic offsets from turn start. A missing boundary means the call ended before that boundary was observed. No tool arguments, output, paths, or nested runtime identifiers are persisted.",
+        "description": "Relay and persistence lifecycle for one model-issued or nested tool call.\n\nAll `*_at_ms` values are monotonic offsets from turn start. A missing boundary means the call ended before that boundary was observed. No tool arguments, output, or paths are persisted; nested identifiers are opaque correlation keys only.",
         "properties": {
           "acceptedAtMs": {
             "default": null,
@@ -23296,6 +23336,20 @@
               "null"
             ]
           },
+          "parentCallId": {
+            "description": "Model-visible outer tool call that owns this nested call, when any.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parentCellId": {
+            "description": "Runtime cell that issued this nested tool request, when any.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "postHandlerMs": {
             "default": null,
             "format": "uint64",
@@ -23345,6 +23399,16 @@
               "null"
             ]
           },
+          "readyToSampleToDispatchNs": {
+            "default": null,
+            "description": "Monotonic latency from the host proving that sampling is unblocked to the provider request reaching its transport dispatch boundary.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "reentryCount": {
             "default": 0,
             "format": "uint32",
@@ -23361,6 +23425,13 @@
             "default": false,
             "description": "The process manager still retained this call after foreground cleanup.",
             "type": "boolean"
+          },
+          "runtimeToolCallId": {
+            "description": "Code-mode's payload-free per-cell invocation id, when any.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "samplingGenerationId": {
             "default": "",
@@ -23402,6 +23473,14 @@
               "null"
             ]
           },
+          "workspaceEvidenceBeforeCacheHit": {
+            "default": null,
+            "description": "Whether the pre-handler workspace identity came from the latest authoritative capture instead of running a fresh capture.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "workspaceEvidenceBeforeMs": {
             "default": null,
             "format": "uint64",
@@ -23410,6 +23489,14 @@
               "integer",
               "null"
             ]
+          },
+          "workspaceEvidenceBeforeTimedOutGitDependencies": {
+            "default": [],
+            "description": "Git dependencies that crossed the bounded capture deadline during a fresh pre-handler workspace capture.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [

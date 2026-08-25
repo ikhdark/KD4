@@ -464,6 +464,42 @@ fn unchanged_runtime_context_preserves_the_previous_request_prefix() {
 }
 
 #[test]
+fn task_state_updates_keep_only_the_latest_model_visible_snapshot() {
+    let first = "<kd4_task_state_v1>\n## Current state\n- first\n</kd4_task_state_v1>";
+    let second = "<kd4_task_state_v1>\n## Current state\n- second\n</kd4_task_state_v1>";
+    let current = "<kd4_task_state_v1>\n## Current state\n- current\n</kd4_task_state_v1>";
+    let projection = project_stable_context(
+        vec![
+            text_message("user", first),
+            output_message("first tool result"),
+            text_message("user", second),
+            output_message("second tool result"),
+            text_message("user", current),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+
+    let text = visible_text(&projection.items);
+    assert!(!text.contains(&first));
+    assert!(!text.contains(&second));
+    assert!(text.contains(&current));
+    assert!(text.contains(&"first tool result"));
+    assert!(text.contains(&"second tool result"));
+    assert_eq!(
+        text.iter()
+            .filter(|text| text.starts_with("<kd4_task_state_v1>"))
+            .count(),
+        1
+    );
+    assert!(projection.manifest.components().iter().any(|component| {
+        component.kind == StableContextKind::TaskEvidence
+            && component.active
+            && component.disposition == StableContextDisposition::Replaced
+    }));
+}
+
+#[test]
 fn recommended_plugins_expire_after_the_requesting_turn() {
     let plugins = "<recommended_plugins>requested catalog</recommended_plugins>";
     let projection = project_stable_context(

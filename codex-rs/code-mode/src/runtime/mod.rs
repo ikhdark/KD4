@@ -18,7 +18,7 @@ use codex_code_mode_protocol::CodeModeToolKind;
 use codex_code_mode_protocol::EnabledToolMetadata;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
-use codex_code_mode_protocol::enabled_tool_metadata;
+use codex_code_mode_protocol::normalize_code_mode_identifier;
 use codex_protocol::ToolName;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
@@ -76,15 +76,27 @@ pub(crate) fn spawn_runtime(
     let runtime_command_tx = command_tx.clone();
     let (isolate_handle_tx, isolate_handle_rx) = std_mpsc::sync_channel(1);
     let startup_cancelled = Arc::new(AtomicBool::new(false));
-    let enabled_tools = request
-        .enabled_tools
-        .iter()
-        .map(enabled_tool_metadata)
-        .collect::<Vec<_>>();
-    let config = RuntimeConfig {
-        tool_call_id: request.tool_call_id,
+    let ExecuteRequest {
+        tool_call_id,
         enabled_tools,
-        source: request.source,
+        source,
+        ..
+    } = request;
+    let enabled_tools = Arc::new(EnabledToolCatalog::new(
+        enabled_tools
+            .into_iter()
+            .map(|definition| EnabledToolMetadata {
+                global_name: normalize_code_mode_identifier(&definition.name),
+                tool_name: definition.tool_name,
+                description: definition.description,
+                kind: definition.kind,
+            })
+            .collect(),
+    ));
+    let config = RuntimeConfig {
+        tool_call_id,
+        enabled_tools,
+        source,
         stored_values,
         default_tool_timeout_ms,
     };
@@ -148,10 +160,43 @@ fn spawn_supervised_runtime_thread(
 #[derive(Clone)]
 struct RuntimeConfig {
     tool_call_id: String,
-    enabled_tools: Vec<EnabledToolMetadata>,
+    enabled_tools: Arc<EnabledToolCatalog>,
     source: String,
     stored_values: HashMap<String, JsonValue>,
     default_tool_timeout_ms: u64,
+}
+
+#[derive(Default)]
+struct EnabledToolCatalog {
+    tools: Vec<EnabledToolMetadata>,
+    by_global_name: HashMap<String, usize>,
+}
+
+impl EnabledToolCatalog {
+    fn new(tools: Vec<EnabledToolMetadata>) -> Self {
+        let mut by_global_name = HashMap::with_capacity(tools.len());
+        for (index, tool) in tools.iter().enumerate() {
+            // Preserve the previous linear lookup's first-match behavior if
+            // two definitions normalize to the same JavaScript identifier.
+            by_global_name
+                .entry(tool.global_name.clone())
+                .or_insert(index);
+        }
+        Self {
+            tools,
+            by_global_name,
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<&EnabledToolMetadata> {
+        self.tools.get(index)
+    }
+
+    fn resolve(&self, global_name: &str) -> Option<&EnabledToolMetadata> {
+        self.by_global_name
+            .get(global_name)
+            .and_then(|index| self.tools.get(*index))
+    }
 }
 
 pub(super) struct RuntimeState {
@@ -161,7 +206,7 @@ pub(super) struct RuntimeState {
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     stored_values: HashMap<String, JsonValue>,
     stored_value_writes: HashMap<String, JsonValue>,
-    enabled_tools: Vec<EnabledToolMetadata>,
+    enabled_tools: Arc<EnabledToolCatalog>,
     next_tool_call_id: u64,
     next_notification_id: u64,
     next_timeout_id: u64,
@@ -339,9 +384,13 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    use codex_code_mode_protocol::CodeModeToolKind;
+    use codex_code_mode_protocol::EnabledToolMetadata;
+    use codex_protocol::ToolName;
     use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
 
+    use super::EnabledToolCatalog;
     use super::ExecuteRequest;
     use super::RuntimeEvent;
     use super::receive_runtime_startup;
@@ -356,6 +405,35 @@ mod tests {
             yield_time_ms: Some(1),
             max_output_tokens: None,
         }
+    }
+
+    #[test]
+    fn enabled_tool_catalog_resolves_exact_names_and_preserves_first_collision() {
+        let metadata = |global_name: &str, description: &str| EnabledToolMetadata {
+            tool_name: ToolName::plain(global_name),
+            global_name: global_name.to_string(),
+            description: description.to_string(),
+            kind: CodeModeToolKind::Function,
+        };
+        let catalog = EnabledToolCatalog::new(vec![
+            metadata("sample_tool", "first"),
+            metadata("sample_tool_extra", "other"),
+            metadata("sample_tool", "later collision"),
+        ]);
+
+        assert_eq!(
+            catalog
+                .resolve("sample_tool")
+                .map(|tool| tool.description.as_str()),
+            Some("first")
+        );
+        assert_eq!(
+            catalog
+                .resolve("sample_tool_extra")
+                .map(|tool| tool.description.as_str()),
+            Some("other")
+        );
+        assert!(catalog.resolve("sample").is_none());
     }
 
     #[test]

@@ -25,6 +25,182 @@ use codex_protocol::protocol::TurnEnvironmentSelections;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
+
+struct PendingToolHistoryPersistence {
+    sequence: u64,
+    codex_home: PathBuf,
+    thread_id: String,
+    snapshot: crate::tool_history::ToolHistoryState,
+    description: &'static str,
+}
+
+#[derive(Default)]
+struct ToolHistoryPersistenceState {
+    next_sequence: u64,
+    pending: Option<PendingToolHistoryPersistence>,
+}
+
+#[derive(Clone)]
+pub(super) struct ToolHistoryPersistenceQueue {
+    state: Arc<std::sync::Mutex<ToolHistoryPersistenceState>>,
+    wake_tx: mpsc::Sender<()>,
+    completed_sequence: watch::Receiver<u64>,
+    #[cfg(test)]
+    persisted_snapshot_count: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ToolHistoryPersistenceQueue {
+    pub(super) fn new(io_gate: Arc<Semaphore>) -> Self {
+        let state = Arc::new(std::sync::Mutex::new(ToolHistoryPersistenceState::default()));
+        let worker_state = Arc::clone(&state);
+        // A single wake is enough because the worker always takes the newest
+        // pending snapshot and keeps draining until it catches up.
+        let (wake_tx, mut wake_rx) = mpsc::channel(/*buffer*/ 1);
+        let (completed_sequence_tx, completed_sequence) = watch::channel(0_u64);
+        #[cfg(test)]
+        let persisted_snapshot_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(test)]
+        let worker_persisted_snapshot_count = Arc::clone(&persisted_snapshot_count);
+        tokio::spawn(async move {
+            while wake_rx.recv().await.is_some() {
+                loop {
+                    let request = {
+                        let mut state = worker_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.pending.take()
+                    };
+                    let Some(request) = request else {
+                        break;
+                    };
+                    let Ok(_permit) = Arc::clone(&io_gate).acquire_owned().await else {
+                        tracing::warn!(
+                            "completed-tool history I/O gate closed before queued persistence"
+                        );
+                        completed_sequence_tx.send_replace(request.sequence);
+                        continue;
+                    };
+                    match crate::tool_history::persist_tool_history_state(
+                        &request.codex_home,
+                        &request.thread_id,
+                        &request.snapshot,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            #[cfg(test)]
+                            worker_persisted_snapshot_count
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            tracing::warn!("failed to persist {}: {err}", request.description);
+                        }
+                    }
+                    completed_sequence_tx.send_replace(request.sequence);
+                }
+            }
+        });
+        Self {
+            state,
+            wake_tx,
+            completed_sequence,
+            #[cfg(test)]
+            persisted_snapshot_count,
+        }
+    }
+
+    pub(super) fn enqueue(
+        &self,
+        codex_home: &Path,
+        thread_id: &ThreadId,
+        snapshot: crate::tool_history::ToolHistoryState,
+        description: &'static str,
+    ) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(sequence) = next_tool_history_persistence_sequence(state.next_sequence) else {
+                tracing::error!(
+                    "tool-history persistence sequence overflowed; refusing to enqueue snapshot"
+                );
+                return;
+            };
+            state.next_sequence = sequence;
+            state.pending = Some(PendingToolHistoryPersistence {
+                sequence,
+                codex_home: codex_home.to_path_buf(),
+                thread_id: thread_id.to_string(),
+                snapshot,
+                description,
+            });
+        }
+        match self.wake_tx.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                tracing::warn!("completed-tool history persistence queue closed unexpectedly");
+            }
+        }
+    }
+
+    pub(super) async fn flush(&self) {
+        let target_sequence = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next_sequence;
+        let mut completed_sequence = self.completed_sequence.clone();
+        loop {
+            if *completed_sequence.borrow_and_update() >= target_sequence {
+                return;
+            }
+            if completed_sequence.changed().await.is_err() {
+                tracing::warn!("completed-tool history persistence queue ended during flush");
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn persisted_snapshot_count(&self) -> u64 {
+        self.persisted_snapshot_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+pub(super) fn next_tool_history_persistence_sequence(current: u64) -> Option<u64> {
+    current.checked_add(1)
+}
+
+pub(super) async fn load_session_persistent_ledgers<
+    TaskEvidence,
+    CommandExecution,
+    TaskLoad,
+    CommandLoad,
+>(
+    task_evidence_load: TaskLoad,
+    command_execution_load: CommandLoad,
+) -> (TaskEvidence, CommandExecution)
+where
+    TaskLoad: std::future::Future<Output = TaskEvidence>,
+    CommandLoad: std::future::Future<Output = CommandExecution>,
+{
+    tokio::join!(task_evidence_load, command_execution_load)
+}
+
+pub(super) fn task_evidence_is_disabled_for_session(
+    ephemeral: bool,
+    session_source: &SessionSource,
+) -> bool {
+    ephemeral
+        && matches!(
+            session_source,
+            SessionSource::SubAgent(SubAgentSource::Review)
+        )
+}
 
 /// Context for an initialized model agent
 ///
@@ -41,7 +217,9 @@ pub(crate) struct Session {
     pub(super) durable_history_completed_commits: Mutex<HashSet<String>>,
     /// Serializes completed-tool ledger snapshots with artifact protection changes so
     /// compaction cannot remove a marker while a concurrent candidate is being persisted.
-    pub(super) tool_history_io_gate: Semaphore,
+    pub(super) tool_history_io_gate: Arc<Semaphore>,
+    /// Keeps ledger durability ordered without delaying nested result relay.
+    pub(super) tool_history_persistence: ToolHistoryPersistenceQueue,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
     /// rebuilds from the current SessionState while holding this lock.
     pub(super) managed_network_proxy_refresh_lock: Semaphore,
@@ -1152,21 +1330,6 @@ impl Session {
                     })
                     .await;
             }
-            let task_evidence = if config.ephemeral
-                && matches!(
-                    session_configuration.session_source,
-                    SessionSource::SubAgent(SubAgentSource::Review)
-                ) {
-                crate::task_evidence::TaskEvidenceLedger::disabled()
-            } else {
-                crate::task_evidence::TaskEvidenceLedger::load_or_new(
-                    config.codex_home.to_path_buf(),
-                    thread_id,
-                    session_configuration.cwd().as_path(),
-                )
-                .await
-            };
-
             let executor_readiness_timing_guard =
                 startup_timing.begin_phase(crate::startup_timing::StartupPhase::ExecutorReadiness);
             let unified_exec_manager = UnifiedExecProcessManager::new_with_deferred_executor(
@@ -1174,13 +1337,29 @@ impl Session {
                 config.features.enabled(Feature::DeferredExecutor),
             );
             drop(executor_readiness_timing_guard);
-            let command_execution =
+            let task_evidence_load = async {
+                if task_evidence_is_disabled_for_session(
+                    config.ephemeral,
+                    &session_configuration.session_source,
+                ) {
+                    crate::task_evidence::TaskEvidenceLedger::disabled()
+                } else {
+                    crate::task_evidence::TaskEvidenceLedger::load_or_new(
+                        config.codex_home.to_path_buf(),
+                        thread_id,
+                        session_configuration.cwd().as_path(),
+                    )
+                    .await
+                }
+            };
+            let command_execution_load =
                 crate::tools::command_execution::CommandExecutionLedger::load_or_new(
                     config.codex_home.to_path_buf(),
                     thread_id.to_string(),
                     session_configuration.cwd().as_path(),
-                )
-                .await;
+                );
+            let (task_evidence, command_execution) =
+                load_session_persistent_ledgers(task_evidence_load, command_execution_load).await;
             let services = SessionServices {
                 // Initialize the MCP connection manager with an uninitialized
                 // instance. It will be replaced with one created via
@@ -1269,6 +1448,9 @@ impl Session {
                 turn_environments: Arc::clone(&turn_environments),
                 git_workspace,
             };
+            let tool_history_io_gate = Arc::new(Semaphore::new(/*permits*/ 1));
+            let tool_history_persistence =
+                ToolHistoryPersistenceQueue::new(Arc::clone(&tool_history_io_gate));
             let sess = Arc::new(Session {
                 thread_id,
                 installation_id,
@@ -1277,7 +1459,8 @@ impl Session {
                 state: Mutex::new(state),
                 durable_history_commit_gate: Semaphore::new(1),
                 durable_history_completed_commits: Mutex::new(HashSet::new()),
-                tool_history_io_gate: Semaphore::new(/*permits*/ 1),
+                tool_history_io_gate,
+                tool_history_persistence,
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
                 features: config.features.clone(),
                 multi_agent_version,

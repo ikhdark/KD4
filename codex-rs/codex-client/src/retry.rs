@@ -35,6 +35,19 @@ impl RetryOn {
             _ => false,
         }
     }
+
+    /// Returns whether a non-idempotent request can be replayed without a
+    /// risk of duplicating server-side work.
+    pub fn should_retry_non_idempotent(
+        &self,
+        err: &TransportError,
+        attempt: u64,
+        max_retries: u64,
+    ) -> bool {
+        attempt < max_retries
+            && self.retry_transport
+            && matches!(err, TransportError::PreDispatch(_))
+    }
 }
 
 /// Computes exponential backoff for a one-based retry number.
@@ -80,6 +93,38 @@ where
                 if policy
                     .retry_on
                     .should_retry(&err, attempt, policy.max_retries) =>
+            {
+                let retry_number = attempt + 1;
+                sleep(backoff(policy.base_delay, retry_number)).await;
+                attempt = retry_number;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Runs a non-idempotent operation, replaying only failures that are proven to
+/// have happened before transport dispatch.
+pub async fn run_with_retry_non_idempotent<T, F, Fut>(
+    policy: RetryPolicy,
+    mut make_req: impl FnMut() -> Request,
+    op: F,
+) -> Result<T, TransportError>
+where
+    F: Fn(Request, u64) -> Fut,
+    Fut: Future<Output = Result<T, TransportError>>,
+{
+    let mut attempt = 0;
+    loop {
+        let req = make_req();
+        match op(req, attempt).await {
+            Ok(resp) => return Ok(resp),
+            Err(err)
+                if policy.retry_on.should_retry_non_idempotent(
+                    &err,
+                    attempt,
+                    policy.max_retries,
+                ) =>
             {
                 let retry_number = attempt + 1;
                 sleep(backoff(policy.base_delay, retry_number)).await;

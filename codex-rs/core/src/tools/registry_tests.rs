@@ -1,5 +1,6 @@
 use super::*;
 use crate::session::step_context::StepContext;
+use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -7,6 +8,7 @@ fn nested_code_mode_projection_is_not_provider_visible() {
     assert!(projection_is_provider_visible(&ToolCallSource::Direct));
     assert!(!projection_is_provider_visible(&ToolCallSource::CodeMode {
         cell_id: "cell".to_string(),
+        parent_call_id: Some("outer".to_string()),
         runtime_tool_call_id: "nested".to_string(),
     }));
     assert!(admission_tracking_enabled(&ToolCallSource::Direct, true));
@@ -20,6 +22,15 @@ fn direct_output_admission_is_not_config_gated() {
 
     assert!(projection_admission_required(&source, &tool_name, false));
     assert!(!admission_tracking_enabled(&source, false));
+}
+
+#[test]
+fn direct_code_mode_output_requires_completed_history_admission() {
+    let source = ToolCallSource::Direct;
+    let tool_name = ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME);
+
+    assert!(projection_admission_required(&source, &tool_name, false));
+    assert!(projection_admission_required(&source, &tool_name, true));
 }
 
 #[test]
@@ -49,6 +60,142 @@ fn direct_recovery_is_exempt_from_recursive_generic_projection() {
         &ToolName::plain("exec"),
         true,
     ));
+}
+
+#[tokio::test]
+async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let call_id = "registry-discovery";
+    let raw_registry_output = "ALL_TOOLS registry description ".repeat(600);
+    let invocation = ToolInvocation {
+        payload: ToolPayload::Custom {
+            input: "text(ALL_TOOLS.find(tool => tool.name === 'exec_command').description);"
+                .to_string(),
+        },
+        ..test_invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            call_id,
+            ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME),
+        )
+    };
+    let result = AnyToolResult {
+        call_id: call_id.to_string(),
+        payload: invocation.payload.clone(),
+        result: Box::new(crate::tools::context::FunctionToolOutput::from_text(
+            raw_registry_output.clone(),
+            Some(true),
+        )),
+        post_tool_use_payload: None,
+        model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
+    };
+
+    let projection_input = prepare_model_projection(
+        &invocation,
+        &result,
+        /*parsed_function_arguments*/ None,
+        /*force_inline_carrier*/ false,
+        /*track_for_admission*/ true,
+    )
+    .expect("direct code-mode output should be admitted");
+    assert_eq!(
+        projection_input.materialization,
+        ProjectionMaterialization::AdmissionOnly
+    );
+    let projection = project_model_output(projection_input)
+        .await
+        .expect("code-mode admission projection");
+    let first_response = projection.response();
+    assert_eq!(
+        history_output_text(&first_response).as_deref(),
+        Some(raw_registry_output.as_str())
+    );
+    let candidate = projection
+        .candidate
+        .expect("completed-tool history candidate");
+
+    let canonical: Arc<[ResponseItem]> = Arc::from([
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: Some("completed".to_string()),
+            call_id: call_id.to_string(),
+            name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
+            namespace: None,
+            input: "text(ALL_TOOLS);".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::from(first_response),
+    ]);
+    let mut history = crate::tool_history::ToolHistoryState::default();
+    history.register(candidate);
+
+    let first_exposure = history.project(Arc::clone(&canonical));
+    assert!(first_exposure.substitutions.is_empty());
+    assert!(history.mark_consumed(
+        &first_exposure.items,
+        crate::tool_history::ModelGenerationId {
+            turn_id: "turn-1".to_string(),
+            ordinal: 1,
+        },
+    ));
+
+    let later_exposure = history.project(canonical);
+    assert_eq!(later_exposure.substitutions.len(), 1);
+    assert!(
+        later_exposure
+            .items
+            .iter()
+            .any(crate::tool_history::response_item_has_valid_tool_history_receipt)
+    );
+    assert!(
+        !serde_json::to_string(&later_exposure.items)
+            .expect("serialize later prompt exposure")
+            .contains(&raw_registry_output)
+    );
+}
+
+#[tokio::test]
+async fn yielded_code_mode_output_keeps_its_live_handle_inline() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let invocation = ToolInvocation {
+        payload: ToolPayload::Custom {
+            input: "yield_control();".to_string(),
+        },
+        ..test_invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "live-cell",
+            ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME),
+        )
+    };
+    let result = AnyToolResult {
+        call_id: "live-cell".to_string(),
+        payload: invocation.payload.clone(),
+        result: Box::new(
+            crate::tools::context::FunctionToolOutput::from_text(
+                "Script running with cell ID cell-1".to_string(),
+                /*success*/ None,
+            )
+            .with_outcome(ToolOutputOutcome::Yielded),
+        ),
+        post_tool_use_payload: None,
+        model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
+    };
+
+    assert!(
+        prepare_model_projection(
+            &invocation,
+            &result,
+            /*parsed_function_arguments*/ None,
+            /*force_inline_carrier*/ false,
+            /*track_for_admission*/ true,
+        )
+        .is_none()
+    );
 }
 
 #[test]

@@ -174,6 +174,7 @@ fn assert_mcp_wrapper_preserves_projection_metadata(
             ToolOutputOutcome::Success => OutputOutcome::Success,
             ToolOutputOutcome::Failure => OutputOutcome::Failure,
             ToolOutputOutcome::TimedOut => OutputOutcome::TimedOut,
+            ToolOutputOutcome::Yielded => OutputOutcome::Success,
             ToolOutputOutcome::Skipped => OutputOutcome::Skipped,
         };
         let diagnostic_class = match metadata.diagnostic_class {

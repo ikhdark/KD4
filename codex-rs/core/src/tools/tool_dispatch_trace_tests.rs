@@ -52,6 +52,7 @@ fn tool_lifecycle_uses_one_clock_and_records_all_boundaries() {
     timing.mark_handler_entry();
     timing.mark_handler_exit();
     turn_timing.adjust_active_tools(-1);
+    timing.mark_output_collected();
     assert!(timing.mark_relay_enqueue());
     let execution_id = timing.execution_id().clone();
     assert!(timing.mark_relay_delivery(&execution_id));
@@ -139,6 +140,10 @@ async fn dispatch_timing_separates_item_poll_gate_authorization_and_handler_boun
     tokio::time::advance(std::time::Duration::from_millis(5)).await;
     timing.mark_output_collected();
     timing.record_workspace_evidence_before(std::time::Duration::from_millis(3));
+    timing.record_workspace_evidence_before_attribution(
+        false,
+        vec!["worktree".to_string(), "untracked".to_string()],
+    );
     timing.record_workspace_evidence_after(std::time::Duration::from_millis(4));
 
     let snapshot = timing.snapshot(tokio::time::Instant::now());
@@ -150,6 +155,11 @@ async fn dispatch_timing_separates_item_poll_gate_authorization_and_handler_boun
     assert_eq!(snapshot.handler_duration_ms, Some(10));
     assert_eq!(snapshot.first_poll_to_output_collected_ms, Some(85));
     assert_eq!(snapshot.workspace_evidence_before_ms, Some(3));
+    assert_eq!(snapshot.workspace_evidence_before_cache_hit, Some(false));
+    assert_eq!(
+        snapshot.workspace_evidence_before_timed_out_git_dependencies,
+        vec!["worktree", "untracked"]
+    );
     assert_eq!(snapshot.workspace_evidence_after_ms, Some(4));
     assert_eq!(snapshot.post_handler_ms, Some(5));
     assert_eq!(snapshot.total_duration_ms, Some(85));
@@ -288,6 +298,7 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
                 "test_tool",
                 ToolCallSource::CodeMode {
                     cell_id: "cell-1".to_string(),
+                    parent_call_id: Some("outer-call".to_string()),
                     runtime_tool_call_id: "tool-1".to_string(),
                 },
                 "{}",

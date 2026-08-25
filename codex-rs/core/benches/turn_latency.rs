@@ -59,6 +59,7 @@ const RELIABILITY_ITERATIONS: usize = 600;
 const CODE_MODE_WARMUPS: usize = 5;
 const CODE_MODE_ITERATIONS: usize = 30;
 const CODE_MODE_CLUSTERS: usize = 3;
+const MAX_READY_TO_SAMPLE_TO_DISPATCH_NS: u64 = 1_000_000_000;
 const CODE_MODE_NESTED_DISPATCH_SOURCE: &str = r#"
 const dispatched = await tools.update_plan({
   plan: [{ step: "benchmark nested dispatch", status: "in_progress" }],
@@ -125,6 +126,7 @@ struct Sample {
     exec_description_tokens: u64,
     prompt_input_tokens: u64,
     tool_calls: u32,
+    max_ready_to_sample_to_dispatch_ns: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -319,13 +321,16 @@ impl CodeModeFixture {
                     .unwrap_or_default();
                 let semantic_output_ok =
                     turn_requests.get(1).is_some_and(nested_output_is_expected);
+                let max_ready_to_sample_to_dispatch_ns =
+                    timing.and_then(max_ready_to_sample_to_dispatch_ns);
                 let failed = completion.last_agent_message.as_deref() != Some("done")
                     || completion.error.is_some()
                     || turn_requests.len() != 2
                     || sampling_requests != 2
                     || tool_calls != 2
                     || !timing.is_some_and(timing_reconciles)
-                    || !semantic_output_ok;
+                    || !semantic_output_ok
+                    || !ready_to_sample_dispatch_gate_passes(max_ready_to_sample_to_dispatch_ns);
                 Sample {
                     duration_ns,
                     sampling_requests,
@@ -339,6 +344,7 @@ impl CodeModeFixture {
                         .unwrap_or_default(),
                     prompt_input_tokens: first_request.map(prompt_input_tokens).unwrap_or_default(),
                     tool_calls,
+                    max_ready_to_sample_to_dispatch_ns,
                 }
             }
             Err(_) => Sample {
@@ -348,6 +354,18 @@ impl CodeModeFixture {
             },
         }
     }
+}
+
+fn max_ready_to_sample_to_dispatch_ns(timing: &TurnTiming) -> Option<u64> {
+    timing
+        .tool_calls
+        .iter()
+        .filter_map(|call| call.ready_to_sample_to_dispatch_ns)
+        .max()
+}
+
+fn ready_to_sample_dispatch_gate_passes(measured_ns: Option<u64>) -> bool {
+    measured_ns.is_some_and(|measured_ns| measured_ns <= MAX_READY_TO_SAMPLE_TO_DISPATCH_NS)
 }
 
 fn nested_output_is_expected(request: &ResponsesRequest) -> bool {
@@ -571,7 +589,7 @@ fn code_mode_capture_report(clusters: Vec<CodeModeClusterReport>) -> CodeModeCap
         .flat_map(|cluster| &cluster.samples)
         .all(|sample| !sample.failed);
     CodeModeCaptureReport {
-        schema_version: 3,
+        schema_version: 4,
         scenario: "code_mode_turn",
         mode: "warm",
         warmups: CODE_MODE_WARMUPS,
@@ -980,7 +998,7 @@ mod tests {
         }]);
         let value = serde_json::to_value(report).expect("capture report should serialize");
 
-        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["schema_version"], 4);
         assert_eq!(value["scenario"], "code_mode_turn");
         assert!(value["clusters"][0].get("capture").is_some());
         for paired_field in [
@@ -992,6 +1010,15 @@ mod tests {
         ] {
             assert!(value["clusters"][0].get(paired_field).is_none());
         }
+    }
+
+    #[test]
+    fn ready_to_sample_dispatch_gate_rejects_multi_second_stalls() {
+        assert!(!ready_to_sample_dispatch_gate_passes(None));
+        assert!(!ready_to_sample_dispatch_gate_passes(Some(
+            5_000_000_000_u64
+        )));
+        assert!(ready_to_sample_dispatch_gate_passes(Some(500_000_000_u64)));
     }
 
     #[test]

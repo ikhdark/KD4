@@ -169,7 +169,12 @@ mod tests {
             &[],
         );
         assert!(description.contains("Nested tool schemas are discovered lazily at runtime"));
-        assert!(description.contains("Find a tool in `ALL_TOOLS`"));
+        assert!(description.contains("When the exact tool name is known"));
+        assert!(
+            description.contains("inspect compact `ALL_TOOL_NAMES` only when the name is unknown")
+        );
+        assert!(description.contains("`resolve_tool(name)`"));
+        assert!(description.contains("Never scan `ALL_TOOLS`"));
         assert!(
             description.len() < 4_000,
             "compact exec prompt unexpectedly expanded to {} bytes",
@@ -199,43 +204,80 @@ mod tests {
         assert!(description.contains("its exact token and direct consumers"));
         assert!(description.contains("search repo/project names only if unresolved"));
         assert!(description.contains("never in the same batch"));
+        assert!(description.contains("Prefer a purpose-built tool over shell"));
+        assert!(description.contains("consolidate related read-only probes"));
+        assert!(description.contains("Mutating or unproven workspace calls are serialized"));
+        assert!(
+            description
+                .contains("independent proven-read-only workspace calls may run concurrently")
+        );
+        assert!(description.contains("shared read gate"));
+        assert!(!description.contains("workspace shell calls are serialized"));
+        assert!(!description.contains("do not launch them in parallel"));
+        assert!(description.contains("merely to re-filter a result already returned"));
+        assert!(description.contains("first safe useful read or action in the initial exec"));
+        assert!(description.contains("skip status-only sampling"));
+        assert!(description.contains("project instructions already in context"));
+        assert!(description.contains("loaded `AGENTS.md` contract"));
+        assert!(description.contains("reread only if marked omitted, incomplete, or stale"));
+        assert!(
+            description.contains("Reuse exact schemas, CLI usage, and results already in context")
+        );
+        assert!(description.contains("do not rediscover or guess arguments/subcommands"));
+        assert!(description.contains("Before guessing an owner ID"));
+        assert!(description.contains("use a compact ID-listing command"));
+        assert!(description.contains("If absent or stale"));
+        assert!(description.contains("inspect the exact schema or `--help` once before calling"));
+        assert!(description.contains("Nested tools: use a present schema"));
+        assert!(description.contains("`resolve_tool(name)` when the name is known"));
+        assert!(description.contains("or inspect `ALL_TOOL_NAMES`"));
+        assert!(description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
+        assert!(description.contains("Read or list known paths directly in the current shell"));
+        assert!(description.contains("do not substitute a search or second shell"));
+        assert!(description.contains("one statically parseable content read"));
+        assert!(description.contains("omit redundant metadata probes"));
+        assert!(description.contains("Repository-wide `rg`/`rg --files` requires"));
+        assert!(description.contains("same-query narrower owner/subtree miss first"));
+        assert!(description.contains("Start scoped with a positional directory"));
+        assert!(description.contains("Never start with bare repo-root `rg --files -g ...`"));
+        assert!(description.contains("every known independent call in one exec"));
+        assert!(description.contains("each fully known multi-file edit in one patch"));
         assert!(description.contains("hard 60s default deadline"));
-        assert!(description.contains("expiry cancels the operation"));
-        assert!(description.contains("Only resume an observation poll"));
-        assert!(description.contains("returned a session or cell ID"));
+        assert!(description.contains("Resume only a returned session/cell ID"));
         assert!(description.contains("never duplicate a timed-out operation"));
         assert!(!description.contains("never an operation"));
         assert!(description.contains("Honor tool contracts"));
-        assert!(description.contains("Await `notify` per settlement"));
+        assert!(description.contains("await `notify` per settlement"));
         assert!(description.contains("use `allSettled`"));
         assert!(description.contains("resolves after delivery; await it"));
         assert!(description.contains("never bare `Promise.all`"));
-        assert!(description.contains("Eight sampling passes per turn"));
-        assert!(description.contains("efficiency target, not a completion/validation cap"));
-        assert!(
-            description
-                .contains("Required routing, safety, contract, test, or validation evidence")
-        );
-        assert!(description.contains("dependent or independent work"));
+        assert!(description.contains("Target at most eight sampling passes"));
+        assert!(description.contains("required routing, safety, contract, test, or validation"));
         assert!(description.contains("same awaited evaluation"));
-        assert!(description.contains("read relevant config/session tables or line ranges"));
+        assert!(description.contains("A tool return alone needs no sampling pass"));
+        assert!(description.contains("only for a new model decision"));
+        assert!(description.contains("unchanged evidence"));
+        assert!(description.contains("synthesize, or stop"));
+        assert!(description.contains("relevant tables/line ranges"));
         assert!(description.contains("never whole files"));
-        assert!(description.contains("after truncation use a retained-artifact selector"));
+        assert!(description.contains("concise synthesis, not raw payloads"));
+        assert!(description.contains("retained-artifact selectors after truncation"));
+        assert!(description.contains("Output defaults to 4000 tokens"));
+        assert!(description.contains("smallest useful budget"));
+        assert!(description.contains("10000-token hard cap"));
         assert!(!description.contains("including six small calls"));
         assert!(!description.contains("group 2-5 independent discovery calls"));
-        assert!(
-            description.contains("Only tools listed in `ALL_TOOLS` are callable inside `exec`")
-        );
-        assert!(description.contains("including a session poll"));
-        assert!(description.contains("change route or relevant state"));
-        assert!(description.contains("Sequence dependencies"));
+        assert!(description.contains("Only `ALL_TOOLS` entries are callable inside `exec`"));
+        assert!(description.contains("never repeat the same call/poll"));
+        assert!(description.contains("change route/state"));
+        assert!(description.contains("Sequence true dependencies"));
         assert!(description.contains("Keep evidence bounded"));
         assert!(!description.contains("Shared MCP Types:"));
         assert!(!description.contains("type ImageContent ="));
         assert!(!description.contains("Model projections are capped"));
         const HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES: usize = 3_337;
         assert!(
-            EXEC_DESCRIPTION_TEMPLATE.len() * 100 <= HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES * 92,
+            EXEC_DESCRIPTION_TEMPLATE.len() * 100 <= HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES * 96,
             "information-gain-aware batching guidance takes priority over marginal descriptor savings"
         );
     }
@@ -286,8 +328,11 @@ mod tests {
         let description = build_exec_tool_description(false, true, &[]);
 
         assert!(description.contains("Some deferred nested tools may be omitted"));
-        assert!(description.contains("filter `ALL_TOOLS` by `name` and `description`"));
-        assert!(!description.contains("do not print the full `ALL_TOOLS` array"));
+        assert!(
+            description.contains("inspect compact `ALL_TOOL_NAMES` only when the name is unknown")
+        );
+        assert!(description.contains("`resolve_tool(\"tool_name\")`"));
+        assert!(description.contains("Never scan `ALL_TOOLS`"));
     }
 
     #[test]

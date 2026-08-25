@@ -73,7 +73,7 @@ async fn managed_job_terminates_child_and_grandchild() -> anyhow::Result<()> {
     };
     if !raw.is_null() {
         let process = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
-        let wait = unsafe { WaitForSingleObject(process.as_raw_handle(), 2_000) };
+        let wait = unsafe { WaitForSingleObject(process.as_raw_handle() as _, 2_000) };
         assert_eq!(
             wait, WAIT_OBJECT_0,
             "grandchild remained alive after Job termination"

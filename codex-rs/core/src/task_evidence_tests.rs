@@ -527,6 +527,43 @@ async fn existing_evidence_reuses_canonical_repository_identity() {
     }
 }
 
+#[tokio::test]
+async fn unchanged_task_evidence_reload_preserves_revision_and_bytes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    let codex_home = temp.path().join("home");
+    tokio::fs::create_dir_all(repo.join(".git"))
+        .await
+        .expect("git dir");
+    tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
+        .await
+        .expect("manifest");
+    let thread_id = ThreadId::new();
+    let evidence_path = codex_home
+        .join("task-evidence")
+        .join(format!("{thread_id}.json"));
+    let ledger = TaskEvidenceLedger::load_or_new(codex_home.clone(), thread_id, &repo).await;
+    let revision = ledger.document_revision().await.expect("document revision");
+    let before = tokio::fs::read(&evidence_path)
+        .await
+        .expect("initial evidence");
+    drop(ledger);
+
+    let reloaded = TaskEvidenceLedger::load_or_new(codex_home, thread_id, &repo).await;
+    let after = tokio::fs::read(&evidence_path)
+        .await
+        .expect("reloaded evidence");
+
+    assert_eq!(after, before);
+    assert_eq!(
+        reloaded
+            .document_revision()
+            .await
+            .expect("reloaded revision"),
+        revision
+    );
+}
+
 #[test]
 fn repository_identity_canonicalizes_drive_letter_case() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -2971,6 +3008,39 @@ async fn completed_plan_step_requires_validation_proof() {
 }
 
 #[tokio::test]
+async fn completion_review_dossier_exposes_focused_work_unit_proof_route() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_planning_update(PlanningUpdateInput {
+            tier: Some(PlanningTier::Focused),
+            implementation_surfaces: vec!["src/focused.rs".to_string()],
+            ..PlanningUpdateInput::default()
+        })
+        .await;
+
+    let dossier = ledger
+        .completion_review_dossier(
+            Some("candidate complete"),
+            &[],
+            &[],
+            &ReviewLensSelectionFacts::default(),
+            &[],
+            true,
+            true,
+        )
+        .await
+        .expect("completion review dossier");
+
+    assert_eq!(dossier.evidence_gate.status, TaskCompletionStatus::Partial);
+    assert!(
+        dossier
+            .locally_obtainable_proof_routes
+            .iter()
+            .any(|route| { route.contains("focused work unit") && route.contains("validation") })
+    );
+}
+
+#[tokio::test]
 async fn source_owner_is_derived_from_implementation_surfaces() {
     let manifest = r#"
 schema_version = 2
@@ -4451,6 +4521,66 @@ async fn completion_proof_cycle_starts_with_fresh_hash_then_reuses_retry_proof()
 }
 
 #[tokio::test]
+async fn repeated_completion_fresh_uses_trusted_completion_proof() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![proof_free_plan_item(
+            "step",
+            StepStatus::Passed,
+        )]))
+        .await;
+    install_tracked_freshness_file(&ledger, &repo, "src/fresh.txt", b"proof\n").await;
+
+    assert_eq!(
+        ledger.completion_gate().await.expect("first gate").status,
+        TaskCompletionStatus::Passed
+    );
+    assert_eq!(
+        ledger.completion_gate().await.expect("second gate").status,
+        TaskCompletionStatus::Passed
+    );
+
+    let diagnostics = ledger.freshness_diagnostics();
+    assert_eq!(diagnostics.scan_invocations, 1);
+    assert_eq!(diagnostics.files_strongly_hashed, 1);
+    assert_eq!(diagnostics.strong_hashes_reused, 1);
+}
+
+#[tokio::test]
+async fn repeated_unchanged_completion_gate_does_not_advance_revision_or_rewrite() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![proof_free_plan_item(
+            "step",
+            StepStatus::Passed,
+        )]))
+        .await;
+    ledger
+        .completion_gate()
+        .await
+        .expect("first completion gate");
+    let evidence_path = ledger.evidence_path().expect("evidence path");
+    let revision = ledger.document_revision().await.expect("document revision");
+    let before = tokio::fs::read(&evidence_path)
+        .await
+        .expect("persisted completion");
+
+    ledger
+        .completion_gate()
+        .await
+        .expect("second completion gate");
+
+    let after = tokio::fs::read(&evidence_path)
+        .await
+        .expect("unchanged completion");
+    assert_eq!(after, before);
+    assert_eq!(
+        ledger.document_revision().await.expect("final revision"),
+        revision
+    );
+}
+
+#[tokio::test]
 async fn requirement_manifest_change_starts_a_new_completion_proof_scan() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     install_tracked_freshness_file(&ledger, &repo, "src/fresh.txt", b"tracked\n").await;
@@ -4852,6 +4982,63 @@ async fn terminal_decision_and_delivery_claim_are_atomic_and_one_shot() {
     assert_eq!(
         ledger.terminal_timing_receipt_for_test(identity).await,
         Some(terminalization)
+    );
+}
+
+#[tokio::test]
+async fn terminal_claim_replays_do_not_rewrite_evidence() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let identity = "thread:stable-terminal";
+    assert!(matches!(
+        ledger
+            .commit_terminal_decision_and_claim(terminal_decision_claim(identity))
+            .await,
+        TerminalClaimResult::Claimed(_)
+    ));
+    let evidence_path = ledger.evidence_path().expect("evidence path");
+    let revision = ledger.document_revision().await.expect("document revision");
+    let authoritative_bytes = tokio::fs::read(&evidence_path)
+        .await
+        .expect("authoritative claim");
+
+    assert!(matches!(
+        ledger
+            .commit_terminal_decision_and_claim(terminal_decision_claim(identity))
+            .await,
+        TerminalClaimResult::AlreadyClaimed(_)
+    ));
+    assert_eq!(
+        tokio::fs::read(&evidence_path)
+            .await
+            .expect("replayed claim"),
+        authoritative_bytes
+    );
+    assert_eq!(
+        ledger.document_revision().await.expect("replayed revision"),
+        revision
+    );
+
+    let mut conflicting = terminal_decision_claim(identity);
+    let EventMsg::TurnComplete(event) = &mut conflicting.authoritative_event.event else {
+        unreachable!("test claim is terminal completion");
+    };
+    event.last_agent_message = Some("conflict".to_string());
+    conflicting.authoritative_event.fingerprint =
+        crate::terminal_event_fingerprint(&conflicting.authoritative_event.event)
+            .expect("terminal fingerprint");
+    assert!(matches!(
+        ledger.commit_terminal_decision_and_claim(conflicting).await,
+        TerminalClaimResult::Conflict { .. }
+    ));
+    assert_eq!(
+        tokio::fs::read(&evidence_path)
+            .await
+            .expect("conflicting claim"),
+        authoritative_bytes
+    );
+    assert_eq!(
+        ledger.document_revision().await.expect("conflict revision"),
+        revision
     );
 }
 
@@ -5992,7 +6179,7 @@ async fn proof_accumulation_changes_dossier_but_not_implementation_identity() {
 }
 
 #[tokio::test]
-async fn terminal_closure_is_atomic_and_reload_preserves_v2_lineage() {
+async fn partial_evidence_cannot_close_clean_completion_review() {
     let (temp, repo, ledger, initial_dossier) = classified_requirement_fixture().await;
     let ledger = Arc::new(ledger);
     assert!(matches!(
@@ -6063,6 +6250,29 @@ async fn terminal_closure_is_atomic_and_reload_preserves_v2_lineage() {
         review_dossier.dossier_snapshot_id,
         closure_dossier.dossier_snapshot_id
     );
+    let mut partial_dossier = closure_dossier.clone();
+    partial_dossier.evidence_gate.status = TaskCompletionStatus::Partial;
+    partial_dossier
+        .evidence_gate
+        .reasons
+        .push("focused proof remains outstanding".to_string());
+    assert_eq!(
+        ledger.finalize_completion_review(&partial_dossier).await,
+        AtomicReviewTransition::Failed
+    );
+    {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("task evidence");
+        let review = document.completion_review_v2.as_ref().expect("V2 ledger");
+        assert!(review.review_risk.unresolved);
+        assert_eq!(
+            review.active_review_cycle.as_ref().map(|cycle| cycle.phase),
+            Some(CompletionReviewCyclePhase::ProvisionalClean)
+        );
+        assert!(review.receipts.iter().all(|receipt| {
+            receipt.attempt_kind != CompletionReviewAttemptKind::TerminalClosure
+        }));
+    }
     let evidence_path = ledger.evidence_path().expect("evidence path");
     let bytes_before_failed_closure = tokio::fs::read(&evidence_path)
         .await

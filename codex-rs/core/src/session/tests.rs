@@ -215,6 +215,116 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration as StdDuration;
 
+#[tokio::test]
+async fn session_persistent_ledgers_load_concurrently() {
+    let (task_started_tx, task_started_rx) = tokio::sync::oneshot::channel();
+    let (command_started_tx, command_started_rx) = tokio::sync::oneshot::channel();
+    let (task_release_tx, task_release_rx) = tokio::sync::oneshot::channel();
+    let (command_release_tx, command_release_rx) = tokio::sync::oneshot::channel();
+
+    let loads = tokio::spawn(super::session::load_session_persistent_ledgers(
+        async move {
+            task_started_tx
+                .send(())
+                .expect("record task-evidence start");
+            task_release_rx.await.expect("release task-evidence load");
+            "task-evidence-ready"
+        },
+        async move {
+            command_started_tx
+                .send(())
+                .expect("record command-execution start");
+            command_release_rx
+                .await
+                .expect("release command-execution load");
+            "command-execution-ready"
+        },
+    ));
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        task_started_rx
+            .await
+            .expect("task-evidence load should start");
+        command_started_rx
+            .await
+            .expect("command-execution load should start before either load is released");
+    })
+    .await
+    .expect("both persistent-ledger loads should start before either is released");
+    assert!(!loads.is_finished());
+
+    task_release_tx.send(()).expect("release task-evidence");
+    command_release_tx
+        .send(())
+        .expect("release command execution");
+    assert_eq!(
+        loads.await.expect("persistent-ledger loads join"),
+        ("task-evidence-ready", "command-execution-ready")
+    );
+
+    assert!(super::session::task_evidence_is_disabled_for_session(
+        true,
+        &SessionSource::SubAgent(SubAgentSource::Review),
+    ));
+    assert!(!super::session::task_evidence_is_disabled_for_session(
+        false,
+        &SessionSource::SubAgent(SubAgentSource::Review),
+    ));
+    assert!(!super::session::task_evidence_is_disabled_for_session(
+        true,
+        &SessionSource::Cli,
+    ));
+}
+
+#[tokio::test]
+async fn tool_history_persistence_queue_coalesces_superseded_snapshots_before_flush() {
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let thread_id = ThreadId::new();
+    let io_gate = Arc::new(Semaphore::new(/*permits*/ 1));
+    let held_io_gate = io_gate.acquire().await.expect("acquire I/O gate");
+    let queue = super::session::ToolHistoryPersistenceQueue::new(Arc::clone(&io_gate));
+
+    for index in 0..32 {
+        let mut snapshot = crate::tool_history::ToolHistoryState::default();
+        snapshot.register_non_workspace_code_mode_call(format!("snapshot-{index}"));
+        queue.enqueue(
+            codex_home.path(),
+            &thread_id,
+            snapshot,
+            "test completed-tool history metadata",
+        );
+    }
+
+    drop(held_io_gate);
+    queue.flush().await;
+
+    let persisted = std::fs::read_to_string(
+        codex_home
+            .path()
+            .join("tool-history")
+            .join(format!("{thread_id}.json")),
+    )
+    .expect("read persisted tool-history ledger");
+    assert!(persisted.contains("snapshot-31"));
+    assert!(!persisted.contains("snapshot-30"));
+    assert!(
+        queue.persisted_snapshot_count() <= 2,
+        "the worker may persist one in-flight snapshot and the newest replacement"
+    );
+}
+
+#[test]
+fn tool_history_persistence_sequence_refuses_overflow() {
+    assert_eq!(
+        super::session::next_tool_history_persistence_sequence(u64::MAX - 1),
+        Some(u64::MAX)
+    );
+    assert_eq!(
+        super::session::next_tool_history_persistence_sequence(u64::MAX),
+        None
+    );
+}
+
 impl StepContext {
     pub(crate) fn for_test(turn: Arc<TurnContext>) -> Arc<Self> {
         let environments = turn.environments.clone();
@@ -2143,7 +2253,20 @@ async fn record_conversation_items_records_tool_output_model_visibility_boundary
         "call-persisted",
         "exec_command",
         codex_protocol::protocol::TurnTimingToolCallSource::Direct,
-        crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot::default(),
+        crate::turn_timing::ToolCallTimingLineage::default(),
+        crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot {
+            lifecycle_events: vec![
+                codex_protocol::protocol::TurnTimingToolLifecycleEvent {
+                    boundary: codex_protocol::protocol::ToolLifecycleBoundary::RequestCreated,
+                    ..Default::default()
+                },
+                codex_protocol::protocol::TurnTimingToolLifecycleEvent {
+                    boundary: codex_protocol::protocol::ToolLifecycleBoundary::RelayDelivery,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
     );
     let item = ResponseItem::FunctionCallOutput {
         id: None,
@@ -2162,6 +2285,17 @@ async fn record_conversation_items_records_tool_output_model_visibility_boundary
         .protocol_timing();
     assert_eq!(timing.tool_calls.len(), 1);
     assert!(timing.tool_calls[0].output_model_visible_at_ms.is_some());
+    assert_eq!(
+        timing.tool_calls[0]
+            .lifecycle_events
+            .iter()
+            .map(|event| event.boundary)
+            .collect::<Vec<_>>(),
+        vec![
+            codex_protocol::protocol::ToolLifecycleBoundary::RequestCreated,
+            codex_protocol::protocol::ToolLifecycleBoundary::RelayDelivery,
+        ]
+    );
 }
 
 #[tokio::test]
@@ -7880,6 +8014,9 @@ where
         skills_snapshot,
     ));
     let startup_timing = crate::startup_timing::StartupTimingState::new(thread_id.to_string());
+    let tool_history_io_gate = Arc::new(Semaphore::new(/*permits*/ 1));
+    let tool_history_persistence =
+        super::session::ToolHistoryPersistenceQueue::new(Arc::clone(&tool_history_io_gate));
     let session = Arc::new(Session {
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -7888,7 +8025,8 @@ where
         state: Mutex::new(state),
         durable_history_commit_gate: Semaphore::new(1),
         durable_history_completed_commits: Mutex::new(HashSet::new()),
-        tool_history_io_gate: Semaphore::new(/*permits*/ 1),
+        tool_history_io_gate,
+        tool_history_persistence,
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),

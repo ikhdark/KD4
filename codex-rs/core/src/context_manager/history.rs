@@ -123,6 +123,8 @@ struct PreparedHistoryCacheEntry {
     source_items: Arc<Vec<ResponseItem>>,
     projection_revision: u64,
     prepared: PreparedPromptInput,
+    pending_source_items: Option<Arc<Vec<ResponseItem>>>,
+    pending_append: Vec<ResponseItem>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -353,6 +355,8 @@ impl ContextManager {
                     source_items,
                     projection_revision: self.projection_revision,
                     prepared: prepared.clone(),
+                    pending_source_items: None,
+                    pending_append: Vec::new(),
                 });
         }
         prepared
@@ -372,6 +376,11 @@ impl ContextManager {
             workspace_identity,
             Some(git_workspace),
         )
+    }
+
+    pub(crate) fn requires_workspace_evidence_validation(&self) -> bool {
+        self.tool_history
+            .requires_workspace_evidence_validation(self.items.as_slice())
     }
 
     pub(crate) fn prepare_for_sampling_prompt_with_workspace_freshness(
@@ -453,6 +462,11 @@ impl ContextManager {
         observation: crate::tool_history::WorkspaceEvidenceObservation,
     ) {
         Arc::make_mut(&mut self.tool_history).register_workspace_evidence(observation);
+        self.invalidate_prepared_history();
+    }
+
+    pub(crate) fn register_non_workspace_code_mode_call(&mut self, call_id: String) {
+        Arc::make_mut(&mut self.tool_history).register_non_workspace_code_mode_call(call_id);
         self.invalidate_prepared_history();
     }
 
@@ -985,6 +999,73 @@ fn project_update_plan_history(items: &mut Vec<ResponseItem>) {
     *items = projected;
 }
 
+fn prepared_append_can_be_completed(items: &[ResponseItem], supports_images: bool) -> bool {
+    let mut calls = BTreeSet::new();
+    let mut outputs = BTreeSet::new();
+    for item in items {
+        match item {
+            ResponseItem::Reasoning { .. } => {}
+            ResponseItem::FunctionCall { name, call_id, .. } if name != "update_plan" => {
+                if !calls.insert(call_id.as_str()) {
+                    return false;
+                }
+            }
+            ResponseItem::CustomToolCall { call_id, .. } => {
+                if !calls.insert(call_id.as_str()) {
+                    return false;
+                }
+            }
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            }
+            | ResponseItem::CustomToolCallOutput {
+                call_id, output, ..
+            } => {
+                if !supports_images
+                    && matches!(
+                        &output.body,
+                        FunctionCallOutputBody::ContentItems(content)
+                            if content.iter().any(|item| matches!(
+                                item,
+                                FunctionCallOutputContentItem::InputImage { .. }
+                            ))
+                    )
+                {
+                    return false;
+                }
+                if !outputs.insert(call_id.as_str()) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    outputs.is_subset(&calls)
+}
+
+fn prepared_append_is_complete_and_safe(items: &[ResponseItem], supports_images: bool) -> bool {
+    if !prepared_append_can_be_completed(items, supports_images) {
+        return false;
+    }
+    let calls = items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCall { call_id, .. }
+            | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let outputs = items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCallOutput { call_id, .. }
+            | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    calls == outputs
+}
+
 impl ContextManager {
     fn advance_prepared_history_for_append(
         &mut self,
@@ -997,28 +1078,50 @@ impl ContextManager {
             .prepared_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(entry) = cache.take() else {
+        let Some(mut entry) = cache.take() else {
             return;
         };
-        if !Arc::ptr_eq(&entry.source_items, pre_append_source)
-            || entry.projection_revision != previous_revision
-            || !appended
-                .iter()
-                .all(|item| matches!(item, ResponseItem::Reasoning { .. }))
+        if entry.projection_revision != previous_revision {
+            return;
+        }
+        let append = if Arc::ptr_eq(&entry.source_items, pre_append_source)
+            && entry.pending_append.is_empty()
         {
+            appended.to_vec()
+        } else if entry
+            .pending_source_items
+            .as_ref()
+            .is_some_and(|source| Arc::ptr_eq(source, pre_append_source))
+        {
+            let mut pending = std::mem::take(&mut entry.pending_append);
+            pending.extend_from_slice(appended);
+            pending
+        } else {
+            return;
+        };
+        if !prepared_append_is_complete_and_safe(&append, entry.prepared.policy.supports_images) {
+            const MAX_PENDING_PREPARED_APPEND_ITEMS: usize = 64;
+            if append.len() <= MAX_PENDING_PREPARED_APPEND_ITEMS
+                && prepared_append_can_be_completed(&append, entry.prepared.policy.supports_images)
+            {
+                entry.projection_revision = self.projection_revision;
+                entry.pending_source_items = Some(Arc::clone(&self.items));
+                entry.pending_append = append;
+                *cache = Some(entry);
+            }
             return;
         }
         let mut items = entry.prepared.items.to_vec();
-        items.extend_from_slice(appended);
+        items.extend_from_slice(&append);
         let items: Arc<[ResponseItem]> = items.into();
         let mut fallback_items = entry.prepared.fallback_items.to_vec();
-        fallback_items.extend_from_slice(appended);
+        fallback_items.extend_from_slice(&append);
         let fallback_items: Arc<[ResponseItem]> = fallback_items.into();
         let mut unreplaced_items = entry.prepared.unreplaced_items.to_vec();
-        unreplaced_items.extend_from_slice(appended);
+        unreplaced_items.extend_from_slice(&append);
         let unreplaced_items: Arc<[ResponseItem]> = unreplaced_items.into();
         let mut unreplaced_fallback_items = entry.prepared.unreplaced_fallback_items.to_vec();
-        unreplaced_fallback_items.extend_from_slice(appended);
+        unreplaced_fallback_items.extend_from_slice(&append);
         let unreplaced_fallback_items: Arc<[ResponseItem]> = unreplaced_fallback_items.into();
         let Ok(fingerprint) = prepared_history_fingerprint(
             &items,
@@ -1048,6 +1151,8 @@ impl ContextManager {
                 fingerprint: Some(fingerprint),
                 policy: entry.prepared.policy,
             },
+            pending_source_items: None,
+            pending_append: Vec::new(),
         });
     }
 

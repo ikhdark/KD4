@@ -1942,7 +1942,20 @@ pub enum TurnTimingToolCallSource {
 }
 
 /// Opaque identity for one concrete execution of a tool call.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, Hash, JsonSchema, TS)]
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    Deserialize,
+    Serialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    JsonSchema,
+    TS,
+)]
 #[serde(transparent)]
 #[ts(type = "string")]
 pub struct ToolExecutionId(pub String);
@@ -2049,12 +2062,25 @@ pub struct TurnTimingToolLifecycleEvent {
 ///
 /// All `*_at_ms` values are monotonic offsets from turn start. A missing
 /// boundary means the call ended before that boundary was observed. No tool
-/// arguments, output, paths, or nested runtime identifiers are persisted.
+/// arguments, output, or paths are persisted; nested identifiers are opaque
+/// correlation keys only.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingToolCall {
     pub call_id: String,
+    /// Model-visible outer tool call that owns this nested call, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub parent_call_id: Option<String>,
+    /// Runtime cell that issued this nested tool request, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub parent_cell_id: Option<String>,
+    /// Code-mode's payload-free per-cell invocation id, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub runtime_tool_call_id: Option<String>,
     pub tool_name: String,
     #[serde(default)]
     pub source: TurnTimingToolCallSource,
@@ -2113,6 +2139,11 @@ pub struct TurnTimingToolCall {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub model_resumed_at_ms: Option<u64>,
+    /// Monotonic latency from the host proving that sampling is unblocked to
+    /// the provider request reaching its transport dispatch boundary.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub ready_to_sample_to_dispatch_ns: Option<u64>,
     #[serde(default)]
     #[ts(type = "number | null")]
     pub item_to_first_poll_ms: Option<u64>,
@@ -2128,6 +2159,15 @@ pub struct TurnTimingToolCall {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub workspace_evidence_before_ms: Option<u64>,
+    /// Whether the pre-handler workspace identity came from the latest
+    /// authoritative capture instead of running a fresh capture.
+    #[serde(default)]
+    #[ts(type = "boolean | null")]
+    pub workspace_evidence_before_cache_hit: Option<bool>,
+    /// Git dependencies that crossed the bounded capture deadline during a
+    /// fresh pre-handler workspace capture.
+    #[serde(default)]
+    pub workspace_evidence_before_timed_out_git_dependencies: Vec<String>,
     #[serde(default)]
     #[ts(type = "number | null")]
     pub workspace_evidence_after_ms: Option<u64>,
@@ -2962,22 +3002,38 @@ pub struct TurnTimingMilestones {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub first_tool_handler_entry_ms: Option<u64>,
-    /// Time from turn start until the first non-control tool is accepted for dispatch.
+    /// Time from turn start until the first domain-work tool is accepted for dispatch.
     #[serde(default)]
     #[ts(type = "number | null")]
     pub first_useful_tool_accepted_ms: Option<u64>,
-    /// Time from turn start until the first non-control tool passes the parallel gate.
+    /// Time from turn start until the first domain-work tool passes the parallel gate.
     #[serde(default)]
     #[ts(type = "number | null")]
     pub first_useful_tool_gate_admitted_ms: Option<u64>,
-    /// Time from turn start until the first authorized non-control tool handler is entered.
+    /// Time from turn start until the first authorized domain-work tool handler is entered.
     #[serde(default)]
     #[ts(type = "number | null")]
     pub first_useful_action_ms: Option<u64>,
-    /// Time from turn start until the first non-control tool completes successfully.
+    /// Time from turn start until the first domain-work tool completes successfully.
     #[serde(default)]
     #[ts(type = "number | null")]
     pub first_successful_useful_action_ms: Option<u64>,
+    /// Time from turn start until the first authorized control/plumbing tool handler is entered.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_infrastructure_action_ms: Option<u64>,
+    /// Time from turn start until the first authorized tool-schema discovery handler is entered.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_tool_discovery_action_ms: Option<u64>,
+    /// Time from turn start until the first authorized domain-work handler is entered.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_domain_action_ms: Option<u64>,
+    /// Time from turn start until the first domain-work tool completes successfully.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub first_successful_domain_action_ms: Option<u64>,
     #[serde(default)]
     #[ts(type = "number | null")]
     pub first_model_output_ms: Option<u64>,
@@ -8176,6 +8232,33 @@ mod tests {
     }
 
     #[test]
+    fn action_class_milestones_round_trip_and_default_for_historical_payloads() {
+        let historical: TurnTimingMilestones =
+            serde_json::from_value(serde_json::json!({})).expect("historical milestones");
+        assert_eq!(historical.first_infrastructure_action_ms, None);
+        assert_eq!(historical.first_tool_discovery_action_ms, None);
+        assert_eq!(historical.first_domain_action_ms, None);
+        assert_eq!(historical.first_successful_domain_action_ms, None);
+
+        let current = TurnTimingMilestones {
+            first_infrastructure_action_ms: Some(2),
+            first_tool_discovery_action_ms: Some(7),
+            first_domain_action_ms: Some(12),
+            first_successful_domain_action_ms: Some(15),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&current).expect("milestone serialization");
+        assert_eq!(value["firstInfrastructureActionMs"], 2);
+        assert_eq!(value["firstToolDiscoveryActionMs"], 7);
+        assert_eq!(value["firstDomainActionMs"], 12);
+        assert_eq!(value["firstSuccessfulDomainActionMs"], 15);
+        assert_eq!(
+            serde_json::from_value::<TurnTimingMilestones>(value).expect("milestone round trip"),
+            current
+        );
+    }
+
+    #[test]
     fn removed_turn_timing_fields_are_absent_and_historical_payloads_still_deserialize() {
         let current =
             serde_json::to_value(TurnTiming::default()).expect("turn timing serialization");
@@ -8299,23 +8382,48 @@ mod tests {
         }))
         .expect("historical tool timing");
         assert_eq!(historical.outcome, None);
+        assert_eq!(historical.parent_call_id, None);
+        assert_eq!(historical.parent_cell_id, None);
+        assert_eq!(historical.runtime_tool_call_id, None);
         assert_eq!(historical.output_model_visible_at_ms, None);
+        assert_eq!(historical.ready_to_sample_to_dispatch_ns, None);
+        assert_eq!(historical.workspace_evidence_before_cache_hit, None);
+        assert!(
+            historical
+                .workspace_evidence_before_timed_out_git_dependencies
+                .is_empty()
+        );
         assert!(!historical.exec_cleanup_state_observed);
         assert!(!historical.background_process_expected);
         assert!(!historical.running_process_after_cleanup);
 
         let current = TurnTimingToolCall {
             call_id: "failed-call".to_string(),
+            parent_call_id: Some("outer-call".to_string()),
+            parent_cell_id: Some("cell-1".to_string()),
+            runtime_tool_call_id: Some("runtime-call-1".to_string()),
             tool_name: "exec_command".to_string(),
             outcome: Some("failure".to_string()),
             output_model_visible_at_ms: Some(17),
+            ready_to_sample_to_dispatch_ns: Some(23_000_000),
+            workspace_evidence_before_cache_hit: Some(false),
+            workspace_evidence_before_timed_out_git_dependencies: vec!["worktree".to_string()],
             exec_cleanup_state_observed: true,
             running_process_after_cleanup: true,
             ..Default::default()
         };
         let value = serde_json::to_value(&current).expect("tool timing serialization");
         assert_eq!(value["outcome"], "failure");
+        assert_eq!(value["parentCallId"], "outer-call");
+        assert_eq!(value["parentCellId"], "cell-1");
+        assert_eq!(value["runtimeToolCallId"], "runtime-call-1");
         assert_eq!(value["outputModelVisibleAtMs"], 17);
+        assert_eq!(value["readyToSampleToDispatchNs"], 23_000_000);
+        assert_eq!(value["workspaceEvidenceBeforeCacheHit"], false);
+        assert_eq!(
+            value["workspaceEvidenceBeforeTimedOutGitDependencies"],
+            serde_json::json!(["worktree"])
+        );
         assert_eq!(value["execCleanupStateObserved"], true);
         assert_eq!(value["backgroundProcessExpected"], false);
         assert_eq!(value["runningProcessAfterCleanup"], true);

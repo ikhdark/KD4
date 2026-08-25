@@ -201,6 +201,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         let stored_values = self.inner.stored_values.lock().await.clone();
         let host = Arc::new(RuntimeCellHost {
             cell_id: cell_id.clone(),
+            parent_tool_call_id: request.tool_call_id.clone(),
             inner: Arc::clone(&self.inner),
             cell_permit: Mutex::new(Some(cell_permit)),
         });
@@ -274,6 +275,7 @@ impl PendingEvent {
 
 struct RuntimeCellHost<D: SessionRuntimeDelegate> {
     cell_id: CellId,
+    parent_tool_call_id: String,
     inner: Arc<Inner<D>>,
     cell_permit: Mutex<Option<OwnedSemaphorePermit>>,
 }
@@ -289,6 +291,7 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             .invoke_tool(
                 NestedToolCall {
                     cell_id: self.cell_id.clone(),
+                    parent_tool_call_id: self.parent_tool_call_id.clone(),
                     runtime_tool_call_id: invocation.id,
                     tool_name: invocation.name,
                     tool_kind: invocation.kind,

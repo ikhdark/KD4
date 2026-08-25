@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use codex_code_mode_protocol::EnabledToolMetadata;
+
 use super::RuntimeState;
 use super::callbacks::clear_timeout_callback;
 use super::callbacks::exit_callback;
@@ -18,8 +22,14 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     delete_global(scope, global, "SharedArrayBuffer")?;
     delete_global(scope, global, "WebAssembly")?;
 
-    let tools = build_tools_object(scope)?;
-    let all_tools = build_all_tools_value(scope)?;
+    let enabled_tools = scope
+        .get_slot::<RuntimeState>()
+        .map(|state| Arc::clone(&state.enabled_tools))
+        .unwrap_or_default();
+    let tools = build_tools_object(scope, &enabled_tools.tools)?;
+    let all_tools = build_all_tools_value(scope, &enabled_tools.tools)?;
+    let all_tool_names = build_all_tool_names_value(scope, &enabled_tools.tools)?;
+    let resolve_tool = helper_function(scope, "resolve_tool", resolve_tool_callback)?;
     let clear_timeout = helper_function(scope, "clearTimeout", clear_timeout_callback)?;
     let set_timeout = helper_function(scope, "setTimeout", set_timeout_callback)?;
     let text = helper_function(scope, "text", text_callback)?;
@@ -33,6 +43,8 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
 
     set_global(scope, global, "tools", tools.into())?;
     set_global(scope, global, "ALL_TOOLS", all_tools)?;
+    set_global(scope, global, "ALL_TOOL_NAMES", all_tool_names)?;
+    set_global(scope, global, "resolve_tool", resolve_tool.into())?;
     set_global(scope, global, "clearTimeout", clear_timeout.into())?;
     set_global(scope, global, "setTimeout", set_timeout.into())?;
     set_global(scope, global, "text", text.into())?;
@@ -46,14 +58,72 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     Ok(())
 }
 
-fn build_tools_object<'s>(
+fn build_all_tool_names_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-) -> Result<v8::Local<'s, v8::Object>, String> {
-    let tools = v8::Object::new(scope);
+    enabled_tools: &[EnabledToolMetadata],
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let array = v8::Array::new(scope, enabled_tools.len() as i32);
+    for (index, tool) in enabled_tools.iter().enumerate() {
+        let name = v8::String::new(scope, &tool.global_name)
+            .ok_or_else(|| "failed to allocate ALL_TOOL_NAMES name".to_string())?;
+        if array.set_index(scope, index as u32, name.into()) != Some(true) {
+            return Err("failed to append ALL_TOOL_NAMES name".to_string());
+        }
+    }
+    Ok(array.into())
+}
+
+fn resolve_tool_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    if args.length() == 0 || !args.get(0).is_string() {
+        retval.set(v8::undefined(scope).into());
+        return;
+    }
+    let requested_name = args.get(0).to_rust_string_lossy(scope);
     let enabled_tools = scope
         .get_slot::<RuntimeState>()
-        .map(|state| state.enabled_tools.clone())
-        .unwrap_or_default();
+        .map(|state| Arc::clone(&state.enabled_tools));
+    let Some(tool) = enabled_tools
+        .as_deref()
+        .and_then(|enabled_tools| enabled_tools.resolve(&requested_name))
+    else {
+        retval.set(v8::undefined(scope).into());
+        return;
+    };
+    let item = v8::Object::new(scope);
+    let Some(name_key) = v8::String::new(scope, "name") else {
+        retval.set(v8::undefined(scope).into());
+        return;
+    };
+    let Some(description_key) = v8::String::new(scope, "description") else {
+        retval.set(v8::undefined(scope).into());
+        return;
+    };
+    let Some(name) = v8::String::new(scope, &tool.global_name) else {
+        retval.set(v8::undefined(scope).into());
+        return;
+    };
+    let Some(description) = v8::String::new(scope, &tool.description) else {
+        retval.set(v8::undefined(scope).into());
+        return;
+    };
+    if item.set(scope, name_key.into(), name.into()) != Some(true)
+        || item.set(scope, description_key.into(), description.into()) != Some(true)
+    {
+        retval.set(v8::undefined(scope).into());
+        return;
+    }
+    retval.set(item.into());
+}
+
+fn build_tools_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    enabled_tools: &[EnabledToolMetadata],
+) -> Result<v8::Local<'s, v8::Object>, String> {
+    let tools = v8::Object::new(scope);
 
     for (tool_index, tool) in enabled_tools.iter().enumerate() {
         let name = v8::String::new(scope, &tool.global_name)
@@ -66,11 +136,8 @@ fn build_tools_object<'s>(
 
 fn build_all_tools_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    enabled_tools: &[EnabledToolMetadata],
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let enabled_tools = scope
-        .get_slot::<RuntimeState>()
-        .map(|state| state.enabled_tools.clone())
-        .unwrap_or_default();
     let array = v8::Array::new(scope, enabled_tools.len() as i32);
     let name_key = v8::String::new(scope, "name")
         .ok_or_else(|| "failed to allocate ALL_TOOLS name key".to_string())?;

@@ -90,6 +90,7 @@ fn extension_tool_call_source(source: ToolCallSource) -> ExtensionToolCallSource
         ToolCallSource::CodeMode {
             cell_id,
             runtime_tool_call_id,
+            ..
         } => ExtensionToolCallSource::CodeMode {
             cell_id,
             runtime_tool_call_id,

@@ -105,6 +105,7 @@ pub(crate) enum ToolKind {
 /// A nested tool request emitted by a running cell.
 pub(crate) struct NestedToolCall {
     pub(crate) cell_id: CellId,
+    pub(crate) parent_tool_call_id: String,
     pub(crate) runtime_tool_call_id: String,
     pub(crate) tool_name: ToolName,
     pub(crate) tool_kind: ToolKind,

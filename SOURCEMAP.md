@@ -49,7 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
-Tracked repository path snapshot: `count=5015 sha256=2a29b1d953a5916358c258355f876cc86da0839a25e2be15ad540a57e4d427ac`.
+Tracked repository path snapshot: `count=5021 sha256=96992e6c921de279fd19ff279c2d92959730aa82b70cb9d0ec32188198b805bb`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires

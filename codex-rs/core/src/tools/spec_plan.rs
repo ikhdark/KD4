@@ -589,7 +589,6 @@ fn is_excluded_from_code_mode(turn_context: &TurnContext, tool_name: &ToolName) 
 fn build_code_mode_executors(
     turn_context: &TurnContext,
     executors: &[RegisteredTool],
-    wait_available: bool,
 ) -> Vec<Arc<dyn CoreToolRuntime>> {
     let tool_mode = effective_tool_mode(turn_context);
     if !matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly) {
@@ -640,9 +639,7 @@ fn build_code_mode_executors(
         code_mode_nested_tool_specs,
         deferred_code_mode_nested_tool_specs,
     ))];
-    if wait_available {
-        result.push(Arc::new(CodeModeWaitHandler));
-    }
+    result.push(Arc::new(CodeModeWaitHandler));
     result
 }
 
@@ -1229,11 +1226,7 @@ fn prepend_code_mode_executors(
     planned_tools: &mut PlannedTools,
 ) {
     let turn_context = context.step_context.turn.as_ref();
-    let code_mode_executors = build_code_mode_executors(
-        turn_context,
-        planned_tools.runtimes(),
-        context.exposure_identity.wait_available,
-    );
+    let code_mode_executors = build_code_mode_executors(turn_context, planned_tools.runtimes());
     planned_tools.runtimes.splice(
         0..0,
         code_mode_executors

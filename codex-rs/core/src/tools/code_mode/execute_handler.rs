@@ -23,8 +23,7 @@ use super::wait_handler::terminate_cancelled_cell;
 
 pub struct CodeModeExecuteHandler {
     spec: ToolSpec,
-    direct_nested_tool_specs: Vec<ToolSpec>,
-    deferred_nested_tool_specs: Vec<ToolSpec>,
+    enabled_tools: Vec<codex_code_mode::ToolDefinition>,
 }
 
 impl CodeModeExecuteHandler {
@@ -33,10 +32,16 @@ impl CodeModeExecuteHandler {
         direct_nested_tool_specs: Vec<ToolSpec>,
         deferred_nested_tool_specs: Vec<ToolSpec>,
     ) -> Self {
+        let mut nested_tool_specs = direct_nested_tool_specs;
+        // Deferred tools stay out of the model-visible `exec` description, but
+        // code running inside the isolate can discover and invoke them through
+        // `ALL_TOOLS`. Cache the complete runtime registry once per handler so
+        // every cell does not rebuild it from cloned tool specs.
+        nested_tool_specs.extend(deferred_nested_tool_specs);
+        let enabled_tools = codex_tools::collect_code_mode_tool_definitions(&nested_tool_specs);
         Self {
             spec,
-            direct_nested_tool_specs,
-            deferred_nested_tool_specs,
+            enabled_tools,
         }
     }
 
@@ -51,13 +56,6 @@ impl CodeModeExecuteHandler {
         let args =
             codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
         let exec = ExecContext { session, turn };
-        let mut nested_tool_specs = self.direct_nested_tool_specs.clone();
-        // Deferred tools stay out of the model-visible `exec` description, but
-        // code running inside the isolate can discover and invoke them through
-        // `ALL_TOOLS`. Build the runtime registry from the complete set so a
-        // same-cell tool search can immediately call the tool it discovers.
-        nested_tool_specs.extend(self.deferred_nested_tool_specs.clone());
-        let enabled_tools = codex_tools::collect_code_mode_tool_definitions(&nested_tool_specs);
         let started_at = std::time::Instant::now();
         let started_cell = exec
             .session
@@ -65,7 +63,7 @@ impl CodeModeExecuteHandler {
             .code_mode_service
             .execute(codex_code_mode::ExecuteRequest {
                 tool_call_id: call_id.clone(),
-                enabled_tools,
+                enabled_tools: self.enabled_tools.clone(),
                 source: args.code.to_owned(),
                 // Initial observation is an immediate internal hand-off from
                 // the runtime to the code-mode owner. Subsequent observations

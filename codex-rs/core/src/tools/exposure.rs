@@ -48,7 +48,6 @@ pub(crate) struct DirectMcpToolEntrypoint {
 pub(crate) struct ToolExposureIdentity {
     pub(crate) selected_skill_direct_mcp_entrypoints: Vec<DirectMcpToolEntrypoint>,
     pub(crate) agent_surface_stage: AgentSurfaceStage,
-    pub(crate) wait_available: bool,
     pub(crate) goal_surface_state: GoalSurfaceState,
     pub(crate) extension_tool_surface_revision: u64,
     pub(crate) mcp_resources_available: bool,
@@ -61,7 +60,6 @@ pub(crate) struct ToolExposureIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DynamicToolExposureIdentity {
     pub(crate) agent_surface_stage: AgentSurfaceStage,
-    pub(crate) wait_available: bool,
     pub(crate) extension_tool_surface_revision: u64,
     pub(crate) mcp_resources_available: bool,
     pub(crate) environment_mode: EnvironmentSurfaceMode,
@@ -72,7 +70,6 @@ impl ToolExposureIdentity {
     pub(crate) fn dynamic_identity(&self) -> DynamicToolExposureIdentity {
         DynamicToolExposureIdentity {
             agent_surface_stage: self.agent_surface_stage,
-            wait_available: self.wait_available,
             extension_tool_surface_revision: self.extension_tool_surface_revision,
             mcp_resources_available: self.mcp_resources_available,
             environment_mode: self.environment_mode,
@@ -87,7 +84,6 @@ impl Default for ToolExposureIdentity {
         Self {
             selected_skill_direct_mcp_entrypoints: Vec::new(),
             agent_surface_stage: AgentSurfaceStage::TypedAdministration,
-            wait_available: true,
             goal_surface_state: GoalSurfaceState::Active,
             extension_tool_surface_revision: 0,
             mcp_resources_available: true,
@@ -108,7 +104,6 @@ mod tests {
         let base = ToolExposureIdentity {
             selected_skill_direct_mcp_entrypoints: Vec::new(),
             agent_surface_stage: AgentSurfaceStage::SpawnOnly,
-            wait_available: false,
             goal_surface_state: GoalSurfaceState::Disabled,
             extension_tool_surface_revision: 0,
             mcp_resources_available: false,
@@ -118,10 +113,6 @@ mod tests {
             environment_starting: false,
         };
         assert_eq!(base, base.clone());
-
-        let mut changed = base.clone();
-        changed.wait_available = true;
-        assert_ne!(base, changed);
 
         let mut changed = base.clone();
         changed.goal_surface_state = GoalSurfaceState::Inactive;
@@ -167,13 +158,6 @@ mod tests {
 
     #[test]
     fn zero_one_or_many_counts_collapse_to_boolean_identity() {
-        let one_waitable_cell = ToolExposureIdentity {
-            wait_available: true,
-            ..ToolExposureIdentity::default()
-        };
-        let two_waitable_cells = one_waitable_cell.clone();
-        assert_eq!(one_waitable_cell, two_waitable_cells);
-
         let one_resource_server = ToolExposureIdentity {
             mcp_resources_available: true,
             ..ToolExposureIdentity::default()

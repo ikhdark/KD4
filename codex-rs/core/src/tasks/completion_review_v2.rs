@@ -152,6 +152,63 @@ pub(crate) struct CompletionReviewState {
     phase: TurnReviewPhase,
     ready_phase_recorded: bool,
     terminal_phase_recorded: bool,
+    evidence_reconciliation_injected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvidenceReconciliation {
+    payload: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvidenceReconciliationAction {
+    Continue,
+    Inject,
+    Exhausted,
+}
+
+fn evidence_reconciliation_action(
+    dossier: &CompletionReviewDossier,
+    pending_lineage: bool,
+    already_injected: bool,
+) -> EvidenceReconciliationAction {
+    if pending_lineage {
+        return EvidenceReconciliationAction::Continue;
+    }
+    if already_injected && dossier.evidence_gate.status != TaskCompletionStatus::Passed {
+        return EvidenceReconciliationAction::Exhausted;
+    }
+    if !already_injected
+        && dossier.evidence_gate.status == TaskCompletionStatus::Partial
+        && !dossier.locally_obtainable_proof_routes.is_empty()
+    {
+        return EvidenceReconciliationAction::Inject;
+    }
+    EvidenceReconciliationAction::Continue
+}
+
+impl ContextualUserFragment for EvidenceReconciliation {
+    fn role(&self) -> &'static str {
+        "developer"
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        Self::type_markers()
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        (
+            "<kd4_evidence_reconciliation>",
+            "</kd4_evidence_reconciliation>",
+        )
+    }
+
+    fn body(&self) -> String {
+        format!(
+            "\nReconcile the authoritative incomplete task evidence below before claiming completion. Perform only the named local proof routes, record their receipts, and keep unresolved state explicit.\n\n{}\n",
+            self.payload
+        )
+    }
 }
 
 impl CompletionReviewState {
@@ -3225,6 +3282,36 @@ async fn coordinate_completion_review_inner(
             });
         }
 
+        match evidence_reconciliation_action(
+            &dossier,
+            pending_lineage,
+            state.evidence_reconciliation_injected,
+        ) {
+            EvidenceReconciliationAction::Inject => {
+                let Some(item) = build_evidence_reconciliation_item(&dossier) else {
+                    state.phase = TurnReviewPhase::Terminal;
+                    return Ok(partial_outcome(ReviewFailureCategory::OversizedRequest));
+                };
+                sess.record_response_item_and_emit_turn_item(turn_context, item)
+                    .await;
+                state.evidence_reconciliation_injected = true;
+                state.phase = TurnReviewPhase::CorrectionInjected;
+                return Ok(CompletionReviewCoordinatorOutcome {
+                    repair_injected: true,
+                    ..Default::default()
+                });
+            }
+            EvidenceReconciliationAction::Exhausted => {
+                state.phase = TurnReviewPhase::Terminal;
+                return Ok(CompletionReviewCoordinatorOutcome {
+                    advisory: sess.services.task_evidence.finalization_advisory().await,
+                    partial_reasons: dossier.evidence_gate.reasons.clone(),
+                    ..Default::default()
+                });
+            }
+            EvidenceReconciliationAction::Continue => {}
+        }
+
         if !dossier.mappings_classified {
             let materialization =
                 match materialize_sources(sess, turn_context, cancellation_token, &dossier, None)
@@ -5005,6 +5092,29 @@ fn build_repair_item(
     Some((item, payload))
 }
 
+fn build_evidence_reconciliation_item(
+    dossier: &CompletionReviewDossier,
+) -> Option<codex_protocol::models::ResponseItem> {
+    if dossier.evidence_gate.status != TaskCompletionStatus::Partial
+        || dossier.locally_obtainable_proof_routes.is_empty()
+    {
+        return None;
+    }
+    let payload = serde_json::to_string_pretty(&json!({
+        "contract": "KD4_EVIDENCE_RECONCILIATION_V1",
+        "root_task_id": dossier.root_task_id,
+        "completion_epoch": dossier.completion_epoch,
+        "manifest_revision": dossier.manifest_revision,
+        "implementation_identity": dossier.implementation_identity_hash,
+        "evidence_gate_reasons": dossier.evidence_gate.reasons,
+        "locally_obtainable_proof_routes": dossier.locally_obtainable_proof_routes,
+    }))
+    .ok()?;
+    let item = ContextualUserFragment::into(EvidenceReconciliation { payload });
+    (approx_token_count(&serde_json::to_string(&item).ok()?) <= MAX_RENDERED_REQUEST_TOKENS)
+        .then_some(item)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5374,6 +5484,54 @@ mod tests {
             initial_repair_baseline_hash: None,
             rereview_input: None,
         }
+    }
+
+    #[test]
+    fn evidence_reconciliation_precedes_supplemental_review_and_is_bounded() {
+        let mut dossier = dossier();
+        dossier.cycle_phase = None;
+        dossier.evidence_gate = TaskCompletionGate {
+            status: TaskCompletionStatus::Partial,
+            reasons: vec!["focused work unit `focused` lacks current validation proof".to_string()],
+            evidence_path: None,
+        };
+        dossier.locally_obtainable_proof_routes =
+            vec!["Run the focused validation and record its current proof receipt".to_string()];
+
+        assert_eq!(
+            evidence_reconciliation_action(&dossier, false, false),
+            EvidenceReconciliationAction::Inject
+        );
+        assert_eq!(
+            evidence_reconciliation_action(&dossier, false, true),
+            EvidenceReconciliationAction::Exhausted
+        );
+        dossier.evidence_gate.status = TaskCompletionStatus::Passed;
+        dossier.evidence_gate.reasons.clear();
+        assert_eq!(
+            evidence_reconciliation_action(&dossier, false, true),
+            EvidenceReconciliationAction::Continue
+        );
+    }
+
+    #[test]
+    fn evidence_reconciliation_does_not_forge_reviewer_findings() {
+        let mut dossier = dossier();
+        dossier.evidence_gate = TaskCompletionGate {
+            status: TaskCompletionStatus::Partial,
+            reasons: vec!["focused proof is missing".to_string()],
+            evidence_path: None,
+        };
+        dossier.locally_obtainable_proof_routes =
+            vec!["run and record the focused proof".to_string()];
+
+        let item =
+            build_evidence_reconciliation_item(&dossier).expect("evidence reconciliation fragment");
+        let rendered = serde_json::to_string(&item).expect("serialized fragment");
+        assert!(rendered.contains("KD4_EVIDENCE_RECONCILIATION_V1"));
+        assert!(rendered.contains("locally_obtainable_proof_routes"));
+        assert!(!rendered.contains("complete_finding_set"));
+        assert!(!rendered.contains("finding_id"));
     }
 
     #[test]

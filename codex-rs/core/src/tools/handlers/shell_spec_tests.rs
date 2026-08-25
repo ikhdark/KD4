@@ -2,8 +2,34 @@ use super::*;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
-fn windows_shell_guidance_description() -> String {
-    format!("\n\n{}", windows_shell_guidance())
+fn command_guidance_description() -> String {
+    format!(
+        "\n\n{}\n\n{}",
+        rg_search_admission_guidance(),
+        windows_shell_guidance()
+    )
+}
+
+#[test]
+fn command_tools_advertise_rg_search_admission_rule() {
+    for tool in [
+        create_exec_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+        create_shell_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+    ] {
+        let description =
+            serde_json::to_value(tool).expect("serialize command tool")["description"]
+                .as_str()
+                .expect("command tool description")
+                .to_string();
+        assert!(description.contains("repository-wide `rg` search is rejected"));
+        assert!(description.contains("Start narrow; expand only after that miss"));
+    }
 }
 
 fn has_parameter(tool: &ToolSpec, parameter_name: &str) -> bool {
@@ -31,7 +57,7 @@ fn exec_command_tool_matches_expected_spec() {
 
     let description = format!(
         "Runs a command in a PTY, returning output or a session ID for ongoing interaction.{}",
-        windows_shell_guidance_description()
+        command_guidance_description()
     );
 
     let mut properties = BTreeMap::from([
@@ -129,7 +155,6 @@ fn exec_command_tool_matches_expected_spec() {
             "Execute without reusing prior immutable evidence.".to_string(),
         )),
     );
-
     assert_eq!(
         tool,
         ToolSpec::Function(ResponsesApiTool {
@@ -270,7 +295,7 @@ Examples of valid command strings:
 - setting an env var: "$env:FOO='bar'; echo $env:FOO"
 - running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -""#
             .to_string()
-            + &windows_shell_guidance_description();
+            + &command_guidance_description();
 
     let mut properties = BTreeMap::from([
         (

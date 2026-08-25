@@ -18,7 +18,7 @@ impl From<AuthError> for TransportError {
     fn from(error: AuthError) -> Self {
         match error {
             AuthError::Build(message) => TransportError::Build(message),
-            AuthError::Transient(message) => TransportError::Network(message),
+            AuthError::Transient(message) => TransportError::PreDispatch(message),
         }
     }
 }

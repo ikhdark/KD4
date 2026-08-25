@@ -142,9 +142,9 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     status,
                 })
             }
-            TransportError::Network(msg) | TransportError::Build(msg) => {
-                CodexErr::Stream(msg, None)
-            }
+            TransportError::Network(msg)
+            | TransportError::PreDispatch(msg)
+            | TransportError::Build(msg) => CodexErr::Stream(msg, None),
         },
         ApiError::RateLimit(msg) => CodexErr::Stream(msg, None),
     }

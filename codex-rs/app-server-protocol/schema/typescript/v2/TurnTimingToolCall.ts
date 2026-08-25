@@ -13,9 +13,22 @@ import type { TurnTimingToolCallSource } from "./TurnTimingToolCallSource";
  *
  * All `*_at_ms` values are monotonic offsets from turn start. A missing
  * boundary means the call ended before that boundary was observed. No tool
- * arguments, output, paths, or nested runtime identifiers are persisted.
+ * arguments, output, or paths are persisted; nested identifiers are opaque
+ * correlation keys only.
  */
-export type TurnTimingToolCall = { callId: string, toolName: string, source: TurnTimingToolCallSource, executionId: ToolExecutionId, samplingGenerationId: SamplingGenerationId,
+export type TurnTimingToolCall = { callId: string,
+/**
+ * Model-visible outer tool call that owns this nested call, when any.
+ */
+parentCallId?: string,
+/**
+ * Runtime cell that issued this nested tool request, when any.
+ */
+parentCellId?: string,
+/**
+ * Code-mode's payload-free per-cell invocation id, when any.
+ */
+runtimeToolCallId?: string, toolName: string, source: TurnTimingToolCallSource, executionId: ToolExecutionId, samplingGenerationId: SamplingGenerationId,
 /**
  * Payload-free terminal classification reported by the tool runtime.
  */
@@ -42,7 +55,22 @@ outputModelVisibleAtMs: number | null,
 /**
  * The next model generation began after this result became model-visible.
  */
-modelResumedAtMs: number | null, itemToFirstPollMs: number | null, parallelGateWaitMs: number | null, authorizationStateCoordinationMs: number | null, handlerDurationMs: number | null, workspaceEvidenceBeforeMs: number | null, workspaceEvidenceAfterMs: number | null, preToolHookMs: number | null, postToolHookMs: number | null, outputProjectionMs: number | null, historyPersistenceMs: number | null, postHandlerMs: number | null, totalDurationMs: number | null, eager: boolean, processAliveAtDelivery: boolean,
+modelResumedAtMs: number | null,
+/**
+ * Monotonic latency from the host proving that sampling is unblocked to
+ * the provider request reaching its transport dispatch boundary.
+ */
+readyToSampleToDispatchNs: number | null, itemToFirstPollMs: number | null, parallelGateWaitMs: number | null, authorizationStateCoordinationMs: number | null, handlerDurationMs: number | null, workspaceEvidenceBeforeMs: number | null,
+/**
+ * Whether the pre-handler workspace identity came from the latest
+ * authoritative capture instead of running a fresh capture.
+ */
+workspaceEvidenceBeforeCacheHit: boolean | null,
+/**
+ * Git dependencies that crossed the bounded capture deadline during a
+ * fresh pre-handler workspace capture.
+ */
+workspaceEvidenceBeforeTimedOutGitDependencies: Array<string>, workspaceEvidenceAfterMs: number | null, preToolHookMs: number | null, postToolHookMs: number | null, outputProjectionMs: number | null, historyPersistenceMs: number | null, postHandlerMs: number | null, totalDurationMs: number | null, eager: boolean, processAliveAtDelivery: boolean,
 /**
  * The exec handler reached its post-cleanup process-store observation.
  */

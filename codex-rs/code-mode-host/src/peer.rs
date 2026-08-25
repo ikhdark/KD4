@@ -52,7 +52,7 @@ enum CellRoute {
 enum CellMessage {
     Delegate {
         id: DelegateRequestId,
-        request: DelegateRequest,
+        request: Box<DelegateRequest>,
         dispatched_tx: oneshot::Sender<Result<(), String>>,
     },
     Closed,
@@ -150,7 +150,7 @@ impl HostPeer {
             (session_id, cell_id),
             CellMessage::Delegate {
                 id,
-                request,
+                request: Box::new(request),
                 dispatched_tx,
             },
         ) {
@@ -436,7 +436,7 @@ async fn drive_cell(
                     request,
                     dispatched_tx,
                 }) => {
-                    peer.send_delegate_if_pending(id, key.0.clone(), request, dispatched_tx).await;
+                    peer.send_delegate_if_pending(id, key.0.clone(), *request, dispatched_tx).await;
                 }
                 Some(CellMessage::Closed) | None => break true,
             },
@@ -461,7 +461,7 @@ async fn drive_cell(
                         request,
                         dispatched_tx,
                     }) => {
-                        peer.send_delegate_if_pending(id, key.0.clone(), request, dispatched_tx).await;
+                        peer.send_delegate_if_pending(id, key.0.clone(), *request, dispatched_tx).await;
                     }
                     Some(CellMessage::Closed) | None => break,
                 },

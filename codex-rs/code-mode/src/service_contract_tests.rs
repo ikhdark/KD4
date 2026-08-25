@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -33,6 +34,42 @@ struct BlockingDelegate {
 struct HeldNotificationDelegate {
     events_tx: mpsc::UnboundedSender<DelegateEvent>,
     notification_release: Notify,
+}
+
+struct RendezvousDelegate {
+    started: AtomicUsize,
+    both_started: Notify,
+}
+
+impl CodeModeSessionDelegate for RendezvousDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        _invocation: CodeModeNestedToolCall,
+        _cancellation_token: CancellationToken,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async move {
+            let started = self.started.fetch_add(1, Ordering::AcqRel) + 1;
+            if started >= 2 {
+                self.both_started.notify_waiters();
+            }
+            while self.started.load(Ordering::Acquire) < 2 {
+                self.both_started.notified().await;
+            }
+            Ok(serde_json::json!({"started": started}))
+        })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
 }
 
 impl HeldNotificationDelegate {
@@ -258,6 +295,45 @@ text(outcome);
             error_text: None,
         }
     );
+}
+
+#[tokio::test]
+async fn two_independent_nested_calls_start_before_either_completes() {
+    let delegate = Arc::new(RendezvousDelegate {
+        started: AtomicUsize::new(0),
+        both_started: Notify::new(),
+    });
+    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+    let cell = service
+        .execute(ExecuteRequest {
+            enabled_tools: vec![blocking_tool()],
+            source: r#"
+const first = tools.block({id: 1});
+const second = tools.block({id: 2});
+const results = await Promise.all([first, second]);
+text(results.length);
+"#
+            .to_string(),
+            yield_time_ms: Some(60_000),
+            ..execute_request("")
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), cell.initial_response())
+            .await
+            .expect("independent nested calls should rendezvous")
+            .unwrap(),
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "2".to_string(),
+            }],
+            error_text: None,
+        }
+    );
+    assert_eq!(delegate.started.load(Ordering::Acquire), 2);
 }
 
 #[tokio::test]

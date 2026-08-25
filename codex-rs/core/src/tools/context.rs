@@ -62,6 +62,8 @@ pub enum ToolCallSource {
     CodeMode {
         /// Runtime cell that issued the nested tool request.
         cell_id: String,
+        /// Model-visible `functions.exec` call that owns the runtime cell.
+        parent_call_id: Option<String>,
         /// Code-mode's per-cell tool invocation id. This is useful for
         /// debugging the JS/runtime bridge, but it is not the Codex tool call id
         /// because the runtime id only needs to be unique within one cell.
@@ -321,7 +323,7 @@ impl FunctionToolOutput {
         self.success = match outcome {
             ToolOutputOutcome::Success => Some(true),
             ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut => Some(false),
-            ToolOutputOutcome::Skipped => None,
+            ToolOutputOutcome::Yielded | ToolOutputOutcome::Skipped => None,
         };
         self
     }
@@ -607,7 +609,9 @@ impl ToolOutput for ExecCommandToolOutput {
                 "failure_signature": command_failure_signature(&semantic_evidence, self.exit_code),
                 "semantic_evidence": semantic_evidence,
             })),
-            ToolOutputOutcome::TimedOut | ToolOutputOutcome::Skipped => None,
+            ToolOutputOutcome::TimedOut
+            | ToolOutputOutcome::Yielded
+            | ToolOutputOutcome::Skipped => None,
         }
     }
 

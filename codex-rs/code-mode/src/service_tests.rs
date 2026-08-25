@@ -6,8 +6,11 @@ use super::RuntimeResponse;
 use super::WaitOutcome;
 use super::WaitRequest;
 use super::runtime_request;
+use crate::CodeModeToolKind;
 use crate::ExecuteRequest;
 use crate::FunctionCallOutputContentItem;
+use crate::ToolDefinition;
+use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
 
 fn execute_request(source: &str) -> ExecuteRequest {
@@ -64,6 +67,39 @@ async fn synchronous_exit_returns_successfully() {
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "before".to_string(),
+            }],
+            error_text: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn compact_tool_discovery_resolves_one_exact_description() {
+    let service = InProcessCodeModeSession::new();
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            enabled_tools: vec![ToolDefinition {
+                name: "sample-tool".to_string(),
+                tool_name: ToolName::plain("sample-tool"),
+                description: "exact schema description".to_string(),
+                kind: CodeModeToolKind::Function,
+                input_schema: None,
+                output_schema: None,
+            }],
+            source: r#"text(JSON.stringify({ names: ALL_TOOL_NAMES, resolved: resolve_tool("sample_tool"), missing: resolve_tool("missing") === undefined }));"#.to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: r#"{"names":["sample_tool"],"resolved":{"name":"sample_tool","description":"exact schema description"},"missing":true}"#.to_string(),
             }],
             error_text: None,
         }

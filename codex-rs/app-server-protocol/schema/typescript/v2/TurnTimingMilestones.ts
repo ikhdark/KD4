@@ -20,18 +20,34 @@ firstToolGateAdmittedMs: number | null,
  */
 firstToolHandlerEntryMs: number | null,
 /**
- * Time from turn start until the first non-control tool is accepted for dispatch.
+ * Time from turn start until the first domain-work tool is accepted for dispatch.
  */
 firstUsefulToolAcceptedMs: number | null,
 /**
- * Time from turn start until the first non-control tool passes the parallel gate.
+ * Time from turn start until the first domain-work tool passes the parallel gate.
  */
 firstUsefulToolGateAdmittedMs: number | null,
 /**
- * Time from turn start until the first authorized non-control tool handler is entered.
+ * Time from turn start until the first authorized domain-work tool handler is entered.
  */
 firstUsefulActionMs: number | null,
 /**
- * Time from turn start until the first non-control tool completes successfully.
+ * Time from turn start until the first domain-work tool completes successfully.
  */
-firstSuccessfulUsefulActionMs: number | null, firstModelOutputMs: number | null, firstActionableOutputMs: number | null, firstVisibleOutputMs: number | null, firstAgentMessageMs: number | null, };
+firstSuccessfulUsefulActionMs: number | null,
+/**
+ * Time from turn start until the first authorized control/plumbing tool handler is entered.
+ */
+firstInfrastructureActionMs: number | null,
+/**
+ * Time from turn start until the first authorized tool-schema discovery handler is entered.
+ */
+firstToolDiscoveryActionMs: number | null,
+/**
+ * Time from turn start until the first authorized domain-work handler is entered.
+ */
+firstDomainActionMs: number | null,
+/**
+ * Time from turn start until the first domain-work tool completes successfully.
+ */
+firstSuccessfulDomainActionMs: number | null, firstModelOutputMs: number | null, firstActionableOutputMs: number | null, firstVisibleOutputMs: number | null, firstAgentMessageMs: number | null, };

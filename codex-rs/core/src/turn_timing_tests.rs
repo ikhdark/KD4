@@ -13,6 +13,7 @@ use codex_protocol::protocol::DeterministicContinuationHostAction;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::ToolExecutionId;
 use codex_protocol::protocol::ToolLifecycleBoundary;
 use codex_protocol::protocol::ToolLifecycleContext;
 use codex_protocol::protocol::TurnTiming;
@@ -32,8 +33,10 @@ use super::InteractiveWaitKind;
 use super::MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS;
 use super::MAX_MODEL_REQUEST_PROGRESS_KINDS;
 use super::MAX_MODEL_REQUEST_TIMINGS;
+use super::NextSampleBlockReason;
 use super::RESERVED_TOOL_OUTPUT_RECURSIVE_SPILL_COUNT;
 use super::TimeSample;
+use super::ToolCallTimingLineage;
 use super::TurnClock;
 use super::TurnLocalPhase;
 use super::TurnTimingState;
@@ -394,19 +397,33 @@ fn first_useful_action_and_first_model_output_are_distinct_milestones() {
         None
     );
 
+    clock.set_ms(6);
+    state.record_tool_call("exec");
+    clock.set_ms(7);
+    state.record_tool_gate_admitted("exec");
     clock.set_ms(8);
-    state.record_tool_call("update_plan");
+    state.record_tool_handler_entry("exec");
+    state.record_tool_completion("exec", true);
     clock.set_ms(9);
-    state.record_tool_gate_admitted("update_plan");
+    state.record_tool_call("update_plan");
     clock.set_ms(10);
+    state.record_tool_gate_admitted("update_plan");
+    clock.set_ms(11);
     state.record_tool_handler_entry("update_plan");
     clock.set_ms(12);
-    state.record_tool_call("shell");
+    state.record_tool_call("tool_search");
+    clock.set_ms(13);
+    state.record_tool_gate_admitted("tool_search");
     clock.set_ms(14);
-    state.record_tool_gate_admitted("shell");
+    state.record_tool_handler_entry("tool_search");
+    state.record_tool_completion("tool_search", true);
+    clock.set_ms(15);
+    state.record_tool_call("shell");
     clock.set_ms(16);
-    state.record_tool_handler_entry("shell");
+    state.record_tool_gate_admitted("shell");
     clock.set_ms(18);
+    state.record_tool_handler_entry("shell");
+    clock.set_ms(19);
     state.record_tool_completion("shell", true);
     clock.set_ms(20);
     assert_eq!(
@@ -418,23 +435,30 @@ fn first_useful_action_and_first_model_output_are_distinct_milestones() {
     assert_eq!(snapshot.time_to_first_token_ms, Some(5));
     let timing = snapshot.protocol_timing();
     assert_eq!(timing.milestones.user_input_recorded_ms, Some(2));
-    assert_eq!(timing.milestones.first_tool_accepted_ms, Some(8));
-    assert_eq!(timing.milestones.first_tool_gate_admitted_ms, Some(9));
-    assert_eq!(timing.milestones.first_tool_handler_entry_ms, Some(10));
-    assert_eq!(timing.milestones.first_useful_tool_accepted_ms, Some(12));
+    assert_eq!(timing.milestones.first_tool_accepted_ms, Some(6));
+    assert_eq!(timing.milestones.first_tool_gate_admitted_ms, Some(7));
+    assert_eq!(timing.milestones.first_tool_handler_entry_ms, Some(8));
+    assert_eq!(timing.milestones.first_useful_tool_accepted_ms, Some(15));
     assert_eq!(
         timing.milestones.first_useful_tool_gate_admitted_ms,
-        Some(14)
+        Some(16)
     );
     assert_eq!(timing.milestones.first_model_output_ms, Some(5));
     assert_eq!(timing.milestones.first_actionable_output_ms, Some(20));
-    assert_eq!(timing.milestones.first_useful_action_ms, Some(16));
+    assert_eq!(timing.milestones.first_infrastructure_action_ms, Some(8));
+    assert_eq!(timing.milestones.first_tool_discovery_action_ms, Some(14));
+    assert_eq!(timing.milestones.first_domain_action_ms, Some(18));
+    assert_eq!(timing.milestones.first_useful_action_ms, Some(18));
     assert_eq!(
         timing.milestones.first_successful_useful_action_ms,
-        Some(18)
+        Some(19)
+    );
+    assert_eq!(
+        timing.milestones.first_successful_domain_action_ms,
+        Some(19)
     );
     assert_eq!(timing.milestones.first_visible_output_ms, Some(20));
-    assert_eq!(timing.counters.tool_call_count, 2);
+    assert_eq!(timing.counters.tool_call_count, 4);
 }
 
 #[test]
@@ -446,6 +470,11 @@ fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
         "call-1",
         "shell_command",
         TurnTimingToolCallSource::CodeMode,
+        ToolCallTimingLineage {
+            parent_call_id: Some("outer-call"),
+            parent_cell_id: Some("cell-1"),
+            runtime_tool_call_id: Some("runtime-call-1"),
+        },
         ToolDispatchTimingSnapshot {
             lifecycle_events: vec![
                 lifecycle_event(ToolLifecycleBoundary::RequestCreated, 20),
@@ -469,7 +498,7 @@ fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
             post_tool_hook_ms: Some(4),
             output_projection_ms: Some(5),
             history_persistence_ms: Some(6),
-            first_poll_to_output_collected_ms: Some(45),
+            first_poll_to_output_collected_ms: Some(42),
             exec_request_to_spawn_ms: Some(22),
             exec_spawn_to_exit_ms: Some(20),
             exec_exit_to_delivery_ms: Some(38),
@@ -485,15 +514,22 @@ fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
             ..ToolDispatchTimingSnapshot::default()
         },
     );
+    clock.set_ms(105);
+    state.record_next_sample_block_reason(NextSampleBlockReason::ReadyToSample);
     clock.set_ms(120);
     let mut pending = Some(ContinuationCause::ToolResult);
     state.begin_model_generation(&mut pending, &SessionSource::Cli);
+    clock.set_ms(130);
+    state.mark_model_request_dispatched();
 
     let timing = state.complete_snapshot().protocol_timing();
     assert_eq!(timing.tool_call_timing_overflow, 0);
     assert_eq!(timing.tool_calls.len(), 1);
     let call = &timing.tool_calls[0];
     assert_eq!(call.call_id, "call-1");
+    assert_eq!(call.parent_call_id.as_deref(), Some("outer-call"));
+    assert_eq!(call.parent_cell_id.as_deref(), Some("cell-1"));
+    assert_eq!(call.runtime_tool_call_id.as_deref(), Some("runtime-call-1"));
     assert_eq!(call.source, TurnTimingToolCallSource::CodeMode);
     assert_eq!(call.outcome.as_deref(), Some("failure"));
     assert_eq!(call.accepted_at_ms, Some(20));
@@ -501,16 +537,55 @@ fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
     assert_eq!(call.parallel_gate_admitted_at_ms, Some(35));
     assert_eq!(call.handler_entry_at_ms, Some(40));
     assert_eq!(call.handler_exit_at_ms, Some(70));
-    assert_eq!(call.output_collected_at_ms, Some(75));
+    assert_eq!(call.output_collected_at_ms, Some(72));
     assert_eq!(call.process_spawned_at_ms, Some(42));
     assert_eq!(call.process_exited_at_ms, Some(62));
     assert_eq!(call.delivered_at_ms, Some(100));
     assert_eq!(call.model_resumed_at_ms, Some(120));
+    assert_eq!(call.ready_to_sample_to_dispatch_ns, Some(25_000_000));
     assert_eq!(call.post_handler_ms, Some(30));
     assert!(call.eager);
     assert!(call.exec_cleanup_state_observed);
     assert!(!call.background_process_expected);
     assert!(call.running_process_after_cleanup);
+}
+
+#[test]
+fn batched_tool_results_share_one_model_resume_boundary() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+
+    for (call_id, delivered_at_ms) in [("call-1", 80), ("call-2", 100)] {
+        clock.set_ms(delivered_at_ms.into());
+        state.record_tool_dispatch_timing(
+            call_id,
+            "shell_command",
+            TurnTimingToolCallSource::Direct,
+            ToolCallTimingLineage::default(),
+            ToolDispatchTimingSnapshot {
+                lifecycle_events: vec![lifecycle_event(
+                    ToolLifecycleBoundary::RelayDelivery,
+                    delivered_at_ms,
+                )],
+                ..ToolDispatchTimingSnapshot::default()
+            },
+        );
+    }
+
+    clock.set_ms(105);
+    state.record_next_sample_block_reason(NextSampleBlockReason::ReadyToSample);
+    clock.set_ms(120);
+    let mut pending = Some(ContinuationCause::ToolResult);
+    state.begin_model_generation(&mut pending, &SessionSource::Cli);
+    clock.set_ms(130);
+    state.mark_model_request_dispatched();
+
+    let calls = state.complete_snapshot().protocol_timing().tool_calls;
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        assert_eq!(call.model_resumed_at_ms, Some(120));
+        assert_eq!(call.ready_to_sample_to_dispatch_ns, Some(25_000_000));
+    }
 }
 
 fn lifecycle_event(boundary: ToolLifecycleBoundary, at_ms: u64) -> TurnTimingToolLifecycleEvent {
@@ -563,7 +638,9 @@ fn background_process_exit_updates_a_tool_already_delivered_alive() {
         "call-background",
         "exec_command",
         TurnTimingToolCallSource::Direct,
+        ToolCallTimingLineage::default(),
         ToolDispatchTimingSnapshot {
+            execution_id: ToolExecutionId("background-execution".to_string()),
             item_to_first_poll_ms: Some(2),
             exec_request_to_spawn_ms: Some(5),
             exec_spawn_to_delivery_ms: Some(20),
@@ -575,6 +652,8 @@ fn background_process_exit_updates_a_tool_already_delivered_alive() {
     state.record_background_tool_process_exit(
         "call-background",
         ToolDispatchTimingSnapshot {
+            execution_id: ToolExecutionId("background-execution".to_string()),
+            lifecycle_events: vec![lifecycle_event(ToolLifecycleBoundary::ProcessExit, 90)],
             exec_spawn_to_exit_ms: Some(75),
             ..ToolDispatchTimingSnapshot::default()
         },
@@ -583,7 +662,12 @@ fn background_process_exit_updates_a_tool_already_delivered_alive() {
     let timing = state.complete_snapshot().protocol_timing();
     let call = &timing.tool_calls[0];
     assert_eq!(call.process_spawned_at_ms, Some(13));
-    assert_eq!(call.process_exited_at_ms, Some(88));
+    assert_eq!(call.process_exited_at_ms, Some(90));
+    assert!(
+        call.lifecycle_events
+            .iter()
+            .any(|event| event.boundary == ToolLifecycleBoundary::ProcessExit && event.at_ms == 90)
+    );
     assert!(call.process_alive_at_delivery);
 }
 
@@ -594,6 +678,7 @@ fn background_process_exit_racing_delivery_is_applied_when_tool_is_recorded() {
     state.record_background_tool_process_exit(
         "call-racing",
         ToolDispatchTimingSnapshot {
+            execution_id: ToolExecutionId("racing-execution".to_string()),
             exec_spawn_to_exit_ms: Some(12),
             ..ToolDispatchTimingSnapshot::default()
         },
@@ -603,7 +688,9 @@ fn background_process_exit_racing_delivery_is_applied_when_tool_is_recorded() {
         "call-racing",
         "exec_command",
         TurnTimingToolCallSource::Direct,
+        ToolCallTimingLineage::default(),
         ToolDispatchTimingSnapshot {
+            execution_id: ToolExecutionId("racing-execution".to_string()),
             item_to_first_poll_ms: Some(0),
             exec_request_to_spawn_ms: Some(3),
             total_duration_ms: Some(20),
@@ -615,6 +702,64 @@ fn background_process_exit_racing_delivery_is_applied_when_tool_is_recorded() {
     let call = &timing.tool_calls[0];
     assert_eq!(call.process_spawned_at_ms, Some(8));
     assert_eq!(call.process_exited_at_ms, Some(20));
+}
+
+#[test]
+fn background_process_exit_matches_duplicate_call_ids_by_execution_id() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    for execution_id in ["first-execution", "second-execution"] {
+        state.record_tool_dispatch_timing(
+            "duplicate-call",
+            "exec_command",
+            TurnTimingToolCallSource::Direct,
+            ToolCallTimingLineage::default(),
+            ToolDispatchTimingSnapshot {
+                execution_id: ToolExecutionId(execution_id.to_string()),
+                ..ToolDispatchTimingSnapshot::default()
+            },
+        );
+    }
+    state.record_background_tool_process_exit(
+        "duplicate-call",
+        ToolDispatchTimingSnapshot {
+            execution_id: ToolExecutionId("second-execution".to_string()),
+            lifecycle_events: vec![lifecycle_event(ToolLifecycleBoundary::ProcessExit, 31)],
+            exec_spawn_to_exit_ms: Some(11),
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.tool_calls[0].process_exited_at_ms, None);
+    assert_eq!(timing.tool_calls[1].process_exited_at_ms, Some(31));
+}
+
+#[test]
+fn model_visible_output_consumes_duplicate_call_ids_in_recorded_order() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    for execution_id in ["first-execution", "second-execution"] {
+        state.record_tool_dispatch_timing(
+            "duplicate-call",
+            "exec_command",
+            TurnTimingToolCallSource::Direct,
+            ToolCallTimingLineage::default(),
+            ToolDispatchTimingSnapshot {
+                execution_id: ToolExecutionId(execution_id.to_string()),
+                ..ToolDispatchTimingSnapshot::default()
+            },
+        );
+    }
+
+    clock.set_ms(10);
+    state.record_tool_output_model_visible("duplicate-call");
+    clock.set_ms(20);
+    state.record_tool_output_model_visible("duplicate-call");
+
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.tool_calls[0].output_model_visible_at_ms, Some(10));
+    assert_eq!(timing.tool_calls[1].output_model_visible_at_ms, Some(20));
 }
 
 #[test]
@@ -785,7 +930,7 @@ fn decision_latency_records_dispatch_actionable_output_and_completion() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 24);
+    assert_eq!(timing.schema_version, 25);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(25));
@@ -1562,7 +1707,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 24);
+    assert_eq!(profile.schema_version, 25);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);

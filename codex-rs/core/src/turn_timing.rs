@@ -17,6 +17,7 @@ use codex_protocol::protocol::NextSampleBlockReason;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::ToolExecutionId;
 use codex_protocol::protocol::ToolLifecycleBoundary;
 use codex_protocol::protocol::ToolLifecycleContext;
 use codex_protocol::protocol::ToolLifecycleTimerWait;
@@ -53,7 +54,7 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 24;
+const TIMING_SCHEMA_VERSION: u16 = 25;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
 // These records are diagnostic histories, not the source of truth for the
@@ -75,20 +76,47 @@ fn adjust_counter(counter: &AtomicU32, delta: i32) {
     }
 }
 
-/// Control-only calls can advance orchestration without beginning the user's
-/// requested work. Keep them observable in dispatch milestones and counters,
-/// but do not let them satisfy the first-useful-action contract.
-pub(crate) fn tool_counts_as_useful_first_action(tool_name: &str) -> bool {
-    !matches!(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolActionClass {
+    Infrastructure,
+    Discovery,
+    Domain,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ToolCallTimingLineage<'a> {
+    pub(crate) parent_call_id: Option<&'a str>,
+    pub(crate) parent_cell_id: Option<&'a str>,
+    pub(crate) runtime_tool_call_id: Option<&'a str>,
+}
+
+fn tool_action_class(tool_name: &str) -> ToolActionClass {
+    if matches!(
         tool_name,
-        "update_plan"
+        "exec"
+            | "update_plan"
             | "request_user_input"
             | "request_permissions"
             | "wait"
             | "wait_agent"
             | "wait_for_environment"
             | "write_stdin"
-    )
+    ) {
+        ToolActionClass::Infrastructure
+    } else if matches!(
+        tool_name,
+        "tool_search" | "list_mcp_resources" | "list_mcp_resource_templates"
+    ) {
+        ToolActionClass::Discovery
+    } else {
+        ToolActionClass::Domain
+    }
+}
+
+/// Compatibility predicate for the legacy useful-action fields. Useful now
+/// means domain work: neither control plumbing nor tool-schema discovery.
+pub(crate) fn tool_counts_as_useful_first_action(tool_name: &str) -> bool {
+    tool_action_class(tool_name) == ToolActionClass::Domain
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,6 +383,22 @@ impl TurnTimingSnapshot {
             first_successful_useful_action_ms: profile
                 .milestones
                 .first_successful_useful_action_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_infrastructure_action_ms: profile
+                .milestones
+                .first_infrastructure_action_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_tool_discovery_action_ms: profile
+                .milestones
+                .first_tool_discovery_action_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_domain_action_ms: profile
+                .milestones
+                .first_domain_action_ns
+                .map(|value| public_ms(value, &mut saturation_count)),
+            first_successful_domain_action_ms: profile
+                .milestones
+                .first_successful_domain_action_ns
                 .map(|value| public_ms(value, &mut saturation_count)),
             first_model_output_ms: profile
                 .milestones
@@ -794,6 +838,10 @@ pub(crate) struct TimingMilestones {
     pub(crate) first_useful_tool_gate_admitted_ns: Option<u128>,
     pub(crate) first_useful_action_ns: Option<u128>,
     pub(crate) first_successful_useful_action_ns: Option<u128>,
+    pub(crate) first_infrastructure_action_ns: Option<u128>,
+    pub(crate) first_tool_discovery_action_ns: Option<u128>,
+    pub(crate) first_domain_action_ns: Option<u128>,
+    pub(crate) first_successful_domain_action_ns: Option<u128>,
     pub(crate) first_model_output_ns: Option<u128>,
     pub(crate) first_actionable_output_ns: Option<u128>,
     pub(crate) first_visible_output_ns: Option<u128>,
@@ -876,7 +924,7 @@ struct TurnTimingStateInner {
     model_requests: Vec<ModelRequestTiming>,
     tool_calls: Vec<TurnTimingToolCall>,
     tool_call_timing_overflow: u32,
-    background_tool_process_exits: BTreeMap<String, u64>,
+    background_tool_process_exits: BTreeMap<(String, ToolExecutionId), ToolDispatchTimingSnapshot>,
     current_generation_index: Option<u32>,
     current_generation_reason: TurnTimingGenerationReason,
     current_generation_purpose: Option<TurnTimingGenerationPurpose>,
@@ -889,6 +937,7 @@ struct TurnTimingStateInner {
     attributed_client_union_ns: u128,
     client_critical_phases: ClientCriticalPhaseTiming,
     dispatch_ready_snapshot: Option<(u128, u128, ClientCriticalPhaseTiming)>,
+    ready_to_sample_ns: Option<u128>,
     pre_first_model_output: Option<PreFirstModelOutputTiming>,
     terminalization: TurnTimingTerminalization,
     tool_output_projection_pending_continuation: bool,
@@ -1457,11 +1506,29 @@ impl TurnTimingState {
                 .milestones
                 .first_tool_handler_entry_ns
                 .get_or_insert(elapsed_ns);
-            if tool_counts_as_useful_first_action(tool_name) {
-                state
-                    .milestones
-                    .first_useful_action_ns
-                    .get_or_insert(elapsed_ns);
+            match tool_action_class(tool_name) {
+                ToolActionClass::Infrastructure => {
+                    state
+                        .milestones
+                        .first_infrastructure_action_ns
+                        .get_or_insert(elapsed_ns);
+                }
+                ToolActionClass::Discovery => {
+                    state
+                        .milestones
+                        .first_tool_discovery_action_ns
+                        .get_or_insert(elapsed_ns);
+                }
+                ToolActionClass::Domain => {
+                    state
+                        .milestones
+                        .first_domain_action_ns
+                        .get_or_insert(elapsed_ns);
+                    state
+                        .milestones
+                        .first_useful_action_ns
+                        .get_or_insert(elapsed_ns);
+                }
             }
         }
     }
@@ -1477,6 +1544,7 @@ impl TurnTimingState {
             && let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns)
         {
             state.milestones.first_successful_useful_action_ns = Some(elapsed_ns);
+            state.milestones.first_successful_domain_action_ns = Some(elapsed_ns);
         }
     }
 
@@ -1485,8 +1553,14 @@ impl TurnTimingState {
         call_id: &str,
         tool_name: &str,
         source: TurnTimingToolCallSource,
+        lineage: ToolCallTimingLineage<'_>,
         timing: ToolDispatchTimingSnapshot,
     ) {
+        let ToolCallTimingLineage {
+            parent_call_id,
+            parent_cell_id,
+            runtime_tool_call_id,
+        } = lineage;
         let sample = self.clock.sample();
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
@@ -1543,14 +1617,19 @@ impl TurnTimingState {
             .zip(timing.item_to_first_poll_ms)
             .map(|(accepted, queued)| accepted.saturating_add(queued))
             .or(legacy_first_poll_at_ms);
-        let output_collected_at_ms = lifecycle_boundary_at(
-            &timing.lifecycle_events,
-            ToolLifecycleBoundary::RelayEnqueue,
-        );
+        let output_collected_at_ms = first_poll_at_ms
+            .zip(timing.first_poll_to_output_collected_ms)
+            .map(|(first_poll, duration)| first_poll.saturating_add(duration));
         let generation_index = state.current_generation_index;
+        let pending_process_exit = state
+            .background_tool_process_exits
+            .remove(&(call_id.to_string(), timing.execution_id.clone()));
 
         let mut tool_call = TurnTimingToolCall {
             call_id: call_id.to_string(),
+            parent_call_id: parent_call_id.map(str::to_string),
+            parent_cell_id: parent_cell_id.map(str::to_string),
+            runtime_tool_call_id: runtime_tool_call_id.map(str::to_string),
             tool_name: tool_name.to_string(),
             source,
             execution_id: timing.execution_id,
@@ -1568,11 +1647,15 @@ impl TurnTimingState {
             delivered_at_ms,
             output_model_visible_at_ms: None,
             model_resumed_at_ms: None,
+            ready_to_sample_to_dispatch_ns: None,
             item_to_first_poll_ms: timing.item_to_first_poll_ms,
             parallel_gate_wait_ms: timing.parallel_gate_wait_ms,
             authorization_state_coordination_ms: timing.authorization_state_coordination_ms,
             handler_duration_ms: timing.handler_duration_ms,
             workspace_evidence_before_ms: timing.workspace_evidence_before_ms,
+            workspace_evidence_before_cache_hit: timing.workspace_evidence_before_cache_hit,
+            workspace_evidence_before_timed_out_git_dependencies: timing
+                .workspace_evidence_before_timed_out_git_dependencies,
             workspace_evidence_after_ms: timing.workspace_evidence_after_ms,
             pre_tool_hook_ms: timing.pre_tool_hook_ms,
             post_tool_hook_ms: timing.post_tool_hook_ms,
@@ -1591,8 +1674,8 @@ impl TurnTimingState {
             reentry_count: timing.reentry_count,
             next_sample_block_reason: NextSampleBlockReason::ReadyToSample,
         };
-        if let Some(spawn_to_exit_ms) = state.background_tool_process_exits.remove(call_id) {
-            record_tool_process_exit(&mut tool_call, spawn_to_exit_ms);
+        if let Some(process_exit) = pending_process_exit {
+            record_tool_process_exit(&mut tool_call, &process_exit);
         }
         state.tool_calls.push(tool_call);
     }
@@ -1619,15 +1702,24 @@ impl TurnTimingState {
             &tool_call.lifecycle_events,
             ToolLifecycleBoundary::RelayDelivery,
         );
-        tool_call.output_collected_at_ms = lifecycle_boundary_at(
-            &tool_call.lifecycle_events,
-            ToolLifecycleBoundary::RelayEnqueue,
-        );
+        tool_call.output_collected_at_ms = tool_call
+            .first_poll_at_ms
+            .zip(timing.first_poll_to_output_collected_ms)
+            .map(|(first_poll, duration)| first_poll.saturating_add(duration));
         true
     }
 
     pub(crate) fn record_next_sample_block_reason(&self, reason: NextSampleBlockReason) {
+        let sample = self.clock.sample();
         let mut state = self.state();
+        state.advance(sample.time.monotonic_ns);
+        state.ready_to_sample_ns = if reason == NextSampleBlockReason::ReadyToSample {
+            state
+                .ready_to_sample_ns
+                .or_else(|| state.elapsed_since_start(sample.time.monotonic_ns))
+        } else {
+            None
+        };
         for tool_call in state.tool_calls.iter_mut().rev() {
             if tool_call.model_resumed_at_ms.is_some() {
                 break;
@@ -1662,12 +1754,9 @@ impl TurnTimingState {
         let model_visible_at_ms = state
             .elapsed_since_start(sample.time.monotonic_ns)
             .map(u128_to_u64_ms);
-        if let Some(tool_call) = state
-            .tool_calls
-            .iter_mut()
-            .rev()
-            .find(|tool_call| tool_call.call_id == call_id)
-        {
+        if let Some(tool_call) = state.tool_calls.iter_mut().find(|tool_call| {
+            tool_call.call_id == call_id && tool_call.output_model_visible_at_ms.is_none()
+        }) {
             tool_call.output_model_visible_at_ms = model_visible_at_ms;
         }
     }
@@ -1679,9 +1768,12 @@ impl TurnTimingState {
         call_id: &str,
         timing: ToolDispatchTimingSnapshot,
     ) {
-        let Some(spawn_to_exit_ms) = timing.exec_spawn_to_exit_ms else {
+        if timing.exec_spawn_to_exit_ms.is_none()
+            && lifecycle_boundary_at(&timing.lifecycle_events, ToolLifecycleBoundary::ProcessExit)
+                .is_none()
+        {
             return;
-        };
+        }
         let sample = self.clock.sample();
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
@@ -1689,18 +1781,16 @@ impl TurnTimingState {
             state.invalid_transition();
             return;
         }
-        if let Some(tool_call) = state
-            .tool_calls
-            .iter_mut()
-            .find(|tool_call| tool_call.call_id == call_id)
-        {
-            record_tool_process_exit(tool_call, spawn_to_exit_ms);
+        if let Some(tool_call) = state.tool_calls.iter_mut().find(|tool_call| {
+            tool_call.call_id == call_id && tool_call.execution_id == timing.execution_id
+        }) {
+            record_tool_process_exit(tool_call, &timing);
             return;
         }
         if state.background_tool_process_exits.len() < MAX_TOOL_CALL_TIMINGS {
             state
                 .background_tool_process_exits
-                .insert(call_id.to_string(), spawn_to_exit_ms);
+                .insert((call_id.to_string(), timing.execution_id.clone()), timing);
         }
     }
 
@@ -2304,8 +2394,9 @@ impl TurnTimingState {
         let sample = self.clock.sample();
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
+        let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns);
         if state.dispatch_ready_snapshot.is_none()
-            && let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns)
+            && let Some(elapsed_ns) = elapsed_ns
         {
             state.dispatch_ready_snapshot = Some((
                 elapsed_ns,
@@ -2313,7 +2404,24 @@ impl TurnTimingState {
                 state.client_critical_phases.clone(),
             ));
         }
-        if let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns)
+        if let (Some(elapsed_ns), Some(ready_to_sample_ns)) =
+            (elapsed_ns, state.ready_to_sample_ns.take())
+        {
+            let ready_to_dispatch_ns =
+                u64::try_from(elapsed_ns.saturating_sub(ready_to_sample_ns)).unwrap_or(u64::MAX);
+            for tool_call in state.tool_calls.iter_mut().rev() {
+                if tool_call.ready_to_sample_to_dispatch_ns.is_some() {
+                    break;
+                }
+                if tool_call.model_resumed_at_ms.is_some()
+                    && (tool_call.output_model_visible_at_ms.is_some()
+                        || tool_call.delivered_at_ms.is_some())
+                {
+                    tool_call.ready_to_sample_to_dispatch_ns = Some(ready_to_dispatch_ns);
+                }
+            }
+        }
+        if let Some(elapsed_ns) = elapsed_ns
             && let Some(request) = state.model_requests.last_mut()
             && request.dispatch_ns.is_none()
         {
@@ -3235,10 +3343,29 @@ fn u128_to_u64_ms(nanos: u128) -> u64 {
     u64::try_from(nanos / NANOS_PER_MILLISECOND).unwrap_or(u64::MAX)
 }
 
-fn record_tool_process_exit(tool_call: &mut TurnTimingToolCall, spawn_to_exit_ms: u64) {
-    tool_call.process_exited_at_ms = tool_call
-        .process_spawned_at_ms
-        .map(|spawned_at_ms| spawned_at_ms.saturating_add(spawn_to_exit_ms));
+fn record_tool_process_exit(
+    tool_call: &mut TurnTimingToolCall,
+    timing: &ToolDispatchTimingSnapshot,
+) {
+    let process_exit_event = timing
+        .lifecycle_events
+        .iter()
+        .find(|event| event.boundary == ToolLifecycleBoundary::ProcessExit);
+    tool_call.process_exited_at_ms = process_exit_event.map(|event| event.at_ms).or_else(|| {
+        tool_call
+            .process_spawned_at_ms
+            .zip(timing.exec_spawn_to_exit_ms)
+            .map(|(spawned_at_ms, spawn_to_exit_ms)| spawned_at_ms.saturating_add(spawn_to_exit_ms))
+    });
+    if let Some(event) = process_exit_event
+        && !tool_call
+            .lifecycle_events
+            .iter()
+            .any(|existing| existing.boundary == ToolLifecycleBoundary::ProcessExit)
+    {
+        tool_call.lifecycle_events.push(event.clone());
+        tool_call.lifecycle_events.sort_by_key(|event| event.at_ms);
+    }
 }
 
 fn lifecycle_boundary_at(

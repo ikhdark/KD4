@@ -6,6 +6,7 @@ use codex_code_mode::FunctionCallOutputContentItem as RuntimeContentItem;
 use codex_code_mode::RuntimeResponse;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_tools::ToolOutput;
+use codex_tools::ToolOutputOutcome;
 
 use super::format_runtime_response;
 
@@ -23,7 +24,7 @@ fn runtime_response_paths_preserve_status_success_and_output_limits() {
                 cell_id: cell_id(),
                 content_items: content_items(),
             },
-            Some(false),
+            None,
             "Script running with cell ID cell-1",
         ),
         (
@@ -76,6 +77,24 @@ fn runtime_response_paths_preserve_status_success_and_output_limits() {
                 if text.contains("Warning: truncated output")
         )));
     }
+}
+
+#[test]
+fn yielded_runtime_response_is_resumable_not_timed_out() {
+    let output = format_runtime_response(
+        RuntimeResponse::Yielded {
+            cell_id: CellId::new("cell-live".to_string()),
+            content_items: Vec::new(),
+        },
+        None,
+        usize::MAX,
+        true,
+        Instant::now(),
+        Vec::new(),
+    );
+
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Yielded);
+    assert_eq!(output.success, None);
 }
 
 #[test]

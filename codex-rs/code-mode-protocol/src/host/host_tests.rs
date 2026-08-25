@@ -512,6 +512,7 @@ fn host_to_client_v1_variants_are_pinned() {
             request: DelegateRequest::InvokeTool {
                 invocation: WireNestedToolCall {
                     cell_id: cell_id("cell-1"),
+                    parent_tool_call_id: Some("outer-call-1".to_string()),
                     runtime_tool_call_id: "runtime-call-1".to_string(),
                     tool_name: WireToolName {
                         name: "freeform_tool".to_string(),
@@ -530,6 +531,7 @@ fn host_to_client_v1_variants_are_pinned() {
                 "type": "tool/invoke",
                 "invocation": {
                     "cell_id": "cell-1",
+                    "parent_tool_call_id": "outer-call-1",
                     "runtime_tool_call_id": "runtime-call-1",
                     "tool_name": {
                         "name": "freeform_tool",

@@ -71,17 +71,15 @@ SOURCE: /[\s\S]+/
     }
 
     #[test]
-    fn optimization_priority_code_mode_builds_coherent_packets_at_the_code_mode_limit() {
+    fn optimization_priority_code_mode_defaults_to_a_narrow_packet_with_an_explicit_escape_hatch() {
         let exec_description = codex_code_mode::build_exec_tool_description(true, false, &[]);
 
-        assert!(exec_description.contains("defaults to 10000"));
-        assert!(
-            codex_code_mode::build_wait_tool_description()
-                .contains("coherent packet of up to 10000 tokens")
-        );
+        assert!(exec_description.contains("defaults to 4000 tokens"));
+        assert!(codex_code_mode::build_wait_tool_description().contains("default to 4000 tokens"));
         assert_eq!(
             codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
-            10_000
+            4_000
         );
+        assert_eq!(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL, 10_000);
     }
 }

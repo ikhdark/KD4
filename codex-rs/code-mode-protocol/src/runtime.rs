@@ -15,8 +15,10 @@ pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 10_000;
 /// ordinary yield intervals far below this value.
 pub const OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS: u64 = u64::MAX;
 /// Default coherent evidence-packet budget when no per-call limit is requested.
-/// The core still caps this at the active model's hard output limit.
-pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
+pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 4_000;
+/// Maximum coherent evidence-packet budget accepted from an explicit request.
+/// The core also caps this at the active model's hard output limit.
+pub const MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ExecuteRequest {
@@ -67,6 +69,8 @@ pub enum RuntimeResponse {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CodeModeNestedToolCall {
     pub cell_id: CellId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
     pub runtime_tool_call_id: String,
     pub tool_name: ToolName,
     pub tool_kind: CodeModeToolKind,

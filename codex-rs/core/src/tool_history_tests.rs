@@ -838,7 +838,7 @@ fn tool_history_admission_bounds_aggregate_first_exposure_and_consumes_receipts(
 }
 
 #[test]
-fn tool_history_admission_charges_receipts_and_drops_unrepresentable_pairs() {
+fn tool_history_admission_preserves_newest_unconsumed_pair_over_budget() {
     let mut state = ToolHistoryState::default();
     let mut items = Vec::new();
     for index in 0..80 {
@@ -857,7 +857,7 @@ fn tool_history_admission_charges_receipts_and_drops_unrepresentable_pairs() {
         .map(|(_, output)| approx_token_count(output))
         .sum::<usize>();
 
-    assert!(projected_tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+    assert!(projected_tokens > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
     assert!(projection.items.len() < 160);
     let fallback_tokens = projection
         .unreplaced_items
@@ -865,18 +865,24 @@ fn tool_history_admission_charges_receipts_and_drops_unrepresentable_pairs() {
         .filter_map(textual_output_identity)
         .map(|(_, output)| approx_token_count(output))
         .sum::<usize>();
-    assert!(fallback_tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
-    assert!(
-        projection
-            .items
-            .iter()
-            .filter_map(textual_output_identity)
-            .all(|(_, output)| serde_json::from_str::<ToolHistoryReceiptV1>(output).is_ok())
-    );
+    assert!(fallback_tokens > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+    let (call_id, output) = projection
+        .items
+        .iter()
+        .find_map(textual_output_identity)
+        .expect("newest unconsumed output");
+    assert_eq!(call_id, "call-79");
+    assert!(output.starts_with("result-79 "));
+    assert!(projection.items.iter().any(|item| {
+        matches!(
+            item,
+            ResponseItem::FunctionCall { call_id, .. } if call_id == "call-79"
+        )
+    }));
 }
 
 #[test]
-fn tool_history_admission_charges_preserved_non_text_content() {
+fn tool_history_admission_preserves_newest_unconsumed_non_text_content() {
     let call_id = "image-call";
     let output = "small text".to_string();
     let mut image_candidate = candidate(call_id, output.clone());
@@ -890,8 +896,9 @@ fn tool_history_admission_charges_preserved_non_text_content() {
         text_output(call_id, output),
     ]));
 
-    assert!(projection.items.is_empty());
-    assert!(projection.unreplaced_items.is_empty());
+    assert_eq!(projection.items.len(), 2);
+    assert_eq!(projection.unreplaced_items.len(), 2);
+    assert!(projection.substitutions.is_empty());
 }
 
 #[test]
@@ -1303,6 +1310,7 @@ fn legacy_tool_history_ledger_keys_remain_compatible() {
     let state = ToolHistoryState {
         candidates: BTreeMap::from([("call-1".to_string(), candidate("call-1", bounded))]),
         workspace_evidence: BTreeMap::new(),
+        non_workspace_code_mode_calls: BTreeSet::new(),
         artifact_call_ids: BTreeMap::new(),
     };
     let mut serialized = serde_json::to_value(&state).expect("serialize ledger state");

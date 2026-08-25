@@ -2,6 +2,7 @@ use crate::auth::SharedAuthProvider;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use crate::telemetry::run_with_request_telemetry;
+use crate::telemetry::run_with_request_telemetry_non_idempotent;
 use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_client::Request;
@@ -136,7 +137,7 @@ impl<T: HttpTransport> EndpointSession<T> {
         let request = request.into_prepared().map_err(TransportError::Build)?;
         let make_request = || request.clone();
 
-        let stream = run_with_request_telemetry(
+        let stream = run_with_request_telemetry_non_idempotent(
             self.provider.retry.to_policy(),
             self.request_telemetry.clone(),
             make_request,

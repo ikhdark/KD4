@@ -29,7 +29,17 @@ impl ContextualUserFragment for TaskModelGuidance {
             "read at that time, search hits as candidates rather than authority, generated summaries ",
             "as derived and potentially lossy, cached observations as potentially stale, inferred ",
             "relationships as hypotheses, and test results as proof only for the exact exercised ",
-            "contract. Resolve contradictions using runtime ",
+            "contract. Reuse current exact values and enumerations already returned by tools ",
+            "instead of rediscovering them. Batch independent read-only checks in one tool ",
+            "generation when their tool contracts allow it. After an observational or wait ",
+            "result leaves the relevant state unchanged, do not repeat that observation unless ",
+            "you can name a pending state transition; otherwise synthesize the evidence, take a ",
+            "state-changing action, or report the blocker. Before final synthesis, compare every ",
+            "version, ",
+            "edition, name, count, path, subcommand, or other literal attributed to a direct file ",
+            "read against the retained evidence. If that evidence is unavailable or stale, mark ",
+            "the value unknown or refresh it; never substitute a remembered value while citing ",
+            "the earlier read. Resolve contradictions using runtime ",
             "reachability, ownership, freshness, and generated-source contracts. Revise the model ",
             "when new evidence disagrees with it, and stay at module-level abstraction until a ",
             "specific uncertainty requires implementation detail. Never fill an unknown with an ",
@@ -64,6 +74,12 @@ mod tests {
         }
         assert!(rendered.contains("storage or repetition never upgrades"));
         assert!(rendered.contains("generated summaries as derived and potentially lossy"));
+        assert!(rendered.contains("Reuse current exact values and enumerations"));
+        assert!(rendered.contains("Batch independent read-only checks"));
+        assert!(rendered.contains("do not repeat that observation unless"));
+        assert!(rendered.contains("name a pending state transition"));
+        assert!(rendered.contains("edition, name, count, path, subcommand"));
+        assert!(rendered.contains("never substitute a remembered value"));
         assert!(rendered.contains("Never fill an unknown"));
         assert!(rendered.ends_with(TASK_MODEL_GUIDANCE_CLOSE_TAG));
     }

@@ -1904,6 +1904,16 @@ pub(crate) struct CompletionReviewDossier {
     pub(crate) rereview_input: Option<RereviewInput>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SamplingCompletionToken {
+    document_revision: u64,
+    evidence_epoch: u64,
+    host_mutation_revision: u64,
+    completion_epoch: u64,
+    manifest_revision: u64,
+    gate: TaskCompletionGate,
+}
+
 /// Validated structured facts that the completion-review host may use to select
 /// applicable review lenses. Free-form review material is intentionally absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -2733,89 +2743,103 @@ impl TaskEvidenceLedger {
                 None
             }
         };
-        let document = if let Some((mut document, legacy_completion_model)) = existing {
-            migrate_document_with_completion_model(&mut document, legacy_completion_model);
-            if rederive_document_source_owners(
-                &mut document,
-                &repo_root,
-                source_owner_index.index(),
-            ) {
-                invalidate_for_plan_change(&mut document);
-                document.planning.material_revision =
-                    document.planning.material_revision.saturating_add(1);
-            }
-            for receipt in &mut document.terminalization_receipts {
-                if receipt.delivery_state.is_authoritative_claim()
-                    && (!receipt.app_server_acknowledged
-                        || !receipt.runtime_status_converged
-                        || !receipt.rollout_mirrored
-                        || !receipt.parent_notification_completed
-                        || !receipt.post_terminal_cleanup_completed
-                        || !receipt.active_turn_detached
-                        || !receipt.terminal_interaction_released)
-                {
-                    // A durable terminal decision is immutable, but delivery and post-terminal
-                    // effects remain independently recoverable. Do not manufacture release or
-                    // delivery success merely because the ledger was reloaded.
-                    receipt.recovery_state = TerminalRecoveryState::Pending;
-                    receipt.updated_at = now.clone();
+        let (document, initial_persistence_required) =
+            if let Some((mut document, legacy_completion_model)) = existing {
+                let original_document = serde_json::to_vec(&document).ok();
+                migrate_document_with_completion_model(&mut document, legacy_completion_model);
+                if rederive_document_source_owners(
+                    &mut document,
+                    &repo_root,
+                    source_owner_index.index(),
+                ) {
+                    invalidate_for_plan_change(&mut document);
+                    document.planning.material_revision =
+                        document.planning.material_revision.saturating_add(1);
                 }
-            }
-            document.start.repository_root.clone_from(&repository_root);
-            document.updated_at = now;
-            document.revision = document.revision.saturating_add(1);
-            document
-        } else {
-            let git = collect_git_info(&repo_root).await;
-            let mut risks = Vec::new();
-            if let Some(reason) = storage_failure_reason.as_deref() {
-                risks.push(task_evidence_storage_risk(reason, 0));
-            }
-            if let Some(reason) = recovery_failure_reason.as_deref() {
-                risks.push(task_evidence_recovery_risk(reason, 0));
-            }
-            TaskEvidenceDocument {
-                schema_version: TASK_EVIDENCE_SCHEMA_VERSION,
-                revision: 1,
-                thread_id: thread_id_text.clone(),
-                started_at: now.clone(),
-                updated_at: now,
-                start: TaskStartState {
-                    cwd: cwd.to_string_lossy().into_owned(),
-                    repository_root,
-                    commit_hash: git
-                        .as_ref()
-                        .and_then(|info| info.commit_hash.as_ref())
-                        .map(|sha| sha.0.clone()),
-                    branch: git.as_ref().and_then(|info| info.branch.clone()),
-                    repository_url: git.and_then(|info| info.repository_url),
-                },
-                evidence_epoch: 0,
-                last_mutation_at: None,
-                planning: PlanningEvidenceState::default(),
-                plan: Vec::new(),
-                active_step_id: None,
-                batch_acknowledgement: None,
-                edit_intents: Vec::new(),
-                edit_receipts: Vec::new(),
-                command_receipts: Vec::new(),
-                external_evidence: Vec::new(),
-                completion_review_receipts: Vec::new(),
-                latest_generated_artifact_hashes: BTreeMap::new(),
-                latest_file_hashes: BTreeMap::new(),
-                risks,
-                next_edit_receipt_sequence: initial_receipt_sequence(),
-                next_command_receipt_sequence: initial_receipt_sequence(),
-                next_external_evidence_receipt_sequence: initial_receipt_sequence(),
-                host_mutation_revision: 0,
-                completion_review_v2: Some(new_completion_review_ledger(&thread_id_text)),
-                source_classification_cache: Vec::new(),
-                terminalization_receipts: Vec::new(),
-                locked_user_decisions: Vec::new(),
-                final_proof: FinalProofStateV1::default(),
-                completion: None,
-            }
-        };
+                for receipt in &mut document.terminalization_receipts {
+                    if receipt.delivery_state.is_authoritative_claim()
+                        && (!receipt.app_server_acknowledged
+                            || !receipt.runtime_status_converged
+                            || !receipt.rollout_mirrored
+                            || !receipt.parent_notification_completed
+                            || !receipt.post_terminal_cleanup_completed
+                            || !receipt.active_turn_detached
+                            || !receipt.terminal_interaction_released)
+                        && receipt.recovery_state != TerminalRecoveryState::Pending
+                    {
+                        // A durable terminal decision is immutable, but delivery and post-terminal
+                        // effects remain independently recoverable. Do not manufacture release or
+                        // delivery success merely because the ledger was reloaded.
+                        receipt.recovery_state = TerminalRecoveryState::Pending;
+                        receipt.updated_at = now.clone();
+                    }
+                }
+                if document.start.repository_root != repository_root {
+                    document.start.repository_root.clone_from(&repository_root);
+                }
+                let document_changed = match (original_document, serde_json::to_vec(&document)) {
+                    (Some(before), Ok(after)) => before != after,
+                    _ => true,
+                };
+                if document_changed {
+                    document.updated_at = now;
+                    document.revision = document.revision.saturating_add(1);
+                }
+                (document, document_changed)
+            } else {
+                let git = collect_git_info(&repo_root).await;
+                let mut risks = Vec::new();
+                if let Some(reason) = storage_failure_reason.as_deref() {
+                    risks.push(task_evidence_storage_risk(reason, 0));
+                }
+                if let Some(reason) = recovery_failure_reason.as_deref() {
+                    risks.push(task_evidence_recovery_risk(reason, 0));
+                }
+                (
+                    TaskEvidenceDocument {
+                        schema_version: TASK_EVIDENCE_SCHEMA_VERSION,
+                        revision: 1,
+                        thread_id: thread_id_text.clone(),
+                        started_at: now.clone(),
+                        updated_at: now,
+                        start: TaskStartState {
+                            cwd: cwd.to_string_lossy().into_owned(),
+                            repository_root,
+                            commit_hash: git
+                                .as_ref()
+                                .and_then(|info| info.commit_hash.as_ref())
+                                .map(|sha| sha.0.clone()),
+                            branch: git.as_ref().and_then(|info| info.branch.clone()),
+                            repository_url: git.and_then(|info| info.repository_url),
+                        },
+                        evidence_epoch: 0,
+                        last_mutation_at: None,
+                        planning: PlanningEvidenceState::default(),
+                        plan: Vec::new(),
+                        active_step_id: None,
+                        batch_acknowledgement: None,
+                        edit_intents: Vec::new(),
+                        edit_receipts: Vec::new(),
+                        command_receipts: Vec::new(),
+                        external_evidence: Vec::new(),
+                        completion_review_receipts: Vec::new(),
+                        latest_generated_artifact_hashes: BTreeMap::new(),
+                        latest_file_hashes: BTreeMap::new(),
+                        risks,
+                        next_edit_receipt_sequence: initial_receipt_sequence(),
+                        next_command_receipt_sequence: initial_receipt_sequence(),
+                        next_external_evidence_receipt_sequence: initial_receipt_sequence(),
+                        host_mutation_revision: 0,
+                        completion_review_v2: Some(new_completion_review_ledger(&thread_id_text)),
+                        source_classification_cache: Vec::new(),
+                        terminalization_receipts: Vec::new(),
+                        locked_user_decisions: Vec::new(),
+                        final_proof: FinalProofStateV1::default(),
+                        completion: None,
+                    },
+                    true,
+                )
+            };
         let writable_evidence_path = storage_failure_reason.is_none().then_some(evidence_path);
         let source_capture_failed = document
             .completion_review_v2
@@ -2838,12 +2862,16 @@ impl TaskEvidenceLedger {
             external_evidence_gate: Arc::new(Semaphore::new(1)),
             freshness_gate: Arc::new(Semaphore::new(1)),
             freshness_state: Arc::new(std::sync::Mutex::new(FreshnessState::default())),
-            last_persisted_revision: Arc::new(AtomicU64::new(0)),
+            last_persisted_revision: Arc::new(AtomicU64::new(if initial_persistence_required {
+                0
+            } else {
+                document.revision
+            })),
             source_capture_failed: Arc::new(AtomicBool::new(source_capture_failed)),
             #[cfg(test)]
             persistence_test_control: Arc::new(std::sync::Mutex::new(None)),
         };
-        if storage_failure_reason.is_none() {
+        if storage_failure_reason.is_none() && initial_persistence_required {
             let persisted = ledger.persist_document(&document).await;
             if mode == TaskEvidenceMode::Kd4Completion && persisted == PersistOutcome::Failed {
                 let mut guard = ledger.document.lock().await;
@@ -3102,59 +3130,65 @@ impl TaskEvidenceLedger {
             let candidate_fingerprint = claim.authoritative_event.fingerprint.clone();
             let candidate_claim = claim.clone();
             let transition = self
-                .atomic_review_update(expected_revision, None, None, |document| {
-                    if let Some(receipt) =
-                        document.terminalization_receipts.iter().find(|receipt| {
-                            receipt.terminal_identity == terminal_identity
-                                && receipt.delivery_state.is_authoritative_claim()
-                        })
-                    {
-                        return match receipt.validated_authoritative_event().cloned() {
-                            Some(authoritative)
-                                if authoritative.fingerprint == candidate_fingerprint =>
-                            {
-                                TerminalClaimMutation::Existing(authoritative)
-                            }
-                            Some(authoritative) => {
-                                TerminalClaimMutation::Conflict(Some(authoritative))
-                            }
-                            _ => TerminalClaimMutation::Conflict(None),
-                        };
-                    }
-                    let now = timestamp();
-                    let authoritative_event = candidate_claim.authoritative_event;
-                    document
-                        .terminalization_receipts
-                        .push(TerminalizationReceipt {
-                            terminal_identity: authoritative_event.terminal_identity.clone(),
-                            durable_outcome: authoritative_event.semantic_outcome.clone(),
-                            authoritative_event: Some(authoritative_event),
-                            delivery_state: TerminalDeliveryState::Claimed,
-                            app_server_acknowledged: false,
-                            runtime_status_converged: false,
-                            rollout_mirrored: false,
-                            parent_notification_completed: false,
-                            post_terminal_cleanup_completed: false,
-                            active_turn_detached: false,
-                            terminal_interaction_released: false,
-                            deadline_exhausted_phase: candidate_claim.deadline_exhausted_phase,
-                            mutation_quiescent: candidate_claim.mutation_quiescent,
-                            durable_success_established: candidate_claim
-                                .durable_success_established,
-                            retained_ownership: candidate_claim.retained_ownership,
-                            recovery_state: TerminalRecoveryState::Pending,
-                            phase_timings_ns: candidate_claim.phase_timings_ns,
-                            terminalization: None,
-                            recorded_at: now.clone(),
-                            updated_at: now,
-                        });
-                    trim_to_last(
-                        &mut document.terminalization_receipts,
-                        MAX_TERMINALIZATION_RECEIPTS,
-                    );
-                    document.updated_at = timestamp();
-                    TerminalClaimMutation::Inserted
-                })
+                .atomic_review_update_if_changed(
+                    expected_revision,
+                    None,
+                    None,
+                    |document| {
+                        if let Some(receipt) =
+                            document.terminalization_receipts.iter().find(|receipt| {
+                                receipt.terminal_identity == terminal_identity
+                                    && receipt.delivery_state.is_authoritative_claim()
+                            })
+                        {
+                            return match receipt.validated_authoritative_event().cloned() {
+                                Some(authoritative)
+                                    if authoritative.fingerprint == candidate_fingerprint =>
+                                {
+                                    TerminalClaimMutation::Existing(authoritative)
+                                }
+                                Some(authoritative) => {
+                                    TerminalClaimMutation::Conflict(Some(authoritative))
+                                }
+                                _ => TerminalClaimMutation::Conflict(None),
+                            };
+                        }
+                        let now = timestamp();
+                        let authoritative_event = candidate_claim.authoritative_event;
+                        document
+                            .terminalization_receipts
+                            .push(TerminalizationReceipt {
+                                terminal_identity: authoritative_event.terminal_identity.clone(),
+                                durable_outcome: authoritative_event.semantic_outcome.clone(),
+                                authoritative_event: Some(authoritative_event),
+                                delivery_state: TerminalDeliveryState::Claimed,
+                                app_server_acknowledged: false,
+                                runtime_status_converged: false,
+                                rollout_mirrored: false,
+                                parent_notification_completed: false,
+                                post_terminal_cleanup_completed: false,
+                                active_turn_detached: false,
+                                terminal_interaction_released: false,
+                                deadline_exhausted_phase: candidate_claim.deadline_exhausted_phase,
+                                mutation_quiescent: candidate_claim.mutation_quiescent,
+                                durable_success_established: candidate_claim
+                                    .durable_success_established,
+                                retained_ownership: candidate_claim.retained_ownership,
+                                recovery_state: TerminalRecoveryState::Pending,
+                                phase_timings_ns: candidate_claim.phase_timings_ns,
+                                terminalization: None,
+                                recorded_at: now.clone(),
+                                updated_at: now,
+                            });
+                        trim_to_last(
+                            &mut document.terminalization_receipts,
+                            MAX_TERMINALIZATION_RECEIPTS,
+                        );
+                        document.updated_at = timestamp();
+                        TerminalClaimMutation::Inserted
+                    },
+                    |mutation| matches!(mutation, TerminalClaimMutation::Inserted),
+                )
                 .await;
             match transition {
                 AtomicReviewTransition::Persisted(TerminalClaimMutation::Inserted) => {
@@ -6272,7 +6306,11 @@ impl TaskEvidenceLedger {
         &self,
         dossier: &CompletionReviewDossier,
     ) -> AtomicReviewTransition<TaskCompletionGate> {
-        if self.user_source_capture_failed()
+        if dossier.evidence_gate.status != TaskCompletionStatus::Passed
+            || !dossier.typed_quiescent
+            || !dossier.default_children_quiescent
+            || !dossier.authoritative_input_errors.is_empty()
+            || self.user_source_capture_failed()
             || !dossier.mappings_classified
             || dossier.sources.iter().any(|source| {
                 source.availability != UserSourceAvailability::Available
@@ -7530,34 +7568,52 @@ impl TaskEvidenceLedger {
             }
             let completion_proof_manifest = self.completion_proof_manifest();
             let mut freshness_state_changed = false;
-            let (gate, snapshot) = self
-                .update_document(|document| {
-                    if !task_is_tracked(document) {
-                        return None;
-                    }
-                    let current_manifest = freshness_manifest(document);
-                    if (!current_manifest.tracked.is_empty()
-                        || !current_manifest.artifact_paths.is_empty())
-                        && completion_proof_manifest.as_ref() != Some(&current_manifest)
-                    {
-                        freshness_state_changed = true;
-                        return None;
-                    }
+            let last_persisted_revision = self.last_persisted_revision.load(Ordering::Acquire);
+            let (gate, snapshot) = {
+                let mut guard = self.document.lock().await;
+                let document = guard.as_mut()?;
+                if !task_is_tracked(document) {
+                    return None;
+                }
+                let current_manifest = freshness_manifest(document);
+                if (!current_manifest.tracked.is_empty()
+                    || !current_manifest.artifact_paths.is_empty())
+                    && completion_proof_manifest.as_ref() != Some(&current_manifest)
+                {
+                    freshness_state_changed = true;
+                    (None, None)
+                } else {
+                    let storage_risk_changed = evidence_path.is_some()
+                        && document.risks.iter().any(|risk| {
+                            risk.id == "task-evidence-storage-failure" && !risk.resolved
+                        });
                     if evidence_path.is_some() {
                         resolve_risk(document, "task-evidence-storage-failure");
                     }
                     let mut gate = derive_completion_gate(document, evidence_path.as_deref());
                     overlay_completion_review_gate(document, &mut gate, source_capture_failed);
-                    document.completion = Some(gate.clone());
-                    document.updated_at = timestamp();
-                    Some(gate)
-                })
-                .await?;
+                    let completion_changed = document.completion.as_ref() != Some(&gate);
+                    let snapshot = if completion_changed || storage_risk_changed {
+                        document.completion = Some(gate.clone());
+                        document.updated_at = timestamp();
+                        document.revision = document.revision.saturating_add(1);
+                        Some(document.clone())
+                    } else if last_persisted_revision < document.revision {
+                        Some(document.clone())
+                    } else {
+                        None
+                    };
+                    (Some(gate), snapshot)
+                }
+            };
             if freshness_state_changed {
                 continue;
             }
             let gate = gate?;
             latest_gate = Some(gate.clone());
+            let Some(snapshot) = snapshot else {
+                return Some(gate);
+            };
             match self.persist_document(&snapshot).await {
                 PersistOutcome::Persisted => return Some(gate),
                 PersistOutcome::Superseded => continue,
@@ -7584,6 +7640,31 @@ impl TaskEvidenceLedger {
             )
             .await,
         )
+    }
+
+    pub(crate) async fn sampling_completion_token(&self) -> Option<SamplingCompletionToken> {
+        let gate = self.completion_gate().await?;
+        if gate.status != TaskCompletionStatus::Passed {
+            return None;
+        }
+        let guard = self.document.lock().await;
+        let document = guard.as_ref()?;
+        let ledger = document.completion_review_v2.as_ref()?;
+        (document.completion.as_ref() == Some(&gate)).then_some(SamplingCompletionToken {
+            document_revision: document.revision,
+            evidence_epoch: document.evidence_epoch,
+            host_mutation_revision: document.host_mutation_revision,
+            completion_epoch: ledger.completion_epoch,
+            manifest_revision: ledger.manifest_revision,
+            gate,
+        })
+    }
+
+    pub(crate) async fn sampling_completion_token_is_current(
+        &self,
+        token: &SamplingCompletionToken,
+    ) -> bool {
+        self.sampling_completion_token().await.as_ref() == Some(token)
     }
 
     async fn block_gate_for_persistence(
@@ -7674,7 +7755,7 @@ impl TaskEvidenceLedger {
         if manifest_after_wait != manifest {
             return false;
         }
-        if purpose == FreshnessPurpose::CompletionRetry
+        if purpose != FreshnessPurpose::Ordinary
             && let Some(reused_hashes) = self.completion_proof_reuse_count(&manifest).await
         {
             let manifest_after_token_check = {
@@ -8699,12 +8780,51 @@ impl TaskEvidenceLedger {
         .await
     }
 
+    async fn atomic_review_update_if_changed<T: Send>(
+        &self,
+        expected_revision: u64,
+        expected_implementation_identity: Option<&str>,
+        expected_dossier_snapshot: Option<&str>,
+        update: impl FnOnce(&mut TaskEvidenceDocument) -> T + Send,
+        changed: impl FnOnce(&T) -> bool + Send,
+    ) -> AtomicReviewTransition<T> {
+        self.atomic_review_update_with_commit_condition(
+            expected_revision,
+            expected_implementation_identity,
+            expected_dossier_snapshot,
+            update,
+            changed,
+            || {},
+        )
+        .await
+    }
+
     async fn atomic_review_update_with_commit<T: Send>(
         &self,
         expected_revision: u64,
         expected_implementation_identity: Option<&str>,
         expected_dossier_snapshot: Option<&str>,
         update: impl FnOnce(&mut TaskEvidenceDocument) -> T + Send,
+        commit: impl FnOnce() + Send,
+    ) -> AtomicReviewTransition<T> {
+        self.atomic_review_update_with_commit_condition(
+            expected_revision,
+            expected_implementation_identity,
+            expected_dossier_snapshot,
+            update,
+            |_| true,
+            commit,
+        )
+        .await
+    }
+
+    async fn atomic_review_update_with_commit_condition<T: Send>(
+        &self,
+        expected_revision: u64,
+        expected_implementation_identity: Option<&str>,
+        expected_dossier_snapshot: Option<&str>,
+        update: impl FnOnce(&mut TaskEvidenceDocument) -> T + Send,
+        changed: impl FnOnce(&T) -> bool + Send,
         commit: impl FnOnce() + Send,
     ) -> AtomicReviewTransition<T> {
         let Some(path) = self.evidence_path() else {
@@ -8733,6 +8853,9 @@ impl TaskEvidenceLedger {
 
         let mut candidate = document.clone();
         let result = update(&mut candidate);
+        if !changed(&result) {
+            return AtomicReviewTransition::Persisted(result);
+        }
         candidate.schema_version = TASK_EVIDENCE_SCHEMA_VERSION;
         candidate.source_classification_cache = canonical_source_classification_cache(
             std::mem::take(&mut candidate.source_classification_cache),
@@ -14208,6 +14331,12 @@ fn completion_review_locally_obtainable_proof_routes(gate: &TaskCompletionGate) 
             ) {
                 Some(format!(
                     "Regenerate or restore the named artifact through its owning generator, then record the focused proof: {reason}"
+                ))
+            } else if reason.starts_with("focused work unit `")
+                && reason.ends_with(" lacks current validation proof")
+            {
+                Some(format!(
+                    "Run the focused work unit's validation route and record its current proof receipt: {reason}"
                 ))
             } else {
                 None

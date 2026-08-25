@@ -394,7 +394,7 @@ async fn streaming_client_adds_auth_headers() -> Result<()> {
 }
 
 #[tokio::test]
-async fn streaming_client_retries_on_transport_error() -> Result<()> {
+async fn streaming_client_does_not_replay_ambiguous_transport_error() -> Result<()> {
     let transport = FlakyTransport::new();
 
     let mut provider = provider("openai");
@@ -419,7 +419,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
     };
     let client = ResponsesClient::new(transport.clone(), provider, Arc::new(NoAuth));
 
-    let _stream = client
+    let result = client
         .stream_request(
             request,
             ResponsesOptions {
@@ -427,21 +427,19 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
                 ..Default::default()
             },
         )
-        .await?;
-    assert_eq!(transport.attempts(), 2);
+        .await;
+    assert!(matches!(
+        result,
+        Err(ApiError::Transport(TransportError::Network(message)))
+            if message == "first attempt fails"
+    ));
+    assert_eq!(transport.attempts(), 1);
     let requests = transport.requests();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0], requests[1]);
+    assert_eq!(requests.len(), 1);
     let RequestBody::EncodedJson(first_body) = &requests[0].0 else {
         panic!("expected an encoded JSON body");
     };
-    let RequestBody::EncodedJson(second_body) = &requests[1].0 else {
-        panic!("expected an encoded JSON body");
-    };
-    assert_eq!(
-        first_body.as_bytes().as_ptr(),
-        second_body.as_bytes().as_ptr()
-    );
+    assert!(!first_body.as_bytes().is_empty());
     assert_eq!(
         requests[0].1.get(http::header::CONTENT_ENCODING),
         Some(&HeaderValue::from_static("zstd"))

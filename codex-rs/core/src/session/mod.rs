@@ -4368,6 +4368,7 @@ impl Session {
     }
 
     async fn acquire_tool_history_io_permit(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.tool_history_persistence.flush().await;
         match self.tool_history_io_gate.acquire().await {
             Ok(permit) => Some(permit),
             Err(error) => {
@@ -4449,47 +4450,57 @@ impl Session {
         codex_home: &std::path::Path,
         candidate: crate::tool_history::ToolHistoryCandidate,
     ) {
-        let Some(_tool_history_io_permit) = self.acquire_tool_history_io_permit().await else {
-            return;
-        };
-        let snapshot = {
-            let mut state = self.state.lock().await;
-            state.register_tool_history_candidate(candidate);
-            state.tool_history_state()
-        };
-        if let Err(err) = crate::tool_history::persist_tool_history_state(
+        let mut state = self.state.lock().await;
+        state.register_tool_history_candidate(candidate);
+        let snapshot = state.tool_history_state();
+        self.tool_history_persistence.enqueue(
             codex_home,
-            &self.thread_id.to_string(),
-            &snapshot,
-        )
-        .await
-        {
-            tracing::warn!("failed to persist completed-tool history metadata: {err}");
-        }
+            &self.thread_id,
+            snapshot,
+            "completed-tool history metadata",
+        );
     }
 
-    pub(crate) async fn register_workspace_evidence(
+    pub(crate) async fn register_workspace_evidence<WorkspaceGateGuard: Send>(
         &self,
         codex_home: &std::path::Path,
         observation: crate::tool_history::WorkspaceEvidenceObservation,
+        workspace_gate_guard: WorkspaceGateGuard,
     ) {
-        let Some(_tool_history_io_permit) = self.acquire_tool_history_io_permit().await else {
-            return;
-        };
-        let snapshot = {
-            let mut state = self.state.lock().await;
-            state.history.register_workspace_evidence(observation);
-            state.tool_history_state()
-        };
-        if let Err(err) = crate::tool_history::persist_tool_history_state(
+        // The workspace gate protects handler effects, not completed-tool
+        // history serialization. Release it before recording the observation;
+        // the session-state lock orders snapshots, and the persistence worker
+        // commits those snapshots in the same order without delaying relay.
+        drop(workspace_gate_guard);
+        let mut state = self.state.lock().await;
+        state.history.register_workspace_evidence(observation);
+        let snapshot = state.tool_history_state();
+        self.tool_history_persistence.enqueue(
             codex_home,
-            &self.thread_id.to_string(),
-            &snapshot,
-        )
-        .await
-        {
-            tracing::warn!("failed to persist workspace evidence metadata: {err}");
-        }
+            &self.thread_id,
+            snapshot,
+            "workspace evidence metadata",
+        );
+    }
+
+    pub(crate) async fn register_non_workspace_code_mode_call(
+        &self,
+        codex_home: &std::path::Path,
+        call_id: String,
+    ) {
+        let mut state = self.state.lock().await;
+        state.history.register_non_workspace_code_mode_call(call_id);
+        let snapshot = state.tool_history_state();
+        self.tool_history_persistence.enqueue(
+            codex_home,
+            &self.thread_id,
+            snapshot,
+            "code-mode workspace classification metadata",
+        );
+    }
+
+    pub(crate) async fn flush_tool_history_persistence(&self) {
+        self.tool_history_persistence.flush().await;
     }
 
     pub(crate) async fn invalidate_tool_history_source_dependencies(

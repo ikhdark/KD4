@@ -5,6 +5,7 @@ use codex_client::RetryPolicy;
 use codex_client::TransportError;
 use codex_client::backoff;
 use codex_client::run_with_retry;
+use codex_client::run_with_retry_non_idempotent;
 use codex_client::sse_stream;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -142,6 +143,57 @@ async fn final_underlying_error_is_preserved() {
     );
     assert_eq!(body.as_deref(), Some("provider failure"));
     assert_eq!(attempts.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn retry_classifier_retries_only_proven_safe_failures() {
+    let pre_dispatch_attempts = Arc::new(AtomicU64::new(0));
+    let attempts_for_op = pre_dispatch_attempts.clone();
+    let result =
+        run_with_retry_non_idempotent(retry_policy(2), request, move |_request, attempt| {
+            let attempts = attempts_for_op.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                if attempt == 0 {
+                    Err(TransportError::PreDispatch(
+                        "temporary auth lookup failure".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+    assert!(result.is_ok());
+    assert_eq!(pre_dispatch_attempts.load(Ordering::Relaxed), 2);
+
+    for unsafe_error in [
+        TransportError::Network("ambiguous socket failure".to_string()),
+        TransportError::Timeout,
+        TransportError::Http {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            url: None,
+            headers: None,
+            body: None,
+        },
+    ] {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_for_op = attempts.clone();
+        let error = Arc::new(std::sync::Mutex::new(Some(unsafe_error)));
+        let error_for_op = error.clone();
+        let result =
+            run_with_retry_non_idempotent(retry_policy(2), request, move |_request, _attempt| {
+                let attempts = attempts_for_op.clone();
+                let error = error_for_op.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    Err::<(), _>(error.lock().expect("error mutex poisoned").take().unwrap())
+                }
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

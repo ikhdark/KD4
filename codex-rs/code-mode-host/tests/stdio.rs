@@ -297,6 +297,7 @@ text(result.value);
         *delegate.invocations.lock().expect("invocations lock"),
         vec![CodeModeNestedToolCall {
             cell_id: cell_id("2"),
+            parent_tool_call_id: Some("call-2".to_string()),
             runtime_tool_call_id: "tool-1".to_string(),
             tool_name: ToolName::plain("echo"),
             tool_kind: CodeModeToolKind::Function,

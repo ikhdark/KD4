@@ -49,6 +49,8 @@ pub(crate) struct ToolDispatchTimingSnapshot {
     pub first_poll_to_handler_entry_ms: Option<u64>,
     pub handler_duration_ms: Option<u64>,
     pub workspace_evidence_before_ms: Option<u64>,
+    pub workspace_evidence_before_cache_hit: Option<bool>,
+    pub workspace_evidence_before_timed_out_git_dependencies: Vec<String>,
     pub workspace_evidence_after_ms: Option<u64>,
     pub pre_tool_hook_ms: Option<u64>,
     pub post_tool_hook_ms: Option<u64>,
@@ -85,6 +87,8 @@ pub(crate) struct ToolDispatchTiming {
     handler_entry_at: OnceLock<Instant>,
     handler_exit_at: OnceLock<Instant>,
     workspace_evidence_before: OnceLock<Duration>,
+    workspace_evidence_before_cache_hit: OnceLock<bool>,
+    workspace_evidence_before_timed_out_git_dependencies: OnceLock<Vec<String>>,
     workspace_evidence_after: OnceLock<Duration>,
     pre_tool_hook: OnceLock<Duration>,
     post_tool_hook: OnceLock<Duration>,
@@ -144,6 +148,8 @@ impl ToolDispatchTiming {
             handler_entry_at: OnceLock::new(),
             handler_exit_at: OnceLock::new(),
             workspace_evidence_before: OnceLock::new(),
+            workspace_evidence_before_cache_hit: OnceLock::new(),
+            workspace_evidence_before_timed_out_git_dependencies: OnceLock::new(),
             workspace_evidence_after: OnceLock::new(),
             pre_tool_hook: OnceLock::new(),
             post_tool_hook: OnceLock::new(),
@@ -246,6 +252,17 @@ impl ToolDispatchTiming {
 
     pub(crate) fn record_workspace_evidence_before(&self, duration: Duration) {
         Self::record_phase(&self.workspace_evidence_before, duration);
+    }
+
+    pub(crate) fn record_workspace_evidence_before_attribution(
+        &self,
+        cache_hit: bool,
+        timed_out_git_dependencies: Vec<String>,
+    ) {
+        let _ = self.workspace_evidence_before_cache_hit.set(cache_hit);
+        let _ = self
+            .workspace_evidence_before_timed_out_git_dependencies
+            .set(timed_out_git_dependencies);
     }
 
     pub(crate) fn record_workspace_evidence_after(&self, duration: Duration) {
@@ -395,6 +412,15 @@ impl ToolDispatchTiming {
                 .get()
                 .copied()
                 .and_then(duration_ms),
+            workspace_evidence_before_cache_hit: self
+                .workspace_evidence_before_cache_hit
+                .get()
+                .copied(),
+            workspace_evidence_before_timed_out_git_dependencies: self
+                .workspace_evidence_before_timed_out_git_dependencies
+                .get()
+                .cloned()
+                .unwrap_or_default(),
             workspace_evidence_after_ms: self
                 .workspace_evidence_after
                 .get()
@@ -590,6 +616,7 @@ fn execution_status_for_outcome(context: codex_tools::ToolOutputOutcomeContext) 
     match context.outcome {
         ToolOutputOutcome::Success => ExecutionStatus::Completed,
         ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut => ExecutionStatus::Failed,
+        ToolOutputOutcome::Yielded => ExecutionStatus::Completed,
         ToolOutputOutcome::Skipped => {
             if context.skip_disposition
                 == Some(ToolOutputSkipDisposition::BlockingRequiredOperation)
@@ -610,6 +637,7 @@ fn tool_dispatch_invocation(invocation: &ToolInvocation) -> Option<ToolDispatchI
         ToolCallSource::CodeMode {
             cell_id,
             runtime_tool_call_id,
+            ..
         } => ToolDispatchRequester::CodeCell {
             runtime_cell_id: cell_id.clone(),
             runtime_tool_call_id: runtime_tool_call_id.clone(),

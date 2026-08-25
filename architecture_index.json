@@ -1,5 +1,5 @@
 {
-  "index_sha256": "d77fd06323515cda941b854192dcf94b5e0331b7cc62ab70d730e6c2d2db579e",
+  "index_sha256": "b6f663142e92ce13cddd378f323b3dbe9bdb7895eb72cc8d7ed2c8e7cc54fe75",
   "index_version": 1,
   "manifest_sha256": "9f7b8e0c349816d9b113680fc9ce20d5815d5af841db704722872787a1997576",
   "omitted": {
@@ -1813,7 +1813,7 @@
       "target": "path:codex-rs/core/src/tools/command_output_artifact_tests.rs"
     }
   ],
-  "repository_revision": "manifest:9f7b8e0c349816d9b113680fc9ce20d5815d5af841db704722872787a1997576:sources:ceacb61514bedf02223c173f9b3367e7092115b2046c3894fb6c8cd5c300ee4f",
+  "repository_revision": "manifest:9f7b8e0c349816d9b113680fc9ce20d5815d5af841db704722872787a1997576:sources:e98049b55ac264ee00541a46c18d4ff71073352d3ab924ef50d1569eda525111",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

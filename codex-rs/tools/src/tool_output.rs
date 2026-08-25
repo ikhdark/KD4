@@ -243,6 +243,8 @@ pub enum ToolOutputOutcome {
     Success,
     Failure,
     TimedOut,
+    /// Execution is still live and can be resumed by the host.
+    Yielded,
     Skipped,
 }
 

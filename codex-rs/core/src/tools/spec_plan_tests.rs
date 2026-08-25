@@ -720,29 +720,18 @@ async fn request_user_input_respects_coarse_mode_and_role_eligibility() {
 }
 
 #[tokio::test]
-async fn wait_is_registered_only_while_a_code_mode_cell_is_waitable() {
-    for wait_available in [false, true] {
-        let identity = ToolExposureIdentity {
-            wait_available,
-            ..ToolExposureIdentity::default()
-        };
-        let plan = probe_with(
-            |turn| set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]),
-            ToolPlanInputs {
-                exposure_identity: identity,
-                ..ToolPlanInputs::default()
-            },
-        )
-        .await;
-        plan.assert_visible_contains(&[codex_code_mode::PUBLIC_TOOL_NAME]);
-        if wait_available {
-            plan.assert_visible_contains(&[codex_code_mode::WAIT_TOOL_NAME]);
-            plan.assert_registered_contains(&[codex_code_mode::WAIT_TOOL_NAME]);
-        } else {
-            plan.assert_visible_lacks(&[codex_code_mode::WAIT_TOOL_NAME]);
-            plan.assert_registered_lacks(&[codex_code_mode::WAIT_TOOL_NAME]);
-        }
-    }
+async fn wait_is_always_registered_when_code_mode_is_enabled() {
+    let plan = probe_with(
+        |turn| set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]),
+        ToolPlanInputs::default(),
+    )
+    .await;
+
+    plan.assert_visible_contains(&[
+        codex_code_mode::PUBLIC_TOOL_NAME,
+        codex_code_mode::WAIT_TOOL_NAME,
+    ]);
+    plan.assert_registered_contains(&[codex_code_mode::WAIT_TOOL_NAME]);
 }
 
 #[tokio::test]

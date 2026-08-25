@@ -97,8 +97,29 @@ struct CodeModePacketReceipt {
     advisory: Option<&'static str>,
 }
 
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: usize,
+}
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_len(value: &JsonValue) -> usize {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, value).map_or(0, |()| counter.bytes)
+}
+
 const TINY_PACKET_RESULT_BYTES: usize = 1_024;
-const TINY_PACKET_ADVISORY: &str = "This exec packet contained one small read-only observation. Limit only one observation or poll on a documented resumable wait or session path to 60 seconds, never the operation's lifetime. On expiry, resume the same valid operation through that path; do not abandon or duplicate it. Otherwise follow the tool's timeout or runtime contract. Attach success and failure handlers to each independent promise and await notify(...) inside each handler, so every settled result is delivered immediately. Use Promise.allSettled only as a lifetime barrier that keeps the cell alive; never put readers in a bare Promise.all, because one stalled call or interruption must not suppress completed results. If this result is sufficient or unchanged from prior evidence, synthesize and stop.";
+const TINY_PACKET_ADVISORY: &str = "Low-density packet: on the next decision, batch every known independent read in one exec, await notify(...) per settlement, and use Promise.allSettled only to keep the cell alive. Resume only a documented live handle. If evidence is sufficient or unchanged, synthesize and stop instead of sampling or polling again.";
 
 impl CodeModeService {
     pub(crate) fn new(session_provider: Arc<dyn CodeModeSessionProvider>) -> Self {
@@ -139,10 +160,6 @@ impl CodeModeService {
             yield_time_ms: codex_code_mode::OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS,
         })
         .await
-    }
-
-    pub(crate) fn has_waitable_cells(&self) -> bool {
-        self.dispatch_broker.has_waitable_cells()
     }
 
     pub(crate) async fn terminate(
@@ -309,7 +326,7 @@ pub(super) fn handle_runtime_response(
     // Nested tool results have already crossed their owning tool boundary. Keep
     // one coherent, model-safe exec packet here instead of applying the much
     // smaller generic per-tool diagnostic budget a second time.
-    let hard_limit = codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL
+    let hard_limit = codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL
         .min(TruncationPolicy::from(exec.turn.model_info.truncation_policy).token_budget());
     let original_image_detail_supported = can_request_original_image_detail(&exec.turn.model_info);
 
@@ -367,10 +384,11 @@ fn format_runtime_response(
         | RuntimeResponse::Result { cell_id, .. } => cell_id.to_string(),
     };
     let script_status = format_script_status(&response);
+    let yielded = matches!(&response, RuntimeResponse::Yielded { .. });
     let (mut content_items, outcome, success) = match response {
         RuntimeResponse::Yielded { content_items, .. } => {
             let content_items = into_function_call_output_content_items(content_items);
-            (content_items, OutputOutcome::TimedOut, true)
+            (content_items, OutputOutcome::Success, true)
         }
         RuntimeResponse::Terminated { content_items, .. } => {
             let content_items = into_function_call_output_content_items(content_items);
@@ -406,11 +424,12 @@ fn format_runtime_response(
         "content_items": &content_items,
     });
     prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
-    let typed_outcome = match outcome {
-        OutputOutcome::Success => codex_tools::ToolOutputOutcome::Success,
-        OutputOutcome::Failure => codex_tools::ToolOutputOutcome::Failure,
-        OutputOutcome::TimedOut => codex_tools::ToolOutputOutcome::TimedOut,
-        OutputOutcome::Skipped => codex_tools::ToolOutputOutcome::Skipped,
+    let typed_outcome = match (yielded, outcome) {
+        (true, _) => codex_tools::ToolOutputOutcome::Yielded,
+        (false, OutputOutcome::Success) => codex_tools::ToolOutputOutcome::Success,
+        (false, OutputOutcome::Failure) => codex_tools::ToolOutputOutcome::Failure,
+        (false, OutputOutcome::TimedOut) => codex_tools::ToolOutputOutcome::TimedOut,
+        (false, OutputOutcome::Skipped) => codex_tools::ToolOutputOutcome::Skipped,
     };
     let sampling_request_signal = if success {
         crate::tools::context::semantic_evidence_sampling_signal(semantic_evidence)
@@ -456,8 +475,10 @@ fn truncate_code_mode_result(
     hard_limit: usize,
 ) -> Vec<FunctionCallOutputContentItem> {
     let diagnostic_text = code_mode_text_content(&items);
+    let requested_limit =
+        max_output_tokens.unwrap_or(codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
     let limits = resolve_output_limits(
-        max_output_tokens,
+        Some(requested_limit),
         outcome,
         None,
         &diagnostic_text,
@@ -496,6 +517,7 @@ async fn call_nested_tool(
 ) -> Result<JsonValue, FunctionCallError> {
     let CodeModeNestedToolCall {
         cell_id,
+        parent_tool_call_id,
         runtime_tool_call_id,
         tool_name,
         tool_kind,
@@ -531,6 +553,7 @@ async fn call_nested_tool(
             call,
             ToolCallSource::CodeMode {
                 cell_id: cell_id.to_string(),
+                parent_call_id: parent_tool_call_id.clone(),
                 runtime_tool_call_id,
             },
             cancellation_token,
@@ -568,7 +591,7 @@ async fn call_nested_tool(
         &cell_id,
         is_batchable_observation(&tool_name, &payload)
             && !result_has_live_exec_session(&result_value),
-        serde_json::to_vec(&result_value).map_or(0, |bytes| bytes.len()),
+        serialized_json_len(&result_value),
         post_tool_use_feedback,
     );
     tool_runtime.record_code_mode_result(
@@ -753,6 +776,7 @@ mod tests {
     use super::is_batchable_observation;
     use super::nested_failure_fingerprint;
     use super::result_has_live_exec_session;
+    use super::serialized_json_len;
     use super::truncate_code_mode_result;
     use crate::tools::context::ToolPayload;
     use codex_code_mode::CellId;
@@ -769,6 +793,21 @@ mod tests {
     }
 
     #[test]
+    fn packet_result_byte_count_matches_compact_json_without_allocating_a_buffer() {
+        let value = json!({
+            "text": "multi-byte: é",
+            "nested": [true, null, {"count": 17}],
+        });
+
+        assert_eq!(
+            serialized_json_len(&value),
+            serde_json::to_vec(&value)
+                .expect("serialize expected packet result")
+                .len()
+        );
+    }
+
+    #[test]
     fn first_tiny_read_only_packet_produces_one_runtime_advisory() {
         let service = test_service();
         let cell = CellId::new("cell".to_string());
@@ -778,21 +817,14 @@ mod tests {
             .finish_packet("cell", "turn")
             .advisory
             .expect("first tiny packet should include an advisory");
-        assert!(advisory.contains("one observation or poll"));
-        assert!(advisory.contains("never the operation's lifetime"));
-        assert!(advisory.contains("resume the same valid operation"));
-        assert!(advisory.contains("do not abandon or duplicate it"));
-        assert!(advisory.contains("follow the tool's timeout or runtime contract"));
-        assert!(advisory.contains("success and failure handlers to each independent promise"));
-        assert!(advisory.contains("await notify(...) inside each handler"));
+        assert!(advisory.contains("batch every known independent read in one exec"));
+        assert!(advisory.contains("await notify(...) per settlement"));
         assert!(advisory.contains("Promise.allSettled"));
-        assert!(advisory.contains("only as a lifetime barrier"));
-        assert!(advisory.contains("every settled result is delivered immediately"));
-        assert!(advisory.contains("never put readers in a bare Promise.all"));
-        assert!(
-            advisory
-                .contains("one stalled call or interruption must not suppress completed results")
-        );
+        assert!(advisory.contains("only to keep the cell alive"));
+        assert!(advisory.contains("Resume only a documented live handle"));
+        assert!(advisory.contains("evidence is sufficient or unchanged"));
+        assert!(advisory.contains("synthesize and stop"));
+        assert!(advisory.contains("instead of sampling or polling again"));
         service.record_packet_call(&cell, true, 128, Vec::new());
         assert!(service.finish_packet("cell", "turn").advisory.is_none());
         service.record_packet_call(&cell, true, 128, Vec::new());
@@ -1003,12 +1035,13 @@ mod tests {
     }
 
     #[test]
-    fn default_outer_success_budget_preserves_a_multi_tool_evidence_packet() {
+    fn default_outer_success_budget_is_narrow_and_explicit_requests_can_use_the_hard_cap() {
         let text = "x".repeat(24_000);
         assert!(codex_utils_string::approx_token_count(&text) > 4_000);
         let items = vec![FunctionCallOutputContentItem::InputText { text }];
 
-        let projected = truncate_code_mode_result(items, None, OutputOutcome::Success, usize::MAX);
+        let projected =
+            truncate_code_mode_result(items.clone(), None, OutputOutcome::Success, usize::MAX);
 
         let [FunctionCallOutputContentItem::InputText { text }] = projected.as_slice() else {
             panic!("expected one projected text item");
@@ -1018,6 +1051,19 @@ mod tests {
             codex_utils_string::approx_token_count(text)
                 <= codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL
         );
+
+        let expanded = truncate_code_mode_result(
+            items,
+            Some(6_000),
+            OutputOutcome::Success,
+            codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+        );
+        let [FunctionCallOutputContentItem::InputText { text }] = expanded.as_slice() else {
+            panic!("expected one expanded text item");
+        };
+        let expanded_tokens = codex_utils_string::approx_token_count(text);
+        assert!(expanded_tokens > codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
+        assert!(expanded_tokens <= 6_000);
     }
 
     #[tokio::test]

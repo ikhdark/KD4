@@ -22,6 +22,11 @@ pub enum TransportError {
     Connection(#[source] HttpError),
     #[error("network error: {0}")]
     Network(String),
+    /// A transient failure proven to have happened before the request was
+    /// dispatched to the transport. Retrying this error cannot duplicate a
+    /// non-idempotent request.
+    #[error("pre-dispatch error: {0}")]
+    PreDispatch(String),
     #[error("request build error: {0}")]
     Build(String),
 }

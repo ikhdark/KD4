@@ -87,7 +87,7 @@ fn duplicate_process_handle(process: RawHandle) -> io::Result<OwnedHandle> {
 
 fn terminate_process(process: &OwnedHandle) -> io::Result<()> {
     let success =
-        unsafe { winapi::um::processthreadsapi::TerminateProcess(process.as_raw_handle(), 1) };
+        unsafe { winapi::um::processthreadsapi::TerminateProcess(process.as_raw_handle() as _, 1) };
     if success == 0 {
         Err(io::Error::last_os_error())
     } else {

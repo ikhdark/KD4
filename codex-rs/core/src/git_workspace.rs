@@ -31,7 +31,10 @@ use codex_git_utils::get_head_commit_hash;
 use codex_otel::MetricsClient;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use futures::FutureExt;
 use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::future::Shared;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -191,21 +194,88 @@ pub(crate) struct WorkspaceEvidenceIdentity {
     pub(crate) worktree_identity: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum WorkspaceEvidenceGitDependency {
+    Head,
+    Index,
+    Worktree,
+    Untracked,
+}
+
+impl WorkspaceEvidenceGitDependency {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Head => "head",
+            Self::Index => "index",
+            Self::Worktree => "worktree",
+            Self::Untracked => "untracked",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WorkspaceEvidenceCapture {
+    pub(crate) identity: Option<WorkspaceEvidenceIdentity>,
+    pub(crate) timed_out_git_dependencies: Vec<WorkspaceEvidenceGitDependency>,
+}
+
+#[derive(Debug)]
+enum CandidateGitOutput {
+    Output(Vec<u8>),
+    Failed,
+    TimedOut,
+}
+
+impl CandidateGitOutput {
+    fn into_output(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Output(output) => Some(output),
+            Self::Failed | Self::TimedOut => None,
+        }
+    }
+}
+
 pub(crate) async fn capture_workspace_evidence_identity(
     cwd: &Path,
 ) -> Option<WorkspaceEvidenceIdentity> {
     let repo_root = get_git_repo_root(cwd)?;
-    stable_workspace_capture(|| capture_candidate_diff_once(&repo_root))
+    stable_workspace_capture(|| capture_candidate_diff_once(&repo_root, None))
         .await
         .map(|capture| capture.workspace_evidence_identity())
 }
 
-pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCapture> {
-    let repo_root = get_git_repo_root(cwd)?;
-    stable_workspace_capture(|| capture_candidate_diff_once(&repo_root)).await
+async fn capture_workspace_evidence_identity_with_attribution(
+    cwd: &Path,
+) -> WorkspaceEvidenceCapture {
+    let Some(repo_root) = get_git_repo_root(cwd) else {
+        return WorkspaceEvidenceCapture::default();
+    };
+    let timed_out_git_dependencies = StdMutex::new(BTreeSet::new());
+    let identity = stable_workspace_capture(|| {
+        capture_candidate_diff_once(&repo_root, Some(&timed_out_git_dependencies))
+    })
+    .await
+    .map(|capture| capture.workspace_evidence_identity());
+    let timed_out_git_dependencies = timed_out_git_dependencies
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .into_iter()
+        .collect();
+    WorkspaceEvidenceCapture {
+        identity,
+        timed_out_git_dependencies,
+    }
 }
 
-async fn capture_candidate_diff_once(repo_root: &Path) -> Option<CandidateDiffCapture> {
+pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCapture> {
+    let repo_root = get_git_repo_root(cwd)?;
+    stable_workspace_capture(|| capture_candidate_diff_once(&repo_root, None)).await
+}
+
+async fn capture_candidate_diff_once(
+    repo_root: &Path,
+    timed_out_git_dependencies: Option<&StdMutex<BTreeSet<WorkspaceEvidenceGitDependency>>>,
+) -> Option<CandidateDiffCapture> {
     let (head, index_capture, worktree_capture, untracked) = tokio::join!(
         candidate_git_output(repo_root, &["rev-parse", "--verify", "HEAD"]),
         candidate_git_output(
@@ -250,6 +320,19 @@ async fn capture_candidate_diff_once(repo_root: &Path) -> Option<CandidateDiffCa
             ],
         ),
     );
+    let timed_out = candidate_git_timeouts(&head, &index_capture, &worktree_capture, &untracked);
+    if !timed_out.is_empty()
+        && let Some(recorded) = timed_out_git_dependencies
+    {
+        recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(timed_out);
+    }
+    let head = head.into_output();
+    let index_capture = index_capture.into_output();
+    let worktree_capture = worktree_capture.into_output();
+    let untracked = untracked.into_output();
     let (index_paths, index_diff) = candidate_diff_and_paths(index_capture?)?;
     let (worktree_paths, worktree_diff) = candidate_diff_and_paths(worktree_capture?)?;
     let untracked = untracked?;
@@ -289,6 +372,25 @@ async fn capture_candidate_diff_once(repo_root: &Path) -> Option<CandidateDiffCa
         changed_paths,
         raw_diff,
     })
+}
+
+fn candidate_git_timeouts(
+    head: &CandidateGitOutput,
+    index: &CandidateGitOutput,
+    worktree: &CandidateGitOutput,
+    untracked: &CandidateGitOutput,
+) -> Vec<WorkspaceEvidenceGitDependency> {
+    [
+        (WorkspaceEvidenceGitDependency::Head, head),
+        (WorkspaceEvidenceGitDependency::Index, index),
+        (WorkspaceEvidenceGitDependency::Worktree, worktree),
+        (WorkspaceEvidenceGitDependency::Untracked, untracked),
+    ]
+    .into_iter()
+    .filter_map(|(dependency, output)| {
+        matches!(output, CandidateGitOutput::TimedOut).then_some(dependency)
+    })
+    .collect()
 }
 
 fn candidate_diff_and_paths(mut output: Vec<u8>) -> Option<(Vec<String>, Vec<u8>)> {
@@ -418,7 +520,7 @@ async fn candidate_untracked_manifest(
     .ok()?
 }
 
-async fn candidate_git_output(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+async fn candidate_git_output(repo_root: &Path, args: &[&str]) -> CandidateGitOutput {
     let mut command = Command::new("git");
     command
         .arg("-c")
@@ -428,11 +530,12 @@ async fn candidate_git_output(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>
         .env("GIT_OPTIONAL_LOCKS", "0")
         .current_dir(repo_root)
         .kill_on_drop(true);
-    let output = timeout(GIT_DEPENDENCY_TIMEOUT, command.output())
-        .await
-        .ok()?
-        .ok()?;
-    output.status.success().then_some(output.stdout)
+    match timeout(GIT_DEPENDENCY_TIMEOUT, command.output()).await {
+        Err(_) => CandidateGitOutput::TimedOut,
+        Ok(Err(_)) => CandidateGitOutput::Failed,
+        Ok(Ok(output)) if output.status.success() => CandidateGitOutput::Output(output.stdout),
+        Ok(Ok(_)) => CandidateGitOutput::Failed,
+    }
 }
 
 impl GitWorkspaceMetadataSource {
@@ -513,6 +616,25 @@ struct CachedWorkspaceEvidenceIdentity {
     identity: Option<WorkspaceEvidenceIdentity>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WorkspaceEvidenceCaptureKey {
+    repo_root: PathBuf,
+    watcher_generation: u64,
+    host_mutation_generation: u64,
+}
+
+#[derive(Clone)]
+struct InFlightWorkspaceEvidenceCapture {
+    capture_sequence: u64,
+    future: Shared<BoxFuture<'static, WorkspaceEvidenceCapture>>,
+}
+
+#[cfg(test)]
+struct WorkspaceEvidenceCapturePause {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 pub(crate) struct GitWorkspaceCache {
     state: Mutex<GitWorkspaceCacheState>,
     watcher_epoch: u64,
@@ -523,9 +645,15 @@ pub(crate) struct GitWorkspaceCache {
     source_watch_registrations: StdMutex<HashMap<PathBuf, WatchRegistration>>,
     source_change_journal: StdMutex<SourceChangeJournal>,
     latest_workspace_evidence: StdMutex<HashMap<PathBuf, CachedWorkspaceEvidenceIdentity>>,
+    in_flight_workspace_evidence:
+        StdMutex<HashMap<WorkspaceEvidenceCaptureKey, InFlightWorkspaceEvidenceCapture>>,
     workspace_evidence_capture_sequence: AtomicU64,
     #[cfg(test)]
     workspace_evidence_capture_count: AtomicU64,
+    #[cfg(test)]
+    next_workspace_evidence_capture_pause: StdMutex<Option<Arc<WorkspaceEvidenceCapturePause>>>,
+    #[cfg(test)]
+    workspace_evidence_waiter_joined: tokio::sync::Notify,
     #[cfg(test)]
     root_resolution_count: AtomicU64,
 }
@@ -599,9 +727,14 @@ impl GitWorkspaceCache {
             source_watch_registrations: StdMutex::new(HashMap::new()),
             source_change_journal: StdMutex::new(SourceChangeJournal::default()),
             latest_workspace_evidence: StdMutex::new(HashMap::new()),
+            in_flight_workspace_evidence: StdMutex::new(HashMap::new()),
             workspace_evidence_capture_sequence: AtomicU64::new(0),
             #[cfg(test)]
             workspace_evidence_capture_count: AtomicU64::new(0),
+            #[cfg(test)]
+            next_workspace_evidence_capture_pause: StdMutex::new(None),
+            #[cfg(test)]
+            workspace_evidence_waiter_joined: tokio::sync::Notify::new(),
             #[cfg(test)]
             root_resolution_count: AtomicU64::new(0),
         });
@@ -644,50 +777,111 @@ impl GitWorkspaceCache {
         &self,
         cwd: &Path,
     ) -> Option<WorkspaceEvidenceIdentity> {
-        #[cfg(test)]
-        self.workspace_evidence_capture_count
-            .fetch_add(1, Ordering::AcqRel);
-        let capture_sequence = self
-            .workspace_evidence_capture_sequence
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
-        let identity = capture_workspace_evidence_identity(cwd).await;
-        let repo_root = identity
-            .as_ref()
-            .and_then(|identity| identity.repository_root.as_deref())
-            .map(Path::new)
-            .map(canonical_workspace_evidence_root)
-            .or_else(|| self.cached_workspace_evidence_root(cwd));
-        if let Some(repo_root) = repo_root {
-            let mut latest = self
-                .latest_workspace_evidence
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if latest
-                .get(&repo_root)
-                .is_none_or(|cached| cached.capture_sequence <= capture_sequence)
-            {
-                latest.insert(
-                    repo_root,
-                    CachedWorkspaceEvidenceIdentity {
-                        capture_sequence,
-                        identity: identity.clone(),
-                    },
-                );
-            }
-        }
-        identity
+        self.workspace_evidence_identity_with_attribution(cwd)
+            .await
+            .identity
     }
 
-    fn cached_workspace_evidence_root(&self, cwd: &Path) -> Option<PathBuf> {
-        let cwd = canonical_workspace_evidence_root(cwd);
-        self.latest_workspace_evidence
+    pub(crate) async fn workspace_evidence_identity_with_attribution(
+        &self,
+        cwd: &Path,
+    ) -> WorkspaceEvidenceCapture {
+        let Some(repo_root) = get_git_repo_root(cwd)
+            .as_deref()
+            .map(canonical_workspace_evidence_root)
+        else {
+            return WorkspaceEvidenceCapture::default();
+        };
+        let key = WorkspaceEvidenceCaptureKey {
+            repo_root: repo_root.clone(),
+            watcher_generation: self.watcher_generation.load(Ordering::Acquire),
+            host_mutation_generation: self.host_mutation_generation.load(Ordering::Acquire),
+        };
+        let (in_flight_capture, coalesced) = {
+            let mut in_flight = self
+                .in_flight_workspace_evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A newer local observation epoch must never join an older
+            // capture. Dropping the map's old shared future is cancellation
+            // safe because every active caller owns its own clone, and keeps
+            // abandoned epochs bounded to one entry per repository.
+            in_flight.retain(|existing_key, _| {
+                existing_key.repo_root != repo_root || existing_key == &key
+            });
+            match in_flight.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => (entry.get().clone(), true),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let capture_sequence = self
+                        .workspace_evidence_capture_sequence
+                        .fetch_add(1, Ordering::AcqRel)
+                        .saturating_add(1);
+                    #[cfg(test)]
+                    self.workspace_evidence_capture_count
+                        .fetch_add(1, Ordering::AcqRel);
+                    #[cfg(test)]
+                    let pause = self
+                        .next_workspace_evidence_capture_pause
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    let capture_repo_root = repo_root.clone();
+                    let future = async move {
+                        #[cfg(test)]
+                        if let Some(pause) = pause {
+                            pause.started.notify_one();
+                            pause.release.notified().await;
+                        }
+                        capture_workspace_evidence_identity_with_attribution(&capture_repo_root)
+                            .await
+                    }
+                    .boxed()
+                    .shared();
+                    let capture = InFlightWorkspaceEvidenceCapture {
+                        capture_sequence,
+                        future,
+                    };
+                    entry.insert(capture.clone());
+                    (capture, false)
+                }
+            }
+        };
+        #[cfg(test)]
+        if coalesced {
+            self.workspace_evidence_waiter_joined.notify_one();
+        }
+        #[cfg(not(test))]
+        let _ = coalesced;
+        let capture = in_flight_capture.future.await;
+        {
+            let mut in_flight = self
+                .in_flight_workspace_evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if in_flight.get(&key).is_some_and(|current| {
+                current.capture_sequence == in_flight_capture.capture_sequence
+            }) {
+                in_flight.remove(&key);
+            }
+        }
+        let capture_sequence = in_flight_capture.capture_sequence;
+        let mut latest = self
+            .latest_workspace_evidence
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .filter(|repo_root| cwd.starts_with(repo_root))
-            .max_by_key(|repo_root| repo_root.components().count())
-            .cloned()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if latest
+            .get(&repo_root)
+            .is_none_or(|cached| cached.capture_sequence <= capture_sequence)
+        {
+            latest.insert(
+                repo_root,
+                CachedWorkspaceEvidenceIdentity {
+                    capture_sequence,
+                    identity: capture.identity.clone(),
+                },
+            );
+        }
+        capture
     }
 
     /// Returns the most recent authoritative identity already captured for a
@@ -710,6 +904,19 @@ impl GitWorkspaceCache {
     pub(crate) fn workspace_evidence_capture_count(&self) -> u64 {
         self.workspace_evidence_capture_count
             .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn pause_next_workspace_evidence_capture(&self) -> Arc<WorkspaceEvidenceCapturePause> {
+        let pause = Arc::new(WorkspaceEvidenceCapturePause {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self
+            .next_workspace_evidence_capture_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&pause));
+        pause
     }
 
     pub(crate) async fn snapshot(

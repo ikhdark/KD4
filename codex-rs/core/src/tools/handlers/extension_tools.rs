@@ -199,6 +199,7 @@ async fn to_extension_call(
             crate::tools::context::ToolCallSource::CodeMode {
                 cell_id,
                 runtime_tool_call_id,
+                ..
             } => ExtensionToolCallSource::CodeMode {
                 cell_id: cell_id.clone(),
                 runtime_tool_call_id: runtime_tool_call_id.clone(),

@@ -25,6 +25,7 @@ use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
 use codex_protocol::items::AgentMessageContent;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::ModelsResponse;
@@ -36,6 +37,7 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
@@ -87,6 +89,90 @@ async fn consecutive_turn_contexts_share_the_unchanged_picker_snapshot() {
         &first_turn.available_models,
         &second_turn.available_models
     ));
+}
+
+#[tokio::test]
+async fn sampling_prompt_workspace_capture_is_skipped_without_workspace_evidence() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let git_workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+    let client_session = session.services.model_client.new_session();
+    let mut history = ContextManager::new();
+    let user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "ordinary conversation".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_items([&user_message], TruncationPolicy::Tokens(10_000));
+
+    let _prepared =
+        prepare_sampling_prompt_for_client(history, &turn_context, &client_session, &git_workspace)
+            .await;
+
+    assert_eq!(git_workspace.workspace_evidence_capture_count(), 0);
+}
+
+#[tokio::test]
+async fn sampling_prompt_workspace_capture_is_skipped_for_non_workspace_code_mode_exec() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let git_workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+    let client_session = session.services.model_client.new_session();
+    let mut history = ContextManager::new();
+    let call_id = "non-workspace-code-mode";
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "functions.exec".to_string(),
+        namespace: None,
+        arguments: "await tools.list_mcp_resources({})".to_string(),
+        call_id: call_id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text("resources".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.register_non_workspace_code_mode_call(call_id.to_string());
+    history.record_items([&call, &output], TruncationPolicy::Tokens(10_000));
+
+    let _prepared =
+        prepare_sampling_prompt_for_client(history, &turn_context, &client_session, &git_workspace)
+            .await;
+
+    assert_eq!(git_workspace.workspace_evidence_capture_count(), 0);
+}
+
+#[tokio::test]
+async fn sampling_prompt_workspace_capture_is_preserved_for_workspace_evidence() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let git_workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+    let client_session = session.services.model_client.new_session();
+    let mut history = ContextManager::new();
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "functions.exec".to_string(),
+        namespace: None,
+        arguments: r#"{"cmd":"git status --short"}"#.to_string(),
+        call_id: "workspace-call".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "workspace-call".to_string(),
+        output: FunctionCallOutputPayload::from_text("clean".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_items([&call, &output], TruncationPolicy::Tokens(10_000));
+
+    let _prepared =
+        prepare_sampling_prompt_for_client(history, &turn_context, &client_session, &git_workspace)
+            .await;
+
+    assert_eq!(git_workspace.workspace_evidence_capture_count(), 1);
 }
 
 #[tokio::test]
@@ -149,6 +235,113 @@ fn kd4_latency_continuation_prefetch_rejects_stale_or_steered_state() {
     assert!(continuation_workspace_prefetch_is_current(7, 7, false));
     assert!(!continuation_workspace_prefetch_is_current(7, 8, false));
     assert!(!continuation_workspace_prefetch_is_current(7, 7, true));
+}
+
+#[tokio::test]
+async fn kd4_latency_continuation_prefetch_skips_non_workspace_eager_read() {
+    let (_, turn_context) = crate::session::tests::make_session_and_context().await;
+    let git_workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let mut history = ContextManager::new();
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "list_mcp_resources".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "non-workspace-read".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "non-workspace-read".to_string(),
+        output: FunctionCallOutputPayload::from_text("resources".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_items([&call, &output], TruncationPolicy::Tokens(10_000));
+
+    let prefetch = start_continuation_workspace_prefetch(
+        &history,
+        &turn_diff_tracker,
+        Arc::clone(&git_workspace),
+        turn_context.config.cwd.clone(),
+    )
+    .await;
+
+    assert!(prefetch.is_none());
+    assert_eq!(git_workspace.workspace_evidence_capture_count(), 0);
+}
+
+#[tokio::test]
+async fn continuation_prefetch_skips_non_workspace_code_mode_exec() {
+    let (_, turn_context) = crate::session::tests::make_session_and_context().await;
+    let git_workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let mut history = ContextManager::new();
+    let call_id = "non-workspace-code-mode-prefetch";
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "functions.exec".to_string(),
+        namespace: None,
+        arguments: "await tools.list_mcp_resources({})".to_string(),
+        call_id: call_id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text("resources".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.register_non_workspace_code_mode_call(call_id.to_string());
+    history.record_items([&call, &output], TruncationPolicy::Tokens(10_000));
+
+    let prefetch = start_continuation_workspace_prefetch(
+        &history,
+        &turn_diff_tracker,
+        Arc::clone(&git_workspace),
+        turn_context.config.cwd.clone(),
+    )
+    .await;
+
+    assert!(prefetch.is_none());
+    assert_eq!(git_workspace.workspace_evidence_capture_count(), 0);
+}
+
+#[tokio::test]
+async fn kd4_latency_continuation_prefetch_preserves_workspace_evidence_read() {
+    let (_, turn_context) = crate::session::tests::make_session_and_context().await;
+    let git_workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let mut history = ContextManager::new();
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "functions.exec".to_string(),
+        namespace: None,
+        arguments: r#"{"cmd":"git status --short"}"#.to_string(),
+        call_id: "workspace-read".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "workspace-read".to_string(),
+        output: FunctionCallOutputPayload::from_text("clean".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_items([&call, &output], TruncationPolicy::Tokens(10_000));
+
+    let (_, handle) = start_continuation_workspace_prefetch(
+        &history,
+        &turn_diff_tracker,
+        Arc::clone(&git_workspace),
+        turn_context.config.cwd.clone(),
+    )
+    .await
+    .expect("workspace evidence should start a continuation prefetch");
+    let _ = handle
+        .await
+        .expect("continuation workspace prefetch should join");
+
+    assert_eq!(git_workspace.workspace_evidence_capture_count(), 1);
 }
 
 #[test]
@@ -281,6 +474,145 @@ fn proven_loop_terminal_generation_ends_unless_new_input_arrives() {
 
     assert!(!generation_needs_follow_up(&request, true, false));
     assert!(generation_needs_follow_up(&request, false, true));
+}
+
+#[test]
+fn passed_evidence_forces_the_next_parent_generation_tool_free() {
+    let ordinary_request = GenerationRequestDisposition {
+        purpose: Some(TurnTimingGenerationPurpose::ArtifactContinuation),
+        sampling: SamplingGenerationDisposition::DecisionBearing,
+        relevant_state_fingerprint: "current-state".to_string(),
+        failure_fingerprint: Some("current-failure".to_string()),
+        terminal_completion_only: false,
+    };
+
+    let (terminal_request, fallback) = evidence_driven_terminal_request(
+        ordinary_request.clone(),
+        1,
+        /*has_pending_input*/ false,
+        /*completion_proved*/ true,
+    );
+    assert!(terminal_request.terminal_completion_only);
+    assert_eq!(
+        terminal_request.purpose,
+        Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning)
+    );
+    assert_eq!(fallback, Some(ordinary_request.clone()));
+    assert!(!generation_needs_follow_up(
+        &terminal_request,
+        /*model_needs_follow_up*/ true,
+        /*has_pending_input*/ false,
+    ));
+
+    for (generation_ordinal, has_pending_input, completion_proved) in
+        [(0, false, true), (1, true, true), (1, false, false)]
+    {
+        let (request, fallback) = evidence_driven_terminal_request(
+            ordinary_request.clone(),
+            generation_ordinal,
+            has_pending_input,
+            completion_proved,
+        );
+        assert_eq!(request, ordinary_request);
+        assert_eq!(fallback, None);
+    }
+}
+
+#[test]
+fn logical_generation_budget_allows_eight_regular_and_one_terminal_generation() {
+    let mut budget = LogicalGenerationBudget::default();
+    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
+        assert_eq!(
+            budget.admit(/*terminal_requested*/ false),
+            LogicalGenerationAdmission::Regular
+        );
+    }
+    assert_eq!(
+        budget.admit(/*terminal_requested*/ false),
+        LogicalGenerationAdmission::Terminal { forced: true }
+    );
+    assert_eq!(
+        budget.admit(/*terminal_requested*/ false),
+        LogicalGenerationAdmission::Exhausted
+    );
+}
+
+#[test]
+fn logical_generation_budget_terminal_attempt_is_exactly_once() {
+    let mut budget = LogicalGenerationBudget::default();
+    assert_eq!(
+        budget.admit(/*terminal_requested*/ true),
+        LogicalGenerationAdmission::Terminal { forced: false }
+    );
+    assert_eq!(
+        budget.admit(/*terminal_requested*/ true),
+        LogicalGenerationAdmission::Exhausted
+    );
+}
+
+#[tokio::test]
+async fn lightweight_terminal_prompt_contract_removes_tools_and_parallel_dispatch() {
+    let (_, turn_context) = crate::session::tests::make_session_and_context().await;
+    let registry = ToolRegistry::from_tools(std::iter::empty::<
+        Arc<dyn crate::tools::registry::CoreToolRuntime>,
+    >());
+    let router = ToolRouter::from_parts(
+        registry,
+        vec![codex_tools::ToolSpec::Function(
+            codex_tools::ResponsesApiTool {
+                name: "read_only_probe".to_string(),
+                description: "probe".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::object(
+                    Default::default(),
+                    None,
+                    Some(false.into()),
+                ),
+                output_schema: None,
+            },
+        )],
+    );
+    let mut prompt = build_prompt(
+        Vec::<ResponseItem>::new(),
+        &router,
+        &turn_context,
+        BaseInstructions::default(),
+    );
+    assert!(!prompt.tools.specs().is_empty());
+
+    enforce_terminal_prompt_contract(&mut prompt, /*terminal_completion_only*/ true);
+
+    assert!(prompt.tools.specs().is_empty());
+    assert!(!prompt.parallel_tool_calls);
+}
+
+#[test]
+fn structured_action_change_compares_the_full_generation_disposition() {
+    let request = GenerationRequestDisposition {
+        purpose: Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning),
+        sampling: SamplingGenerationDisposition::DecisionBearing,
+        relevant_state_fingerprint: "state-a".to_string(),
+        failure_fingerprint: None,
+        terminal_completion_only: false,
+    };
+
+    assert!(!generation_request_action_changed(&request, None));
+    assert!(!generation_request_action_changed(&request, Some(&request)));
+
+    let mut changed_state = request.clone();
+    changed_state.relevant_state_fingerprint = "state-b".to_string();
+    assert!(generation_request_action_changed(
+        &request,
+        Some(&changed_state)
+    ));
+
+    let mut changed_terminal_contract = request.clone();
+    changed_terminal_contract.terminal_completion_only = true;
+    assert!(generation_request_action_changed(
+        &request,
+        Some(&changed_terminal_contract)
+    ));
 }
 
 #[test]
@@ -2138,7 +2470,7 @@ fn controlled_tool_call(
 }
 
 #[tokio::test(start_paused = true)]
-async fn eager_tool_poll_overlaps_a_controlled_response_tail_without_changing_results() {
+async fn eligible_direct_tool_calls_overlap_a_response_tail_without_changing_results() {
     const RESPONSE_TAIL: Duration = Duration::from_millis(250);
     let baseline_item_accepted = tokio::time::Instant::now();
     let (baseline_first_poll_tx, mut baseline_first_poll_rx) = tokio::sync::oneshot::channel();
@@ -2280,7 +2612,7 @@ async fn eager_tool_results_remain_in_call_order_after_reverse_completion() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn eager_tool_failure_is_observed_only_after_response_streaming_finishes() {
+async fn eager_tool_failure_can_be_collected_before_response_streaming_finishes() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let future: BoxFuture<'static, CodexResult<ResponseInputItem>> = Box::pin(async move {
@@ -2295,13 +2627,15 @@ async fn eager_tool_failure_is_observed_only_after_response_streaming_finishes()
     )));
 
     started_rx.await.expect("eager tool should start");
-    tokio::time::advance(Duration::from_millis(250)).await;
-    let response_tail_finished = true;
-    assert!(response_tail_finished);
+    let (tail_finished_tx, mut tail_finished_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let _ = tail_finished_tx.send(());
+    });
 
     release_tx
         .send(())
-        .expect("failed eager tool should remain attached until collection drain");
+        .expect("failed eager tool should remain attached until collection");
     let error = in_flight
         .next()
         .await
@@ -2309,6 +2643,10 @@ async fn eager_tool_failure_is_observed_only_after_response_streaming_finishes()
         .result
         .expect_err("synthetic tool should fail");
     assert!(error.to_string().contains("synthetic eager tool failure"));
+    assert!(matches!(
+        tail_finished_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
 }
 
 struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);

@@ -101,6 +101,7 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
     let cell_state = Arc::new(CellState::new(CancellationToken::new()));
     let host = RuntimeCellHost {
         cell_id: CellId::new("terminating-writer"),
+        parent_tool_call_id: "parent-call".to_string(),
         inner: Arc::clone(&runtime.inner),
         cell_permit: Mutex::new(None),
     };

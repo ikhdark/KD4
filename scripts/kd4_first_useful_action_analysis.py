@@ -14,9 +14,10 @@ except ImportError:
     from rollout_snapshot import RolloutSnapshot
 
 
-CANONICAL_TIMING_SCHEMA_VERSION = 20
-CONTROL_ONLY_TOOLS = frozenset(
+CANONICAL_TIMING_SCHEMA_VERSION = 25
+INFRASTRUCTURE_TOOLS = frozenset(
     {
+        "exec",
         "update_plan",
         "request_user_input",
         "request_permissions",
@@ -26,6 +27,9 @@ CONTROL_ONLY_TOOLS = frozenset(
         "write_stdin",
     }
 )
+TOOL_DISCOVERY_TOOLS = frozenset(
+    {"tool_search", "list_mcp_resources", "list_mcp_resource_templates"}
+)
 
 
 def _tool_basename(name: str) -> str:
@@ -33,7 +37,12 @@ def _tool_basename(name: str) -> str:
 
 
 def is_useful_tool(name: str) -> bool:
-    return bool(name) and _tool_basename(name) not in CONTROL_ONLY_TOOLS
+    basename = _tool_basename(name)
+    return (
+        bool(name)
+        and basename not in INFRASTRUCTURE_TOOLS
+        and basename not in TOOL_DISCOVERY_TOOLS
+    )
 
 
 def _timestamp_ms(value: object) -> float | None:
@@ -162,7 +171,7 @@ def analyze_snapshots(snapshots: Sequence[RolloutSnapshot]) -> dict[str, Any]:
                     isinstance(schema_version, int)
                     and schema_version >= CANONICAL_TIMING_SCHEMA_VERSION
                     and isinstance(milestones, dict)
-                    and isinstance(milestones.get("firstUsefulActionMs"), (int, float))
+                    and isinstance(milestones.get("firstDomainActionMs"), (int, float))
                 ):
                     canonical_rows.append(
                         {
@@ -229,6 +238,24 @@ def analyze_snapshots(snapshots: Sequence[RolloutSnapshot]) -> dict[str, Any]:
         "startToFirstUsefulActionMs": _summary(
             row["firstUsefulActionMs"] for row in canonical_rows
         ),
+        "startToFirstInfrastructureActionMs": _summary(
+            row["firstInfrastructureActionMs"]
+            for row in canonical_rows
+            if "firstInfrastructureActionMs" in row
+        ),
+        "startToFirstToolDiscoveryActionMs": _summary(
+            row["firstToolDiscoveryActionMs"]
+            for row in canonical_rows
+            if "firstToolDiscoveryActionMs" in row
+        ),
+        "startToFirstDomainActionMs": _summary(
+            row["firstDomainActionMs"] for row in canonical_rows
+        ),
+        "startToFirstSuccessfulDomainActionMs": _summary(
+            row["firstSuccessfulDomainActionMs"]
+            for row in canonical_rows
+            if "firstSuccessfulDomainActionMs" in row
+        ),
         "usefulExecutionToSuccessMs": _summary(
             value
             for row in canonical_rows
@@ -253,11 +280,11 @@ def analyze_snapshots(snapshots: Sequence[RolloutSnapshot]) -> dict[str, Any]:
         "schemaVersion": 1,
         "measurementContract": {
             "canonical": (
-                "timing schema 20+: authorized non-control handler entry, with accepted, "
-                "gate, input, and successful-completion phase boundaries"
+                "timing schema 25+: separate authorized infrastructure, tool-discovery, "
+                "domain, and successful-domain handler boundaries"
             ),
             "legacy": (
-                "rollout event reconstruction: first non-control tool emitted by the model; "
+                "rollout event reconstruction: first domain tool emitted by the model; "
                 "not handler entry and not a runtime benchmark"
             ),
         },

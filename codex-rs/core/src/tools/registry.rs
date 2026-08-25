@@ -1209,7 +1209,9 @@ impl ToolRegistry {
         let lifecycle_outcome = match &result {
             Ok(result) => match result.outcome_for_logging() {
                 ToolOutputOutcome::Skipped => ToolCallOutcome::Skipped,
-                ToolOutputOutcome::Success => ToolCallOutcome::Completed { success: true },
+                ToolOutputOutcome::Success | ToolOutputOutcome::Yielded => {
+                    ToolCallOutcome::Completed { success: true }
+                }
                 ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut => {
                     ToolCallOutcome::Completed { success: false }
                 }
@@ -1382,7 +1384,8 @@ fn projection_admission_required(
     force_inline_carrier: bool,
 ) -> bool {
     projection_is_provider_visible(source)
-        && !generic_projection_is_exempt(tool_name, force_inline_carrier)
+        && (crate::tools::code_mode::is_exec_tool_name(tool_name)
+            || !generic_projection_is_exempt(tool_name, force_inline_carrier))
 }
 
 async fn notify_tool_finish_if_unclaimed(
@@ -1552,9 +1555,15 @@ fn prepare_model_projection(
 ) -> Option<ModelProjectionInput> {
     // Exact artifact reads are already bounded and must never recursively spill.
     // Code mode also performs its own coherent outer projection after merging
-    // native nested results. Re-projecting `functions.exec` here discards the
-    // nested tools' typed packet and creates a generic recovery artifact.
-    if generic_projection_is_exempt(&invocation.tool_name, force_inline_carrier) {
+    // native nested results. Keep the first `functions.exec` result byte-for-byte
+    // provider-visible, but admit it to completed-tool history so later
+    // generations can replace consumed output with an exact-artifact receipt.
+    let admit_code_mode_output = crate::tools::code_mode::is_exec_tool_name(&invocation.tool_name)
+        && !force_inline_carrier
+        && track_for_admission;
+    if generic_projection_is_exempt(&invocation.tool_name, force_inline_carrier)
+        && !admit_code_mode_output
+    {
         return None;
     }
 
@@ -1569,6 +1578,11 @@ fn prepare_model_projection(
             admission_fallback_metadata(&original_response, result.result.outcome_for_logging())
         })?
     })?;
+    // A yielded cell still owns a live handle that the model may need on the
+    // next generation. Only terminal code-mode output is safe to retire.
+    if admit_code_mode_output && metadata.outcome == ToolOutputOutcome::Yielded {
+        return None;
+    }
     let spillable_text = metadata.spillable_text.join("\n");
     if spillable_text.is_empty() && preserved_content.is_empty() && metadata.fragments.is_empty() {
         return None;
@@ -1577,6 +1591,7 @@ fn prepare_model_projection(
         ToolOutputOutcome::Success => OutputOutcome::Success,
         ToolOutputOutcome::Failure => OutputOutcome::Failure,
         ToolOutputOutcome::TimedOut => OutputOutcome::TimedOut,
+        ToolOutputOutcome::Yielded => OutputOutcome::Success,
         ToolOutputOutcome::Skipped => OutputOutcome::Skipped,
     };
     let diagnostic_class = match metadata.diagnostic_class {
@@ -1613,6 +1628,8 @@ fn prepare_model_projection(
     }
     let materialization = if force_inline_carrier {
         ProjectionMaterialization::InlineCarrier
+    } else if admit_code_mode_output {
+        ProjectionMaterialization::AdmissionOnly
     } else if needs_canonical_artifact {
         ProjectionMaterialization::CanonicalArtifact
     } else {
@@ -1703,7 +1720,9 @@ fn prepare_model_projection(
         match metadata.outcome {
             ToolOutputOutcome::Failure => "tool_failure",
             ToolOutputOutcome::TimedOut => "tool_timeout",
-            ToolOutputOutcome::Success | ToolOutputOutcome::Skipped => "tool_output",
+            ToolOutputOutcome::Success
+            | ToolOutputOutcome::Yielded
+            | ToolOutputOutcome::Skipped => "tool_output",
         }
     };
     let source_dependencies = resolve_projection_source_dependencies(
@@ -2301,6 +2320,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         ToolOutputOutcome::Success => "success",
         ToolOutputOutcome::Failure => "failure",
         ToolOutputOutcome::TimedOut => "timeout",
+        ToolOutputOutcome::Yielded => "yielded",
         ToolOutputOutcome::Skipped => "skipped",
     };
     if materialization == ProjectionMaterialization::InlineCarrier {

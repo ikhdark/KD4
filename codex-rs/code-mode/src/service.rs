@@ -221,6 +221,7 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
             .invoke_tool(
                 CodeModeNestedToolCall {
                     cell_id: protocol_cell_id(&invocation.cell_id),
+                    parent_tool_call_id: Some(invocation.parent_tool_call_id),
                     runtime_tool_call_id: invocation.runtime_tool_call_id,
                     tool_name: codex_protocol::ToolName {
                         name: invocation.tool_name.name,

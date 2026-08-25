@@ -41,6 +41,11 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
                         record(
                             "2026-08-17T00:00:07Z",
                             "response_item",
+                            {"type": "tool_search_call", "execution": "client"},
+                        ),
+                        record(
+                            "2026-08-17T00:00:08Z",
+                            "response_item",
                             {"type": "function_call", "name": "exec_command"},
                         ),
                         record(
@@ -62,10 +67,10 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
         )
         self.assertEqual(
             result["legacyReconstructed"]["userInputEventToUsefulToolEmittedMs"]["p50"],
-            3000.0,
+            4000.0,
         )
 
-    def test_schema_20_uses_canonical_phase_boundaries(self) -> None:
+    def test_schema_25_uses_separate_action_class_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "rollout.jsonl"
             path.write_text(
@@ -82,13 +87,17 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
                             {
                                 "type": "task_complete",
                                 "timing": {
-                                    "schemaVersion": 20,
+                                    "schemaVersion": 25,
                                     "milestones": {
                                         "userInputRecordedMs": 100,
                                         "firstUsefulToolAcceptedMs": 250,
                                         "firstUsefulToolGateAdmittedMs": 280,
                                         "firstUsefulActionMs": 320,
                                         "firstSuccessfulUsefulActionMs": 500,
+                                        "firstInfrastructureActionMs": 120,
+                                        "firstToolDiscoveryActionMs": 220,
+                                        "firstDomainActionMs": 320,
+                                        "firstSuccessfulDomainActionMs": 500,
                                     },
                                 },
                             },
@@ -112,9 +121,26 @@ class FirstUsefulActionAnalysisTest(unittest.TestCase):
         self.assertEqual(
             result["canonical"]["usefulExecutionToSuccessMs"]["p50"], 180.0
         )
+        self.assertEqual(
+            result["canonical"]["startToFirstInfrastructureActionMs"]["p50"],
+            120.0,
+        )
+        self.assertEqual(
+            result["canonical"]["startToFirstToolDiscoveryActionMs"]["p50"],
+            220.0,
+        )
+        self.assertEqual(
+            result["canonical"]["startToFirstDomainActionMs"]["p50"], 320.0
+        )
+        self.assertEqual(
+            result["canonical"]["startToFirstSuccessfulDomainActionMs"]["p50"],
+            500.0,
+        )
 
     def test_schema_19_field_is_not_treated_as_canonical(self) -> None:
         self.assertFalse(analysis.is_useful_tool("functions.wait_agent"))
+        self.assertFalse(analysis.is_useful_tool("functions.exec"))
+        self.assertFalse(analysis.is_useful_tool("functions.tool_search"))
         self.assertTrue(analysis.is_useful_tool("functions.exec_command"))
 
 

@@ -545,6 +545,7 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
         | StableContextKind::Wait
         | StableContextKind::DynamicHistory
         | StableContextKind::TaskModelGuidance
+        | StableContextKind::TaskEvidence
         | StableContextKind::ModelSwitch
         | StableContextKind::Personality => PromptContextCategory::OtherInjected,
     }

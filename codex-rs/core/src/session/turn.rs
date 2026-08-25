@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -92,6 +93,7 @@ use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item_with_finalized_facts;
+use crate::task_evidence::SamplingCompletionToken;
 use crate::tasks::TurnTaskResult;
 use crate::tasks::completion_review::CompletionReviewTurnEvidence;
 use crate::tasks::emit_compact_metric;
@@ -183,6 +185,7 @@ use codex_utils_stream_parser::ProposedPlanSegment;
 use codex_utils_stream_parser::extract_proposed_plan_text;
 use codex_utils_stream_parser::strip_citations;
 use futures::future::BoxFuture;
+use futures::future::Either;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use tokio_util::sync::CancellationToken;
@@ -234,9 +237,13 @@ pub(crate) async fn prepare_sampling_prompt_for_client(
     _client_session: &ModelClientSession,
     git_workspace: &crate::git_workspace::GitWorkspaceCache,
 ) -> PreparedPromptInput {
-    let workspace_identity = git_workspace
-        .workspace_evidence_identity(turn_context.config.cwd.as_path())
-        .await;
+    let workspace_identity = if history.requires_workspace_evidence_validation() {
+        git_workspace
+            .workspace_evidence_identity(turn_context.config.cwd.as_path())
+            .await
+    } else {
+        None
+    };
     prepare_sampling_prompt_with_workspace_identity(
         history,
         turn_context,
@@ -274,6 +281,27 @@ fn continuation_workspace_prefetch_is_current(
     accepted_user_input: bool,
 ) -> bool {
     baseline_mutation_revision == current_mutation_revision && !accepted_user_input
+}
+
+async fn start_continuation_workspace_prefetch(
+    history: &ContextManager,
+    turn_diff_tracker: &Arc<tokio::sync::Mutex<TurnDiffTracker>>,
+    git_workspace: Arc<crate::git_workspace::GitWorkspaceCache>,
+    cwd: codex_utils_absolute_path::AbsolutePathBuf,
+) -> Option<(
+    u64,
+    AbortOnDropHandle<Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
+)> {
+    if !history.requires_workspace_evidence_validation() {
+        return None;
+    }
+    let baseline_mutation_revision = turn_diff_tracker.lock().await.current_mutation_revision();
+    let handle = AbortOnDropHandle::new(tokio::spawn(async move {
+        git_workspace
+            .workspace_evidence_identity(cwd.as_path())
+            .await
+    }));
+    Some((baseline_mutation_revision, handle))
 }
 
 pub(crate) async fn run_turn(
@@ -397,11 +425,16 @@ pub(crate) async fn run_turn(
     let mut stop_hook_active = false;
     let mut pending_continuation_cause = None;
     let mut pending_generation_request: Option<GenerationRequestDisposition> = None;
+    let mut pending_evidence_terminal_request: Option<(
+        GenerationRequestDisposition,
+        SamplingCompletionToken,
+    )> = None;
     let mut prefetched_workspace_identity: Option<
         Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
     > = None;
     let mut has_started_generation = false;
     let mut logical_generation_ordinal = 0_u32;
+    let mut logical_generation_budget = LogicalGenerationBudget::default();
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
@@ -459,7 +492,7 @@ pub(crate) async fn run_turn(
             )
         };
         let request_signals = reasoning_governor.collector(&request_baselines);
-        let generation_request = pending_generation_request.take().unwrap_or_else(|| {
+        let mut generation_request = pending_generation_request.take().unwrap_or_else(|| {
             if !has_started_generation {
                 reasoning_governor.initial_generation_request(&request_baselines)
             } else {
@@ -490,6 +523,26 @@ pub(crate) async fn run_turn(
                 }
             }
         });
+        if let Some((ordinary_request, token)) = pending_evidence_terminal_request.take()
+            && (recorded_input.accepted_user_input
+                || !sess
+                    .services
+                    .task_evidence
+                    .sampling_completion_token_is_current(&token)
+                    .await)
+        {
+            generation_request = ordinary_request;
+        }
+        let generation_budget_admission =
+            logical_generation_budget.admit(generation_request.terminal_completion_only);
+        let budget_forced_terminal = match generation_budget_admission {
+            LogicalGenerationAdmission::Regular => false,
+            LogicalGenerationAdmission::Terminal { forced } => {
+                generation_request = generation_request.require_terminal_completion();
+                forced
+            }
+            LogicalGenerationAdmission::Exhausted => break 'sampling_loop,
+        };
         has_started_generation = true;
         let generation_id = ModelGenerationId {
             turn_id: turn_context.sub_id.clone(),
@@ -604,6 +657,12 @@ pub(crate) async fn run_turn(
                     model_needs_follow_up,
                     has_pending_input,
                 );
+                if budget_forced_terminal {
+                    // The budget grants one final tool-free synthesis request.
+                    // Queued input remains in the mailbox for the next turn;
+                    // it must not reopen this exhausted sampling loop.
+                    needs_follow_up = false;
+                }
                 let progress_kinds =
                     request_signals.progress_kinds(&request_baselines, &settled_state);
                 let convergence_decision = if needs_follow_up && !has_pending_input {
@@ -646,6 +705,32 @@ pub(crate) async fn run_turn(
                     next_generation_request = next_generation_request
                         .map(GenerationRequestDisposition::require_terminal_completion);
                 }
+                if let Some(request) = next_generation_request.take() {
+                    let completion_token = if generation_id.ordinal > 0
+                        && !has_pending_input
+                        && !request.terminal_completion_only
+                        && !request.completes_protocol_turn_deterministically()
+                    {
+                        sess.services
+                            .task_evidence
+                            .sampling_completion_token()
+                            .await
+                    } else {
+                        None
+                    };
+                    let (scheduled_request, ordinary_request) = evidence_driven_terminal_request(
+                        request,
+                        generation_id.ordinal,
+                        has_pending_input,
+                        completion_token.is_some(),
+                    );
+                    next_generation_request = Some(scheduled_request);
+                    if let (Some(ordinary_request), Some(token)) =
+                        (ordinary_request, completion_token)
+                    {
+                        pending_evidence_terminal_request = Some((ordinary_request, token));
+                    }
+                }
                 if next_generation_request
                     .as_ref()
                     .is_some_and(
@@ -660,9 +745,10 @@ pub(crate) async fn run_turn(
                 }
                 turn_context.turn_timing_state.record_generation_outcome(
                     progress_kinds.clone(),
-                    next_generation_request
-                        .as_ref()
-                        .is_some_and(|next| next.purpose != generation_request.purpose),
+                    generation_request_action_changed(
+                        &generation_request,
+                        next_generation_request.as_ref(),
+                    ),
                     progress_kinds.is_empty(),
                 );
                 pending_generation_request = next_generation_request;
@@ -1183,6 +1269,42 @@ fn authoritative_wait_terminal_surface(
     }
 }
 
+const MAX_REGULAR_LOGICAL_GENERATIONS: u32 = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogicalGenerationAdmission {
+    Regular,
+    Terminal { forced: bool },
+    Exhausted,
+}
+
+#[derive(Default)]
+struct LogicalGenerationBudget {
+    regular_generations: u32,
+    terminal_generation_used: bool,
+}
+
+impl LogicalGenerationBudget {
+    fn admit(&mut self, terminal_requested: bool) -> LogicalGenerationAdmission {
+        if terminal_requested {
+            if self.terminal_generation_used {
+                return LogicalGenerationAdmission::Exhausted;
+            }
+            self.terminal_generation_used = true;
+            return LogicalGenerationAdmission::Terminal { forced: false };
+        }
+        if self.regular_generations < MAX_REGULAR_LOGICAL_GENERATIONS {
+            self.regular_generations = self.regular_generations.saturating_add(1);
+            return LogicalGenerationAdmission::Regular;
+        }
+        if self.terminal_generation_used {
+            return LogicalGenerationAdmission::Exhausted;
+        }
+        self.terminal_generation_used = true;
+        LogicalGenerationAdmission::Terminal { forced: true }
+    }
+}
+
 fn generation_needs_follow_up(
     generation_request: &GenerationRequestDisposition,
     model_needs_follow_up: bool,
@@ -1193,6 +1315,38 @@ fn generation_needs_follow_up(
     } else {
         model_needs_follow_up || has_pending_input
     }
+}
+
+fn evidence_driven_terminal_request(
+    request: GenerationRequestDisposition,
+    generation_ordinal: u32,
+    has_pending_input: bool,
+    completion_proved: bool,
+) -> (
+    GenerationRequestDisposition,
+    Option<GenerationRequestDisposition>,
+) {
+    if generation_ordinal == 0
+        || has_pending_input
+        || !completion_proved
+        || request.terminal_completion_only
+        || request.completes_protocol_turn_deterministically()
+    {
+        return (request, None);
+    }
+
+    let ordinary_request = request.clone();
+    (
+        request.require_terminal_completion(),
+        Some(ordinary_request),
+    )
+}
+
+fn generation_request_action_changed(
+    generation_request: &GenerationRequestDisposition,
+    next_generation_request: Option<&GenerationRequestDisposition>,
+) -> bool {
+    next_generation_request.is_some_and(|next| next != generation_request)
 }
 
 async fn record_completion_review_partial_reason(sess: &Session, reason: String) {
@@ -2867,15 +3021,24 @@ async fn run_sampling_request(
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
+    let terminal_completion_only = generation_request.terminal_completion_only;
     // Deferred schemas are leased to one model request. Record the set that
     // was already active before dispatch; discovery performed by tools in this
     // request creates new activations that must remain available to the next
     // continuation and therefore are not part of this release set.
-    let advertised_deferred_tools = turn_context.activated_deferred_tools();
-    let _advertised_deferred_tool_lease =
-        AdvertisedDeferredToolLease::new(Arc::clone(&turn_context), advertised_deferred_tools);
+    let _advertised_deferred_tool_lease = (!terminal_completion_only).then(|| {
+        let advertised_deferred_tools = turn_context.activated_deferred_tools();
+        AdvertisedDeferredToolLease::new(Arc::clone(&turn_context), advertised_deferred_tools)
+    });
     let cached_router = prebuilt_router.take();
     let router = match cached_router {
+        Some(router) if terminal_completion_only => {
+            // A terminal continuation advertises no tools, so exposure drift
+            // cannot affect this request. Reuse the already-finalized router
+            // only as a defensive sink for an invalid model-emitted tool call.
+            turn_context.turn_timing_state.record_tool_router_reuse();
+            router
+        }
         Some(router)
             if finalized_router_matches_current_exposure(
                 sess.as_ref(),
@@ -2920,10 +3083,12 @@ async fn run_sampling_request(
     // still rebuild while ordinary tool continuations reuse the same registry.
     *prebuilt_router = Some(Arc::clone(&router));
     let base_instructions = sess.get_base_instructions().await;
-    sess.persist_rollout_items(&[codex_protocol::protocol::RolloutItem::ToolManifest(
-        router.tool_manifest(turn_context.as_ref()),
-    )])
-    .await;
+    if !terminal_completion_only {
+        sess.persist_rollout_items(&[codex_protocol::protocol::RolloutItem::ToolManifest(
+            router.tool_manifest(turn_context.as_ref()),
+        )])
+        .await;
+    }
 
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&sess),
@@ -2931,12 +3096,14 @@ async fn run_sampling_request(
         Arc::clone(&turn_diff_tracker),
     )
     .with_sampling_request_signals(request_signals.clone());
-    let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
-        &sess,
-        Arc::clone(&step_context),
-        Arc::clone(&turn_diff_tracker),
-        request_signals,
-    );
+    let _code_mode_worker = (!terminal_completion_only).then(|| {
+        sess.services.code_mode_service.start_turn_worker(
+            &sess,
+            Arc::clone(&step_context),
+            Arc::clone(&turn_diff_tracker),
+            request_signals,
+        )
+    });
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
     let mut accepted_attempt_input = prepared_input.shared_items();
@@ -2950,10 +3117,8 @@ async fn run_sampling_request(
         step_context.as_ref(),
         base_instructions.clone(),
     );
-    if generation_request.terminal_completion_only {
-        prompt.tools = Arc::new(ToolSchemaArtifact::default());
-        prompt.parallel_tool_calls = false;
-    }
+    enforce_terminal_prompt_contract(&mut prompt, terminal_completion_only);
+    let mut accepted_prompt_fingerprint = prepared_input.fingerprint();
     drop(prompt_construction_guard);
     turn_context
         .turn_timing_state
@@ -3031,15 +3196,29 @@ async fn run_sampling_request(
                 sess.services.git_workspace.as_ref(),
             )
             .await;
-            accepted_attempt_input = retry_input.shared_items();
-            prompt = build_projected_prompt(
-                sess.as_ref(),
-                &retry_input,
-                router.as_ref(),
-                step_context.as_ref(),
-                base_instructions.clone(),
-            );
+            let retry_fingerprint = retry_input.fingerprint();
+            let prompt_is_proven_unchanged = accepted_prompt_fingerprint.is_some()
+                && retry_fingerprint == accepted_prompt_fingerprint;
+            if !prompt_is_proven_unchanged {
+                accepted_attempt_input = retry_input.shared_items();
+                prompt = build_projected_prompt(
+                    sess.as_ref(),
+                    &retry_input,
+                    router.as_ref(),
+                    step_context.as_ref(),
+                    base_instructions.clone(),
+                );
+                enforce_terminal_prompt_contract(&mut prompt, terminal_completion_only);
+                accepted_prompt_fingerprint = retry_fingerprint;
+            }
         }
+    }
+}
+
+fn enforce_terminal_prompt_contract(prompt: &mut Prompt, terminal_completion_only: bool) {
+    if terminal_completion_only {
+        prompt.tools = Arc::new(ToolSchemaArtifact::default());
+        prompt.parallel_tool_calls = false;
     }
 }
 
@@ -3058,7 +3237,6 @@ async fn finalized_router_matches_current_exposure(
 ) -> bool {
     let current = DynamicToolExposureIdentity {
         agent_surface_stage: agent_surface_stage(sess, step_context.turn.as_ref()),
-        wait_available: sess.services.code_mode_service.has_waitable_cells(),
         extension_tool_surface_revision: extension_tool_surface_revision(sess),
         mcp_resources_available: step_context
             .mcp
@@ -3308,7 +3486,6 @@ async fn derive_tool_exposure_identity(
     )
     .direct_entrypoints;
     let agent_surface_stage = agent_surface_stage(sess, turn_context);
-    let wait_available = sess.services.code_mode_service.has_waitable_cells();
     let goal_surface_state = goal_surface_state(extension_tool_executors);
     let extension_tool_surface_revision = extension_tool_surface_revision(sess);
     let mcp_resources_available = step_context
@@ -3329,7 +3506,6 @@ async fn derive_tool_exposure_identity(
     ToolExposureIdentity {
         selected_skill_direct_mcp_entrypoints,
         agent_surface_stage,
-        wait_available,
         goal_surface_state,
         extension_tool_surface_revision,
         mcp_resources_available,
@@ -3898,8 +4074,20 @@ async fn handle_assistant_item_done_in_plan_mode(
     false
 }
 
+#[cfg(test)]
 #[instrument(level = "trace", skip_all)]
 async fn drain_in_flight(
+    in_flight: &mut FuturesOrdered<BoxFuture<'static, InFlightToolResult>>,
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+) -> CodexResult<()> {
+    let mut completed = VecDeque::new();
+    drain_in_flight_with_buffer(&mut completed, in_flight, sess, turn_context).await
+}
+
+#[instrument(level = "trace", skip_all)]
+async fn drain_in_flight_with_buffer(
+    completed: &mut VecDeque<InFlightToolResult>,
     in_flight: &mut FuturesOrdered<BoxFuture<'static, InFlightToolResult>>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -3907,21 +4095,23 @@ async fn drain_in_flight(
     let mut first_error = None;
     let mut active_without_pending_passes = 0_u8;
     loop {
+        let pending_tool_count = completed.len().saturating_add(in_flight.len());
         let reason = reconcile_turn_progress(
             &turn_context.turn_timing_state,
-            in_flight.len(),
+            pending_tool_count,
             &mut active_without_pending_passes,
         );
         turn_context
             .turn_timing_state
             .record_next_sample_block_reason(reason);
-        trace!(
-            ?reason,
-            pending_tool_count = in_flight.len(),
-            "tool relay reconciliation"
-        );
-        let Some(completion) = in_flight.next().await else {
-            break;
+        trace!(?reason, pending_tool_count, "tool relay reconciliation");
+        let completion = if let Some(completion) = completed.pop_front() {
+            completion
+        } else {
+            let Some(completion) = in_flight.next().await else {
+                break;
+            };
+            completion
         };
         if completion.execution_id != *completion.timing.execution_id() {
             let err = CodexErr::Fatal(format!(
@@ -3936,6 +4126,16 @@ async fn drain_in_flight(
             }
             continue;
         }
+        completion
+            .timing
+            .mark_relay_delivery(&completion.execution_id);
+        turn_context
+            .turn_timing_state
+            .update_tool_dispatch_lifecycle(
+                &completion.call_id,
+                &completion.execution_id,
+                completion.timing.snapshot(tokio::time::Instant::now()),
+            );
         match completion.result {
             Ok(response_input) => {
                 let response_item = response_input.into();
@@ -3976,38 +4176,18 @@ async fn drain_in_flight(
                     &response_item,
                 )
                 .await;
-                completion
-                    .timing
-                    .mark_relay_delivery(&completion.execution_id);
-                turn_context
-                    .turn_timing_state
-                    .update_tool_dispatch_lifecycle(
-                        &completion.call_id,
-                        &completion.execution_id,
-                        completion.timing.snapshot(tokio::time::Instant::now()),
-                    );
                 record_reconciliation(
                     &turn_context.turn_timing_state,
-                    in_flight.len(),
+                    completed.len().saturating_add(in_flight.len()),
                     &mut active_without_pending_passes,
                     "relay delivery",
                 );
             }
             Err(err) => {
                 error!("in-flight tool future failed during drain: {err}");
-                completion
-                    .timing
-                    .mark_relay_delivery(&completion.execution_id);
-                turn_context
-                    .turn_timing_state
-                    .update_tool_dispatch_lifecycle(
-                        &completion.call_id,
-                        &completion.execution_id,
-                        completion.timing.snapshot(tokio::time::Instant::now()),
-                    );
                 record_reconciliation(
                     &turn_context.turn_timing_state,
-                    in_flight.len(),
+                    completed.len().saturating_add(in_flight.len()),
                     &mut active_without_pending_passes,
                     "relay error delivery",
                 );
@@ -4441,6 +4621,7 @@ async fn try_run_sampling_request(
     let attempt_identity = stream.attempt_identity().cloned();
     let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
         FuturesOrdered::new();
+    let mut completed_in_flight = VecDeque::new();
     let mut earlier_tool_calls_eligible = true;
     let mut all_tool_calls_eager_read_eligible = true;
     let mut continuation_workspace_prefetch = None;
@@ -4503,12 +4684,35 @@ async fn try_run_sampling_request(
 
         let model_stream_wait_timing_guard =
             turn_context.turn_timing_state.begin_model_stream_wait();
-        let stream_event = stream
-            .next()
-            .instrument(trace_span!(parent: &handle_responses, "receiving"))
-            .or_cancel(&cancellation_token)
-            .await;
+        let stream_event = if in_flight.is_empty() {
+            Either::Left(
+                stream
+                    .next()
+                    .instrument(trace_span!(parent: &handle_responses, "receiving"))
+                    .or_cancel(&cancellation_token)
+                    .await,
+            )
+        } else {
+            tokio::select! {
+                event = stream
+                    .next()
+                    .instrument(trace_span!(parent: &handle_responses, "receiving"))
+                    .or_cancel(&cancellation_token) => Either::Left(event),
+                completion = in_flight.next() => Either::Right(completion),
+            }
+        };
         drop(model_stream_wait_timing_guard);
+        let stream_event = match stream_event {
+            Either::Left(stream_event) => stream_event,
+            Either::Right(Some(completion)) => {
+                // Poll eager work while the provider is still streaming, but
+                // defer model-visible delivery until the response has closed.
+                // FuturesOrdered makes this buffer provider-call ordered.
+                completed_in_flight.push_back(completion);
+                continue;
+            }
+            Either::Right(None) => continue,
+        };
         let event = match stream_event {
             Ok(event) => event,
             Err(codex_async_utils::CancelErr::Cancelled) => break Err(CodexErr::TurnAborted),
@@ -4820,16 +5024,14 @@ async fn try_run_sampling_request(
                     server_end_turn_false = true;
                 }
                 if needs_follow_up && !in_flight.is_empty() && all_tool_calls_eager_read_eligible {
-                    let baseline_mutation_revision =
-                        turn_diff_tracker.lock().await.current_mutation_revision();
-                    let git_workspace = Arc::clone(&sess.services.git_workspace);
-                    let cwd = turn_context.config.cwd.clone();
-                    let handle = AbortOnDropHandle::new(tokio::spawn(async move {
-                        git_workspace
-                            .workspace_evidence_identity(cwd.as_path())
-                            .await
-                    }));
-                    continuation_workspace_prefetch = Some((baseline_mutation_revision, handle));
+                    let history = sess.clone_history().await;
+                    continuation_workspace_prefetch = start_continuation_workspace_prefetch(
+                        &history,
+                        &turn_diff_tracker,
+                        Arc::clone(&sess.services.git_workspace),
+                        turn_context.config.cwd.clone(),
+                    )
+                    .await;
                 }
                 break Ok(UnsettledSamplingRequestResult {
                     needs_follow_up,
@@ -4998,12 +5200,18 @@ async fn try_run_sampling_request(
     )
     .await;
 
-    let tool_blocking_timing_guard = if in_flight.is_empty() {
+    let tool_blocking_timing_guard = if in_flight.is_empty() && completed_in_flight.is_empty() {
         None
     } else {
         Some(turn_context.turn_timing_state.begin_tool_blocking())
     };
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    drain_in_flight_with_buffer(
+        &mut completed_in_flight,
+        &mut in_flight,
+        sess.clone(),
+        turn_context.clone(),
+    )
+    .await?;
     drop(tool_blocking_timing_guard);
 
     let terminal = {

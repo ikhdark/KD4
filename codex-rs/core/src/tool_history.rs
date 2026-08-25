@@ -316,6 +316,11 @@ pub(crate) struct ToolHistoryState {
     candidates: BTreeMap<String, ToolHistoryCandidate>,
     #[serde(default)]
     workspace_evidence: BTreeMap<String, WorkspaceEvidenceObservation>,
+    /// Current runtimes record completed code-mode carriers that authoritatively
+    /// contained no workspace-observing nested calls. Absence remains unknown
+    /// for legacy ledgers and therefore fails closed.
+    #[serde(default)]
+    non_workspace_code_mode_calls: BTreeSet<String>,
     #[serde(skip)]
     artifact_call_ids: BTreeMap<String, String>,
 }
@@ -485,6 +490,11 @@ impl ToolHistoryState {
             .or_insert(observation);
     }
 
+    pub(crate) fn register_non_workspace_code_mode_call(&mut self, call_id: String) {
+        self.workspace_evidence.remove(&call_id);
+        self.non_workspace_code_mode_calls.insert(call_id);
+    }
+
     #[cfg(test)]
     pub(crate) fn consumed_outputs_for_tool(&self, tool_identity: &str) -> Vec<(String, String)> {
         self.candidates
@@ -585,6 +595,10 @@ impl ToolHistoryState {
             unreplaced_items: projected,
             substitutions: Arc::from([]),
         }
+    }
+
+    pub(crate) fn requires_workspace_evidence_validation(&self, items: &[ResponseItem]) -> bool {
+        !self.workspace_evidence_requirements(items).is_empty()
     }
 
     fn project_inner(
@@ -934,58 +948,7 @@ impl ToolHistoryState {
         workspace_identity: Option<&WorkspaceEvidenceIdentity>,
         git_workspace: Option<&GitWorkspaceCache>,
     ) {
-        let mut requirements = BTreeMap::<String, String>::new();
-        for item in items.iter() {
-            let (name, arguments, call_id) = match item {
-                ResponseItem::FunctionCall {
-                    name,
-                    arguments,
-                    call_id,
-                    ..
-                } => (name, arguments, call_id),
-                ResponseItem::CustomToolCall {
-                    name,
-                    input,
-                    call_id,
-                    ..
-                } => (name, input, call_id),
-                _ => continue,
-            };
-            // Code-mode's `functions.exec` carrier can contain repository
-            // reads even though the carrier itself is not a host executable.
-            // Explicitly registered evidence is authoritative for any other
-            // tool whose current classifier no longer exposes that detail.
-            let call_observes_workspace =
-                name == "functions.exec" || tool_call_observes_workspace_parts(name, arguments);
-            if call_observes_workspace || self.workspace_evidence.contains_key(call_id) {
-                requirements.insert(call_id.clone(), call_id.clone());
-                continue;
-            }
-            if name != "read_tool_output" {
-                continue;
-            }
-            let Some(artifact_id) = read_tool_output_artifact_id(arguments) else {
-                continue;
-            };
-            let origin = self
-                .artifact_call_ids
-                .get(&artifact_id)
-                .and_then(|call_id| self.candidates.get(call_id));
-            match origin {
-                Some(candidate)
-                    if candidate.tool_identity == "functions.exec"
-                        || self.workspace_evidence.contains_key(&candidate.call_id) =>
-                {
-                    requirements.insert(call_id.clone(), candidate.call_id.clone());
-                }
-                Some(_) => {}
-                None => {
-                    // Legacy or missing provenance cannot safely establish that recovered
-                    // output was independent of the workspace revision.
-                    requirements.insert(call_id.clone(), call_id.clone());
-                }
-            };
-        }
+        let requirements = self.workspace_evidence_requirements(items);
 
         for item in items.iter_mut() {
             let Some((call_id, body)) = textual_output_body_mut(item) else {
@@ -1030,6 +993,68 @@ impl ToolHistoryState {
         }
     }
 
+    fn workspace_evidence_requirements(&self, items: &[ResponseItem]) -> BTreeMap<String, String> {
+        let mut requirements = BTreeMap::<String, String>::new();
+        for item in items.iter() {
+            let (name, arguments, call_id) = match item {
+                ResponseItem::FunctionCall {
+                    name,
+                    arguments,
+                    call_id,
+                    ..
+                } => (name, arguments, call_id),
+                ResponseItem::CustomToolCall {
+                    name,
+                    input,
+                    call_id,
+                    ..
+                } => (name, input, call_id),
+                _ => continue,
+            };
+            // Code-mode's `functions.exec` carrier can contain repository
+            // reads even though the carrier itself is not a host executable.
+            // Explicitly registered evidence is authoritative for any other
+            // tool whose current classifier no longer exposes that detail.
+            let code_mode_workspace_state_unknown = name == "functions.exec"
+                && !self.non_workspace_code_mode_calls.contains(call_id)
+                && !self.workspace_evidence.contains_key(call_id);
+            let call_observes_workspace = code_mode_workspace_state_unknown
+                || tool_call_observes_workspace_parts(name, arguments);
+            if call_observes_workspace || self.workspace_evidence.contains_key(call_id) {
+                requirements.insert(call_id.clone(), call_id.clone());
+                continue;
+            }
+            if name != "read_tool_output" {
+                continue;
+            }
+            let Some(artifact_id) = read_tool_output_artifact_id(arguments) else {
+                continue;
+            };
+            let origin = self
+                .artifact_call_ids
+                .get(&artifact_id)
+                .and_then(|call_id| self.candidates.get(call_id));
+            match origin {
+                Some(candidate)
+                    if (candidate.tool_identity == "functions.exec"
+                        && !self
+                            .non_workspace_code_mode_calls
+                            .contains(&candidate.call_id))
+                        || self.workspace_evidence.contains_key(&candidate.call_id) =>
+                {
+                    requirements.insert(call_id.clone(), candidate.call_id.clone());
+                }
+                Some(_) => {}
+                None => {
+                    // Legacy or missing provenance cannot safely establish that recovered
+                    // output was independent of the workspace revision.
+                    requirements.insert(call_id.clone(), call_id.clone());
+                }
+            };
+        }
+        requirements
+    }
+
     pub(crate) fn retain_for_history(&mut self, items: &[ResponseItem]) {
         let mut live = items
             .iter()
@@ -1069,6 +1094,8 @@ impl ToolHistoryState {
         self.candidates.retain(|call_id, _| live.contains(call_id));
         self.workspace_evidence
             .retain(|call_id, _| live.contains(call_id));
+        self.non_workspace_code_mode_calls
+            .retain(|call_id| live.contains(call_id));
         self.rebuild_artifact_index();
     }
 
@@ -1364,6 +1391,7 @@ pub(crate) async fn remint_tool_history_state_for_fork(
     state: ToolHistoryState,
 ) -> (ToolHistoryState, usize) {
     let workspace_evidence = state.workspace_evidence;
+    let non_workspace_code_mode_calls = state.non_workspace_code_mode_calls;
     let mut reminted_by_identity = BTreeMap::<(String, u64, String), String>::new();
     let mut reminted_candidates = BTreeMap::new();
     let mut dropped_candidates = 0_usize;
@@ -1412,6 +1440,7 @@ pub(crate) async fn remint_tool_history_state_for_fork(
     let mut reminted_state = ToolHistoryState {
         candidates: reminted_candidates,
         workspace_evidence,
+        non_workspace_code_mode_calls,
         artifact_call_ids: BTreeMap::new(),
     };
     reminted_state.rebuild_artifact_index();
@@ -1429,6 +1458,8 @@ pub(crate) async fn persist_tool_history_state(
         state,
     })
     .map_err(|err| format!("failed to serialize tool-history ledger: {err}"))?;
+    #[cfg(test)]
+    pause_tool_history_persistence_for_test_if_requested(thread_id).await;
     tokio::task::spawn_blocking(move || {
         let directory = path
             .parent()
@@ -1454,6 +1485,96 @@ pub(crate) async fn persist_tool_history_state(
     })
     .await
     .map_err(|err| format!("tool-history ledger writer failed: {err}"))?
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ToolHistoryPersistencePauseState {
+    thread_id: String,
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+pub(crate) struct ToolHistoryPersistencePause {
+    state: ToolHistoryPersistencePauseState,
+}
+
+#[cfg(test)]
+impl ToolHistoryPersistencePause {
+    pub(crate) async fn wait_until_reached(&self) {
+        self.state.reached.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ToolHistoryPersistencePause {
+    fn drop(&mut self) {
+        let slot = tool_history_persistence_pause_slot();
+        let mut pending = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(&pending.reached, &self.state.reached))
+        {
+            *pending = None;
+        }
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+fn tool_history_persistence_pause_slot()
+-> &'static std::sync::Mutex<Option<ToolHistoryPersistencePauseState>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<ToolHistoryPersistencePauseState>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn pause_next_tool_history_persistence_for_test(
+    thread_id: &str,
+) -> ToolHistoryPersistencePause {
+    let state = ToolHistoryPersistencePauseState {
+        thread_id: thread_id.to_string(),
+        reached: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let mut pending = tool_history_persistence_pause_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        pending.is_none(),
+        "only one tool-history persistence pause may be installed at a time"
+    );
+    *pending = Some(state.clone());
+    ToolHistoryPersistencePause { state }
+}
+
+#[cfg(test)]
+async fn pause_tool_history_persistence_for_test_if_requested(thread_id: &str) {
+    let pause = {
+        let mut pending = tool_history_persistence_pause_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.thread_id == thread_id)
+        {
+            pending.take()
+        } else {
+            None
+        }
+    };
+    if let Some(pause) = pause {
+        pause.reached.notify_one();
+        pause.release.notified().await;
+    }
 }
 
 fn ledger_path(codex_home: &std::path::Path, thread_id: &str) -> std::path::PathBuf {
@@ -2011,8 +2132,6 @@ fn workspace_call_observes_from_arguments(arguments: Option<&serde_json::Value>)
         && !crate::turn_diff_tracker::command_reads_repository_history(&command)
 }
 
-/// Returns whether a workspace-capable process call has an independently
-/// enforced read-only execution boundary and may use the shared gate.
 pub(crate) fn tool_call_is_proven_read_only(_tool_identity: &str, _payload: &ToolPayload) -> bool {
     // A command-name mutation heuristic cannot prove that launching a process
     // is side-effect-free: validation commands can run build scripts and an
