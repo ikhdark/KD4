@@ -494,6 +494,69 @@ catch {{
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Codex Desktop is unavailable", result.stdout)
 
+    def test_restart_activates_packaged_desktop_and_restores_process_env(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+function Get-CodexDesktopExecutableProof {{ return 'C:\Program Files\WindowsApps\OpenAI.Codex\app\Codex.exe' }}
+function Get-Process {{ return @() }}
+function Start-Process {{
+    param([string]$FilePath, [object[]]$ArgumentList)
+    $script:Launch = [pscustomobject]@{{
+        FilePath = $FilePath
+        Argument = [string]$ArgumentList[0]
+        CliPath = [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'Process')
+        CodexHome = [Environment]::GetEnvironmentVariable('CODEX_HOME', 'Process')
+        SqliteHome = [Environment]::GetEnvironmentVariable('CODEX_SQLITE_HOME', 'Process')
+    }}
+}}
+[Environment]::SetEnvironmentVariable('CODEX_CLI_PATH', 'before-cli', 'Process')
+[Environment]::SetEnvironmentVariable('CODEX_HOME', 'before-home', 'Process')
+[Environment]::SetEnvironmentVariable('CODEX_SQLITE_HOME', 'before-sqlite', 'Process')
+Restart-CodexDesktop `
+    -LocalCliPath 'C:\local\codex.exe' `
+    -LocalCodexHome 'C:\local\home' `
+    -LocalCodexSqliteHome 'C:\local\sqlite'
+[pscustomobject]@{{
+    Launch = $script:Launch
+    RestoredCliPath = [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'Process')
+    RestoredCodexHome = [Environment]::GetEnvironmentVariable('CODEX_HOME', 'Process')
+    RestoredSqliteHome = [Environment]::GetEnvironmentVariable('CODEX_SQLITE_HOME', 'Process')
+}} | ConvertTo-Json -Compress -Depth 3
+"""
+        result = subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+            env=clean_env(),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout.splitlines()[-1])
+        self.assertEqual(output["Launch"]["FilePath"], "explorer.exe")
+        self.assertEqual(
+            output["Launch"]["Argument"],
+            r"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App",
+        )
+        self.assertEqual(output["Launch"]["CliPath"], r"C:\local\codex.exe")
+        self.assertEqual(output["Launch"]["CodexHome"], r"C:\local\home")
+        self.assertEqual(output["Launch"]["SqliteHome"], r"C:\local\sqlite")
+        self.assertEqual(output["RestoredCliPath"], "before-cli")
+        self.assertEqual(output["RestoredCodexHome"], "before-home")
+        self.assertEqual(output["RestoredSqliteHome"], "before-sqlite")
+
     def test_noop_restart_failure_is_terminal_after_committed_publish(self) -> None:
         publish_script = publish_source_text()
         noop_branch = publish_script.split("if (-not $binaryChanged) {", 1)[1].split(

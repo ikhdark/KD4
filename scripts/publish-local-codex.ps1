@@ -2104,17 +2104,41 @@ function Restart-CodexDesktop {
         throw "Codex Desktop did not exit before restart."
     }
 
-    if ([string]::IsNullOrWhiteSpace($LocalCliPath)) {
-        Start-Process $desktopPath | Out-Null
+    $previousProcessEnvironment = @{}
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($LocalCliPath)) {
+            foreach ($entry in @(
+                    @{ Name = "CODEX_CLI_PATH"; Value = $LocalCliPath },
+                    @{ Name = "CODEX_HOME"; Value = $LocalCodexHome },
+                    @{ Name = "CODEX_SQLITE_HOME"; Value = $LocalCodexSqliteHome }
+                )) {
+                $previousProcessEnvironment[$entry.Name] = [Environment]::GetEnvironmentVariable(
+                    $entry.Name,
+                    "Process"
+                )
+                [Environment]::SetEnvironmentVariable(
+                    $entry.Name,
+                    [string]$entry.Value,
+                    "Process"
+                )
+            }
+        }
+
+        # Packaged WindowsApps executables cannot be started directly with
+        # UseShellExecute=false. Activate Desktop through its AppUserModelID.
+        Start-Process `
+            -FilePath "explorer.exe" `
+            -ArgumentList "shell:AppsFolder\$CodexDesktopAppId" |
+            Out-Null
     }
-    else {
-        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-        $startInfo.FileName = $desktopPath
-        $startInfo.UseShellExecute = $false
-        $startInfo.Environment["CODEX_CLI_PATH"] = $LocalCliPath
-        $startInfo.Environment["CODEX_HOME"] = $LocalCodexHome
-        $startInfo.Environment["CODEX_SQLITE_HOME"] = $LocalCodexSqliteHome
-        [System.Diagnostics.Process]::Start($startInfo) | Out-Null
+    finally {
+        foreach ($name in $previousProcessEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable(
+                $name,
+                $previousProcessEnvironment[$name],
+                "Process"
+            )
+        }
     }
     Write-ProofLine "desktopRestart" "restarted"
 }
