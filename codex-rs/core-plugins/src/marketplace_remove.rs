@@ -343,7 +343,6 @@ mod tests {
         assert!(!config.contains("[marketplaces.debug]"));
     }
 
-    #[cfg(windows)]
     #[test]
     fn remove_marketplace_commits_after_locked_root_is_staged() {
         use std::os::windows::fs::OpenOptionsExt;
@@ -366,19 +365,20 @@ mod tests {
         fs::create_dir_all(&installed_root).unwrap();
         let locked_file = installed_root.join("locked");
         fs::write(&locked_file, "locked").unwrap();
+        let staged_root = stage_marketplace_root(&installed_root).unwrap();
+        let staged_path = staged_root
+            .staged_root
+            .as_ref()
+            .expect("installed root should be staged");
         let _lock = fs::OpenOptions::new()
             .read(true)
             .share_mode(0x0000_0001 | 0x0000_0002)
-            .open(&locked_file)
+            .open(staged_path.join("locked"))
             .unwrap();
 
-        remove_marketplace_sync(
-            codex_home.path(),
-            MarketplaceRemoveRequest {
-                marketplace_name: "debug".to_string(),
-            },
-        )
-        .expect("staging is the removal commit point");
+        let config_outcome = remove_user_marketplace_config(codex_home.path(), "debug").unwrap();
+        assert_eq!(config_outcome, RemoveMarketplaceConfigOutcome::Removed);
+        staged_root.commit();
 
         assert!(!installed_root.exists());
         let config =

@@ -145,11 +145,7 @@ fn validate_direct_validation_values(
                 "validation covered path `{path}` must be a normalized repository-relative scope"
             ));
         }
-        let identity = if cfg!(windows) {
-            path.to_ascii_lowercase()
-        } else {
-            path.clone()
-        };
+        let identity = path.to_ascii_lowercase();
         if !seen.insert(identity) {
             return Err(format!(
                 "validation covered path `{path}` must not be duplicated"
@@ -265,6 +261,7 @@ mod tests {
             json!(["src//lib"]),
             json!(["src/./lib"]),
             json!(["src", "src"]),
+            json!(["src", "SRC"]),
         ] {
             assert!(
                 serde_json::from_value::<ValidationResult>(json!({

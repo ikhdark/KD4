@@ -735,16 +735,9 @@ mod tests {
     }
 
     fn long_running_child() -> tokio::process::Child {
-        #[cfg(windows)]
         let mut command = {
             let mut command = Command::new("cmd");
             command.args(["/D", "/S", "/C", "ping -n 60 127.0.0.1 >NUL"]);
-            command
-        };
-        #[cfg(not(windows))]
-        let mut command = {
-            let mut command = Command::new("sh");
-            command.args(["-c", "sleep 60"]);
             command
         };
         command

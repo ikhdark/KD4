@@ -10,6 +10,7 @@ use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
@@ -623,11 +624,7 @@ fn set_foreign_primary_environment(turn: &mut TurnContext) {
         ))
         .expect("remote test environment"),
     );
-    let foreign_cwd = if cfg!(windows) {
-        PathUri::parse("file:///tmp/codex-foreign-primary").expect("POSIX cwd URI")
-    } else {
-        PathUri::parse("file:///C:/codex-foreign-primary").expect("Windows cwd URI")
-    };
+    let foreign_cwd = PathUri::parse("file:///tmp/codex-foreign-primary").expect("POSIX cwd URI");
     let shell = turn.environments.turn_environments[0].shell.clone();
     turn.environments.turn_environments[0] = crate::session::turn_context::TurnEnvironment::new(
         "remote-primary".to_string(),
@@ -948,6 +945,7 @@ async fn foreign_primary_hides_exec_command_only_when_platform_sandboxing_is_req
     let sandboxed = probe(|turn| {
         set_foreign_primary_environment(turn);
         turn.permission_profile = PermissionProfile::workspace_write();
+        turn.windows_sandbox_level = WindowsSandboxLevel::RestrictedToken;
         set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
         turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
     })

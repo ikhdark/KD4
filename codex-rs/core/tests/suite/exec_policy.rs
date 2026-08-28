@@ -293,7 +293,7 @@ async fn assert_direct_argv_shell_name_is_opaque(unified_exec: bool) -> Result<(
     let program = test
         .config
         .cwd
-        .join(if cfg!(windows) { "bash.exe" } else { "bash" })
+        .join("bash.exe")
         .to_string_lossy()
         .into_owned();
     let command = vec![program.clone(), "-lc".to_string(), "ls".to_string()];
@@ -372,14 +372,40 @@ async fn assert_direct_argv_shell_name_is_opaque(unified_exec: bool) -> Result<(
     Ok(())
 }
 
-#[tokio::test]
-async fn authorization_identity_legacy_direct_argv_shell_name_is_opaque() -> Result<()> {
-    assert_direct_argv_shell_name_is_opaque(false).await
+fn run_direct_argv_shell_name_is_opaque(unified_exec: bool) -> Result<()> {
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
+    let test_name = if unified_exec {
+        "authorization_identity_unified_direct_argv_shell_name_is_opaque"
+    } else {
+        "authorization_identity_legacy_direct_argv_shell_name_is_opaque"
+    };
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(Box::pin(assert_direct_argv_shell_name_is_opaque(
+                unified_exec,
+            )))
+        })?;
+
+    match handle.join() {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
-#[tokio::test]
-async fn authorization_identity_unified_direct_argv_shell_name_is_opaque() -> Result<()> {
-    assert_direct_argv_shell_name_is_opaque(true).await
+#[test]
+fn authorization_identity_legacy_direct_argv_shell_name_is_opaque() -> Result<()> {
+    run_direct_argv_shell_name_is_opaque(false)
+}
+
+#[test]
+fn authorization_identity_unified_direct_argv_shell_name_is_opaque() -> Result<()> {
+    run_direct_argv_shell_name_is_opaque(true)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

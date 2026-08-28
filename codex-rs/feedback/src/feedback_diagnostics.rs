@@ -193,19 +193,18 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn collect_from_pairs_ignores_non_utf8_entries_without_inspecting_values() {
-        use std::os::unix::ffi::OsStringExt;
+        use std::os::windows::ffi::OsStringExt;
 
         let diagnostics = FeedbackDiagnostics::collect_from_pairs([
             (
-                std::ffi::OsString::from_vec(vec![0xff]),
+                std::ffi::OsString::from_wide(&[0xd800]),
                 std::ffi::OsString::from("unrelated"),
             ),
             (
                 std::ffi::OsString::from("HTTPS_PROXY"),
-                std::ffi::OsString::from_vec(vec![0xfe]),
+                std::ffi::OsString::from_wide(&[0xd801]),
             ),
         ]);
 

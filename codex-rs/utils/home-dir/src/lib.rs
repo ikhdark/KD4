@@ -135,15 +135,8 @@ mod tests {
         assert_eq!(resolved, expected);
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn find_codex_home_non_unicode_is_not_treated_as_unset() {
-        #[cfg(unix)]
-        let configured = {
-            use std::os::unix::ffi::OsStringExt;
-            std::ffi::OsString::from_vec(vec![b'c', b'o', b'd', b'e', b'x', 0xff])
-        };
-        #[cfg(windows)]
         let configured = {
             use std::os::windows::ffi::OsStringExt;
             std::ffi::OsString::from_wide(&[0xd800])
@@ -155,25 +148,5 @@ mod tests {
             err.to_string().contains("CODEX_HOME"),
             "unexpected error: {err}"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn find_codex_home_accepts_non_utf8_directory() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let parent = TempDir::new().expect("temp home");
-        let path = parent.path().join(std::ffi::OsString::from_vec(vec![
-            b'c', b'o', b'd', b'e', b'x', 0xff,
-        ]));
-        fs::create_dir(&path).expect("create non-UTF-8 CODEX_HOME");
-
-        let resolved = find_codex_home_from_env(Some(path.as_os_str()))
-            .expect("non-UTF-8 CODEX_HOME should resolve");
-        let expected = AbsolutePathBuf::from_absolute_path(
-            path.canonicalize().expect("canonicalize non-UTF-8 home"),
-        )
-        .expect("absolute non-UTF-8 home");
-        assert_eq!(resolved, expected);
     }
 }

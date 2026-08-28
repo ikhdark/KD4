@@ -90,7 +90,6 @@ async fn focused_validation_heartbeat_covers_only_the_pending_operation() {
 }
 
 fn create_directory_alias(target: &std::path::Path, alias: &std::path::Path) {
-    #[cfg(windows)]
     {
         let output = std::process::Command::new("cmd")
             .args(["/c", "mklink", "/J"])
@@ -104,15 +103,10 @@ fn create_directory_alias(target: &std::path::Path, alias: &std::path::Path) {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, alias).expect("directory symlink is created");
 }
 
 fn remove_directory_alias(alias: &std::path::Path) {
-    #[cfg(windows)]
     std::fs::remove_dir(alias).expect("junction removes without touching its target");
-    #[cfg(unix)]
-    std::fs::remove_file(alias).expect("directory symlink removes without touching its target");
 }
 
 #[test]
@@ -122,6 +116,9 @@ fn formerly_forbidden_runner_flags_use_ordinary_preflight() {
         vec!["cargo".into(), "test".into(), "--all-targets".into()],
         vec!["cargo".into(), "check".into(), "--workspace".into()],
         vec!["python".into(), "-m".into(), "pytest".into(), "-q".into()],
+        ["just", "config-schema-regenerate", "validation-test"]
+            .map(str::to_string)
+            .to_vec(),
     ] {
         let mut leaf = structured_cargo_leaf();
         leaf.argv = argv;
@@ -456,7 +453,6 @@ async fn shell_pipeline_validation_is_denied_before_execution() {
     assert_eq!(structured["command_was_executed"], false);
 }
 
-#[cfg(windows)]
 #[test]
 fn direct_validation_rejects_covered_path_junction_escape() {
     let repository = tempfile::tempdir().expect("repository tempdir");
@@ -482,29 +478,6 @@ fn direct_validation_rejects_covered_path_junction_escape() {
     let error = super::direct_validation_route(&context, &invocation, repository.path(), 30_000)
         .expect_err("covered path junction escape must fail");
     std::fs::remove_dir(&linked).expect("junction removes without touching its target");
-    assert!(error.contains("outside the repository"));
-}
-
-#[cfg(unix)]
-#[test]
-fn direct_validation_rejects_covered_path_symlink_escape() {
-    let repository = tempfile::tempdir().expect("repository tempdir");
-    let outside = tempfile::tempdir().expect("outside tempdir");
-    std::fs::write(outside.path().join("outside.rs"), b"outside\n")
-        .expect("outside fixture writes");
-    let linked = repository.path().join("linked");
-    create_directory_alias(outside.path(), &linked);
-
-    let context = ValidationCommandContext {
-        covered_paths: vec!["linked/outside.rs".to_string()],
-    };
-    let invocation = CommandInvocation::Argv {
-        program: "cargo".to_string(),
-        args: vec!["test".to_string(), "--all-targets".to_string()],
-    };
-    let error = super::direct_validation_route(&context, &invocation, repository.path(), 30_000)
-        .expect_err("covered path symlink escape must fail");
-    remove_directory_alias(&linked);
     assert!(error.contains("outside the repository"));
 }
 

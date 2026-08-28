@@ -219,7 +219,6 @@ fn test_inherit_all_with_default_excludes() {
     assert_eq!(result, expected);
 }
 
-#[cfg(windows)]
 #[test]
 fn test_core_inherit_respects_case_insensitive_names_on_windows() {
     let vars = make_vars(&[
@@ -247,7 +246,6 @@ fn test_core_inherit_respects_case_insensitive_names_on_windows() {
     assert_eq!(result, expected);
 }
 
-#[cfg(windows)]
 #[test]
 fn create_env_inserts_pathext_on_windows_when_missing() {
     let vars = make_vars(&[]);
@@ -266,7 +264,6 @@ fn create_env_inserts_pathext_on_windows_when_missing() {
     assert_eq!(result, expected);
 }
 
-#[cfg(windows)]
 #[test]
 fn create_env_preserves_existing_pathext_case_insensitively_on_windows() {
     let vars = make_vars(&[("PathExt", ".COM;.EXE;.BAT;.CMD;.PS1")]);

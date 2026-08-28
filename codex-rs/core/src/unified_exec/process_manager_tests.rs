@@ -1007,17 +1007,13 @@ async fn spawned_validation_survives_a_later_retry_launch_error() {
         Arc::clone(&turn),
         "call-unified-validation-retry-error".to_string(),
     );
-    let command = if cfg!(windows) {
-        vec![
-            "cmd.exe".to_string(),
-            "/D".to_string(),
-            "/S".to_string(),
-            "/C".to_string(),
-            "exit /b 126".to_string(),
-        ]
-    } else {
-        vec!["sh".to_string(), "-c".to_string(), "exit 126".to_string()]
-    };
+    let command = vec![
+        "cmd.exe".to_string(),
+        "/D".to_string(),
+        "/S".to_string(),
+        "/C".to_string(),
+        "exit /b 126".to_string(),
+    ];
     let mut request = ExecCommandRequest {
         command: command.clone(),
         command_for_safety: command.clone(),
@@ -1033,11 +1029,7 @@ async fn spawned_validation_survives_a_later_retry_launch_error() {
             owned_path: None,
             bytes: 0,
         },
-        shell_type: if cfg!(windows) {
-            crate::shell::ShellType::PowerShell
-        } else {
-            crate::shell::ShellType::Sh
-        },
+        shell_type: crate::shell::ShellType::PowerShell,
         shell_wrapper_is_owned: false,
         hook_command: command.join(" "),
         process_id: 125,

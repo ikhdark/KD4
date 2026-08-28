@@ -13085,11 +13085,7 @@ fn find_kd4_repo_root(cwd: &Path) -> Option<PathBuf> {
 fn path_is_same_or_descendant(path: &Path, root: &Path) -> bool {
     let normalized = |path: &Path| {
         let normalized = path.to_string_lossy().replace('\\', "/");
-        if cfg!(windows) {
-            normalized.to_ascii_lowercase()
-        } else {
-            normalized
-        }
+        normalized.to_ascii_lowercase()
     };
     let path = normalized(path);
     let root = normalized(root);
@@ -13792,11 +13788,7 @@ fn validation_paths_overlap(left: &str, right: &str) -> bool {
 }
 
 fn validation_path_component_eq(left: &str, right: &str) -> bool {
-    if cfg!(windows) {
-        left.eq_ignore_ascii_case(right)
-    } else {
-        left == right
-    }
+    left.eq_ignore_ascii_case(right)
 }
 
 fn workspace_proof_scope(document: &TaskEvidenceDocument) -> WorkspaceProofScope {
@@ -15140,9 +15132,7 @@ mod tests {
         assert!(validation_paths_overlap(".", "core/src/lib.rs"));
         assert!(validation_paths_overlap("core", "core/src/lib.rs"));
         assert!(!validation_paths_overlap("core/src", "protocol/src"));
-        if cfg!(windows) {
-            assert!(validation_paths_overlap("Core/Src", "core/src/lib.rs"));
-        }
+        assert!(validation_paths_overlap("Core/Src", "core/src/lib.rs"));
     }
 
     #[cfg(debug_assertions)]

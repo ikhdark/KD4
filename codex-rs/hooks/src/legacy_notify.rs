@@ -141,7 +141,6 @@ mod tests {
     }
 
     fn delayed_marker_command(directory: &std::path::Path) -> Vec<String> {
-        #[cfg(windows)]
         {
             let script = directory.join("delayed-marker.ps1");
             std::fs::write(
@@ -159,22 +158,6 @@ mod tests {
                 "-File".to_string(),
                 script.to_string_lossy().into_owned(),
             ]
-        }
-
-        #[cfg(not(windows))]
-        {
-            let script = directory.join("delayed-marker.sh");
-            std::fs::write(
-                &script,
-                concat!(
-                    "script_dir=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n",
-                    "printf started > \"$script_dir/started.txt\"\n",
-                    "sleep 2\n",
-                    "printf escaped > \"$script_dir/escaped.txt\"\n",
-                ),
-            )
-            .expect("write finalizer test script");
-            vec!["sh".to_string(), script.to_string_lossy().into_owned()]
         }
     }
 

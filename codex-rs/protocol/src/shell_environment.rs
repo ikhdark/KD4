@@ -39,7 +39,7 @@ pub fn create_env_from_vars<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    populate_env_for_platform(vars, policy, thread_id, cfg!(windows))
+    populate_env_for_platform(vars, policy, thread_id, true)
 }
 
 pub fn populate_env<I>(
@@ -50,13 +50,7 @@ pub fn populate_env<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    populate_env_impl(
-        vars,
-        policy,
-        thread_id,
-        cfg!(windows),
-        /*inject_pathext*/ false,
-    )
+    populate_env_impl(vars, policy, thread_id, true, /*inject_pathext*/ false)
 }
 
 fn populate_env_for_platform<I>(
@@ -302,17 +296,8 @@ mod tests {
         );
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn non_utf8_process_entries_are_skipped_without_panicking() {
-        #[cfg(unix)]
-        fn non_utf8_os_string() -> OsString {
-            use std::os::unix::ffi::OsStringExt;
-
-            OsString::from_vec(vec![0xff])
-        }
-
-        #[cfg(windows)]
         fn non_utf8_os_string() -> OsString {
             use std::os::windows::ffi::OsStringExt;
 

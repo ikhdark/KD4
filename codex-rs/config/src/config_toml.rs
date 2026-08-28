@@ -737,7 +737,7 @@ impl ConfigToml {
         active_project: Option<&ProjectConfig>,
         permission_profile_constraint: Option<&crate::Constrained<PermissionProfile>>,
     ) -> PermissionProfile {
-        let is_unsandboxed_windows = is_unsandboxed_windows(windows_sandbox_level, cfg!(windows));
+        let is_unsandboxed_windows = is_unsandboxed_windows(windows_sandbox_level, true);
         let configured_sandbox_mode = sandbox_mode_override.or(self.sandbox_mode);
         let resolved_sandbox_mode = configured_sandbox_mode
             .or_else(|| {

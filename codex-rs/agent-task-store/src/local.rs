@@ -4275,11 +4275,7 @@ fn stored_covered_paths_are_normalized(covered_paths: &[String]) -> bool {
         if !is_normalized_repository_relative_scope(path) {
             return false;
         }
-        let identity = if cfg!(windows) {
-            path.to_ascii_lowercase()
-        } else {
-            path.clone()
-        };
+        let identity = path.to_ascii_lowercase();
         seen.insert(identity)
     })
 }

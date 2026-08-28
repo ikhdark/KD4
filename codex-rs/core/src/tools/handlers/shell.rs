@@ -788,20 +788,8 @@ pub(crate) fn normalize_covered_paths(
         .iter()
         .map(|path| normalize_repo_relative_path(path, "validation covered path", &canonical_root))
         .collect::<Result<Vec<_>, _>>()?;
-    normalized.sort_by_key(|path| {
-        if cfg!(windows) {
-            path.to_ascii_lowercase()
-        } else {
-            path.clone()
-        }
-    });
-    normalized.dedup_by(|left, right| {
-        if cfg!(windows) {
-            left.eq_ignore_ascii_case(right)
-        } else {
-            left == right
-        }
-    });
+    normalized.sort_by_key(|path| path.to_ascii_lowercase());
+    normalized.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     Ok(normalized)
 }
 
@@ -872,14 +860,10 @@ fn path_has_component_prefix(path: &Path, prefix: &Path) -> bool {
         let Some(actual) = path_components.next() else {
             return false;
         };
-        if cfg!(windows) {
-            actual
-                .as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
-        } else {
-            actual == expected
-        }
+        actual
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
     })
 }
 

@@ -2956,6 +2956,7 @@ async fn non_normalized_validation_result_paths_cannot_satisfy_completion() {
         serde_json::json!(["../outside"]),
         serde_json::json!(["src/./lib.rs"]),
         serde_json::json!(["src", "src"]),
+        serde_json::json!(["src", "SRC"]),
         serde_json::json!(["/absolute"]),
     ]
     .into_iter()

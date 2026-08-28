@@ -53,13 +53,6 @@ fn proxy_env_uses_first_present_casing_even_when_unusable() {
         None
     );
 
-    #[cfg(unix)]
-    let non_unicode = {
-        use std::os::unix::ffi::OsStringExt;
-
-        std::ffi::OsString::from_vec(vec![0xff])
-    };
-    #[cfg(windows)]
     let non_unicode = {
         use std::os::windows::ffi::OsStringExt;
 

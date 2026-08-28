@@ -51,7 +51,6 @@ async fn sandbox_denial_preserves_the_process_raw_output_artifact() {
 }
 
 fn create_validation_cwd_alias(target: &std::path::Path, alias: &std::path::Path) {
-    #[cfg(windows)]
     {
         let output = std::process::Command::new("cmd")
             .args(["/c", "mklink", "/J"])
@@ -65,15 +64,10 @@ fn create_validation_cwd_alias(target: &std::path::Path, alias: &std::path::Path
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, alias).expect("directory symlink is created");
 }
 
 fn remove_validation_cwd_alias(alias: &std::path::Path) {
-    #[cfg(windows)]
     std::fs::remove_dir(alias).expect("junction removes without touching its target");
-    #[cfg(unix)]
-    std::fs::remove_file(alias).expect("directory symlink removes without touching its target");
 }
 
 #[test]

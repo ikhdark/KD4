@@ -158,7 +158,7 @@ pub(crate) fn default_builtin_permission_profile_name(
     default_builtin_permission_profile_name_for_platform(
         active_project,
         windows_sandbox_level,
-        cfg!(windows),
+        true,
     )
 }
 

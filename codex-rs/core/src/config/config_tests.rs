@@ -3844,11 +3844,7 @@ trust_level = "trusted"
         /*permission_profile_constraint*/ None,
     )
     .await;
-    if cfg!(windows) {
-        assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
-    } else {
-        assert_matches!(resolution, SandboxPolicy::WorkspaceWrite { .. });
-    }
+    assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
 
     let sandbox_workspace_write = format!(
         r#"
@@ -3875,11 +3871,7 @@ exclude_slash_tmp = true
         /*permission_profile_constraint*/ None,
     )
     .await;
-    if cfg!(windows) {
-        assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
-    } else {
-        assert_matches!(resolution, SandboxPolicy::WorkspaceWrite { .. });
-    }
+    assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
 }
 
 #[tokio::test]
@@ -3957,66 +3949,20 @@ exclude_slash_tmp = true
                 );
             }
             "workspace-write" => {
-                #[cfg(windows)]
-                {
-                    assert_eq!(
-                        &sandbox_policy,
-                        &SandboxPolicy::new_read_only_policy(),
-                        "legacy workspace-write should keep the existing Windows downgrade when \
+                assert_eq!(
+                    &sandbox_policy,
+                    &SandboxPolicy::new_read_only_policy(),
+                    "legacy workspace-write should keep the existing Windows downgrade when \
                          the Windows sandbox is disabled"
-                    );
-                    assert_eq!(
-                        file_system_policy,
-                        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
-                            &sandbox_policy,
-                            cwd.path()
-                        ),
-                        "downgraded workspace-write should match the legacy read-only projection"
-                    );
-                }
-                #[cfg(not(windows))]
-                {
-                    assert_eq!(
-                        config.permissions.workspace_roots(),
-                        &[cwd.abs(), extra_root.clone()]
-                    );
-                    assert!(
-                        file_system_policy
-                            .entries
-                            .contains(&FileSystemSandboxEntry {
-                                path: FileSystemPath::Path { path: cwd.abs() },
-                                access: FileSystemAccessMode::Write,
-                            })
-                    );
-                    assert!(
-                        file_system_policy
-                            .entries
-                            .contains(&FileSystemSandboxEntry {
-                                path: FileSystemPath::Path {
-                                    path: extra_root.clone(),
-                                },
-                                access: FileSystemAccessMode::Write,
-                            })
-                    );
-                }
-                #[cfg(not(windows))]
-                for subpath in [".git", ".agents", ".codex"] {
-                    assert!(
-                        file_system_policy
-                            .entries
-                            .contains(&FileSystemSandboxEntry {
-                                path: FileSystemPath::Path {
-                                    path: AbsolutePathBuf::resolve_path_against_base(
-                                        subpath,
-                                        cwd.path()
-                                    ),
-                                },
-                                access: FileSystemAccessMode::Read,
-                            }),
-                        "case `{name}` should materialize `{subpath}` for the runtime workspace \
-                         root"
-                    );
-                }
+                );
+                assert_eq!(
+                    file_system_policy,
+                    FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+                        &sandbox_policy,
+                        cwd.path()
+                    ),
+                    "downgraded workspace-write should match the legacy read-only projection"
+                );
             }
             _ => unreachable!("unexpected test case `{name}`"),
         }
@@ -5031,15 +4977,8 @@ async fn sqlite_home_defaults_to_codex_home_for_workspace_write() -> std::io::Re
     Ok(())
 }
 
-#[cfg(any(unix, windows))]
 #[test]
 fn non_utf8_sqlite_home_env_value_keeps_precedence() {
-    #[cfg(unix)]
-    let configured = {
-        use std::os::unix::ffi::OsStringExt;
-        std::ffi::OsString::from_vec(vec![b's', b'q', b'l', b'i', b't', b'e', 0xff])
-    };
-    #[cfg(windows)]
     let configured = {
         use std::os::windows::ffi::OsStringExt;
         std::ffi::OsString::from_wide(&[0xd800])
@@ -8964,11 +8903,7 @@ trust_level = "untrusted"
     .await;
 
     // Verify that untrusted projects get WorkspaceWrite (or ReadOnly on Windows due to downgrade)
-    if cfg!(windows) {
-        assert_matches!(resolution, SandboxPolicy::ReadOnly { .. });
-    } else {
-        assert_matches!(resolution, SandboxPolicy::WorkspaceWrite { .. });
-    }
+    assert_matches!(resolution, SandboxPolicy::ReadOnly { .. });
 
     Ok(())
 }
@@ -9017,7 +8952,6 @@ async fn derive_sandbox_policy_falls_back_to_read_only_for_implicit_defaults() -
     Ok(())
 }
 
-#[cfg(windows)]
 #[tokio::test]
 async fn derive_sandbox_policy_preserves_windows_downgrade_for_unsupported_fallback()
 -> anyhow::Result<()> {
@@ -9278,17 +9212,10 @@ async fn test_untrusted_project_gets_unless_trusted_approval_policy() -> anyhow:
     );
 
     // Verify that untrusted projects still get WorkspaceWrite sandbox (or ReadOnly on Windows)
-    if cfg!(windows) {
-        assert_matches!(
-            config.legacy_sandbox_policy(),
-            SandboxPolicy::ReadOnly { .. }
-        );
-    } else {
-        assert_matches!(
-            config.legacy_sandbox_policy(),
-            SandboxPolicy::WorkspaceWrite { .. }
-        );
-    }
+    assert_matches!(
+        config.legacy_sandbox_policy(),
+        SandboxPolicy::ReadOnly { .. }
+    );
 
     Ok(())
 }
