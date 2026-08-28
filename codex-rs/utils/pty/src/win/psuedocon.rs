@@ -82,19 +82,11 @@ shared_library!(Ntdll,
     ) -> NTSTATUS,
 );
 
-fn load_conpty() -> ConPtyFuncs {
-    let kernel = ConPtyFuncs::open(Path::new("kernel32.dll")).expect(
+static CONPTY: LazyLock<ConPtyFuncs> = LazyLock::new(|| {
+    ConPtyFuncs::open(Path::new("kernel32.dll")).expect(
         "this system does not support conpty.  Windows 10 October 2018 or newer is required",
-    );
-
-    if let Ok(sideloaded) = ConPtyFuncs::open(Path::new("conpty.dll")) {
-        sideloaded
-    } else {
-        kernel
-    }
-}
-
-static CONPTY: LazyLock<ConPtyFuncs> = LazyLock::new(load_conpty);
+    )
+});
 
 pub fn conpty_supported() -> bool {
     windows_build_number().is_some_and(|build| build >= MIN_CONPTY_BUILD)
@@ -254,6 +246,9 @@ fn build_environment_block(cmd: &CommandBuilder) -> Vec<u16> {
         block.extend(OsStr::new(value).encode_wide());
         block.push(0);
     }
+    if block.is_empty() {
+        block.push(0);
+    }
     block.push(0);
     block
 }
@@ -271,15 +266,24 @@ fn build_cmdline(cmd: &CommandBuilder) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
         search_path(cmd, first)
     };
 
+    let argv = cmd.get_argv();
+    let args = argv.get(1..).unwrap_or_default();
+    let cmd_payload_index = crate::windows_cmd_payload_index(&exe_os, args);
     let mut cmdline = Vec::new();
     append_quoted(&exe_os, &mut cmdline);
-    for arg in cmd.get_argv().iter().skip(1) {
+    for (index, arg) in args.iter().enumerate() {
         cmdline.push(' ' as u16);
         ensure!(
             !arg.encode_wide().any(|c| c == 0),
             "invalid encoding for command line argument {arg:?}"
         );
-        append_quoted(arg, &mut cmdline);
+        if Some(index) == cmd_payload_index {
+            cmdline.push('"' as u16);
+            cmdline.extend(arg.encode_wide());
+            cmdline.push('"' as u16);
+        } else {
+            append_quoted(arg, &mut cmdline);
+        }
     }
     cmdline.push(0);
 
@@ -290,8 +294,13 @@ fn build_cmdline(cmd: &CommandBuilder) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
 }
 
 fn search_path(cmd: &CommandBuilder, exe: &OsStr) -> OsString {
-    if let Some(path) = cmd.get_env("PATH") {
-        let extensions = cmd.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
+    let host_path = env::var_os("PATH");
+    if let Some(path) = cmd.get_env("PATH").or(host_path.as_deref()) {
+        let host_extensions = env::var_os("PATHEXT");
+        let extensions = cmd
+            .get_env("PATHEXT")
+            .or(host_extensions.as_deref())
+            .unwrap_or(OsStr::new(".EXE"));
         for path in env::split_paths(path) {
             let candidate = path.join(exe);
             if candidate.exists() {
@@ -362,7 +371,13 @@ fn append_quoted(arg: &OsStr, cmdline: &mut Vec<u16>) {
 mod tests {
     use super::CONPTY;
     use super::MIN_CONPTY_BUILD;
+    use super::build_cmdline;
+    use super::build_environment_block;
     use super::windows_build_number;
+    use portable_pty::CommandBuilder;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::Path;
 
     #[test]
     fn windows_build_number_returns_value() {
@@ -375,5 +390,44 @@ mod tests {
     #[test]
     fn conpty_functions_load() {
         std::sync::LazyLock::force(&CONPTY);
+    }
+
+    #[test]
+    fn command_lookup_uses_host_path_when_child_environment_is_empty() {
+        let mut command = CommandBuilder::new("cmd.exe");
+        command.env_clear();
+
+        let (executable, _) = build_cmdline(&command).expect("build command line");
+        let executable = OsString::from_wide(&executable[..executable.len() - 1]);
+
+        assert!(Path::new(&executable).is_absolute(), "{executable:?}");
+        assert!(Path::new(&executable).is_file(), "{executable:?}");
+    }
+
+    #[test]
+    fn empty_child_environment_has_double_nul_terminator() {
+        let mut command = CommandBuilder::new("cmd.exe");
+        command.env_clear();
+
+        assert_eq!(build_environment_block(&command), vec![0, 0]);
+    }
+
+    #[test]
+    fn cmd_payload_keeps_inner_quotes_in_conpty_command_line() {
+        let payload = r#"set "CODEX_CMD_QUOTE=two words" & echo ready"#;
+        let mut command = CommandBuilder::new("cmd.exe");
+        command.arg("/d");
+        command.arg("/c");
+        command.arg(payload);
+
+        let (_, command_line) = build_cmdline(&command).expect("build command line");
+        let command_line = OsString::from_wide(&command_line[..command_line.len() - 1]);
+        let command_line = command_line.to_string_lossy();
+
+        assert!(
+            command_line.ends_with(&format!(r#" /d /c "{payload}""#)),
+            "{command_line}"
+        );
+        assert!(!command_line.contains(r#"\"CODEX_CMD_QUOTE"#));
     }
 }

@@ -21,20 +21,8 @@ pub enum ValidationRouteOrdering {
 #[serde(deny_unknown_fields)]
 pub struct ValidationRouteLeaf {
     pub argv: Vec<String>,
-    /// The specific uncertainty this command resolves. Older persisted plans
-    /// may omit it, but newly admitted automatic validation requires it.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub uncertainty: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub covered_paths: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub covered_contracts: Vec<String>,
     pub timeout_ms: u64,
-    /// Most timeouts are execution policy rather than proof semantics. Set this
-    /// only when the validation contract explicitly defines the timeout as part
-    /// of what the command proves.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub semantic_timeout: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema, TS)]
@@ -54,26 +42,22 @@ impl<'de> Deserialize<'de> for ValidationRouteLeaf {
         #[serde(deny_unknown_fields)]
         struct Raw {
             argv: Vec<String>,
-            #[serde(default)]
-            uncertainty: String,
-            #[serde(default)]
             covered_paths: Vec<String>,
-            #[serde(default)]
-            covered_contracts: Vec<String>,
             timeout_ms: u64,
-            #[serde(default)]
-            semantic_timeout: bool,
         }
         let raw = Raw::deserialize(deserializer)?;
-        if raw.argv.is_empty() || raw.argv.iter().any(String::is_empty) {
+        if raw.argv.is_empty() || raw.argv.iter().any(|value| value.trim().is_empty()) {
             return Err(serde::de::Error::custom(
                 "validation route argv must contain a non-empty program and non-empty arguments",
             ));
         }
         validate_nonblank_values("validation covered path", &raw.covered_paths)
             .map_err(serde::de::Error::custom)?;
-        validate_nonblank_values("validation covered contract", &raw.covered_contracts)
-            .map_err(serde::de::Error::custom)?;
+        if raw.covered_paths.is_empty() {
+            return Err(serde::de::Error::custom(
+                "validation covered_paths must contain at least one repository-relative path",
+            ));
+        }
         if raw.timeout_ms == 0 || raw.timeout_ms > MAX_STRUCTURED_VALIDATION_TIMEOUT_MS {
             return Err(serde::de::Error::custom(format!(
                 "validation route timeout_ms must be between 1 and {MAX_STRUCTURED_VALIDATION_TIMEOUT_MS}"
@@ -81,11 +65,8 @@ impl<'de> Deserialize<'de> for ValidationRouteLeaf {
         }
         Ok(Self {
             argv: raw.argv,
-            uncertainty: raw.uncertainty,
             covered_paths: raw.covered_paths,
-            covered_contracts: raw.covered_contracts,
             timeout_ms: raw.timeout_ms,
-            semantic_timeout: raw.semantic_timeout,
         })
     }
 }
@@ -357,11 +338,6 @@ fn visit_dependency<'a>(
     visiting.remove(id);
     visited.insert(id);
     Ok(())
-}
-
-#[allow(clippy::trivially_copy_pass_by_ref)]
-const fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[cfg(test)]

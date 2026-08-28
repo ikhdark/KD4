@@ -177,7 +177,7 @@ async fn forwards_exact_urls_and_caches_clients_by_resolved_route() {
         .await
         .expect("proxy client should build separately");
 
-    assert_eq!(pool.clients.lock().expect("client cache lock").len(), 2);
+    assert_eq!(pool.cached_route_count(), 2);
     assert_eq!(
         resolver.observed_urls(),
         vec![
@@ -295,7 +295,7 @@ async fn no_redirect_pool_returns_redirect_response() {
 }
 
 #[tokio::test]
-async fn bounds_cached_routes_and_rebuilds_an_evicted_route() {
+async fn evicts_the_least_recently_used_route() {
     let pool = RouteAwareClientPool::with_builder(
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         ClientRouteClass::Api,
@@ -314,28 +314,34 @@ async fn bounds_cached_routes_and_rebuilds_an_evicted_route() {
         .collect::<HashMap<_, _>>();
     let resolver = FakeRouteResolver::new(routes.clone());
 
-    for request_url in routes.keys() {
+    let request_urls = routes.keys().cloned().collect::<Vec<_>>();
+    for request_url in request_urls.iter().take(MAX_CACHED_ROUTES) {
         resolve_with(&pool, &resolver, request_url)
             .await
             .expect("client should build");
     }
-    let evicted_route = {
-        let clients = pool.clients.lock().expect("client cache lock");
-        assert_eq!(clients.len(), MAX_CACHED_ROUTES);
-        routes
-            .iter()
-            .find(|(_, route)| !clients.contains_key(*route))
-            .map(|(request_url, _)| request_url.clone())
-            .expect("one route should have been evicted")
-    };
-
-    resolve_with(&pool, &resolver, &evicted_route)
+    let least_recent_url = &request_urls[0];
+    let recently_used_url = &request_urls[1];
+    resolve_with(&pool, &resolver, least_recent_url)
         .await
-        .expect("evicted client should rebuild");
+        .expect("least recent route should be reusable");
+    resolve_with(&pool, &resolver, recently_used_url)
+        .await
+        .expect("recent route should be reusable");
+    resolve_with(&pool, &resolver, &request_urls[MAX_CACHED_ROUTES])
+        .await
+        .expect("new route should build");
 
-    let clients = pool.clients.lock().expect("client cache lock");
-    assert_eq!(clients.len(), MAX_CACHED_ROUTES);
-    assert!(clients.contains_key(&routes[&evicted_route]));
+    {
+        let clients = pool.clients.lock().expect("client cache lock");
+        assert_eq!(clients.clients.len(), MAX_CACHED_ROUTES);
+        assert!(clients.clients.contains_key(&routes[least_recent_url]));
+        assert!(clients.clients.contains_key(&routes[recently_used_url]));
+        assert!(
+            !clients.clients.contains_key(&routes[&request_urls[2]]),
+            "the untouched least-recent route should be evicted"
+        );
+    }
 }
 
 #[tokio::test]
@@ -703,4 +709,20 @@ impl Write for TestLogSink {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+#[test]
+fn request_builder_query_appends_encoded_pairs() {
+    let request = RouteAwareClientPool::new(
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        ClientRouteClass::Api,
+    )
+    .get("https://example.test/catalog?existing=1")
+    .query(&[("page token", "next/value")])
+    .request
+    .expect("request should build");
+
+    assert_eq!(
+        request.url().as_str(),
+        "https://example.test/catalog?existing=1&page+token=next%2Fvalue"
+    );
 }

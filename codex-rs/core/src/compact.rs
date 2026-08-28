@@ -7,12 +7,11 @@ use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
 use crate::context::is_legacy_compaction_warning_fragment;
 use crate::context::is_startup_contextual_user_fragment;
+use crate::context::is_task_evidence_context_fragment;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
-use crate::hook_runtime::PostCompactHookOutcome;
-use crate::hook_runtime::PreCompactHookOutcome;
-use crate::hook_runtime::run_post_compact_hooks;
-use crate::hook_runtime::run_pre_compact_hooks;
+use crate::hook_runtime::run_post_compact_hook_gate;
+use crate::hook_runtime::run_pre_compact_hook_gate;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
@@ -23,6 +22,8 @@ use crate::session::PreviousTurnSettings;
 use crate::session::session::Session;
 use crate::session::turn::get_last_assistant_message_from_turn;
 use crate::session::turn_context::TurnContext;
+use crate::stable_context::StableContextTarget;
+use crate::stable_context::project_stable_context;
 use codex_analytics::CodexCompactionEvent;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
@@ -31,6 +32,7 @@ use codex_analytics::CompactionStatus;
 use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
+use codex_protocol::ResponseItemId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
@@ -61,6 +63,8 @@ pub use codex_prompts::COMPACTION_BASE_INSTRUCTIONS;
 pub use codex_prompts::INCREMENTAL_SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
+const COMPACTION_SUMMARY_ITEM_ID_PREFIX: &str = "msg_compaction_summary_";
+const COMPACTION_SUMMARY_ITEM_ID_BASE: &str = "msg_compaction_summary";
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 4_000;
 const COMPACT_AGENT_MESSAGE_MAX_TOKENS: usize = 4_000;
 const COMPACT_TASK_STATE_MAX_TOKENS: usize = 1_800;
@@ -150,8 +154,15 @@ pub(crate) async fn build_compaction_initial_context(
     }
 }
 
-pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
-    provider.supports_remote_compaction()
+pub(crate) fn should_use_remote_compact_task(
+    provider: &ModelProviderInfo,
+    compact_prompt: Option<&str>,
+) -> bool {
+    provider.supports_remote_compaction() && compact_prompt.is_none()
+}
+
+fn incremental_summarization_prompt(compact_prompt: Option<&str>) -> &str {
+    compact_prompt.unwrap_or(INCREMENTAL_SUMMARIZATION_PROMPT)
 }
 
 pub(crate) async fn run_inline_auto_compact_task(
@@ -240,28 +251,17 @@ async fn run_compact_task_inner(
         phase,
     )
     .await;
-    let pre_compact_outcome = run_pre_compact_hooks(&sess, &turn_context, trigger).await;
-    match pre_compact_outcome {
-        PreCompactHookOutcome::Continue => {}
-        PreCompactHookOutcome::Stopped { reason } => {
-            crate::hook_runtime::emit_hook_stop_reason(
-                &sess,
-                &turn_context,
-                "PreCompact",
-                reason.as_deref(),
+    if run_pre_compact_hook_gate(&sess, &turn_context, trigger).await {
+        let error = CodexErr::TurnAborted;
+        attempt
+            .track(
+                sess.as_ref(),
+                CompactionStatus::Interrupted,
+                Some(&error),
+                CompactionAnalyticsDetails::default(),
             )
             .await;
-            let error = CodexErr::TurnAborted;
-            attempt
-                .track(
-                    sess.as_ref(),
-                    CompactionStatus::Interrupted,
-                    Some(&error),
-                    CompactionAnalyticsDetails::default(),
-                )
-                .await;
-            return Err(error);
-        }
+        return Err(error);
     }
     let result = run_compact_task_inner_impl(
         Arc::clone(&sess),
@@ -274,27 +274,18 @@ async fn run_compact_task_inner(
     .await;
     let status = compaction_status_from_result(&result);
     let codex_error = result.as_ref().err();
-    if let Ok(summary) = &result {
-        let post_compact_outcome =
-            run_post_compact_hooks(&sess, &turn_context, trigger, Some(summary)).await;
-        if let PostCompactHookOutcome::Stopped { reason } = post_compact_outcome {
-            crate::hook_runtime::emit_hook_stop_reason(
-                &sess,
-                &turn_context,
-                "PostCompact",
-                reason.as_deref(),
+    if let Ok(summary) = &result
+        && run_post_compact_hook_gate(&sess, &turn_context, trigger, Some(summary)).await
+    {
+        attempt
+            .track(
+                sess.as_ref(),
+                status,
+                codex_error,
+                CompactionAnalyticsDetails::default(),
             )
             .await;
-            attempt
-                .track(
-                    sess.as_ref(),
-                    status,
-                    codex_error,
-                    CompactionAnalyticsDetails::default(),
-                )
-                .await;
-            return Err(CodexErr::TurnAborted);
-        }
+        return Err(CodexErr::TurnAborted);
     }
     attempt
         .track(
@@ -326,7 +317,8 @@ async fn run_compact_task_inner_impl(
         && can_reuse_previous_summary(history.raw_items(), omitted_user_text);
     if previous_summary.is_some() && !reuse_previous_summary {
         input.push(UserInput::Text {
-            text: INCREMENTAL_SUMMARIZATION_PROMPT.to_string(),
+            text: incremental_summarization_prompt(turn_context.config.compact_prompt.as_deref())
+                .to_string(),
             text_elements: Vec::new(),
         });
     }
@@ -368,7 +360,9 @@ async fn run_compact_task_inner_impl(
         base_instructions: base_instructions.clone(),
         ..Default::default()
     };
-    if !reuse_previous_summary {
+    let summary_text_result = if reuse_previous_summary {
+        validated_compaction_summary(previous_summary.as_deref(), "", false)
+    } else {
         turn_context.turn_timing_state.begin_compaction_generation();
         let mut retries = 0;
         loop {
@@ -384,14 +378,26 @@ async fn run_compact_task_inner_impl(
 
             match attempt_result {
                 Ok(output) => {
-                    sess.record_conversation_items(turn_context.as_ref(), &output.items)
-                        .await;
                     sess.update_token_usage_info(
                         turn_context.as_ref(),
                         output.token_usage.as_ref(),
                     )
                     .await?;
-                    break;
+                    let summary_suffix =
+                        get_last_assistant_message_from_turn(&output.items).unwrap_or_default();
+                    match validated_compaction_summary(
+                        previous_summary.as_deref(),
+                        &summary_suffix,
+                        true,
+                    ) {
+                        Ok(summary_text) => {
+                            // Model output is tentative until its checkpoint is semantically valid.
+                            sess.record_conversation_items(turn_context.as_ref(), &output.items)
+                                .await;
+                            break Ok(summary_text);
+                        }
+                        Err(error) => break Err(error),
+                    }
                 }
                 Err(err @ (CodexErr::Interrupted | CodexErr::TurnAborted)) => {
                     return Err(err);
@@ -431,26 +437,16 @@ async fn run_compact_task_inner_impl(
                 }
             }
         }
-    }
-
-    let history_snapshot = if reuse_previous_summary {
-        history
-    } else {
-        sess.clone_history().await
     };
-    let history_items = history_snapshot.raw_items();
-    let summary_suffix = if reuse_previous_summary {
-        String::new()
-    } else {
-        get_last_assistant_message_from_turn(history_items).unwrap_or_default()
+    let summary_text = match summary_text_result {
+        Ok(summary_text) => summary_text,
+        Err(error) => {
+            sess.track_turn_codex_error(turn_context.as_ref(), &error);
+            let event = EventMsg::Error(error.to_error_event(/*message_prefix*/ None));
+            sess.send_event(&turn_context, event).await;
+            return Err(error);
+        }
     };
-    if !reuse_previous_summary {
-        validate_generated_compaction_summary(previous_summary.as_deref(), &summary_suffix)?;
-    }
-    let summary_text = bounded_task_state_summary(previous_summary.as_deref(), &summary_suffix);
-    if has_compaction_section(&summary_text) {
-        validate_generated_compaction_summary(None, &summary_text)?;
-    }
     // The summary and durable world state own consumed continuation state. Preserve only the
     // exact input tail that no model-generated item has consumed yet, in its original order.
     let mut summary_for_history = summary_text.clone();
@@ -458,15 +454,7 @@ async fn run_compact_task_inner_impl(
         summary_for_history.push_str("\n\n");
         summary_for_history.push_str(COMPACT_IMAGE_OMISSION_MARKER);
     }
-    unresolved_history.push(ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: summary_for_history,
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    });
+    unresolved_history.push(compaction_summary_item(summary_for_history));
     let mut new_history = unresolved_history;
     if let Some(summary_item) = new_history.last_mut() {
         // This replacement history skips `record_conversation_items`; only the appended summary
@@ -528,8 +516,10 @@ async fn run_compact_task_inner_impl(
 }
 
 pub(crate) fn strip_compaction_startup_envelopes(items: Vec<ResponseItem>) -> Vec<ResponseItem> {
-    items
-        .into_iter()
+    project_stable_context(items.into(), StableContextTarget::Sampling)
+        .items
+        .iter()
+        .cloned()
         .filter_map(|item| match item {
             ResponseItem::Message {
                 id,
@@ -538,7 +528,13 @@ pub(crate) fn strip_compaction_startup_envelopes(items: Vec<ResponseItem>) -> Ve
                 phase,
                 internal_chat_message_metadata_passthrough,
             } if role == "user" => {
-                content.retain(|part| !is_startup_contextual_user_fragment(part));
+                // The compaction prompt names the structured task-state envelope as its
+                // authoritative continuation state. Strip reproducible startup material, but
+                // retain that one dynamic envelope so local compaction can actually consume it.
+                content.retain(|part| {
+                    !is_startup_contextual_user_fragment(part)
+                        || is_task_evidence_context_fragment(part)
+                });
                 (!content.is_empty()).then_some(ResponseItem::Message {
                     id,
                     role,
@@ -625,6 +621,21 @@ fn validate_generated_compaction_summary(
             missing.join(", ")
         )))
     }
+}
+
+fn validated_compaction_summary(
+    previous_summary: Option<&str>,
+    summary_suffix: &str,
+    validate_suffix: bool,
+) -> CodexResult<String> {
+    if validate_suffix {
+        validate_generated_compaction_summary(previous_summary, summary_suffix)?;
+    }
+    let summary_text = bounded_task_state_summary(previous_summary, summary_suffix);
+    if has_compaction_section(&summary_text) {
+        validate_generated_compaction_summary(None, &summary_text)?;
+    }
+    Ok(summary_text)
 }
 
 fn has_nonempty_compaction_section(summary: &str) -> bool {
@@ -733,13 +744,17 @@ fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
         }
     }
 
-    for (index, (_, configured_budget, updates)) in sections.iter().enumerate() {
+    for (index, (heading, configured_budget, updates)) in sections.iter().enumerate() {
         let mut low = 0usize;
         let mut high = (*configured_budget).min(max_tokens);
         let mut selected = bodies[index].clone();
         while low < high {
             let candidate_budget = low.saturating_add(high).saturating_add(1) / 2;
-            let candidate = retain_newest_section_updates(updates, candidate_budget);
+            let candidate = if *heading == GOAL_HEADING {
+                retain_goal_boundary_updates(updates, candidate_budget)
+            } else {
+                retain_newest_section_updates(updates, candidate_budget)
+            };
             let candidate = if candidate.trim().is_empty() {
                 "[truncated]".to_string()
             } else {
@@ -810,6 +825,42 @@ fn retain_newest_section_updates(updates: &[Vec<String>], max_tokens: usize) -> 
     }
     retained.reverse();
     retained.join("\n\n")
+}
+
+/// Keeps the original goal/constraints and the latest goal revision in agreement.
+/// Intermediate status belongs in the other checkpoint sections and may be evicted.
+fn retain_goal_boundary_updates(updates: &[Vec<String>], max_tokens: usize) -> String {
+    let nonempty = updates
+        .iter()
+        .map(|update| update.join("\n").trim().to_string())
+        .filter(|update| !update.is_empty())
+        .collect::<Vec<_>>();
+    let Some(oldest) = nonempty.first() else {
+        return String::new();
+    };
+    let Some(newest) = nonempty.last() else {
+        return String::new();
+    };
+    if nonempty.len() == 1 {
+        return truncate_text_to_token_ceiling(oldest, max_tokens);
+    }
+
+    let separator = "\n\n";
+    let separator_tokens = approx_token_count(separator);
+    if max_tokens <= separator_tokens {
+        return truncate_text_to_token_ceiling(newest, max_tokens);
+    }
+    let payload_budget = max_tokens.saturating_sub(separator_tokens);
+    let newest = truncate_text_to_token_ceiling(newest, payload_budget.div_ceil(2));
+    let oldest_budget = payload_budget.saturating_sub(approx_token_count(&newest));
+    let oldest = truncate_text_to_token_ceiling(oldest, oldest_budget);
+    if oldest.is_empty() {
+        return truncate_text_to_token_ceiling(newest.as_str(), max_tokens);
+    }
+    if newest.is_empty() {
+        return truncate_text_to_token_ceiling(oldest.as_str(), max_tokens);
+    }
+    format!("{oldest}{separator}{newest}")
 }
 
 pub(crate) struct CompactionAnalyticsAttempt {
@@ -944,9 +995,9 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
                 internal_chat_message_metadata_passthrough,
                 ..
             } if role == "user" => {
-                let message = content_items_to_text(content).unwrap_or_default();
-                if is_summary_message(&message)
-                    || content.iter().any(is_legacy_compaction_warning_fragment)
+                if is_compaction_summary_item(item)
+                    || (item.turn_id().is_none()
+                        && content.iter().any(is_legacy_compaction_warning_fragment))
                 {
                     return None;
                 }
@@ -1335,25 +1386,45 @@ pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
 }
 
-fn latest_summary_message(items: &[ResponseItem]) -> Option<&str> {
-    items.iter().rev().find_map(|item| match item {
-        ResponseItem::Message { role, content, .. } if role == "user" => {
-            content.iter().find_map(|item| match item {
-                ContentItem::InputText { text } if is_summary_message(text) => Some(text.as_str()),
-                _ => None,
-            })
-        }
+fn compaction_summary_item(summary_text: String) -> ResponseItem {
+    ResponseItem::Message {
+        id: Some(ResponseItemId::new(COMPACTION_SUMMARY_ITEM_ID_BASE)),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText { text: summary_text }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn compaction_summary_text(item: &ResponseItem) -> Option<&str> {
+    let ResponseItem::Message {
+        id: Some(id),
+        role,
+        content,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    if role != "user" || !id.as_str().starts_with(COMPACTION_SUMMARY_ITEM_ID_PREFIX) {
+        return None;
+    }
+    content.iter().find_map(|content| match content {
+        ContentItem::InputText { text } if is_summary_message(text) => Some(text.as_str()),
         _ => None,
     })
 }
 
+fn is_compaction_summary_item(item: &ResponseItem) -> bool {
+    compaction_summary_text(item).is_some()
+}
+
+fn latest_summary_message(items: &[ResponseItem]) -> Option<&str> {
+    items.iter().rev().find_map(compaction_summary_text)
+}
+
 fn history_after_latest_summary_is_user_only(items: &[ResponseItem]) -> bool {
-    let Some(summary_index) = items.iter().rposition(|item| match item {
-        ResponseItem::Message { role, content, .. } if role == "user" => content.iter().any(
-            |content| matches!(content, ContentItem::InputText { text } if is_summary_message(text)),
-        ),
-        _ => false,
-    }) else {
+    let Some(summary_index) = items.iter().rposition(is_compaction_summary_item) else {
         return false;
     };
     items[summary_index + 1..]
@@ -1404,17 +1475,19 @@ pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
     let mut last_user_or_summary_index = None;
     let mut last_real_user_index = None;
     for (i, item) in compacted_history.iter().enumerate().rev() {
-        let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(item) else {
+        if is_compaction_summary_item(item) {
+            last_user_or_summary_index.get_or_insert(i);
+            continue;
+        }
+        let Some(TurnItem::UserMessage(_)) = crate::event_mapping::parse_turn_item(item) else {
             continue;
         };
         // Compaction summaries are encoded as user messages, so track both:
         // the last real user message (preferred insertion point) and the last
         // user-message-like item (fallback summary insertion point).
         last_user_or_summary_index.get_or_insert(i);
-        if !is_summary_message(&user.message()) {
-            last_real_user_index = Some(i);
-            break;
-        }
+        last_real_user_index = Some(i);
+        break;
     }
     let last_compaction_index = compacted_history
         .iter()
@@ -1500,13 +1573,7 @@ fn build_compacted_history_with_limits(
         summary_text.push_str(COMPACT_IMAGE_OMISSION_MARKER);
     }
 
-    history.push(ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText { text: summary_text }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    });
+    history.push(compaction_summary_item(summary_text));
 
     history
 }

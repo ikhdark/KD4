@@ -32,6 +32,8 @@ pub(crate) use self::types::CompletionCommit;
 use self::types::CompletionDelivery;
 use self::types::ObservationDelivery;
 use crate::TaskFailureHandler;
+use crate::runtime::MAX_BUFFERED_OUTPUT_BYTES;
+use crate::runtime::OutputAdmission;
 use crate::runtime::RuntimeCommand;
 use crate::runtime::RuntimeEvent;
 use crate::runtime::spawn_runtime;
@@ -63,11 +65,13 @@ impl CellActor {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (initial_response_tx, initial_response_rx) = oneshot::channel();
+        let output_admission = Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES));
         let (runtime_tx, runtime_terminate_handle) = spawn_runtime(
             stored_values,
             runtime_request(request),
             default_tool_timeout_ms,
             event_tx,
+            Arc::clone(&output_admission),
             task_failure_handler.clone(),
         )?;
         let handle = CellHandle::new(command_tx, Arc::clone(&cell_state));
@@ -77,6 +81,7 @@ impl CellActor {
                 runtime_tx,
                 runtime_terminate_handle,
                 cell_state,
+                output_admission,
             },
             event_rx,
             command_rx,
@@ -96,6 +101,7 @@ struct CellContext {
     runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
     runtime_terminate_handle: v8::IsolateHandle,
     cell_state: Arc<CellState>,
+    output_admission: Arc<OutputAdmission>,
 }
 
 struct Observer {
@@ -115,11 +121,13 @@ async fn run_cell<H: CellHost>(
         runtime_tx,
         runtime_terminate_handle,
         cell_state,
+        output_admission,
     } = context;
     let cancellation_token = cell_state.cancellation_token();
     let tool_cancellation_token = cancellation_token.child_token();
     let notification_cancellation_token = CancellationToken::new();
     let mut content_items = Vec::new();
+    let mut admitted_output_bytes = 0usize;
     let mut observer = Some(initial_observer);
     let mut termination = false;
     let mut runtime_closed = false;
@@ -197,7 +205,7 @@ async fn run_cell<H: CellHost>(
                 // already-observed state change could remain buffered forever
                 // when the runtime produces no subsequent event.
                 if matches!(mode, ObserveMode::StateChange) && !content_items.is_empty() {
-                    restore_undelivered_yield(
+                    finish_yield_delivery(
                         send_cell_event(
                             response_tx,
                             CellEvent::Yielded {
@@ -205,6 +213,8 @@ async fn run_cell<H: CellHost>(
                             },
                         ),
                         &mut content_items,
+                        &mut admitted_output_bytes,
+                        output_admission.as_ref(),
                     );
                     continue;
                 }
@@ -219,7 +229,7 @@ async fn run_cell<H: CellHost>(
                 }
             } => {
                 yield_timer = None;
-                restore_undelivered_yield(
+                finish_yield_delivery(
                     send_observer_event(
                         observer.take(),
                         CellEvent::Yielded {
@@ -227,6 +237,8 @@ async fn run_cell<H: CellHost>(
                         },
                     ),
                     &mut content_items,
+                    &mut admitted_output_bytes,
+                    output_admission.as_ref(),
                 );
             }
             maybe_event = async {
@@ -311,13 +323,15 @@ async fn run_cell<H: CellHost>(
                     RuntimeEvent::Started => {
                         yield_timer = observer.as_ref().and_then(observer_timer);
                     }
-                    RuntimeEvent::ContentItem(item) => {
+                    RuntimeEvent::ContentItem { item, admitted_bytes } => {
                         content_items.push(output_item(item));
+                        admitted_output_bytes =
+                            admitted_output_bytes.saturating_add(admitted_bytes);
                         if matches!(
                             observer.as_ref().map(|observer| observer.mode),
                             Some(ObserveMode::StateChange)
                         ) {
-                            restore_undelivered_yield(
+                            finish_yield_delivery(
                                 send_observer_event(
                                     observer.take(),
                                     CellEvent::Yielded {
@@ -325,6 +339,8 @@ async fn run_cell<H: CellHost>(
                                     },
                                 ),
                                 &mut content_items,
+                                &mut admitted_output_bytes,
+                                output_admission.as_ref(),
                             );
                         }
                     }
@@ -335,7 +351,7 @@ async fn run_cell<H: CellHost>(
                         );
                         if yield_observer {
                             yield_timer = None;
-                            restore_undelivered_yield(
+                            finish_yield_delivery(
                                 send_observer_event(
                                     observer.take(),
                                     CellEvent::Yielded {
@@ -343,6 +359,8 @@ async fn run_cell<H: CellHost>(
                                     },
                                 ),
                                 &mut content_items,
+                                &mut admitted_output_bytes,
+                                output_admission.as_ref(),
                             );
                         }
                     }
@@ -489,9 +507,14 @@ fn send_cell_event(
     }
 }
 
-fn restore_undelivered_yield(delivery: Result<(), CellEvent>, content_items: &mut Vec<OutputItem>) {
+fn finish_yield_delivery(
+    delivery: Result<(), CellEvent>,
+    content_items: &mut Vec<OutputItem>,
+    admitted_output_bytes: &mut usize,
+    output_admission: &OutputAdmission,
+) {
     match delivery {
-        Ok(()) => {}
+        Ok(()) => output_admission.release(std::mem::take(admitted_output_bytes)),
         Err(CellEvent::Yielded {
             content_items: mut undelivered_items,
         }) => {

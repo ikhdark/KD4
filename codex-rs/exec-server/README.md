@@ -158,10 +158,10 @@ Request params:
 ```json
 {
   "processId": "proc-1",
-  "argv": ["bash", "-lc", "printf 'hello\\n'"],
-  "cwd": "file:///absolute/working/directory",
+  "argv": ["powershell.exe", "-NoLogo", "-NoProfile", "-Command", "Write-Output hello"],
+  "cwd": "file:///C:/work/project",
   "env": {
-    "PATH": "/usr/bin:/bin"
+    "PATH": "C:\\Windows\\System32;C:\\Program Files\\PowerShell\\7"
   },
   "tty": true,
   "pipeStdin": false,
@@ -419,7 +419,7 @@ Initialize:
 Start a process:
 
 ```json
-{"id":2,"method":"process/start","params":{"processId":"proc-1","argv":["bash","-lc","printf 'ready\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done"],"cwd":"file:///tmp","env":{"PATH":"/usr/bin:/bin"},"tty":true,"pipeStdin":false,"arg0":null}}
+{"id":2,"method":"process/start","params":{"processId":"proc-1","argv":["powershell.exe","-NoLogo","-NoProfile","-NoExit"],"cwd":"file:///C:/work/project","env":{"PATH":"C:\\Windows\\System32;C:\\Program Files\\PowerShell\\7"},"tty":true,"pipeStdin":false,"arg0":null}}
 {"id":2,"result":{"processId":"proc-1"}}
 {"method":"process/output","params":{"processId":"proc-1","seq":1,"stream":"stdout","chunk":"cmVhZHkK"}}
 ```

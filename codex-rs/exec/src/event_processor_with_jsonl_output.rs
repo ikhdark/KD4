@@ -13,6 +13,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::WebSearchAction as AppServerWebSearchAction;
 use codex_core::config::Config;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -315,10 +316,16 @@ impl EventProcessorWithJsonOutput {
                     id: item.id,
                     query: item.query,
                     action: match item.action {
-                        Some(action) => serde_json::from_value(
-                            serde_json::to_value(action).unwrap_or_else(|_| json!("other")),
-                        )
-                        .unwrap_or(WebSearchAction::Other),
+                        Some(AppServerWebSearchAction::Search { query, queries }) => {
+                            WebSearchAction::Search { query, queries }
+                        }
+                        Some(AppServerWebSearchAction::OpenPage { url }) => {
+                            WebSearchAction::OpenPage { url }
+                        }
+                        Some(AppServerWebSearchAction::FindInPage { url, pattern }) => {
+                            WebSearchAction::FindInPage { url, pattern }
+                        }
+                        Some(AppServerWebSearchAction::Other) => WebSearchAction::Other,
                         None => WebSearchAction::Other,
                     },
                 }),

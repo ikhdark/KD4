@@ -14,7 +14,6 @@ use codex_utils_output_truncation::approx_bytes_for_tokens;
 use tracing::warn;
 
 pub const BASE_INSTRUCTIONS: &str = codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT;
-const DEFAULT_PERSONALITY_HEADER: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
 const LOCAL_FRIENDLY_TEMPLATE: &str =
     "You optimize for team morale and being a supportive teammate as much as code quality.";
 const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
@@ -119,7 +118,7 @@ fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
     match slug {
         "gpt-5.2-codex" | "exp-codex-personality" => Some(ModelMessages {
             instructions_template: Some(format!(
-                "{DEFAULT_PERSONALITY_HEADER}\n\n{PERSONALITY_PLACEHOLDER}\n\n{BASE_INSTRUCTIONS}"
+                "{PERSONALITY_PLACEHOLDER}\n\n{BASE_INSTRUCTIONS}"
             )),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: Some(String::new()),
@@ -130,6 +129,17 @@ fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
         }),
         _ => None,
     }
+}
+
+pub(crate) fn apply_local_personality_messages(model: &mut ModelInfo, requested_slug: &str) {
+    let Some(mut local_messages) = local_personality_messages_for_slug(requested_slug) else {
+        return;
+    };
+    local_messages.approvals = model
+        .model_messages
+        .as_ref()
+        .and_then(|messages| messages.approvals.clone());
+    model.model_messages = Some(local_messages);
 }
 
 #[cfg(test)]

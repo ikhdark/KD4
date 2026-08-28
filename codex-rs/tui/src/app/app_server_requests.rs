@@ -12,7 +12,6 @@ use codex_app_server_protocol::McpServerElicitationRequestResponse;
 use codex_app_server_protocol::PermissionsRequestApprovalResponse;
 use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::ServerRequest;
-use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
 
 impl App {
     pub(super) async fn reject_app_server_request(
@@ -104,16 +103,14 @@ impl PendingAppServerRequests {
                 None
             }
             ServerRequest::PermissionsRequestApproval { request_id, params } => {
-                // TODO(anp): Remove this duplicate validation once core permission paths remain
-                // PathUri after crossing the app-server boundary. Native permission paths do not
-                // yet have an ingress validation step, so validate them here before recording the
-                // request as pending. Discovering an invalid path later in a UI delivery path
-                // would leave the app-server RPC waiting without a clean rejection path.
-                if let Err(err) = CoreRequestPermissionProfile::try_from(params.permissions.clone())
+                if let Err(err) = params
+                    .permissions
+                    .clone()
+                    .into_core_with_cwd(&params.cwd_uri)
                 {
                     return Some(UnsupportedAppServerRequest {
                         request_id: request_id.clone(),
-                        message: format!("failed to localize requested filesystem paths: {err}"),
+                        message: format!("invalid requested filesystem paths: {err}"),
                     });
                 }
                 self.permissions_approvals
@@ -412,7 +409,6 @@ struct McpRequestKey {
 mod tests {
     use super::PendingAppServerRequests;
     use super::ResolvedAppServerRequest;
-    use super::UnsupportedAppServerRequest;
     use crate::app_command::AppCommand as Op;
     use codex_app_server_protocol::AdditionalFileSystemPermissions;
     use codex_app_server_protocol::AdditionalNetworkPermissions;
@@ -437,6 +433,7 @@ mod tests {
     use codex_protocol::models::NetworkPermissions;
     use codex_protocol::request_permissions::RequestPermissionProfile;
     use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -483,9 +480,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_permissions_with_paths_that_cannot_be_localized() {
+    fn accepts_permissions_with_relative_paths_for_foreign_cwd() {
         let mut pending = PendingAppServerRequests::default();
-        let request_id = AppServerRequestId::Integer(7);
         let permissions = codex_app_server_protocol::RequestPermissionProfile {
             network: None,
             file_system: Some(AdditionalFileSystemPermissions {
@@ -498,14 +494,13 @@ mod tests {
                 entries: None,
             }),
         };
-        let localization_error =
-            RequestPermissionProfile::try_from(permissions.clone()).expect_err("relative path");
-        let cwd =
-            AbsolutePathBuf::try_from(PathBuf::from(r"C:\tmp")).expect("path must be absolute");
+        let cwd_uri = PathUri::parse("file:///home/remote/project").expect("foreign cwd URI");
+        let cwd = AbsolutePathBuf::try_from(std::env::current_dir().expect("current directory"))
+            .expect("current directory should be absolute");
 
         assert_eq!(
             pending.note_server_request(&ServerRequest::PermissionsRequestApproval {
-                request_id: request_id.clone(),
+                request_id: AppServerRequestId::Integer(7),
                 params: PermissionsRequestApprovalParams {
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
@@ -513,16 +508,12 @@ mod tests {
                     environment_id: None,
                     started_at_ms: 0,
                     cwd,
+                    cwd_uri,
                     reason: None,
                     permissions,
                 },
             }),
-            Some(UnsupportedAppServerRequest {
-                request_id,
-                message: format!(
-                    "failed to localize requested filesystem paths: {localization_error}"
-                ),
-            })
+            None
         );
     }
 
@@ -545,6 +536,7 @@ mod tests {
                     environment_id: None,
                     started_at_ms: 0,
                     cwd: absolute_path(r"C:\tmp"),
+                    cwd_uri: PathUri::from_abs_path(&absolute_path(r"C:\tmp")),
                     reason: None,
                     permissions: serde_json::from_value(json!({
                         "network": { "enabled": null }
@@ -577,8 +569,8 @@ mod tests {
                             enabled: Some(true),
                         }),
                         file_system: Some(FileSystemPermissions::from_read_write_roots(
-                            Some(vec![absolute_path(read_path)]),
-                            Some(vec![absolute_path(write_path)]),
+                            Some(vec![PathUri::from_abs_path(&absolute_path(read_path))]),
+                            Some(vec![PathUri::from_abs_path(&absolute_path(write_path))]),
                         )),
                     },
                     scope: codex_protocol::request_permissions::PermissionGrantScope::Session,

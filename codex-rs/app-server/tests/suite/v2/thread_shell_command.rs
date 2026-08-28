@@ -5,11 +5,14 @@ use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_shell_command_sse_response;
 use app_test_support::format_with_current_shell_display;
 use app_test_support::to_response;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionOutputDeltaNotification;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
 use codex_app_server_protocol::CommandExecutionSource;
 use codex_app_server_protocol::CommandExecutionStatus;
+use codex_app_server_protocol::EnvironmentAddResponse;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -28,6 +31,7 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadTurnsListParams;
 use codex_app_server_protocol::ThreadTurnsListResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
+use codex_app_server_protocol::TurnEnvironmentParams;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
@@ -35,11 +39,22 @@ use codex_core::shell::default_user_shell;
 use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
 use codex_features::FEATURES;
 use codex_features::Feature;
+use codex_utils_path_uri::PathUri;
+use futures::SinkExt;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
 use tempfile::TempDir;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
+
+use super::exec_server_test_support::accept_exec_server_environment;
+use super::exec_server_test_support::read_exec_server_json;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -186,7 +201,7 @@ async fn thread_shell_command_history_responses_exclude_persisted_command_execut
 }
 
 #[tokio::test]
-async fn thread_shell_command_returns_error_when_local_environment_is_disabled() -> Result<()> {
+async fn thread_shell_command_errors_when_thread_has_no_selected_environment() -> Result<()> {
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
     std::fs::create_dir(&codex_home)?;
@@ -225,8 +240,240 @@ async fn thread_shell_command_returns_error_when_local_environment_is_disabled()
     let error = mcp
         .read_stream_until_error_message(RequestId::Integer(shell_id))
         .await?;
-    assert_eq!(error.error.message, "local environment is not configured");
+    assert_eq!(error.error.message, "thread has no selected environment");
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_shell_command_uses_selected_remote_environment_without_local_environment()
+-> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let exec_server_url = format!("ws://{}", listener.local_addr()?);
+    let exec_server = tokio::spawn(serve_remote_user_shell(listener));
+    let tmp = TempDir::new()?;
+    let codex_home = tmp.path().join("codex_home");
+    std::fs::create_dir(&codex_home)?;
+    let server = create_mock_responses_server_sequence(vec![]).await;
+    create_config_toml(
+        codex_home.as_path(),
+        &server.uri(),
+        "never",
+        &BTreeMap::default(),
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.as_path())
+        .without_auto_env()
+        .with_env_overrides(&[(CODEX_EXEC_SERVER_URL_ENV_VAR, Some("none"))])
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let add_id = mcp
+        .send_raw_request(
+            "environment/add",
+            Some(json!({
+                "environmentId": "remote-a",
+                "execServerUrl": exec_server_url,
+                "connectTimeoutMs": 10_000,
+            })),
+        )
+        .await?;
+    let add_response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(add_id)),
+    )
+    .await??;
+    let _: EnvironmentAddResponse = to_response(add_response)?;
+
+    let remote_cwd = PathUri::parse("file:///home/remote/workspace")?;
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            environments: Some(vec![TurnEnvironmentParams {
+                environment_id: "remote-a".to_string(),
+                cwd: remote_cwd.clone().into(),
+            }]),
+            ..Default::default()
+        })
+        .await?;
+    let start_response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse {
+        thread,
+        selected_environment,
+        ..
+    } = to_response::<ThreadStartResponse>(start_response)?;
+    assert_eq!(
+        selected_environment.map(|selected| (selected.environment_id, selected.cwd)),
+        Some(("remote-a".to_string(), remote_cwd))
+    );
+
+    let shell_id = mcp
+        .send_thread_shell_command_request(ThreadShellCommandParams {
+            thread_id: thread.id,
+            command: "printf remote-shell".to_string(),
+        })
+        .await?;
+    let shell_response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(shell_id)),
+    )
+    .await??;
+    let _: ThreadShellCommandResponse = to_response(shell_response)?;
+
+    let started = wait_for_command_execution_started(&mut mcp, /*expected_id*/ None).await?;
+    let ThreadItem::CommandExecution { id, cwd, .. } = started.item else {
+        unreachable!("helper returns command execution item");
+    };
+    assert_eq!(cwd.as_str(), "/home/remote/workspace");
+    let completed = wait_for_command_execution_completed(&mut mcp, Some(&id)).await?;
+    let ThreadItem::CommandExecution {
+        status,
+        aggregated_output,
+        exit_code,
+        ..
+    } = completed.item
+    else {
+        unreachable!("helper returns command execution item");
+    };
+    assert_eq!(status, CommandExecutionStatus::Completed);
+    assert_eq!(aggregated_output.as_deref(), Some("remote shell output\n"));
+    assert_eq!(exit_code, Some(0));
+    timeout(DEFAULT_READ_TIMEOUT, exec_server).await???;
+
+    Ok(())
+}
+
+async fn serve_remote_user_shell(listener: TcpListener) -> Result<()> {
+    let mut websocket = accept_exec_server_environment(
+        listener,
+        json!({
+            "operatingSystem": "linux",
+            "shell": {"name": "bash", "path": "/bin/bash"},
+            "cwd": "file:///home/remote/workspace",
+        }),
+    )
+    .await?;
+    let mut shell_snapshot_process_id = None;
+    let mut shell_process_id = None;
+
+    loop {
+        let request = read_exec_server_json(&mut websocket).await?;
+        match request["method"].as_str() {
+            Some("process/start") => {
+                let process_id = request["params"]["processId"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("process/start missing processId"))?
+                    .to_string();
+                if process_id.contains("-shell-snapshot-") {
+                    shell_snapshot_process_id = Some(process_id.clone());
+                } else {
+                    assert_eq!(request["params"]["cwd"], "file:///home/remote/workspace");
+                    assert_eq!(
+                        request["params"]["argv"]
+                            .as_array()
+                            .and_then(|argv| argv.last())
+                            .and_then(Value::as_str),
+                        Some("printf remote-shell")
+                    );
+                    shell_process_id = Some(process_id.clone());
+                }
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "id": request["id"],
+                        "result": {"processId": process_id},
+                    }),
+                )
+                .await?;
+            }
+            Some("process/read") => {
+                let process_id = request["params"]["processId"].as_str();
+                let result = if process_id == shell_snapshot_process_id.as_deref() {
+                    json!({
+                        "chunks": [],
+                        "nextSeq": 0,
+                        "exited": true,
+                        "exitCode": 0,
+                        "closed": true,
+                        "failure": null,
+                        "sandboxDenied": false,
+                    })
+                } else {
+                    assert_eq!(process_id, shell_process_id.as_deref());
+                    json!({
+                        "chunks": [{
+                            "seq": 1,
+                            "stream": "stdout",
+                            "chunk": BASE64_STANDARD.encode("remote shell output\n"),
+                        }],
+                        "nextSeq": 2,
+                        "exited": true,
+                        "exitCode": 0,
+                        "closed": true,
+                        "failure": null,
+                        "sandboxDenied": false,
+                    })
+                };
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({"id": request["id"], "result": result}),
+                )
+                .await?;
+                if process_id == shell_process_id.as_deref() {
+                    return Ok(());
+                }
+            }
+            Some("fs/createDirectory") => {
+                send_exec_server_json(&mut websocket, json!({"id": request["id"], "result": {}}))
+                    .await?;
+            }
+            Some("fs/getMetadata") => {
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "id": request["id"],
+                        "error": {"code": -32004, "message": "not found"},
+                    }),
+                )
+                .await?;
+            }
+            Some("fs/canonicalize") => {
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "id": request["id"],
+                        "result": {"path": request["params"]["path"]},
+                    }),
+                )
+                .await?;
+            }
+            Some("fs/walk") => {
+                send_exec_server_json(
+                    &mut websocket,
+                    json!({
+                        "id": request["id"],
+                        "result": {"entries": [], "errors": [], "truncated": false},
+                    }),
+                )
+                .await?;
+            }
+            method => anyhow::bail!("unexpected remote shell exec-server request: {method:?}"),
+        }
+    }
+}
+
+async fn send_exec_server_json(
+    websocket: &mut WebSocketStream<TcpStream>,
+    message: Value,
+) -> Result<()> {
+    websocket
+        .send(Message::Text(message.to_string().into()))
+        .await?;
     Ok(())
 }
 

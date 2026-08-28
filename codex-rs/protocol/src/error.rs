@@ -61,6 +61,10 @@ pub enum CodexErr {
     /// Optionally includes the requested delay before retrying the turn.
     #[error("stream disconnected before completion: {0}")]
     Stream(String, Option<Duration>),
+    /// Returned after the request transport has exhausted its retry policy on failures proven to
+    /// have happened before dispatch. Outer response-stream loops must not retry this error again.
+    #[error("request failed before dispatch after exhausting retries: {0}")]
+    PreDispatchRetryExhausted(String),
     #[error(
         "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
     )]
@@ -87,6 +91,9 @@ pub enum CodexErr {
     /// Unexpected HTTP status code.
     #[error("{0}")]
     UnexpectedStatus(UnexpectedResponseError),
+    /// A permanent access denial for a region where the service is unavailable.
+    #[error("{0}")]
+    RegionRestricted(UnexpectedResponseError),
     /// Invalid request.
     #[error("{0}")]
     InvalidRequest(String),
@@ -152,6 +159,8 @@ impl CodexErr {
             | CodexErr::Interrupted
             | CodexErr::EnvVar(_)
             | CodexErr::Fatal(_)
+            | CodexErr::PreDispatchRetryExhausted(_)
+            | CodexErr::RegionRestricted(_)
             | CodexErr::UsageNotIncluded
             | CodexErr::QuotaExceeded
             | CodexErr::InvalidImageRequest()
@@ -234,7 +243,7 @@ impl CodexErr {
     pub fn http_status_code_value(&self) -> Option<u16> {
         let http_status_code = match self {
             CodexErr::RetryLimit(err) => Some(err.status),
-            CodexErr::UnexpectedStatus(err) => Some(err.status),
+            CodexErr::UnexpectedStatus(err) | CodexErr::RegionRestricted(err) => Some(err.status),
             CodexErr::ConnectionFailed(err) => err.status,
             CodexErr::ResponseStreamFailed(err) => err.status,
             _ => None,

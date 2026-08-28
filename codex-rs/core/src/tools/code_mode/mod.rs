@@ -31,14 +31,19 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::RequiredToolTerminalCause;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolPayload;
 use crate::tools::effective_tool_mode;
 use crate::tools::parallel::ToolCallRuntime;
+use crate::tools::parallel::required_tool_error_terminal_cause;
+use crate::tools::parallel::required_tool_terminal_cause;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
 use codex_protocol::openai_models::ToolMode;
 use codex_tools::ToolName;
+use codex_tools::ToolOutputOutcome;
+use codex_tools::ToolOutputSkipDisposition;
 use codex_tools::can_request_original_image_detail;
 use codex_tools::sanitize_original_image_detail as sanitize_image_detail_items;
 use codex_utils_output_truncation::OutputOutcome;
@@ -83,10 +88,19 @@ struct CodeModePacketAdmission {
 
 #[derive(Default)]
 struct CodeModePacketMetrics {
+    next_nested_ordinal: usize,
     nested_call_count: usize,
     batchable_observation_count: usize,
     result_bytes: usize,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
+    first_required_terminal: Option<CodeModeNestedTerminal>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CodeModeNestedTerminal {
+    ordinal: usize,
+    cause: RequiredToolTerminalCause,
+    message: String,
 }
 
 struct CodeModePacketReceipt {
@@ -94,6 +108,7 @@ struct CodeModePacketReceipt {
     batchable_observation_count: usize,
     result_bytes: usize,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
+    first_required_terminal: Option<CodeModeNestedTerminal>,
     advisory: Option<&'static str>,
 }
 
@@ -194,19 +209,32 @@ impl CodeModeService {
         self.dispatch_broker.close_cell(cell_id);
     }
 
-    fn record_packet_call(
+    fn begin_packet_call(&self, cell_id: &CellId) -> usize {
+        let mut admission = self
+            .packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let metrics = admission.cells.entry(cell_id.to_string()).or_default();
+        let ordinal = metrics.next_nested_ordinal;
+        metrics.next_nested_ordinal = metrics.next_nested_ordinal.saturating_add(1);
+        metrics.nested_call_count = metrics.nested_call_count.saturating_add(1);
+        ordinal
+    }
+
+    fn complete_packet_call(
         &self,
         cell_id: &CellId,
+        ordinal: usize,
         batchable_observation: bool,
         result_bytes: usize,
         post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
+        required_terminal: Option<(RequiredToolTerminalCause, String)>,
     ) {
         let mut admission = self
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let metrics = admission.cells.entry(cell_id.to_string()).or_default();
-        metrics.nested_call_count = metrics.nested_call_count.saturating_add(1);
         metrics.batchable_observation_count = metrics
             .batchable_observation_count
             .saturating_add(usize::from(batchable_observation));
@@ -214,6 +242,39 @@ impl CodeModeService {
         metrics
             .post_tool_use_feedback
             .extend(post_tool_use_feedback);
+        if let Some((cause, message)) = required_terminal {
+            let candidate = CodeModeNestedTerminal {
+                ordinal,
+                cause,
+                message,
+            };
+            if metrics
+                .first_required_terminal
+                .as_ref()
+                .is_none_or(|current| candidate.ordinal < current.ordinal)
+            {
+                metrics.first_required_terminal = Some(candidate);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn record_packet_call(
+        &self,
+        cell_id: &CellId,
+        batchable_observation: bool,
+        result_bytes: usize,
+        post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
+    ) {
+        let ordinal = self.begin_packet_call(cell_id);
+        self.complete_packet_call(
+            cell_id,
+            ordinal,
+            batchable_observation,
+            result_bytes,
+            post_tool_use_feedback,
+            None,
+        );
     }
 
     fn finish_packet(&self, cell_id: &str, turn_id: &str) -> CodeModePacketReceipt {
@@ -240,8 +301,17 @@ impl CodeModeService {
             batchable_observation_count: metrics.batchable_observation_count,
             result_bytes: metrics.result_bytes,
             post_tool_use_feedback: metrics.post_tool_use_feedback,
+            first_required_terminal: metrics.first_required_terminal,
             advisory,
         }
+    }
+
+    pub(crate) fn finish_turn(&self, turn_id: &str) {
+        self.packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .consecutive_tiny_packets_by_turn
+            .remove(turn_id);
     }
 
     pub(crate) fn record_owner_drained_continuation(
@@ -354,12 +424,50 @@ pub(super) fn handle_runtime_response(
         started_at,
         packet.post_tool_use_feedback,
     );
+    if let Some(required_terminal) = packet.first_required_terminal {
+        output = fold_nested_required_terminal(output, required_terminal);
+    }
     if let Some(advisory) = packet.advisory {
         output.body.push(FunctionCallOutputContentItem::InputText {
             text: advisory.to_string(),
         });
     }
     Ok(output)
+}
+
+fn fold_nested_required_terminal(
+    mut output: FunctionToolOutput,
+    terminal: CodeModeNestedTerminal,
+) -> FunctionToolOutput {
+    output.body.push(FunctionCallOutputContentItem::InputText {
+        text: format!("Required nested tool outcome: {}", terminal.message),
+    });
+    match terminal.cause {
+        RequiredToolTerminalCause::Blocked => output
+            .with_skip_disposition(ToolOutputSkipDisposition::BlockingRequiredOperation)
+            .with_sampling_request_signal(serde_json::json!({
+                "outcome": "blocked",
+                "nested_ordinal": terminal.ordinal,
+            })),
+        RequiredToolTerminalCause::Failure => output
+            .with_outcome(ToolOutputOutcome::Failure)
+            .with_sampling_request_signal(serde_json::json!({
+                "outcome": "failure",
+                "nested_ordinal": terminal.ordinal,
+            })),
+        RequiredToolTerminalCause::TimedOut => output
+            .with_outcome(ToolOutputOutcome::TimedOut)
+            .with_sampling_request_signal(serde_json::json!({
+                "outcome": "timeout",
+                "nested_ordinal": terminal.ordinal,
+            })),
+        RequiredToolTerminalCause::RecoverableCancellation => output
+            .with_outcome(ToolOutputOutcome::Failure)
+            .with_sampling_request_signal(serde_json::json!({
+                "outcome": "recoverable_cancellation",
+                "nested_ordinal": terminal.ordinal,
+            })),
+    }
 }
 
 fn runtime_response_cell_id(response: &RuntimeResponse) -> &str {
@@ -523,10 +631,25 @@ async fn call_nested_tool(
         tool_kind,
         input,
     } = invocation;
+    let packet_ordinal = exec
+        .session
+        .services
+        .code_mode_service
+        .begin_packet_call(&cell_id);
     if is_exec_tool_name(&tool_name) {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "{PUBLIC_TOOL_NAME} cannot invoke itself"
-        )));
+        let message = format!("{PUBLIC_TOOL_NAME} cannot invoke itself");
+        exec.session
+            .services
+            .code_mode_service
+            .complete_packet_call(
+                &cell_id,
+                packet_ordinal,
+                false,
+                0,
+                Vec::new(),
+                Some((RequiredToolTerminalCause::Failure, message.clone())),
+            );
+        return Err(FunctionCallError::RespondToModel(message));
     }
 
     let payload = match build_nested_tool_payload(tool_kind, &tool_name, input) {
@@ -538,6 +661,17 @@ async fn call_nested_tool(
                 None,
                 nested_failure_fingerprint(&tool_name, &error),
             );
+            exec.session
+                .services
+                .code_mode_service
+                .complete_packet_call(
+                    &cell_id,
+                    packet_ordinal,
+                    false,
+                    0,
+                    Vec::new(),
+                    Some((RequiredToolTerminalCause::Failure, error.clone())),
+                );
             return Err(FunctionCallError::RespondToModel(error));
         }
     };
@@ -562,12 +696,25 @@ async fn call_nested_tool(
     let mut result = match result {
         Ok(result) => result,
         Err(error) => {
+            let message = error.to_string();
+            let terminal_cause = required_tool_error_terminal_cause(&error);
             tool_runtime.record_code_mode_failure(
                 cell_id.as_str(),
                 &tool_name,
                 Some(&payload),
-                nested_failure_fingerprint(&tool_name, &error.to_string()),
+                nested_failure_fingerprint(&tool_name, &message),
             );
+            exec.session
+                .services
+                .code_mode_service
+                .complete_packet_call(
+                    &cell_id,
+                    packet_ordinal,
+                    false,
+                    0,
+                    Vec::new(),
+                    Some((terminal_cause, message)),
+                );
             return Err(error);
         }
     };
@@ -587,13 +734,31 @@ async fn call_nested_tool(
     }
     let post_tool_use_feedback = result.take_code_mode_feedback();
     let result_value = result.code_mode_result();
-    exec.session.services.code_mode_service.record_packet_call(
-        &cell_id,
-        is_batchable_observation(&tool_name, &payload)
-            && !result_has_live_exec_session(&result_value),
-        serialized_json_len(&result_value),
-        post_tool_use_feedback,
-    );
+    let required_terminal =
+        required_tool_terminal_cause(outcome_context, signal.as_ref()).map(|cause| {
+            let label = match cause {
+                RequiredToolTerminalCause::Blocked => "blocked",
+                RequiredToolTerminalCause::Failure => "failed",
+                RequiredToolTerminalCause::TimedOut => "timed out",
+                RequiredToolTerminalCause::RecoverableCancellation => "was cancelled",
+            };
+            (
+                cause,
+                format!("required nested tool `{}` {label}", tool_name.name),
+            )
+        });
+    exec.session
+        .services
+        .code_mode_service
+        .complete_packet_call(
+            &cell_id,
+            packet_ordinal,
+            is_batchable_observation(&tool_name, &payload)
+                && !result_has_live_exec_session(&result_value),
+            serialized_json_len(&result_value),
+            post_tool_use_feedback,
+            required_terminal,
+        );
     tool_runtime.record_code_mode_result(
         CodeModeToolResult {
             cell_id: cell_id.as_str(),
@@ -602,7 +767,7 @@ async fn call_nested_tool(
             source_dependencies,
             outcome_context,
             signal: signal.as_ref(),
-            result: result_value.clone(),
+            result: &result_value,
             canonical_artifact_required,
         },
         &receipts,
@@ -773,11 +938,14 @@ mod tests {
     use super::CodeModeService;
     use super::OutputOutcome;
     use super::build_nested_tool_payload;
+    use super::fold_nested_required_terminal;
     use super::is_batchable_observation;
     use super::nested_failure_fingerprint;
     use super::result_has_live_exec_session;
     use super::serialized_json_len;
     use super::truncate_code_mode_result;
+    use crate::tools::context::FunctionToolOutput;
+    use crate::tools::context::RequiredToolTerminalCause;
     use crate::tools::context::ToolPayload;
     use codex_code_mode::CellId;
     use codex_code_mode::CodeModeToolKind;
@@ -786,6 +954,9 @@ mod tests {
     use codex_protocol::models::FunctionCallOutputContentItem;
     use codex_protocol::models::SearchToolCallParams;
     use codex_tools::ToolName;
+    use codex_tools::ToolOutput;
+    use codex_tools::ToolOutputOutcome;
+    use codex_tools::ToolOutputSkipDisposition;
     use serde_json::json;
 
     fn test_service() -> CodeModeService {
@@ -839,6 +1010,33 @@ mod tests {
     }
 
     #[test]
+    fn turn_completion_releases_tiny_packet_admission_state() {
+        let service = test_service();
+        let cell = CellId::new("cell".to_string());
+        service.record_packet_call(&cell, true, 128, Vec::new());
+        service.finish_packet("cell", "finished-turn");
+        assert!(
+            service
+                .packet_admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .consecutive_tiny_packets_by_turn
+                .contains_key("finished-turn")
+        );
+
+        service.finish_turn("finished-turn");
+
+        assert!(
+            !service
+                .packet_admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .consecutive_tiny_packets_by_turn
+                .contains_key("finished-turn")
+        );
+    }
+
+    #[test]
     fn post_tool_feedback_is_drained_once_with_code_mode_packet() {
         let service = test_service();
         let cell = CellId::new("feedback-cell".to_string());
@@ -859,6 +1057,55 @@ mod tests {
                 .post_tool_use_feedback
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn nested_terminal_fold_uses_registration_order_and_preserves_blocked_status() {
+        let service = test_service();
+        let cell = CellId::new("terminal-cell".to_string());
+        let first = service.begin_packet_call(&cell);
+        let second = service.begin_packet_call(&cell);
+
+        service.complete_packet_call(
+            &cell,
+            second,
+            false,
+            0,
+            Vec::new(),
+            Some((
+                RequiredToolTerminalCause::Failure,
+                "second nested failure".to_string(),
+            )),
+        );
+        service.complete_packet_call(
+            &cell,
+            first,
+            false,
+            0,
+            Vec::new(),
+            Some((
+                RequiredToolTerminalCause::Blocked,
+                "first nested block".to_string(),
+            )),
+        );
+
+        let terminal = service
+            .finish_packet("terminal-cell", "turn")
+            .first_required_terminal
+            .expect("the first registered terminal nested call must be retained");
+        assert_eq!(terminal.ordinal, first);
+        assert_eq!(terminal.cause, RequiredToolTerminalCause::Blocked);
+
+        let output = fold_nested_required_terminal(
+            FunctionToolOutput::from_text("script completed".to_string(), Some(true)),
+            terminal,
+        );
+        assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Skipped);
+        assert_eq!(
+            output.skip_disposition,
+            Some(ToolOutputSkipDisposition::BlockingRequiredOperation)
+        );
+        assert!(output.into_text().contains("first nested block"));
     }
 
     #[test]

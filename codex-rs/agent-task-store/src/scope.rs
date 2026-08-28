@@ -248,11 +248,7 @@ fn paths_equal(left: &str, right: &str) -> bool {
 }
 
 fn comparison_key(path: &str) -> String {
-    if cfg!(windows) {
-        path.to_lowercase()
-    } else {
-        path.to_string()
-    }
+    path.to_lowercase()
 }
 
 pub(crate) fn path_comparison_key(path: &str) -> String {
@@ -288,32 +284,17 @@ const ENCODED_PATH_PREFIX: &str = ":native-path:";
 
 fn filesystem_identity_bytes(path: &Path) -> Vec<u8> {
     let bytes = native_os_bytes(path.as_os_str());
-    if cfg!(windows) {
-        // Canonical Windows paths normally preserve the filesystem's spelling. Lowercase
-        // valid Unicode paths for compatibility with the legacy identity while retaining a
-        // lossless wide-character fallback for paths that cannot be represented as UTF-8.
-        if let Some(path) = path.to_str() {
-            return path.to_lowercase().into_bytes();
-        }
-    } else if let Some(path) = path.to_str() {
-        return path.as_bytes().to_vec();
+    // Canonical Windows paths normally preserve the filesystem's spelling. Lowercase
+    // valid Unicode paths for compatibility with the legacy identity while retaining a
+    // lossless wide-character fallback for paths that cannot be represented as UTF-8.
+    if let Some(path) = path.to_str() {
+        return path.to_lowercase().into_bytes();
     }
-    let mut identity = if cfg!(windows) {
-        b"windows\0".to_vec()
-    } else {
-        b"unix\0".to_vec()
-    };
+    let mut identity = b"windows\0".to_vec();
     identity.extend(bytes);
     identity
 }
 
-#[cfg(unix)]
-fn native_os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    value.as_bytes().to_vec()
-}
-
-#[cfg(windows)]
 fn native_os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
     use std::os::windows::ffi::OsStrExt;
     value
@@ -322,13 +303,6 @@ fn native_os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
         .collect::<Vec<_>>()
 }
 
-#[cfg(unix)]
-fn native_os_string_from_hex(value: &str) -> Option<std::ffi::OsString> {
-    use std::os::unix::ffi::OsStringExt;
-    Some(std::ffi::OsString::from_vec(hex_decode(value)?))
-}
-
-#[cfg(windows)]
 fn native_os_string_from_hex(value: &str) -> Option<std::ffi::OsString> {
     use std::os::windows::ffi::OsStringExt;
     let bytes = hex_decode(value)?;
@@ -373,25 +347,12 @@ mod audit_tests {
     use super::*;
 
     #[test]
-    fn audit_workspace_case_identity_is_platform_aware() {
-        if cfg!(windows) {
-            assert_eq!(comparison_key("Src/Lib.rs"), comparison_key("src/lib.rs"));
-        } else {
-            assert_ne!(comparison_key("Src/Lib.rs"), comparison_key("src/lib.rs"));
-        }
+    fn audit_workspace_case_identity_is_windows_case_insensitive() {
+        assert_eq!(comparison_key("Src/Lib.rs"), comparison_key("src/lib.rs"));
     }
 
     #[test]
     fn audit_workspace_native_path_encoding_is_lossless() {
-        #[cfg(unix)]
-        let (left, right) = {
-            use std::os::unix::ffi::OsStringExt;
-            (
-                PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0x80])),
-                PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0x81])),
-            )
-        };
-        #[cfg(windows)]
         let (left, right) = {
             use std::os::windows::ffi::OsStringExt;
             (

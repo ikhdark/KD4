@@ -271,13 +271,19 @@ fn otel_export_routing_policy_routes_tool_result_log_and_trace_events() {
     let tool_log = find_log_by_event_name(&logs, "codex.tool_result");
     let tool_log_attrs = log_attributes(&tool_log.record);
     assert_eq!(
-        tool_log_attrs.get("arguments").map(String::as_str),
-        Some("secret arguments")
+        tool_log_attrs.get("arguments_length").map(String::as_str),
+        Some("16")
     );
     assert_eq!(
-        tool_log_attrs.get("output").map(String::as_str),
-        Some("secret output\nsecond line")
+        tool_log_attrs.get("output_length").map(String::as_str),
+        Some("25")
     );
+    assert_eq!(
+        tool_log_attrs.get("output_line_count").map(String::as_str),
+        Some("2")
+    );
+    assert!(!tool_log_attrs.contains_key("arguments"));
+    assert!(!tool_log_attrs.contains_key("output"));
     assert_eq!(
         tool_log_attrs.get("mcp_server").map(String::as_str),
         Some("internal-mcp")
@@ -312,6 +318,50 @@ fn otel_export_routing_policy_routes_tool_result_log_and_trace_events() {
     assert!(!tool_trace_attrs.contains_key("output"));
     assert!(!tool_trace_attrs.contains_key("mcp_server"));
     assert!(!tool_trace_attrs.contains_key("mcp_server_origin"));
+}
+
+#[test]
+fn logging_contract_failed_tool_event_omits_error_output() {
+    let log_exporter = InMemoryLogExporter::default();
+    let logger_provider = SdkLoggerProvider::builder()
+        .with_simple_exporter(log_exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(
+        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider)
+            .with_filter(filter_fn(OtelProvider::log_export_filter)),
+    );
+
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        let manager = SessionTelemetry::new(
+            ThreadId::new(),
+            "gpt-5.1",
+            "gpt-5.1",
+            None,
+            None,
+            Some(TelemetryAuthMode::ApiKey),
+            "codex_exec".to_string(),
+            true,
+            "tty".to_string(),
+            SessionSource::Cli,
+        );
+        manager.log_tool_failed("shell", "failure secret\nsecond line");
+    });
+
+    logger_provider.force_flush().expect("flush logs");
+    let logs = log_exporter.get_emitted_logs().expect("log export");
+    let tool_log = find_log_by_event_name(&logs, "codex.tool_result");
+    let attributes = log_attributes(&tool_log.record);
+    assert_eq!(
+        attributes.get("output_length").map(String::as_str),
+        Some("26")
+    );
+    assert_eq!(
+        attributes.get("output_line_count").map(String::as_str),
+        Some("2")
+    );
+    assert!(!attributes.contains_key("output"));
+    assert!(!attributes.contains_key("error.message"));
 }
 
 #[test]

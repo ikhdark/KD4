@@ -67,6 +67,12 @@ pub trait ThreadStore: Any + Send + Sync {
     /// replay history and before updating any implementation-owned projections.
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()>;
 
+    /// Appends raw rollout items in stream order without requiring an immediate durability
+    /// barrier. Stores that do not buffer writes may use the ordinary append contract.
+    fn append_items_ordered(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
+        self.append_items(params)
+    }
+
     /// Materializes the thread if persistence is lazy, then persists all queued items.
     fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;
 

@@ -21,6 +21,8 @@ use super::dispatcher::hook_scope_label;
 use super::dispatcher::scope_for_event;
 use codex_protocol::protocol::HookExecutionMode;
 use codex_protocol::protocol::HookHandlerType;
+use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
+use codex_utils_pty::run_windows_process_operation;
 
 const HOOK_STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
 const HOOK_STREAM_READ_BUFFER_BYTES: usize = 16 * 1024;
@@ -87,7 +89,8 @@ async fn run_command_with_reservation(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        .creation_flags(WINDOWS_CREATE_SUSPENDED);
 
     let managed = match timeout_at(timeout_deadline, reservation).await {
         Ok(Ok(managed)) => managed,
@@ -111,22 +114,27 @@ async fn run_command_with_reservation(
         return finish_timeout(started_at, started, handler.timeout_sec);
     }
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            return finish_command_run(
-                started_at,
-                started,
-                CommandRunCompletion {
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    error: Some(err.to_string()),
-                    outcome: "spawn_error",
-                },
-            );
-        }
-    };
+    let spawn_timeout = timeout_deadline.saturating_duration_since(tokio::time::Instant::now());
+    let mut child =
+        match run_windows_process_operation(spawn_timeout, move || command.spawn()).await {
+            Ok(child) => child,
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+                return finish_timeout(started_at, started, handler.timeout_sec);
+            }
+            Err(err) => {
+                return finish_command_run(
+                    started_at,
+                    started,
+                    CommandRunCompletion {
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error: Some(err.to_string()),
+                        outcome: "spawn_error",
+                    },
+                );
+            }
+        };
 
     {
         let Some(process_id) = child.id() else {
@@ -143,7 +151,7 @@ async fn run_command_with_reservation(
                 },
             );
         };
-        if let Err(err) = managed.attach(process_id) {
+        if let Err(err) = managed.attach_and_resume(process_id) {
             terminate_command_tree(&mut child, &managed).await;
             return finish_command_run(
                 started_at,

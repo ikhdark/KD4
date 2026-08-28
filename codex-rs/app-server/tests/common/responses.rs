@@ -36,7 +36,7 @@ pub fn create_apply_patch_sse_response(
 ) -> anyhow::Result<String> {
     Ok(responses::sse(vec![
         responses::ev_response_created("resp-1"),
-        responses::ev_apply_patch_shell_command_call_via_heredoc(call_id, patch_content),
+        responses::ev_apply_patch_custom_tool_call(call_id, patch_content),
         responses::ev_completed("resp-1"),
     ]))
 }

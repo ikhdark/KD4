@@ -155,8 +155,20 @@ pub(crate) fn default_builtin_permission_profile_name(
     active_project: &ProjectConfig,
     windows_sandbox_level: WindowsSandboxLevel,
 ) -> &'static str {
+    default_builtin_permission_profile_name_for_platform(
+        active_project,
+        windows_sandbox_level,
+        cfg!(windows),
+    )
+}
+
+fn default_builtin_permission_profile_name_for_platform(
+    active_project: &ProjectConfig,
+    windows_sandbox_level: WindowsSandboxLevel,
+    is_windows: bool,
+) -> &'static str {
     if (active_project.is_trusted() || active_project.is_untrusted())
-        && windows_sandbox_level != WindowsSandboxLevel::Disabled
+        && (!is_windows || windows_sandbox_level != WindowsSandboxLevel::Disabled)
     {
         BUILT_IN_WORKSPACE_PROFILE
     } else {
@@ -443,7 +455,7 @@ pub(crate) fn compile_permission_profile(
                     push_warning(
                         startup_warnings,
                         format!(
-                            "Filesystem deny-read glob `{pattern}` uses `**`. Non-macOS sandboxing does not support unbounded `**` natively; set `glob_scan_max_depth` in this filesystem profile to cap Linux glob expansion and silence this warning, or enumerate explicit depths such as `*.env`, `*/*.env`, and `*/*/*.env`."
+                            "Filesystem deny-read glob `{pattern}` uses `**`. Windows sandboxing does not support unbounded `**` natively; set `glob_scan_max_depth` in this filesystem profile to cap glob expansion and silence this warning, or enumerate explicit depths such as `*.env`, `*/*.env`, and `*/*/*.env`."
                         ),
                     );
                 }

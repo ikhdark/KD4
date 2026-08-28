@@ -538,16 +538,6 @@ fn install_with_new_version_keeps_existing_plugin_root_and_prunes_old_versions()
 }
 
 #[test]
-fn old_plugin_version_would_stay_active_for_local_or_later_versions() {
-    assert!(old_plugin_version_would_stay_active(
-        DEFAULT_PLUGIN_VERSION,
-        "1.0.0"
-    ));
-    assert!(old_plugin_version_would_stay_active("10.0.0", "9.0.0"));
-    assert!(!old_plugin_version_would_stay_active("1.0.0", "2.0.0"));
-}
-
-#[test]
 fn plugin_root_rejects_path_separators_in_key_segments() {
     let err = PluginId::parse("../../etc@debug").unwrap_err();
     assert_eq!(

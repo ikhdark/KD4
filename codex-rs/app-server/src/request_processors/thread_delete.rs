@@ -62,6 +62,33 @@ impl ThreadRequestProcessor {
             }
         }
 
+        if let Some(local_store) = self
+            .thread_store
+            .as_any()
+            .downcast_ref::<codex_thread_store::LocalThreadStore>()
+        {
+            let staged_delete = local_store
+                .stage_thread_deletes(delete_order.as_slice())
+                .await
+                .map_err(thread_store_delete_error)?;
+            if let Some(state_db) = self.state_db.as_ref() {
+                state_db
+                    .delete_threads_strict(delete_order.as_slice())
+                    .await
+                    .map_err(|err| {
+                        internal_error(format!(
+                            "failed to delete app-server state for {thread_id}: {err}"
+                        ))
+                    })?;
+            }
+            staged_delete.commit().await;
+            for thread_id_to_delete in delete_order {
+                self.prepare_thread_for_delete(thread_id_to_delete).await;
+                deleted_thread_ids.push(thread_id_to_delete.to_string());
+            }
+            return Ok(ThreadDeleteResponse {});
+        }
+
         let mut completed_thread_ids = Vec::new();
         for thread_id_to_delete in delete_order.iter().copied() {
             match self

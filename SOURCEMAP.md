@@ -6,13 +6,13 @@ KD4 is the user's local fork of
 ownership, runtime entrypoints, package boundaries, contracts, generated
 artifacts, validation routes, and the local install path.
 
-Read [`AGENTS.md`](AGENTS.md) and the nearest scoped `AGENTS.md` before changing
-files. This map is the cross-cutting source of truth when ownership is unclear,
+Read the root [`AGENTS.md`](AGENTS.md) before changing files. This map is the
+cross-cutting source of truth when ownership is unclear,
 a behavior crosses packages or languages, or a source change must be traced to
 an SDK, schema, package, installed binary, or Codex Desktop.
 
 - Product documentation: [OpenAI Codex documentation](https://developers.openai.com/codex)
-- Local build and publish policy: [`scripts/AGENTS.md`](scripts/AGENTS.md)
+- Local build and publish policy: [`AGENTS.md`](AGENTS.md)
 - Standalone installation guidance: [`scripts/install/README.md`](scripts/install/README.md)
 - License: [`LICENSE`](LICENSE)
 
@@ -49,7 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
-Tracked repository path snapshot: `count=5021 sha256=96992e6c921de279fd19ff279c2d92959730aa82b70cb9d0ec32188198b805bb`.
+Tracked repository path snapshot: `count=5015 sha256=bb39b25efc2ef322a7c1cd8c98b1af6d1bd46d6c29114626567a6f56aabe867e`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires
@@ -60,8 +60,7 @@ manual edit. Content-only changes do not alter the snapshot.
 A change is material to this map when it does any of the following:
 
 - adds, removes, renames, or repurposes a tracked top-level entry;
-- adds, removes, or moves a Rust package, JavaScript/Python project manifest, or
-  scoped `AGENTS.md`;
+- adds, removes, or moves a Rust package or JavaScript/Python project manifest;
 - changes a primary executable, SDK, daemon, generator, or runtime entrypoint;
 - moves responsibility between crates, packages, scripts, or instruction scopes;
 - changes ownership of a public protocol, configuration, stored-state,
@@ -84,7 +83,7 @@ map remains useful.
 
 ## How to use this map
 
-1. Read the root and nearest scoped `AGENTS.md`.
+1. Read the root `AGENTS.md`.
 2. Query the smallest named owner slice before reading the broad map. Run
    `python scripts/source_owners.py slice --owner <owner-id>
    --focus "<task description>" --max-relationships 32`.
@@ -174,16 +173,6 @@ below.
 | Path | Applies to |
 | --- | --- |
 | `AGENTS.md` | Entire repository; canonical shared policy plus KD4 project context |
-| `.codex/AGENTS.md` | Repo-local Codex configuration, environment setup, durable harness material, fork-local skills, and workspace policy |
-| `codex-rs/AGENTS.md` | Compact Rust-wide invariants; detailed ownership, workflow, and validation routing live in this map |
-| `codex-rs/core/AGENTS.md` | Core-only session, context, diagnostics, compatibility, and validation deltas |
-| `codex-rs/prompts/AGENTS.md` | Model-visible prompt text, templates, and snapshot expectations |
-| `codex-rs/protocol/AGENTS.md` | Shared event, item, configuration, permission, and compatibility types |
-| `codex-rs/shell-command/AGENTS.md` | Shell parsing, environment, execution, and platform compatibility |
-| `codex-rs/tui/src/bottom_pane/AGENTS.md` | Bottom-pane interaction, composer, overlays, rendering, and snapshots |
-| `scripts/AGENTS.md` | Repository scripts, local publish, checks, packaging helpers, and validation |
-| `scripts/codex_package/AGENTS.md` | Canonical CLI and app-server package directory/archive builder |
-| `scripts/install/AGENTS.md` | Standalone shell and PowerShell installer contracts |
 
 ## Runtime and executable entrypoints
 
@@ -226,7 +215,7 @@ below.
 | State, threads, rollouts, history, and memories | `codex-rs/agent-task-store`, `codex-rs/memories/read`, `codex-rs/memories/write`, `codex-rs/message-history`, `codex-rs/rollout`, `codex-rs/rollout-trace`, `codex-rs/state`, `codex-rs/thread-store` |
 | Models, backend clients, and network transports | `codex-rs/backend-client`, `codex-rs/chatgpt`, `codex-rs/codex-api`, `codex-rs/codex-backend-openapi-models`, `codex-rs/codex-client`, `codex-rs/http-client`, `codex-rs/lmstudio`, `codex-rs/model-provider`, `codex-rs/model-provider-info`, `codex-rs/models-manager`, `codex-rs/ollama`, `codex-rs/responses-api-proxy`, `codex-rs/websocket-client` |
 | Plugins, skills, connectors, and MCP | `codex-rs/codex-mcp`, `codex-rs/connectors`, `codex-rs/core-plugins`, `codex-rs/core-skills`, `codex-rs/mcp-server`, `codex-rs/mcp-server/tests/common`, `codex-rs/plugin`, `codex-rs/rmcp-client`, `codex-rs/skills` |
-| Extension API and built-in extensions | `codex-rs/ext/connectors`, `codex-rs/ext/extension-api`, `codex-rs/ext/goal`, `codex-rs/ext/guardian`, `codex-rs/ext/image-generation`, `codex-rs/ext/items`, `codex-rs/ext/mcp`, `codex-rs/ext/memories`, `codex-rs/ext/skills`, `codex-rs/ext/web-search` |
+| Extension API and built-in extensions | `codex-rs/ext/builtins`, `codex-rs/ext/connectors`, `codex-rs/ext/extension-api`, `codex-rs/ext/goal`, `codex-rs/ext/image-generation`, `codex-rs/ext/items`, `codex-rs/ext/mcp`, `codex-rs/ext/memories`, `codex-rs/ext/skills`, `codex-rs/ext/web-search` |
 | Cloud and external agents | `codex-rs/agent-graph-store`, `codex-rs/agent-identity`, `codex-rs/cloud-config`, `codex-rs/cloud-tasks`, `codex-rs/cloud-tasks-client`, `codex-rs/cloud-tasks-mock-client`, `codex-rs/external-agent-migration`, `codex-rs/external-agent-sessions` |
 | Telemetry, feedback, and diagnostics | `codex-rs/analytics`, `codex-rs/feedback`, `codex-rs/otel`, `codex-rs/response-debug-context` |
 | Support crates and narrow binaries | `codex-rs/async-utils`, `codex-rs/codex-experimental-api-macros`, `codex-rs/git-utils`, `codex-rs/stdio-to-uds`, `codex-rs/test-binary-support`, `codex-rs/uds` |
@@ -340,12 +329,15 @@ core.
 | `ToolContributor` | Native extension-owned tool executors |
 | `ToolLifecycleContributor` | Accepted tool-call start and terminal observation |
 | `TurnItemContributor` | Ordered post-processing of parsed turn items |
-| `ApprovalReviewContributor` | Extension-owned approval review decisions |
+| `ApprovalReviewContributor` | First-claim approval review decisions before the host Guardian fallback |
 
 Built-in implementations live under `codex-rs/ext/*`; host installation and
 dispatch cross `codex-rs/core-plugins`, `codex-rs/core-skills`, and core
 session/tool/context owners. `codex-rs/hooks` is a separate external-command
 hook engine and policy surface, not a substitute for the typed extension API.
+`codex-rs/ext/builtins` owns the capability-aware installation profile shared
+by app-server and MCP-server hosts; hosts provide dependencies and event sinks
+instead of maintaining separate built-in extension lists.
 
 ## Persistence and stored state
 
@@ -433,8 +425,7 @@ an exact test filter selected at least one relevant test.
 
 ## Rust workflow reference
 
-This section is an on-demand reference for Rust work; it is intentionally not
-duplicated in the automatically loaded `codex-rs/AGENTS.md`.
+This section is the on-demand reference for Rust work.
 
 | Need | Preferred route |
 | --- | --- |
@@ -455,16 +446,16 @@ install tools or add dependencies solely to follow this reference.
 | --- | --- |
 | Repository source routing and material-change inventory | `SOURCEMAP.md`; validate with `just source-map-check` |
 | Repository-wide editing policy | `AGENTS.md` |
-| Rust workspace policy | `codex-rs/AGENTS.md` |
-| Script ownership and validation | `scripts/AGENTS.md`, then owner script help or the closest checked-in README |
+| Rust workspace policy | `AGENTS.md`, then the Rust workflow reference in this map |
+| Script ownership and validation | Owner script help or the closest checked-in README |
 | Repo-local Codex setup and durable harness | `.codex/harness/README.md` |
-| Local build and Desktop publish | `scripts/AGENTS.md`, `scripts/publish-local-codex.ps1`, and the build/publish section above |
-| Standalone installation | `scripts/install/AGENTS.md`, `scripts/install/README.md` |
+| Local build and Desktop publish | `scripts/publish-local-codex.ps1` and the build/publish section above |
+| Standalone installation | `scripts/install/README.md` |
 | Product usage, configuration, authentication, and sandbox guidance | [OpenAI Codex documentation](https://developers.openai.com/codex) |
-| Fork-local skills and agent guidance | `.codex/skills` and the nearest scoped `AGENTS.md` |
+| Fork-local skills and agent guidance | `.codex/skills` and the root `AGENTS.md` |
 | Package-specific implementation background | nearest crate/package `README.md` |
 
-Operational rules belong in the closest `AGENTS.md`. Package architecture,
+Operational rules belong in the root `AGENTS.md`. Package architecture,
 usage, and examples belong in the nearest README or checked-in documentation.
 This map owns cross-cutting navigation and structural inventory.
 
@@ -489,9 +480,9 @@ This map owns cross-cutting navigation and structural inventory.
 | npm packaging or install behavior | codex-cli -> stage script/codex_package -> platform package/archive -> installer/release workflow |
 | SDK/API surface | app-server protocol/schema -> TypeScript and/or Python SDK -> generated models/types -> focused SDK tests |
 | Dependency or build-system change | owning manifest -> lock state -> workspace/recipe consumers -> focused build/test/package proof |
-| New top-level area, package, or instruction scope | add the owner and policy boundary -> update the machine-checked inventory in this file -> add routing/validation -> run `just source-map-check` |
+| New top-level area or package | add the owner and policy boundary -> update the machine-checked inventory in this file -> add routing/validation -> run `just source-map-check` |
 
-<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=9f7b8e0c349816d9b113680fc9ce20d5815d5af841db704722872787a1997576 -->
+<!-- BEGIN KD4 SOURCE OWNERS schema=2 manifest_sha256=8a3a6a230e0962303f50ea587d41160119d40d78d8a51d86cacd55b65e380ca3 -->
 ### Managed KD4 source-owner index
 
 This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`, not this block.
@@ -508,7 +499,7 @@ This table is generated by `scripts/source_owners.py`; edit `source_owners.toml`
 | `model-catalog-runtime` | `codex-rs/models-manager` | `codex-rs/models-manager/src/manager.rs::ModelsManager` | `callers_consumers:consumed_by` -> `owner:core-agent-runtime`<br>`control_flow:calls` -> `path:codex-rs/models-manager/src/model_info.rs`<br>`runtime_registration:constructs` -> `path:codex-rs/models-manager/src/manager.rs`<br>+1 more | `semantic:model-instruction-resolution` | `models-manager-focused` |
 | `planning-architecture-runtime` | `codex-rs/core/src/plan_store.rs`<br>`codex-rs/core/src/tools/handlers/plan.rs`<br>`codex-rs/core/src/tools/handlers/plan_tests.rs`<br>`codex-rs/core/src/tools/spec_plan.rs`<br>`codex-rs/core/src/session/reasoning_governor.rs` | `codex-rs/core/src/tools/handlers/plan.rs::PlanHandler`<br>`codex-rs/core/src/plan_store.rs::PlanStore` | `control_flow:calls` -> `path:codex-rs/core/src/task_evidence.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/session/reasoning_governor.rs`<br>`runtime_registration:registers` -> `path:codex-rs/core/src/tools/spec_plan.rs`<br>+1 more | `semantic:durable-plan-update` | `planning-focused` |
 | `repository-context-discovery` | `codex-rs/core/src/git_workspace.rs`<br>`codex-rs/core/src/agents_md.rs` | `codex-rs/core/src/git_workspace.rs::GitWorkspaceCache`<br>`codex-rs/core/src/agents_md.rs::load_project_instructions` | `control_flow:calls` -> `path:codex-rs/core/src/agents_md.rs`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/src/session/mod.rs`<br>`runtime_registration:constructs` -> `path:codex-rs/core/src/git_workspace.rs`<br>+1 more | `semantic:snapshot-scoped-discovery` | `repository-context-focused` |
-| `rust-turn-latency-benchmark` | `codex-rs/core/benches/turn_latency.rs`<br>`codex-rs/core/tests/turn_latency_bench.rs` | `codex-rs/core/benches/turn_latency.rs::main` | `control_flow:calls` -> `owner:core-agent-runtime`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/Cargo.toml`<br>`runtime_registration:registers` -> `path:codex-rs/core/Cargo.toml`<br>+1 more | `semantic:separate-capture-and-comparison-verdicts` | `rust-turn-latency-focused` |
+| `rust-turn-latency-benchmark` | `codex-rs/core/benches/turn_latency.rs`<br>`codex-rs/core/benches/turn_latency/ab_contract.rs`<br>`codex-rs/core/benches/turn_latency/ab_runner.rs`<br>`codex-rs/core/benches/turn_latency/runtime_fixtures.rs`<br>`codex-rs/core/benches/turn_latency/tests.rs`<br>`codex-rs/core/tests/turn_latency_bench.rs`<br>`docs/benchmarks/turn-latency/README.md` | `codex-rs/core/benches/turn_latency.rs::main` | `generated_artifacts:emits` -> `path:docs/benchmarks/turn-latency/accepted`<br>`control_flow:calls` -> `owner:core-agent-runtime`<br>`callers_consumers:consumed_by` -> `path:codex-rs/core/Cargo.toml`<br>+2 more | `semantic:separate-capture-and-comparison-verdicts`<br>`semantic:accepted-turn-latency-reports-are-verified` | `rust-turn-latency-focused` |
 | `shared-protocol-contracts` | `codex-rs/protocol` | `codex-rs/protocol/src/lib.rs::protocol` | `callers_consumers:consumed_by` -> `owner:core-agent-runtime`<br>`control_flow:consumed_by` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/protocol/src/lib.rs`<br>+1 more | `compatibility:shared-protocol-compatibility` | `protocol-focused` |
 | `shared-utility-crates` | `codex-rs/utils` | `codex-rs/utils/build-info/src/lib.rs::BuildInfo`<br>`codex-rs/utils/der/src/lib.rs::first_der_item` | `control_flow:consumed_by` -> `owner:cli-entrypoints`<br>`callers_consumers:consumed_by` -> `owner:app-server-runtime`<br>`runtime_registration:registers` -> `path:codex-rs/Cargo.toml`<br>+1 more | `semantic:shared-utility-single-source` | `shared-utilities-focused` |
 | `source-owner-index` | `scripts/source_owners.py`<br>`source_owners.toml` | `scripts/source_owners.py::main` | `control_flow:generates` -> `generated:architecture_index.json`<br>`callers_consumers:consumed_by` -> `path:SOURCEMAP.md`<br>`configuration:reads_config` -> `config:source_owners.toml`<br>+3 more | `compatibility:fresh-index` | `source-owner-focused` |

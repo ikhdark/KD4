@@ -142,6 +142,12 @@ pub(super) fn server_notification_thread_target(
                 None => return ServerNotificationThreadTarget::AppScoped,
             }
         }
+        ServerNotification::McpServerStartupCompleted(notification) => {
+            match notification.thread_id.as_deref() {
+                Some(thread_id) => Some(thread_id),
+                None => return ServerNotificationThreadTarget::AppScoped,
+            }
+        }
         ServerNotification::SkillsChanged(_)
         | ServerNotification::McpServerOauthLoginCompleted(_)
         | ServerNotification::AccountUpdated(_)
@@ -206,6 +212,7 @@ mod tests {
             sandbox_policy: codex_app_server_protocol::SandboxPolicy::ReadOnly {
                 network_access: false,
             },
+            permission_profile: None,
             active_permission_profile: None,
             model: "gpt-5.4".to_string(),
             model_provider: "openai".to_string(),

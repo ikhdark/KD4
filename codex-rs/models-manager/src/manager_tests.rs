@@ -12,6 +12,7 @@ use codex_login::ExternalAuthRefreshContext;
 use codex_login::TokenData;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -943,6 +944,28 @@ async fn get_model_info_uses_custom_catalog() {
     assert!(model_info.supports_image_detail_original);
     assert!(!model_info.supports_parallel_tool_calls);
     assert!(!model_info.used_fallback_model_metadata);
+}
+
+#[tokio::test]
+async fn exact_gpt_5_2_codex_alias_applies_local_personality_to_catalog_match() {
+    let config = ModelsManagerConfig {
+        personality_enabled: true,
+        ..Default::default()
+    };
+    let remote = remote_model("gpt-5.2", "GPT-5.2", /*priority*/ 0);
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: vec![remote],
+    });
+
+    let model_info = manager.get_model_info("gpt-5.2-codex", &config).await;
+
+    assert!(!model_info.used_fallback_model_metadata);
+    assert_eq!(model_info.slug, "gpt-5.2-codex");
+    assert!(
+        model_info
+            .get_model_instructions(Some(codex_protocol::config_types::Personality::Friendly,))
+            .contains("supportive teammate")
+    );
 }
 
 #[tokio::test]
@@ -2050,4 +2073,34 @@ fn bundled_models_json_roundtrips() {
         !response.models.is_empty(),
         "bundled models.json should contain at least one model"
     );
+}
+
+#[test]
+fn bundled_api_models_advertise_none_reasoning_effort() {
+    let response = crate::bundled_models_response()
+        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
+
+    for slug in [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.2",
+    ] {
+        let model = response
+            .models
+            .iter()
+            .find(|model| model.slug == slug)
+            .unwrap_or_else(|| panic!("bundled models.json should contain {slug}"));
+
+        assert!(
+            model
+                .supported_reasoning_levels
+                .iter()
+                .any(|preset| preset.effort == ReasoningEffort::None),
+            "{slug} should advertise the provider-supported none reasoning effort"
+        );
+    }
 }

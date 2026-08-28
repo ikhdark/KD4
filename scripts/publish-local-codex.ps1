@@ -2044,12 +2044,94 @@ function Ensure-LocalCodexSqliteHomeDirectory {
     Write-ProofLine "localCodexSqliteHomeAction" "created"
 }
 
+function Get-CodexDesktopProcessesForPath {
+    param([string]$DesktopPath)
+
+    return @(
+        Get-Process Codex -ErrorAction SilentlyContinue |
+            Where-Object {
+                try {
+                    [string]::Equals($_.Path, $DesktopPath, [System.StringComparison]::OrdinalIgnoreCase)
+                }
+                catch {
+                    $false
+                }
+            }
+    )
+}
+
+function Test-DesktopRuntimeProof {
+    param(
+        [string]$TargetPath,
+        [int]$TimeoutMilliseconds = 5000
+    )
+
+    if (-not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
+        return $false
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    try {
+        $process.StartInfo.FileName = $TargetPath
+        $process.StartInfo.Arguments = "doctor --json --summary"
+        $process.StartInfo.RedirectStandardInput = $true
+        $process.StartInfo.RedirectStandardOutput = $true
+        $process.StartInfo.RedirectStandardError = $true
+        $process.StartInfo.UseShellExecute = $false
+        $process.StartInfo.CreateNoWindow = $true
+        if (-not $process.Start()) {
+            return $false
+        }
+        $process.StandardInput.Close()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            try {
+                $process.Kill()
+                [void]$process.WaitForExit(2000)
+            }
+            catch {
+            }
+            return $false
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        [void]$stderrTask.GetAwaiter().GetResult()
+        $doctor = ConvertFrom-DoctorOutput -OutputLines @($stdout)
+        if ($null -eq $doctor) {
+            return $false
+        }
+        $checksProperty = $doctor.PSObject.Properties["checks"]
+        if ($null -eq $checksProperty -or $null -eq $checksProperty.Value) {
+            return $false
+        }
+        foreach ($checkId in @("local_publish.readiness", "desktop.runtime_chain")) {
+            $checkProperty = $checksProperty.Value.PSObject.Properties[$checkId]
+            if ($null -eq $checkProperty -or $null -eq $checkProperty.Value) {
+                return $false
+            }
+            $statusProperty = $checkProperty.Value.PSObject.Properties["status"]
+            if ($null -eq $statusProperty -or [string]$statusProperty.Value -ne "ok") {
+                return $false
+            }
+        }
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function Restart-CodexDesktop {
     param(
         [switch]$DryRun,
         [string]$LocalCliPath,
         [string]$LocalCodexHome,
-        [string]$LocalCodexSqliteHome
+        [string]$LocalCodexSqliteHome,
+        [ValidateRange(1, 120)]
+        [int]$ActivationTimeoutSeconds = 15
     )
 
     $desktopPath = Get-CodexDesktopExecutableProof
@@ -2066,18 +2148,17 @@ function Restart-CodexDesktop {
         return
     }
 
+    if ([string]::IsNullOrWhiteSpace($LocalCliPath)) {
+        throw "LocalCliPath is required to prove the restarted Desktop fork runtime."
+    }
+    if ([string]::IsNullOrWhiteSpace($LocalCodexHome)) {
+        throw "LocalCodexHome is required to prove the restarted Desktop fork runtime."
+    }
+
     # Match on the resolved desktop executable path so codex CLI sessions
     # (same process name, different binary) are never killed.
     $desktopProcesses = @(
-        Get-Process Codex -ErrorAction SilentlyContinue |
-            Where-Object {
-                try {
-                    [string]::Equals($_.Path, $desktopPath, [System.StringComparison]::OrdinalIgnoreCase)
-                }
-                catch {
-                    $false
-                }
-            } |
+        Get-CodexDesktopProcessesForPath -DesktopPath $desktopPath |
             ForEach-Object {
                 [pscustomobject]@{
                     Id = $_.Id
@@ -2102,6 +2183,12 @@ function Restart-CodexDesktop {
     } while ([DateTime]::UtcNow -lt $stopDeadline)
     if ($remainingDesktopProcesses.Count -gt 0) {
         throw "Codex Desktop did not exit before restart."
+    }
+
+    $runtimeReceiptPath = Join-Path $LocalCodexHome "runtime\desktop-app-server-runtime.json"
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $runtimeReceiptPath) {
+        throw "Could not clear the stale Desktop runtime receipt before restart: $runtimeReceiptPath"
     }
 
     $previousProcessEnvironment = @{}
@@ -2130,6 +2217,43 @@ function Restart-CodexDesktop {
             -FilePath "explorer.exe" `
             -ArgumentList "shell:AppsFolder\$CodexDesktopAppId" |
             Out-Null
+
+        $activationDeadline = [DateTime]::UtcNow.AddSeconds($ActivationTimeoutSeconds)
+        $liveDesktopProcesses = @()
+        do {
+            $liveDesktopProcesses = @(
+                Get-CodexDesktopProcessesForPath -DesktopPath $desktopPath
+            )
+            if ($liveDesktopProcesses.Count -gt 0) {
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $activationDeadline)
+        if ($liveDesktopProcesses.Count -eq 0) {
+            throw "Explorer accepted activation, but Codex Desktop did not start before the bounded deadline."
+        }
+
+        $runtimeProofMatched = $false
+        do {
+            $remainingMilliseconds = [Math]::Max(
+                1,
+                [int][Math]::Ceiling(($activationDeadline - [DateTime]::UtcNow).TotalMilliseconds)
+            )
+            $probeTimeoutMilliseconds = [Math]::Min(5000, $remainingMilliseconds)
+            if (
+                (Test-DesktopRuntimeProof `
+                    -TargetPath $LocalCliPath `
+                    -TimeoutMilliseconds $probeTimeoutMilliseconds) -and
+                @(Get-CodexDesktopProcessesForPath -DesktopPath $desktopPath).Count -gt 0
+            ) {
+                $runtimeProofMatched = $true
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $activationDeadline)
+        if (-not $runtimeProofMatched) {
+            throw "Codex Desktop started, but its live binary, build, or CODEX_HOME receipt did not match the intended local fork."
+        }
     }
     finally {
         foreach ($name in $previousProcessEnvironment.Keys) {
@@ -3778,7 +3902,7 @@ if ($DryRun) {
             Restart-CodexDesktop -DryRun -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
         }
         else {
-            Restart-CodexDesktop -DryRun
+            Restart-CodexDesktop -DryRun -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
         }
     }
     if (-not [string]::IsNullOrWhiteSpace($staleSourceBuildFailureMessage)) {
@@ -3851,7 +3975,7 @@ if (-not $binaryChanged) {
                 Restart-CodexDesktop -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
             }
             else {
-                Restart-CodexDesktop
+                Restart-CodexDesktop -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
             }
             Write-ProofLine "restartFailed" "false"
         }
@@ -4021,7 +4145,7 @@ if ($RestartDesktop) {
             Restart-CodexDesktop -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
         }
         else {
-            Restart-CodexDesktop
+            Restart-CodexDesktop -LocalCliPath $targetPath -LocalCodexHome $LocalCodexHome -LocalCodexSqliteHome $LocalCodexSqliteHome
         }
         Write-ProofLine "restartFailed" "false"
     }

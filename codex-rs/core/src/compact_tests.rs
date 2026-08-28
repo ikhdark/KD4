@@ -85,6 +85,10 @@ fn user_message(text: &str) -> ResponseItem {
     }
 }
 
+fn summary_message(text: &str) -> ResponseItem {
+    compaction_summary_item(format!("{SUMMARY_PREFIX}\n{text}"))
+}
+
 fn agent_message(text: &str) -> ResponseItem {
     ResponseItem::AgentMessage {
         id: None,
@@ -335,6 +339,93 @@ do things
 }
 
 #[test]
+fn compaction_retains_authoritative_task_evidence_while_stripping_other_startup_entries() {
+    let task_evidence =
+        "<kd4_task_state_v1>\nauthoritative continuation checkpoint\n</kd4_task_state_v1>";
+    let items = vec![
+        user_message(&crate::context::TaskModelGuidance.render()),
+        user_message("<environment_context>\n<cwd>/stale</cwd>\n</environment_context>"),
+        user_message(task_evidence),
+        user_message("real user message"),
+    ];
+
+    let compactable = strip_compaction_startup_envelopes(items);
+    let collected = collect_user_messages(&compactable);
+
+    assert_eq!(
+        collected,
+        vec![
+            compacted_user_message(task_evidence),
+            compacted_user_message("real user message"),
+        ]
+    );
+}
+
+#[test]
+fn compaction_keeps_only_current_developer_startup_and_preserves_ordinary_developer_text() {
+    let old_instructions = crate::context_manager::updates::build_developer_update_item(
+        crate::stable_context::configured_developer_instructions_sections(Some(
+            "old developer instructions",
+        )),
+    )
+    .expect("old instructions");
+    let current_instructions = crate::context_manager::updates::build_developer_update_item(
+        crate::stable_context::configured_developer_instructions_sections(Some(
+            "current developer instructions",
+        )),
+    )
+    .expect("current instructions");
+    let ordinary = crate::context_manager::updates::build_developer_update_item(vec![
+        "ordinary developer conversation".to_string(),
+    ])
+    .expect("ordinary developer message");
+    let old_permissions = crate::context_manager::updates::build_developer_update_item(vec![
+        "<permissions instructions>\nold\n</permissions instructions>".to_string(),
+    ])
+    .expect("old permissions");
+    let current_permissions = crate::context_manager::updates::build_developer_update_item(vec![
+        "<permissions instructions>\ncurrent\n</permissions instructions>".to_string(),
+    ])
+    .expect("current permissions");
+
+    let compactable = strip_compaction_startup_envelopes(vec![
+        old_instructions,
+        old_permissions,
+        ordinary,
+        current_instructions,
+        current_permissions,
+    ]);
+    let developer_text = compactable
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|content| match content {
+            ContentItem::InputText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert!(!developer_text.contains(&"old developer instructions"));
+    assert!(
+        !developer_text.contains(&"<permissions instructions>\nold\n</permissions instructions>")
+    );
+    assert!(developer_text.contains(&"current developer instructions"));
+    assert!(
+        developer_text
+            .contains(&"<permissions instructions>\ncurrent\n</permissions instructions>")
+    );
+    assert!(developer_text.contains(&"ordinary developer conversation"));
+    assert!(
+        developer_text
+            .iter()
+            .all(|text| !text.contains("configured_developer_instructions"))
+    );
+}
+
+#[test]
 fn collect_user_messages_filters_legacy_warnings() {
     let items = vec![
         user_message(
@@ -352,6 +443,39 @@ fn collect_user_messages_filters_legacy_warnings() {
     let collected = collect_user_messages(&items);
 
     assert_eq!(vec![compacted_user_message("real user message")], collected);
+}
+
+#[test]
+fn unresolved_tail_preserves_turn_stamped_warning_shaped_input() {
+    let warning = "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.";
+    let metadata = InternalChatMessageMetadataPassthrough {
+        turn_id: Some("turn-user-warning".to_string()),
+    };
+    let items = vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: warning.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: Some(metadata.clone()),
+    }];
+
+    let collected = collect_user_messages(&items);
+    let (unresolved_history, _) = build_unresolved_user_history(&items);
+
+    assert_eq!(
+        vec![CompactedUserMessage {
+            source_item_id: None,
+            content: vec![UserInput::Text {
+                text: warning.to_string(),
+                text_elements: Vec::new(),
+            }],
+            internal_chat_message_metadata_passthrough: Some(metadata),
+        }],
+        collected
+    );
+    assert_eq!(unresolved_history, items);
 }
 
 #[test]
@@ -612,7 +736,7 @@ fn unresolved_user_and_agent_messages_keep_their_original_order() {
 #[test]
 fn summary_reuse_is_disabled_when_post_summary_user_tail_is_truncated() {
     let items = vec![
-        user_message(&format!("{SUMMARY_PREFIX}\nprior checkpoint")),
+        summary_message("prior checkpoint"),
         user_message(&"unresolved constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 3)),
     ];
 
@@ -753,17 +877,26 @@ fn newest_section_updates_include_separator_cost_in_their_budget() {
 }
 
 #[test]
+fn goal_section_retains_original_constraints_and_latest_revision() {
+    let updates = vec![
+        vec![format!("ORIGINAL_CONSTRAINT {}", "original ".repeat(200))],
+        vec!["obsolete intermediate goal".to_string()],
+        vec![format!("LATEST_REVISION {}", "latest ".repeat(200))],
+    ];
+
+    let retained = retain_goal_boundary_updates(&updates, 96);
+
+    assert!(approx_token_count(&retained) <= 96);
+    assert!(retained.contains("ORIGINAL_CONSTRAINT"));
+    assert!(retained.contains("LATEST_REVISION"));
+    assert!(!retained.contains("obsolete intermediate goal"));
+}
+
+#[test]
 fn summary_can_be_reused_when_only_new_user_input_follows_it() {
+    let summary_text = format!("{SUMMARY_PREFIX}\nsettled state");
     let items = vec![
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: format!("{SUMMARY_PREFIX}\nsettled state"),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
+        compaction_summary_item(summary_text.clone()),
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -774,7 +907,29 @@ fn summary_can_be_reused_when_only_new_user_input_follows_it() {
             internal_chat_message_metadata_passthrough: None,
         },
     ];
+    assert_eq!(latest_summary_message(&items), Some(summary_text.as_str()));
     assert!(history_after_latest_summary_is_user_only(&items));
+}
+
+#[test]
+fn user_text_with_summary_prefix_does_not_spoof_checkpoint() {
+    let prefixed_user_text = format!("{SUMMARY_PREFIX}\nuser-authored requirements");
+    let items = vec![
+        user_message(&prefixed_user_text),
+        user_message("next request"),
+    ];
+    let (unresolved_history, _) = build_unresolved_user_history(&items);
+
+    assert_eq!(latest_summary_message(&items), None);
+    assert!(!history_after_latest_summary_is_user_only(&items));
+    assert_eq!(unresolved_history, items);
+    assert_eq!(
+        collect_user_messages(&items),
+        vec![
+            compacted_user_message(&prefixed_user_text),
+            compacted_user_message("next request"),
+        ]
+    );
 }
 
 #[test]
@@ -863,15 +1018,16 @@ fn image_limits_emit_a_stable_compaction_omission_marker() {
 fn build_token_limited_compacted_history_appends_summary_message() {
     let initial_context: Vec<ResponseItem> = Vec::new();
     let user_messages = vec![compacted_user_message("first user message")];
-    let summary_text = "summary text";
+    let summary_text = format!("{SUMMARY_PREFIX}\nsummary text");
 
-    let history = build_compacted_history(initial_context, &user_messages, summary_text);
+    let history = build_compacted_history(initial_context, &user_messages, &summary_text);
     assert!(
         !history.is_empty(),
         "expected compacted history to include summary"
     );
 
     let last = history.last().expect("history should have a summary entry");
+    assert!(is_compaction_summary_item(last));
     let summary = match last {
         ResponseItem::Message { role, content, .. } if role == "user" => {
             content_items_to_text(content).unwrap_or_default()
@@ -940,7 +1096,23 @@ fn should_use_remote_compact_task_for_azure_provider() {
         supports_standalone_web_search: false,
     };
 
-    assert!(should_use_remote_compact_task(&provider));
+    assert!(should_use_remote_compact_task(&provider, None));
+    assert!(
+        !should_use_remote_compact_task(&provider, Some("custom compact prompt")),
+        "a custom prompt must use local compaction so the prompt reaches the model"
+    );
+}
+
+#[test]
+fn custom_compact_prompt_also_governs_incremental_summaries() {
+    assert_eq!(
+        incremental_summarization_prompt(Some("preserve the custom structure")),
+        "preserve the custom structure"
+    );
+    assert_eq!(
+        incremental_summarization_prompt(None),
+        INCREMENTAL_SUMMARIZATION_PROMPT
+    );
 }
 #[tokio::test]
 async fn process_compacted_history_replaces_developer_messages() {
@@ -1104,15 +1276,7 @@ async fn process_compacted_history_inserts_context_before_last_real_user_message
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: format!("{SUMMARY_PREFIX}\nsummary text"),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
+        summary_message("summary text"),
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -1168,6 +1332,7 @@ async fn process_compacted_history_reinjects_model_switch_message() {
 
 #[test]
 fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() {
+    let summary_item = summary_message("summary text");
     let compacted_history = vec![
         ResponseItem::Message {
             id: None,
@@ -1187,15 +1352,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: format!("{SUMMARY_PREFIX}\nsummary text"),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
+        summary_item.clone(),
     ];
     let initial_context = vec![ResponseItem::Message {
         id: None,
@@ -1237,15 +1394,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: format!("{SUMMARY_PREFIX}\nsummary text"),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
+        summary_item,
     ];
     assert_eq!(refreshed, expected);
 }

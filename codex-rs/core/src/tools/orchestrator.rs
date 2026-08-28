@@ -3,8 +3,8 @@ Module: orchestrator
 
 Central place for approvals + sandbox selection + retry semantics. Drives a
 simple sequence for any ToolRuntime: approval → select sandbox → attempt →
-retry with an escalated sandbox strategy on denial (no re‑approval thanks to
-caching).
+retry with an escalated sandbox strategy only when a denial is proven safe to
+replay (no re-approval thanks to caching).
 */
 use crate::guardian::guardian_rejection_message;
 use crate::guardian::guardian_timeout_message;
@@ -84,6 +84,7 @@ impl ToolOrchestrator {
             tool_name: tool_ctx.tool_name.clone(),
         };
         let attempt_with_network_approval = SandboxAttempt {
+            codex_home: attempt.codex_home,
             sandbox: attempt.sandbox,
             sandbox_requested: attempt.sandbox_requested,
             permissions: attempt.permissions,
@@ -258,6 +259,7 @@ impl ToolOrchestrator {
             .unwrap_or_else(|| turn_ctx.cwd_uri());
         let workspace_roots = turn_ctx.config.effective_workspace_roots();
         let initial_attempt = SandboxAttempt {
+            codex_home: &turn_ctx.config.codex_home,
             sandbox: initial_sandbox,
             sandbox_requested,
             permissions: &turn_ctx.permission_profile,
@@ -316,7 +318,7 @@ impl ToolOrchestrator {
                         network_policy_decision,
                     })));
                 }
-                if !tool.escalate_on_failure() {
+                if !tool.escalate_on_failure() || !tool.sandbox_denial_replay_is_safe() {
                     otel.sandbox_outcome(
                         &otel_tn,
                         otel_ci,
@@ -433,6 +435,7 @@ impl ToolOrchestrator {
                     SandboxType::None
                 };
                 let retry_attempt = SandboxAttempt {
+                    codex_home: &turn_ctx.config.codex_home,
                     sandbox: retry_sandbox,
                     sandbox_requested: retry_sandbox_requested,
                     permissions: &turn_ctx.permission_profile,
@@ -632,4 +635,118 @@ fn build_denial_reason_from_output(_output: &ExecToolCallOutput) -> String {
     // Keep approval reason terse and stable for UX/tests, but accept the
     // output so we can evolve heuristics later without touching call sites.
     "command failed; retry without sandbox?".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::tests::make_session_and_context;
+    use crate::tools::sandboxing::Approvable;
+    use crate::tools::sandboxing::ApprovalAction;
+    use crate::tools::sandboxing::ApprovalCtx;
+    use crate::tools::sandboxing::ExecApprovalRequirement;
+    use crate::tools::sandboxing::Sandboxable;
+    use codex_sandboxing::SandboxablePreference;
+    use codex_tools::ToolName;
+    use futures::future::BoxFuture;
+    use std::sync::Arc;
+
+    struct DeniedAfterDispatchRuntime {
+        attempts: usize,
+    }
+
+    impl Sandboxable for DeniedAfterDispatchRuntime {
+        fn sandbox_preference(&self) -> SandboxablePreference {
+            SandboxablePreference::Auto
+        }
+
+        fn escalate_on_failure(&self) -> bool {
+            true
+        }
+    }
+
+    impl Approvable<()> for DeniedAfterDispatchRuntime {
+        type ApprovalKey = String;
+
+        fn approval_keys(&self, _req: &()) -> Vec<Self::ApprovalKey> {
+            vec!["denied-after-dispatch".to_string()]
+        }
+
+        fn exec_approval_requirement(&self, _req: &()) -> Option<ExecApprovalRequirement> {
+            Some(ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: None,
+            })
+        }
+
+        fn start_approval_async<'a>(
+            &'a mut self,
+            _req: &'a (),
+            _ctx: ApprovalCtx<'a>,
+        ) -> BoxFuture<'a, ReviewDecision> {
+            Box::pin(async { ReviewDecision::Approved })
+        }
+
+        fn approval_action(
+            &self,
+            _req: &(),
+            _ctx: &ApprovalCtx<'_>,
+        ) -> std::io::Result<ApprovalAction> {
+            Err(std::io::Error::other("guardian approval should not run"))
+        }
+    }
+
+    impl ToolRuntime<(), ()> for DeniedAfterDispatchRuntime {
+        async fn run(
+            &mut self,
+            _req: &(),
+            _attempt: &SandboxAttempt<'_>,
+            _ctx: &ToolCtx,
+        ) -> Result<(), ToolError> {
+            self.attempts += 1;
+            if self.attempts == 1 {
+                Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
+                    output: Box::new(ExecToolCallOutput::default()),
+                    network_policy_decision: None,
+                })))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_sandbox_denial_is_not_replayed_without_safe_provenance() {
+        let (session, mut turn) = make_session_and_context().await;
+        turn.approval_policy
+            .set(AskForApproval::UnlessTrusted)
+            .expect("test setup should allow updating approval policy");
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let tool_ctx = ToolCtx {
+            session: Arc::clone(&session),
+            turn: Arc::clone(&turn),
+            call_id: "denied-call".to_string(),
+            tool_name: ToolName::plain("denied_after_dispatch"),
+        };
+        let mut runtime = DeniedAfterDispatchRuntime { attempts: 0 };
+
+        let result = ToolOrchestrator::new()
+            .run(
+                &mut runtime,
+                &(),
+                &tool_ctx,
+                turn.as_ref(),
+                AskForApproval::UnlessTrusted,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ToolError::Codex(CodexErr::Sandbox(
+                SandboxErr::Denied { .. }
+            )))
+        ));
+        assert_eq!(runtime.attempts, 1);
+    }
 }

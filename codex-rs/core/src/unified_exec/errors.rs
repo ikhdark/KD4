@@ -1,3 +1,4 @@
+use crate::tools::command_output_artifact::RawOutputArtifact;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_utils_path_uri::PathUri;
 use thiserror::Error;
@@ -25,6 +26,7 @@ pub(crate) enum UnifiedExecError {
     SandboxDenied {
         message: String,
         output: ExecToolCallOutput,
+        raw_output_artifact: Option<RawOutputArtifact>,
     },
     #[error("{path} is not valid on {}", std::env::consts::OS)]
     ForeignPath { path: PathUri },
@@ -40,6 +42,22 @@ impl UnifiedExecError {
     }
 
     pub(crate) fn sandbox_denied(message: String, output: ExecToolCallOutput) -> Self {
-        Self::SandboxDenied { message, output }
+        Self::SandboxDenied {
+            message,
+            output,
+            raw_output_artifact: None,
+        }
+    }
+
+    pub(crate) fn sandbox_denied_with_artifact(
+        message: String,
+        output: ExecToolCallOutput,
+        raw_output_artifact: Option<RawOutputArtifact>,
+    ) -> Self {
+        Self::SandboxDenied {
+            message,
+            output,
+            raw_output_artifact,
+        }
     }
 }

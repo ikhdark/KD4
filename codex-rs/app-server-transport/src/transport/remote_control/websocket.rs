@@ -28,13 +28,14 @@ use crate::transport::remote_control::enroll::format_headers;
 use crate::transport::remote_control::enroll::load_persisted_remote_control_enrollment;
 use crate::transport::remote_control::enroll::preview_remote_control_response_body;
 use crate::transport::remote_control::enroll::update_persisted_remote_control_enrollment;
-use crate::transport::remote_control::server_api::enroll_remote_control_server;
-use crate::transport::remote_control::server_api::refresh_remote_control_server;
+use crate::transport::remote_control::server_api::enroll_remote_control_server_with_client;
+use crate::transport::remote_control::server_api::refresh_remote_control_server_with_client;
 use axum::http::HeaderValue;
 use base64::Engine;
 use codex_app_server_protocol::RemoteControlConnectionStatus;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
 use codex_core::retry::backoff;
+use codex_http_client::RouteAwareClientPool;
 use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_login::AuthManager;
 use codex_login::UnauthorizedRecovery;
@@ -85,6 +86,13 @@ const REMOTE_CONTROL_WEBSOCKET_CONNECT_TIMEOUT: std::time::Duration =
 const REMOTE_CONTROL_CONNECTION_SHUTDOWN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 const REMOTE_APP_SERVER_NOT_FOUND_DETAIL: &str = "Remote app server not found";
+
+#[cfg(test)]
+fn test_http_clients() -> RouteAwareClientPool {
+    super::remote_control_http_clients(codex_http_client::HttpClientFactory::new(
+        codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+    ))
+}
 
 struct BoundedOutboundBuffer {
     buffer_by_stream: HashMap<(ClientId, StreamId), VecDeque<ServerEnvelope>>,
@@ -274,6 +282,7 @@ pub(crate) struct RemoteControlWebsocket {
     desired_state_tx: Arc<watch::Sender<RemoteControlDesiredState>>,
     desired_state_rx: watch::Receiver<RemoteControlDesiredState>,
     desired_state_persistence_lock: Arc<Semaphore>,
+    http_clients: RouteAwareClientPool,
 }
 
 pub(crate) struct RemoteControlWebsocketConfig {
@@ -281,6 +290,7 @@ pub(crate) struct RemoteControlWebsocketConfig {
     pub(crate) installation_id: String,
     pub(crate) remote_control_target: Option<RemoteControlTarget>,
     pub(crate) server_name: String,
+    pub(crate) http_clients: RouteAwareClientPool,
 }
 
 pub(super) struct RemoteControlAuthContext<'a> {
@@ -397,6 +407,7 @@ pub(super) struct RemoteControlConnectOptions<'a> {
     app_server_client_name: Option<&'a str>,
     desired_state_tx: &'a watch::Sender<RemoteControlDesiredState>,
     desired_state_persistence_lock: &'a Semaphore,
+    http_clients: &'a RouteAwareClientPool,
 }
 
 impl RemoteControlWebsocket {
@@ -447,6 +458,7 @@ impl RemoteControlWebsocket {
             desired_state_tx,
             desired_state_rx,
             desired_state_persistence_lock: channels.desired_state_persistence_lock,
+            http_clients: config.http_clients,
         }
     }
 
@@ -546,6 +558,9 @@ impl RemoteControlWebsocket {
                 desired_state = ?*self.desired_state_rx.borrow(),
                 "app-server remote control websocket connection cycle ended"
             );
+            if !self.wait_to_reconnect_after(connection_end_reason).await {
+                break;
+            }
         }
 
         self.client_tracker.lock().await.shutdown().await;
@@ -556,6 +571,46 @@ impl RemoteControlWebsocket {
             shutdown_requested = self.shutdown_token.is_cancelled(),
             "app-server remote control websocket loop exited"
         );
+    }
+
+    async fn wait_to_reconnect_after(
+        &mut self,
+        connection_end_reason: ConnectionEndReason,
+    ) -> bool {
+        let Some((reconnect_delay, reconnect_backoff_reset)) = reconnect_delay_after_connection_end(
+            connection_end_reason,
+            &mut self.reconnect_attempt,
+        ) else {
+            return true;
+        };
+        warn!(
+            remote_control_url = %self.remote_control_url,
+            installation_id = %self.installation_id,
+            server_name = %self.server_name,
+            reconnect_delay = ?reconnect_delay,
+            reconnect_backoff_reset,
+            "remote control websocket connection stopped; delaying reconnect"
+        );
+        Self::wait_for_reconnect_delay(
+            &self.shutdown_token,
+            &mut self.desired_state_rx,
+            reconnect_delay,
+        )
+        .await
+    }
+
+    async fn wait_for_reconnect_delay(
+        shutdown_token: &CancellationToken,
+        desired_state_rx: &mut watch::Receiver<RemoteControlDesiredState>,
+        reconnect_delay: std::time::Duration,
+    ) -> bool {
+        tokio::select! {
+            _ = shutdown_token.cancelled() => false,
+            changed = desired_state_rx.wait_for(|state| !state.is_enabled()) => {
+                changed.is_ok()
+            }
+            _ = tokio::time::sleep(reconnect_delay) => true,
+        }
     }
 
     async fn wait_for_app_server_client_name(
@@ -722,6 +777,7 @@ impl RemoteControlWebsocket {
                 app_server_client_name,
                 desired_state_tx: &self.desired_state_tx,
                 desired_state_persistence_lock: &self.desired_state_persistence_lock,
+                http_clients: &self.http_clients,
             };
             let auth_context = RemoteControlAuthContext {
                 auth_manager: &self.auth_manager,
@@ -1313,6 +1369,17 @@ fn next_reconnect_delay(reconnect_attempt: &mut u64) -> (std::time::Duration, bo
     (reconnect_delay, reconnect_backoff_reset)
 }
 
+fn reconnect_delay_after_connection_end(
+    connection_end_reason: ConnectionEndReason,
+    reconnect_attempt: &mut u64,
+) -> Option<(std::time::Duration, bool)> {
+    matches!(
+        connection_end_reason,
+        ConnectionEndReason::ConnectionWorkerStopped
+    )
+    .then(|| next_reconnect_delay(reconnect_attempt))
+}
+
 pub(super) async fn connect_remote_control_websocket(
     remote_control_target: &RemoteControlTarget,
     state_db: Option<&StateRuntime>,
@@ -1550,8 +1617,18 @@ async fn prepare_remote_control_enrollment(
         let enrollment_ref = enrollment.as_mut().ok_or_else(|| {
             io::Error::other("missing remote control enrollment before server refresh")
         })?;
-        match refresh_remote_control_server(&auth, connect_options.installation_id, enrollment_ref)
+        let client = connect_options
+            .http_clients
+            .client_for_url(&remote_control_target.refresh_url)
             .await
+            .map_err(io::Error::other)?;
+        match refresh_remote_control_server_with_client(
+            &client,
+            &auth,
+            connect_options.installation_id,
+            enrollment_ref,
+        )
+        .await
         {
             Ok(()) => {}
             Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -1732,7 +1809,13 @@ async fn enroll_and_persist_remote_control_server(
         remote_control_target.enroll_url,
         auth_context.auth.account_id
     );
-    let new_enrollment = match enroll_remote_control_server(
+    let client = connect_options
+        .http_clients
+        .client_for_url(&remote_control_target.enroll_url)
+        .await
+        .map_err(io::Error::other)?;
+    let new_enrollment = match enroll_remote_control_server_with_client(
+        &client,
         remote_control_target,
         auth_context.auth,
         connect_options.installation_id,
@@ -1906,6 +1989,62 @@ mod tests {
         assert!(reconnect_delay <= Duration::from_millis(220));
         assert!(!reconnect_backoff_reset);
         assert_eq!(reconnect_attempt, 1);
+    }
+
+    #[test]
+    fn stopped_connection_uses_first_reconnect_delay() {
+        let mut reconnect_attempt = 0;
+
+        let (reconnect_delay, reconnect_backoff_reset) = reconnect_delay_after_connection_end(
+            ConnectionEndReason::ConnectionWorkerStopped,
+            &mut reconnect_attempt,
+        )
+        .expect("a stopped connection should be throttled");
+
+        assert!(reconnect_delay >= Duration::from_millis(180));
+        assert!(reconnect_delay <= Duration::from_millis(220));
+        assert!(!reconnect_backoff_reset);
+        assert_eq!(reconnect_attempt, 1);
+        assert!(
+            reconnect_delay_after_connection_end(
+                ConnectionEndReason::Disabled,
+                &mut reconnect_attempt,
+            )
+            .is_none()
+        );
+        assert_eq!(reconnect_attempt, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_delay_waits_and_honors_shutdown() {
+        let shutdown_token = CancellationToken::new();
+        let (_desired_state_tx, mut desired_state_rx) =
+            watch::channel(RemoteControlDesiredState::Enabled {
+                persistence_preference: None,
+            });
+        let started_at = tokio::time::Instant::now();
+
+        assert!(
+            RemoteControlWebsocket::wait_for_reconnect_delay(
+                &shutdown_token,
+                &mut desired_state_rx,
+                Duration::from_secs(1),
+            )
+            .await
+        );
+        assert_eq!(started_at.elapsed(), Duration::from_secs(1));
+
+        shutdown_token.cancel();
+        let started_at = tokio::time::Instant::now();
+        assert!(
+            !RemoteControlWebsocket::wait_for_reconnect_delay(
+                &shutdown_token,
+                &mut desired_state_rx,
+                Duration::from_secs(60),
+            )
+            .await
+        );
+        assert_eq!(started_at.elapsed(), Duration::ZERO);
     }
 
     #[test]
@@ -2108,6 +2247,7 @@ mod tests {
                 app_server_client_name: None,
                 desired_state_tx: &enabled_desired_state_sender(),
                 desired_state_persistence_lock: &Semaphore::new(1),
+                http_clients: &test_http_clients(),
             },
             &status_publisher,
         )
@@ -2175,6 +2315,7 @@ mod tests {
                 app_server_client_name: None,
                 desired_state_tx: &enabled_desired_state_sender(),
                 desired_state_persistence_lock: &Semaphore::new(1),
+                http_clients: &test_http_clients(),
             },
             &status_publisher,
         )
@@ -2265,6 +2406,7 @@ mod tests {
                 app_server_client_name: None,
                 desired_state_tx: &enabled_desired_state_sender(),
                 desired_state_persistence_lock: &Semaphore::new(1),
+                http_clients: &test_http_clients(),
             },
             &status_publisher,
         )
@@ -2369,6 +2511,7 @@ mod tests {
                 app_server_client_name: None,
                 desired_state_tx: &enabled_desired_state_sender(),
                 desired_state_persistence_lock: &Semaphore::new(1),
+                http_clients: &test_http_clients(),
             },
             &status_publisher,
         )
@@ -2437,6 +2580,7 @@ mod tests {
                 app_server_client_name: None,
                 desired_state_tx: &enabled_desired_state_sender(),
                 desired_state_persistence_lock: &Semaphore::new(1),
+                http_clients: &test_http_clients(),
             },
             &status_publisher,
         )
@@ -2492,6 +2636,7 @@ mod tests {
                 app_server_client_name: None,
                 desired_state_tx: &enabled_desired_state_sender(),
                 desired_state_persistence_lock: &Semaphore::new(1),
+                http_clients: &test_http_clients(),
             },
             &status_publisher,
         )
@@ -2542,6 +2687,7 @@ mod tests {
                         installation_id: TEST_INSTALLATION_ID.to_string(),
                         remote_control_target: Some(remote_control_target),
                         server_name: "test-server".to_string(),
+                        http_clients: test_http_clients(),
                     },
                     /*state_db*/ None,
                     remote_control_auth_manager(),

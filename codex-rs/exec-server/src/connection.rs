@@ -7,6 +7,9 @@ use std::time::Duration;
 use axum::extract::ws::Message as AxumWebSocketMessage;
 use axum::extract::ws::WebSocket as AxumWebSocket;
 use codex_exec_server_protocol::JSONRPCMessage;
+use codex_utils_pty::ManagedRootProcess;
+use codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT;
+use codex_utils_pty::run_windows_process_operation;
 use futures::Sink;
 use futures::SinkExt;
 use futures::Stream;
@@ -33,6 +36,8 @@ pub(crate) const CHANNEL_CAPACITY: usize = 128;
 // WebSocket transports so stdio has the same per-message bound.
 const MAX_STDIO_JSONRPC_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 const STDIO_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(2);
+const STDIO_FORCE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const STDIO_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(70);
 #[cfg(test)]
 pub(crate) const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(25);
 #[cfg(not(test))]
@@ -53,9 +58,19 @@ pub(crate) enum JsonRpcTransport {
 }
 
 impl JsonRpcTransport {
+    #[cfg(test)]
     fn from_child_process(child_process: Child) -> Self {
         Self::Stdio {
-            transport: StdioTransport::spawn(child_process),
+            transport: StdioTransport::spawn(child_process, None),
+        }
+    }
+
+    fn from_managed_child_process(
+        child_process: Child,
+        managed_root: Arc<ManagedRootProcess>,
+    ) -> Self {
+        Self::Stdio {
+            transport: StdioTransport::spawn(child_process, Some(managed_root)),
         }
     }
 
@@ -63,6 +78,21 @@ impl JsonRpcTransport {
         match self {
             Self::Plain => {}
             Self::Stdio { transport } => transport.terminate(),
+        }
+    }
+
+    pub(crate) async fn terminate_and_wait(&self) -> bool {
+        match self {
+            Self::Plain => true,
+            Self::Stdio { transport } => transport.terminate_and_wait().await,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn termination_completed(&self) -> bool {
+        match self {
+            Self::Plain => true,
+            Self::Stdio { transport } => transport.termination_completed(),
         }
     }
 }
@@ -74,22 +104,56 @@ pub(crate) struct StdioTransport {
 
 struct StdioTransportHandle {
     terminate_tx: watch::Sender<bool>,
+    terminated_rx: watch::Receiver<bool>,
     terminate_requested: AtomicBool,
 }
 
 impl StdioTransport {
-    fn spawn(child_process: Child) -> Self {
+    fn spawn(child_process: Child, managed_root: Option<Arc<ManagedRootProcess>>) -> Self {
         let (terminate_tx, terminate_rx) = watch::channel(false);
+        let (terminated_tx, terminated_rx) = watch::channel(false);
         let handle = Arc::new(StdioTransportHandle {
             terminate_tx,
+            terminated_rx,
             terminate_requested: AtomicBool::new(false),
         });
-        spawn_stdio_child_supervisor(child_process, terminate_rx);
+        spawn_stdio_child_supervisor(child_process, managed_root, terminate_rx, terminated_tx);
         Self { handle }
     }
 
     fn terminate(&self) {
         self.handle.terminate();
+    }
+
+    async fn terminate_and_wait(&self) -> bool {
+        self.terminate_and_wait_with_timeout(STDIO_SUPERVISOR_TIMEOUT)
+            .await
+    }
+
+    async fn terminate_and_wait_with_timeout(&self, wait_timeout: Duration) -> bool {
+        self.terminate();
+        let mut terminated_rx = self.handle.terminated_rx.clone();
+        let completed = timeout(wait_timeout, async {
+            loop {
+                if *terminated_rx.borrow() {
+                    break;
+                }
+                if terminated_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        if !completed {
+            warn!("exec-server stdio child supervisor exceeded its termination deadline");
+        }
+        completed
+    }
+
+    #[cfg(test)]
+    fn termination_completed(&self) -> bool {
+        *self.handle.terminated_rx.borrow()
     }
 }
 
@@ -107,19 +171,38 @@ impl Drop for StdioTransportHandle {
     }
 }
 
-fn spawn_stdio_child_supervisor(mut child_process: Child, mut terminate_rx: watch::Receiver<bool>) {
+fn spawn_stdio_child_supervisor(
+    mut child_process: Child,
+    managed_root: Option<Arc<ManagedRootProcess>>,
+    mut terminate_rx: watch::Receiver<bool>,
+    terminated_tx: watch::Sender<bool>,
+) {
     let process_group_id = child_process.id();
     tokio::spawn(async move {
+        let _completion = StdioChildSupervisorCompletion(terminated_tx);
         tokio::select! {
             result = child_process.wait() => {
                 log_stdio_child_wait_result(result);
-                kill_process_tree(&mut child_process, process_group_id);
+                kill_process_tree(&mut child_process, process_group_id).await;
             }
             () = wait_for_stdio_termination(&mut terminate_rx) => {
+                if let Some(managed_root) = managed_root.as_ref()
+                    && let Err(err) = managed_root.terminate()
+                {
+                    debug!("failed to terminate managed exec-server stdio process tree: {err}");
+                }
                 terminate_stdio_child(&mut child_process, process_group_id).await;
             }
         }
     });
+}
+
+struct StdioChildSupervisorCompletion(watch::Sender<bool>);
+
+impl Drop for StdioChildSupervisorCompletion {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
 }
 
 async fn wait_for_stdio_termination(terminate_rx: &mut watch::Receiver<bool>) {
@@ -134,36 +217,41 @@ async fn wait_for_stdio_termination(terminate_rx: &mut watch::Receiver<bool>) {
 }
 
 async fn terminate_stdio_child(child_process: &mut Child, process_group_id: Option<u32>) {
-    terminate_process_tree(child_process, process_group_id);
+    terminate_process_tree(child_process, process_group_id).await;
     match timeout(STDIO_TERMINATION_GRACE_PERIOD, child_process.wait()).await {
         Ok(result) => {
             log_stdio_child_wait_result(result);
         }
         Err(_) => {
-            kill_process_tree(child_process, process_group_id);
-            log_stdio_child_wait_result(child_process.wait().await);
+            kill_process_tree(child_process, process_group_id).await;
+            match timeout(STDIO_FORCE_REAP_TIMEOUT, child_process.wait()).await {
+                Ok(result) => log_stdio_child_wait_result(result),
+                Err(_) => warn!(
+                    "exec-server stdio child did not exit after forced termination within {STDIO_FORCE_REAP_TIMEOUT:?}"
+                ),
+            }
         }
     }
 }
 
-fn terminate_process_tree(child_process: &mut Child, process_group_id: Option<u32>) {
+async fn terminate_process_tree(child_process: &mut Child, process_group_id: Option<u32>) {
     let Some(process_group_id) = process_group_id else {
         kill_direct_child(child_process, "terminate");
         return;
     };
 
-    if !kill_windows_process_tree(process_group_id) {
+    if !kill_windows_process_tree(process_group_id).await {
         kill_direct_child(child_process, "terminate");
     }
 }
 
-fn kill_process_tree(child_process: &mut Child, process_group_id: Option<u32>) {
+async fn kill_process_tree(child_process: &mut Child, process_group_id: Option<u32>) {
     let Some(process_group_id) = process_group_id else {
         kill_direct_child(child_process, "kill");
         return;
     };
 
-    if !kill_windows_process_tree(process_group_id) {
+    if !kill_windows_process_tree(process_group_id).await {
         kill_direct_child(child_process, "kill");
     }
 }
@@ -174,14 +262,18 @@ fn kill_direct_child(child_process: &mut Child, action: &str) {
     }
 }
 
-fn kill_windows_process_tree(pid: u32) -> bool {
+async fn kill_windows_process_tree(pid: u32) -> bool {
     let pid = pid.to_string();
-    match std::process::Command::new("taskkill")
-        .args(["/PID", pid.as_str(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+    let pid_for_task = pid.clone();
+    match run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
+        std::process::Command::new("taskkill")
+            .args(["/PID", pid_for_task.as_str(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    })
+    .await
     {
         Ok(status) => status.success(),
         Err(err) => {
@@ -495,8 +587,18 @@ impl JsonRpcConnection {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_child_process(mut self, child_process: Child) -> Self {
         self.transport = JsonRpcTransport::from_child_process(child_process);
+        self
+    }
+
+    pub(crate) fn with_managed_child_process(
+        mut self,
+        child_process: Child,
+        managed_root: Arc<ManagedRootProcess>,
+    ) -> Self {
+        self.transport = JsonRpcTransport::from_managed_child_process(child_process, managed_root);
         self
     }
 }
@@ -646,6 +748,30 @@ mod tests {
     use tokio_tungstenite::connect_async;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stdio_transport_close_has_a_deadline_without_discarding_supervisor_state() {
+        let (terminate_tx, _terminate_rx) = watch::channel(false);
+        let (terminated_tx, terminated_rx) = watch::channel(false);
+        let transport = StdioTransport {
+            handle: Arc::new(StdioTransportHandle {
+                terminate_tx,
+                terminated_rx,
+                terminate_requested: AtomicBool::new(false),
+            }),
+        };
+
+        assert!(
+            !transport
+                .terminate_and_wait_with_timeout(Duration::from_secs(2))
+                .await,
+            "close should return when the supervisor misses its deadline"
+        );
+        assert!(!transport.termination_completed());
+
+        terminated_tx.send_replace(true);
+        assert!(transport.termination_completed());
+    }
 
     #[tokio::test]
     async fn stdio_connection_accepts_message_at_size_limit() -> anyhow::Result<()> {

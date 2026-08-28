@@ -5,6 +5,8 @@ use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use http::HeaderMap;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
@@ -120,23 +122,24 @@ struct RateLimitEventCredits {
     balance: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RateLimitEvent {
-    #[serde(rename = "type")]
-    kind: String,
-    plan_type: Option<PlanType>,
-    rate_limits: Option<RateLimitEventDetails>,
-    credits: Option<RateLimitEventCredits>,
-    metered_limit_name: Option<String>,
-    limit_name: Option<String>,
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RateLimitEventBody {
+    plan_type: Option<Value>,
+    rate_limits: Option<Value>,
+    credits: Option<Value>,
+    metered_limit_name: Option<Value>,
+    limit_name: Option<Value>,
 }
 
-pub fn parse_rate_limit_event(payload: &str) -> Option<RateLimitSnapshot> {
-    let event: RateLimitEvent = serde_json::from_str(payload).ok()?;
-    if event.kind != "codex.rate_limits" {
-        return None;
-    }
-    let (primary, secondary) = if let Some(details) = event.rate_limits.as_ref() {
+pub(crate) fn rate_limit_snapshot_from_event(
+    event: RateLimitEventBody,
+) -> Option<RateLimitSnapshot> {
+    let plan_type: Option<PlanType> = parse_optional_event_field(event.plan_type)?;
+    let rate_limits: Option<RateLimitEventDetails> = parse_optional_event_field(event.rate_limits)?;
+    let credits: Option<RateLimitEventCredits> = parse_optional_event_field(event.credits)?;
+    let metered_limit_name: Option<String> = parse_optional_event_field(event.metered_limit_name)?;
+    let limit_name: Option<String> = parse_optional_event_field(event.limit_name)?;
+    let (primary, secondary) = if let Some(details) = rate_limits.as_ref() {
         (
             map_event_window(details.primary.as_ref()),
             map_event_window(details.secondary.as_ref()),
@@ -144,15 +147,12 @@ pub fn parse_rate_limit_event(payload: &str) -> Option<RateLimitSnapshot> {
     } else {
         (None, None)
     };
-    let credits = event.credits.map(|credits| CreditsSnapshot {
+    let credits = credits.map(|credits| CreditsSnapshot {
         has_credits: credits.has_credits,
         unlimited: credits.unlimited,
         balance: credits.balance,
     });
-    let limit_id = event
-        .metered_limit_name
-        .or(event.limit_name)
-        .map(normalize_limit_id);
+    let limit_id = metered_limit_name.or(limit_name).map(normalize_limit_id);
     Some(RateLimitSnapshot {
         limit_id: Some(limit_id.unwrap_or_else(|| "codex".to_string())),
         limit_name: None,
@@ -161,9 +161,16 @@ pub fn parse_rate_limit_event(payload: &str) -> Option<RateLimitSnapshot> {
         credits,
         individual_limit: None,
         spend_control_reached: None,
-        plan_type: event.plan_type,
+        plan_type,
         rate_limit_reached_type: None,
     })
+}
+
+fn parse_optional_event_field<T: DeserializeOwned>(value: Option<Value>) -> Option<Option<T>> {
+    match value {
+        Some(value) => serde_json::from_value(value).ok().map(Some),
+        None => Some(None),
+    }
 }
 
 fn map_event_window(window: Option<&RateLimitEventWindow>) -> Option<RateLimitWindow> {

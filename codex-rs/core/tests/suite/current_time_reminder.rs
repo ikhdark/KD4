@@ -214,6 +214,8 @@ async fn current_time_reminders_can_follow_only_user_or_tool_outputs() -> Result
     let mut continue_response = ev_completed("resp-2");
     // Ask for another inference without recording a new user message or tool output.
     continue_response["response"]["end_turn"] = json!(false);
+    let mut repeated_continue_response = ev_completed("resp-3");
+    repeated_continue_response["response"]["end_turn"] = json!(false);
     let responses = mount_sse_sequence(
         &server,
         vec![
@@ -230,6 +232,11 @@ async fn current_time_reminders_can_follow_only_user_or_tool_outputs() -> Result
                 ev_response_created("resp-2"),
                 ev_assistant_message("msg-2", "continue"),
                 continue_response,
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("msg-3", "complete"),
+                repeated_continue_response,
             ]),
         ],
     )
@@ -251,13 +258,17 @@ async fn current_time_reminders_can_follow_only_user_or_tool_outputs() -> Result
         .await?;
 
     let requests = responses.requests();
-    // An unchanged end_turn=false continuation is host-completed without
-    // spending another model request. The requests that remain correspond to
-    // the user input and the tool output, and each receives one new reminder.
-    assert_eq!(requests.len(), 2);
+    // Honor one decision-bearing end_turn=false resample. If the unchanged
+    // protocol signal repeats, host completion prevents a fourth request.
+    // The resample has no new user/tool output, so it receives no new reminder.
+    assert_eq!(requests.len(), 3);
     assert_eq!(current_time_reminders(&requests[0]), vec![FIRST_REMINDER]);
     assert_eq!(
         current_time_reminders(&requests[1]),
+        vec![FIRST_REMINDER, SECOND_REMINDER]
+    );
+    assert_eq!(
+        current_time_reminders(&requests[2]),
         vec![FIRST_REMINDER, SECOND_REMINDER]
     );
     Ok(())

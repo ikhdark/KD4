@@ -110,7 +110,8 @@ fn catalog_entry_from_skill(skill: &SkillMetadata, enabled: bool) -> SkillCatalo
     )
     .with_short_description(skill.short_description.clone())
     .with_display_path(display_path)
-    .with_dependencies(skill.dependencies.clone());
+    .with_dependencies(skill.dependencies.clone())
+    .with_source_scope(skill.scope);
 
     if !enabled {
         entry = entry.disabled();

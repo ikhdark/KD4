@@ -40,19 +40,35 @@ pub fn apply_rollout_items(
     items: &[RolloutItem],
     default_provider: &str,
 ) {
-    let mut settings_reducer = PersistedThreadSettingsReducer::default();
+    let mut reducer = ThreadMetadataRolloutReducer::default();
     for item in items {
+        reducer.apply_item(metadata, item);
+    }
+    reducer.finish(metadata, default_provider);
+}
+
+/// Stateful rollout-to-metadata projection for callers that stream items from disk.
+#[derive(Default)]
+pub struct ThreadMetadataRolloutReducer {
+    settings_reducer: PersistedThreadSettingsReducer,
+}
+
+impl ThreadMetadataRolloutReducer {
+    pub fn apply_item(&mut self, metadata: &mut ThreadMetadata, item: &RolloutItem) {
         apply_non_setting_rollout_item(metadata, item);
         if !matches!(
             item,
             RolloutItem::SessionMeta(meta_line) if meta_line.meta.id != metadata.id
         ) {
-            settings_reducer.apply_item(item);
+            self.settings_reducer.apply_item(item);
         }
     }
-    apply_reduced_persisted_thread_settings(metadata, settings_reducer.into_settings());
-    if metadata.model_provider.is_empty() {
-        metadata.model_provider = default_provider.to_string();
+
+    pub fn finish(self, metadata: &mut ThreadMetadata, default_provider: &str) {
+        apply_reduced_persisted_thread_settings(metadata, self.settings_reducer.into_settings());
+        if metadata.model_provider.is_empty() {
+            metadata.model_provider = default_provider.to_string();
+        }
     }
 }
 
@@ -238,7 +254,9 @@ pub(crate) fn enum_to_string<T: Serialize>(value: &T) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::ThreadMetadataRolloutReducer;
     use super::apply_rollout_item;
+    use super::apply_rollout_items;
     use crate::model::ThreadMetadata;
     use chrono::DateTime;
     use chrono::Utc;
@@ -293,6 +311,38 @@ mod tests {
             DateTime::<Utc>::from_timestamp(started_at, 0).expect("valid timestamp")
         );
         assert!(super::rollout_item_affects_thread_metadata(&item));
+    }
+
+    #[test]
+    fn streaming_metadata_reducer_matches_batch_projection() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".to_string(),
+                trace_id: None,
+                started_at: Some(1_735_905_845),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                client_id: None,
+                message: format!("{USER_MESSAGE_BEGIN} streamed request"),
+                images: Some(vec![]),
+                local_images: vec![],
+                text_elements: vec![],
+                ..Default::default()
+            })),
+        ];
+        let mut batch = metadata_for_test();
+        let mut streamed = batch.clone();
+
+        apply_rollout_items(&mut batch, &items, "test-provider");
+        let mut reducer = ThreadMetadataRolloutReducer::default();
+        for item in &items {
+            reducer.apply_item(&mut streamed, item);
+        }
+        reducer.finish(&mut streamed, "test-provider");
+
+        assert_eq!(streamed, batch);
     }
 
     #[test]

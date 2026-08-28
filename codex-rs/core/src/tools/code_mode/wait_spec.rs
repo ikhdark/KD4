@@ -12,10 +12,13 @@ pub(crate) fn create_wait_tool() -> ToolSpec {
         ),
         (
             "max_tokens".to_string(),
-            JsonSchema::number(Some(format!(
-                "Output token budget for this wait call. {}.",
-                adaptive_output_budget_description()
-            ))),
+            JsonSchema {
+                minimum: Some(serde_json::Number::from(0_u64)),
+                ..JsonSchema::integer(Some(format!(
+                    "Output token budget for this wait call. {}.",
+                    adaptive_output_budget_description()
+                )))
+            },
         ),
         (
             "terminate".to_string(),
@@ -73,10 +76,13 @@ mod tests {
                         ),
                         (
                             "max_tokens".to_string(),
-                            JsonSchema::number(Some(format!(
-                                "Output token budget for this wait call. {}.",
-                                adaptive_output_budget_description()
-                            ))),
+                            JsonSchema {
+                                minimum: Some(serde_json::Number::from(0_u64)),
+                                ..JsonSchema::integer(Some(format!(
+                                    "Output token budget for this wait call. {}.",
+                                    adaptive_output_budget_description()
+                                )))
+                            },
                         ),
                         (
                             "terminate".to_string(),
@@ -108,6 +114,22 @@ mod tests {
             code_properties.keys().cloned().collect::<Vec<_>>(),
             vec!["cell_id", "max_tokens", "terminate"]
         );
+        let code_wait_schema =
+            serde_json::to_value(&code_wait.parameters).expect("serialize code-mode wait schema");
+        let code_wait_validator =
+            jsonschema::validator_for(&code_wait_schema).expect("compile code-mode wait schema");
+        assert!(code_wait_validator.is_valid(&serde_json::json!({
+            "cell_id": "cell-1",
+            "max_tokens": 0,
+        })));
+        assert!(!code_wait_validator.is_valid(&serde_json::json!({
+            "cell_id": "cell-1",
+            "max_tokens": -1,
+        })));
+        assert!(!code_wait_validator.is_valid(&serde_json::json!({
+            "cell_id": "cell-1",
+            "max_tokens": 1.5,
+        })));
 
         let ToolSpec::Function(agent_wait) = create_wait_agent_tool_v2(WaitAgentTimeoutOptions {
             default_timeout_ms: 30_000,

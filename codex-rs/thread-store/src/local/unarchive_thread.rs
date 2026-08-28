@@ -17,6 +17,17 @@ pub(super) async fn unarchive_thread(
     store: &LocalThreadStore,
     params: ArchiveThreadParams,
 ) -> ThreadStoreResult<StoredThread> {
+    unarchive_thread_with_touch(store, params, touch_modified_time).await
+}
+
+async fn unarchive_thread_with_touch<F>(
+    store: &LocalThreadStore,
+    params: ArchiveThreadParams,
+    touch: F,
+) -> ThreadStoreResult<StoredThread>
+where
+    F: FnOnce(&std::path::Path) -> std::io::Result<()>,
+{
     let thread_id = params.thread_id;
     let state_db_ctx = store.state_db().await;
     let archived_path = find_archived_thread_path_by_id_str(
@@ -100,9 +111,12 @@ pub(super) async fn unarchive_thread(
         );
     }
 
-    touch_modified_time(restored_path.as_path()).map_err(|err| ThreadStoreError::Internal {
-        message: format!("failed to update unarchived thread timestamp: {err}"),
-    })?;
+    if let Err(err) = touch(restored_path.as_path()) {
+        tracing::warn!(
+            "failed to update unarchived thread timestamp after moving the rollout; \
+             the unarchive remains committed: {err}"
+        );
+    }
 
     Ok(thread)
 }
@@ -152,6 +166,31 @@ mod tests {
             thread.first_user_message.as_deref(),
             Some("Archived user message")
         );
+    }
+
+    #[tokio::test]
+    async fn unarchive_thread_does_not_report_failure_after_timestamp_touch_fails() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let uuid = Uuid::from_u128(207);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let archived_path = write_archived_session_file(home.path(), "2025-01-03T15-00-00", uuid)
+            .expect("archived session file");
+
+        let thread =
+            unarchive_thread_with_touch(&store, ArchiveThreadParams { thread_id }, |_path| {
+                Err(std::io::Error::other("forced timestamp failure"))
+            })
+            .await
+            .expect("rollout move is the unarchive commit point");
+
+        let restored_path = home
+            .path()
+            .join("sessions/2025/01/03")
+            .join(archived_path.file_name().expect("file name"));
+        assert!(!archived_path.exists());
+        assert!(restored_path.exists());
+        assert_eq!(thread.rollout_path, Some(restored_path));
     }
 
     #[tokio::test]

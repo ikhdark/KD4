@@ -45,6 +45,7 @@ use crate::state::ExecutorSkillsStepState;
 use crate::state::SkillsThreadState;
 use crate::state::SkillsTurnState;
 use crate::tools::skill_tools;
+use crate::world_state::SKILLS_WORLD_STATE_ID;
 use crate::world_state::executor_skills_world_state_section;
 
 struct SkillsExtension<C> {
@@ -99,6 +100,10 @@ impl<C> ContextContributor for SkillsExtension<C>
 where
     C: Send + Sync + 'static,
 {
+    fn world_state_section_ids(&self) -> &'static [&'static str] {
+        &[SKILLS_WORLD_STATE_ID]
+    }
+
     fn estimate_thread_context<'a>(
         &'a self,
         session_store: &'a ExtensionData,
@@ -355,6 +360,7 @@ where
                             )
                             .0,
                             contents,
+                            source_scope: entry.source_scope,
                         };
                         fragments.push(Box::new(fragment));
                         main_prompts_injected = true;

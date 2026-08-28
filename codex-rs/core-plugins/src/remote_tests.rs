@@ -1,5 +1,47 @@
 use super::*;
+use codex_http_client::OutboundProxyPolicy;
 use pretty_assertions::assert_eq;
+
+#[test]
+fn remote_service_pool_retains_the_effective_proxy_policy() {
+    let config = RemotePluginServiceConfig::new(
+        "https://example.test".to_string(),
+        HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+    );
+
+    assert_eq!(
+        config.outbound_proxy_policy(),
+        OutboundProxyPolicy::RespectSystemProxy
+    );
+}
+
+#[tokio::test]
+async fn fetch_remote_installed_plugins_reuses_one_client_across_scopes() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/ps/plugins/installed"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plugins": [],
+                "pagination": {"next_page_token": null},
+            })),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+    let config = RemotePluginServiceConfig::new(
+        server.uri(),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+
+    let installed =
+        fetch_remote_installed_plugins_with_client(&config.http_clients, &config, &auth)
+            .await
+            .expect("all installed-plugin scopes should load");
+
+    assert!(installed.is_empty());
+}
 
 #[test]
 fn remote_catalog_http_client_error_is_classified() {

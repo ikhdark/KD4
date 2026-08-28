@@ -4,6 +4,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
@@ -110,7 +111,6 @@ impl WriteStdinHandler {
             FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
         })?;
 
-        let mut completed_validation_skip_disposition = None;
         if let Some(running) = session
             .services
             .command_execution
@@ -129,9 +129,6 @@ impl WriteStdinHandler {
                     .update_running_artifact(args.session_id, artifact)
                     .await;
             } else {
-                completed_validation_skip_disposition = response.exit_code.and_then(|exit_code| {
-                    running.completed_validation_skip_disposition(&response.raw_output, exit_code)
-                });
                 session
                     .services
                     .command_execution
@@ -161,22 +158,6 @@ impl WriteStdinHandler {
                 .await;
         }
 
-        if completed_validation_skip_disposition
-            == Some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
-        {
-            let validation_result = session
-                .services
-                .command_execution
-                .validation_result_for_call(&response.event_call_id)
-                .await;
-            return Ok(boxed_tool_output(
-                super::exec_command::completed_validation_not_applicable_output(
-                    &response,
-                    validation_result,
-                ),
-            ));
-        }
-
         Ok(boxed_tool_output(response))
     }
 }
@@ -201,6 +182,10 @@ impl CoreToolRuntime for WriteStdinHandler {
         // are background polls, and non-empty writes continue a command that
         // already ran PreToolUse as Bash, so do not emit a second pre hook here.
         None
+    }
+
+    fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
+        matches!(&invocation.payload, ToolPayload::Function { .. }).then(HookToolName::exec_command)
     }
 
     fn post_tool_use_payload(

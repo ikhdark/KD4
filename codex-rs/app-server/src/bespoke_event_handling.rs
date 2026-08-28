@@ -9,6 +9,7 @@ use crate::request_processors::thread_settings_from_core_snapshot;
 use crate::server_request_error::is_turn_transition_server_request_error;
 use crate::thread_state::ThreadState;
 use crate::thread_state::TurnSummary;
+use crate::thread_state::acknowledge_terminal_notification;
 use crate::thread_state::resolve_server_request_on_thread_listener;
 use crate::thread_status::ThreadWatchActiveGuard;
 use crate::thread_status::ThreadWatchManager;
@@ -37,6 +38,8 @@ use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::McpServerElicitationAction;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
+use codex_app_server_protocol::McpServerStartupCompletedNotification;
+use codex_app_server_protocol::McpServerStartupFailure;
 use codex_app_server_protocol::McpServerStartupState;
 use codex_app_server_protocol::McpServerStatusUpdatedNotification;
 use codex_app_server_protocol::McpToolCallProgressNotification;
@@ -87,7 +90,6 @@ use codex_core::ThreadManager;
 use codex_protocol::ThreadId;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
 use codex_protocol::items::TurnItem as CoreTurnItem;
-use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::Event;
@@ -105,9 +107,10 @@ use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequest
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputAnswer as CoreRequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse as CoreRequestUserInputResponse;
-use codex_sandboxing::policy_transforms::intersect_permission_profiles;
+use codex_sandboxing::policy_transforms::intersect_uri_permission_profiles;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
+use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -249,6 +252,26 @@ pub(crate) async fn apply_bespoke_event_handling(
             };
             outgoing
                 .send_server_notification(ServerNotification::McpServerStatusUpdated(notification))
+                .await;
+        }
+        EventMsg::McpStartupComplete(completed) => {
+            let notification = McpServerStartupCompletedNotification {
+                thread_id: Some(conversation_id.to_string()),
+                ready: completed.ready,
+                failed: completed
+                    .failed
+                    .into_iter()
+                    .map(|failure| McpServerStartupFailure {
+                        server: failure.server,
+                        error: failure.error,
+                    })
+                    .collect(),
+                cancelled: completed.cancelled,
+            };
+            outgoing
+                .send_server_notification(ServerNotification::McpServerStartupCompleted(
+                    notification,
+                ))
                 .await;
         }
         EventMsg::Warning(warning_event) => {
@@ -441,6 +464,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 started_at_ms,
                 command,
                 cwd,
+                cwd_uri,
                 reason,
                 network_approval_context,
                 proposed_execpolicy_amendment,
@@ -454,6 +478,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .cloned()
                 .map(|parsed| V2ParsedCommand::from_core_with_cwd(parsed, &cwd))
                 .collect::<Vec<_>>();
+            let completion_cwd = cwd_uri.unwrap_or_else(|| PathUri::from_abs_path(&cwd));
             let presentation = if let Some(network_approval_context) =
                 network_approval_context.map(V2NetworkApprovalContext::from)
             {
@@ -462,7 +487,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 let command_string = command_display_string(&command);
                 let completion_item = CommandExecutionCompletionItem {
                     command: command_string,
-                    cwd: cwd.clone().into(),
+                    cwd: completion_cwd.into(),
                     command_actions: command_actions.clone(),
                 };
                 CommandExecutionApprovalPresentation::Command(completion_item)
@@ -656,9 +681,23 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .note_permission_requested(&conversation_id.to_string())
                 .await;
             let requested_permissions = request.permissions.clone();
-            let request_cwd = match request.cwd.clone() {
-                Some(cwd) => cwd,
-                None => conversation.config_snapshot().await.cwd().clone(),
+            let config_snapshot = conversation.config_snapshot().await;
+            let request_cwd = request
+                .cwd
+                .clone()
+                .unwrap_or_else(|| config_snapshot.cwd().clone());
+            let request_cwd_uri = if let Some(cwd_uri) = request
+                .cwd_uri
+                .clone()
+                .or_else(|| request.cwd.as_ref().map(PathUri::from_abs_path))
+            {
+                cwd_uri
+            } else {
+                config_snapshot
+                    .environment_selections()
+                    .first()
+                    .map(|environment| environment.cwd.clone())
+                    .unwrap_or_else(|| PathUri::from_abs_path(config_snapshot.cwd()))
             };
             let params = PermissionsRequestApprovalParams {
                 thread_id: conversation_id.to_string(),
@@ -666,7 +705,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 item_id: request.call_id.clone(),
                 environment_id: request.environment_id.clone(),
                 started_at_ms: request.started_at_ms,
-                cwd: request_cwd.clone(),
+                cwd: request_cwd,
+                cwd_uri: request_cwd_uri.clone(),
                 reason: request.reason,
                 permissions: request.permissions.into(),
             };
@@ -678,7 +718,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 conversation_id,
                 turn_id: request.turn_id,
                 requested_permissions,
-                request_cwd,
+                request_cwd: request_cwd_uri,
                 pending_request_id,
                 outgoing,
                 receiver: rx,
@@ -930,7 +970,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             respond_to_pending_interrupts(&thread_state, &outgoing).await;
 
             thread_watch_manager
-                .note_turn_interrupted(&conversation_id.to_string())
+                .note_turn_aborted(&conversation_id.to_string(), &turn_aborted_event.reason)
                 .await;
             let attempt = handle_turn_interrupted(
                 conversation_id,
@@ -1074,7 +1114,20 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
 
-        _ => {}
+        EventMsg::AgentMessage(_)
+        | EventMsg::UserMessage(_)
+        | EventMsg::AgentReasoning(_)
+        | EventMsg::AgentReasoningRawContent(_)
+        | EventMsg::SessionConfigured(_)
+        | EventMsg::WebSearchBegin(_)
+        | EventMsg::WebSearchEnd(_)
+        | EventMsg::ImageGenerationBegin(_)
+        | EventMsg::ImageGenerationEnd(_) => {
+            // These legacy/raw events have no direct v2 projection. Their
+            // user-visible equivalents arrive through canonical item events or
+            // request responses. Keep this list exhaustive so a new EventMsg
+            // cannot become silently invisible to app-server clients.
+        }
     }
 }
 
@@ -1254,15 +1307,14 @@ async fn finish_terminal_notification_attempt(
             &attempt.dispatch.targeted_connection_ids,
             &attempt.dispatch.accepted_connection_ids,
         );
-    if notification_accepted
-        && conversation
-            .acknowledge_terminal_event(turn_id, fingerprint)
-            .await
-    {
-        thread_state
-            .lock()
-            .await
-            .mark_terminal_acknowledged(turn_id, fingerprint);
+    if notification_accepted {
+        acknowledge_terminal_notification(
+            conversation.as_ref(),
+            thread_state,
+            turn_id,
+            fingerprint,
+        )
+        .await;
     }
 }
 
@@ -1421,9 +1473,16 @@ async fn maybe_emit_raw_response_item_completed(
 
 async fn find_and_remove_turn_summary(
     _conversation_id: ThreadId,
+    event_turn_id: &str,
+    terminal_fingerprint: Option<&str>,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) -> TurnSummary {
     let mut state = thread_state.lock().await;
+    if let Some(fingerprint) = terminal_fingerprint
+        && let Some(summary) = state.retained_terminal_turn_summary(event_turn_id, fingerprint)
+    {
+        return summary;
+    }
     std::mem::take(&mut state.turn_summary)
 }
 
@@ -1435,7 +1494,13 @@ async fn handle_turn_complete(
     thread_state: &Arc<Mutex<ThreadState>>,
     terminal_fingerprint: Option<&str>,
 ) -> TerminalNotificationAttempt {
-    let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
+    let turn_summary = find_and_remove_turn_summary(
+        conversation_id,
+        &event_turn_id,
+        terminal_fingerprint,
+        thread_state,
+    )
+    .await;
 
     let embedded_error = turn_complete_event.error.as_ref().map(|error| TurnError {
         message: error.message.clone(),
@@ -1477,14 +1542,32 @@ async fn handle_turn_interrupted(
     thread_state: &Arc<Mutex<ThreadState>>,
     terminal_fingerprint: Option<&str>,
 ) -> TerminalNotificationAttempt {
-    let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
+    let turn_summary = find_and_remove_turn_summary(
+        conversation_id,
+        &event_turn_id,
+        terminal_fingerprint,
+        thread_state,
+    )
+    .await;
+    let internal_error =
+        turn_aborted_event.reason == codex_protocol::protocol::TurnAbortReason::InternalError;
+    let status = if internal_error {
+        TurnStatus::Failed
+    } else {
+        TurnStatus::Interrupted
+    };
+    let error = if internal_error {
+        turn_summary.last_error
+    } else {
+        None
+    };
 
     emit_turn_completed_with_status(
         conversation_id,
         event_turn_id,
         TurnCompletionMetadata {
-            status: TurnStatus::Interrupted,
-            error: None,
+            status,
+            error,
             completion: None,
             started_at: turn_summary.started_at,
             completed_at: turn_aborted_event.completed_at,
@@ -1566,12 +1649,14 @@ async fn handle_token_count_event(
             token_usage,
         };
         outgoing
-            .send_server_notification(ServerNotification::ThreadTokenUsageUpdated(notification))
+            .send_component_notification_if_changed(ServerNotification::ThreadTokenUsageUpdated(
+                notification,
+            ))
             .await;
     }
     if let Some(rate_limits) = rate_limits {
         outgoing
-            .send_server_notification(ServerNotification::AccountRateLimitsUpdated(
+            .send_component_notification_if_changed(ServerNotification::AccountRateLimitsUpdated(
                 AccountRateLimitsUpdatedNotification {
                     rate_limits: rate_limits.into(),
                 },
@@ -1625,67 +1710,8 @@ async fn on_request_user_input_response(
         );
     }
     drop(user_input_guard);
-    let value = match response {
-        Ok(Ok(value)) => value,
-        Ok(Err(err)) if is_turn_transition_server_request_error(&err) => return,
-        Ok(Err(err)) => {
-            error!("request failed with client error: {err:?}");
-            let empty = CoreRequestUserInputResponse {
-                answers: HashMap::new(),
-                interrupted: false,
-            };
-            if let Err(err) = conversation
-                .submit(Op::UserInputAnswer {
-                    id: event_turn_id,
-                    response: empty,
-                })
-                .await
-            {
-                error!("failed to submit UserInputAnswer: {err}");
-            }
-            return;
-        }
-        Err(err) => {
-            error!("request failed: {err:?}");
-            let empty = CoreRequestUserInputResponse {
-                answers: HashMap::new(),
-                interrupted: false,
-            };
-            if let Err(err) = conversation
-                .submit(Op::UserInputAnswer {
-                    id: event_turn_id,
-                    response: empty,
-                })
-                .await
-            {
-                error!("failed to submit UserInputAnswer: {err}");
-            }
-            return;
-        }
-    };
-
-    let response =
-        serde_json::from_value::<ToolRequestUserInputResponse>(value).unwrap_or_else(|err| {
-            error!("failed to deserialize ToolRequestUserInputResponse: {err}");
-            ToolRequestUserInputResponse {
-                answers: HashMap::new(),
-                interrupted: false,
-            }
-        });
-    let response = CoreRequestUserInputResponse {
-        interrupted: response.interrupted,
-        answers: response
-            .answers
-            .into_iter()
-            .map(|(id, answer)| {
-                (
-                    id,
-                    CoreRequestUserInputAnswer {
-                        answers: answer.answers,
-                    },
-                )
-            })
-            .collect(),
+    let Some(response) = request_user_input_response_from_client_result(response) else {
+        return;
     };
 
     if let Err(err) = conversation
@@ -1696,6 +1722,53 @@ async fn on_request_user_input_response(
         .await
     {
         error!("failed to submit UserInputAnswer: {err}");
+    }
+}
+
+fn interrupted_request_user_input_response() -> CoreRequestUserInputResponse {
+    CoreRequestUserInputResponse {
+        answers: HashMap::new(),
+        interrupted: true,
+    }
+}
+
+fn request_user_input_response_from_client_result(
+    response: std::result::Result<ClientRequestResult, oneshot::error::RecvError>,
+) -> Option<CoreRequestUserInputResponse> {
+    match response {
+        Ok(Ok(value)) => {
+            let response = match serde_json::from_value::<ToolRequestUserInputResponse>(value) {
+                Ok(response) => response,
+                Err(err) => {
+                    error!("failed to deserialize ToolRequestUserInputResponse: {err}");
+                    return Some(interrupted_request_user_input_response());
+                }
+            };
+            Some(CoreRequestUserInputResponse {
+                interrupted: response.interrupted,
+                answers: response
+                    .answers
+                    .into_iter()
+                    .map(|(id, answer)| {
+                        (
+                            id,
+                            CoreRequestUserInputAnswer {
+                                answers: answer.answers,
+                            },
+                        )
+                    })
+                    .collect(),
+            })
+        }
+        Ok(Err(err)) if is_turn_transition_server_request_error(&err) => None,
+        Ok(Err(err)) => {
+            error!("request failed with client error: {err:?}");
+            Some(interrupted_request_user_input_response())
+        }
+        Err(err) => {
+            error!("request failed: {err:?}");
+            Some(interrupted_request_user_input_response())
+        }
     }
 }
 
@@ -1802,14 +1875,12 @@ async fn on_request_permissions_response(
     let response = match request_permissions_response_from_client_result(
         requested_permissions,
         response,
-        request_cwd.as_path(),
+        &request_cwd,
     ) {
         Ok(Some(response)) => response,
         Ok(None) => return,
-        // TODO(anp): Remove this native-path localization error path once core permission paths
-        // remain PathUri after crossing the app-server boundary.
         Err(err) => {
-            let message = format!("failed to localize granted filesystem paths: {err}");
+            let message = format!("invalid granted filesystem paths: {err}");
             handle_error_notification(
                 conversation_id,
                 &turn_id,
@@ -1846,7 +1917,7 @@ struct PendingRequestPermissionsResponse {
     conversation_id: ThreadId,
     turn_id: String,
     requested_permissions: CoreRequestPermissionProfile,
-    request_cwd: AbsolutePathBuf,
+    request_cwd: PathUri,
     pending_request_id: RequestId,
     outgoing: ThreadScopedOutgoingMessageSender,
     receiver: oneshot::Receiver<ClientRequestResult>,
@@ -1856,7 +1927,7 @@ struct PendingRequestPermissionsResponse {
 fn request_permissions_response_from_client_result(
     requested_permissions: CoreRequestPermissionProfile,
     response: std::result::Result<ClientRequestResult, oneshot::error::RecvError>,
-    cwd: &std::path::Path,
+    cwd: &PathUri,
 ) -> std::io::Result<Option<CoreRequestPermissionsResponse>> {
     let value = match response {
         Ok(Ok(value)) => value,
@@ -1902,11 +1973,12 @@ fn request_permissions_response_from_client_result(
             strict_auto_review: false,
         }));
     }
-    let granted_permissions: CoreAdditionalPermissionProfile = response.permissions.try_into()?;
+    let granted_permissions = response.permissions.into_core_with_cwd(cwd)?;
     let permissions = if granted_permissions.is_empty() {
         CoreRequestPermissionProfile::default()
     } else {
-        intersect_permission_profiles(requested_permissions.into(), granted_permissions, cwd).into()
+        intersect_uri_permission_profiles(requested_permissions.into(), granted_permissions, cwd)
+            .into()
     };
     Ok(Some(CoreRequestPermissionsResponse {
         permissions,
@@ -2181,6 +2253,12 @@ mod tests {
         Arc::new(Mutex::new(ThreadState::default()))
     }
 
+    fn native_path_uri(path: &std::path::Path) -> PathUri {
+        PathUri::from_abs_path(
+            &AbsolutePathBuf::from_absolute_path(path).expect("absolute native path"),
+        )
+    }
+
     const TEST_TURN_COMPLETED_AT: i64 = 1_716_000_456;
     const TEST_TURN_DURATION_MS: i64 = 1_234;
 
@@ -2195,6 +2273,44 @@ mod tests {
             OutgoingEnvelope::Broadcast { message } => Ok(message),
             OutgoingEnvelope::ToConnection { message, .. } => Ok(message),
         }
+    }
+
+    fn assert_interrupted_user_input_response(response: Option<CoreRequestUserInputResponse>) {
+        assert_eq!(
+            response,
+            Some(CoreRequestUserInputResponse {
+                answers: HashMap::new(),
+                interrupted: true,
+            })
+        );
+    }
+
+    #[test]
+    fn request_user_input_client_error_is_interrupted() {
+        assert_interrupted_user_input_response(request_user_input_response_from_client_result(Ok(
+            Err(JSONRPCErrorError {
+                code: -1,
+                message: "client could not collect an answer".to_string(),
+                data: None,
+            }),
+        )));
+    }
+
+    #[tokio::test]
+    async fn request_user_input_closed_response_channel_is_interrupted() {
+        let (sender, receiver) = oneshot::channel::<ClientRequestResult>();
+        drop(sender);
+
+        assert_interrupted_user_input_response(request_user_input_response_from_client_result(
+            receiver.await,
+        ));
+    }
+
+    #[test]
+    fn request_user_input_malformed_response_is_interrupted() {
+        assert_interrupted_user_input_response(request_user_input_response_from_client_result(Ok(
+            Ok(json!({ "answers": "not-an-answer-map" })),
+        )));
     }
 
     #[tokio::test]
@@ -2995,7 +3111,7 @@ mod tests {
         let response = request_permissions_response_from_client_result(
             CoreRequestPermissionProfile::default(),
             Ok(Err(error)),
-            std::env::current_dir().expect("current dir").as_path(),
+            &native_path_uri(&std::env::current_dir().expect("current dir")),
         )
         .expect("paths should localize");
 
@@ -3008,7 +3124,11 @@ mod tests {
         let output_path = r"C:\tmp\output";
         let ignored_path = r"C:\tmp\ignored";
         let absolute_path = |path: &str| {
-            AbsolutePathBuf::try_from(std::path::PathBuf::from(path)).expect("absolute path")
+            native_path_uri(
+                AbsolutePathBuf::try_from(std::path::PathBuf::from(path))
+                    .expect("absolute path")
+                    .as_path(),
+            )
         };
         let requested_permissions = CoreRequestPermissionProfile {
             network: Some(CoreNetworkPermissions {
@@ -3071,14 +3191,14 @@ mod tests {
             ),
         ];
 
-        let cwd = std::env::current_dir().expect("current dir");
+        let cwd = native_path_uri(&std::env::current_dir().expect("current dir"));
         for (granted_permissions, expected_permissions) in cases {
             let response = request_permissions_response_from_client_result(
                 requested_permissions.clone(),
                 Ok(Ok(serde_json::json!({
                     "permissions": granted_permissions,
                 }))),
-                cwd.as_path(),
+                &cwd,
             )
             .expect("paths should localize")
             .expect("response should be accepted");
@@ -3102,7 +3222,7 @@ mod tests {
                 "scope": "session",
                 "permissions": {},
             }))),
-            std::env::current_dir().expect("current dir").as_path(),
+            &native_path_uri(&std::env::current_dir().expect("current dir")),
         )
         .expect("paths should localize")
         .expect("response should be accepted");
@@ -3130,7 +3250,7 @@ mod tests {
                     },
                 },
             }))),
-            std::env::current_dir().expect("current dir").as_path(),
+            &native_path_uri(&std::env::current_dir().expect("current dir")),
         )
         .expect("paths should localize")
         .expect("response should be accepted");
@@ -3162,7 +3282,7 @@ mod tests {
                     },
                 },
             }))),
-            std::env::current_dir().expect("current dir").as_path(),
+            &native_path_uri(&std::env::current_dir().expect("current dir")),
         )
         .expect("paths should localize")
         .expect("response should be accepted");
@@ -3176,6 +3296,8 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute cwd");
         let child = cwd.join("child");
+        let cwd_uri = PathUri::from_abs_path(&cwd);
+        let child_uri = PathUri::from_abs_path(&child);
         let requested_permissions = CoreRequestPermissionProfile {
             file_system: Some(CoreFileSystemPermissions {
                 entries: vec![FileSystemSandboxEntry {
@@ -3198,7 +3320,7 @@ mod tests {
                     },
                 },
             }))),
-            cwd.as_path(),
+            &cwd_uri,
         )
         .expect("paths should localize")
         .expect("response should be accepted");
@@ -3208,7 +3330,7 @@ mod tests {
             CoreRequestPermissionProfile {
                 file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
                     /*read*/ None,
-                    Some(vec![child]),
+                    Some(vec![child_uri]),
                 )),
                 ..Default::default()
             }
@@ -3223,6 +3345,7 @@ mod tests {
         let later_cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("later-cwd"))
             .expect("absolute later cwd");
         let later_child = later_cwd.join("child");
+        let request_cwd_uri = PathUri::from_abs_path(&request_cwd);
         let requested_permissions = CoreRequestPermissionProfile {
             file_system: Some(CoreFileSystemPermissions {
                 entries: vec![FileSystemSandboxEntry {
@@ -3245,7 +3368,7 @@ mod tests {
                     },
                 },
             }))),
-            request_cwd.as_path(),
+            &request_cwd_uri,
         )
         .expect("paths should localize")
         .expect("response should be accepted");
@@ -3261,10 +3384,12 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute cwd");
         let child = cwd.join("child");
+        let cwd_uri = PathUri::from_abs_path(&cwd);
+        let child_uri = PathUri::from_abs_path(&child);
         let requested_permissions = CoreRequestPermissionProfile {
             file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
                 /*read*/ None,
-                Some(vec![child]),
+                Some(vec![child_uri]),
             )),
             ..Default::default()
         };
@@ -3287,7 +3412,7 @@ mod tests {
                     },
                 },
             }))),
-            cwd.as_path(),
+            &cwd_uri,
         )
         .expect("paths should localize")
         .expect("response should be accepted");
@@ -3314,7 +3439,8 @@ mod tests {
         )
         .await;
 
-        let turn_summary = find_and_remove_turn_summary(conversation_id, &thread_state).await;
+        let turn_summary =
+            find_and_remove_turn_summary(conversation_id, "turn-1", None, &thread_state).await;
         assert_eq!(
             turn_summary.last_error,
             Some(TurnError {
@@ -3744,6 +3870,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_error_abort_emits_failed_with_recorded_error() -> Result<()> {
+        let conversation_id = ThreadId::new();
+        let event_turn_id = "internal_error1".to_string();
+        let thread_state = new_thread_state();
+        let expected_error = TurnError {
+            message: "worker panicked".to_string(),
+            codex_error_info: Some(V2CodexErrorInfo::InternalServerError),
+            additional_details: None,
+        };
+        handle_error(conversation_id, expected_error.clone(), &thread_state).await;
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
+        let mut aborted = turn_aborted_event(&event_turn_id);
+        aborted.reason = codex_protocol::protocol::TurnAbortReason::InternalError;
+
+        handle_turn_interrupted(
+            conversation_id,
+            event_turn_id.clone(),
+            aborted,
+            &outgoing,
+            &thread_state,
+            None,
+        )
+        .await;
+
+        let msg = recv_broadcast_message(&mut rx).await?;
+        match msg {
+            OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(n)) => {
+                assert_eq!(n.turn.id, event_turn_id);
+                assert_eq!(n.turn.status, TurnStatus::Failed);
+                assert_eq!(n.turn.error, Some(expected_error));
+                assert_eq!(n.turn.completed_at, Some(TEST_TURN_COMPLETED_AT));
+                assert_eq!(n.turn.duration_ms, Some(TEST_TURN_DURATION_MS));
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no extra messages expected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_internal_error_projection_preserves_retained_metadata() -> Result<()> {
+        let conversation_id = ThreadId::new();
+        let event_turn_id = "restart-internal-error".to_string();
+        let mut aborted = turn_aborted_event(&event_turn_id);
+        aborted.reason = codex_protocol::protocol::TurnAbortReason::InternalError;
+        let terminal_event = EventMsg::TurnAborted(aborted.clone());
+        let terminal_fingerprint = codex_core::terminal_event_fingerprint(&terminal_event)
+            .expect("terminal event should have a fingerprint");
+        let thread_state = new_thread_state();
+        thread_state
+            .lock()
+            .await
+            .seed_terminal_ledger_from_history(&[
+                RolloutItem::EventMsg(EventMsg::TurnStarted(
+                    codex_protocol::protocol::TurnStartedEvent {
+                        turn_id: event_turn_id.clone(),
+                        trace_id: None,
+                        started_at: Some(42),
+                        model_context_window: None,
+                        collaboration_mode_kind: Default::default(),
+                    },
+                )),
+                RolloutItem::EventMsg(EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                    message: "worker panicked".to_string(),
+                    codex_error_info: Some(
+                        codex_protocol::protocol::CodexErrorInfo::InternalServerError,
+                    ),
+                })),
+                RolloutItem::EventMsg(terminal_event),
+            ]);
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        handle_turn_interrupted(
+            conversation_id,
+            event_turn_id.clone(),
+            aborted,
+            &outgoing,
+            &thread_state,
+            Some(&terminal_fingerprint),
+        )
+        .await;
+
+        let msg = recv_broadcast_message(&mut rx).await?;
+        match msg {
+            OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(n)) => {
+                assert_eq!(n.turn.id, event_turn_id);
+                assert_eq!(n.turn.status, TurnStatus::Failed);
+                assert_eq!(n.turn.started_at, Some(42));
+                assert_eq!(
+                    n.turn.error.as_ref().map(|error| error.message.as_str()),
+                    Some("worker panicked")
+                );
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no extra messages expected");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_handle_turn_complete_emits_failed_with_error() -> Result<()> {
         let conversation_id = ThreadId::new();
         let event_turn_id = "complete_err1".to_string();
@@ -3867,7 +4111,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_token_count_event_emits_usage_and_rate_limits() -> Result<()> {
+    async fn test_handle_token_count_event_deduplicates_unchanged_components_per_connection()
+    -> Result<()> {
         let conversation_id = ThreadId::new();
         let turn_id = "turn-123".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -3875,8 +4120,8 @@ mod tests {
             tx,
             codex_analytics::AnalyticsEventsClient::disabled(),
         ));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(
-            outgoing,
+        let scoped_outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing.clone(),
             vec![ConnectionId(1)],
             ThreadId::new(),
         );
@@ -3922,10 +4167,10 @@ mod tests {
             conversation_id,
             turn_id.clone(),
             TokenCountEvent {
-                info: Some(info),
-                rate_limits: Some(rate_limits),
+                info: Some(info.clone()),
+                rate_limits: Some(rate_limits.clone()),
             },
-            &outgoing,
+            &scoped_outgoing,
         )
         .await;
 
@@ -3957,6 +4202,154 @@ mod tests {
             }
             other => bail!("unexpected notification: {other:?}"),
         }
+
+        handle_token_count_event(
+            conversation_id,
+            turn_id.clone(),
+            TokenCountEvent {
+                info: Some(info.clone()),
+                rate_limits: Some(rate_limits.clone()),
+            },
+            &scoped_outgoing,
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "an identical combined snapshot must not emit either component"
+        );
+
+        handle_token_count_event(
+            conversation_id,
+            "turn-124".to_string(),
+            TokenCountEvent {
+                info: Some(info.clone()),
+                rate_limits: Some(rate_limits.clone()),
+            },
+            &scoped_outgoing,
+        )
+        .await;
+        assert!(matches!(
+            recv_broadcast_message(&mut rx).await?,
+            OutgoingMessage::AppServerNotification(ServerNotification::ThreadTokenUsageUpdated(_))
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the first usage snapshot for a new turn must be delivered without repeating rate limits"
+        );
+
+        let mut changed_info = info.clone();
+        changed_info.total_token_usage.total_tokens += 1;
+        handle_token_count_event(
+            conversation_id,
+            turn_id.clone(),
+            TokenCountEvent {
+                info: Some(changed_info.clone()),
+                rate_limits: Some(rate_limits.clone()),
+            },
+            &scoped_outgoing,
+        )
+        .await;
+        assert!(matches!(
+            recv_broadcast_message(&mut rx).await?,
+            OutgoingMessage::AppServerNotification(ServerNotification::ThreadTokenUsageUpdated(_))
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged rate-limit component must stay suppressed"
+        );
+
+        let mut changed_rate_limits = rate_limits.clone();
+        changed_rate_limits
+            .primary
+            .as_mut()
+            .expect("primary window")
+            .used_percent += 1.0;
+        handle_token_count_event(
+            conversation_id,
+            turn_id.clone(),
+            TokenCountEvent {
+                info: Some(changed_info.clone()),
+                rate_limits: Some(changed_rate_limits.clone()),
+            },
+            &scoped_outgoing,
+        )
+        .await;
+        assert!(matches!(
+            recv_broadcast_message(&mut rx).await?,
+            OutgoingMessage::AppServerNotification(ServerNotification::AccountRateLimitsUpdated(_))
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged token-usage component must stay suppressed"
+        );
+
+        let second_connection_outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing.clone(),
+            vec![ConnectionId(2)],
+            ThreadId::new(),
+        );
+        handle_token_count_event(
+            conversation_id,
+            turn_id.clone(),
+            TokenCountEvent {
+                info: Some(changed_info.clone()),
+                rate_limits: Some(changed_rate_limits.clone()),
+            },
+            &second_connection_outgoing,
+        )
+        .await;
+        for _ in 0..2 {
+            let OutgoingEnvelope::ToConnection { connection_id, .. } =
+                rx.recv().await.expect("initial component notification")
+            else {
+                panic!("component notifications must be connection scoped");
+            };
+            assert_eq!(connection_id, ConnectionId(2));
+        }
+
+        outgoing
+            .send_initial_component_notification_to_connection(
+                ConnectionId(2),
+                ServerNotification::ThreadTokenUsageUpdated(ThreadTokenUsageUpdatedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: turn_id.clone(),
+                    token_usage: ThreadTokenUsage::from(changed_info.clone()),
+                }),
+            )
+            .await;
+        let OutgoingEnvelope::ToConnection {
+            connection_id,
+            message:
+                OutgoingMessage::AppServerNotification(ServerNotification::ThreadTokenUsageUpdated(_)),
+            ..
+        } = rx.recv().await.expect("explicit token usage replay")
+        else {
+            panic!("explicit replay must bypass changed-only suppression");
+        };
+        assert_eq!(connection_id, ConnectionId(2));
+
+        outgoing.connection_closed(ConnectionId(2)).await;
+        handle_token_count_event(
+            conversation_id,
+            turn_id,
+            TokenCountEvent {
+                info: Some(changed_info),
+                rate_limits: Some(changed_rate_limits),
+            },
+            &second_connection_outgoing,
+        )
+        .await;
+        for _ in 0..2 {
+            let OutgoingEnvelope::ToConnection { connection_id, .. } = rx
+                .recv()
+                .await
+                .expect("component notification after reconnect")
+            else {
+                panic!("component notifications must be connection scoped");
+            };
+            assert_eq!(connection_id, ConnectionId(2));
+        }
+        assert!(rx.try_recv().is_err(), "no extra notifications expected");
         Ok(())
     }
 

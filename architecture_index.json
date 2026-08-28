@@ -1,7 +1,7 @@
 {
-  "index_sha256": "b6f663142e92ce13cddd378f323b3dbe9bdb7895eb72cc8d7ed2c8e7cc54fe75",
+  "index_sha256": "b6dc2833cc7a9d41f439108e255f2fe528429b1b5ce34f773058454f65851246",
   "index_version": 1,
-  "manifest_sha256": "9f7b8e0c349816d9b113680fc9ce20d5815d5af841db704722872787a1997576",
+  "manifest_sha256": "8a3a6a230e0962303f50ea587d41160119d40d78d8a51d86cacd55b65e380ca3",
   "omitted": {
     "relationships": 0
   },
@@ -579,11 +579,12 @@
         "codex-rs/core/benches/turn_latency.rs"
       ],
       "facet_exclusions": {
-        "configuration_and_gates": "The benchmark command selects a workflow directly; no repository feature or configuration file owns that selection.",
-        "generated_artifacts": "Serialized reports are local runtime outputs rather than checked-in generated mirrors."
+        "configuration_and_gates": "The benchmark command selects a workflow directly; no repository feature or configuration file owns that selection."
       },
       "feature_ids": [],
-      "generated_artifacts": [],
+      "generated_artifacts": [
+        "docs/benchmarks/turn-latency/accepted"
+      ],
       "id": "rust-turn-latency-benchmark",
       "invariants": [
         {
@@ -599,6 +600,20 @@
           "tests": [
             "codex-rs/core/tests/turn_latency_bench.rs"
           ]
+        },
+        {
+          "evidence": [
+            {
+              "path": "codex-rs/core/benches/turn_latency/ab_runner.rs",
+              "symbol": "import_accepted_ab_report"
+            }
+          ],
+          "id": "accepted-turn-latency-reports-are-verified",
+          "kind": "semantic",
+          "statement": "Only hash-valid, complete, uncapped, passing batch and final A/B reports enter the tracked accepted-report mirror.",
+          "tests": [
+            "codex-rs/core/benches/turn_latency/tests.rs"
+          ]
         }
       ],
       "primary_entries": [
@@ -610,9 +625,15 @@
       ],
       "roots": [
         "codex-rs/core/benches/turn_latency.rs",
-        "codex-rs/core/tests/turn_latency_bench.rs"
+        "codex-rs/core/benches/turn_latency/ab_contract.rs",
+        "codex-rs/core/benches/turn_latency/ab_runner.rs",
+        "codex-rs/core/benches/turn_latency/runtime_fixtures.rs",
+        "codex-rs/core/benches/turn_latency/tests.rs",
+        "codex-rs/core/tests/turn_latency_bench.rs",
+        "docs/benchmarks/turn-latency/README.md"
       ],
       "tests": [
+        "codex-rs/core/benches/turn_latency/tests.rs",
         "codex-rs/core/tests/turn_latency_bench.rs"
       ],
       "validation": [
@@ -1459,6 +1480,19 @@
       "target": "owner:core-agent-runtime"
     },
     {
+      "category": "generated_artifacts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "codex-rs/core/benches/turn_latency/ab_runner.rs",
+          "symbol": "import_accepted_ab_report"
+        }
+      ],
+      "kind": "emits",
+      "source": "owner:rust-turn-latency-benchmark",
+      "target": "path:docs/benchmarks/turn-latency/accepted"
+    },
+    {
       "category": "runtime_registration",
       "confidence": "declared",
       "evidence": [
@@ -1813,7 +1847,7 @@
       "target": "path:codex-rs/core/src/tools/command_output_artifact_tests.rs"
     }
   ],
-  "repository_revision": "manifest:9f7b8e0c349816d9b113680fc9ce20d5815d5af841db704722872787a1997576:sources:e98049b55ac264ee00541a46c18d4ff71073352d3ab924ef50d1569eda525111",
+  "repository_revision": "manifest:8a3a6a230e0962303f50ea587d41160119d40d78d8a51d86cacd55b65e380ca3:sources:6207310b9fb38b0aef3945c9a8a32f4b6a04ec0fbfb1d4cfbbebe862fa0bfe62",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

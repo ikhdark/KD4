@@ -49,6 +49,7 @@ pub use unix_socket::acquire_app_server_startup_lock;
 pub use unix_socket::prepare_control_socket_path;
 pub use unix_socket::start_control_socket_acceptor;
 pub use websocket::start_websocket_acceptor;
+pub use websocket::validate_websocket_listener;
 
 const APP_SERVER_CONTROL_SOCKET_DIR_NAME: &str = "app-server-control";
 const APP_SERVER_CONTROL_SOCKET_FILE_NAME: &str = "app-server-control.sock";

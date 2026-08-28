@@ -1,9 +1,6 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -29,11 +26,17 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::AbortedToolOutput;
+use crate::tools::context::RequiredToolTerminal;
+use crate::tools::context::RequiredToolTerminalCause;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolDispatchAbort;
+use crate::tools::context::ToolDispatchState;
+use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::lifecycle::notify_tool_aborted;
 use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
+use crate::tools::registry::install_synthetic_terminal_projection;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
 use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
@@ -45,8 +48,89 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TurnTimingToolCallSource;
+use codex_tools::ToolOutputOutcome;
+use codex_tools::ToolOutputOutcomeContext;
+use codex_tools::ToolOutputSkipDisposition;
 
 pub(crate) const TOOL_RUNTIME_CANCELLATION_GRACE: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+pub(crate) struct ToolCallCompletion {
+    pub(crate) response: ResponseInputItem,
+    pub(crate) required_terminal: Option<RequiredToolTerminal>,
+}
+
+impl ToolCallCompletion {
+    pub(crate) fn nonterminal(response: ResponseInputItem) -> Self {
+        Self {
+            response,
+            required_terminal: None,
+        }
+    }
+}
+
+fn required_tool_terminal(
+    call: &ToolCall,
+    outcome_context: ToolOutputOutcomeContext,
+    signal: Option<&serde_json::Value>,
+) -> Option<RequiredToolTerminal> {
+    let cause = required_tool_terminal_cause(outcome_context, signal)?;
+    let label = match cause {
+        RequiredToolTerminalCause::Blocked => "blocked",
+        RequiredToolTerminalCause::Failure => "failed",
+        RequiredToolTerminalCause::TimedOut => "timed out",
+        RequiredToolTerminalCause::RecoverableCancellation => "was cancelled",
+    };
+    Some(RequiredToolTerminal {
+        call_id: call.call_id.clone(),
+        cause,
+        message: format!("required tool `{}` {label}", call.tool_name),
+    })
+}
+
+pub(crate) fn required_tool_terminal_cause(
+    outcome_context: ToolOutputOutcomeContext,
+    signal: Option<&serde_json::Value>,
+) -> Option<RequiredToolTerminalCause> {
+    if outcome_context.outcome == ToolOutputOutcome::Yielded {
+        return None;
+    }
+    let signalled = signal
+        .and_then(|value| value.get("outcome"))
+        .and_then(serde_json::Value::as_str);
+    match signalled {
+        Some("blocked") => Some(RequiredToolTerminalCause::Blocked),
+        Some("timeout") => Some(RequiredToolTerminalCause::TimedOut),
+        Some("recoverable_cancellation") => {
+            Some(RequiredToolTerminalCause::RecoverableCancellation)
+        }
+        Some("failure") => Some(RequiredToolTerminalCause::Failure),
+        _ => match outcome_context.outcome {
+            ToolOutputOutcome::Failure => Some(RequiredToolTerminalCause::Failure),
+            ToolOutputOutcome::TimedOut => Some(RequiredToolTerminalCause::TimedOut),
+            ToolOutputOutcome::Skipped
+                if outcome_context.skip_disposition
+                    == Some(ToolOutputSkipDisposition::BlockingRequiredOperation) =>
+            {
+                Some(RequiredToolTerminalCause::Blocked)
+            }
+            ToolOutputOutcome::Success
+            | ToolOutputOutcome::Yielded
+            | ToolOutputOutcome::Skipped => None,
+        },
+    }
+}
+
+pub(crate) fn required_tool_error_terminal_cause(
+    error: &FunctionCallError,
+) -> RequiredToolTerminalCause {
+    match error {
+        FunctionCallError::DeniedToModel(_) => RequiredToolTerminalCause::Blocked,
+        FunctionCallError::RespondToModel(_) | FunctionCallError::Fatal(_) => {
+            RequiredToolTerminalCause::Failure
+        }
+    }
+}
 
 fn reused_failure_diagnosis(
     _tool_name: &codex_tools::ToolName,
@@ -157,15 +241,376 @@ pub(crate) struct ToolCallRuntime {
     parallel_execution: Arc<RwLock<()>>,
     workspace_execution:
         Arc<Mutex<std::collections::HashMap<std::path::PathBuf, Weak<RwLock<()>>>>>,
+    canonical_workspace_resources:
+        Arc<Mutex<std::collections::HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>>,
     sampling_request_signals: Option<SamplingRequestSignalCollector>,
 }
 
-fn workspace_tool_may_use_parallel_gate(
-    supports_parallel: bool,
-    proven_read_only: bool,
-    workspace_capable: bool,
-) -> bool {
-    supports_parallel && (!workspace_capable || proven_read_only)
+struct PendingWorkspaceEvidenceResponse {
+    ordinal: u64,
+    response: ResponseInputItem,
+    workspace_cwd: std::path::PathBuf,
+    source_dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+    source_path_observations: Vec<crate::git_workspace::SourcePathChangeObservation>,
+    timing: Option<Arc<ToolDispatchTiming>>,
+}
+
+struct PendingWorkspaceMutation {
+    ordinal: u64,
+    workspace_cwd: std::path::PathBuf,
+    affected_paths: Option<std::collections::BTreeSet<std::path::PathBuf>>,
+    observe_command_ledger: bool,
+}
+
+#[derive(Default)]
+struct WorkspaceEvidenceGenerationBatchState {
+    sealed: bool,
+    next_ordinal: u64,
+    next_effect_ordinal: u64,
+    call_ordinals: std::collections::HashMap<String, u64>,
+    responses: Vec<PendingWorkspaceEvidenceResponse>,
+    mutations: Vec<PendingWorkspaceMutation>,
+}
+
+/// Request-scoped workspace evidence collected until all accepted tool calls
+/// in one model sampling generation have settled.
+pub(crate) struct WorkspaceEvidenceGenerationBatch {
+    state: Mutex<WorkspaceEvidenceGenerationBatchState>,
+}
+
+pub(crate) struct WorkspaceEvidenceGenerationFlush {
+    pub(crate) prefetched_workspace_identity:
+        Option<Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
+    #[cfg(test)]
+    pub(crate) authoritative_capture_count: usize,
+    #[cfg(test)]
+    pub(crate) registered_call_ids: Vec<String>,
+}
+
+impl WorkspaceEvidenceGenerationBatch {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(WorkspaceEvidenceGenerationBatchState::default()),
+        }
+    }
+
+    pub(crate) fn register_call(&self, call_id: &str) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.sealed {
+            return false;
+        }
+        if state.call_ordinals.contains_key(call_id) {
+            return true;
+        }
+        let ordinal = state.next_ordinal;
+        state.next_ordinal = state.next_ordinal.saturating_add(1);
+        state.call_ordinals.insert(call_id.to_string(), ordinal);
+        true
+    }
+
+    pub(crate) fn accepts_call(&self, call_id: &str) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !state.sealed && state.call_ordinals.contains_key(call_id)
+    }
+
+    pub(crate) fn record_mutation(
+        &self,
+        call_id: &str,
+        workspace_cwd: std::path::PathBuf,
+        affected_paths: Option<std::collections::BTreeSet<std::path::PathBuf>>,
+        observe_command_ledger: bool,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.sealed || !state.call_ordinals.contains_key(call_id) {
+            return false;
+        }
+        let ordinal = state.next_effect_ordinal;
+        state.next_effect_ordinal = state.next_effect_ordinal.saturating_add(1);
+        state.mutations.push(PendingWorkspaceMutation {
+            ordinal,
+            workspace_cwd,
+            affected_paths,
+            observe_command_ledger,
+        });
+        true
+    }
+
+    fn queue_response(
+        &self,
+        response: &ResponseInputItem,
+        classification: &crate::tool_history::WorkspaceCallClassification,
+        source_dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+        source_path_observations: Vec<crate::git_workspace::SourcePathChangeObservation>,
+        timing: Option<Arc<ToolDispatchTiming>>,
+    ) -> bool {
+        let Some(call_id) = response_input_call_id(response) else {
+            return false;
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(ordinal) = state.call_ordinals.get(call_id).copied() else {
+            return false;
+        };
+        if state.sealed {
+            return false;
+        }
+        state.responses.push(PendingWorkspaceEvidenceResponse {
+            ordinal,
+            response: response.clone(),
+            workspace_cwd: classification.workspace_cwd.clone(),
+            source_dependencies,
+            source_path_observations,
+            timing,
+        });
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_mutating_response_for_test(
+        &self,
+        response: &ResponseInputItem,
+        classification: &crate::tool_history::WorkspaceCallClassification,
+        source_path_observations: Vec<crate::git_workspace::SourcePathChangeObservation>,
+    ) -> bool {
+        self.queue_response(
+            response,
+            classification,
+            classification.source_dependencies.clone(),
+            source_path_observations,
+            None,
+        )
+    }
+
+    pub(crate) async fn flush(
+        self: &Arc<Self>,
+        session: &Session,
+        turn: &TurnContext,
+        tracker: &SharedTurnDiffTracker,
+    ) -> WorkspaceEvidenceGenerationFlush {
+        let (responses, mutations) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.sealed = true;
+            (
+                std::mem::take(&mut state.responses),
+                std::mem::take(&mut state.mutations),
+            )
+        };
+        tracker
+            .lock()
+            .await
+            .clear_workspace_evidence_generation_batch(self);
+
+        struct Group {
+            cwd: std::path::PathBuf,
+            responses: Vec<PendingWorkspaceEvidenceResponse>,
+            mutations: Vec<PendingWorkspaceMutation>,
+        }
+
+        struct FinalizedResponse {
+            ordinal: u64,
+            response: ResponseInputItem,
+            revision: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+            source_dependencies:
+                std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+            source_path_observations: Vec<crate::git_workspace::SourcePathChangeObservation>,
+        }
+
+        let mut groups = std::collections::BTreeMap::<std::path::PathBuf, Group>::new();
+        for response in responses {
+            let key = canonical_workspace_evidence_key(&response.workspace_cwd);
+            groups
+                .entry(key)
+                .or_insert_with(|| Group {
+                    cwd: response.workspace_cwd.clone(),
+                    responses: Vec::new(),
+                    mutations: Vec::new(),
+                })
+                .responses
+                .push(response);
+        }
+        for mutation in mutations {
+            let key = canonical_workspace_evidence_key(&mutation.workspace_cwd);
+            groups
+                .entry(key)
+                .or_insert_with(|| Group {
+                    cwd: mutation.workspace_cwd.clone(),
+                    responses: Vec::new(),
+                    mutations: Vec::new(),
+                })
+                .mutations
+                .push(mutation);
+        }
+        // Relay persistence precedes this generation-boundary flush. Exclude
+        // only the queued responses that will be bound to the authoritative
+        // post-generation identity below; earlier history must still be
+        // invalidated by every mutation in the batch.
+        let current_generation_response_call_ids = groups
+            .values()
+            .flat_map(|group| group.responses.iter())
+            .filter_map(|response| response_input_call_id(&response.response).map(str::to_string))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let primary_key = canonical_workspace_evidence_key(turn.config.cwd.as_path());
+        let mut prefetched_workspace_identity = None;
+        let mut finalized_responses = Vec::new();
+        #[cfg(test)]
+        let mut authoritative_capture_count = 0;
+        for (key, mut group) in groups {
+            group.responses.sort_by_key(|response| response.ordinal);
+            group.mutations.sort_by_key(|mutation| mutation.ordinal);
+            let capture_started = Instant::now();
+            let capture = session
+                .services
+                .git_workspace
+                .workspace_evidence_identity_with_attribution(&group.cwd)
+                .await;
+            #[cfg(test)]
+            {
+                authoritative_capture_count += 1;
+            }
+            let capture_duration = capture_started.elapsed();
+            if let Some(timing) = group
+                .responses
+                .iter()
+                .find_map(|response| response.timing.as_ref())
+            {
+                timing.record_workspace_evidence_after(capture_duration);
+            }
+
+            if !group.mutations.is_empty() {
+                let broad_invalidation = group
+                    .mutations
+                    .iter()
+                    .any(|mutation| mutation.affected_paths.is_none());
+                let affected_paths = (!broad_invalidation).then(|| {
+                    group
+                        .mutations
+                        .iter()
+                        .flat_map(|mutation| {
+                            mutation
+                                .affected_paths
+                                .as_ref()
+                                .into_iter()
+                                .flatten()
+                                .cloned()
+                        })
+                        .collect::<std::collections::BTreeSet<_>>()
+                });
+                session
+                    .invalidate_tool_history_source_dependencies_excluding_call_ids(
+                        turn.config.codex_home.as_path(),
+                        affected_paths.as_ref(),
+                        capture.identity.as_ref(),
+                        &current_generation_response_call_ids,
+                    )
+                    .await;
+
+                let (final_mutation_revision, observe_command_ledger) = {
+                    let tracker = tracker.lock().await;
+                    (
+                        tracker.current_mutation_revision(),
+                        group
+                            .mutations
+                            .iter()
+                            .any(|mutation| mutation.observe_command_ledger),
+                    )
+                };
+                if observe_command_ledger {
+                    session
+                        .services
+                        .command_execution
+                        .observe_repository_revision_with_identity(
+                            &turn.sub_id,
+                            final_mutation_revision,
+                            capture.identity.clone(),
+                        )
+                        .await;
+                }
+            }
+
+            if key == primary_key {
+                // Preserve the distinction between no primary capture and an
+                // authoritative capture of a non-Git workspace. The latter
+                // must suppress an older continuation prefetch just as a Git
+                // identity does.
+                prefetched_workspace_identity = Some(capture.identity.clone());
+            }
+            for response in group.responses {
+                finalized_responses.push(FinalizedResponse {
+                    ordinal: response.ordinal,
+                    response: response.response,
+                    revision: capture.identity.clone(),
+                    source_dependencies: response.source_dependencies,
+                    source_path_observations: response.source_path_observations,
+                });
+            }
+        }
+
+        finalized_responses.sort_by_key(|response| response.ordinal);
+        #[cfg(test)]
+        let registered_call_ids = finalized_responses
+            .iter()
+            .filter_map(|response| response_input_call_id(&response.response).map(str::to_string))
+            .collect();
+        for response in finalized_responses {
+            ToolCallRuntime::register_workspace_evidence_observation(
+                session,
+                turn,
+                WorkspaceEvidenceObservation {
+                    response: &response.response,
+                    revision: response.revision,
+                    captured_current: true,
+                    source_dependencies: response.source_dependencies,
+                    source_path_observations: response.source_path_observations,
+                    workspace_gate_guard: None,
+                },
+            )
+            .await;
+        }
+
+        WorkspaceEvidenceGenerationFlush {
+            prefetched_workspace_identity,
+            #[cfg(test)]
+            authoritative_capture_count,
+            #[cfg(test)]
+            registered_call_ids,
+        }
+    }
+}
+
+fn response_input_call_id(response: &ResponseInputItem) -> Option<&str> {
+    match response {
+        ResponseInputItem::FunctionCallOutput { call_id, .. }
+        | ResponseInputItem::McpToolCallOutput { call_id, .. }
+        | ResponseInputItem::CustomToolCallOutput { call_id, .. }
+        | ResponseInputItem::ToolSearchOutput { call_id, .. } => Some(call_id),
+        ResponseInputItem::Message { .. } => None,
+    }
+}
+
+fn canonical_workspace_evidence_key(cwd: &std::path::Path) -> std::path::PathBuf {
+    codex_git_utils::get_git_repo_root(cwd)
+        .and_then(|root| dunce::canonicalize(root).ok())
+        .or_else(|| dunce::canonicalize(cwd).ok())
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
+fn workspace_tool_may_use_parallel_gate(supports_parallel: bool, workspace_capable: bool) -> bool {
+    supports_parallel && !workspace_capable
 }
 
 fn bypasses_outer_workspace_gate(tool_name: &codex_tools::ToolName) -> bool {
@@ -174,24 +619,98 @@ fn bypasses_outer_workspace_gate(tool_name: &codex_tools::ToolName) -> bool {
     crate::tools::code_mode::is_exec_tool_name(tool_name)
 }
 
-fn classify_workspace_tool_call_for_dispatch(
+fn workspace_tool_call_classifications_for_dispatch(
     source: &ToolCallSource,
     tool_identity: &str,
     payload: &ToolPayload,
     default_cwd: &std::path::Path,
-) -> Option<crate::tool_history::WorkspaceCallClassification> {
-    (!matches!(source, ToolCallSource::Direct)).then(|| {
+    admission_hint: Option<crate::tool_history::WorkspaceCallClassification>,
+) -> (
+    crate::tool_history::WorkspaceCallClassification,
+    Option<crate::tool_history::WorkspaceCallClassification>,
+) {
+    let admission = admission_hint.unwrap_or_else(|| {
         crate::tool_history::classify_workspace_tool_call(tool_identity, payload, default_cwd)
-    })
+    });
+    let inner_evidence = (!matches!(source, ToolCallSource::Direct)).then(|| admission.clone());
+    (admission, inner_evidence)
+}
+
+fn workspace_evidence_classification_for_executed_payload(
+    original: &crate::tool_history::WorkspaceCallClassification,
+    tool_identity: &str,
+    executed_payload: Option<&ToolPayload>,
+    default_cwd: &std::path::Path,
+) -> crate::tool_history::WorkspaceCallClassification {
+    executed_payload.map_or_else(
+        || original.clone(),
+        |payload| {
+            crate::tool_history::classify_workspace_tool_call(tool_identity, payload, default_cwd)
+        },
+    )
+}
+
+fn workspace_evidence_baseline_is_compatible(
+    original: &crate::tool_history::WorkspaceCallClassification,
+    executed: &crate::tool_history::WorkspaceCallClassification,
+) -> bool {
+    original.workspace_cwd == executed.workspace_cwd
 }
 
 fn canonical_workspace_resource_key(
     classification: Option<&crate::tool_history::WorkspaceCallClassification>,
+    cache: &Mutex<std::collections::HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>,
 ) -> Option<std::path::PathBuf> {
-    let classification =
-        classification.filter(|classification| classification.observes_workspace)?;
-    let repo_root = codex_git_utils::get_git_repo_root(&classification.workspace_cwd)?;
-    dunce::canonicalize(repo_root).ok()
+    let classification = classification?;
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(resource) = cache.get(&classification.workspace_cwd) {
+        return resource.clone();
+    }
+    let resource = codex_git_utils::get_git_repo_root(&classification.workspace_cwd)
+        .and_then(|repo_root| dunce::canonicalize(repo_root).ok());
+    cache.insert(classification.workspace_cwd.clone(), resource.clone());
+    resource
+}
+
+fn workspace_resource_key_for_admission(
+    classification: &crate::tool_history::WorkspaceCallClassification,
+    cache: &Mutex<std::collections::HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>,
+    supports_parallel: bool,
+    workspace_capable: bool,
+) -> Option<std::path::PathBuf> {
+    (supports_parallel && workspace_capable)
+        .then(|| canonical_workspace_resource_key(Some(classification), cache))
+        .flatten()
+}
+
+#[derive(Debug)]
+struct WorkspaceAdmissionPlan {
+    bypass_outer_gate: bool,
+    resource_key: Option<std::path::PathBuf>,
+    supports_parallel: bool,
+    workspace_capable: bool,
+}
+
+fn workspace_admission_plan(
+    tool_name: &codex_tools::ToolName,
+    classification: &crate::tool_history::WorkspaceCallClassification,
+    cache: &Mutex<std::collections::HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>,
+    supports_parallel: bool,
+    workspace_capable: bool,
+) -> WorkspaceAdmissionPlan {
+    WorkspaceAdmissionPlan {
+        bypass_outer_gate: bypasses_outer_workspace_gate(tool_name),
+        resource_key: workspace_resource_key_for_admission(
+            classification,
+            cache,
+            supports_parallel,
+            workspace_capable,
+        ),
+        supports_parallel,
+        workspace_capable,
+    }
 }
 
 fn workspace_resource_gate(
@@ -209,10 +728,6 @@ fn workspace_resource_gate(
     gates.insert(resource_key, Arc::downgrade(&gate));
     gate
 }
-
-const DISPATCH_WAITING_FOR_ADMISSION: u8 = 0;
-const DISPATCH_ADMITTED: u8 = 1;
-const DISPATCH_CANCELLED_BEFORE_ADMISSION: u8 = 2;
 
 struct WorkspaceEvidenceBaseline {
     revision: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
@@ -241,9 +756,8 @@ struct WorkspaceEvidenceObservation<'a> {
     workspace_gate_guard: Option<WorkspaceGateGuard>,
 }
 
-enum WorkspaceResourceGateGuard {
-    Read { _guard: OwnedRwLockReadGuard<()> },
-    Write { _guard: OwnedRwLockWriteGuard<()> },
+struct WorkspaceResourceGateGuard {
+    _guard: OwnedRwLockWriteGuard<()>,
 }
 
 enum WorkspaceGateGuard {
@@ -259,6 +773,42 @@ enum WorkspaceGateGuard {
     },
 }
 
+async fn acquire_shared_workspace_gate(
+    gate: Arc<RwLock<()>>,
+    turn_timing_state: &Arc<TurnTimingState>,
+) -> OwnedRwLockReadGuard<()> {
+    match Arc::clone(&gate).try_read_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let waiter_guard = LifecycleCounterGuard::increment(
+                turn_timing_state,
+                LifecycleCounter::ParallelGateWaiter,
+            );
+            let guard = gate.read_owned().await;
+            drop(waiter_guard);
+            guard
+        }
+    }
+}
+
+async fn acquire_exclusive_workspace_gate(
+    gate: Arc<RwLock<()>>,
+    turn_timing_state: &Arc<TurnTimingState>,
+) -> OwnedRwLockWriteGuard<()> {
+    match Arc::clone(&gate).try_write_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let waiter_guard = LifecycleCounterGuard::increment(
+                turn_timing_state,
+                LifecycleCounter::ParallelGateWaiter,
+            );
+            let guard = gate.write_owned().await;
+            drop(waiter_guard);
+            guard
+        }
+    }
+}
+
 async fn acquire_workspace_gate(
     parallel_execution: Arc<RwLock<()>>,
     workspace_execution: Arc<
@@ -266,40 +816,28 @@ async fn acquire_workspace_gate(
     >,
     resource_key: Option<std::path::PathBuf>,
     supports_parallel: bool,
-    proven_read_only: bool,
     workspace_capable: bool,
+    turn_timing_state: &Arc<TurnTimingState>,
 ) -> WorkspaceGateGuard {
-    if !workspace_capable
-        && workspace_tool_may_use_parallel_gate(
-            supports_parallel,
-            proven_read_only,
-            workspace_capable,
-        )
-    {
+    if workspace_tool_may_use_parallel_gate(supports_parallel, workspace_capable) {
         return WorkspaceGateGuard::Shared {
-            _guard: parallel_execution.read_owned().await,
+            _guard: acquire_shared_workspace_gate(parallel_execution, turn_timing_state).await,
         };
     }
     let Some(resource_key) = resource_key.filter(|_| supports_parallel && workspace_capable) else {
         return WorkspaceGateGuard::Exclusive {
-            _guard: parallel_execution.write_owned().await,
+            _guard: acquire_exclusive_workspace_gate(parallel_execution, turn_timing_state).await,
         };
     };
 
     let resource_gate = workspace_resource_gate(workspace_execution.as_ref(), resource_key);
-    let resource = if proven_read_only {
-        WorkspaceResourceGateGuard::Read {
-            _guard: resource_gate.read_owned().await,
-        }
-    } else {
-        WorkspaceResourceGateGuard::Write {
-            _guard: resource_gate.write_owned().await,
-        }
+    let resource = WorkspaceResourceGateGuard {
+        _guard: acquire_exclusive_workspace_gate(resource_gate, turn_timing_state).await,
     };
     // Acquire the resource first. If an unknown-resource writer is already
     // queued on the global barrier, Tokio's writer preference lets it run
     // before another same-resource waiter extends the read phase.
-    let global = parallel_execution.read_owned().await;
+    let global = acquire_shared_workspace_gate(parallel_execution, turn_timing_state).await;
     WorkspaceGateGuard::ResourceScoped {
         _resource: resource,
         _global: global,
@@ -316,21 +854,7 @@ async fn capture_workspace_evidence_baseline(
     // that races the snapshot is then either reflected by the snapshot or
     // invalidates the path-scoped observation.
     let repo_root = codex_git_utils::get_git_repo_root(cwd);
-    let source_path_observations = repo_root
-        .as_ref()
-        .map(|repo_root| {
-            source_dependencies
-                .iter()
-                .filter_map(|dependency| {
-                    cache.begin_source_path_change_observation(
-                        repo_root,
-                        std::path::Path::new(&dependency.path),
-                        dependency.recursive,
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let source_path_observations = begin_source_path_observations(cache, cwd, &source_dependencies);
     let cached_revision = if reuse_latest {
         repo_root
             .as_deref()
@@ -356,6 +880,28 @@ async fn capture_workspace_evidence_baseline(
     }
 }
 
+fn begin_source_path_observations(
+    cache: &crate::git_workspace::GitWorkspaceCache,
+    cwd: &std::path::Path,
+    source_dependencies: &std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+) -> Vec<crate::git_workspace::SourcePathChangeObservation> {
+    codex_git_utils::get_git_repo_root(cwd)
+        .as_ref()
+        .map(|repo_root| {
+            source_dependencies
+                .iter()
+                .filter_map(|dependency| {
+                    cache.begin_source_path_change_observation(
+                        repo_root,
+                        std::path::Path::new(&dependency.path),
+                        dependency.recursive,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn finish_workspace_evidence_capture(
     baseline: &WorkspaceEvidenceBaseline,
     mutation_advanced: bool,
@@ -377,6 +923,21 @@ fn finish_workspace_evidence_capture(
     (revision, captured_current)
 }
 
+fn workspace_evidence_source_dependencies(
+    baseline: Option<&WorkspaceEvidenceBaseline>,
+    source_dependencies_override: Option<
+        &std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+    >,
+    classification: &crate::tool_history::WorkspaceCallClassification,
+) -> std::collections::BTreeSet<crate::tool_history::SourceDependencyV1> {
+    source_dependencies_override.cloned().unwrap_or_else(|| {
+        baseline.map_or_else(
+            || classification.source_dependencies.clone(),
+            |baseline| baseline.source_dependencies.clone(),
+        )
+    })
+}
+
 impl ToolCallRuntime {
     pub(crate) fn new(
         session: Arc<Session>,
@@ -389,6 +950,7 @@ impl ToolCallRuntime {
             tracker,
             parallel_execution: Arc::new(RwLock::new(())),
             workspace_execution: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            canonical_workspace_resources: Arc::new(Mutex::new(std::collections::HashMap::new())),
             sampling_request_signals: None,
         }
     }
@@ -401,6 +963,30 @@ impl ToolCallRuntime {
         self
     }
 
+    async fn activate_workspace_evidence_generation(&self, call_id: &str) {
+        let batch = &self.step_context.workspace_evidence_generation_batch;
+        if !batch.register_call(call_id) {
+            return;
+        }
+        self.tracker
+            .lock()
+            .await
+            .activate_workspace_evidence_generation_batch(batch);
+    }
+
+    pub(crate) async fn flush_workspace_evidence_generation(
+        &self,
+    ) -> WorkspaceEvidenceGenerationFlush {
+        self.step_context
+            .workspace_evidence_generation_batch
+            .flush(
+                self.session.as_ref(),
+                self.step_context.turn.as_ref(),
+                &self.tracker,
+            )
+            .await
+    }
+
     async fn register_workspace_evidence_for_response(
         &self,
         response: &ResponseInputItem,
@@ -410,9 +996,34 @@ impl ToolCallRuntime {
             std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
         >,
         classification: &crate::tool_history::WorkspaceCallClassification,
-    ) {
+        timing: Option<Arc<ToolDispatchTiming>>,
+    ) -> bool {
         if !classification.observes_workspace {
-            return;
+            return false;
+        }
+        let source_dependencies = workspace_evidence_source_dependencies(
+            baseline.as_ref(),
+            source_dependencies_override.as_ref(),
+            classification,
+        );
+        let source_path_observations = baseline
+            .as_ref()
+            .filter(|baseline| baseline.source_dependencies == source_dependencies)
+            .map(|baseline| baseline.source_path_observations.clone())
+            .unwrap_or_default();
+        if mutation_advanced
+            && self
+                .step_context
+                .workspace_evidence_generation_batch
+                .queue_response(
+                    response,
+                    classification,
+                    source_dependencies,
+                    source_path_observations,
+                    timing,
+                )
+        {
+            return true;
         }
         let gate_guard = Some(WorkspaceGateGuard::Shared {
             _guard: Arc::clone(&self.parallel_execution).read_owned().await,
@@ -428,15 +1039,19 @@ impl ToolCallRuntime {
                 classification,
                 workspace_gate_guard: gate_guard,
             },
+            None,
+            None,
         )
-        .await;
+        .await
     }
 
     async fn register_workspace_evidence_after_call(
         session: &Session,
         turn: &TurnContext,
         input: WorkspaceEvidenceAfterCall<'_>,
-    ) {
+        generation_batch: Option<&Arc<WorkspaceEvidenceGenerationBatch>>,
+        timing: Option<Arc<ToolDispatchTiming>>,
+    ) -> bool {
         let WorkspaceEvidenceAfterCall {
             response,
             baseline,
@@ -446,7 +1061,31 @@ impl ToolCallRuntime {
             workspace_gate_guard,
         } = input;
         if !classification.observes_workspace {
-            return;
+            return false;
+        }
+        let source_dependencies = workspace_evidence_source_dependencies(
+            baseline.as_ref(),
+            source_dependencies_override.as_ref(),
+            classification,
+        );
+        let source_path_observations = baseline
+            .as_ref()
+            .filter(|baseline| baseline.source_dependencies == source_dependencies)
+            .map(|baseline| baseline.source_path_observations.clone())
+            .unwrap_or_default();
+        if mutation_advanced
+            && generation_batch.is_some_and(|batch| {
+                batch.queue_response(
+                    response,
+                    classification,
+                    source_dependencies.clone(),
+                    source_path_observations.clone(),
+                    timing,
+                )
+            })
+        {
+            drop(workspace_gate_guard);
+            return true;
         }
         let (revision, captured_current) = match baseline.as_ref() {
             Some(_baseline) if mutation_advanced => {
@@ -463,17 +1102,6 @@ impl ToolCallRuntime {
             Some(baseline) => finish_workspace_evidence_capture(baseline, mutation_advanced),
             None => (None, false),
         };
-        let source_dependencies = source_dependencies_override.unwrap_or_else(|| {
-            baseline.as_ref().map_or_else(
-                || classification.source_dependencies.clone(),
-                |baseline| baseline.source_dependencies.clone(),
-            )
-        });
-        let source_path_observations = baseline
-            .as_ref()
-            .filter(|baseline| baseline.source_dependencies == source_dependencies)
-            .map(|baseline| baseline.source_path_observations.clone())
-            .unwrap_or_default();
         Self::register_workspace_evidence_observation(
             session,
             turn,
@@ -487,6 +1115,7 @@ impl ToolCallRuntime {
             },
         )
         .await;
+        false
     }
 
     async fn register_workspace_evidence_observation(
@@ -605,12 +1234,8 @@ impl ToolCallRuntime {
                 TypedToolClass::ReadSearch
             )
         });
-        let proven_read_only_shell = crate::tool_history::tool_call_is_proven_read_only(
-            call.tool_name.name.as_str(),
-            &call.payload,
-        );
         let eligible = *earlier_calls_eligible
-            && (typed_read || proven_read_only_shell)
+            && typed_read
             && self
                 .step_context
                 .tool_router()
@@ -658,12 +1283,26 @@ impl ToolCallRuntime {
         ))
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_tool_call_with_trace(
         self,
         call: ToolCall,
         cancellation_token: CancellationToken,
         timing: Arc<ToolDispatchTiming>,
     ) -> impl std::future::Future<Output = Result<ResponseInputItem, CodexErr>> {
+        let completion = self.handle_model_tool_call_with_trace(call, cancellation_token, timing);
+        async move { completion.await.map(|completion| completion.response) }
+    }
+
+    pub(crate) fn handle_model_tool_call_with_trace(
+        self,
+        call: ToolCall,
+        cancellation_token: CancellationToken,
+        timing: Arc<ToolDispatchTiming>,
+    ) -> impl std::future::Future<Output = Result<ToolCallCompletion, CodexErr>> {
+        self.step_context
+            .workspace_evidence_generation_batch
+            .register_call(&call.call_id);
         self.step_context
             .turn
             .turn_timing_state
@@ -691,14 +1330,17 @@ impl ToolCallRuntime {
             )
         });
         let signal_collector = self.sampling_request_signals.clone();
-        let workspace_call_classification = crate::tool_history::classify_workspace_tool_call(
-            call.tool_name.name.as_str(),
-            &call.payload,
-            self.step_context.turn.config.cwd.as_path(),
-        );
         async move {
             timing.mark_first_poll();
             let _tool_call_timing_guard = tool_call_timing_guard;
+            let workspace_call_classification =
+                crate::tool_history::classify_workspace_tool_call(
+                    call.tool_name.name.as_str(),
+                    &call.payload,
+                    self.step_context.turn.config.cwd.as_path(),
+                );
+            self.activate_workspace_evidence_generation(&call.call_id)
+                .await;
             if let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.suppressed_failure.as_ref()
             {
@@ -725,9 +1367,17 @@ impl ToolCallRuntime {
                     false,
                     None,
                     &workspace_call_classification,
+                    None,
                 )
                 .await;
-                return Ok(response);
+                return Ok(ToolCallCompletion {
+                    required_terminal: required_tool_terminal(
+                        &call,
+                        ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
+                        None,
+                    ),
+                    response,
+                });
             }
             if let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.suppressed_source_pass.as_ref()
@@ -755,9 +1405,10 @@ impl ToolCallRuntime {
                     false,
                     None,
                     &workspace_call_classification,
+                    None,
                 )
                 .await;
-                return Ok(response);
+                return Ok(ToolCallCompletion::nonterminal(response));
             }
             if let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.blocked_wait_guard.as_ref()
@@ -788,7 +1439,14 @@ impl ToolCallRuntime {
                         signal_collector
                             .record_suppressed_result(registration.ordinal, &response);
                     }
-                    return Ok(response);
+                    return Ok(ToolCallCompletion {
+                        required_terminal: Some(RequiredToolTerminal {
+                            call_id: call.call_id.clone(),
+                            cause: RequiredToolTerminalCause::Blocked,
+                            message: format!("required tool `{}` remained blocked", call.tool_name),
+                        }),
+                        response,
+                    });
                 }
                 if let Some(signal_collector) = signal_collector.as_ref() {
                     signal_collector
@@ -840,6 +1498,7 @@ impl ToolCallRuntime {
                 cancellation_token,
                 timing,
                 Some(workspace_call_classification.source_dependencies.clone()),
+                Some(workspace_call_classification.clone()),
             );
             let result = future.await;
             evidence_timing.record_outcome(tool_dispatch_outcome_label(&result));
@@ -864,6 +1523,8 @@ impl ToolCallRuntime {
                     };
                     let outcome_context = response.outcome_context();
                     let signal = response.sampling_request_signal();
+                    let required_terminal =
+                        required_tool_terminal(&error_call, outcome_context, signal.as_ref());
                     let owner_key = response.deterministic_continuation_owner_key();
                     if let Some(owner_key) = owner_key.as_deref() {
                         let continuations = self
@@ -886,13 +1547,29 @@ impl ToolCallRuntime {
                         collector.record_accepted_deterministic_continuation_receipts(&receipts);
                     }
                     let canonical_artifact_required = response.requires_canonical_artifact();
+                    let executed_workspace_call_classification =
+                        workspace_evidence_classification_for_executed_payload(
+                            &workspace_call_classification,
+                            owner_tool_name.name.as_str(),
+                            Some(&response.payload),
+                            self.step_context.turn.config.cwd.as_path(),
+                        );
                     let source_dependencies_override = owner_key.as_deref().and_then(|owner_key| {
                         signal_collector.as_ref().and_then(|collector| {
                             collector.code_mode_source_dependencies(owner_key)
                         })
                     })
                     .or_else(|| response.projected_source_dependencies().cloned());
+                    // Ordinary tool results install their canonical projection in the
+                    // registry, where this phase is already recorded. Cancellation
+                    // owns a synthesized terminal result and intentionally bypasses
+                    // the remaining registry pipeline, so materializing its raw
+                    // model-visible response is the projection boundary. The timing
+                    // slot is write-once, preserving the registry measurement for
+                    // ordinary results while closing the abort path's attribution.
+                    let projection_started = Instant::now();
                     let response = response.into_response();
+                    evidence_timing.record_output_projection(projection_started.elapsed());
                     let code_mode_exec = crate::tools::code_mode::is_exec_tool_name(&owner_tool_name);
                     let (workspace_revision_before, evidence_classification) =
                         if code_mode_exec {
@@ -930,18 +1607,28 @@ impl ToolCallRuntime {
                                 }
                             }
                         } else {
-                            (workspace_revision_before, workspace_call_classification.clone())
+                            let workspace_revision_before = workspace_revision_before.filter(|_| {
+                                workspace_evidence_baseline_is_compatible(
+                                    &workspace_call_classification,
+                                    &executed_workspace_call_classification,
+                                )
+                            });
+                            (
+                                workspace_revision_before,
+                                executed_workspace_call_classification,
+                            )
                         };
                     let evidence_capture_started = Instant::now();
-                    self.register_workspace_evidence_for_response(
+                    let workspace_evidence_deferred = self.register_workspace_evidence_for_response(
                         &response,
                         workspace_revision_before,
                         mutation_advanced,
                         source_dependencies_override,
                         &evidence_classification,
+                        Some(Arc::clone(&evidence_timing)),
                     )
                     .await;
-                    if evidence_classification.observes_workspace {
+                    if evidence_classification.observes_workspace && !workspace_evidence_deferred {
                         evidence_timing
                             .record_workspace_evidence_after(evidence_capture_started.elapsed());
                     }
@@ -961,7 +1648,10 @@ impl ToolCallRuntime {
                             canonical_artifact_required,
                         );
                     }
-                    Ok(response)
+                    Ok(ToolCallCompletion {
+                        response,
+                        required_terminal,
+                    })
                 }
                 Err(FunctionCallError::Fatal(message)) => {
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
@@ -970,6 +1660,7 @@ impl ToolCallRuntime {
                     Err(CodexErr::Fatal(message))
                 }
                 Err(other) => {
+                    let terminal_cause = required_tool_error_terminal_cause(&other);
                     let mutation_advanced = if let Some(before) = mutation_revision_before {
                         mutation_tracker.lock().await.current_mutation_revision() > before
                     } else {
@@ -980,19 +1671,38 @@ impl ToolCallRuntime {
                     }
                     let response = Self::failure_response(error_call.clone(), other);
                     let evidence_capture_started = Instant::now();
-                    self.register_workspace_evidence_for_response(
+                    let workspace_evidence_deferred = self.register_workspace_evidence_for_response(
                         &response,
                         workspace_revision_before,
                         mutation_advanced,
                         None,
                         &workspace_call_classification,
+                        Some(Arc::clone(&evidence_timing)),
                     )
                     .await;
-                    if observes_workspace {
+                    if observes_workspace && !workspace_evidence_deferred {
                         evidence_timing
                             .record_workspace_evidence_after(evidence_capture_started.elapsed());
                     }
-                    Ok(response)
+                    Ok(ToolCallCompletion {
+                        response,
+                        required_terminal: Some(RequiredToolTerminal {
+                            call_id: error_call.call_id,
+                            cause: terminal_cause,
+                            message: format!(
+                                "required tool `{}` {}",
+                                error_call.tool_name,
+                                match terminal_cause {
+                                    RequiredToolTerminalCause::Blocked => "blocked",
+                                    RequiredToolTerminalCause::Failure => "failed",
+                                    RequiredToolTerminalCause::TimedOut => "timed out",
+                                    RequiredToolTerminalCause::RecoverableCancellation => {
+                                        "was cancelled"
+                                    }
+                                }
+                            ),
+                        }),
+                    })
                 }
             }
         }
@@ -1006,6 +1716,9 @@ impl ToolCallRuntime {
         source: ToolCallSource,
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
+        self.step_context
+            .workspace_evidence_generation_batch
+            .register_call(&call.call_id);
         let timing = Arc::new(ToolDispatchTiming::new_with_turn_clock(
             Arc::clone(&self.step_context.turn.turn_timing_state),
             TokioInstant::now(),
@@ -1013,27 +1726,51 @@ impl ToolCallRuntime {
         ));
         let nested_code_mode = matches!(&source, ToolCallSource::CodeMode { .. });
         let signal_collector = self.sampling_request_signals.clone();
-        self.step_context
-            .turn
-            .turn_timing_state
-            .record_tool_call(call.tool_name.name.as_str());
-        let tool_call_timing_guard = ToolCallTimingGuard::capture_for_turn(
-            Arc::clone(&timing),
-            Arc::clone(&self.step_context.turn.turn_timing_state),
-            &self.session.thread_id,
-            &self.step_context.turn.sub_id,
-            &call,
-            &source,
-        );
+        let accepted = if let ToolCallSource::CodeMode { parent_call_id, .. } = &source {
+            self.step_context.turn.tool_call_acceptance.try_accept(|| {
+                self.step_context
+                    .turn
+                    .turn_timing_state
+                    .try_record_accepted_tool_call(
+                        &call.call_id,
+                        timing.execution_id(),
+                        TurnTimingToolCallSource::CodeMode,
+                        parent_call_id.as_deref(),
+                    )
+            })
+        } else {
+            true
+        };
         async move {
+            if !accepted {
+                return Err(FunctionCallError::Fatal(format!(
+                    "refusing nested tool call `{}` after terminal acceptance was sealed or tool-call capacity was exhausted",
+                    call.call_id
+                )));
+            }
+            self.step_context
+                .turn
+                .turn_timing_state
+                .record_tool_call(call.tool_name.name.as_str());
+            let tool_call_timing_guard = ToolCallTimingGuard::capture_for_turn(
+                Arc::clone(&timing),
+                Arc::clone(&self.step_context.turn.turn_timing_state),
+                &self.session.thread_id,
+                &self.step_context.turn.sub_id,
+                &call,
+                &source,
+            );
             timing.mark_first_poll();
             let _tool_call_timing_guard = tool_call_timing_guard;
+            self.activate_workspace_evidence_generation(&call.call_id)
+                .await;
             let result = self
                 .handle_tool_call_with_source_and_timing(
                     call,
                     source,
                     cancellation_token,
                     Arc::clone(&timing),
+                    None,
                     None,
                 )
                 .await;
@@ -1064,6 +1801,7 @@ impl ToolCallRuntime {
         projection_source_dependencies: Option<
             std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
         >,
+        workspace_admission_hint: Option<crate::tool_history::WorkspaceCallClassification>,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
         let Some(router) = self.step_context.tool_router() else {
             return Either::Left(std::future::ready(Err(FunctionCallError::Fatal(
@@ -1079,40 +1817,45 @@ impl ToolCallRuntime {
         let tracker = Arc::clone(&self.tracker);
         let lock = Arc::clone(&self.parallel_execution);
         let workspace_execution = Arc::clone(&self.workspace_execution);
-        let invocation_cancellation_token = cancellation_token.clone();
+        // The caller-facing token selects terminal ownership here. Handlers
+        // receive a separate token so they cannot observe cancellation and
+        // publish a competing terminal result before this boundary claims the
+        // abort. Runtimes that need cooperative cleanup are notified only
+        // after the abort owns the terminal outcome.
+        let runtime_cancellation_token = CancellationToken::new();
+        let invocation_cancellation_token = runtime_cancellation_token.clone();
         let started = Instant::now();
         let abort_session = Arc::clone(&session);
         let abort_source = source.clone();
         // Direct calls own evidence registration in the outer response path,
         // where code-mode dependency overrides are also available. Nested
         // code-mode calls have no such outer layer and register here.
-        let workspace_call_classification = classify_workspace_tool_call_for_dispatch(
-            &source,
-            call.tool_name.name.as_str(),
-            &call.payload,
-            turn.config.cwd.as_path(),
-        );
+        let (workspace_admission_classification, workspace_call_classification) =
+            workspace_tool_call_classifications_for_dispatch(
+                &source,
+                call.tool_name.name.as_str(),
+                &call.payload,
+                turn.config.cwd.as_path(),
+                workspace_admission_hint,
+            );
         let model_issued = matches!(&source, ToolCallSource::Direct);
         let abort_turn = Arc::clone(&turn);
-        let terminal_outcome_reached = Arc::new(AtomicBool::new(false));
-        let dispatch_terminal_outcome_reached = Arc::clone(&terminal_outcome_reached);
-        let post_dispatch_terminal_outcome_reached = Arc::clone(&terminal_outcome_reached);
-        let abort_requested = Arc::new(AtomicBool::new(false));
-        let dispatch_abort_requested = Arc::clone(&abort_requested);
-        let admission_state = Arc::new(AtomicU8::new(DISPATCH_WAITING_FOR_ADMISSION));
-        let dispatch_admission_state = Arc::clone(&admission_state);
+        let dispatch_state = Arc::new(ToolDispatchState::new());
+        let admission_dispatch_state = Arc::clone(&dispatch_state);
+        let router_dispatch_state = Arc::clone(&dispatch_state);
+        let post_dispatch_state = Arc::clone(&dispatch_state);
         let dispatch_call = call.clone();
         let dispatch_tool_name = call.tool_name.name.clone();
         let evidence_call = call.clone();
         let workspace_capable =
             crate::tool_history::tool_observes_workspace(evidence_call.tool_name.name.as_str());
-        let proven_read_only = crate::tool_history::tool_call_is_proven_read_only(
-            evidence_call.tool_name.name.as_str(),
-            &evidence_call.payload,
+        let workspace_admission = workspace_admission_plan(
+            &evidence_call.tool_name,
+            &workspace_admission_classification,
+            self.canonical_workspace_resources.as_ref(),
+            supports_parallel,
+            workspace_capable,
         );
-        let bypass_outer_workspace_gate = bypasses_outer_workspace_gate(&evidence_call.tool_name);
-        let workspace_resource_key =
-            canonical_workspace_resource_key(workspace_call_classification.as_ref());
         let evidence_tracker = Arc::clone(&tracker);
 
         let dispatch_span = trace_span!(
@@ -1123,6 +1866,17 @@ impl ToolCallRuntime {
             aborted = false,
         );
         let abort_dispatch_span = dispatch_span.clone();
+        let cancellation_timing = Arc::clone(&timing);
+        let abort_invocation = ToolInvocation {
+            session: Arc::clone(&abort_session),
+            step_context: Arc::clone(&step_context),
+            cancellation_token: cancellation_token.clone(),
+            tracker: Arc::clone(&tracker),
+            call_id: call.call_id.clone(),
+            tool_name: call.tool_name.clone(),
+            source: abort_source.clone(),
+            payload: call.payload.clone(),
+        };
 
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
@@ -1149,37 +1903,22 @@ impl ToolCallRuntime {
                 } else {
                     None
                 };
-                let gate_waiter_guard = (!bypass_outer_workspace_gate).then(|| {
-                    LifecycleCounterGuard::increment(
-                        &turn.turn_timing_state,
-                        LifecycleCounter::ParallelGateWaiter,
-                    )
-                });
-                let gate_guard = if bypass_outer_workspace_gate {
+                let gate_guard = if workspace_admission.bypass_outer_gate {
                     None
                 } else {
                     Some(
                         acquire_workspace_gate(
                             Arc::clone(&lock),
                             Arc::clone(&workspace_execution),
-                            workspace_resource_key,
-                            supports_parallel,
-                            proven_read_only,
-                            workspace_capable,
+                            workspace_admission.resource_key,
+                            workspace_admission.supports_parallel,
+                            workspace_admission.workspace_capable,
+                            &turn.turn_timing_state,
                         )
                         .await,
                     )
                 };
-                drop(gate_waiter_guard);
-                if dispatch_admission_state
-                    .compare_exchange(
-                        DISPATCH_WAITING_FOR_ADMISSION,
-                        DISPATCH_ADMITTED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_err()
-                {
+                if !admission_dispatch_state.try_admit() {
                     // The cancellation owner won the admission race. Release
                     // any newly acquired guard without entering the handler;
                     // the outer task immediately aborts this pending future and
@@ -1262,7 +2001,7 @@ impl ToolCallRuntime {
                         tracker,
                         dispatch_call,
                         source,
-                        dispatch_terminal_outcome_reached,
+                        router_dispatch_state,
                     )
                     .instrument(dispatch_span.clone());
                 let result = scope_tool_dispatch_timing(
@@ -1274,9 +2013,7 @@ impl ToolCallRuntime {
                 )
                 .await;
                 timing.mark_output_collected();
-                if dispatch_abort_requested.load(Ordering::Acquire)
-                    && post_dispatch_terminal_outcome_reached.load(Ordering::Acquire)
-                {
+                if post_dispatch_state.is_aborted() {
                     return result;
                 }
                 let successful = result.as_ref().is_ok_and(|result| {
@@ -1284,6 +2021,29 @@ impl ToolCallRuntime {
                 });
                 turn.turn_timing_state
                     .record_tool_completion(dispatch_tool_name.as_str(), successful);
+                let evidence_classification =
+                    workspace_call_classification
+                        .as_ref()
+                        .map(|classification| {
+                            workspace_evidence_classification_for_executed_payload(
+                                classification,
+                                dispatch_tool_name.as_str(),
+                                result.as_ref().ok().map(|result| &result.payload),
+                                turn.config.cwd.as_path(),
+                            )
+                        });
+                let source_dependencies_override = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|result| result.projected_source_dependencies().cloned());
+                let evidence_revision_before = evidence_revision_before.filter(|_| {
+                    workspace_call_classification
+                        .as_ref()
+                        .zip(evidence_classification.as_ref())
+                        .is_some_and(|(original, executed)| {
+                            workspace_evidence_baseline_is_compatible(original, executed)
+                        })
+                });
                 let evidence_response = match result.as_ref() {
                     Ok(result) => Some(result.response()),
                     Err(FunctionCallError::Fatal(_)) => None,
@@ -1292,10 +2052,11 @@ impl ToolCallRuntime {
                         err.to_string(),
                     )),
                 };
-                if let (Some(response), Some(evidence_revision_before), Some(classification)) = (
+                if let (Some(response), Some(classification)) = (
                     evidence_response.as_ref(),
-                    evidence_revision_before,
-                    workspace_call_classification.as_ref(),
+                    evidence_classification
+                        .as_ref()
+                        .filter(|classification| classification.observes_workspace),
                 ) {
                     let evidence_capture_started = Instant::now();
                     let mutation_advanced = if let Some(before) = evidence_mutation_revision_before
@@ -1304,20 +2065,24 @@ impl ToolCallRuntime {
                     } else {
                         false
                     };
-                    Self::register_workspace_evidence_after_call(
+                    let workspace_evidence_deferred = Self::register_workspace_evidence_after_call(
                         session.as_ref(),
                         turn.as_ref(),
                         WorkspaceEvidenceAfterCall {
                             response,
-                            baseline: Some(evidence_revision_before),
+                            baseline: evidence_revision_before,
                             mutation_advanced,
-                            source_dependencies_override: None,
+                            source_dependencies_override,
                             classification,
                             workspace_gate_guard: gate_guard,
                         },
+                        Some(&step_context.workspace_evidence_generation_batch),
+                        Some(Arc::clone(&timing)),
                     )
                     .await;
-                    timing.record_workspace_evidence_after(evidence_capture_started.elapsed());
+                    if !workspace_evidence_deferred {
+                        timing.record_workspace_evidence_after(evidence_capture_started.elapsed());
+                    }
                 } else {
                     drop(gate_guard);
                 }
@@ -1329,24 +2094,20 @@ impl ToolCallRuntime {
                 tokio::select! {
                 res = &mut dispatch_handle => res.map_err(Self::tool_task_join_error)?,
                 _ = cancellation_token.cancelled() => {
-                    if terminal_outcome_reached.load(Ordering::Acquire) || dispatch_handle.is_finished() {
+                    if dispatch_state.is_terminal() || dispatch_handle.is_finished() {
                         dispatch_handle.await.map_err(Self::tool_task_join_error)?
                     } else {
-                        let cancelled_before_admission = admission_state
-                            .compare_exchange(
-                                DISPATCH_WAITING_FOR_ADMISSION,
-                                DISPATCH_CANCELLED_BEFORE_ADMISSION,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok();
-                        abort_requested.store(true, Ordering::Release);
+                        let cancelled_before_admission = match dispatch_state.try_abort() {
+                            ToolDispatchAbort::BeforeAdmission => true,
+                            ToolDispatchAbort::AfterAdmission => false,
+                            ToolDispatchAbort::AlreadyTerminal => {
+                                return dispatch_handle.await.map_err(Self::tool_task_join_error)?;
+                            }
+                        };
                         let secs = started.elapsed().as_secs_f32().max(0.1);
                         abort_dispatch_span.record("aborted", true);
                         if wait_for_runtime_cancellation && !cancelled_before_admission {
-                            if terminal_outcome_reached.swap(true, Ordering::AcqRel) {
-                                return dispatch_handle.await.map_err(Self::tool_task_join_error)?;
-                            }
+                            runtime_cancellation_token.cancel();
                             // The abort owns the terminal outcome; await only so
                             // the runtime can finish process teardown. A
                             // non-cooperative implementation cannot retain the
@@ -1383,7 +2144,45 @@ impl ToolCallRuntime {
                                 Err(err) => return Err(Self::tool_task_join_error(err)),
                             }
                         }
-                        let response = Self::aborted_response(&call, secs);
+                        if call.tool_name.namespace.is_none()
+                            && call.tool_name.name == crate::tools::EXEC_COMMAND_TOOL_NAME
+                        {
+                            let terminated_processes = abort_session
+                                .services
+                                .unified_exec_manager
+                                .terminate_unpublished_processes_for_call_ids(
+                                    std::slice::from_ref(&call.call_id),
+                                )
+                                .await
+                                .map_err(|error| {
+                                    FunctionCallError::Fatal(format!(
+                                        "failed to terminate unpublished retained process for interrupted exec_command call `{}`: {error}",
+                                        call.call_id
+                                    ))
+                                })?;
+                            if terminated_processes > 0 {
+                                cancellation_timing.mark_exec_process_exited();
+                            }
+                            cancellation_timing.record_exec_cleanup_state(
+                                /*background_process_expected*/ false,
+                                /*running_process_after_cleanup*/ false,
+                            );
+                        }
+                        // Cancelling the dispatch task drops `tool.handle(...)`
+                        // before its ordinary return marker can run. Close the
+                        // handler boundary only after any retained process has
+                        // confirmed termination so lifecycle ordering remains
+                        // ProcessExit <= HandlerReturn.
+                        cancellation_timing.mark_handler_exit_if_entered();
+                        let mut response = Self::aborted_response(&call, secs);
+                        scope_tool_dispatch_timing(
+                            Arc::clone(&cancellation_timing),
+                            install_synthetic_terminal_projection(
+                                &abort_invocation,
+                                &mut response,
+                            ),
+                        )
+                        .await;
                         notify_tool_aborted(
                             abort_session.as_ref(),
                             abort_turn.as_ref(),
@@ -1420,7 +2219,10 @@ impl ToolCallRuntime {
         Self::failure_response_for_message(&call, err.to_string())
     }
 
-    fn failure_response_for_message(call: &ToolCall, message: String) -> ResponseInputItem {
+    pub(crate) fn failure_response_for_message(
+        call: &ToolCall,
+        message: String,
+    ) -> ResponseInputItem {
         match &call.payload {
             ToolPayload::ToolSearch { .. } => ResponseInputItem::ToolSearchOutput {
                 call_id: call.call_id.clone(),
@@ -1454,7 +2256,6 @@ impl ToolCallRuntime {
             result: Box::new(AbortedToolOutput {
                 message: Self::abort_message(call, secs),
             }),
-            post_tool_use_payload: None,
             model_projection: None,
             source_dependencies: None,
             code_mode_feedback: Vec::new(),
@@ -1662,6 +2463,55 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
+    fn required_tool_terminal_classification_preserves_success_yield_and_nonblocking_skips() {
+        for context in [
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
+            ToolOutputOutcomeContext::skipped(Some(ToolOutputSkipDisposition::Deferred)),
+            ToolOutputOutcomeContext::skipped(Some(ToolOutputSkipDisposition::Suppressed)),
+            ToolOutputOutcomeContext::skipped(Some(ToolOutputSkipDisposition::NotApplicable)),
+        ] {
+            assert_eq!(required_tool_terminal_cause(context, None), None);
+        }
+
+        assert_eq!(
+            required_tool_terminal_cause(
+                ToolOutputOutcomeContext::skipped(Some(
+                    ToolOutputSkipDisposition::BlockingRequiredOperation,
+                )),
+                None,
+            ),
+            Some(RequiredToolTerminalCause::Blocked),
+        );
+        assert_eq!(
+            required_tool_terminal_cause(
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
+                None,
+            ),
+            Some(RequiredToolTerminalCause::Failure),
+        );
+        assert_eq!(
+            required_tool_terminal_cause(
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::TimedOut),
+                None,
+            ),
+            Some(RequiredToolTerminalCause::TimedOut),
+        );
+        assert_eq!(
+            required_tool_error_terminal_cause(&FunctionCallError::DeniedToModel(
+                "rejected by user".to_string(),
+            )),
+            RequiredToolTerminalCause::Blocked,
+        );
+        assert_eq!(
+            required_tool_error_terminal_cause(&FunctionCallError::RespondToModel(
+                "command exited nonzero".to_string(),
+            )),
+            RequiredToolTerminalCause::Failure,
+        );
+    }
+
+    #[test]
     fn shell_family_abort_messages_share_the_command_format() {
         for tool_name in [
             crate::tools::SHELL_COMMAND_TOOL_NAME,
@@ -1705,10 +2555,45 @@ mod tests {
 
     #[test]
     fn workspace_observers_are_serialized_without_an_enforced_read_boundary() {
-        assert!(workspace_tool_may_use_parallel_gate(true, true, false));
-        assert!(!workspace_tool_may_use_parallel_gate(true, false, true));
-        assert!(workspace_tool_may_use_parallel_gate(true, false, false));
-        assert!(!workspace_tool_may_use_parallel_gate(false, true, true));
+        assert!(workspace_tool_may_use_parallel_gate(true, false));
+        assert!(!workspace_tool_may_use_parallel_gate(true, true));
+        assert!(!workspace_tool_may_use_parallel_gate(false, false));
+        assert!(!workspace_tool_may_use_parallel_gate(false, true));
+    }
+
+    #[tokio::test]
+    async fn workspace_gate_waiter_counter_excludes_immediate_shared_admission() {
+        let turn_timing_state = Arc::new(TurnTimingState::default());
+        let global = Arc::new(RwLock::new(()));
+        let resources = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        let first = acquire_workspace_gate(
+            Arc::clone(&global),
+            Arc::clone(&resources),
+            None,
+            true,
+            false,
+            &turn_timing_state,
+        )
+        .await;
+        let second = acquire_workspace_gate(
+            Arc::clone(&global),
+            Arc::clone(&resources),
+            None,
+            true,
+            false,
+            &turn_timing_state,
+        )
+        .await;
+
+        assert_eq!(
+            turn_timing_state
+                .lifecycle_context()
+                .parallel_gate_waiter_count,
+            0,
+            "immediately granted shared gates are active holders, not waiters"
+        );
+        drop((first, second));
     }
 
     #[tokio::test]
@@ -1718,27 +2603,36 @@ mod tests {
         let second_repo = root.path().join("second");
         std::fs::create_dir_all(first_repo.join(".git")).expect("first repository marker");
         std::fs::create_dir_all(second_repo.join(".git")).expect("second repository marker");
-        let classification =
-            |workspace_cwd: &std::path::Path| crate::tool_history::WorkspaceCallClassification {
-                observes_workspace: true,
+        let classification = |workspace_cwd: &std::path::Path, observes_workspace| {
+            crate::tool_history::WorkspaceCallClassification {
+                observes_workspace,
                 workspace_cwd: workspace_cwd.to_path_buf(),
                 source_dependencies: Default::default(),
-            };
-        let first_key = canonical_workspace_resource_key(Some(&classification(&first_repo)))
-            .expect("canonical first resource");
-        let second_key = canonical_workspace_resource_key(Some(&classification(&second_repo)))
-            .expect("canonical second resource");
+            }
+        };
+        let canonical_resources = Mutex::new(std::collections::HashMap::new());
+        let first_key = canonical_workspace_resource_key(
+            Some(&classification(&first_repo, false)),
+            &canonical_resources,
+        )
+        .expect("canonical first resource");
+        let second_key = canonical_workspace_resource_key(
+            Some(&classification(&second_repo, true)),
+            &canonical_resources,
+        )
+        .expect("canonical second resource");
         assert_ne!(first_key, second_key);
 
         let global = Arc::new(RwLock::new(()));
         let resources = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let turn_timing_state = Arc::new(TurnTimingState::default());
         let first_guard = acquire_workspace_gate(
             Arc::clone(&global),
             Arc::clone(&resources),
             Some(first_key.clone()),
             true,
-            false,
             true,
+            &turn_timing_state,
         )
         .await;
         let second_guard = tokio::time::timeout(
@@ -1748,8 +2642,8 @@ mod tests {
                 Arc::clone(&resources),
                 Some(second_key),
                 true,
-                false,
                 true,
+                &turn_timing_state,
             ),
         )
         .await
@@ -1764,8 +2658,8 @@ mod tests {
                     Arc::clone(&resources),
                     Some(first_key),
                     true,
-                    false,
                     true,
+                    &turn_timing_state,
                 ),
             )
             .await
@@ -1780,8 +2674,8 @@ mod tests {
                     Arc::clone(&resources),
                     None,
                     true,
-                    false,
                     true,
+                    &turn_timing_state,
                 ),
             )
             .await
@@ -1797,8 +2691,8 @@ mod tests {
                 Arc::clone(&resources),
                 None,
                 true,
-                false,
                 true,
+                &turn_timing_state,
             ),
         )
         .await
@@ -1822,23 +2716,205 @@ mod tests {
 
         assert!(bypasses_outer_workspace_gate(&exec));
         assert!(!bypasses_outer_workspace_gate(&nested_mutation));
-        assert!(!workspace_tool_may_use_parallel_gate(false, false, true));
+        assert!(!workspace_tool_may_use_parallel_gate(false, true));
     }
 
     #[test]
-    fn direct_dispatch_skips_duplicate_workspace_call_classification() {
+    fn orchestration_audit_workspace_admission_plan_keeps_outer_and_nested_gate_ownership_explicit()
+    {
+        let classification = crate::tool_history::WorkspaceCallClassification {
+            observes_workspace: true,
+            workspace_cwd: std::path::PathBuf::from("missing-workspace"),
+            source_dependencies: Default::default(),
+        };
+        let canonical_resources = Mutex::new(std::collections::HashMap::new());
+        let exec = workspace_admission_plan(
+            &codex_tools::ToolName::plain(crate::tools::code_mode::PUBLIC_TOOL_NAME),
+            &classification,
+            &canonical_resources,
+            true,
+            true,
+        );
+        let nested = workspace_admission_plan(
+            &codex_tools::ToolName::plain("shell_command"),
+            &classification,
+            &canonical_resources,
+            false,
+            true,
+        );
+
+        assert!(exec.bypass_outer_gate);
+        assert!(!nested.bypass_outer_gate);
+        assert!(nested.resource_key.is_none());
+        assert!(!nested.supports_parallel);
+        assert!(nested.workspace_capable);
+    }
+
+    #[test]
+    fn direct_dispatch_reuses_outer_classification_for_admission_without_duplicate_evidence() {
         let payload = ToolPayload::Function {
             arguments: r#"{"cmd":"cargo test","workdir":"missing-workspace"}"#.to_string(),
         };
+        let admission_hint = crate::tool_history::classify_workspace_tool_call(
+            "cargo_test",
+            &payload,
+            std::path::Path::new("missing-workspace"),
+        );
+
+        let (admission, inner_evidence) = workspace_tool_call_classifications_for_dispatch(
+            &ToolCallSource::Direct,
+            "cargo_test",
+            &payload,
+            std::path::Path::new("missing-workspace"),
+            Some(admission_hint.clone()),
+        );
+
+        assert_eq!(admission, admission_hint);
+        assert_eq!(inner_evidence, None);
+    }
+
+    #[test]
+    fn post_hook_workspace_evidence_uses_the_executed_payload() {
+        let default_cwd = std::path::Path::new("/repo");
+        let original_mutation = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "program": "git",
+                "args": ["add", "src/lib.rs"],
+                "workdir": "/repo"
+            })
+            .to_string(),
+        };
+        let original_mutation = crate::tool_history::classify_workspace_tool_call(
+            "exec_command",
+            &original_mutation,
+            default_cwd,
+        );
+        assert!(!original_mutation.observes_workspace);
+
+        let rewritten_read = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "program": "rg",
+                "args": ["needle", "src/lib.rs"],
+                "workdir": "/other-repo"
+            })
+            .to_string(),
+        };
+        let executed_read = workspace_evidence_classification_for_executed_payload(
+            &original_mutation,
+            "exec_command",
+            Some(&rewritten_read),
+            default_cwd,
+        );
+        assert!(executed_read.observes_workspace);
+        assert_eq!(
+            executed_read.workspace_cwd,
+            std::path::PathBuf::from("/other-repo")
+        );
+        assert_eq!(
+            executed_read.source_dependencies,
+            std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
+                std::path::Path::new("/other-repo/src/lib.rs"),
+                false,
+            )])
+        );
+        assert!(!workspace_evidence_baseline_is_compatible(
+            &original_mutation,
+            &executed_read,
+        ));
+
+        let original_read = crate::tool_history::classify_workspace_tool_call(
+            "exec_command",
+            &rewritten_read,
+            default_cwd,
+        );
+        let executed_mutation = workspace_evidence_classification_for_executed_payload(
+            &original_read,
+            "exec_command",
+            Some(&ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "program": "git",
+                    "args": ["add", "src/lib.rs"],
+                    "workdir": "/other-repo"
+                })
+                .to_string(),
+            }),
+            default_cwd,
+        );
+        assert!(!executed_mutation.observes_workspace);
+        assert_eq!(
+            workspace_evidence_classification_for_executed_payload(
+                &original_read,
+                "exec_command",
+                None,
+                default_cwd,
+            ),
+            original_read,
+        );
+    }
+
+    #[test]
+    fn non_workspace_or_serial_admission_skips_workspace_resource_resolution() {
+        let missing = std::path::PathBuf::from("definitely-missing-workspace-resource");
+        let classification = crate::tool_history::WorkspaceCallClassification {
+            observes_workspace: false,
+            workspace_cwd: missing,
+            source_dependencies: Default::default(),
+        };
+        let canonical_resources = Mutex::new(std::collections::HashMap::new());
 
         assert_eq!(
-            classify_workspace_tool_call_for_dispatch(
-                &ToolCallSource::Direct,
-                "cargo_test",
-                &payload,
-                std::path::Path::new("missing-workspace"),
+            workspace_resource_key_for_admission(
+                &classification,
+                &canonical_resources,
+                true,
+                false,
             ),
-            None,
+            None
+        );
+        assert_eq!(
+            workspace_resource_key_for_admission(
+                &classification,
+                &canonical_resources,
+                false,
+                true,
+            ),
+            None
+        );
+        assert!(
+            canonical_resources
+                .lock()
+                .expect("canonical resource cache")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn workspace_resource_resolution_is_cached_for_the_turn() {
+        let root = tempfile::tempdir().expect("temporary workspace root");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("repository marker");
+        let classification = crate::tool_history::WorkspaceCallClassification {
+            observes_workspace: true,
+            workspace_cwd: repo.clone(),
+            source_dependencies: Default::default(),
+        };
+        let canonical_resources = Mutex::new(std::collections::HashMap::new());
+
+        let first =
+            workspace_resource_key_for_admission(&classification, &canonical_resources, true, true)
+                .expect("first canonical resource");
+        std::fs::remove_dir_all(repo.join(".git")).expect("remove repository marker");
+        let second =
+            workspace_resource_key_for_admission(&classification, &canonical_resources, true, true)
+                .expect("cached canonical resource");
+
+        assert_eq!(second, first);
+        assert_eq!(
+            canonical_resources
+                .lock()
+                .expect("canonical resource cache")
+                .len(),
+            1
         );
     }
 
@@ -2154,6 +3230,10 @@ mod tests {
         );
         assert!(lifecycle.parallel_gate_admitted_at_ms.is_none());
         assert!(lifecycle.output_collected_at_ms.is_some());
+        assert!(
+            lifecycle.output_projection_ms.is_some(),
+            "the synthesized nested abort result must record its model-visible projection"
+        );
 
         Ok(())
     }
@@ -2261,11 +3341,7 @@ mod tests {
         let step_context = step_context.with_tool_router_for_test(router);
         let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
         let governor = crate::session::reasoning_governor::SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(
-            0,
-            crate::turn_diff_tracker::ValidationFreshnessStatus::None,
-            None,
-        );
+        let baselines = governor.baselines(0);
         let runtime = ToolCallRuntime::new(session, step_context, Arc::clone(&tracker))
             .with_sampling_request_signals(governor.collector(&baselines));
         let held_tracker = Arc::clone(&tracker).lock_owned().await;
@@ -2378,6 +3454,7 @@ mod tests {
                 false,
                 None,
                 &non_workspace,
+                None,
             ),
         )
         .await
@@ -2392,7 +3469,7 @@ mod tests {
             tokio::time::timeout(
                 Duration::from_millis(50),
                 runtime.register_workspace_evidence_for_response(
-                    &response, None, false, None, &workspace,
+                    &response, None, false, None, &workspace, None,
                 ),
             )
             .await
@@ -3191,6 +4268,7 @@ mod tests {
     struct CancellationCleanupHandler {
         tool_name: codex_tools::ToolName,
         started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        invocation_token: std::sync::Mutex<Option<oneshot::Sender<CancellationToken>>>,
         cleanup_started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
         allow_cleanup: Arc<Notify>,
     }
@@ -3228,6 +4306,14 @@ mod tests {
                 .take();
             if let Some(started) = started {
                 let _ = started.send(());
+            }
+            let invocation_token = self
+                .invocation_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(invocation_token) = invocation_token {
+                let _ = invocation_token.send(invocation.cancellation_token.clone());
             }
             invocation.cancellation_token.cancelled().await;
             let cleanup_started = self
@@ -3292,6 +4378,7 @@ mod tests {
         let handler = Arc::new(CancellationCleanupHandler {
             tool_name: tool_name.clone(),
             started: std::sync::Mutex::new(Some(started_tx)),
+            invocation_token: std::sync::Mutex::new(None),
             cleanup_started: std::sync::Mutex::new(Some(cleanup_started_tx)),
             allow_cleanup: Arc::new(Notify::new()),
         }) as Arc<dyn CoreToolRuntime>;
@@ -3506,6 +4593,7 @@ mod tests {
         let handler = Arc::new(CancellationCleanupHandler {
             tool_name: tool_name.clone(),
             started: std::sync::Mutex::new(Some(started_tx)),
+            invocation_token: std::sync::Mutex::new(None),
             cleanup_started: std::sync::Mutex::new(Some(cleanup_started_tx)),
             allow_cleanup: Arc::clone(&allow_cleanup),
         }) as Arc<dyn CoreToolRuntime>;
@@ -3554,6 +4642,142 @@ mod tests {
             .drain(..)
             .collect::<Vec<_>>();
         assert_eq!(vec![ToolCallOutcome::Aborted], actual);
+        let timing = turn_context
+            .turn_timing_state
+            .complete_snapshot()
+            .protocol_timing();
+        let call_timing = timing
+            .tool_calls
+            .iter()
+            .find(|timing| timing.call_id == "call-1")
+            .expect("cancelled call timing");
+        assert!(call_timing.handler_entry_at_ms.is_some());
+        assert!(call_timing.handler_exit_at_ms.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nested_cancellation_owns_terminal_before_runtime_cleanup() -> anyhow::Result<()> {
+        let (mut session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut builder =
+            codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+        builder.tool_lifecycle_contributor(Arc::new(FinishRecorder {
+            records: Arc::clone(&records),
+        }));
+        session.services.extensions = Arc::new(builder.build());
+
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        turn_context.turn_timing_state.mark_turn_started();
+        let tool_name = codex_tools::ToolName::plain("nested_cleanup_tool");
+        let (started_tx, _started_rx) = oneshot::channel();
+        let (invocation_token_tx, invocation_token_rx) = oneshot::channel();
+        let (cleanup_started_tx, cleanup_started_rx) = oneshot::channel();
+        let allow_cleanup = Arc::new(Notify::new());
+        let handler = Arc::new(CancellationCleanupHandler {
+            tool_name: tool_name.clone(),
+            started: std::sync::Mutex::new(Some(started_tx)),
+            invocation_token: std::sync::Mutex::new(Some(invocation_token_tx)),
+            cleanup_started: std::sync::Mutex::new(Some(cleanup_started_tx)),
+            allow_cleanup: Arc::clone(&allow_cleanup),
+        }) as Arc<dyn CoreToolRuntime>;
+        let step_context = StepContext::for_test(Arc::clone(&turn_context));
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([handler]),
+            Vec::new(),
+        ));
+        let step_context = step_context.with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            session,
+            step_context,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        let cancellation_token = CancellationToken::new();
+        let mut response_future = Box::pin(runtime.handle_tool_call_with_source(
+            ToolCall {
+                tool_name,
+                call_id: "nested-cancel-cleanup".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+            },
+            ToolCallSource::CodeMode {
+                cell_id: "cell-1".to_string(),
+                parent_call_id: Some("outer-call".to_string()),
+                runtime_tool_call_id: "runtime-call-1".to_string(),
+            },
+            cancellation_token.clone(),
+        ));
+
+        assert!(
+            futures::poll!(response_future.as_mut()).is_pending(),
+            "nested handler should remain in flight"
+        );
+        let handler_token = tokio::time::timeout(Duration::from_secs(1), invocation_token_rx)
+            .await
+            .expect("handler should expose its runtime token")
+            .expect("runtime token sender should remain alive");
+        cancellation_token.cancel();
+        assert!(
+            !handler_token.is_cancelled(),
+            "external cancellation must not reach the handler before the outer boundary owns the terminal result"
+        );
+
+        let response_task = tokio::spawn(response_future);
+        cleanup_started_rx
+            .await
+            .expect("owned abort should start cooperative runtime cleanup");
+        assert!(handler_token.is_cancelled());
+        allow_cleanup.notify_one();
+
+        let response = tokio::time::timeout(Duration::from_secs(1), response_task)
+            .await
+            .expect("timed out waiting for nested abort response")
+            .expect("nested abort task should join")?;
+        let response = response.response();
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+            anyhow::bail!("cancelled nested tool should return function output");
+        };
+        let FunctionCallOutputBody::Text(text) = output.body else {
+            anyhow::bail!("cancelled nested tool output should be text");
+        };
+        assert!(text.contains("aborted by user"));
+        assert_eq!(
+            records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[ToolCallOutcome::Aborted]
+        );
+
+        let timing = turn_context
+            .turn_timing_state
+            .complete_snapshot()
+            .protocol_timing();
+        let call_timing = timing
+            .tool_calls
+            .iter()
+            .find(|timing| timing.call_id == "nested-cancel-cleanup")
+            .expect("nested cancellation timing");
+        assert_eq!(
+            call_timing.source,
+            codex_protocol::protocol::TurnTimingToolCallSource::CodeMode
+        );
+        assert_eq!(call_timing.parent_call_id.as_deref(), Some("outer-call"));
+        assert!(call_timing.handler_entry_at_ms.is_some());
+        assert!(call_timing.handler_exit_at_ms.is_some());
+        assert!(call_timing.output_projection_ms.is_some());
+        let closure = turn_context.turn_timing_state.tool_closure_snapshot();
+        assert_eq!(closure.accepted_count, 1);
+        assert_eq!(closure.timing_paired_count, 1);
+        assert_eq!(closure.terminal_count, 1);
+        assert_eq!(
+            closure.persisted_count, 0,
+            "this runtime unit stops below the owning direct-call persistence boundary"
+        );
+        assert!(closure.orphan_calls.is_empty());
 
         Ok(())
     }
@@ -3570,6 +4794,7 @@ mod tests {
         let handler = Arc::new(CancellationCleanupHandler {
             tool_name: tool_name.clone(),
             started: std::sync::Mutex::new(Some(started_tx)),
+            invocation_token: std::sync::Mutex::new(None),
             cleanup_started: std::sync::Mutex::new(Some(cleanup_started_tx)),
             allow_cleanup: Arc::new(Notify::new()),
         }) as Arc<dyn CoreToolRuntime>;

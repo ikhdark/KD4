@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 
+use codex_app_server_protocol::McpServerStartupCompletedNotification;
 use codex_app_server_protocol::McpServerStartupState;
 use codex_app_server_protocol::McpServerStatusUpdatedNotification;
 
@@ -278,5 +279,35 @@ impl ChatWidget {
             status,
             /*complete_when_settled*/ true,
         );
+    }
+
+    pub(super) fn on_mcp_server_startup_completed(
+        &mut self,
+        notification: McpServerStartupCompletedNotification,
+    ) {
+        for failure in &notification.failed {
+            let already_reported = self
+                .mcp_startup_status
+                .as_ref()
+                .and_then(|status| status.get(&failure.server))
+                .is_some_and(|status| {
+                    matches!(status, McpStartupStatus::Failed { error } if error == &failure.error)
+                });
+            if !already_reported {
+                self.on_warning(failure.error.clone());
+            }
+        }
+
+        let mut failed: Vec<_> = notification
+            .failed
+            .into_iter()
+            .map(|failure| failure.server)
+            .collect();
+        failed.sort();
+        failed.dedup();
+        let mut cancelled = notification.cancelled;
+        cancelled.sort();
+        cancelled.dedup();
+        self.finish_mcp_startup(failed, cancelled);
     }
 }

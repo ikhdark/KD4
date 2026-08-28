@@ -1,4 +1,15 @@
 use super::*;
+use std::future::Future;
+
+async fn await_mcp_response<F, T>(
+    response: F,
+) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError>
+where
+    F: Future<Output = Result<T, JSONRPCErrorError>>,
+    T: Into<ClientResponsePayload>,
+{
+    response.await.map(|response| Some(response.into()))
+}
 
 #[derive(Clone)]
 pub(crate) struct McpRequestProcessor {
@@ -46,19 +57,15 @@ impl McpRequestProcessor {
         request_id: &ConnectionRequestId,
         params: ListMcpServerStatusParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.list_mcp_server_status(request_id, params)
-            .await
-            .map(|()| None)
+        await_mcp_response(self.list_mcp_server_status(request_id, params)).await
     }
 
     pub(crate) async fn mcp_resource_read(
         &self,
-        request_id: &ConnectionRequestId,
+        _request_id: &ConnectionRequestId,
         params: McpResourceReadParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.read_mcp_resource(request_id, params)
-            .await
-            .map(|()| None)
+        await_mcp_response(self.read_mcp_resource(params)).await
     }
 
     pub(crate) async fn mcp_server_tool_call(
@@ -178,6 +185,7 @@ impl McpRequestProcessor {
             resolve_oauth_scopes(scopes, server.scopes.clone(), discovered_scopes);
 
         let handle = perform_oauth_login_return_url_with_http_client(
+            &mcp_config.codex_home,
             &name,
             &url,
             mcp_config.mcp_oauth_credentials_store_mode,
@@ -223,10 +231,7 @@ impl McpRequestProcessor {
         &self,
         request_id: &ConnectionRequestId,
         params: ListMcpServerStatusParams,
-    ) -> Result<(), JSONRPCErrorError> {
-        let request = request_id.clone();
-
-        let outgoing = Arc::clone(&self.outgoing);
+    ) -> Result<ListMcpServerStatusResponse, JSONRPCErrorError> {
         let (config, thread) = match params.thread_id.as_deref() {
             Some(thread_id) => {
                 let (_, thread) = self.load_thread(thread_id).await?;
@@ -259,31 +264,7 @@ impl McpRequestProcessor {
             }
         };
 
-        tokio::spawn(async move {
-            Self::list_mcp_server_status_task(
-                outgoing,
-                request,
-                params,
-                mcp_config,
-                auth,
-                runtime_context,
-                codex_apps_tools_cache,
-            )
-            .await;
-        });
-        Ok(())
-    }
-
-    async fn list_mcp_server_status_task(
-        outgoing: Arc<OutgoingMessageSender>,
-        request_id: ConnectionRequestId,
-        params: ListMcpServerStatusParams,
-        mcp_config: codex_mcp::McpConfig,
-        auth: Option<CodexAuth>,
-        runtime_context: McpRuntimeContext,
-        codex_apps_tools_cache: codex_mcp::CodexAppsToolsCache,
-    ) {
-        let result = Self::list_mcp_server_status_response(
+        Self::list_mcp_server_status_response(
             request_id.request_id.to_string(),
             params,
             mcp_config,
@@ -291,8 +272,7 @@ impl McpRequestProcessor {
             runtime_context,
             codex_apps_tools_cache,
         )
-        .await;
-        outgoing.send_result(request_id, result).await;
+        .await
     }
 
     async fn list_mcp_server_status_response(
@@ -307,34 +287,10 @@ impl McpRequestProcessor {
             McpServerStatusDetail::Full => McpSnapshotDetail::Full,
             McpServerStatusDetail::ToolsAndAuthOnly => McpSnapshotDetail::ToolsAndAuthOnly,
         };
-
-        let snapshot = collect_mcp_server_status_snapshot_with_detail(
-            &mcp_config,
-            auth.as_ref(),
-            request_id,
-            runtime_context,
-            codex_apps_tools_cache,
-            detail,
-        )
-        .await;
-
-        let McpServerStatusSnapshot {
-            server_infos,
-            tools_by_server,
-            resources,
-            resource_templates,
-            auth_statuses,
-            mut server_names,
-        } = snapshot;
-        server_names.extend(
-            auth_statuses
-                .keys()
-                .cloned()
-                .chain(resources.keys().cloned())
-                .chain(resource_templates.keys().cloned()),
-        );
+        let mut server_names = codex_mcp::effective_mcp_servers(&mcp_config, auth.as_ref())
+            .into_keys()
+            .collect::<Vec<_>>();
         server_names.sort();
-        server_names.dedup();
 
         let total = server_names.len();
         let limit = params.limit.unwrap_or(total as u32).max(1) as usize;
@@ -354,8 +310,29 @@ impl McpRequestProcessor {
         }
 
         let end = start.saturating_add(effective_limit).min(total);
+        let selected_server_names = server_names[start..end].to_vec();
 
-        let data: Vec<McpServerStatus> = server_names[start..end]
+        let snapshot = collect_mcp_server_status_snapshot_for_servers_with_detail(
+            &mcp_config,
+            auth.as_ref(),
+            request_id,
+            runtime_context,
+            codex_apps_tools_cache,
+            detail,
+            &selected_server_names,
+        )
+        .await;
+
+        let McpServerStatusSnapshot {
+            server_infos,
+            tools_by_server,
+            resources,
+            resource_templates,
+            auth_statuses,
+            server_names: _,
+        } = snapshot;
+
+        let data: Vec<McpServerStatus> = selected_server_names
             .iter()
             .map(|name| McpServerStatus {
                 name: name.clone(),
@@ -382,10 +359,8 @@ impl McpRequestProcessor {
 
     async fn read_mcp_resource(
         &self,
-        request_id: &ConnectionRequestId,
         params: McpResourceReadParams,
-    ) -> Result<(), JSONRPCErrorError> {
-        let outgoing = Arc::clone(&self.outgoing);
+    ) -> Result<McpResourceReadResponse, JSONRPCErrorError> {
         let McpResourceReadParams {
             thread_id,
             server,
@@ -394,13 +369,8 @@ impl McpRequestProcessor {
 
         if let Some(thread_id) = thread_id {
             let (_, thread) = self.load_thread(&thread_id).await?;
-            let request_id = request_id.clone();
-
-            tokio::spawn(async move {
-                let result = thread.read_mcp_resource(&server, &uri).await;
-                Self::send_mcp_resource_read_response(outgoing, request_id, result).await;
-            });
-            return Ok(());
+            let result = thread.read_mcp_resource(&server, &uri).await;
+            return Self::mcp_resource_read_response(result);
         }
 
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
@@ -414,30 +384,24 @@ impl McpRequestProcessor {
         // environment stdio MCPs must declare their own absolute cwd.
         let runtime_context =
             McpRuntimeContext::new(Arc::clone(&environment_manager), config.cwd.to_path_buf());
-        let request_id = request_id.clone();
 
-        tokio::spawn(async move {
-            let result = read_mcp_resource_without_thread(
-                &mcp_config,
-                auth.as_ref(),
-                runtime_context,
-                codex_apps_tools_cache,
-                &server,
-                &uri,
-            )
-            .await
-            .and_then(|result| serde_json::to_value(result).map_err(anyhow::Error::from));
-            Self::send_mcp_resource_read_response(outgoing, request_id, result).await;
-        });
-        Ok(())
+        let result = read_mcp_resource_without_thread(
+            &mcp_config,
+            auth.as_ref(),
+            runtime_context,
+            codex_apps_tools_cache,
+            &server,
+            &uri,
+        )
+        .await
+        .and_then(|result| serde_json::to_value(result).map_err(anyhow::Error::from));
+        Self::mcp_resource_read_response(result)
     }
 
-    async fn send_mcp_resource_read_response(
-        outgoing: Arc<OutgoingMessageSender>,
-        request_id: ConnectionRequestId,
+    fn mcp_resource_read_response(
         result: anyhow::Result<serde_json::Value>,
-    ) {
-        let result = result
+    ) -> Result<McpResourceReadResponse, JSONRPCErrorError> {
+        result
             .map_err(|error| internal_error(format!("{error:#}")))
             .and_then(|result| {
                 serde_json::from_value::<McpResourceReadResponse>(result).map_err(|error| {
@@ -445,8 +409,7 @@ impl McpRequestProcessor {
                         "failed to deserialize MCP resource read response: {error}"
                     ))
                 })
-            });
-        outgoing.send_result(request_id, result).await;
+            })
     }
 
     async fn call_mcp_server_tool(
@@ -462,5 +425,45 @@ impl McpRequestProcessor {
             .await
             .map(McpServerToolCallResponse::from)
             .map_err(|error| internal_error(format!("{error:#}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_owned_mcp_response_drops_semantic_work_when_cancelled() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        {
+            let work_started = Arc::clone(&started);
+            let work_dropped = DropFlag(Arc::clone(&dropped));
+            let response = await_mcp_response(async move {
+                let _work_dropped = work_dropped;
+                work_started.notify_one();
+                std::future::pending::<Result<ListMcpServerStatusResponse, JSONRPCErrorError>>()
+                    .await
+            });
+            tokio::pin!(response);
+
+            tokio::select! {
+                result = &mut response => panic!("semantic MCP work completed unexpectedly: {result:?}"),
+                _ = started.notified() => {}
+            }
+        }
+
+        assert!(dropped.load(Ordering::Acquire));
     }
 }

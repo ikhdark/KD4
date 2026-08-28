@@ -1,7 +1,4 @@
-use tracing::debug;
-
 pub(crate) fn try_parse_error_message(text: &str) -> String {
-    debug!("Parsing server error response: {}", text);
     let json = serde_json::from_str::<serde_json::Value>(text).unwrap_or_default();
     if let Some(error) = json.get("error")
         && let Some(message) = error.get("message")
@@ -9,10 +6,7 @@ pub(crate) fn try_parse_error_message(text: &str) -> String {
     {
         return message_str.to_string();
     }
-    if text.is_empty() {
-        return "Unknown error".to_string();
-    }
-    text.to_string()
+    "Unknown error".to_string()
 }
 
 #[cfg(test)]
@@ -37,9 +31,9 @@ mod tests {
     }
 
     #[test]
-    fn try_parse_error_message_falls_back_to_raw_text() {
+    fn logging_contract_try_parse_error_message_uses_generic_fallback() {
         let text = r#"{"message": "test"}"#;
         let message = try_parse_error_message(text);
-        assert_eq!(message, r#"{"message": "test"}"#);
+        assert_eq!(message, "Unknown error");
     }
 }

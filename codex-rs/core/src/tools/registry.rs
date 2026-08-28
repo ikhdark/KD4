@@ -2,6 +2,7 @@ use crate::FunctionCallError;
 use crate::agent::task_capabilities::TypedToolClass;
 use crate::client_common::ToolSchemaArtifact;
 use crate::hook_runtime::PreToolUseHookResult;
+use crate::hook_runtime::prepare_additional_context_items;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::run_post_tool_use_hooks;
 use crate::hook_runtime::run_pre_tool_use_hooks;
@@ -17,6 +18,7 @@ use crate::tools::command_output_artifact::create_canonical_output_artifact;
 use crate::tools::command_output_artifact::read_tool_output_selectors_with_ceiling_and_reuse;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
+use crate::tools::context::ToolDispatchState;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -73,11 +75,16 @@ use codex_utils_output_truncation::resolve_projected_output_limits;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use futures::future::BoxFuture;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -147,6 +154,11 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         Box::pin(async { Vec::new() })
     }
 
+    fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
+        matches!(&invocation.payload, ToolPayload::Function { .. })
+            .then(|| function_hook_tool_name(invocation))
+    }
+
     fn post_tool_use_payload(
         &self,
         invocation: &ToolInvocation,
@@ -157,7 +169,7 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         };
 
         Some(PostToolUsePayload {
-            tool_name: function_hook_tool_name(invocation),
+            tool_name: self.post_tool_use_hook_name(invocation)?,
             tool_use_id: result.post_tool_use_id(&invocation.call_id),
             tool_input: result
                 .post_tool_use_input(&invocation.payload)
@@ -242,7 +254,6 @@ pub(crate) struct AnyToolResult {
     pub(crate) call_id: String,
     pub(crate) payload: ToolPayload,
     pub(crate) result: Box<dyn ToolOutput>,
-    pub(crate) post_tool_use_payload: Option<PostToolUsePayload>,
     pub(crate) model_projection: Option<ModelToolProjection>,
     pub(crate) source_dependencies:
         Option<std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>>,
@@ -329,10 +340,19 @@ impl BoundedModelProjection {
 }
 
 impl AnyToolResult {
-    fn install_model_projection(&mut self, model_projection: Option<ModelToolProjection>) {
-        self.source_dependencies = model_projection
-            .as_ref()
-            .map(|projection| projection.source_dependencies.clone())
+    fn install_model_projection(
+        &mut self,
+        model_projection: Option<ModelToolProjection>,
+        source_dependencies_override: Option<
+            std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+        >,
+    ) {
+        self.source_dependencies = source_dependencies_override
+            .or_else(|| {
+                model_projection
+                    .as_ref()
+                    .map(|projection| projection.source_dependencies.clone())
+            })
             .or_else(precomputed_projection_source_dependencies);
         self.model_projection = model_projection;
     }
@@ -472,6 +492,49 @@ impl AnyToolResult {
             None => result.code_mode_result(&payload),
         }
     }
+}
+
+/// Materialize the model-visible representation for a terminal result owned by
+/// the cancellation path. That path deliberately bypasses post-tool hooks and
+/// the ordinary registry finish notification, but it still owes the same
+/// projection attribution as every other accepted tool call.
+pub(crate) async fn install_synthetic_terminal_projection(
+    invocation: &ToolInvocation,
+    result: &mut AnyToolResult,
+) {
+    let parsed_function_arguments = ParsedFunctionArguments::from_payload(&invocation.payload);
+    let provider_visible = projection_is_provider_visible(&invocation.source);
+    let phase_started = Instant::now();
+    let model_projection = match prepare_model_projection(
+        invocation,
+        result,
+        parsed_function_arguments.as_ref(),
+        /*source_dependencies_override*/ None,
+        /*force_inline_carrier*/ false,
+        /*track_for_admission*/ false,
+    ) {
+        Some(input) => project_model_output(input).await,
+        None => None,
+    };
+    record_lifecycle_phase(invocation, "projection", phase_started);
+    if let Some(projection) = &model_projection {
+        invocation
+            .step_context
+            .turn
+            .turn_timing_state
+            .record_tool_output_projection_facts(
+                projection.canonical_bytes,
+                projection.canonical_tokens,
+                projection.model_bytes,
+                projection.projected_tokens,
+                projection.artifact_created,
+                projection.artifact_reused,
+                projection.projection_truncated,
+                projection.omitted_sections,
+                provider_visible,
+            );
+    }
+    result.install_model_projection(model_projection, /*source_dependencies_override*/ None);
 }
 
 impl ModelToolProjection {
@@ -654,6 +717,67 @@ impl ToolOutput for PostToolUseFeedbackOutput {
     }
 }
 
+struct UnavailableModelProjectionOutput {
+    original: Box<dyn ToolOutput>,
+    model_visible: FunctionToolOutput,
+}
+
+impl ToolOutput for UnavailableModelProjectionOutput {
+    fn log_preview(&self) -> String {
+        self.original.log_preview()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        self.original.success_for_logging()
+    }
+
+    fn outcome_for_logging(&self) -> ToolOutputOutcome {
+        self.original.outcome_for_logging()
+    }
+
+    fn outcome_context(&self) -> codex_tools::ToolOutputOutcomeContext {
+        self.original.outcome_context()
+    }
+
+    fn sampling_request_signal(&self) -> Option<Value> {
+        self.original.sampling_request_signal()
+    }
+
+    fn deterministic_continuation_receipts(
+        &self,
+    ) -> Vec<TurnTimingDeterministicContinuationReceipt> {
+        self.original.deterministic_continuation_receipts()
+    }
+
+    fn deterministic_continuation_owner_key(&self) -> Option<String> {
+        self.original.deterministic_continuation_owner_key()
+    }
+
+    fn deterministic_continuation_content(&self) -> Vec<Value> {
+        self.original.deterministic_continuation_content()
+    }
+
+    fn contains_external_context(&self) -> bool {
+        self.original.contains_external_context()
+    }
+
+    fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        self.model_visible.projection_metadata()
+    }
+
+    fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        self.model_visible.canonical_result(payload)
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        self.model_visible.to_response_item(call_id, payload)
+    }
+
+    fn code_mode_result(&self, payload: &ToolPayload) -> Value {
+        self.model_visible.code_mode_result(payload)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreToolUsePayload {
     /// Hook-facing tool name model.
@@ -690,6 +814,8 @@ pub(crate) struct RegisteredTool {
     authorization_class: TypedToolClass,
     external_mutation_intent: crate::agent::task_capabilities::ExternalMutationIntent,
     spec: ToolSpec,
+    canonical_spec_sha256: OnceLock<String>,
+    code_mode_argument_preflight: Arc<CodeModeArgumentPreflight>,
 }
 
 impl RegisteredTool {
@@ -715,6 +841,8 @@ impl RegisteredTool {
             external_mutation_intent:
                 crate::agent::task_capabilities::ExternalMutationIntent::MayMutate,
             spec,
+            canonical_spec_sha256: OnceLock::new(),
+            code_mode_argument_preflight: Arc::new(CodeModeArgumentPreflight::default()),
         }
     }
 
@@ -740,6 +868,8 @@ impl RegisteredTool {
             external_mutation_intent:
                 crate::agent::task_capabilities::ExternalMutationIntent::MayMutate,
             spec,
+            canonical_spec_sha256: OnceLock::new(),
+            code_mode_argument_preflight: Arc::new(CodeModeArgumentPreflight::default()),
         }
     }
 
@@ -775,6 +905,22 @@ impl RegisteredTool {
 
     pub(crate) fn spec(&self) -> &ToolSpec {
         &self.spec
+    }
+
+    pub(crate) fn spec_mut(&mut self) -> &mut ToolSpec {
+        self.canonical_spec_sha256.take();
+        &mut self.spec
+    }
+
+    pub(crate) fn canonical_spec_sha256(&self) -> &str {
+        self.canonical_spec_sha256.get_or_init(|| {
+            let canonical_spec =
+                canonicalize_json(&serde_json::to_value(&self.spec).unwrap_or_default());
+            format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&canonical_spec).unwrap_or_default())
+            )
+        })
     }
 
     pub(crate) fn search_info(&self) -> Option<codex_tools::ToolSearchInfo> {
@@ -879,13 +1025,9 @@ impl ToolRegistry {
         Arc::clone(&self.model_visible_schemas)
     }
 
-    pub(crate) fn manifest_entries(&self) -> Vec<(ToolName, ToolExposure, ToolSpec)> {
-        let mut entries = self
-            .tools
-            .iter()
-            .map(|(name, tool)| (name.clone(), tool.exposure(), tool.spec().clone()))
-            .collect::<Vec<_>>();
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
+    pub(crate) fn manifest_entries(&self) -> Vec<&RegisteredTool> {
+        let mut entries = self.tools.values().collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.tool_name().cmp(right.tool_name()));
         entries
     }
 
@@ -909,6 +1051,18 @@ impl ToolRegistry {
         Some(tool.waits_for_runtime_cancellation())
     }
 
+    #[cfg(test)]
+    pub(crate) fn code_mode_argument_preflight_counts(
+        &self,
+        name: &ToolName,
+    ) -> Option<(usize, usize)> {
+        let preflight = &self.tools.get(name)?.code_mode_argument_preflight;
+        Some((
+            preflight.compile_count.load(Ordering::Relaxed),
+            preflight.validation_count.load(Ordering::Relaxed),
+        ))
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "tool dispatch must keep active-turn accounting atomic"
@@ -916,11 +1070,12 @@ impl ToolRegistry {
     pub(crate) async fn dispatch_any_with_terminal_outcome(
         &self,
         mut invocation: ToolInvocation,
-        terminal_outcome_reached: Arc<AtomicBool>,
+        dispatch_state: Arc<ToolDispatchState>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
         let mut parsed_function_arguments =
             ParsedFunctionArguments::from_payload(&invocation.payload);
+        let mut rewritten_source_dependencies = None;
         let tool_name_flat = flat_tool_name(&tool_name);
         let call_id_owned = invocation.call_id.clone();
         let otel = invocation.step_context.turn.session_telemetry.clone();
@@ -950,8 +1105,12 @@ impl ToolRegistry {
             }
         }
         let dispatch_trace = ToolDispatchTrace::start(&invocation);
-        let (tool, tool_spec) = match self.tools.get(&tool_name) {
-            Some(registered) => (Arc::clone(registered.runtime()), registered.spec().clone()),
+        let (tool, tool_spec, code_mode_argument_preflight) = match self.tools.get(&tool_name) {
+            Some(registered) => (
+                Arc::clone(registered.runtime()),
+                registered.spec().clone(),
+                Arc::clone(&registered.code_mode_argument_preflight),
+            ),
             None => {
                 let message = unsupported_tool_call_message(&invocation.payload, &tool_name);
                 let log_payload = invocation.payload.log_payload();
@@ -966,7 +1125,7 @@ impl ToolRegistry {
                     /*extra_trace_fields*/ &[],
                 );
                 let err = FunctionCallError::RespondToModel(message);
-                dispatch_trace.record_failed(&err);
+                dispatch_trace.record_failed(&err).await;
                 return Err(err);
             }
         };
@@ -997,12 +1156,12 @@ impl ToolRegistry {
                 &extra_trace_fields,
             );
             let err = FunctionCallError::Fatal(message);
-            dispatch_trace.record_failed(&err);
+            dispatch_trace.record_failed(&err).await;
             return Err(err);
         }
 
         if matches!(invocation.source, ToolCallSource::CodeMode { .. })
-            && let Err(message) = preflight_code_mode_arguments(
+            && let Err(message) = code_mode_argument_preflight.validate(
                 &tool_name,
                 &tool_spec,
                 &invocation.payload,
@@ -1021,7 +1180,7 @@ impl ToolRegistry {
                 &extra_trace_fields,
             );
             let err = FunctionCallError::RespondToModel(message);
-            dispatch_trace.record_failed(&err);
+            dispatch_trace.record_failed(&err).await;
             return Err(err);
         }
 
@@ -1029,6 +1188,7 @@ impl ToolRegistry {
         notify_tool_start(&invocation).await;
         record_lifecycle_phase(&invocation, "notify_start", phase_started);
 
+        let mut hook_rewrote_input = false;
         let pre_tool_use_payload =
             with_parsed_function_arguments(parsed_function_arguments.clone(), async {
                 tool.pre_tool_use_payload(&invocation)
@@ -1048,10 +1208,10 @@ impl ToolRegistry {
             match pre_tool_use_result {
                 PreToolUseHookResult::Blocked(message) => {
                     let err = FunctionCallError::RespondToModel(message);
-                    dispatch_trace.record_failed(&err);
+                    dispatch_trace.record_failed(&err).await;
                     notify_tool_finish_if_unclaimed(
                         &invocation,
-                        terminal_outcome_reached.as_ref(),
+                        dispatch_state.as_ref(),
                         ToolCallOutcome::Blocked,
                     )
                     .await;
@@ -1069,12 +1229,27 @@ impl ToolRegistry {
                             invocation = updated_invocation;
                             parsed_function_arguments =
                                 ParsedFunctionArguments::from_payload(&invocation.payload);
+                            hook_rewrote_input = true;
+                            let rewritten_tool_name = flat_tool_name(&invocation.tool_name);
+                            rewritten_source_dependencies = crate::tool_history::tool_observes_workspace(
+                                rewritten_tool_name.as_ref(),
+                            )
+                            .then(|| {
+                                crate::tool_history::source_dependencies_for_tool_call_with_parsed_arguments(
+                                    rewritten_tool_name.as_ref(),
+                                    &invocation.payload,
+                                    parsed_function_arguments
+                                        .as_ref()
+                                        .and_then(|parsed| parsed.value().ok()),
+                                    invocation.step_context.turn.config.cwd.as_path(),
+                                )
+                            });
                         }
                         Err(err) => {
-                            dispatch_trace.record_failed(&err);
+                            dispatch_trace.record_failed(&err).await;
                             notify_tool_finish_if_unclaimed(
                                 &invocation,
-                                terminal_outcome_reached.as_ref(),
+                                dispatch_state.as_ref(),
                                 ToolCallOutcome::Failed {
                                     handler_executed: false,
                                 },
@@ -1093,8 +1268,9 @@ impl ToolRegistry {
         // PreToolUse hooks may replace the arguments after the initial code-mode
         // admission check. Validate the final payload that will reach the
         // handler so a hook cannot turn a schema-valid call into an invalid one.
-        if matches!(invocation.source, ToolCallSource::CodeMode { .. })
-            && let Err(message) = preflight_code_mode_arguments(
+        if hook_rewrote_input
+            && matches!(invocation.source, ToolCallSource::CodeMode { .. })
+            && let Err(message) = code_mode_argument_preflight.validate(
                 &tool_name,
                 &tool_spec,
                 &invocation.payload,
@@ -1113,10 +1289,10 @@ impl ToolRegistry {
                 &extra_trace_fields,
             );
             let err = FunctionCallError::RespondToModel(message);
-            dispatch_trace.record_failed(&err);
+            dispatch_trace.record_failed(&err).await;
             notify_tool_finish_if_unclaimed(
                 &invocation,
-                terminal_outcome_reached.as_ref(),
+                dispatch_state.as_ref(),
                 ToolCallOutcome::Failed {
                     handler_executed: false,
                 },
@@ -1129,7 +1305,7 @@ impl ToolRegistry {
         let log_payload = invocation.payload.log_payload();
 
         let phase_started = Instant::now();
-        let result = otel
+        let mut result = otel
             .log_tool_result_with_tags(
                 tool_name_flat.as_ref(),
                 &call_id_owned,
@@ -1147,21 +1323,21 @@ impl ToolRegistry {
                         .await
                     }
                 },
-                |result| (result.result.log_preview(), result.success_for_logging()),
+                AnyToolResult::success_for_logging,
+                |result| result.result.log_preview(),
             )
             .await;
         record_lifecycle_phase(&invocation, "handler", phase_started);
-        // When the cancellation owner has already claimed the terminal
-        // lifecycle, the handler was awaited only for runtime/process cleanup.
-        // Do not extend the failed round-trip with hooks, projection, or a
-        // duplicate completion path after that cleanup has finished.
-        if invocation.cancellation_token.is_cancelled()
-            && terminal_outcome_reached.load(Ordering::Acquire)
-        {
+        // Handler completion is the first point where an ordinary result can
+        // own the terminal outcome. Claim it before hooks or projection so a
+        // concurrent abort can never publish a second representation. If the
+        // abort already owns the terminal outcome, this handler was awaited
+        // only for cooperative cleanup and must not run post-processing.
+        if !dispatch_state.try_complete() {
             let err = FunctionCallError::RespondToModel(
                 "tool cancelled after runtime cleanup".to_string(),
             );
-            dispatch_trace.record_failed(&err);
+            dispatch_trace.record_failed(&err).await;
             return Err(err);
         }
         let success = match &result {
@@ -1169,39 +1345,76 @@ impl ToolRegistry {
             Err(_) => false,
         };
         emit_metric_for_tool_read(&invocation, success);
-        let post_tool_use_payload = if success {
-            result
-                .as_ref()
-                .ok()
-                .and_then(|result| result.post_tool_use_payload.clone())
+        let post_tool_use_plan = success
+            .then(|| tool.post_tool_use_hook_name(&invocation))
+            .flatten()
+            .and_then(|tool_name| {
+                let plan = invocation
+                    .session
+                    .hooks()
+                    .plan_post_tool_use(tool_name.name(), tool_name.matcher_aliases());
+                (!plan.is_empty()).then_some((tool_name, plan))
+            });
+        let post_tool_use_payload = if let Some((tool_name, plan)) = post_tool_use_plan {
+            let payload =
+                with_parsed_function_arguments(parsed_function_arguments.clone(), async {
+                    result.as_mut().ok().and_then(|result| {
+                        CoreToolRuntime::post_tool_use_payload(
+                            tool.as_ref(),
+                            &invocation,
+                            result.result.as_ref(),
+                        )
+                    })
+                })
+                .await;
+            payload.map(|payload| {
+                debug_assert_eq!(payload.tool_name, tool_name);
+                (plan, payload)
+            })
         } else {
             None
         };
-        let post_tool_use_outcome = if let Some(post_tool_use_payload) = post_tool_use_payload {
-            let phase_started = Instant::now();
-            let outcome = run_post_tool_use_hooks(
-                &invocation.session,
-                &invocation.step_context.turn,
-                post_tool_use_payload.tool_use_id,
-                post_tool_use_payload.tool_name.name().to_string(),
-                post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
-                post_tool_use_payload.tool_input,
-                post_tool_use_payload.tool_response,
-            )
-            .await;
-            record_lifecycle_phase(&invocation, "post_hooks", phase_started);
-            Some(outcome)
-        } else {
-            None
-        };
+        let post_tool_use_outcome =
+            if let Some((plan, post_tool_use_payload)) = post_tool_use_payload {
+                let phase_started = Instant::now();
+                let outcome = run_post_tool_use_hooks(
+                    &invocation.session,
+                    &invocation.step_context.turn,
+                    plan,
+                    post_tool_use_payload.tool_use_id,
+                    post_tool_use_payload.tool_name.name().to_string(),
+                    post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
+                    post_tool_use_payload.tool_input,
+                    post_tool_use_payload.tool_response,
+                )
+                .await;
+                record_lifecycle_phase(&invocation, "post_hooks", phase_started);
+                Some(outcome)
+            } else {
+                None
+            };
         if let Some(outcome) = &post_tool_use_outcome {
             let phase_started = Instant::now();
-            record_additional_contexts(
-                &invocation.session,
-                &invocation.step_context.turn,
-                outcome.additional_contexts.clone(),
-            )
-            .await;
+            if matches!(&invocation.source, ToolCallSource::Direct) {
+                let contexts = prepare_additional_context_items(
+                    &invocation.session,
+                    &invocation.step_context.turn,
+                    outcome.additional_contexts.clone(),
+                )
+                .await;
+                invocation
+                    .step_context
+                    .turn
+                    .queue_post_tool_contexts(&invocation.call_id, contexts)
+                    .await;
+            } else {
+                record_additional_contexts(
+                    &invocation.session,
+                    &invocation.step_context.turn,
+                    outcome.additional_contexts.clone(),
+                )
+                .await;
+            }
             record_lifecycle_phase(&invocation, "additional_context", phase_started);
         }
 
@@ -1229,14 +1442,9 @@ impl ToolRegistry {
                         });
                         let err = FunctionCallError::RespondToModel(message);
                         let phase_started = Instant::now();
-                        notify_tool_finish_if_unclaimed(
-                            &invocation,
-                            terminal_outcome_reached.as_ref(),
-                            lifecycle_outcome,
-                        )
-                        .await;
+                        notify_tool_finish(&invocation, lifecycle_outcome).await;
                         record_lifecycle_phase(&invocation, "notify_finish", phase_started);
-                        dispatch_trace.record_failed(&err);
+                        dispatch_trace.record_failed(&err).await;
                         return Err(err);
                     }
                     if let Some(feedback_message) = outcome.feedback_message {
@@ -1279,6 +1487,7 @@ impl ToolRegistry {
                     &invocation,
                     &result,
                     parsed_function_arguments.as_ref(),
+                    rewritten_source_dependencies.as_ref(),
                     force_inline_carrier,
                     projection_admission_required,
                 );
@@ -1292,22 +1501,20 @@ impl ToolRegistry {
                 if (canonical_artifact_required || admission_tracking_required)
                     && model_projection.is_none()
                 {
-                    let err = FunctionCallError::Fatal(format!(
-                        "failed to preserve and admit the fully received result for {} as a canonical artifact",
-                        flat_tool_name(&invocation.tool_name)
-                    ));
-                    let phase_started = Instant::now();
-                    notify_tool_finish_if_unclaimed(
-                        &invocation,
-                        terminal_outcome_reached.as_ref(),
-                        ToolCallOutcome::Failed {
-                            handler_executed: true,
-                        },
-                    )
-                    .await;
-                    record_lifecycle_phase(&invocation, "notify_finish", phase_started);
-                    dispatch_trace.record_failed(&err);
-                    return Err(err);
+                    tracing::error!(
+                        tool_name = %flat_tool_name(&invocation.tool_name),
+                        call_id = %invocation.call_id,
+                        "tool execution completed but its canonical result could not be preserved"
+                    );
+                    let model_visible = FunctionToolOutput::from_text(
+                        "Tool execution completed, but its full result could not be preserved for model delivery."
+                            .to_string(),
+                        Some(result.success_for_logging()),
+                    );
+                    result.result = Box::new(UnavailableModelProjectionOutput {
+                        original: result.result,
+                        model_visible,
+                    });
                 }
                 if let Some(projection) = &model_projection {
                     invocation
@@ -1337,33 +1544,25 @@ impl ToolRegistry {
                         record_history_persistence(phase_started.elapsed());
                     }
                 }
-                result.install_model_projection(model_projection);
+                result.install_model_projection(model_projection, rewritten_source_dependencies);
                 let phase_started = Instant::now();
-                notify_tool_finish_if_unclaimed(
-                    &invocation,
-                    terminal_outcome_reached.as_ref(),
-                    lifecycle_outcome,
-                )
-                .await;
+                notify_tool_finish(&invocation, lifecycle_outcome).await;
                 record_lifecycle_phase(&invocation, "notify_finish", phase_started);
-                dispatch_trace.record_completed(
-                    &invocation,
-                    &result.call_id,
-                    &result.payload,
-                    result.result.as_ref(),
-                );
+                dispatch_trace
+                    .record_completed(
+                        &invocation,
+                        &result.call_id,
+                        &result.payload,
+                        result.result.as_ref(),
+                    )
+                    .await;
                 Ok(result)
             }
             Err(err) => {
                 let phase_started = Instant::now();
-                notify_tool_finish_if_unclaimed(
-                    &invocation,
-                    terminal_outcome_reached.as_ref(),
-                    lifecycle_outcome,
-                )
-                .await;
+                notify_tool_finish(&invocation, lifecycle_outcome).await;
                 record_lifecycle_phase(&invocation, "notify_finish", phase_started);
-                dispatch_trace.record_failed(&err);
+                dispatch_trace.record_failed(&err).await;
                 Err(err)
             }
         }
@@ -1390,10 +1589,10 @@ fn projection_admission_required(
 
 async fn notify_tool_finish_if_unclaimed(
     invocation: &ToolInvocation,
-    terminal_outcome_reached: &AtomicBool,
+    dispatch_state: &ToolDispatchState,
     outcome: ToolCallOutcome,
 ) -> bool {
-    if terminal_outcome_reached.swap(true, Ordering::AcqRel) {
+    if !dispatch_state.try_complete() {
         return false;
     }
 
@@ -1429,6 +1628,7 @@ async fn handle_any_tool(
             .config
             .memories
             .disable_on_external_context
+        && invocation.step_context.turn.claim_memory_pollution_signal()
     {
         state_integration::mark_thread_memory_mode_polluted(
             invocation.session.services.state_db.as_deref(),
@@ -1437,13 +1637,10 @@ async fn handle_any_tool(
         )
         .await;
     }
-    let post_tool_use_payload =
-        CoreToolRuntime::post_tool_use_payload(tool, &invocation, output.as_ref());
     Ok(AnyToolResult {
         call_id: invocation.call_id,
         payload: invocation.payload,
         result: output,
-        post_tool_use_payload,
         model_projection: None,
         source_dependencies: None,
         code_mode_feedback: Vec::new(),
@@ -1510,12 +1707,22 @@ fn precomputed_projection_source_dependencies()
 
 fn resolve_projection_source_dependencies<F>(
     turn_timing_state: &TurnTimingState,
+    authoritative_override: Option<
+        std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+    >,
     precomputed: Option<std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>>,
     fallback: F,
 ) -> std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>
 where
     F: FnOnce() -> std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
 {
+    if let Some(source_dependencies) = authoritative_override {
+        // A PreToolUse rewrite invalidates analysis of the original payload.
+        // Count the final-payload analysis as fallback work even though it was
+        // performed immediately after rebuilding the invocation.
+        turn_timing_state.record_projection_source_dependencies_fallback();
+        return source_dependencies;
+    }
     match precomputed {
         Some(source_dependencies) => {
             turn_timing_state.record_projection_source_dependencies_reuse();
@@ -1550,6 +1757,9 @@ fn prepare_model_projection(
     invocation: &ToolInvocation,
     result: &AnyToolResult,
     parsed_function_arguments: Option<&ParsedFunctionArguments>,
+    source_dependencies_override: Option<
+        &std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
+    >,
     force_inline_carrier: bool,
     track_for_admission: bool,
 ) -> Option<ModelProjectionInput> {
@@ -1727,6 +1937,7 @@ fn prepare_model_projection(
     };
     let source_dependencies = resolve_projection_source_dependencies(
         invocation.step_context.turn.turn_timing_state.as_ref(),
+        source_dependencies_override.cloned(),
         precomputed_projection_source_dependencies(),
         || {
             crate::tool_history::source_dependencies_for_tool_call_with_parsed_arguments(
@@ -3059,7 +3270,7 @@ fn serialize_projection_with_limit(
     loop {
         envelope.result["selected_text"] =
             Value::String(truncate_text_to_token_ceiling(output, output_limit));
-        let rendered = serialize_projection_with_exact_metrics(&mut envelope)?;
+        let rendered = render_projection_with_exact_metrics(&mut envelope)?;
         let rendered_tokens = approx_token_count(&rendered);
         if rendered_tokens <= effective_limit {
             return Some(BoundedModelProjection::Envelope { envelope, rendered });
@@ -3083,27 +3294,69 @@ fn serialize_projection_with_limit(
         "essential": essential,
         "selected_text": "",
     });
-    let rendered = serialize_projection_with_exact_metrics(&mut envelope)?;
+    let rendered = render_projection_with_exact_metrics(&mut envelope)?;
     Some(BoundedModelProjection::Envelope { envelope, rendered })
 }
 
-fn serialize_projection_with_exact_metrics(envelope: &mut ToolProjectionV1) -> Option<String> {
-    // The metrics are part of the serialized envelope, so updating them can
-    // change the serialization length. Iterate to the fixed point rather than
-    // reporting the size of the preceding serialization.
-    for _ in 0..8 {
-        let rendered = serde_json::to_string(envelope).ok()?;
-        let model_bytes = rendered.len() as u64;
-        let model_approximate_tokens = approx_token_count(&rendered) as u64;
-        if envelope.model_bytes == model_bytes
-            && envelope.model_approximate_tokens == model_approximate_tokens
-        {
-            return Some(rendered);
-        }
-        envelope.model_bytes = model_bytes;
-        envelope.model_approximate_tokens = model_approximate_tokens;
+fn render_projection_with_exact_metrics(envelope: &mut ToolProjectionV1) -> Option<String> {
+    let selected_text = envelope.result["selected_text"]
+        .as_str()
+        .unwrap_or_default();
+    let mut header = serde_json::Map::new();
+    header.insert(
+        "outcome".to_string(),
+        Value::String(envelope.outcome.clone()),
+    );
+    header.insert(
+        "canonical_complete".to_string(),
+        Value::Bool(envelope.canonical_complete),
+    );
+    if let Some(artifact_id) = envelope.artifact_id.as_ref() {
+        header.insert(
+            "artifact_id".to_string(),
+            Value::String(artifact_id.clone()),
+        );
     }
-    None
+    if !envelope.omitted_sections.is_empty() {
+        header.insert(
+            "omitted_sections".to_string(),
+            serde_json::to_value(&envelope.omitted_sections).ok()?,
+        );
+    }
+    for field in ["essential", "preserved_content", "artifact"] {
+        if let Some(value) = envelope.result.get(field)
+            && !value.is_null()
+            && !value.as_array().is_some_and(Vec::is_empty)
+            && !value.as_object().is_some_and(serde_json::Map::is_empty)
+        {
+            header.insert(field.to_string(), value.clone());
+        }
+    }
+    if let Some(selection) = envelope.result["selection"].as_object() {
+        let mut compact_selection = serde_json::Map::new();
+        for field in ["selected_ids", "omitted_inline_ids", "partial_ids"] {
+            if let Some(value) = selection.get(field)
+                && !value.as_array().is_some_and(Vec::is_empty)
+            {
+                compact_selection.insert(field.to_string(), value.clone());
+            }
+        }
+        if !compact_selection.is_empty() {
+            header.insert("selection".to_string(), Value::Object(compact_selection));
+        }
+    }
+    if !selected_text.is_empty() {
+        header.insert("selected_text_follows".to_string(), Value::Bool(true));
+    }
+
+    let mut rendered = serde_json::to_string(&header).ok()?;
+    if !selected_text.is_empty() {
+        rendered.push('\n');
+        rendered.push_str(selected_text);
+    }
+    envelope.model_bytes = rendered.len() as u64;
+    envelope.model_approximate_tokens = approx_token_count(&rendered) as u64;
+    Some(rendered)
 }
 
 fn preserved_non_text_content(response: &ResponseInputItem) -> Vec<Value> {
@@ -3155,30 +3408,10 @@ fn function_hook_tool_name(invocation: &ToolInvocation) -> HookToolName {
     HookToolName::new(flat_tool_name(&invocation.tool_name).into_owned())
 }
 
-fn preflight_code_mode_arguments(
+fn compile_code_mode_argument_validator(
     tool_name: &ToolName,
     spec: &ToolSpec,
-    payload: &ToolPayload,
-    parsed_function_arguments: Option<&ParsedFunctionArguments>,
-) -> Result<(), String> {
-    let ToolPayload::Function { arguments: _ } = payload else {
-        return Ok(());
-    };
-    let value = parsed_function_arguments
-        .and_then(|parsed| parsed.value().ok())
-        .cloned()
-        .ok_or_else(|| {
-            let message = parsed_function_arguments
-                .and_then(|parsed| parsed.value().err())
-                .unwrap_or("unknown JSON parse error");
-            format!("tool `{tool_name}` arguments are not valid JSON: {message}")
-        })?;
-    if !value.is_object() {
-        return Err(format!(
-            "tool `{tool_name}` expects a JSON object for arguments"
-        ));
-    }
-
+) -> Result<Option<jsonschema::Validator>, String> {
     let parameters = match spec {
         ToolSpec::Function(tool) => Some(&tool.parameters),
         ToolSpec::Namespace(namespace) => namespace.tools.iter().find_map(|nested| match nested {
@@ -3192,39 +3425,89 @@ fn preflight_code_mode_arguments(
         ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } | ToolSpec::Freeform(_) => None,
     };
     let Some(parameters) = parameters else {
-        return Ok(());
+        return Ok(None);
     };
     let schema = serde_json::to_value(parameters)
         .map_err(|err| format!("tool `{tool_name}` argument schema is invalid: {err}"))?;
     let validator = jsonschema::validator_for(&schema).map_err(|err| {
         format!("tool `{tool_name}` argument schema could not be compiled: {err}")
     })?;
-    let mut errors = validator.iter_errors(&value);
-    let messages = errors
-        .by_ref()
-        .take(4)
-        .map(|error| {
-            let pointer = error.instance_path().as_str();
-            let path = if pointer.is_empty() {
-                "$".to_string()
-            } else {
-                format!("${pointer}")
-            };
-            format!("{path}: {error}")
-        })
-        .collect::<Vec<_>>();
-    if messages.is_empty() {
-        return Ok(());
+    Ok(Some(validator))
+}
+
+#[derive(Default)]
+struct CodeModeArgumentPreflight {
+    validator: OnceLock<Result<Option<jsonschema::Validator>, String>>,
+    #[cfg(test)]
+    compile_count: AtomicUsize,
+    #[cfg(test)]
+    validation_count: AtomicUsize,
+}
+
+impl CodeModeArgumentPreflight {
+    fn validate(
+        &self,
+        tool_name: &ToolName,
+        spec: &ToolSpec,
+        payload: &ToolPayload,
+        parsed_function_arguments: Option<&ParsedFunctionArguments>,
+    ) -> Result<(), String> {
+        let ToolPayload::Function { arguments: _ } = payload else {
+            return Ok(());
+        };
+        let value = parsed_function_arguments
+            .and_then(|parsed| parsed.value().ok())
+            .cloned()
+            .ok_or_else(|| {
+                let message = parsed_function_arguments
+                    .and_then(|parsed| parsed.value().err())
+                    .unwrap_or("unknown JSON parse error");
+                format!("tool `{tool_name}` arguments are not valid JSON: {message}")
+            })?;
+        if !value.is_object() {
+            return Err(format!(
+                "tool `{tool_name}` expects a JSON object for arguments"
+            ));
+        }
+
+        let validator = self.validator.get_or_init(|| {
+            #[cfg(test)]
+            self.compile_count.fetch_add(1, Ordering::Relaxed);
+            compile_code_mode_argument_validator(tool_name, spec)
+        });
+        let validator = validator.as_ref().map_err(Clone::clone)?;
+        let Some(validator) = validator else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        self.validation_count.fetch_add(1, Ordering::Relaxed);
+        let mut errors = validator.iter_errors(&value);
+        let messages = errors
+            .by_ref()
+            .take(4)
+            .map(|error| {
+                let pointer = error.instance_path().as_str();
+                let path = if pointer.is_empty() {
+                    "$".to_string()
+                } else {
+                    format!("${pointer}")
+                };
+                format!("{path}: {error}")
+            })
+            .collect::<Vec<_>>();
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let suffix = errors
+            .next()
+            .is_some()
+            .then_some("; additional errors omitted");
+        Err(format!(
+            "tool `{tool_name}` argument preflight failed: {}{}",
+            messages.join("; "),
+            suffix.unwrap_or_default()
+        ))
     }
-    let suffix = errors
-        .next()
-        .is_some()
-        .then_some("; additional errors omitted");
-    Err(format!(
-        "tool `{tool_name}` argument preflight failed: {}{}",
-        messages.join("; "),
-        suffix.unwrap_or_default()
-    ))
 }
 
 fn function_hook_tool_input(arguments: &str) -> Value {

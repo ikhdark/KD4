@@ -12,34 +12,65 @@
 use anyhow::Context;
 use anyhow::Result;
 use codex_features::Feature;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::TaskCompletionStatus;
+use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnTiming;
+use codex_protocol::protocol::TurnTimingToolCall;
+use codex_protocol::protocol::TurnTimingToolCallSource;
+use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
+use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_assistant_message;
-use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_custom_tool_call;
+use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
 use futures::SinkExt;
 use futures::StreamExt;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use regex_lite::Regex;
+use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::env;
+use std::fs;
 use std::fs::OpenOptions;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Read;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
-
+use std::process::Child;
+use std::process::ChildStdin;
+use std::process::ChildStdout;
 use std::process::Command;
-
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 use std::time::Instant;
 use tempfile::TempDir;
@@ -54,12 +85,97 @@ use tokio_tungstenite::tungstenite::Message;
 
 const DEFAULT_WARMUPS: usize = 10;
 const DEFAULT_ITERATIONS: usize = 100;
-const DEFAULT_CLUSTERS: usize = 3;
+const DEFAULT_CLUSTERS: usize = 5;
 const RELIABILITY_ITERATIONS: usize = 600;
 const CODE_MODE_WARMUPS: usize = 5;
 const CODE_MODE_ITERATIONS: usize = 30;
 const CODE_MODE_CLUSTERS: usize = 3;
+const AB_WARMUPS: usize = 3;
+const AB_ITERATIONS: usize = 30;
+const AB_CLUSTERS: usize = 3;
+const AB_BOOTSTRAP_REPLICATES: usize = 10_000;
+const AB_BOOTSTRAP_SEED: u64 = 0x4b44_345f_4142_7631;
+const AB_FAMILY_WISE_ALPHA: f64 = 0.05;
+const AB_QUICK_LOOKS: [usize; 1] = [10];
+const AB_BATCH_LOOKS: [usize; 1] = [20];
+const AB_FINAL_LOOKS: [usize; 3] = [10, 20, 30];
+const AB_REPLAY_LOOKS: [usize; 1] = [10];
+const AB_CORRECTNESS_ONLY_LOOKS: [usize; 1] = [1];
+const AB_MEDIAN_RATIO_UCB_LIMIT: f64 = 0.75;
+const AB_P95_RATIO_UCB_LIMIT: f64 = 1.00;
+const AB_RATIO_TARGET: f64 = 0.50;
+const AB_WORKLOAD_SCHEMA_VERSION: u16 = 13;
+const AB_BASELINE_STATE_SCHEMA_VERSION: u16 = 2;
+const AB_FILTERED_TREE_IDENTITY_VERSION: u16 = 1;
+const AB_METRIC_GATE_VERSION: u16 = 14;
+const AB_REPORT_SCHEMA_VERSION: u16 = 15;
+const AB_REPLAY_SESSION_AUDIT_EVIDENCE_VERSION: u16 = 1;
+const AB_PREPARED_MANIFEST_SCHEMA_VERSION: u16 = 1;
+const AB_WORKER_STACK_BYTES: &str = "16777216";
+const AB_OVERLAY_REPOSITORY_PATH: &[u8] = b"codex-rs/core/benches/turn_latency.rs";
 const MAX_READY_TO_SAMPLE_TO_DISPATCH_NS: u64 = 1_000_000_000;
+const AB_HIGH_VOLUME_SUBTURNS: usize = 16;
+const AB_HIGH_VOLUME_DIRECT_CALLS_PER_GENERATION: usize = 2;
+const AB_HIGH_VOLUME_NESTED_CALLS_PER_GENERATION: usize = 3;
+const AB_REPLAY_PAIRS: usize = 10;
+const AB_REPLAY_A_GENERATIONS: u32 = 18;
+const AB_REPLAY_B_GENERATIONS: u32 = 8;
+const AB_LONG_HISTORY_TURNS: usize = 32;
+const AB_LONG_HISTORY_SEED_BYTES: usize = 512;
+const AB_REQUEST_COMPONENT_NAMES: [&str; 5] = [
+    "instructions",
+    "tool_schemas",
+    "history",
+    "current_input",
+    "prompt_cache_key",
+];
+const AB_LONG_HISTORY_NO_TOOL_PROMPT: &str =
+    "Answer the deterministic long-history benchmark without calling tools.";
+const AB_LONG_HISTORY_NO_TOOL_REPLY: &str = "long-history no-tool benchmark complete";
+const AB_LONG_HISTORY_TOOL_PROMPT: &str =
+    "Update the deterministic benchmark plan once, then report completion.";
+const AB_LONG_HISTORY_TOOL_REPLY: &str = "long-history tool continuation complete";
+const AB_STABLE_CONTEXT_PROMPT: &str = "Repeat the stable request-cache benchmark response.";
+const AB_STABLE_CONTEXT_REPLY: &str = "stable request-cache benchmark complete";
+const AB_CONTEXT_CHANGE_PROMPT_A: &str = "Run context invalidation probe alpha.";
+const AB_CONTEXT_CHANGE_PROMPT_B: &str = "Run context invalidation probe beta.";
+const AB_CONTEXT_CHANGE_REPLY: &str = "context invalidation benchmark complete";
+const AB_SINGLE_DIRECT_PROMPT: &str = "Run the deterministic single direct tool benchmark.";
+const AB_SINGLE_DIRECT_REPLY: &str = "single direct tool benchmark complete";
+const AB_PARALLEL_TRIPLE_PROMPT: &str =
+    "Run exactly three deterministic parallel-safe direct tool calls.";
+const AB_PARALLEL_TRIPLE_REPLY: &str = "parallel-safe triple benchmark complete";
+const AB_EXCLUSIVE_GATE_PROMPT: &str =
+    "Run two same-workspace exec calls and one unrelated parallel-safe direct tool call.";
+const AB_EXCLUSIVE_GATE_REPLY: &str = "exclusive-gate benchmark complete";
+const AB_EXCLUSIVE_GATE_CHILD_MARKER: &str = "__KD4_EXCLUSIVE_GATE_CHILD_COMPLETE__";
+const AB_EXCLUSIVE_GATE_CHILD_DELAY_MS: u64 = 100;
+const AB_EXCLUSIVE_GATE_YIELD_TIME_MS: u64 = 10_000;
+const AB_RETAINED_EXEC_PROMPT: &str =
+    "Run the deterministic retained exec lifecycle through exactly two write_stdin polls.";
+const AB_RETAINED_EXEC_REPLY: &str = "retained exec lifecycle complete";
+const AB_ABORT_DIRECT_NESTED_PROMPT: &str =
+    "Run one CodeMode tool that reaches the deterministic permission barrier.";
+const AB_ABORT_FORBIDDEN_RESUME_REPLY: &str =
+    "forbidden model resume after abort-direct-nested interrupt";
+const AB_ABORT_RETAINED_PROMPT: &str =
+    "Start the deterministic retained process and wait for an explicit interrupt.";
+const AB_ABORT_RETAINED_FORBIDDEN_RESUME_REPLY: &str =
+    "forbidden model resume after retained-process interrupt";
+const AB_ABORT_RETAINED_YIELD_TIME_MS: u64 = 10;
+const AB_ABORT_DIRECT_NESTED_SOURCE: &str = r#"// @exec: {"yield_time_ms": 1000}
+await tools.request_permissions({
+  reason: "benchmark interrupt barrier",
+  permissions: { network: { enabled: true } },
+});"#;
+const AB_RETAINED_READY_MARKER: &str = "__KD4_RETAINED_READY__";
+const AB_RETAINED_POLL_MARKER: &str = "__KD4_RETAINED_POLL_ACK__";
+const AB_RETAINED_FINISHED_MARKER: &str = "__KD4_RETAINED_FINISHED__";
+const AB_HISTORY_SEED_PREFIX: &str = "request-cache-history-seed-";
+const AB_HISTORY_SEED_REPLY: &str = "request-cache deterministic seed reply";
+const CODE_MODE_HIGH_VOLUME_PROMPT: &str =
+    "Run one deterministic high-volume CodeMode dispatch subturn.";
+const CODE_MODE_HIGH_VOLUME_FOLLOW_UP: &str = "high-volume CodeMode dispatch complete";
 const CODE_MODE_NESTED_DISPATCH_SOURCE: &str = r#"
 const dispatched = await tools.update_plan({
   plan: [{ step: "benchmark nested dispatch", status: "in_progress" }],
@@ -68,6 +184,24 @@ text(JSON.stringify({
   dispatched: typeof dispatched?.message === "string",
 }));
 "#;
+const CODE_MODE_HIGH_VOLUME_SINGLE_NESTED_SOURCE: &str = r#"
+await tools.update_plan({
+  plan: [{ step: "benchmark high-volume nested dispatch one", status: "in_progress" }],
+});
+"#;
+const CODE_MODE_HIGH_VOLUME_DOUBLE_NESTED_SOURCE: &str = r#"
+await Promise.all([
+  tools.update_plan({
+    plan: [{ step: "benchmark high-volume nested dispatch two-a", status: "in_progress" }],
+  }),
+  tools.update_plan({
+    plan: [{ step: "benchmark high-volume nested dispatch two-b", status: "in_progress" }],
+  }),
+]);
+"#;
+
+#[cfg(test)]
+static AB_BUILD_COMMAND_INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,35 +233,7 @@ enum Variant {
     Candidate,
 }
 
-#[derive(Debug)]
-struct Args {
-    scenario: Option<Scenario>,
-    mode: Option<Mode>,
-    iterations: usize,
-    warmups: usize,
-    clusters: usize,
-    absolute_margin_ms: f64,
-    relative_margin: f64,
-}
-
-#[derive(Debug)]
-enum BenchmarkCommand {
-    CodeModeCapture { host: PathBuf },
-    Synthetic(Args),
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-struct Sample {
-    duration_ns: u64,
-    sampling_requests: u32,
-    failed: bool,
-    serialized_bytes: u64,
-    cache_hits: u32,
-    exec_description_tokens: u64,
-    prompt_input_tokens: u64,
-    tool_calls: u32,
-    max_ready_to_sample_to_dispatch_ns: Option<u64>,
-}
+include!("turn_latency/ab_contract.rs");
 
 #[derive(Debug, Serialize)]
 struct VariantSummary {
@@ -272,12 +378,12 @@ impl CodeModeFixture {
             sequence.push(sse(vec![
                 ev_response_created(&response_id),
                 ev_custom_tool_call(&call_id, "exec", CODE_MODE_NESTED_DISPATCH_SOURCE),
-                ev_completed(&response_id),
+                ev_completed_with_usage(&response_id, 1_024, 768, 24, 16),
             ]));
             let completion_id = format!("{fixture_id}-completion-{turn}");
             sequence.push(sse(vec![
                 ev_assistant_message(&completion_id, "done"),
-                ev_completed(&completion_id),
+                ev_completed_with_usage(&completion_id, 1_280, 1_024, 8, 0),
             ]));
         }
         let response_mock = mount_sse_sequence(&server, sequence).await;
@@ -313,117 +419,67 @@ impl CodeModeFixture {
             Ok(completion) => {
                 let timing = completion.timing.as_ref();
                 let first_request = turn_requests.first();
-                let sampling_requests = timing
-                    .map(|timing| timing.counters.model_request_count)
-                    .unwrap_or_default();
-                let tool_calls = timing
-                    .map(|timing| timing.counters.tool_call_count)
-                    .unwrap_or_default();
+                let mut sample = timing.map(sample_from_timing).unwrap_or_default();
+                sample.duration_ns = duration_ns;
                 let semantic_output_ok =
                     turn_requests.get(1).is_some_and(nested_output_is_expected);
                 let max_ready_to_sample_to_dispatch_ns =
                     timing.and_then(max_ready_to_sample_to_dispatch_ns);
-                let failed = completion.last_agent_message.as_deref() != Some("done")
-                    || completion.error.is_some()
-                    || turn_requests.len() != 2
-                    || sampling_requests != 2
-                    || tool_calls != 2
-                    || !timing.is_some_and(timing_reconciles)
-                    || !semantic_output_ok
-                    || !ready_to_sample_dispatch_gate_passes(max_ready_to_sample_to_dispatch_ns);
-                Sample {
-                    duration_ns,
-                    sampling_requests,
-                    failed,
-                    serialized_bytes: first_request
-                        .map(|request| request.body_bytes().len() as u64)
-                        .unwrap_or_default(),
-                    cache_hits: 0,
-                    exec_description_tokens: first_request
-                        .map(exec_description_tokens)
-                        .unwrap_or_default(),
-                    prompt_input_tokens: first_request.map(prompt_input_tokens).unwrap_or_default(),
-                    tool_calls,
-                    max_ready_to_sample_to_dispatch_ns,
+                if completion.last_agent_message.as_deref() != Some("done") {
+                    sample.failure_codes.push("wrong_final_message".to_string());
                 }
+                if completion.error.is_some() {
+                    sample
+                        .failure_codes
+                        .push("unexpected_terminal_error".to_string());
+                }
+                if turn_requests.len() != 2 {
+                    sample.failure_codes.push("request_count".to_string());
+                }
+                if sample.sampling_requests != 2 {
+                    sample.failure_codes.push("generation_count".to_string());
+                }
+                if sample.tool_calls != 2
+                    || sample.direct_tool_calls != 1
+                    || sample.nested_tool_calls != 1
+                {
+                    sample.failure_codes.push("tool_graph".to_string());
+                }
+                if !timing.is_some_and(timing_reconciles) {
+                    sample
+                        .failure_codes
+                        .push("timing_reconciliation".to_string());
+                }
+                if !semantic_output_ok {
+                    sample.failure_codes.push("nested_output".to_string());
+                }
+                if !ready_to_sample_dispatch_gate_passes(max_ready_to_sample_to_dispatch_ns) {
+                    sample.failure_codes.push("post_tool_handoff".to_string());
+                }
+                sample.serialized_bytes = first_request
+                    .map(|request| request.body_bytes().len() as u64)
+                    .unwrap_or_default();
+                sample.cache_hits = sample.workspace_evidence_cache_hits;
+                sample.exec_description_tokens = first_request
+                    .map(exec_description_tokens)
+                    .unwrap_or_default();
+                sample.prompt_input_tokens =
+                    first_request.map(prompt_input_tokens).unwrap_or_default();
+                sample.max_ready_to_sample_to_dispatch_ns = max_ready_to_sample_to_dispatch_ns;
+                sample.failed = !sample.failure_codes.is_empty();
+                sample
             }
-            Err(_) => Sample {
+            Err(error) => Sample {
                 duration_ns,
                 failed: true,
+                failure_codes: vec![format!("completion_error:{error}")],
                 ..Sample::default()
             },
         }
     }
 }
 
-fn max_ready_to_sample_to_dispatch_ns(timing: &TurnTiming) -> Option<u64> {
-    timing
-        .tool_calls
-        .iter()
-        .filter_map(|call| call.ready_to_sample_to_dispatch_ns)
-        .max()
-}
-
-fn ready_to_sample_dispatch_gate_passes(measured_ns: Option<u64>) -> bool {
-    measured_ns.is_some_and(|measured_ns| measured_ns <= MAX_READY_TO_SAMPLE_TO_DISPATCH_NS)
-}
-
-fn nested_output_is_expected(request: &ResponsesRequest) -> bool {
-    request
-        .body_json()
-        .get("input")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|items| {
-            items.iter().any(|item| {
-                item.get("type").and_then(serde_json::Value::as_str)
-                    == Some("custom_tool_call_output")
-                    && item
-                        .get("output")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|output| output.contains("\"dispatched\":true"))
-            })
-        })
-}
-
-fn timing_reconciles(timing: &TurnTiming) -> bool {
-    timing.model_requests.len() == timing.counters.model_request_count as usize
-        && timing.counters.model_request_count
-            == timing.counters.attempts_by_kind.primary
-                + timing.counters.attempts_by_kind.retry
-                + timing.counters.attempts_by_kind.fallback
-        && timing
-            .model_requests
-            .iter()
-            .map(|request| request.tool_call_count)
-            .sum::<u32>()
-            == timing.counters.tool_call_count
-}
-
-fn exec_description_tokens(request: &ResponsesRequest) -> u64 {
-    request
-        .body_json()
-        .get("tools")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|tools| {
-            tools.iter().find_map(|tool| {
-                (tool.get("name").and_then(serde_json::Value::as_str) == Some("exec"))
-                    .then(|| tool.get("description").and_then(serde_json::Value::as_str))
-                    .flatten()
-            })
-        })
-        .map(codex_utils_output_truncation::approx_token_count)
-        .unwrap_or_default() as u64
-}
-
-fn prompt_input_tokens(request: &ResponsesRequest) -> u64 {
-    let body = request.body_json();
-    let logical_prompt = serde_json::json!({
-        "instructions": body.get("instructions"),
-        "input": body.get("input"),
-        "tools": body.get("tools"),
-    });
-    codex_utils_output_truncation::approx_token_count(&logical_prompt.to_string()) as u64
-}
+include!("turn_latency/runtime_fixtures.rs");
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -437,30 +493,31 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        BenchmarkCommand::AbCapture(args) => capture_ab_baseline(&args),
+        BenchmarkCommand::AbPrepare(args) => run_ab_prepare(&args),
+        BenchmarkCommand::AbCompare(args) => run_ab_compare(&args),
+        BenchmarkCommand::AbImportReport(args) => {
+            let receipt = import_accepted_ab_report(&args)?;
+            println!("{}", serde_json::to_string(&receipt)?);
+            Ok(())
+        }
+        BenchmarkCommand::AbWorker(args) => run_ab_worker(&args).await,
+        BenchmarkCommand::AbExclusiveGateChild => run_ab_exclusive_gate_child(),
+        BenchmarkCommand::AbRetainedChild => run_ab_retained_child(),
+        BenchmarkCommand::AbReplayCommand { mode, paths } => run_ab_replay_command(&mode, &paths),
         BenchmarkCommand::Synthetic(args) => run_synthetic_reports(args).await,
     }
 }
 
 async fn run_synthetic_reports(args: Args) -> Result<()> {
-    let scenarios = args.scenario.map_or_else(
-        || {
-            vec![
-                Scenario::Deterministic,
-                Scenario::LoopbackWebsocket,
-                Scenario::Persistence,
-                Scenario::WindowsExecutor,
-            ]
-        },
-        |scenario| vec![scenario],
-    );
+    let scenarios = args
+        .scenario
+        .map_or_else(default_synthetic_scenarios, |scenario| vec![scenario]);
     let modes = args
         .mode
         .map_or_else(|| vec![Mode::Cold, Mode::Warm], |mode| vec![mode]);
     let mut any_failed = false;
     for scenario in scenarios {
-        if scenario == Scenario::WindowsExecutor && !cfg!(windows) {
-            continue;
-        }
         for mode in &modes {
             let report = run_report(scenario, *mode, &args).await?;
             any_failed |= !report.passed;
@@ -471,6 +528,15 @@ async fn run_synthetic_reports(args: Args) -> Result<()> {
         anyhow::bail!("one or more independent benchmark clusters failed non-inferiority")
     }
     Ok(())
+}
+
+fn default_synthetic_scenarios() -> Vec<Scenario> {
+    vec![
+        Scenario::Deterministic,
+        Scenario::LoopbackWebsocket,
+        Scenario::Persistence,
+        Scenario::WindowsExecutor,
+    ]
 }
 
 async fn run_report(scenario: Scenario, mode: Mode, args: &Args) -> Result<Report> {
@@ -813,6 +879,10 @@ fn non_inferiority(
     let failure_rate_delta = candidate.iter().filter(|sample| sample.failed).count() as f64
         / candidate.len() as f64
         - baseline.iter().filter(|sample| sample.failed).count() as f64 / baseline.len() as f64;
+    let all_samples_succeeded = baseline
+        .iter()
+        .chain(candidate)
+        .all(|sample| !sample.failed);
     NonInferiority {
         absolute_regression_ucb_ms,
         relative_regression_ucb,
@@ -823,7 +893,8 @@ fn non_inferiority(
         passed: absolute_regression_ucb_ms <= absolute_margin_ms
             && relative_regression_ucb <= relative_margin
             && sampling_request_mean_delta <= 0.0
-            && failure_rate_delta <= 0.0,
+            && failure_rate_delta <= 0.0
+            && all_samples_succeeded,
     }
 }
 
@@ -851,6 +922,8 @@ fn percentile(values: &[f64], quantile: f64) -> f64 {
     values[index]
 }
 
+include!("turn_latency/ab_runner.rs");
+
 fn parse_command() -> Result<BenchmarkCommand> {
     parse_command_from(env::args().skip(1))
 }
@@ -863,7 +936,290 @@ fn parse_command_from(values: impl IntoIterator<Item = String>) -> Result<Benchm
     if first == "code-mode-turn" {
         return parse_code_mode_args_from(values);
     }
+    if first == "ab-capture" {
+        return parse_ab_capture_args_from(values);
+    }
+    if first == "ab-prepare" {
+        return parse_ab_prepare_args_from(values);
+    }
+    if first == "ab-compare" {
+        return parse_ab_compare_args_from(values);
+    }
+    if first == "ab-import-report" {
+        return parse_ab_import_report_args_from(values);
+    }
+    if first == "ab-worker" {
+        return parse_ab_worker_args_from(values);
+    }
+    if first == "ab-exclusive-gate-child" {
+        anyhow::ensure!(
+            values.next().is_none(),
+            "ab-exclusive-gate-child accepts no arguments"
+        );
+        return Ok(BenchmarkCommand::AbExclusiveGateChild);
+    }
+    if first == "ab-retained-child" {
+        anyhow::ensure!(
+            values.next().is_none(),
+            "ab-retained-child accepts no arguments"
+        );
+        return Ok(BenchmarkCommand::AbRetainedChild);
+    }
+    if first == "ab-replay-command" {
+        let mode = values.next().context("ab-replay-command requires a mode")?;
+        let paths = values.map(PathBuf::from).collect::<Vec<_>>();
+        anyhow::ensure!(
+            !paths.is_empty(),
+            "ab-replay-command requires at least one path"
+        );
+        return Ok(BenchmarkCommand::AbReplayCommand { mode, paths });
+    }
     parse_synthetic_args_from(std::iter::once(first).chain(values)).map(BenchmarkCommand::Synthetic)
+}
+
+fn parse_flag_once<T>(
+    slot: &mut Option<T>,
+    flag: &str,
+    parse_value: impl FnOnce() -> Result<T>,
+) -> Result<()> {
+    anyhow::ensure!(slot.is_none(), "{flag} supplied more than once");
+    *slot = Some(parse_value()?);
+    Ok(())
+}
+
+fn parse_ab_import_report_args_from(
+    values: impl IntoIterator<Item = String>,
+) -> Result<BenchmarkCommand> {
+    let mut report = None;
+    let mut repo = None;
+    let mut values = values.into_iter();
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--report" => {
+                parse_flag_once(&mut report, "--report", || {
+                    Ok(PathBuf::from(values.next().context("missing report path")?))
+                })?;
+            }
+            "--repo" => {
+                parse_flag_once(&mut repo, "--repo", || {
+                    Ok(PathBuf::from(values.next().context("missing repo path")?))
+                })?;
+            }
+            other => anyhow::bail!("unknown ab-import-report argument `{other}`"),
+        }
+    }
+    Ok(BenchmarkCommand::AbImportReport(AbImportReportArgs {
+        report: report.context("ab-import-report requires --report <path>")?,
+        repo: repo.unwrap_or_else(|| PathBuf::from(".")),
+    }))
+}
+
+fn parse_ab_capture_args_from(
+    values: impl IntoIterator<Item = String>,
+) -> Result<BenchmarkCommand> {
+    let mut repo = None;
+    let mut state = None;
+    let mut values = values.into_iter();
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--repo" => parse_flag_once(&mut repo, "--repo", || {
+                Ok(PathBuf::from(values.next().context("missing repo path")?))
+            })?,
+            "--state" => parse_flag_once(&mut state, "--state", || {
+                Ok(PathBuf::from(values.next().context("missing state path")?))
+            })?,
+            other => anyhow::bail!("unknown ab-capture argument `{other}`"),
+        }
+    }
+    Ok(BenchmarkCommand::AbCapture(AbCaptureArgs {
+        repo: repo.unwrap_or_else(|| PathBuf::from(".")),
+        state: state.context("ab-capture requires --state <path>")?,
+    }))
+}
+
+fn parse_ab_prepare_args_from(
+    values: impl IntoIterator<Item = String>,
+) -> Result<BenchmarkCommand> {
+    let mut state = None;
+    let mut candidate_repo = None;
+    let mut work_root = None;
+    let mut manifest = None;
+    let mut baseline_target_dir = None;
+    let mut candidate_target_dir = None;
+    let mut reuse_work_root = None;
+    let mut values = values.into_iter();
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--state" => parse_flag_once(&mut state, "--state", || {
+                Ok(PathBuf::from(values.next().context("missing state path")?))
+            })?,
+            "--candidate-repo" => {
+                parse_flag_once(&mut candidate_repo, "--candidate-repo", || {
+                    Ok(PathBuf::from(
+                        values.next().context("missing candidate repo path")?,
+                    ))
+                })?;
+            }
+            "--work-root" => {
+                parse_flag_once(&mut work_root, "--work-root", || {
+                    Ok(PathBuf::from(values.next().context("missing work root")?))
+                })?;
+            }
+            "--manifest" => {
+                parse_flag_once(&mut manifest, "--manifest", || {
+                    Ok(PathBuf::from(
+                        values.next().context("missing manifest path")?,
+                    ))
+                })?;
+            }
+            "--baseline-target-dir" => {
+                parse_flag_once(&mut baseline_target_dir, "--baseline-target-dir", || {
+                    Ok(PathBuf::from(
+                        values.next().context("missing baseline target directory")?,
+                    ))
+                })?;
+            }
+            "--candidate-target-dir" => {
+                parse_flag_once(&mut candidate_target_dir, "--candidate-target-dir", || {
+                    Ok(PathBuf::from(
+                        values
+                            .next()
+                            .context("missing candidate target directory")?,
+                    ))
+                })?;
+            }
+            "--reuse-work-root" => {
+                parse_flag_once(&mut reuse_work_root, "--reuse-work-root", || Ok(()))?;
+            }
+            other => anyhow::bail!("unknown ab-prepare argument `{other}`"),
+        }
+    }
+    anyhow::ensure!(
+        baseline_target_dir.is_some() == candidate_target_dir.is_some(),
+        "ab-prepare requires --baseline-target-dir and --candidate-target-dir together"
+    );
+    Ok(BenchmarkCommand::AbPrepare(AbPrepareArgs {
+        state: state.context("ab-prepare requires --state <path>")?,
+        candidate_repo: candidate_repo.unwrap_or_else(|| PathBuf::from(".")),
+        work_root: work_root.context("ab-prepare requires --work-root <path>")?,
+        manifest: manifest.context("ab-prepare requires --manifest <path>")?,
+        baseline_target_dir,
+        candidate_target_dir,
+        reuse_work_root: reuse_work_root.is_some(),
+    }))
+}
+
+fn parse_ab_compare_args_from(
+    values: impl IntoIterator<Item = String>,
+) -> Result<BenchmarkCommand> {
+    let mut manifest = None;
+    let mut report = None;
+    let mut profile = None;
+    let mut requested_workloads = Vec::new();
+    let mut values = values.into_iter();
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--manifest" => {
+                parse_flag_once(&mut manifest, "--manifest", || {
+                    Ok(PathBuf::from(
+                        values.next().context("missing manifest path")?,
+                    ))
+                })?;
+            }
+            "--report" => {
+                parse_flag_once(&mut report, "--report", || {
+                    Ok(PathBuf::from(values.next().context("missing report path")?))
+                })?;
+            }
+            "--profile" => {
+                parse_flag_once(&mut profile, "--profile", || {
+                    AbExecutionProfile::parse(&values.next().context("missing execution profile")?)
+                })?;
+            }
+            "--workload" => {
+                let workload = AbWorkload::parse(&values.next().context("missing workload")?)?;
+                anyhow::ensure!(
+                    !requested_workloads.contains(&workload),
+                    "duplicate A/B workload selection `{}`",
+                    workload.name()
+                );
+                requested_workloads.push(workload);
+            }
+            other => anyhow::bail!("unknown ab-compare argument `{other}`"),
+        }
+    }
+    let profile = profile.context("ab-compare requires --profile <quick|batch|final|replay>")?;
+    ab_profile_workloads(profile, &requested_workloads)?;
+    Ok(BenchmarkCommand::AbCompare(AbCompareArgs {
+        manifest: manifest.context("ab-compare requires --manifest <path>")?,
+        report: report.context("ab-compare requires --report <path>")?,
+        profile,
+        requested_workloads,
+    }))
+}
+
+fn parse_ab_worker_args_from(values: impl IntoIterator<Item = String>) -> Result<BenchmarkCommand> {
+    let mut code_mode_host = None;
+    let mut variant = None;
+    let mut cluster = None;
+    let mut workload = None;
+    let mut warmups = None;
+    let mut samples = None;
+    let mut values = values.into_iter();
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--code-mode-host" => {
+                parse_flag_once(&mut code_mode_host, "--code-mode-host", || {
+                    Ok(PathBuf::from(
+                        values.next().context("missing code mode host path")?,
+                    ))
+                })?;
+            }
+            "--variant" => parse_flag_once(&mut variant, "--variant", || {
+                values.next().context("missing variant")
+            })?,
+            "--cluster" => {
+                parse_flag_once(&mut cluster, "--cluster", || {
+                    Ok(values.next().context("missing cluster")?.parse::<usize>()?)
+                })?;
+            }
+            "--workload" => {
+                parse_flag_once(&mut workload, "--workload", || {
+                    AbWorkload::parse(&values.next().context("missing workload")?)
+                })?;
+            }
+            "--warmups" => {
+                parse_flag_once(&mut warmups, "--warmups", || {
+                    Ok(values.next().context("missing warmups")?.parse::<usize>()?)
+                })?;
+            }
+            "--samples" => {
+                parse_flag_once(&mut samples, "--samples", || {
+                    Ok(values.next().context("missing samples")?.parse::<usize>()?)
+                })?;
+            }
+            other => anyhow::bail!("unknown ab-worker argument `{other}`"),
+        }
+    }
+    let variant = variant.context("ab-worker requires --variant <A|B>")?;
+    anyhow::ensure!(
+        variant == "A" || variant == "B",
+        "worker variant must be A or B"
+    );
+    let cluster = cluster.context("ab-worker requires --cluster <n>")?;
+    anyhow::ensure!(cluster > 0, "worker cluster is out of range");
+    let warmups = warmups.context("ab-worker requires --warmups <n>")?;
+    let samples = samples.context("ab-worker requires --samples <n>")?;
+    let workload = workload.context("ab-worker requires --workload <name>")?;
+    anyhow::ensure!(samples > 0, "worker samples must be positive");
+    Ok(BenchmarkCommand::AbWorker(AbWorkerArgs {
+        code_mode_host: code_mode_host.context("ab-worker requires --code-mode-host <path>")?,
+        variant,
+        cluster,
+        workload,
+        warmups,
+        samples,
+    }))
 }
 
 fn parse_code_mode_args_from(values: impl IntoIterator<Item = String>) -> Result<BenchmarkCommand> {
@@ -872,10 +1228,11 @@ fn parse_code_mode_args_from(values: impl IntoIterator<Item = String>) -> Result
     while let Some(flag) = values.next() {
         match flag.as_str() {
             "--code-mode-host" => {
-                anyhow::ensure!(host.is_none(), "--code-mode-host supplied more than once");
-                host = Some(PathBuf::from(
-                    values.next().context("missing code-mode host path")?,
-                ));
+                parse_flag_once(&mut host, "--code-mode-host", || {
+                    Ok(PathBuf::from(
+                        values.next().context("missing code-mode host path")?,
+                    ))
+                })?;
             }
             other => anyhow::bail!(
                 "unknown code-mode-turn argument `{other}`; the workload is fixed and accepts only --code-mode-host <existing executable>"
@@ -888,185 +1245,91 @@ fn parse_code_mode_args_from(values: impl IntoIterator<Item = String>) -> Result
 }
 
 fn parse_synthetic_args_from(values: impl IntoIterator<Item = String>) -> Result<Args> {
-    let mut args = Args {
-        scenario: None,
-        mode: None,
-        iterations: DEFAULT_ITERATIONS,
-        warmups: DEFAULT_WARMUPS,
-        clusters: DEFAULT_CLUSTERS,
-        absolute_margin_ms: 3.0,
-        relative_margin: 0.03,
-    };
+    let mut scenario = None;
+    let mut mode = None;
+    let mut iterations = None;
+    let mut warmups = None;
+    let mut clusters = None;
+    let mut absolute_margin_ms = None;
+    let mut relative_margin = None;
     let mut values = values.into_iter();
     while let Some(flag) = values.next() {
         match flag.as_str() {
             "--scenario" => {
-                args.scenario = Some(match values.next().context("missing scenario")?.as_str() {
-                    "deterministic" => Scenario::Deterministic,
-                    "loopback-websocket" => Scenario::LoopbackWebsocket,
-                    "persistence" => Scenario::Persistence,
-                    "windows-executor" => Scenario::WindowsExecutor,
-                    other => anyhow::bail!("unknown scenario `{other}`"),
-                });
+                parse_flag_once(&mut scenario, "--scenario", || {
+                    Ok(match values.next().context("missing scenario")?.as_str() {
+                        "deterministic" => Scenario::Deterministic,
+                        "loopback-websocket" => Scenario::LoopbackWebsocket,
+                        "persistence" => Scenario::Persistence,
+                        "windows-executor" => Scenario::WindowsExecutor,
+                        other => anyhow::bail!("unknown scenario `{other}`"),
+                    })
+                })?;
             }
             "--mode" => {
-                args.mode = Some(match values.next().context("missing mode")?.as_str() {
-                    "cold" => Mode::Cold,
-                    "warm" => Mode::Warm,
-                    other => anyhow::bail!("unknown mode `{other}`"),
-                });
+                parse_flag_once(&mut mode, "--mode", || {
+                    Ok(match values.next().context("missing mode")?.as_str() {
+                        "cold" => Mode::Cold,
+                        "warm" => Mode::Warm,
+                        other => anyhow::bail!("unknown mode `{other}`"),
+                    })
+                })?;
             }
             "--iterations" => {
-                args.iterations = values.next().context("missing iterations")?.parse()?
+                parse_flag_once(&mut iterations, "--iterations", || {
+                    Ok(values.next().context("missing iterations")?.parse()?)
+                })?;
             }
-            "--warmups" => args.warmups = values.next().context("missing warmups")?.parse()?,
-            "--clusters" => args.clusters = values.next().context("missing clusters")?.parse()?,
+            "--warmups" => {
+                parse_flag_once(&mut warmups, "--warmups", || {
+                    Ok(values.next().context("missing warmups")?.parse()?)
+                })?;
+            }
+            "--clusters" => {
+                parse_flag_once(&mut clusters, "--clusters", || {
+                    Ok(values.next().context("missing clusters")?.parse()?)
+                })?;
+            }
             "--absolute-margin-ms" => {
-                args.absolute_margin_ms =
-                    values.next().context("missing absolute margin")?.parse()?
+                parse_flag_once(&mut absolute_margin_ms, "--absolute-margin-ms", || {
+                    Ok(values.next().context("missing absolute margin")?.parse()?)
+                })?;
             }
             "--relative-margin" => {
-                args.relative_margin = values.next().context("missing relative margin")?.parse()?
+                parse_flag_once(&mut relative_margin, "--relative-margin", || {
+                    Ok(values.next().context("missing relative margin")?.parse()?)
+                })?;
             }
-            "--reliability" => args.iterations = RELIABILITY_ITERATIONS,
+            "--reliability" => parse_flag_once(&mut iterations, "--reliability", || {
+                Ok(RELIABILITY_ITERATIONS)
+            })?,
             other => anyhow::bail!("unknown argument `{other}`"),
         }
     }
+    let args = Args {
+        scenario,
+        mode,
+        iterations: iterations.unwrap_or(DEFAULT_ITERATIONS),
+        warmups: warmups.unwrap_or(DEFAULT_WARMUPS),
+        clusters: clusters.unwrap_or(DEFAULT_CLUSTERS),
+        absolute_margin_ms: absolute_margin_ms.unwrap_or(3.0),
+        relative_margin: relative_margin.unwrap_or(0.03),
+    };
     anyhow::ensure!(args.iterations > 0, "iterations must be positive");
     anyhow::ensure!(args.clusters > 0, "clusters must be positive");
+    anyhow::ensure!(
+        args.absolute_margin_ms.is_finite() && args.absolute_margin_ms >= 0.0,
+        "absolute margin must be finite and non-negative"
+    );
+    anyhow::ensure!(
+        args.relative_margin.is_finite() && args.relative_margin >= 0.0,
+        "relative margin must be finite and non-negative"
+    );
     Ok(args)
 }
 
 #[cfg(test)]
 #[allow(dead_code, unused_imports)]
 mod tests {
-    use super::*;
-
-    fn strings(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_string()).collect()
-    }
-
-    #[test]
-    fn code_mode_command_has_one_fixed_configuration() {
-        let command = parse_command_from(strings(&[
-            "code-mode-turn",
-            "--code-mode-host",
-            "code-mode-host",
-        ]))
-        .expect("fixed code-mode command should parse");
-
-        let BenchmarkCommand::CodeModeCapture { host } = command else {
-            panic!("expected code-mode capture command");
-        };
-        assert_eq!(host, PathBuf::from("code-mode-host"));
-
-        let error = parse_command_from(strings(&[
-            "code-mode-turn",
-            "--code-mode-host",
-            "code-mode-host",
-            "--mode",
-            "warm",
-        ]))
-        .expect_err("generic mode must not be part of code-mode capture");
-        assert!(error.to_string().contains("workload is fixed"));
-    }
-
-    #[test]
-    fn synthetic_scenarios_do_not_include_code_mode_capture() {
-        let command = parse_command_from(strings(&["--scenario", "deterministic"]))
-            .expect("synthetic command should parse");
-        let BenchmarkCommand::Synthetic(args) = command else {
-            panic!("expected synthetic command");
-        };
-        assert_eq!(args.scenario, Some(Scenario::Deterministic));
-
-        let error = parse_command_from(strings(&["--scenario", "code-mode-turn"]))
-            .expect_err("code mode must use its dedicated command");
-        assert!(error.to_string().contains("unknown scenario"));
-    }
-
-    #[test]
-    fn code_mode_capture_report_has_no_local_ab_gate() {
-        let samples = vec![Sample {
-            duration_ns: 1_000_000,
-            ..Sample::default()
-        }];
-        let report = code_mode_capture_report(vec![CodeModeClusterReport {
-            cluster: 1,
-            capture: summarize(&samples),
-            samples,
-        }]);
-        let value = serde_json::to_value(report).expect("capture report should serialize");
-
-        assert_eq!(value["schema_version"], 4);
-        assert_eq!(value["scenario"], "code_mode_turn");
-        assert!(value["clusters"][0].get("capture").is_some());
-        for paired_field in [
-            "baseline",
-            "candidate",
-            "non_inferiority",
-            "baseline_samples",
-            "candidate_samples",
-        ] {
-            assert!(value["clusters"][0].get(paired_field).is_none());
-        }
-    }
-
-    #[test]
-    fn ready_to_sample_dispatch_gate_rejects_multi_second_stalls() {
-        assert!(!ready_to_sample_dispatch_gate_passes(None));
-        assert!(!ready_to_sample_dispatch_gate_passes(Some(
-            5_000_000_000_u64
-        )));
-        assert!(ready_to_sample_dispatch_gate_passes(Some(500_000_000_u64)));
-    }
-
-    #[test]
-    fn code_mode_workload_dispatches_exactly_one_nested_tool() {
-        assert_eq!(
-            CODE_MODE_NESTED_DISPATCH_SOURCE
-                .matches("tools.update_plan")
-                .count(),
-            1
-        );
-        assert!(CODE_MODE_NESTED_DISPATCH_SOURCE.contains("dispatched"));
-        assert!(!CODE_MODE_NESTED_DISPATCH_SOURCE.contains("completed"));
-    }
-
-    #[tokio::test]
-    async fn deterministic_cache_hit_reuses_the_cached_serialization() {
-        let mut state = ScenarioState::new().expect("scenario state should initialize");
-        let (_, _, first_cache_hits) = deterministic_sample(Variant::Candidate, &mut state)
-            .await
-            .expect("cold candidate sample should succeed");
-        assert_eq!(first_cache_hits, 0);
-
-        state.serialized_schema = Some(vec![0; 7]);
-        let (_, serialized_bytes, second_cache_hits) =
-            deterministic_sample(Variant::Candidate, &mut state)
-                .await
-                .expect("warm candidate sample should succeed");
-
-        assert_eq!(serialized_bytes, 7);
-        assert_eq!(second_cache_hits, 1);
-    }
-
-    #[test]
-    fn non_empty_samples_drive_summary_and_non_inferiority_statistics() {
-        let baseline = [Sample {
-            duration_ns: 1_000_000,
-            sampling_requests: 2,
-            ..Sample::default()
-        }];
-        let candidate = baseline;
-
-        let summary = summarize(&baseline);
-        let gate = non_inferiority(&baseline, &candidate, 0.0, 0.0);
-
-        assert_eq!(summary.median_ms, 1.0);
-        assert_eq!(summary.failure_rate, 0.0);
-        assert_eq!(gate.absolute_regression_ucb_ms, 0.0);
-        assert_eq!(gate.relative_regression_ucb, 0.0);
-        assert!(gate.passed);
-    }
+    include!("turn_latency/tests.rs");
 }

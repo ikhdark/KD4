@@ -64,7 +64,7 @@ impl<T: HttpTransport> ImagesClient<T> {
             .map_err(|e| ApiError::Stream(format!("failed to encode {operation} request: {e}")))?;
         let resp = self
             .session
-            .execute(Method::POST, path, extra_headers, Some(body))
+            .execute_non_idempotent(Method::POST, path, extra_headers, Some(body))
             .await?;
         serde_json::from_slice(&resp.body)
             .map_err(|e| ApiError::Stream(format!("failed to decode {operation} response: {e}")))
@@ -89,6 +89,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     #[derive(Clone, Default)]
@@ -121,6 +123,63 @@ mod tests {
                 headers: HeaderMap::new(),
                 body: self.response_body.as_ref().clone().into(),
             })
+        }
+
+        async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError> {
+            Err(TransportError::Build("stream should not run".to_string()))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RetryProbeFailure {
+        Network,
+        Timeout,
+        Http5xx,
+        PreDispatchThenSuccess,
+    }
+
+    #[derive(Clone)]
+    struct RetryProbeTransport {
+        attempts: Arc<AtomicUsize>,
+        failure: RetryProbeFailure,
+    }
+
+    impl RetryProbeTransport {
+        fn new(failure: RetryProbeFailure) -> Self {
+            Self {
+                attempts: Arc::new(AtomicUsize::new(0)),
+                failure,
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl HttpTransport for RetryProbeTransport {
+        async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            match self.failure {
+                RetryProbeFailure::Network => Err(TransportError::Network(
+                    "ambiguous socket failure".to_string(),
+                )),
+                RetryProbeFailure::Timeout => Err(TransportError::Timeout),
+                RetryProbeFailure::Http5xx => Err(TransportError::Http {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    url: None,
+                    headers: None,
+                    body: None,
+                }),
+                RetryProbeFailure::PreDispatchThenSuccess if attempt == 0 => Err(
+                    TransportError::PreDispatch("temporary auth lookup failure".to_string()),
+                ),
+                RetryProbeFailure::PreDispatchThenSuccess => Ok(Response {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    body: response_body().into(),
+                }),
+            }
         }
 
         async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError> {
@@ -296,5 +355,96 @@ mod tests {
             message.starts_with("failed to decode image generation response: missing field `data`"),
             "{message}"
         );
+    }
+
+    #[tokio::test]
+    async fn image_generation_and_edit_retry_only_proven_pre_dispatch_failures() {
+        for failure in [
+            RetryProbeFailure::Network,
+            RetryProbeFailure::Timeout,
+            RetryProbeFailure::Http5xx,
+        ] {
+            for edit in [false, true] {
+                let transport = RetryProbeTransport::new(failure);
+                let client = ImagesClient::new(transport.clone(), provider(), Arc::new(DummyAuth));
+
+                let result = if edit {
+                    client
+                        .edit(
+                            &ImageEditRequest {
+                                images: vec![ImageUrl {
+                                    image_url: "data:image/png;base64,Zm9v".to_string(),
+                                }],
+                                prompt: "add a red hat".to_string(),
+                                background: None,
+                                model: "gpt-image-1.5".to_string(),
+                                n: None,
+                                quality: None,
+                                size: None,
+                            },
+                            HeaderMap::new(),
+                        )
+                        .await
+                } else {
+                    client
+                        .generate(
+                            &ImageGenerationRequest {
+                                prompt: "a red fox in a field".to_string(),
+                                background: None,
+                                model: "gpt-image-1.5".to_string(),
+                                n: None,
+                                quality: None,
+                                size: None,
+                            },
+                            HeaderMap::new(),
+                        )
+                        .await
+                };
+
+                assert!(result.is_err());
+                assert_eq!(transport.attempts(), 1);
+            }
+        }
+
+        for edit in [false, true] {
+            let transport = RetryProbeTransport::new(RetryProbeFailure::PreDispatchThenSuccess);
+            let client = ImagesClient::new(transport.clone(), provider(), Arc::new(DummyAuth));
+
+            let result = if edit {
+                client
+                    .edit(
+                        &ImageEditRequest {
+                            images: vec![ImageUrl {
+                                image_url: "data:image/png;base64,Zm9v".to_string(),
+                            }],
+                            prompt: "add a red hat".to_string(),
+                            background: None,
+                            model: "gpt-image-1.5".to_string(),
+                            n: None,
+                            quality: None,
+                            size: None,
+                        },
+                        HeaderMap::new(),
+                    )
+                    .await
+            } else {
+                client
+                    .generate(
+                        &ImageGenerationRequest {
+                            prompt: "a red fox in a field".to_string(),
+                            background: None,
+                            model: "gpt-image-1.5".to_string(),
+                            n: None,
+                            quality: None,
+                            size: None,
+                        },
+                        HeaderMap::new(),
+                    )
+                    .await
+            };
+
+            assert!(result.is_ok());
+            assert_eq!(transport.attempts(), 2);
+        }
     }
 }

@@ -140,15 +140,15 @@ pub(super) fn completion_state(
     scope: &mut v8::PinScope<'_, '_>,
     pending_promise: Option<&v8::Global<v8::Promise>>,
 ) -> CompletionState {
-    let stored_value_writes = scope
+    let (stored_value_writes, stored_value_limit_error) = scope
         .get_slot::<RuntimeState>()
-        .map(|state| state.stored_value_writes.clone())
+        .map(RuntimeState::stored_value_completion)
         .unwrap_or_default();
 
     let Some(pending_promise) = pending_promise else {
         return CompletionState::Completed {
             stored_value_writes,
-            error_text: None,
+            error_text: stored_value_limit_error,
         };
     };
 
@@ -157,7 +157,7 @@ pub(super) fn completion_state(
         v8::PromiseState::Pending => CompletionState::Pending,
         v8::PromiseState::Fulfilled => CompletionState::Completed {
             stored_value_writes,
-            error_text: None,
+            error_text: stored_value_limit_error,
         },
         v8::PromiseState::Rejected => {
             let result = promise.result(scope);
@@ -168,7 +168,7 @@ pub(super) fn completion_state(
             };
             CompletionState::Completed {
                 stored_value_writes,
-                error_text,
+                error_text: stored_value_limit_error.or(error_text),
             }
         }
     }

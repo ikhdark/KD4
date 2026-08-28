@@ -11,7 +11,7 @@ use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
-// macOS arm64 and Windows CI can spend tens of seconds in app-server
+// Windows CI can spend tens of seconds in app-server
 // startup before the initialize response or fuzzy-search notifications arrive.
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);

@@ -10,8 +10,9 @@ use std::time::Instant;
 use codex_agent_task_store::AgentTask;
 use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::ValidationCallStatus;
-use codex_agent_task_store::ValidationProofKind;
 use codex_features::Feature;
+use codex_models_manager::manager::RefreshStrategy;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -87,7 +88,6 @@ use crate::task_evidence::sha256_file;
 use crate::task_evidence::source_classification_cache_key;
 use crate::task_evidence::source_local_classification_is_valid_for_source;
 use crate::task_evidence::source_local_classifications_with_manifest_gaps;
-use crate::turn_diff_tracker::ValidationFreshnessStatus;
 
 const REVIEW_DEADLINE: Duration = Duration::from_secs(90);
 const REVIEW_CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
@@ -97,6 +97,117 @@ const MAX_REVIEW_FINDINGS: usize = 32;
 const MAX_REVIEW_REQUIREMENTS: usize = 256;
 const AUTHORITATIVE_MUTATION_EVIDENCE_LIMIT: usize = 100;
 const AUTHORITATIVE_BINDING_READ_CONCURRENCY: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompletionTerminalKind {
+    Candidate,
+    Completed,
+    RequiredTool,
+    Aborted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CompletionScope {
+    reviewer_enabled: bool,
+    root_agent: bool,
+    review_subagent: bool,
+    evidence_enabled: bool,
+    terminal_kind: CompletionTerminalKind,
+}
+
+impl CompletionScope {
+    pub(crate) fn candidate(turn_context: &TurnContext, evidence_enabled: bool) -> Self {
+        Self::from_facts(
+            turn_context
+                .config
+                .features
+                .enabled(Feature::TaskCompletionReviewer),
+            !turn_context.session_source.is_non_root_agent(),
+            matches!(
+                turn_context.session_source,
+                SessionSource::SubAgent(SubAgentSource::Review)
+            ),
+            evidence_enabled,
+            CompletionTerminalKind::Candidate,
+        )
+    }
+
+    pub(crate) fn terminal(
+        turn_context: &TurnContext,
+        evidence_enabled: bool,
+        aborted: bool,
+        required_tool_terminal: bool,
+    ) -> Self {
+        let terminal_kind = if aborted {
+            CompletionTerminalKind::Aborted
+        } else if required_tool_terminal {
+            CompletionTerminalKind::RequiredTool
+        } else {
+            CompletionTerminalKind::Completed
+        };
+        Self::from_facts(
+            turn_context
+                .config
+                .features
+                .enabled(Feature::TaskCompletionReviewer),
+            !turn_context.session_source.is_non_root_agent(),
+            matches!(
+                turn_context.session_source,
+                SessionSource::SubAgent(SubAgentSource::Review)
+            ),
+            evidence_enabled,
+            terminal_kind,
+        )
+    }
+
+    fn from_facts(
+        reviewer_enabled: bool,
+        root_agent: bool,
+        review_subagent: bool,
+        evidence_enabled: bool,
+        terminal_kind: CompletionTerminalKind,
+    ) -> Self {
+        Self {
+            reviewer_enabled,
+            root_agent,
+            review_subagent,
+            evidence_enabled,
+            terminal_kind,
+        }
+    }
+
+    pub(crate) fn candidate_evidence_in_scope(self) -> bool {
+        self.terminal_kind == CompletionTerminalKind::Candidate
+            && !self.review_subagent
+            && self.evidence_enabled
+    }
+
+    pub(crate) fn is_review_subagent(self) -> bool {
+        self.review_subagent
+    }
+
+    pub(crate) fn reviewer_enabled(self) -> bool {
+        self.reviewer_enabled
+    }
+
+    pub(crate) fn terminal_review_gate_in_scope(self) -> bool {
+        self.terminal_kind == CompletionTerminalKind::Completed && self.reviewer_enabled
+    }
+
+    pub(crate) fn typed_quiescence_in_scope(self) -> bool {
+        self.terminal_kind != CompletionTerminalKind::Aborted && self.root_agent
+    }
+
+    pub(crate) fn final_proof_in_scope(self) -> bool {
+        self.terminal_kind == CompletionTerminalKind::Completed
+            && self.root_agent
+            && self.evidence_enabled
+    }
+
+    pub(crate) fn passed_root_completion_in_scope(self) -> bool {
+        self.terminal_kind == CompletionTerminalKind::Completed && self.root_agent
+    }
+}
 
 const SOURCE_CLASSIFICATION_MARKER: &str = "KD4_SOURCE_CLASSIFICATION_REQUEST_V1";
 const SOURCE_LOCAL_CLASSIFICATION_MARKER: &str = "KD4_SOURCE_LOCAL_CLASSIFICATION_REQUEST_V4";
@@ -164,6 +275,7 @@ struct EvidenceReconciliation {
 enum EvidenceReconciliationAction {
     Continue,
     Inject,
+    Unavailable,
     Exhausted,
 }
 
@@ -171,6 +283,7 @@ fn evidence_reconciliation_action(
     dossier: &CompletionReviewDossier,
     pending_lineage: bool,
     already_injected: bool,
+    repair_follow_up_available: bool,
 ) -> EvidenceReconciliationAction {
     if pending_lineage {
         return EvidenceReconciliationAction::Continue;
@@ -182,10 +295,17 @@ fn evidence_reconciliation_action(
         && dossier.evidence_gate.status == TaskCompletionStatus::Partial
         && !dossier.locally_obtainable_proof_routes.is_empty()
     {
-        return EvidenceReconciliationAction::Inject;
+        return if repair_follow_up_available {
+            EvidenceReconciliationAction::Inject
+        } else {
+            EvidenceReconciliationAction::Unavailable
+        };
     }
     EvidenceReconciliationAction::Continue
 }
+
+const REPAIR_FOLLOW_UP_UNAVAILABLE_REASON: &str =
+    "completion review found repair work after the regular generation budget was exhausted";
 
 impl ContextualUserFragment for EvidenceReconciliation {
     fn role(&self) -> &'static str {
@@ -353,8 +473,6 @@ impl ReviewAdmissionDecision {
 pub(crate) struct CompletionReviewTurnEvidence {
     pub(crate) exact_diff: Option<String>,
     pub(crate) mutation_revision: u64,
-    pub(crate) validation_freshness: ValidationFreshnessStatus,
-    pub(crate) last_successful_validation_revision: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1034,16 +1152,17 @@ fn disable_reviewer_features(config: &mut Config) -> Result<(), ()> {
 
 async fn build_reviewer_config(
     turn_context: &TurnContext,
+    models_manager: &SharedModelsManager,
     requires_images: bool,
-) -> Result<Config, ()> {
+) -> Result<Config, ReviewFailureCategory> {
     let mut config = turn_context.config.as_ref().clone();
     if !config.agent_roles.contains_key("reviewer") {
-        return Err(());
+        return Err(ReviewFailureCategory::UnsupportedConfiguration);
     }
     let inherited_model_provider = config.model_provider.clone();
     apply_role_to_config(&mut config, Some("reviewer"))
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| ReviewFailureCategory::UnsupportedConfiguration)?;
     config.model_provider = inherited_model_provider;
     if requires_images {
         config.model = Some(turn_context.model_info.slug.clone());
@@ -1067,13 +1186,30 @@ async fn build_reviewer_config(
     config
         .permissions
         .set_permission_profile(PermissionProfile::read_only())
-        .map_err(|_| ())?;
+        .map_err(|_| ReviewFailureCategory::UnsupportedConfiguration)?;
     config
         .web_search_mode
         .set(WebSearchMode::Disabled)
-        .map_err(|_| ())?;
-    config.mcp_servers.set(HashMap::new()).map_err(|_| ())?;
-    disable_reviewer_features(&mut config)?;
+        .map_err(|_| ReviewFailureCategory::UnsupportedConfiguration)?;
+    config
+        .mcp_servers
+        .set(HashMap::new())
+        .map_err(|_| ReviewFailureCategory::UnsupportedConfiguration)?;
+    disable_reviewer_features(&mut config)
+        .map_err(|_| ReviewFailureCategory::UnsupportedConfiguration)?;
+    let resolved_model = models_manager
+        .get_default_model(
+            &config.model,
+            /*allow_provider_model_fallback*/ false,
+            RefreshStrategy::Offline,
+            config.http_client_factory(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to resolve completion reviewer model");
+            ReviewFailureCategory::SpawnModel
+        })?;
+    config.model = Some(resolved_model);
     Ok(config)
 }
 
@@ -1127,9 +1263,15 @@ async fn run_reviewer_once(
             UserInput::Image { .. } | UserInput::LocalImage { .. }
         )
     });
-    let subconfig = match build_reviewer_config(turn_context.as_ref(), requires_images).await {
+    let subconfig = match build_reviewer_config(
+        turn_context.as_ref(),
+        &sess.services.models_manager,
+        requires_images,
+    )
+    .await
+    {
         Ok(config) => config,
-        Err(()) => return ReviewerExecution::failed(ReviewFailureCategory::SpawnModel),
+        Err(_) => return ReviewerExecution::failed(ReviewFailureCategory::SpawnModel),
     };
     let schema = match kind {
         ReviewerRequestKind::Classification => source_classification_schema(),
@@ -1512,8 +1654,6 @@ fn review_dossier_json(
         &CompletionReviewTurnEvidence {
             exact_diff: None,
             mutation_revision: dossier.host_mutation_revision,
-            validation_freshness: ValidationFreshnessStatus::None,
-            last_successful_validation_revision: None,
         },
     )
     .unwrap_or_else(|_| "{}".to_string())
@@ -1549,9 +1689,7 @@ fn bounded_review_dossier_json(
     }
     let validation_summary = json!({
         "ordinary_gate": dossier.evidence_gate,
-        "freshness": format!("{:?}", turn_evidence.validation_freshness),
         "mutation_revision": turn_evidence.mutation_revision,
-        "last_successful_validation_revision": turn_evidence.last_successful_validation_revision,
         "focused_receipts": dossier.reviewer_visible_evidence.get("proofReceipts"),
         "external_evidence": dossier.reviewer_visible_evidence.get("externalEvidence"),
     });
@@ -2952,10 +3090,7 @@ fn review_admission_decision_for_source(
         .as_deref()
         .is_some_and(|diff| !diff.trim().is_empty());
     let has_mutations = dossier.has_task_attributed_mutations || has_turn_diff;
-    let fresh_validation = turn_evidence.validation_freshness
-        == ValidationFreshnessStatus::PassedAfterLastMutation
-        && turn_evidence.last_successful_validation_revision
-            == Some(turn_evidence.mutation_revision);
+    let fresh_validation = dossier.evidence_gate.status == TaskCompletionStatus::Passed;
     let deterministic_completion_evidence_sufficient = dossier.mappings_classified
         && dossier.source_classification_current
         && dossier.relationship_resolution_current
@@ -2967,8 +3102,7 @@ fn review_admission_decision_for_source(
         && dossier.evidence_gate.status == TaskCompletionStatus::Passed
         && dossier.authoritative_input_errors.is_empty()
         && dossier.typed_quiescent
-        && dossier.default_children_quiescent
-        && (!has_mutations || fresh_validation);
+        && dossier.default_children_quiescent;
     if !deterministic_completion_evidence_sufficient {
         return ReviewAdmissionDecision::Admit;
     }
@@ -3124,6 +3258,7 @@ pub(crate) async fn coordinate_completion_review(
     cancellation_token: &CancellationToken,
     turn_evidence: &CompletionReviewTurnEvidence,
     candidate_completion: Option<&str>,
+    repair_follow_up_available: bool,
     state: &mut CompletionReviewState,
 ) -> CodexResult<CompletionReviewCoordinatorOutcome> {
     state.record_current_phase(turn_context.turn_timing_state.as_ref());
@@ -3133,6 +3268,7 @@ pub(crate) async fn coordinate_completion_review(
         cancellation_token,
         turn_evidence,
         candidate_completion,
+        repair_follow_up_available,
         state,
     )
     .await;
@@ -3146,29 +3282,27 @@ async fn coordinate_completion_review_inner(
     cancellation_token: &CancellationToken,
     turn_evidence: &CompletionReviewTurnEvidence,
     candidate_completion: Option<&str>,
+    repair_follow_up_available: bool,
     state: &mut CompletionReviewState,
 ) -> CodexResult<CompletionReviewCoordinatorOutcome> {
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
-    if matches!(
-        &turn_context.session_source,
-        SessionSource::SubAgent(SubAgentSource::Review)
-    ) {
+    let completion_scope = CompletionScope::candidate(
+        turn_context.as_ref(),
+        sess.services.task_evidence.allows_kd4_completion(),
+    );
+    if completion_scope.is_review_subagent() {
         state.phase = TurnReviewPhase::Terminal;
         return Ok(CompletionReviewCoordinatorOutcome::default());
     }
-    if !sess.services.task_evidence.allows_kd4_completion() {
+    if !completion_scope.candidate_evidence_in_scope() {
         return Ok(CompletionReviewCoordinatorOutcome::default());
     }
     if state.phase == TurnReviewPhase::Terminal {
         return Ok(CompletionReviewCoordinatorOutcome::default());
     }
-    if !turn_context
-        .config
-        .features
-        .enabled(Feature::TaskCompletionReviewer)
-    {
+    if !completion_scope.reviewer_enabled() {
         let dossier = review_dossier(sess, candidate_completion).await;
         let obligation = dossier
             .as_ref()
@@ -3286,6 +3420,7 @@ async fn coordinate_completion_review_inner(
             &dossier,
             pending_lineage,
             state.evidence_reconciliation_injected,
+            repair_follow_up_available,
         ) {
             EvidenceReconciliationAction::Inject => {
                 let Some(item) = build_evidence_reconciliation_item(&dossier) else {
@@ -3306,6 +3441,16 @@ async fn coordinate_completion_review_inner(
                 return Ok(CompletionReviewCoordinatorOutcome {
                     advisory: sess.services.task_evidence.finalization_advisory().await,
                     partial_reasons: dossier.evidence_gate.reasons.clone(),
+                    ..Default::default()
+                });
+            }
+            EvidenceReconciliationAction::Unavailable => {
+                let mut reasons = dossier.evidence_gate.reasons.clone();
+                reasons.push(REPAIR_FOLLOW_UP_UNAVAILABLE_REASON.to_string());
+                state.phase = TurnReviewPhase::Terminal;
+                return Ok(CompletionReviewCoordinatorOutcome {
+                    advisory: sess.services.task_evidence.finalization_advisory().await,
+                    partial_reasons: reasons,
                     ..Default::default()
                 });
             }
@@ -3493,6 +3638,7 @@ async fn coordinate_completion_review_inner(
                     dossier,
                     &obligation,
                     turn_evidence,
+                    repair_follow_up_available,
                 )
                 .await;
             }
@@ -3526,6 +3672,7 @@ async fn coordinate_completion_review_inner(
             &mut lens_observation_advisories,
             &obligation,
             turn_evidence,
+            repair_follow_up_available,
         )
         .await?;
         if outcome.candidate_changed {
@@ -3866,17 +4013,7 @@ fn authoritative_typed_validation_proofs(task: &AgentTask) -> Vec<TypedValidatio
                 .find(|call| call.call_id == *call_id && call.attempt_id == attempt.attempt_id)?;
             let evidence = &call.evidence;
             if call.status != ValidationCallStatus::Succeeded
-                || call.proof_kind != ValidationProofKind::Focused
-                || call
-                    .resolved_executable
-                    .as_deref()
-                    .is_none_or(|path| !Path::new(path).is_absolute())
-                || !evidence.is_reusable_success()
                 || evidence.end_epoch != Some(receipt.evidence_epoch)
-                || evidence
-                    .source_evidence_epoch
-                    .is_none_or(|epoch| epoch > receipt.evidence_epoch)
-                || evidence.covered_manifest.is_empty()
             {
                 return None;
             }
@@ -3886,25 +4023,8 @@ fn authoritative_typed_validation_proofs(task: &AgentTask) -> Vec<TypedValidatio
                 .and_then(|value| serde_json::from_value(value).ok())?;
             if validation_result.call_id != call.call_id
                 || !validation_result.status.is_success()
-                || validation_result.freshness
-                    == codex_protocol::validation::ValidationFreshness::Superseded
-                || validation_result.proof_key.validation_contract_version
-                    != codex_protocol::validation::VALIDATION_CONTRACT_VERSION
-                || validation_result.proof_key.implementation_identity
-                    != evidence.implementation_identity
-                || validation_result.proof_key.coverage_identity != evidence.coverage_identity
-                || validation_result.proof_key.repository.is_empty()
-                || validation_result.proof_key.cwd.is_empty()
-                || evidence.cwd.as_deref() != Some(validation_result.proof_key.cwd.as_str())
-                || validation_result.route.leaves.is_empty()
-                || validation_result
-                    .raw_artifact_ref
-                    .as_deref()
-                    .is_none_or(str::is_empty)
-                || validation_result
-                    .raw_artifact_sha256
-                    .as_deref()
-                    .is_none_or(str::is_empty)
+                || validation_result.argv.is_empty()
+                || validation_result.covered_paths.is_empty()
             {
                 return None;
             }
@@ -3915,13 +4035,6 @@ fn authoritative_typed_validation_proofs(task: &AgentTask) -> Vec<TypedValidatio
                 receipt_evidence_epoch: receipt.evidence_epoch,
                 workspace_epoch,
                 validation_end_epoch: evidence.end_epoch?,
-                implementation_identity: evidence.implementation_identity.clone(),
-                coverage_identity: evidence.coverage_identity.clone(),
-                recorded_cwd: evidence.cwd.clone()?,
-                retained_output_digest: evidence.retained_output_digest.clone(),
-                retained_output_ref: evidence.retained_output_ref.clone()?,
-                covered_manifest: evidence.covered_manifest.clone(),
-                current_workspace_manifest_identity: None,
                 validation_result,
             })
         })
@@ -4165,6 +4278,7 @@ async fn run_contract_review(
     lens_observation_advisories: &mut Vec<String>,
     obligation: &ReviewObligationMode,
     turn_evidence: &CompletionReviewTurnEvidence,
+    repair_follow_up_available: bool,
 ) -> CodexResult<CompletionReviewCoordinatorOutcome> {
     let mut preflight_timer = ReviewTelemetryTimer::start(
         Arc::clone(&turn_context.turn_timing_state),
@@ -4270,24 +4384,27 @@ async fn run_contract_review(
             UserInput::Image { .. } | UserInput::LocalImage { .. }
         )
     });
-    let subconfig = match build_reviewer_config(turn_context, requires_images).await {
-        Ok(config) => config,
-        Err(()) => {
-            record_review_infrastructure(
-                sess,
-                turn_context,
-                &dossier,
-                obligation,
-                ReviewAdmissionDecision::Admit,
-                None,
-                ReviewFailureCategory::UnsupportedConfiguration,
-                None,
-            )
-            .await;
-            state.phase = TurnReviewPhase::Terminal;
-            return Ok(CompletionReviewCoordinatorOutcome::default());
-        }
-    };
+    let subconfig =
+        match build_reviewer_config(turn_context, &sess.services.models_manager, requires_images)
+            .await
+        {
+            Ok(config) => config,
+            Err(failure) => {
+                record_review_infrastructure(
+                    sess,
+                    turn_context,
+                    &dossier,
+                    obligation,
+                    ReviewAdmissionDecision::Admit,
+                    None,
+                    failure,
+                    None,
+                )
+                .await;
+                state.phase = TurnReviewPhase::Terminal;
+                return Ok(CompletionReviewCoordinatorOutcome::default());
+            }
+        };
     let schema = completion_review_output_schema(&selected_lenses);
     let reviewer_contract = reviewer_execution_contract(&subconfig);
     let attempt_identity =
@@ -4727,6 +4844,7 @@ async fn run_contract_review(
             lens_observation_advisories,
             obligation,
             turn_evidence,
+            repair_follow_up_available,
         ))
         .await;
     }
@@ -4780,6 +4898,32 @@ async fn run_contract_review(
         state.phase = TurnReviewPhase::Terminal;
         return Ok(match transition {
             AtomicReviewTransition::Persisted(_) => CompletionReviewCoordinatorOutcome::default(),
+            AtomicReviewTransition::Superseded => superseded_persistence_outcome(),
+            AtomicReviewTransition::Failed => partial_outcome(ReviewFailureCategory::Persistence),
+        });
+    }
+
+    if !repair_follow_up_available {
+        let transition = persist_validated_attempt(
+            sess,
+            &dossier,
+            attempt_kind,
+            parent_review_id,
+            validated,
+            None,
+            Some("partial"),
+            None,
+            gap_reconstructed,
+            lens_observation_advisories,
+            &attempt_identity,
+        )
+        .await;
+        state.phase = TurnReviewPhase::Terminal;
+        return Ok(match transition {
+            AtomicReviewTransition::Persisted(_) => CompletionReviewCoordinatorOutcome {
+                partial_reasons: vec![REPAIR_FOLLOW_UP_UNAVAILABLE_REASON.to_string()],
+                ..Default::default()
+            },
             AtomicReviewTransition::Superseded => superseded_persistence_outcome(),
             AtomicReviewTransition::Failed => partial_outcome(ReviewFailureCategory::Persistence),
         });
@@ -4868,6 +5012,7 @@ async fn resume_correction(
     dossier: CompletionReviewDossier,
     obligation: &ReviewObligationMode,
     turn_evidence: &CompletionReviewTurnEvidence,
+    repair_follow_up_available: bool,
 ) -> CodexResult<CompletionReviewCoordinatorOutcome> {
     if dossier.correction_consumed {
         state.phase = TurnReviewPhase::Terminal;
@@ -4915,6 +5060,7 @@ async fn resume_correction(
         &mut lens_observation_advisories,
         obligation,
         turn_evidence,
+        repair_follow_up_available,
     )
     .await?;
     attach_lens_observation_advisories(&mut outcome, lens_observation_advisories);
@@ -5118,7 +5264,9 @@ fn build_evidence_reconciliation_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AgentRoleConfig;
     use crate::config::ConfigBuilder;
+    use crate::session::session::SessionSettingsUpdate;
     use crate::task_evidence::CurrentRepairSnapshot;
     use chrono::Utc;
     use codex_agent_task_store::AcceptanceCriterion;
@@ -5134,20 +5282,51 @@ mod tests {
     use codex_agent_task_store::CriterionStatus;
     use codex_agent_task_store::ValidationCall;
     use codex_agent_task_store::ValidationEvidence;
-    use codex_agent_task_store::WorkspaceManifestEntry;
     use codex_agent_task_store::WorkspaceStrategy;
     use codex_agent_task_store::WorkspaceTaskStatus;
-    use codex_protocol::plan_tool::ValidationRoute;
-    use codex_protocol::plan_tool::ValidationRouteLeaf;
-    use codex_protocol::plan_tool::ValidationRouteOrdering;
+    use codex_protocol::config_types::CollaborationMode;
+    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::config_types::Settings;
     use codex_protocol::protocol::TaskCompletionGate;
-    use codex_protocol::validation::ValidationFreshness;
-    use codex_protocol::validation::ValidationProofKey;
     use codex_protocol::validation::ValidationResult;
     use codex_protocol::validation::ValidationTerminalStatus;
     use sha2::Digest;
     use sha2::Sha256;
     use tempfile::tempdir;
+
+    #[test]
+    fn orchestration_audit_completion_scope_preserves_each_stage_contract() {
+        let completed =
+            CompletionScope::from_facts(true, true, false, true, CompletionTerminalKind::Completed);
+        assert!(completed.terminal_review_gate_in_scope());
+        assert!(completed.typed_quiescence_in_scope());
+        assert!(completed.final_proof_in_scope());
+        assert!(completed.passed_root_completion_in_scope());
+
+        let required_tool = CompletionScope::from_facts(
+            true,
+            true,
+            false,
+            true,
+            CompletionTerminalKind::RequiredTool,
+        );
+        assert!(!required_tool.terminal_review_gate_in_scope());
+        assert!(required_tool.typed_quiescence_in_scope());
+        assert!(!required_tool.final_proof_in_scope());
+        assert!(!required_tool.passed_root_completion_in_scope());
+
+        let aborted =
+            CompletionScope::from_facts(true, true, false, true, CompletionTerminalKind::Aborted);
+        assert!(!aborted.terminal_review_gate_in_scope());
+        assert!(!aborted.typed_quiescence_in_scope());
+        assert!(!aborted.final_proof_in_scope());
+        assert!(!aborted.passed_root_completion_in_scope());
+
+        let review_candidate =
+            CompletionScope::from_facts(true, false, true, true, CompletionTerminalKind::Candidate);
+        assert!(!review_candidate.candidate_evidence_in_scope());
+        assert!(review_candidate.is_review_subagent());
+    }
 
     #[tokio::test]
     async fn authoritative_binding_reads_are_concurrent_and_ordered() {
@@ -5185,33 +5364,9 @@ mod tests {
         let now = Utc::now();
         let workspace_epoch = 7;
         let call_id = "typed-validation".to_string();
-        let implementation_identity = "typed-implementation".to_string();
-        let coverage_identity = "typed-coverage".to_string();
-        let repository = "C:/repo".to_string();
         let validation_result = ValidationResult {
-            proof_key: ValidationProofKey {
-                repository: repository.clone(),
-                cwd: repository.clone(),
-                canonical_route_hash: "typed-route".to_string(),
-                implementation_identity: implementation_identity.clone(),
-                coverage_identity: coverage_identity.clone(),
-                environment_identity: "typed-environment".to_string(),
-                toolchain_identity: "typed-toolchain".to_string(),
-                configuration_identity: "typed-configuration".to_string(),
-                validation_contract_version:
-                    codex_protocol::validation::VALIDATION_CONTRACT_VERSION,
-            },
-            route: ValidationRoute {
-                leaves: vec![ValidationRouteLeaf {
-                    argv: vec!["cargo".to_string(), "test".to_string(), "typed".to_string()],
-                    uncertainty: "typed validation".to_string(),
-                    covered_paths: vec!["codex-rs/core/src/task_evidence.rs".to_string()],
-                    covered_contracts: vec!["typed-child-final-proof".to_string()],
-                    timeout_ms: 120_000,
-                    semantic_timeout: false,
-                }],
-                ordering: ValidationRouteOrdering::RunAll,
-            },
+            argv: vec!["cargo".to_string(), "test".to_string(), "typed".to_string()],
+            covered_paths: vec!["codex-rs/core/src/task_evidence.rs".to_string()],
             call_id: call_id.clone(),
             process_id: None,
             status: ValidationTerminalStatus::Succeeded,
@@ -5220,7 +5375,6 @@ mod tests {
             failure_excerpt: None,
             raw_artifact_ref: Some("artifact://typed-raw".to_string()),
             raw_artifact_sha256: Some("typed-raw-sha256".to_string()),
-            freshness: ValidationFreshness::Executed,
         };
         AgentTask {
             assignment: Assignment {
@@ -5279,48 +5433,15 @@ mod tests {
                 next_action: None,
                 architecture_contract: None,
                 evidence_epoch: workspace_epoch,
-                evidence_manifest_hash: "typed-manifest".to_string(),
                 sealed_at: now,
             }),
             validation_calls: vec![ValidationCall {
                 call_id,
                 attempt_id,
                 command_summary: "focused validation".to_string(),
-                resolved_executable: Some(
-                    std::fs::canonicalize(
-                        std::env::current_exe().expect("current test executable"),
-                    )
-                    .expect("current test executable canonicalizes")
-                    .to_string_lossy()
-                    .into_owned(),
-                ),
-                proof_kind: ValidationProofKind::Focused,
                 evidence: ValidationEvidence {
-                    candidate_id: "typed-candidate".to_string(),
-                    implementation_identity,
-                    source_evidence_epoch: Some(workspace_epoch),
-                    normalized_invocation: "cargo test typed".to_string(),
-                    coverage_identity,
                     start_epoch: workspace_epoch,
                     end_epoch: Some(workspace_epoch),
-                    covered_scopes: Vec::new(),
-                    covered_manifest: vec![WorkspaceManifestEntry {
-                        path: "codex-rs/core/src/task_evidence.rs".to_string(),
-                        content_hash: Some("typed-content".to_string()),
-                        existed: true,
-                    }],
-                    execution_snapshot: None,
-                    covered_contracts: vec!["typed-child-final-proof".to_string()],
-                    manifest_hash: "typed-manifest".to_string(),
-                    repository_wide: false,
-                    cwd: Some(repository),
-                    environment_hash: Some("typed-environment".to_string()),
-                    toolchain: Some("typed-toolchain".to_string()),
-                    features_configuration_identity: "typed-configuration".to_string(),
-                    covered_input_manifest_hash: "typed-inputs".to_string(),
-                    dependency_manifest_hash: "typed-dependencies".to_string(),
-                    successful_result: Some(true),
-                    retained_output_digest: "typed-output-digest".to_string(),
                     retained_output_ref: Some("artifact://typed-output".to_string()),
                     output_summary: Some("typed validation passed".to_string()),
                     validation_result: Some(
@@ -5328,8 +5449,6 @@ mod tests {
                             .expect("validation result serializes"),
                     ),
                     lease_expires_at: None,
-                    shared_from_call_id: None,
-                    stale_reason: None,
                 },
                 status: ValidationCallStatus::Succeeded,
                 recorded_at: now,
@@ -5350,7 +5469,7 @@ mod tests {
         let proofs = authoritative_typed_validation_proofs(&task);
         assert_eq!(proofs.len(), 1);
         assert_eq!(proofs[0].call_id, "typed-validation");
-        assert_eq!(proofs[0].retained_output_ref, "artifact://typed-output");
+        assert_eq!(proofs[0].validation_result.argv, ["cargo", "test", "typed"]);
 
         task.workspace_status.epoch = task.workspace_status.epoch.saturating_add(1);
         assert_eq!(authoritative_typed_validation_proofs(&task).len(), 1);
@@ -5499,17 +5618,21 @@ mod tests {
             vec!["Run the focused validation and record its current proof receipt".to_string()];
 
         assert_eq!(
-            evidence_reconciliation_action(&dossier, false, false),
+            evidence_reconciliation_action(&dossier, false, false, true),
             EvidenceReconciliationAction::Inject
         );
         assert_eq!(
-            evidence_reconciliation_action(&dossier, false, true),
+            evidence_reconciliation_action(&dossier, false, false, false),
+            EvidenceReconciliationAction::Unavailable
+        );
+        assert_eq!(
+            evidence_reconciliation_action(&dossier, false, true, true),
             EvidenceReconciliationAction::Exhausted
         );
         dossier.evidence_gate.status = TaskCompletionStatus::Passed;
         dossier.evidence_gate.reasons.clear();
         assert_eq!(
-            evidence_reconciliation_action(&dossier, false, true),
+            evidence_reconciliation_action(&dossier, false, true, true),
             EvidenceReconciliationAction::Continue
         );
     }
@@ -5536,23 +5659,19 @@ mod tests {
 
     #[test]
     fn stability_gate_only_blocks_unstable_or_unavailable_evidence() {
-        let current = CompletionReviewTurnEvidence {
+        let evidence = CompletionReviewTurnEvidence {
             exact_diff: Some("diff-a".to_string()),
             mutation_revision: 3,
-            validation_freshness: ValidationFreshnessStatus::PassedAfterLastMutation,
-            last_successful_validation_revision: Some(3),
         };
         assert!(review_stability_blocker_reasons(&dossier()).is_empty());
 
-        let mut stale = current;
-        stale.last_successful_validation_revision = Some(2);
         assert!(review_stability_blocker_reasons(&dossier()).is_empty());
         assert_eq!(
             review_admission_decision_for_source(
                 &SessionSource::Cli,
                 &dossier(),
                 &ReviewObligationMode::Supplemental,
-                &stale,
+                &evidence,
             ),
             ReviewAdmissionDecision::Admit,
             "stale deterministic proof must admit supplemental review"
@@ -5611,8 +5730,6 @@ mod tests {
         let fresh = CompletionReviewTurnEvidence {
             exact_diff: Some("diff-a".to_string()),
             mutation_revision: 3,
-            validation_freshness: ValidationFreshnessStatus::PassedAfterLastMutation,
-            last_successful_validation_revision: Some(3),
         };
 
         assert_eq!(
@@ -5640,6 +5757,127 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn text_reviewer_config_pins_the_resolved_default_model() {
+        let (session, mut turn_context) = crate::session::tests::make_session_and_context().await;
+        let no_model = None;
+        let expected_model = session
+            .services
+            .models_manager
+            .get_default_model(
+                &no_model,
+                /*allow_provider_model_fallback*/ false,
+                RefreshStrategy::Offline,
+                turn_context.config.http_client_factory(),
+            )
+            .await
+            .expect("offline reviewer model should resolve");
+        let turn_config = Arc::make_mut(&mut turn_context.config);
+        turn_config.model = None;
+        turn_config.agent_roles.insert(
+            "reviewer".to_string(),
+            crate::config::AgentRoleConfig {
+                description: Some("Completion reviewer".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let reviewer_config = build_reviewer_config(
+            &turn_context,
+            &session.services.models_manager,
+            /*requires_images*/ false,
+        )
+        .await
+        .expect("text reviewer config should resolve");
+
+        assert_eq!(
+            reviewer_config.model.as_deref(),
+            Some(expected_model.as_str())
+        );
+        assert_eq!(
+            reviewer_execution_contract(&reviewer_config).reviewer_model,
+            expected_model,
+            "the reuse identity must contain the model the reviewer child will execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_runtime_model_is_inherited_by_text_reviewer_unless_role_overrides_it() {
+        let (session, mut turn_context) = crate::session::tests::make_session_and_context().await;
+        let session_configuration =
+            crate::session::tests::make_session_configuration_for_tests().await;
+        let live_model = "live-review-model";
+        let updated_session_configuration = session_configuration
+            .apply(&SessionSettingsUpdate {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: live_model.to_string(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            })
+            .expect("live model update should apply");
+        let mut per_turn_config = Session::build_per_turn_config(
+            &updated_session_configuration,
+            turn_context.cwd().clone(),
+        );
+        Arc::make_mut(&mut per_turn_config).agent_roles.insert(
+            "reviewer".to_string(),
+            AgentRoleConfig {
+                description: Some("Completion reviewer".to_string()),
+                ..Default::default()
+            },
+        );
+        turn_context.config = per_turn_config;
+        turn_context.model_info.slug = live_model.to_string();
+
+        let reviewer_config = build_reviewer_config(
+            &turn_context,
+            &session.services.models_manager,
+            /*requires_images*/ false,
+        )
+        .await
+        .expect("text reviewer config should resolve");
+
+        assert_eq!(reviewer_config.model.as_deref(), Some(live_model));
+        assert_eq!(
+            reviewer_execution_contract(&reviewer_config).reviewer_model,
+            live_model,
+            "the reuse identity should use the live turn model"
+        );
+
+        let role_dir = tempdir().expect("reviewer role temp dir");
+        let explicit_role_path = role_dir.path().join("reviewer.toml");
+        tokio::fs::write(&explicit_role_path, "model = \"explicit-review-model\"\n")
+            .await
+            .expect("write explicit reviewer role");
+        let explicit_turn_config = Arc::make_mut(&mut turn_context.config);
+        explicit_turn_config.agent_roles.insert(
+            "reviewer".to_string(),
+            AgentRoleConfig {
+                description: Some("Explicit completion reviewer".to_string()),
+                config_file: Some(explicit_role_path),
+                nickname_candidates: None,
+            },
+        );
+
+        let explicit_reviewer_config = build_reviewer_config(
+            &turn_context,
+            &session.services.models_manager,
+            /*requires_images*/ false,
+        )
+        .await
+        .expect("explicit reviewer config should resolve");
+
+        assert_eq!(
+            explicit_reviewer_config.model.as_deref(),
+            Some("explicit-review-model")
+        );
+    }
+
     #[test]
     fn completion_attempt_identity_covers_every_reuse_identity_class() {
         let base_dossier = dossier();
@@ -5647,8 +5885,6 @@ mod tests {
         let base_evidence = CompletionReviewTurnEvidence {
             exact_diff: Some("diff-a".to_string()),
             mutation_revision: 3,
-            validation_freshness: ValidationFreshnessStatus::PassedAfterLastMutation,
-            last_successful_validation_revision: Some(3),
         };
         let base_obligation = ReviewObligationMode::Mandatory {
             requirement_ids: vec!["requirement-1".to_string()],
@@ -5729,18 +5965,6 @@ mod tests {
         );
 
         let mut changed_evidence = base_evidence.clone();
-        changed_evidence.validation_freshness = ValidationFreshnessStatus::FailedAfterLastMutation;
-        assert_ne!(
-            base,
-            identity(
-                &base_dossier,
-                &changed_evidence,
-                &base_obligation,
-                &base_contract,
-                CompletionReviewAttemptKind::Initial,
-            )
-        );
-        changed_evidence = base_evidence.clone();
         changed_evidence.exact_diff = Some("diff-b".to_string());
         assert_ne!(
             base,

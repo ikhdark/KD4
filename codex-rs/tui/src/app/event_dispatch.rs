@@ -570,8 +570,8 @@ impl App {
             AppEvent::OpenMarketplaceAddPrompt => {
                 self.chat_widget.open_marketplace_add_prompt();
             }
-            AppEvent::OpenMarketplaceAddLoading { source } => {
-                self.chat_widget.open_marketplace_add_loading_popup(&source);
+            AppEvent::OpenMarketplaceAddLoading => {
+                self.chat_widget.open_marketplace_add_loading_popup();
             }
             AppEvent::OpenMarketplaceRemoveConfirm {
                 marketplace_name,
@@ -639,14 +639,10 @@ impl App {
             } => {
                 self.fetch_marketplace_upgrade(app_server, cwd, marketplace_name);
             }
-            AppEvent::MarketplaceAddLoaded {
-                cwd,
-                source,
-                result,
-            } => {
+            AppEvent::MarketplaceAddLoaded { cwd, result } => {
                 let add_succeeded = result.is_ok();
                 self.chat_widget
-                    .on_marketplace_add_loaded(cwd.clone(), source, result);
+                    .on_marketplace_add_loaded(cwd.clone(), result);
                 if add_succeeded && self.chat_widget.config_ref().cwd.as_path() == cwd.as_path() {
                     self.fetch_plugins_list(app_server, cwd);
                 }

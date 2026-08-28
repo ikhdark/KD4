@@ -7,41 +7,25 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 
+const KD4_VALIDATION_COMMAND_GUIDANCE: &str = "For direct validation proof, use `kind: \"argv\"` and include non-empty repository-relative `validation.covered_paths`. A recognized validation command without this metadata may run, but is not recorded as proof.";
+
 fn validation_context_schema() -> JsonSchema {
-    JsonSchema::object(
-        BTreeMap::from([
-            (
-                "uncertainty".to_string(),
-                JsonSchema::string(Some(
-                    "Required for any test, check, lint, benchmark, or fuzz command. State the specific uncertainty this command resolves and why its coverage is sufficient."
-                        .to_string(),
-                )),
-            ),
-            (
-                "covered_paths".to_string(),
-                JsonSchema::array(
-                    JsonSchema::string(/*description*/ None),
-                    Some(
-                        "Repository-relative files or directories whose current contents determine whether this proof remains reusable."
-                            .to_string(),
-                    ),
-                ),
-            ),
-            (
-                "covered_contracts".to_string(),
-                JsonSchema::array(
-                    JsonSchema::string(/*description*/ None),
-                    Some("Named behavioral contracts this command proves.".to_string()),
-                ),
-            ),
-        ]),
-        Some(vec![
-            "uncertainty".to_string(),
+    let mut schema = JsonSchema::object(
+        BTreeMap::from([(
             "covered_paths".to_string(),
-            "covered_contracts".to_string(),
-        ]),
+            JsonSchema::array(
+                JsonSchema::string(/*description*/ None),
+                Some(
+                    "Non-empty repository-relative scopes attributed to this validation result."
+                        .to_string(),
+                ),
+            ),
+        )]),
+        Some(vec!["covered_paths".to_string()]),
         Some(false.into()),
-    )
+    );
+    schema.description = Some(KD4_VALIDATION_COMMAND_GUIDANCE.to_string());
+    schema
 }
 
 const LEGACY_SHELL_SCRIPT_DESCRIPTION: &str = "Legacy shell script to execute. Use this only when shell semantics are required, including PowerShell cmdlets, variables or interpolation, pipelines or redirection, here-docs, compound statements, shell builtins, and `.cmd`/`.bat` semantics. When a standalone native executable and separated arguments are already known, use `kind: \"argv\"` with `program` and `args` instead; do not serialize them into this string field. This includes Git (`git`), ripgrep (`rg`), Cargo (`cargo`), Node (`node`), Python (`python`), and KD4 helper executables such as `kds`. Examples: `git` with `[\"status\", \"--short\"]`; `rg` with `[\"--files\"]`; `cargo` with `[\"test\", \"-p\", \"codex-core\"]`; `node` with `[\"script.js\"]`; `python` with `[\"-m\", \"pytest\"]`; `kds` with `[\"--help\"]`. Arbitrary command strings remain shell scripts and must not be heuristically split. For complex PowerShell, prefer `kind: \"powershell_script\"`. If shell inspection is necessary, keep read-only PowerShell to direct cmdlet pipelines without variables, loops, or script blocks so it can remain outside the repository mutation lane.";
@@ -68,17 +52,33 @@ fn command_parameters_schema(
         })
         .map(|(name, schema)| (name.clone(), schema.clone()))
         .collect::<BTreeMap<_, _>>();
+    let common_refs = common
+        .keys()
+        .map(|name| {
+            let escaped_name = name.replace('~', "~0").replace('/', "~1");
+            (
+                name.clone(),
+                JsonSchema {
+                    schema_ref: Some(format!("#/$defs/{escaped_name}")),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let command_property = properties[script_field].clone();
     let program_property = properties["program"].clone();
     let args_property = properties["args"].clone();
     let powershell_property = properties["script_body"].clone();
+    let kind_description = Some(format!(
+        "Explicit command encoding. `script` uses `{script_field}`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`."
+    ));
 
     let variant =
         |kind: &str, variant_properties: Vec<(String, JsonSchema)>, required: Vec<String>| {
-            let mut branch = common.clone();
+            let mut branch = common_refs.clone();
             branch.insert(
                 "kind".to_string(),
-                JsonSchema::string_enum(vec![json!(kind)], None),
+                JsonSchema::string_enum(vec![json!(kind)], kind_description.clone()),
             );
             branch.extend(variant_properties);
             let mut required_fields = vec!["kind".to_string()];
@@ -86,7 +86,7 @@ fn command_parameters_schema(
             JsonSchema::object(branch, Some(required_fields), Some(false.into()))
         };
 
-    JsonSchema::one_of(
+    let mut schema = JsonSchema::one_of(
         vec![
             variant(
                 "script",
@@ -111,7 +111,9 @@ fn command_parameters_schema(
             "Exactly one explicit command encoding: script, argv, or PowerShell script."
                 .to_string(),
         ),
-    )
+    );
+    schema.defs = Some(common);
+    schema
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,30 +129,30 @@ pub fn create_exec_command_tool(options: CommandToolOptions) -> ToolSpec {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn create_exec_command_tool_with_environment_id(
     options: CommandToolOptions,
     include_environment_id: bool,
     include_shell_parameter: bool,
 ) -> ToolSpec {
+    create_exec_command_tool_for_policy(
+        options,
+        include_environment_id,
+        include_shell_parameter,
+        /*allow_escalated_sandbox_permissions*/ true,
+    )
+}
+
+pub(crate) fn create_exec_command_tool_for_policy(
+    options: CommandToolOptions,
+    include_environment_id: bool,
+    include_shell_parameter: bool,
+    allow_escalated_sandbox_permissions: bool,
+) -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "cmd".to_string(),
             JsonSchema::string(Some(LEGACY_SHELL_SCRIPT_DESCRIPTION.to_string())),
-        ),
-        (
-            "kind".to_string(),
-            JsonSchema::string_enum(
-                vec![
-                    json!("legacy"),
-                    json!("script"),
-                    json!("argv"),
-                    json!("powershell_script"),
-                ],
-                Some(
-                    "Command encoding. `legacy` preserves the historical untagged `cmd` string; `script` explicitly uses `cmd`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`."
-                        .to_string(),
-                ),
-            ),
         ),
         (
             "program".to_string(),
@@ -234,6 +236,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
     }
     properties.extend(create_approval_parameters(
         options.exec_permission_approvals_enabled,
+        allow_escalated_sandbox_permissions,
     ));
     properties.insert(
         "force_fresh".to_string(),
@@ -244,9 +247,10 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
         description: format!(
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}\n\n{}",
+            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}\n\n{}\n\n{}",
+            KD4_VALIDATION_COMMAND_GUIDANCE,
             rg_search_admission_guidance(),
-            windows_shell_guidance(),
+            filesystem_safety_guidance(),
         ),
         strict: false,
         defer_loading: None,
@@ -304,26 +308,19 @@ pub fn create_write_stdin_tool() -> ToolSpec {
     })
 }
 
+#[cfg(test)]
 pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
+    create_shell_command_tool_for_policy(options, /*allow_escalated_sandbox_permissions*/ true)
+}
+
+pub(crate) fn create_shell_command_tool_for_policy(
+    options: CommandToolOptions,
+    allow_escalated_sandbox_permissions: bool,
+) -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "command".to_string(),
             JsonSchema::string(Some(LEGACY_SHELL_SCRIPT_DESCRIPTION.to_string())),
-        ),
-        (
-            "kind".to_string(),
-            JsonSchema::string_enum(
-                vec![
-                    json!("legacy"),
-                    json!("script"),
-                    json!("argv"),
-                    json!("powershell_script"),
-                ],
-                Some(
-                    "Command encoding. `legacy` preserves the historical untagged `command` string; `script` explicitly uses `command`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`."
-                        .to_string(),
-                ),
-            ),
         ),
         (
             "program".to_string(),
@@ -384,6 +381,7 @@ pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
     }
     properties.extend(create_approval_parameters(
         options.exec_permission_approvals_enabled,
+        allow_escalated_sandbox_permissions,
     ));
     properties.insert(
         "force_fresh".to_string(),
@@ -406,7 +404,10 @@ Examples of valid command strings:
 
 {}
 
+{}
+
 {}"#,
+        KD4_VALIDATION_COMMAND_GUIDANCE,
         rg_search_admission_guidance(),
         windows_shell_guidance(),
     );
@@ -510,39 +511,55 @@ fn unified_exec_output_schema() -> Value {
 
 fn create_approval_parameters(
     exec_permission_approvals_enabled: bool,
+    allow_escalated_sandbox_permissions: bool,
 ) -> BTreeMap<String, JsonSchema> {
     let mut sandbox_permission_values = vec![json!("use_default")];
     if exec_permission_approvals_enabled {
         sandbox_permission_values.push(json!("with_additional_permissions"));
     }
-    sandbox_permission_values.push(json!("require_escalated"));
-    let sandbox_permissions_description = if exec_permission_approvals_enabled {
-        "Per-command sandbox override. Defaults to `use_default`; use `with_additional_permissions` with `additional_permissions`, or `require_escalated` for unsandboxed execution."
-    } else {
-        "Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for unsandboxed execution."
+    if allow_escalated_sandbox_permissions {
+        sandbox_permission_values.push(json!("require_escalated"));
+    }
+    let sandbox_permissions_description = match (
+        exec_permission_approvals_enabled,
+        allow_escalated_sandbox_permissions,
+    ) {
+        (true, true) => {
+            "Per-command sandbox override. Defaults to `use_default`; use `with_additional_permissions` with `additional_permissions`, or `require_escalated` for unsandboxed execution."
+        }
+        (true, false) => {
+            "Per-command sandbox override. Defaults to `use_default`; use `with_additional_permissions` with `additional_permissions`."
+        }
+        (false, true) => {
+            "Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for unsandboxed execution."
+        }
+        (false, false) => "Per-command sandbox override. Defaults to `use_default`.",
     };
 
-    let mut properties = BTreeMap::from([
-        (
-            "sandbox_permissions".to_string(),
-            JsonSchema::string_enum(
-                sandbox_permission_values,
-                Some(sandbox_permissions_description.to_string()),
-            ),
+    let mut properties = BTreeMap::from([(
+        "sandbox_permissions".to_string(),
+        JsonSchema::string_enum(
+            sandbox_permission_values,
+            Some(sandbox_permissions_description.to_string()),
         ),
-        (
+    )]);
+
+    if allow_escalated_sandbox_permissions {
+        properties.extend([
+            (
             "justification".to_string(),
             JsonSchema::string(Some(
                 "User-facing approval question for `require_escalated`; omit otherwise.".to_string(),
             )),
-        ),
-        (
-            "prefix_rule".to_string(),
-            JsonSchema::array(JsonSchema::string(/*description*/ None), Some(
+            ),
+            (
+                "prefix_rule".to_string(),
+                JsonSchema::array(JsonSchema::string(/*description*/ None), Some(
                     r#"Reusable approval prefix for `cmd`, only with `sandbox_permissions: "require_escalated"`; for example ["git", "pull"]."#.to_string(),
                 )),
-        ),
-    ]);
+            ),
+        ]);
+    }
 
     if exec_permission_approvals_enabled {
         let mut additional_permissions = permission_profile_schema();
@@ -622,9 +639,13 @@ fn windows_shell_guidance() -> &'static str {
 - When using `Start-Process` to launch a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly asked for a visible interactive window. Use visible windows only for interactive tools the user needs to see or control."#
 }
 
+fn filesystem_safety_guidance() -> &'static str {
+    "Filesystem safety: keep destructive operations in one shell, resolve recursive delete or move targets inside the intended directory first, and avoid unresolved variables or globs."
+}
+
 fn rg_search_admission_guidance() -> &'static str {
-    r#"Search admission rule:
-- A repository-wide `rg` search is rejected until the same query first returns no matches in a narrower likely owning path. Start narrow; expand only after that miss."#
+    r#"Search guidance:
+- Start repository `rg` searches in a likely owning path. Expand after a miss or when the request genuinely requires a repository-wide inventory."#
 }
 
 #[cfg(test)]

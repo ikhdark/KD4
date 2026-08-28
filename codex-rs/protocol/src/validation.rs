@@ -1,38 +1,42 @@
-use crate::plan_tool::ValidationRoute;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use ts_rs::TS;
 
-pub const VALIDATION_CONTRACT_VERSION: u32 = 1;
-
-/// Model-declared applicability for a validation command launched directly
-/// through a shell tool. The command itself remains owned by the tool call;
-/// this context records why running it is useful and which inputs make an
-/// earlier successful result reusable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+/// Repository-relative paths whose current contents are checked by a direct
+/// validation command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationCommandContext {
-    pub uncertainty: String,
     pub covered_paths: Vec<String>,
-    pub covered_contracts: Vec<String>,
 }
 
-/// Semantic proof applicability. Execution-instance metadata is deliberately
-/// absent so this value can be used for both singleflight and completed reuse.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct ValidationProofKey {
-    pub repository: String,
-    pub cwd: String,
-    pub canonical_route_hash: String,
-    pub implementation_identity: String,
-    pub coverage_identity: String,
-    pub environment_identity: String,
-    pub toolchain_identity: String,
-    pub configuration_identity: String,
-    pub validation_contract_version: u32,
+impl<'de> Deserialize<'de> for ValidationCommandContext {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            covered_paths: Vec<String>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        if raw.covered_paths.is_empty()
+            || raw
+                .covered_paths
+                .iter()
+                .any(|value| value.trim().is_empty())
+        {
+            return Err(serde::de::Error::custom(
+                "validation covered_paths must contain non-empty paths",
+            ));
+        }
+        Ok(Self {
+            covered_paths: raw.covered_paths,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
@@ -40,14 +44,7 @@ pub struct ValidationProofKey {
 #[ts(rename_all = "snake_case", export_to = "v2/")]
 pub enum ValidationTerminalStatus {
     Succeeded,
-    #[serde(
-        alias = "timed_out",
-        alias = "cancelled",
-        alias = "infrastructure_failure",
-        alias = "admission_rejected"
-    )]
     Failed,
-    Superseded,
 }
 
 impl ValidationTerminalStatus {
@@ -56,24 +53,13 @@ impl ValidationTerminalStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(rename_all = "snake_case", export_to = "v2/")]
-pub enum ValidationFreshness {
-    Executed,
-    Joined,
-    Reused,
-    Superseded,
-}
-
-/// Settled validation evidence. IDs, timing, and artifact integrity describe
-/// one execution and therefore never participate in `ValidationProofKey`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+/// The settled result of one validation command execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ValidationResult {
-    pub proof_key: ValidationProofKey,
-    pub route: ValidationRoute,
+    pub argv: Vec<String>,
+    pub covered_paths: Vec<String>,
     pub call_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -92,41 +78,203 @@ pub struct ValidationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub raw_artifact_sha256: Option<String>,
-    pub freshness: ValidationFreshness,
+}
+
+impl<'de> Deserialize<'de> for ValidationResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            argv: Vec<String>,
+            covered_paths: Vec<String>,
+            call_id: String,
+            #[serde(default)]
+            process_id: Option<String>,
+            status: ValidationTerminalStatus,
+            duration_ms: u64,
+            #[serde(default)]
+            summary: Option<String>,
+            #[serde(default)]
+            failure_excerpt: Option<String>,
+            #[serde(default)]
+            raw_artifact_ref: Option<String>,
+            #[serde(default)]
+            raw_artifact_sha256: Option<String>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        validate_direct_validation_values(&raw.argv, &raw.covered_paths)
+            .map_err(serde::de::Error::custom)?;
+        if raw.call_id.trim().is_empty() {
+            return Err(serde::de::Error::custom(
+                "validation result call_id must be non-empty",
+            ));
+        }
+        Ok(Self {
+            argv: raw.argv,
+            covered_paths: raw.covered_paths,
+            call_id: raw.call_id,
+            process_id: raw.process_id,
+            status: raw.status,
+            duration_ms: raw.duration_ms,
+            summary: raw.summary,
+            failure_excerpt: raw.failure_excerpt,
+            raw_artifact_ref: raw.raw_artifact_ref,
+            raw_artifact_sha256: raw.raw_artifact_sha256,
+        })
+    }
+}
+
+fn validate_direct_validation_values(
+    argv: &[String],
+    covered_paths: &[String],
+) -> Result<(), String> {
+    if argv.is_empty() || argv.iter().any(|value| value.trim().is_empty()) {
+        return Err("validation argv values must be non-empty".to_string());
+    }
+    if covered_paths.is_empty() || covered_paths.iter().any(|value| value.trim().is_empty()) {
+        return Err("validation covered_paths must contain non-empty paths".to_string());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for path in covered_paths {
+        if !is_normalized_repository_relative_scope(path) {
+            return Err(format!(
+                "validation covered path `{path}` must be a normalized repository-relative scope"
+            ));
+        }
+        let identity = if cfg!(windows) {
+            path.to_ascii_lowercase()
+        } else {
+            path.clone()
+        };
+        if !seen.insert(identity) {
+            return Err(format!(
+                "validation covered path `{path}` must not be duplicated"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_normalized_repository_relative_scope(path: &str) -> bool {
+    if path == "." {
+        return true;
+    }
+    if path.is_empty()
+        || path.trim() != path
+        || path.contains('\\')
+        || path.starts_with('/')
+        || path.starts_with('~')
+        || path.ends_with('/')
+        || path.contains("//")
+        || path.as_bytes().get(1) == Some(&b':')
+    {
+        return false;
+    }
+    path.split('/')
+        .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::ValidationCommandContext;
+    use super::ValidationResult;
     use super::ValidationTerminalStatus;
+    use serde_json::json;
 
     #[test]
-    fn terminal_status_wire_contract_is_exact_and_historical_failures_are_readable() {
+    fn terminal_status_wire_contract_is_lean_and_exact() {
         let statuses = [
             ValidationTerminalStatus::Succeeded,
             ValidationTerminalStatus::Failed,
-            ValidationTerminalStatus::Superseded,
         ];
         assert_eq!(
             statuses
                 .into_iter()
                 .map(|status| serde_json::to_value(status).expect("status serialization"))
                 .collect::<Vec<_>>(),
-            vec![
-                serde_json::json!("succeeded"),
-                serde_json::json!("failed"),
-                serde_json::json!("superseded"),
-            ]
+            vec![serde_json::json!("succeeded"), serde_json::json!("failed"),]
         );
-        for historical in [
-            "timed_out",
-            "cancelled",
-            "infrastructure_failure",
-            "admission_rejected",
+        assert!(serde_json::from_value::<ValidationTerminalStatus>(json!("superseded")).is_err());
+        assert!(serde_json::from_value::<ValidationTerminalStatus>(json!("timed_out")).is_err());
+    }
+
+    #[test]
+    fn lean_context_and_result_round_trip_and_reject_legacy_fields() {
+        let context_value = json!({"covered_paths": ["codex-rs/core/src"]});
+        let context = serde_json::from_value::<ValidationCommandContext>(context_value.clone())
+            .expect("lean context");
+        assert_eq!(
+            serde_json::to_value(context).expect("context value"),
+            context_value
+        );
+
+        let result_value = json!({
+            "argv": ["cargo", "test", "-p", "codex-core", "focused_case"],
+            "coveredPaths": ["codex-rs/core/src"],
+            "callId": "call-1",
+            "status": "succeeded",
+            "durationMs": 12
+        });
+        let result =
+            serde_json::from_value::<ValidationResult>(result_value.clone()).expect("lean result");
+        assert_eq!(
+            serde_json::to_value(result).expect("result value"),
+            result_value
+        );
+
+        for legacy in [
+            json!({"covered_paths": ["src"], "uncertainty": "legacy"}),
+            json!({"covered_paths": ["src"], "covered_contracts": ["legacy"]}),
         ] {
-            assert_eq!(
-                serde_json::from_value::<ValidationTerminalStatus>(serde_json::json!(historical))
-                    .expect("historical persisted failure status"),
-                ValidationTerminalStatus::Failed
+            assert!(serde_json::from_value::<ValidationCommandContext>(legacy).is_err());
+        }
+    }
+
+    #[test]
+    fn lean_context_and_result_require_nonempty_paths_and_argv() {
+        for value in [
+            json!({"covered_paths": []}),
+            json!({"covered_paths": [" "]}),
+        ] {
+            assert!(serde_json::from_value::<ValidationCommandContext>(value).is_err());
+        }
+        for value in [
+            json!({
+                "argv": [""], "coveredPaths": ["src"], "callId": "call-1",
+                "status": "failed", "durationMs": 1
+            }),
+            json!({
+                "argv": ["cargo"], "coveredPaths": [], "callId": "call-1",
+                "status": "failed", "durationMs": 1
+            }),
+        ] {
+            assert!(serde_json::from_value::<ValidationResult>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn validation_result_rejects_non_normalized_or_duplicate_paths() {
+        for covered_paths in [
+            json!(["../src"]),
+            json!(["/src"]),
+            json!(["C:/src"]),
+            json!(["src//lib"]),
+            json!(["src/./lib"]),
+            json!(["src", "src"]),
+        ] {
+            assert!(
+                serde_json::from_value::<ValidationResult>(json!({
+                    "argv": ["cargo", "test"],
+                    "coveredPaths": covered_paths,
+                    "callId": "call-1",
+                    "status": "succeeded",
+                    "durationMs": 1
+                }))
+                .is_err()
             );
         }
     }

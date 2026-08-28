@@ -93,8 +93,8 @@ impl App {
         app_server: &mut AppServerSession,
         key_event: KeyEvent,
     ) {
-        // Some terminals, especially on macOS, encode Option+Left/Right as Option+b/f unless
-        // enhanced keyboard reporting is available. We only treat those word-motion fallbacks as
+        // Some Windows terminal configurations encode Alt+Left/Right as Alt+b/f unless enhanced
+        // keyboard reporting is available. We only treat those word-motion fallbacks as
         // agent-switch shortcuts when the composer is empty so we never steal the expected
         // editing behavior for moving across words inside a draft.
         let allow_agent_word_motion_fallback = !self.enhanced_keys_supported

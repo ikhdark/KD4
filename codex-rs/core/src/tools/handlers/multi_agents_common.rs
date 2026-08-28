@@ -6,13 +6,15 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use codex_config::types::WindowsSandboxModeToml;
+use codex_features::Feature;
 use codex_model_provider::create_model_provider;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
-use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
@@ -166,16 +168,14 @@ pub(crate) fn parse_collab_input(
 /// Builds the base config snapshot for a newly spawned sub-agent.
 ///
 /// The returned config starts from the parent's effective config and then refreshes the
-/// runtime-owned fields carried on `turn`, including model selection, reasoning settings,
-/// approval policy, sandbox, and cwd. Role-specific overrides are layered after this step;
+/// runtime-owned fields carried on `turn`, including the active base prompt, model selection,
+/// reasoning settings, approval policy, sandbox, and cwd. Role-specific overrides are layered
+/// after this step;
 /// skipping this helper and cloning stale config state directly can send the child agent out with
 /// the wrong provider or runtime policy.
-pub(crate) fn build_agent_spawn_config(
-    base_instructions: &BaseInstructions,
-    turn: &TurnContext,
-) -> Result<Config, FunctionCallError> {
+pub(crate) fn build_agent_spawn_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
     let mut config = build_agent_shared_config(turn)?;
-    config.base_instructions = Some(base_instructions.text.clone());
+    config.base_instructions = Some(turn.base_instructions.text.clone());
     Ok(config)
 }
 
@@ -233,6 +233,29 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
             .map_err(|err| {
                 FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
             })?;
+        config.permissions.windows_sandbox_mode = match turn.windows_sandbox_level {
+            WindowsSandboxLevel::Elevated => Some(WindowsSandboxModeToml::Elevated),
+            WindowsSandboxLevel::RestrictedToken => Some(WindowsSandboxModeToml::Unelevated),
+            WindowsSandboxLevel::Disabled => {
+                config
+                    .features
+                    .disable(Feature::WindowsSandboxElevated)
+                    .map_err(|err| {
+                        FunctionCallError::RespondToModel(format!(
+                            "windows sandbox feature state is invalid: {err}"
+                        ))
+                    })?;
+                config
+                    .features
+                    .disable(Feature::WindowsSandbox)
+                    .map_err(|err| {
+                        FunctionCallError::RespondToModel(format!(
+                            "windows sandbox feature state is invalid: {err}"
+                        ))
+                    })?;
+                None
+            }
+        };
     }
     config
         .permissions

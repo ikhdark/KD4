@@ -15,8 +15,8 @@ use self::desired_state::acquire_persistence_lock;
 use self::enroll::RemoteControlEnrollment;
 use self::enroll::load_persisted_remote_control_enrollment;
 use self::enroll::update_persisted_remote_control_enrollment;
-use self::server_api::enroll_remote_control_server;
-use self::server_api::refresh_remote_control_server;
+use self::server_api::enroll_remote_control_server_with_client;
+use self::server_api::refresh_remote_control_server_with_client;
 use crate::transport::remote_control::websocket::RemoteControlChannels;
 use crate::transport::remote_control::websocket::RemoteControlStatusPublisher;
 use crate::transport::remote_control::websocket::RemoteControlWebsocket;
@@ -39,6 +39,10 @@ use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_protocol::RemoteControlPairingStatusParams;
 use codex_app_server_protocol::RemoteControlPairingStatusResponse;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClient;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
 use codex_state::StateRuntime;
 use futures::FutureExt;
@@ -64,10 +68,18 @@ use tracing::warn;
 
 pub(super) const REMOTE_CONTROL_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 
+fn remote_control_http_clients(factory: HttpClientFactory) -> RouteAwareClientPool {
+    RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
+        factory,
+        ClientRouteClass::Api,
+    )
+}
+
 pub struct RemoteControlStartConfig {
     pub remote_control_url: String,
     pub installation_id: String,
     pub policy: RemoteControlPolicy,
+    pub http_client_factory: HttpClientFactory,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +129,27 @@ pub struct RemoteControlHandle {
     pairing_persistence_key: RemoteControlPairingPersistenceKey,
     pairing_persistence_key_required: bool,
     auth_manager: Arc<AuthManager>,
+    http_clients: RouteAwareClientPool,
+}
+
+#[derive(Clone, Copy)]
+enum RemoteControlHttpClientSource<'a> {
+    Pool(&'a RouteAwareClientPool),
+    #[cfg(test)]
+    Fixed(&'a HttpClient),
+}
+
+impl RemoteControlHttpClientSource<'_> {
+    async fn client_for_url(self, url: &str) -> io::Result<HttpClient> {
+        match self {
+            Self::Pool(http_clients) => http_clients
+                .client_for_url(url)
+                .await
+                .map_err(io::Error::other),
+            #[cfg(test)]
+            Self::Fixed(client) => Ok(client.clone()),
+        }
+    }
 }
 
 // Pairing and websocket connect share one selected server so they cannot enroll or replace
@@ -395,6 +428,35 @@ impl RemoteControlHandle {
         if !self.desired_state_tx.borrow().is_enabled() {
             return Err(Self::pairing_disabled_error());
         }
+        self.start_pairing_with_source(
+            RemoteControlHttpClientSource::Pool(&self.http_clients),
+            params,
+            app_server_client_name,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn start_pairing_with_client(
+        &self,
+        client: &HttpClient,
+        params: RemoteControlPairingStartParams,
+        app_server_client_name: Option<&str>,
+    ) -> io::Result<RemoteControlPairingStartResponse> {
+        self.start_pairing_with_source(
+            RemoteControlHttpClientSource::Fixed(client),
+            params,
+            app_server_client_name,
+        )
+        .await
+    }
+
+    async fn start_pairing_with_source(
+        &self,
+        http_clients: RemoteControlHttpClientSource<'_>,
+        params: RemoteControlPairingStartParams,
+        app_server_client_name: Option<&str>,
+    ) -> io::Result<RemoteControlPairingStartResponse> {
         let mut auth = load_remote_control_auth(&self.auth_manager)
             .await
             .map_err(|_| pairing_unavailable_error())?;
@@ -405,6 +467,7 @@ impl RemoteControlHandle {
         let mut current_enrollment = self.current_enrollment.lock().await;
         let mut enrollment = self
             .load_or_enroll_pairing_server(
+                http_clients,
                 &mut current_enrollment,
                 &mut auth,
                 &installation_id,
@@ -415,6 +478,7 @@ impl RemoteControlHandle {
             .await?;
         if enrollment.should_refresh_server_token() {
             let refresh_result = refresh_pairing_enrollment(
+                http_clients,
                 &mut current_enrollment,
                 &self.auth_manager,
                 &mut auth,
@@ -428,6 +492,7 @@ impl RemoteControlHandle {
             {
                 enrollment = self
                     .load_or_enroll_pairing_server(
+                        http_clients,
                         &mut current_enrollment,
                         &mut auth,
                         &installation_id,
@@ -443,38 +508,42 @@ impl RemoteControlHandle {
         let pairing_request = || protocol::StartRemoteControlPairingRequest {
             manual_code: params.manual_code,
         };
-        let pairing_response = match enrollment.start_pairing(pairing_request()).await {
-            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-                clear_pairing_server_token(&mut current_enrollment, &mut enrollment)?;
-                refresh_pairing_enrollment(
-                    &mut current_enrollment,
-                    &self.auth_manager,
-                    &mut auth,
-                    &installation_id,
-                    &mut enrollment,
-                )
-                .await?;
-                enrollment.start_pairing(pairing_request()).await
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                enrollment = self
-                    .load_or_enroll_pairing_server(
+        let pairing_response =
+            match start_pairing_request(http_clients, &enrollment, pairing_request()).await {
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                    clear_pairing_server_token(&mut current_enrollment, &mut enrollment)?;
+                    refresh_pairing_enrollment(
+                        http_clients,
                         &mut current_enrollment,
+                        &self.auth_manager,
                         &mut auth,
                         &installation_id,
-                        &status.server_name,
-                        app_server_client_name,
-                        RemoteControlEnrollmentSelection::ReplaceExisting,
+                        &mut enrollment,
                     )
                     .await?;
-                enrollment.start_pairing(pairing_request()).await
-            }
-            pairing_response => pairing_response,
-        };
+                    start_pairing_request(http_clients, &enrollment, pairing_request()).await
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    enrollment = self
+                        .load_or_enroll_pairing_server(
+                            http_clients,
+                            &mut current_enrollment,
+                            &mut auth,
+                            &installation_id,
+                            &status.server_name,
+                            app_server_client_name,
+                            RemoteControlEnrollmentSelection::ReplaceExisting,
+                        )
+                        .await?;
+                    start_pairing_request(http_clients, &enrollment, pairing_request()).await
+                }
+                pairing_response => pairing_response,
+            };
         if let Err(err) = &pairing_response {
             match err.kind() {
                 io::ErrorKind::NotFound => {
                     self.load_or_enroll_pairing_server(
+                        http_clients,
                         &mut current_enrollment,
                         &mut auth,
                         &installation_id,
@@ -504,8 +573,11 @@ impl RemoteControlHandle {
         pairing_response
     }
 
+    // Pairing enrollment intentionally carries the selected server and persistence context.
+    #[allow(clippy::too_many_arguments)]
     async fn load_or_enroll_pairing_server(
         &self,
+        http_clients: RemoteControlHttpClientSource<'_>,
         current_enrollment: &mut Option<RemoteControlEnrollment>,
         auth: &mut auth::RemoteControlConnectionAuth,
         installation_id: &str,
@@ -514,7 +586,8 @@ impl RemoteControlHandle {
         selection: RemoteControlEnrollmentSelection,
     ) -> io::Result<RemoteControlEnrollment> {
         let (enrollment, created) = self
-            .load_or_enroll_server(
+            .load_or_enroll_server_with_source(
+                http_clients,
                 current_enrollment,
                 auth,
                 installation_id,
@@ -554,8 +627,11 @@ impl RemoteControlHandle {
         Ok(enrollment)
     }
 
-    async fn load_or_enroll_server(
+    // Server selection must keep all enrollment identity inputs in one atomic decision.
+    #[allow(clippy::too_many_arguments)]
+    async fn load_or_enroll_server_with_source(
         &self,
+        http_clients: RemoteControlHttpClientSource<'_>,
         current_enrollment: &Option<RemoteControlEnrollment>,
         auth: &mut auth::RemoteControlConnectionAuth,
         installation_id: &str,
@@ -594,6 +670,7 @@ impl RemoteControlHandle {
         }
 
         let enrollment = enroll_pairing_server(
+            http_clients,
             &self.auth_manager,
             auth,
             &remote_control_target,
@@ -626,6 +703,18 @@ impl RemoteControlHandle {
         if !self.desired_state_tx.borrow().is_enabled() {
             return Err(Self::pairing_disabled_error());
         }
+        self.pairing_status_with_source(
+            RemoteControlHttpClientSource::Pool(&self.http_clients),
+            params,
+        )
+        .await
+    }
+
+    async fn pairing_status_with_source(
+        &self,
+        http_clients: RemoteControlHttpClientSource<'_>,
+        params: RemoteControlPairingStatusParams,
+    ) -> io::Result<RemoteControlPairingStatusResponse> {
         let mut auth = load_remote_control_auth(&self.auth_manager)
             .await
             .map_err(|_| pairing_unavailable_error())?;
@@ -642,6 +731,7 @@ impl RemoteControlHandle {
         let server_name = status.server_name;
         if enrollment.should_refresh_server_token() {
             let refresh_result = refresh_pairing_enrollment(
+                http_clients,
                 &mut current_enrollment,
                 &self.auth_manager,
                 &mut auth,
@@ -654,6 +744,7 @@ impl RemoteControlHandle {
                 .is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
             {
                 self.load_or_enroll_pairing_server(
+                    http_clients,
                     &mut current_enrollment,
                     &mut auth,
                     &installation_id,
@@ -669,26 +760,38 @@ impl RemoteControlHandle {
         let status_code = remote_control_pairing_status_code(&params)?;
         let pairing_status_request =
             || protocol::RemoteControlPairingStatusRequest::from(status_code.clone());
-        let pairing_status_response =
-            match enrollment.pairing_status(pairing_status_request()).await {
-                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-                    clear_pairing_server_token(&mut current_enrollment, &mut enrollment)?;
-                    refresh_pairing_enrollment(
-                        &mut current_enrollment,
-                        &self.auth_manager,
-                        &mut auth,
-                        &installation_id,
-                        &mut enrollment,
-                    )
-                    .await?;
-                    enrollment.pairing_status(pairing_status_request()).await
-                }
-                pairing_status_response => pairing_status_response,
-            };
+        let pairing_status_response = match pairing_status_request_with_source(
+            http_clients,
+            &enrollment,
+            pairing_status_request(),
+        )
+        .await
+        {
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                clear_pairing_server_token(&mut current_enrollment, &mut enrollment)?;
+                refresh_pairing_enrollment(
+                    http_clients,
+                    &mut current_enrollment,
+                    &self.auth_manager,
+                    &mut auth,
+                    &installation_id,
+                    &mut enrollment,
+                )
+                .await?;
+                pairing_status_request_with_source(
+                    http_clients,
+                    &enrollment,
+                    pairing_status_request(),
+                )
+                .await
+            }
+            pairing_status_response => pairing_status_response,
+        };
         if let Err(err) = &pairing_status_response {
             match err.kind() {
                 io::ErrorKind::NotFound => {
                     self.load_or_enroll_pairing_server(
+                        http_clients,
                         &mut current_enrollment,
                         &mut auth,
                         &installation_id,
@@ -723,8 +826,13 @@ impl RemoteControlHandle {
         params: RemoteControlClientsListParams,
     ) -> io::Result<RemoteControlClientsListResponse> {
         self.ensure_remote_control_allowed_io()?;
-        clients::list_remote_control_clients(&self.remote_control_url, &self.auth_manager, params)
-            .await
+        clients::list_remote_control_clients_with_pool(
+            &self.http_clients,
+            &self.remote_control_url,
+            &self.auth_manager,
+            params,
+        )
+        .await
     }
 
     pub async fn revoke_client(
@@ -732,8 +840,13 @@ impl RemoteControlHandle {
         params: RemoteControlClientsRevokeParams,
     ) -> io::Result<RemoteControlClientsRevokeResponse> {
         self.ensure_remote_control_allowed_io()?;
-        clients::revoke_remote_control_client(&self.remote_control_url, &self.auth_manager, params)
-            .await
+        clients::revoke_remote_control_client_with_pool(
+            &self.http_clients,
+            &self.remote_control_url,
+            &self.auth_manager,
+            params,
+        )
+        .await
     }
 
     fn pairing_disabled_error() -> io::Error {
@@ -775,14 +888,24 @@ impl RemoteControlHandle {
 }
 
 async fn enroll_pairing_server(
+    http_clients: RemoteControlHttpClientSource<'_>,
     auth_manager: &Arc<AuthManager>,
     auth: &mut auth::RemoteControlConnectionAuth,
     remote_control_target: &protocol::RemoteControlTarget,
     installation_id: &str,
     server_name: &str,
 ) -> io::Result<RemoteControlEnrollment> {
-    match enroll_remote_control_server(remote_control_target, auth, installation_id, server_name)
-        .await
+    let client = http_clients
+        .client_for_url(&remote_control_target.enroll_url)
+        .await?;
+    match enroll_remote_control_server_with_client(
+        &client,
+        remote_control_target,
+        auth,
+        installation_id,
+        server_name,
+    )
+    .await
     {
         Ok(enrollment) => return Ok(enrollment),
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
@@ -797,7 +920,14 @@ async fn enroll_pairing_server(
         }
         Err(err) => return Err(err),
     }
-    enroll_remote_control_server(remote_control_target, auth, installation_id, server_name).await
+    enroll_remote_control_server_with_client(
+        &client,
+        remote_control_target,
+        auth,
+        installation_id,
+        server_name,
+    )
+    .await
 }
 
 fn remote_control_pairing_status_code(
@@ -822,13 +952,18 @@ fn remote_control_pairing_status_code(
 }
 
 async fn refresh_pairing_enrollment(
+    http_clients: RemoteControlHttpClientSource<'_>,
     current_enrollment: &mut Option<RemoteControlEnrollment>,
     auth_manager: &Arc<AuthManager>,
     auth: &mut auth::RemoteControlConnectionAuth,
     installation_id: &str,
     enrollment: &mut RemoteControlEnrollment,
 ) -> io::Result<()> {
-    let mut refresh_result = refresh_remote_control_server(auth, installation_id, enrollment).await;
+    let client = http_clients
+        .client_for_url(&enrollment.remote_control_target.refresh_url)
+        .await?;
+    let mut refresh_result =
+        refresh_remote_control_server_with_client(&client, auth, installation_id, enrollment).await;
     if refresh_result
         .as_ref()
         .is_err_and(|err| err.kind() == io::ErrorKind::PermissionDenied)
@@ -839,8 +974,13 @@ async fn refresh_pairing_enrollment(
             match load_remote_control_auth(auth_manager).await {
                 Ok(recovered_auth) if recovered_auth.account_id == enrollment.account_id => {
                     *auth = recovered_auth;
-                    refresh_result =
-                        refresh_remote_control_server(auth, installation_id, enrollment).await;
+                    refresh_result = refresh_remote_control_server_with_client(
+                        &client,
+                        auth,
+                        installation_id,
+                        enrollment,
+                    )
+                    .await;
                 }
                 Ok(_) | Err(_) => {
                     enrollment.clear_server_token();
@@ -862,6 +1002,30 @@ async fn refresh_pairing_enrollment(
     } else {
         refresh_result
     }
+}
+
+async fn start_pairing_request(
+    http_clients: RemoteControlHttpClientSource<'_>,
+    enrollment: &RemoteControlEnrollment,
+    request: protocol::StartRemoteControlPairingRequest,
+) -> io::Result<RemoteControlPairingStartResponse> {
+    let client = http_clients
+        .client_for_url(&enrollment.remote_control_target.pair_url)
+        .await?;
+    enrollment.start_pairing_with_client(&client, request).await
+}
+
+async fn pairing_status_request_with_source(
+    http_clients: RemoteControlHttpClientSource<'_>,
+    enrollment: &RemoteControlEnrollment,
+    request: protocol::RemoteControlPairingStatusRequest,
+) -> io::Result<RemoteControlPairingStatusResponse> {
+    let client = http_clients
+        .client_for_url(&enrollment.remote_control_target.pair_status_url)
+        .await?;
+    enrollment
+        .pairing_status_with_client(&client, request)
+        .await
 }
 
 fn clear_pairing_server_token(
@@ -940,6 +1104,7 @@ pub async fn start_remote_control(
     app_server_client_name_rx: Option<oneshot::Receiver<String>>,
     startup_mode: RemoteControlStartupMode,
 ) -> io::Result<(JoinHandle<()>, RemoteControlHandle)> {
+    let http_clients = remote_control_http_clients(config.http_client_factory.clone());
     let policy = config.policy;
     let state_db_available = state_db.is_some();
     let requested_initial_enabled = startup_mode == RemoteControlStartupMode::EnabledEphemeral;
@@ -1006,6 +1171,7 @@ pub async fn start_remote_control(
     let installation_id_for_log = installation_id.clone();
     let server_name_for_log = server_name.clone();
     let shutdown_token_for_log = shutdown_token.clone();
+    let websocket_http_clients = http_clients.clone();
     let join_handle = tokio::spawn(async move {
         info!(
             remote_control_url = %remote_control_url_for_log,
@@ -1020,6 +1186,7 @@ pub async fn start_remote_control(
                 installation_id,
                 remote_control_target,
                 server_name,
+                http_clients: websocket_http_clients,
             },
             state_db,
             auth_manager,
@@ -1081,6 +1248,7 @@ pub async fn start_remote_control(
             pairing_persistence_key,
             pairing_persistence_key_required,
             auth_manager: handle_auth_manager,
+            http_clients,
         },
     ))
 }

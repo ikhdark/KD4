@@ -23,8 +23,6 @@ use codex_sandboxing::SandboxType;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
-use core_test_support::skip_if_no_remote_env;
-use core_test_support::test_codex::test_env as remote_test_env;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -33,6 +31,8 @@ use tokio::sync::Notify;
 use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::Instant;
+
+const TEST_MAX_OUTPUT_TOKENS: usize = 10_000;
 
 async fn test_session_and_turn() -> (Arc<Session>, Arc<TurnContext>) {
     let (session, turn) = make_session_and_context().await;
@@ -73,6 +73,7 @@ fn test_exec_request(
     let arg0 = None;
     ExecRequest::new(
         command,
+        turn.config.codex_home.clone(),
         cwd,
         env,
         network,
@@ -101,7 +102,24 @@ async fn exec_command_with_tty(
     let cwd = workdir
         .as_ref()
         .map_or_else(|| turn.cwd().clone(), |workdir| turn.cwd().join(workdir));
-    let command = vec!["bash".to_string(), "-lc".to_string(), cmd.to_string()];
+    let command = if cmd == "powershell.exe -NoExit" {
+        vec![
+            "powershell.exe".to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NoExit".to_string(),
+            "-Command".to_string(),
+            "-".to_string(),
+        ]
+    } else {
+        vec![
+            "powershell.exe".to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            cmd.to_string(),
+        ]
+    };
     let request = test_exec_request(turn, command.clone(), cwd.clone(), shell_env());
 
     let process = manager
@@ -109,6 +127,7 @@ async fn exec_command_with_tty(
             process_id,
             &request,
             tty,
+            None,
             Box::new(NoopSpawnLifecycle),
             None,
             turn.environments
@@ -152,6 +171,7 @@ async fn exec_command_with_tty(
         output_closed,
         output_closed_notify,
         cancellation_token,
+        ..
     } = process.output_handles();
     let deadline = started_at + Duration::from_millis(yield_time_ms);
     let collected = UnifiedExecProcessManager::collect_output_until_deadline(
@@ -201,17 +221,6 @@ async fn exec_command_with_tty(
         raw_output_artifact: None,
         repair_notice: None,
     })
-}
-
-#[derive(Debug)]
-struct TestSpawnLifecycle {
-    inherited_fds: Vec<i32>,
-}
-
-impl SpawnLifecycle for TestSpawnLifecycle {
-    fn inherited_fds(&self) -> Vec<i32> {
-        self.inherited_fds.clone()
-    }
 }
 
 struct BlockingTerminateExecProcess {
@@ -298,6 +307,7 @@ async fn blocking_terminate_unified_process(
             }),
         },
         None,
+        None,
         &PendingSpawnRegistration::default(),
     )
     .await?)
@@ -361,7 +371,11 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
     let cwd = turn.cwd().clone();
 
     let open_shell = exec_command(
-        &session, &turn, "bash -i", /*yield_time_ms*/ 2_500, /*workdir*/ None,
+        &session,
+        &turn,
+        "powershell.exe -NoExit",
+        /*yield_time_ms*/ 2_500,
+        /*workdir*/ None,
     )
     .await?;
     let process_id = open_shell.process_id.expect("expected process_id");
@@ -370,7 +384,7 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
         vec![BackgroundTerminalInfo {
             item_id: "call".to_string(),
             process_id: process_id.to_string(),
-            command: "bash -i".to_string(),
+            command: "powershell.exe -NoExit".to_string(),
             cwd: cwd.into(),
         }]
     );
@@ -378,7 +392,7 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
     write_stdin(
         &session,
         process_id,
-        "export CODEX_INTERACTIVE_SHELL_VAR=codex\n",
+        "$env:CODEX_INTERACTIVE_SHELL_VAR = 'codex'\n",
         /*yield_time_ms*/ 2_500,
     )
     .await?;
@@ -386,13 +400,13 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
     let out_2 = write_stdin(
         &session,
         process_id,
-        "echo $CODEX_INTERACTIVE_SHELL_VAR\n",
+        "Write-Output $env:CODEX_INTERACTIVE_SHELL_VAR\n",
         /*yield_time_ms*/ 2_500,
     )
     .await?;
     assert!(
         out_2
-            .truncated_output(DEFAULT_MAX_OUTPUT_TOKENS)
+            .truncated_output(TEST_MAX_OUTPUT_TOKENS)
             .contains("codex"),
         "expected environment variable output"
     );
@@ -409,7 +423,11 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
     let (session, turn) = test_session_and_turn().await;
 
     let shell_a = exec_command(
-        &session, &turn, "bash -i", /*yield_time_ms*/ 2_500, /*workdir*/ None,
+        &session,
+        &turn,
+        "powershell.exe -NoExit",
+        /*yield_time_ms*/ 2_500,
+        /*workdir*/ None,
     )
     .await?;
     let session_a = shell_a.process_id.expect("expected process id");
@@ -417,7 +435,7 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
     write_stdin(
         &session,
         session_a,
-        "export CODEX_INTERACTIVE_SHELL_VAR=codex\n",
+        "$env:CODEX_INTERACTIVE_SHELL_VAR = 'codex'\n",
         /*yield_time_ms*/ 2_500,
     )
     .await?;
@@ -425,7 +443,7 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
     let out_2 = exec_command(
         &session,
         &turn,
-        "echo $CODEX_INTERACTIVE_SHELL_VAR",
+        "Write-Output $env:CODEX_INTERACTIVE_SHELL_VAR",
         /*yield_time_ms*/ 2_500,
         /*workdir*/ None,
     )
@@ -437,7 +455,7 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
     );
     assert!(
         !out_2
-            .truncated_output(DEFAULT_MAX_OUTPUT_TOKENS)
+            .truncated_output(TEST_MAX_OUTPUT_TOKENS)
             .contains("codex"),
         "short command should run in a fresh shell"
     );
@@ -445,13 +463,13 @@ async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
     let out_3 = write_stdin(
         &session,
         shell_a.process_id.expect("expected process id"),
-        "echo $CODEX_INTERACTIVE_SHELL_VAR\n",
+        "Write-Output $env:CODEX_INTERACTIVE_SHELL_VAR\n",
         /*yield_time_ms*/ 2_500,
     )
     .await?;
     assert!(
         out_3
-            .truncated_output(DEFAULT_MAX_OUTPUT_TOKENS)
+            .truncated_output(TEST_MAX_OUTPUT_TOKENS)
             .contains("codex"),
         "session should preserve state"
     );
@@ -466,7 +484,11 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
     let (session, turn) = test_session_and_turn().await;
 
     let open_shell = exec_command(
-        &session, &turn, "bash -i", /*yield_time_ms*/ 2_500, /*workdir*/ None,
+        &session,
+        &turn,
+        "powershell.exe -NoExit",
+        /*yield_time_ms*/ 2_500,
+        /*workdir*/ None,
     )
     .await?;
     let process_id = open_shell.process_id.expect("expected process id");
@@ -474,7 +496,7 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
     write_stdin(
         &session,
         process_id,
-        format!("export CODEX_INTERACTIVE_SHELL_VAR={TEST_VAR_VALUE}\n").as_str(),
+        format!("$env:CODEX_INTERACTIVE_SHELL_VAR = '{TEST_VAR_VALUE}'\n").as_str(),
         /*yield_time_ms*/ 2_500,
     )
     .await?;
@@ -482,13 +504,13 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
     let out_2 = write_stdin(
         &session,
         process_id,
-        "sleep 5 && echo $CODEX_INTERACTIVE_SHELL_VAR\n",
+        "Start-Sleep -Seconds 5; Write-Output $env:CODEX_INTERACTIVE_SHELL_VAR\n",
         /*yield_time_ms*/ 10,
     )
     .await?;
     assert!(
         !out_2
-            .truncated_output(DEFAULT_MAX_OUTPUT_TOKENS)
+            .truncated_output(TEST_MAX_OUTPUT_TOKENS)
             .contains(TEST_VAR_VALUE),
         "timeout too short should yield incomplete output"
     );
@@ -499,7 +521,7 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
 
     assert!(
         out_3
-            .truncated_output(DEFAULT_MAX_OUTPUT_TOKENS)
+            .truncated_output(TEST_MAX_OUTPUT_TOKENS)
             .contains(TEST_VAR_VALUE),
         "subsequent poll should retrieve output"
     );
@@ -521,7 +543,7 @@ async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
     let response = exec_command(
         &session,
         &turn,
-        "sleep 1 && echo unified-exec-done",
+        "Start-Sleep -Seconds 1; Write-Output unified-exec-done",
         /*yield_time_ms*/ 250,
         /*workdir*/ None,
     )
@@ -533,7 +555,7 @@ async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
     );
     assert!(
         response
-            .truncated_output(DEFAULT_MAX_OUTPUT_TOKENS)
+            .truncated_output(TEST_MAX_OUTPUT_TOKENS)
             .contains("unified-exec-done"),
         "exec_command should wait for output after the pause lifts"
     );
@@ -553,7 +575,7 @@ async fn requests_with_large_timeout_are_capped() -> anyhow::Result<()> {
     let result = exec_command(
         &session,
         &turn,
-        "echo codex",
+        "Write-Output codex",
         /*yield_time_ms*/ 120_000,
         /*workdir*/ None,
     )
@@ -562,7 +584,7 @@ async fn requests_with_large_timeout_are_capped() -> anyhow::Result<()> {
     assert!(result.process_id.is_some());
     assert!(
         result
-            .truncated_output(DEFAULT_MAX_OUTPUT_TOKENS)
+            .truncated_output(TEST_MAX_OUTPUT_TOKENS)
             .contains("codex")
     );
 
@@ -576,7 +598,7 @@ async fn completed_commands_do_not_persist_sessions() -> anyhow::Result<()> {
     let result = exec_command(
         &session,
         &turn,
-        "echo codex",
+        "Write-Output codex",
         /*yield_time_ms*/ 2_500,
         /*workdir*/ None,
     )
@@ -588,7 +610,7 @@ async fn completed_commands_do_not_persist_sessions() -> anyhow::Result<()> {
     );
     assert!(
         result
-            .truncated_output(DEFAULT_MAX_OUTPUT_TOKENS)
+            .truncated_output(TEST_MAX_OUTPUT_TOKENS)
             .contains("codex")
     );
 
@@ -611,7 +633,11 @@ async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<(
     let (session, turn) = test_session_and_turn().await;
 
     let open_shell = exec_command(
-        &session, &turn, "bash -i", /*yield_time_ms*/ 2_500, /*workdir*/ None,
+        &session,
+        &turn,
+        "powershell.exe -NoExit",
+        /*yield_time_ms*/ 2_500,
+        /*workdir*/ None,
     )
     .await?;
     let process_id = open_shell.process_id.expect("expected process id");
@@ -669,7 +695,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             process_id,
             cwd: cwd.into(),
             initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            hook_command: "sleep 60".to_string(),
+            hook_command: "Start-Sleep -Seconds 60".to_string(),
             tty: true,
             network_approval: None,
             session: Arc::downgrade(&session),
@@ -743,7 +769,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
             process_id,
             cwd: cwd.into(),
             initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            hook_command: "sleep 60".to_string(),
+            hook_command: "Start-Sleep -Seconds 60".to_string(),
             tty: true,
             network_approval: None,
             session: Arc::downgrade(&session),
@@ -795,7 +821,13 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
     let cwd = turn.cwd().clone();
     let request = test_exec_request(
         &turn,
-        vec!["bash".to_string(), "-lc".to_string(), "exit 17".to_string()],
+        vec![
+            "cmd.exe".to_string(),
+            "/D".to_string(),
+            "/S".to_string(),
+            "/C".to_string(),
+            "exit /b 17".to_string(),
+        ],
         cwd,
         shell_env(),
     );
@@ -806,6 +838,7 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
             /*process_id*/ 1234,
             &request,
             /*tty*/ false,
+            None,
             Box::new(NoopSpawnLifecycle),
             None,
             &environment,
@@ -825,100 +858,5 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
 
     assert!(process.has_exited());
     assert_eq!(process.exit_code(), Some(17));
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Result<()> {
-    skip_if_no_remote_env!(Ok(()));
-
-    let remote_test_env = remote_test_env().await?;
-    let (_, turn) = make_session_and_context().await;
-    let request = test_exec_request(
-        &turn,
-        vec!["bash".to_string(), "-i".to_string()],
-        remote_test_env.cwd().clone(),
-        shell_env(),
-    );
-
-    let manager = UnifiedExecProcessManager::default();
-    let process = manager
-        .open_session_with_prepared_exec_env(
-            /*process_id*/ 1234,
-            &request,
-            /*tty*/ true,
-            Box::new(NoopSpawnLifecycle),
-            None,
-            remote_test_env.environment(),
-            &PendingSpawnRegistration::default(),
-        )
-        .await?;
-
-    process.write(b"printf 'remote-unified-exec\\n'\n").await?;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let crate::unified_exec::process::OutputHandles {
-        output_buffer,
-        output_notify,
-        output_closed,
-        output_closed_notify,
-        cancellation_token,
-    } = process.output_handles();
-    let collected = UnifiedExecProcessManager::collect_output_until_deadline(
-        &output_buffer,
-        &output_notify,
-        &output_closed,
-        &output_closed_notify,
-        &cancellation_token,
-        /*pause_state*/ None,
-        Instant::now() + Duration::from_millis(2_500),
-    )
-    .await;
-
-    assert!(String::from_utf8_lossy(&collected).contains("remote-unified-exec"));
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()> {
-    skip_if_no_remote_env!(Ok(()));
-
-    let remote_test_env = remote_test_env().await?;
-    let (_, mut turn) = make_session_and_context().await;
-    turn.environments.turn_environments[0].environment =
-        Arc::new(remote_test_env.environment().clone());
-
-    let cwd = turn.cwd().clone();
-    let request = test_exec_request(
-        &turn,
-        vec!["bash".to_string(), "-lc".to_string(), "echo ok".to_string()],
-        cwd,
-        shell_env(),
-    );
-
-    let manager = UnifiedExecProcessManager::default();
-    let err = manager
-        .open_session_with_prepared_exec_env(
-            /*process_id*/ 1234,
-            &request,
-            /*tty*/ true,
-            Box::new(TestSpawnLifecycle {
-                inherited_fds: vec![42],
-            }),
-            None,
-            turn.environments
-                .primary()
-                .expect("turn environment")
-                .environment
-                .as_ref(),
-            &PendingSpawnRegistration::default(),
-        )
-        .await
-        .expect_err("expected inherited fd rejection");
-
-    assert_eq!(
-        err.to_string(),
-        "Failed to create unified exec process: remote exec-server does not support inherited file descriptors"
-    );
     Ok(())
 }

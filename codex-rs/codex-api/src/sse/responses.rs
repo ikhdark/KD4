@@ -91,7 +91,6 @@ async fn process_sse_with_metadata(
     turn_state: Option<Arc<OnceLock<String>>>,
 ) {
     let mut stream = stream.eventsource();
-    let mut response_error: Option<ApiError> = None;
     let mut interpreter = ResponsesEventInterpreter::new(&metadata, turn_state);
     let mut poll_ordinal = 0_u64;
 
@@ -130,10 +129,11 @@ async fn process_sse_with_metadata(
                 return;
             }
             Ok(None) => {
-                let error = response_error.unwrap_or(ApiError::Stream(
-                    "stream closed before response.completed".into(),
-                ));
-                let _ = tx_event.send(Err(error)).await;
+                let _ = tx_event
+                    .send(Err(ApiError::Stream(
+                        "stream closed before response.completed".into(),
+                    )))
+                    .await;
                 if let Some(t) = telemetry.as_ref() {
                     t.on_sse_cleanup(
                         SseCleanupOutcome::CarrierEofBeforeCompleted,
@@ -156,19 +156,33 @@ async fn process_sse_with_metadata(
         trace!("SSE event: {}", &sse.data);
 
         let events = match interpreter.process_payload(&sse.data) {
-            Ok(events) => events,
+            Ok(events) => {
+                if let Some(t) = telemetry.as_ref() {
+                    t.on_sse_event(&sse.event, start.elapsed(), None);
+                }
+                events
+            }
             Err(ResponsesEventError::Parse(error)) => {
+                if let Some(t) = telemetry.as_ref() {
+                    t.on_sse_event(&sse.event, start.elapsed(), Some(&error));
+                }
                 debug!("Failed to parse SSE event: {error}, data: {}", &sse.data);
+                let _ = tx_event
+                    .send(Err(ApiError::Stream(format!(
+                        "failed to parse SSE event: {error}"
+                    ))))
+                    .await;
                 if let Some(t) = telemetry.as_ref() {
                     t.on_sse_cleanup(SseCleanupOutcome::ProtocolError, start.elapsed());
                 }
-                continue;
+                return;
             }
             Err(ResponsesEventError::Api(error)) => {
-                // SSE may include a final protocol error followed by EOF. Preserve the existing
-                // behavior of reporting that error when the carrier closes.
-                response_error = Some(error);
-                continue;
+                if let Some(t) = telemetry.as_ref() {
+                    t.on_sse_event(&sse.event, start.elapsed(), Some(&error));
+                }
+                let _ = tx_event.send(Err(error)).await;
+                return;
             }
         };
 
@@ -352,6 +366,61 @@ mod tests {
                 assert!(end_turn.is_none());
             }
             other => panic!("unexpected third event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_errors_stop_before_completed() {
+        let completed = json!({
+            "type": "response.completed",
+            "response": { "id": "resp1" }
+        })
+        .to_string();
+        let completed_sse = format!("event: response.completed\ndata: {completed}\n\n");
+
+        for (case, event_kind, payload) in [
+            (
+                "invalid output item",
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {"type": "message"}
+                })
+                .to_string(),
+            ),
+            (
+                "malformed json",
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done""#.to_string(),
+            ),
+        ] {
+            let invalid_sse = format!("event: {event_kind}\ndata: {payload}\n\n");
+            let reader = std::io::Cursor::new(format!("{invalid_sse}{completed_sse}"));
+            let stream =
+                ReaderStream::new(reader).map_err(|err| TransportError::Network(err.to_string()));
+            let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(16);
+            tokio::spawn(process_sse(
+                Box::pin(stream),
+                tx,
+                idle_timeout(),
+                /*telemetry*/ None,
+            ));
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+
+            assert_eq!(events.len(), 1, "case {case}");
+            match &events[0] {
+                Err(ApiError::Stream(message)) => {
+                    assert!(
+                        message.contains("response.output_item.done")
+                            || message.contains("failed to parse SSE event"),
+                        "case {case}: {message}"
+                    );
+                }
+                other => panic!("unexpected event for {case}: {other:?}"),
+            }
         }
     }
 
@@ -564,6 +633,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_error_is_emitted_before_pending_carrier_closes() {
+        let raw_error = r#"{"type":"response.failed","response":{"error":{"code":"context_length_exceeded","message":"too long"}}}"#;
+        let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(sse))]).chain(stream::pending());
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        tokio::spawn(process_sse(
+            Box::pin(stream),
+            tx,
+            Duration::from_secs(30),
+            /*telemetry*/ None,
+        ));
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("terminal API error should not wait for the carrier")
+            .expect("response stream should emit the API error");
+        assert_matches!(event, Err(ApiError::ContextWindowExceeded));
+        let closed = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("response stream should close after the API error");
+        assert!(closed.is_none());
+    }
+
+    #[tokio::test]
     async fn context_window_error_is_fatal() {
         let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b","object":"response","created_at":1759510079,"status":"failed","background":false,"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."},"usage":null,"user":null,"metadata":{}}}"#;
 
@@ -757,6 +850,68 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingSseTelemetry {
+        interpreted_events: std::sync::Mutex<Vec<(String, bool)>>,
+    }
+
+    impl SseTelemetry for RecordingSseTelemetry {
+        fn on_sse_poll(
+            &self,
+            _result: &Result<
+                Option<
+                    Result<
+                        eventsource_stream::Event,
+                        eventsource_stream::EventStreamError<TransportError>,
+                    >,
+                >,
+                tokio::time::error::Elapsed,
+            >,
+            _duration: Duration,
+        ) {
+        }
+
+        fn on_sse_event(
+            &self,
+            kind: &str,
+            _duration: Duration,
+            error: Option<&dyn std::fmt::Display>,
+        ) {
+            self.interpreted_events
+                .lock()
+                .expect("recording telemetry lock")
+                .push((kind.to_string(), error.is_none()));
+        }
+    }
+
+    #[tokio::test]
+    async fn telemetry_uses_nested_item_interpretation_result() {
+        let telemetry = Arc::new(RecordingSseTelemetry::default());
+        let body = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n\n"
+        );
+        let stream = ReaderStream::new(std::io::Cursor::new(body))
+            .map_err(|err| TransportError::Network(err.to_string()));
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(2);
+
+        tokio::spawn(process_sse(
+            Box::pin(stream),
+            tx,
+            idle_timeout(),
+            Some(telemetry.clone()),
+        ));
+
+        assert!(matches!(rx.recv().await, Some(Err(ApiError::Stream(_)))));
+        assert_eq!(
+            *telemetry
+                .interpreted_events
+                .lock()
+                .expect("recording telemetry lock"),
+            vec![("response.output_item.done".to_string(), false)]
+        );
     }
 
     #[tokio::test]

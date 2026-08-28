@@ -16,9 +16,11 @@
 //! duplicating client-construction logic.
 
 use std::env;
+use std::fs;
 use std::process;
 use std::time::Duration;
 
+const PROBE_EXCLUSIVE_CA_ENV: &str = "CODEX_CUSTOM_CA_PROBE_EXCLUSIVE_CA";
 const PROBE_TLS13_ENV: &str = "CODEX_CUSTOM_CA_PROBE_TLS13";
 const PROBE_PROXY_ENV: &str = "CODEX_CUSTOM_CA_PROBE_PROXY";
 const PROBE_URL_ENV: &str = "CODEX_CUSTOM_CA_PROBE_URL";
@@ -47,6 +49,22 @@ fn main() {
 async fn run_probe() -> Result<(), String> {
     let proxy_url = env::var(PROBE_PROXY_ENV).ok();
     let target_url = env::var(PROBE_URL_ENV).ok();
+    if let Ok(explicit_ca_path) = env::var(PROBE_EXCLUSIVE_CA_ENV) {
+        let explicit_ca = fs::read(&explicit_ca_path).map_err(|error| {
+            format!("failed to read explicit CA file {explicit_ca_path}: {error}")
+        })?;
+        let client = codex_http_client::HttpClientBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .tls_certs_only_pem(&explicit_ca)
+            .map_err(|error| format!("failed to parse explicit CA: {error}"))?
+            .build_with_transport_default_proxy()
+            .map_err(|error| error.to_string())?;
+        if let Some(url) = target_url {
+            post_http_client_probe_request(&client, &url).await?;
+        }
+        return Ok(());
+    }
+
     let mut builder = reqwest::Client::builder();
     if target_url.is_some() {
         builder = builder.timeout(Duration::from_secs(5));
@@ -78,6 +96,31 @@ fn build_probe_client(
 }
 
 async fn post_probe_request(client: &reqwest::Client, url: &str) -> Result<(), String> {
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("grant_type=authorization_code&code=test")
+        .send()
+        .await
+        .map_err(|error| format!("probe request failed: {error:?}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("failed to read probe response body: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("probe request returned {status}: {body}"));
+    }
+    if body != "ok" {
+        return Err(format!("probe response body mismatch: {body}"));
+    }
+    Ok(())
+}
+
+async fn post_http_client_probe_request(
+    client: &codex_http_client::HttpClient,
+    url: &str,
+) -> Result<(), String> {
     let response = client
         .post(url)
         .header("Content-Type", "application/x-www-form-urlencoded")

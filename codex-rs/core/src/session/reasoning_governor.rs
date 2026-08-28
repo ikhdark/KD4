@@ -36,7 +36,6 @@ use sha2::Sha256;
 
 use crate::tool_history::SourceDependencyV1;
 use crate::tools::handlers::command_shape::CommandInvocation;
-use crate::turn_diff_tracker::ValidationFreshnessStatus;
 use crate::turn_timing::TurnTimingState;
 use crate::validation_admission::ValidationClassification;
 use crate::validation_admission::classify_validation;
@@ -45,9 +44,8 @@ pub(crate) type SamplingReasoningPhase = ReasoningPolicyPhase;
 pub(crate) type SamplingRequestPolicySource = ReasoningPolicySource;
 
 const TURN_EFFICIENCY_TOOL_CALL_THRESHOLD: usize = 8;
-const TURN_EFFICIENCY_TERMINAL_TOOL_CALL_THRESHOLD: usize = TURN_EFFICIENCY_TOOL_CALL_THRESHOLD * 2;
 const TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL: u64 = 500;
-const DISTINCT_FAILURE_RECOVERY_LIMIT: u32 = 2;
+const DISTINCT_FAILURE_RECOVERY_ADVISORY_THRESHOLD: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ContinuationDisposition {
@@ -246,8 +244,6 @@ fn unix_timestamp_millis() -> i64 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SamplingRequestBaselines {
     mutation_revision: u64,
-    validation_status: ValidationFreshnessStatus,
-    validation_revision: Option<u64>,
     plan_revision: u64,
     input_revision: u64,
     tool_exposure_revision: u64,
@@ -256,10 +252,8 @@ pub(crate) struct SamplingRequestBaselines {
 impl SamplingRequestBaselines {
     fn revision_key(&self) -> String {
         format!(
-            "mutation={};validation_status={:?};validation_revision={:?};plan={};input={};tool_exposure={}",
+            "mutation={};plan={};input={};tool_exposure={}",
             self.mutation_revision,
-            self.validation_status,
-            self.validation_revision,
             self.plan_revision,
             self.input_revision,
             self.tool_exposure_revision,
@@ -274,8 +268,6 @@ impl SamplingRequestBaselines {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SamplingRequestSettledState {
     pub(crate) mutation_revision: u64,
-    pub(crate) validation_status: ValidationFreshnessStatus,
-    pub(crate) validation_revision: Option<u64>,
     pub(crate) tool_exposure_revision: u64,
 }
 
@@ -300,6 +292,7 @@ struct SamplingToolOutcome {
     source_evidence: Option<Value>,
     unfinished_mutation_obligation: bool,
     failure_fingerprint: Option<String>,
+    failure_is_terminal: bool,
     failure_diagnosis_reused: bool,
     canonical_artifact_required: bool,
     nested_in_code_mode: bool,
@@ -322,6 +315,7 @@ impl SamplingToolOutcome {
             source_evidence: sampling_source_evidence(signal),
             unfinished_mutation_obligation: sampling_unfinished_mutation_obligation(signal),
             failure_fingerprint: sampling_failure_fingerprint(signal),
+            failure_is_terminal: sampling_failure_is_terminal(signal),
             failure_diagnosis_reused: false,
             canonical_artifact_required: false,
             nested_in_code_mode: false,
@@ -509,7 +503,7 @@ struct SamplingRequestSignalState {
     deterministic_continuation_receipts: BTreeSet<String>,
     registered_count: usize,
     wait_call_count: usize,
-    process_monitor_count: usize,
+    process_monitor_ordinals: BTreeSet<u64>,
     saw_artifact_read: bool,
     saw_canonical_artifact_requirement: bool,
     saw_validation: bool,
@@ -536,7 +530,7 @@ pub(crate) struct CodeModeToolResult<'a> {
     pub(crate) source_dependencies: Option<BTreeSet<SourceDependencyV1>>,
     pub(crate) outcome_context: ToolOutputOutcomeContext,
     pub(crate) signal: Option<&'a Value>,
-    pub(crate) result: Value,
+    pub(crate) result: &'a Value,
     pub(crate) canonical_artifact_required: bool,
 }
 
@@ -630,7 +624,7 @@ impl SamplingRequestSignalCollector {
             state.wait_call_count = state.wait_call_count.saturating_add(1);
         }
         if live_process_poll {
-            state.process_monitor_count = state.process_monitor_count.saturating_add(1);
+            state.process_monitor_ordinals.insert(ordinal);
         }
         if direct_code_mode_exec {
             state.direct_code_mode_exec_count = state.direct_code_mode_exec_count.saturating_add(1);
@@ -716,6 +710,7 @@ impl SamplingRequestSignalCollector {
         let mut outcome =
             SamplingToolOutcome::plain(ordinal, SamplingToolOutcomeKind::Failure, None);
         outcome.failure_fingerprint = Some(failure_fingerprint.to_string());
+        outcome.failure_is_terminal = true;
         outcome.failure_diagnosis_reused = true;
         outcome.nested_in_code_mode = true;
         let mut state = self
@@ -798,10 +793,13 @@ impl SamplingRequestSignalCollector {
         let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
         let plan = sampling_plan(signal);
         let mut outcome = SamplingToolOutcome::from_signal(ordinal, outcome_context, plan, signal);
-        if outcome.is_failure_evidence() && outcome.failure_fingerprint.is_none() {
-            outcome.failure_fingerprint = Some(code_mode_result_failure_fingerprint(
-                tool_name, payload, &result,
-            ));
+        if outcome.is_failure_evidence() {
+            if outcome.failure_fingerprint.is_none() {
+                outcome.failure_fingerprint = Some(code_mode_result_failure_fingerprint(
+                    tool_name, payload, result,
+                ));
+            }
+            outcome.failure_is_terminal |= value_failure_is_terminal(result);
         }
         outcome.canonical_artifact_required = canonical_artifact_required;
         outcome.nested_in_code_mode = true;
@@ -810,7 +808,7 @@ impl SamplingRequestSignalCollector {
             .source_evidence
             .as_ref()
             .and_then(value_evidence_identity)
-            .or_else(|| value_evidence_identity(&result));
+            .or_else(|| value_evidence_identity(result));
         let mut state = self
             .state
             .lock()
@@ -849,7 +847,7 @@ impl SamplingRequestSignalCollector {
             tool_name,
             payload,
             signal,
-            Some(&result),
+            Some(result),
         ) {
             state.authoritative_wait_observations.push(observation);
         }
@@ -961,8 +959,11 @@ impl SamplingRequestSignalCollector {
         let plan = sampling_plan(signal.as_ref());
         let mut outcome =
             SamplingToolOutcome::from_signal(ordinal, outcome_context, plan, signal.as_ref());
-        if outcome.is_failure_evidence() && outcome.failure_fingerprint.is_none() {
-            outcome.failure_fingerprint = response_failure_fingerprint(response);
+        if outcome.is_failure_evidence() {
+            if outcome.failure_fingerprint.is_none() {
+                outcome.failure_fingerprint = response_failure_fingerprint(response);
+            }
+            outcome.failure_is_terminal |= response_failure_is_terminal(response);
         }
         let evidence_identity = outcome
             .source_evidence
@@ -1029,6 +1030,7 @@ impl SamplingRequestSignalCollector {
             .filter(|outcome| outcome.is_failure_evidence())
             .collect::<Vec<_>>();
         if !failures.is_empty() {
+            let suppressible_failure = failures.iter().all(|outcome| outcome.failure_is_terminal);
             let failure_only = if code_mode_owned {
                 outcomes.len() == state.code_mode_nested_tool_count
                     && outcomes.iter().all(|outcome| outcome.is_failure_evidence())
@@ -1101,8 +1103,12 @@ impl SamplingRequestSignalCollector {
                 kind,
                 failure_only,
                 broad_source_evidence_by_action: BTreeMap::new(),
-                repeated_failure: repeated_action_identity
-                    .map(|action_identity| (action_identity, failure_fingerprint)),
+                repeated_failure: if suppressible_failure {
+                    repeated_action_identity
+                        .map(|action_identity| (action_identity, failure_fingerprint))
+                } else {
+                    None
+                },
             });
         }
         // A successful `write_stdin` result is monitoring state for a process
@@ -1110,7 +1116,7 @@ impl SamplingRequestSignalCollector {
         // unchanged until output or termination, so it is not a failed or
         // no-progress reasoning attempt. Actual write/poll errors were handled
         // by the failure branch above and remain eligible for deduplication.
-        if state.process_monitor_count == state.registered_count {
+        if state.process_monitor_ordinals.len() == state.registered_count {
             return None;
         }
         let incomplete_code_mode_outcomes = code_mode_owned
@@ -1224,6 +1230,35 @@ impl SamplingRequestSignalCollector {
         state.registered_count > 0 && state.wait_call_count == state.registered_count
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_process_monitor(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !state.process_monitor_ordinals.is_empty()
+    }
+
+    pub(crate) fn observed_successful_process_monitor(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.outcomes.iter().any(|outcome| {
+            matches!(
+                outcome.kind,
+                SamplingToolOutcomeKind::Success | SamplingToolOutcomeKind::Yielded
+            ) && state.process_monitor_ordinals.contains(&outcome.ordinal)
+        })
+    }
+
+    fn saw_validation(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .saw_validation
+    }
+
     fn generation_purpose(
         &self,
         baselines: &SamplingRequestBaselines,
@@ -1243,28 +1278,19 @@ impl SamplingRequestSignalCollector {
             .outcomes
             .iter()
             .any(|outcome| outcome.is_failure_evidence() && !outcome.failure_diagnosis_reused);
-        let validation_failed = matches!(
-            settled.validation_status,
-            ValidationFreshnessStatus::FailedAfterLastMutation
-                | ValidationFreshnessStatus::TimedOut
-        );
-
         // Mixed generations use the protocol's conservative precedence. The
         // initial/compaction cases are selected by the caller before this
         // post-tool classifier runs.
         if has_pending_input {
             Some(TurnTimingGenerationPurpose::InitialReasoning)
         } else if state.saw_mutation || settled.mutation_revision > baselines.mutation_revision {
-            Some(if observed_failure || validation_failed {
+            Some(if observed_failure {
                 TurnTimingGenerationPurpose::Repair
             } else {
                 TurnTimingGenerationPurpose::ImplementationDecision
             })
-        } else if state.saw_validation
-            || settled.validation_status != baselines.validation_status
-            || settled.validation_revision != baselines.validation_revision
-        {
-            Some(if observed_new_failure || validation_failed {
+        } else if state.saw_validation {
+            Some(if observed_new_failure {
                 TurnTimingGenerationPurpose::FailureDiagnosis
             } else {
                 TurnTimingGenerationPurpose::ValidationInterpretation
@@ -1281,7 +1307,7 @@ impl SamplingRequestSignalCollector {
                 .any(|action| action.class == StructuredActionClass::BroadSource)
         {
             Some(TurnTimingGenerationPurpose::ArtifactContinuation)
-        } else if observed_new_failure || validation_failed {
+        } else if observed_new_failure {
             Some(TurnTimingGenerationPurpose::FailureDiagnosis)
         } else if state.registered_count > 0 {
             // Every successful tool result is new model-visible evidence even
@@ -1307,9 +1333,7 @@ impl SamplingRequestSignalCollector {
         if settled.mutation_revision != baselines.mutation_revision {
             progress.push(TurnTimingProgressKind::WorkspaceMutation);
         }
-        if settled.validation_status != baselines.validation_status
-            || settled.validation_revision != baselines.validation_revision
-        {
+        if state.saw_validation {
             progress.push(TurnTimingProgressKind::ValidationResult);
         }
         if state
@@ -1417,6 +1441,10 @@ fn sampling_failure_fingerprint(signal: Option<&Value>) -> Option<String> {
         })
         .filter(|fingerprint| !fingerprint.is_empty())
         .map(str::to_owned)
+}
+
+fn sampling_failure_is_terminal(signal: Option<&Value>) -> bool {
+    signal.is_some_and(value_failure_is_terminal)
 }
 
 struct CanonicalToolAction {
@@ -1537,6 +1565,27 @@ fn response_failure_fingerprint(response: &ResponseInputItem) -> Option<String> 
     let value =
         response_output_text(response).and_then(|text| serde_json::from_str::<Value>(text).ok())?;
     value_failure_signature(&value)
+}
+
+fn response_failure_is_terminal(response: &ResponseInputItem) -> bool {
+    response_output_text(response)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .is_some_and(|value| value_failure_is_terminal(&value))
+}
+
+fn value_failure_is_terminal(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            fields.get("retryable").and_then(Value::as_bool) == Some(false)
+                || fields.values().any(value_failure_is_terminal)
+        }
+        Value::Array(values) => values.iter().any(value_failure_is_terminal),
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .as_ref()
+            .is_some_and(value_failure_is_terminal),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
 }
 
 fn value_failure_signature(value: &Value) -> Option<String> {
@@ -1905,31 +1954,17 @@ impl SamplingReasoningGovernor {
     }
 
     #[cfg(test)]
-    pub(crate) fn baselines(
-        &self,
-        mutation_revision: u64,
-        validation_status: ValidationFreshnessStatus,
-        validation_revision: Option<u64>,
-    ) -> SamplingRequestBaselines {
-        self.baselines_with_tool_exposure_revision(
-            mutation_revision,
-            validation_status,
-            validation_revision,
-            0,
-        )
+    pub(crate) fn baselines(&self, mutation_revision: u64) -> SamplingRequestBaselines {
+        self.baselines_with_tool_exposure_revision(mutation_revision, 0)
     }
 
     pub(crate) fn baselines_with_tool_exposure_revision(
         &self,
         mutation_revision: u64,
-        validation_status: ValidationFreshnessStatus,
-        validation_revision: Option<u64>,
         tool_exposure_revision: u64,
     ) -> SamplingRequestBaselines {
         SamplingRequestBaselines {
             mutation_revision,
-            validation_status,
-            validation_revision,
             plan_revision: self.plan_revision,
             input_revision: self.input_revision,
             tool_exposure_revision,
@@ -2010,8 +2045,6 @@ impl SamplingReasoningGovernor {
     ) -> Option<ResidualDeterministicSamplingProof> {
         if has_pending_input
             || settled.mutation_revision != baselines.mutation_revision
-            || settled.validation_status != baselines.validation_status
-            || settled.validation_revision != baselines.validation_revision
             || self.plan_revision != baselines.plan_revision
             || self.input_revision != baselines.input_revision
             || settled.tool_exposure_revision != baselines.tool_exposure_revision
@@ -2129,8 +2162,6 @@ impl SamplingReasoningGovernor {
     ) -> SamplingConvergenceDecision {
         let settled_revision = self.settled_revision_key(settled);
         if settled.mutation_revision != baselines.mutation_revision
-            || settled.validation_status != baselines.validation_status
-            || settled.validation_revision != baselines.validation_revision
             || self.plan_revision != baselines.plan_revision
             || self.input_revision != baselines.input_revision
             || settled.tool_exposure_revision != baselines.tool_exposure_revision
@@ -2205,17 +2236,20 @@ impl SamplingReasoningGovernor {
             None
         };
         if distinct_failure_recovery_attempt
-            .is_some_and(|attempt| attempt >= DISTINCT_FAILURE_RECOVERY_LIMIT)
+            .is_some_and(|attempt| attempt >= DISTINCT_FAILURE_RECOVERY_ADVISORY_THRESHOLD)
         {
+            // Different actions or failure fingerprints are not a proven
+            // loop. Keep the latest identity so an exact retry still
+            // converges, but leave tools available for a narrower recovery.
+            self.last_cycle = request_deterministic_cycle;
             self.last_state_revision = Some(settled_revision);
             self.directive_issued = true;
             return SamplingConvergenceDecision {
-                continuation: ContinuationDisposition::TerminalCompletionRequired,
+                continuation: ContinuationDisposition::ModelRequired,
                 directive: Some(
-                    "Convergence enforced: the bounded failure-recovery budget was exhausted while relevant state remained unchanged. No further tools are available for this turn. Complete now from existing evidence, truthfully reporting the failures and any blocker."
+                    "Failure-recovery advisory: multiple distinct strategies failed while relevant state remained unchanged. Use a narrower or materially different recovery strategy; if none remains, truthfully report the failures and any blocker."
                         .to_string(),
                 ),
-                // Distinct failures do not prove an exact semantic loop.
                 proven_loop_activated: false,
                 authoritative_wait: None,
             };
@@ -2224,10 +2258,9 @@ impl SamplingReasoningGovernor {
             guard.settled_revision != settled_revision || !request_has_negligible_runtime
         }) {
             // State progress and substantive child runtime start a fresh
-            // efficiency window. A changed negligible-runtime cycle can be new
-            // evidence, but it does not reset the bounded turn-level budget;
-            // otherwise search-read-search churn could evade the advisory by
-            // changing arguments on every generation.
+            // efficiency window. Distinct negligible-runtime cycles remain in
+            // the current window, but cannot force completion without a
+            // repeated semantic identity.
             self.reset_turn_efficiency_guard();
         }
 
@@ -2260,24 +2293,9 @@ impl SamplingReasoningGovernor {
             .unwrap_or(u64::MAX)
             .saturating_mul(TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL);
         let exceeds_turn_efficiency_guard = request_tool_calls > 0
+            && repeated_cycle
             && self.turn_efficiency_tool_calls >= TURN_EFFICIENCY_TOOL_CALL_THRESHOLD
             && self.turn_efficiency_child_runtime_ms <= negligible_runtime_limit_ms;
-        if exceeds_turn_efficiency_guard
-            && self.turn_efficiency_guard.is_some()
-            && self.turn_efficiency_tool_calls >= TURN_EFFICIENCY_TERMINAL_TOOL_CALL_THRESHOLD
-        {
-            self.last_state_revision = Some(settled_revision);
-            self.directive_issued = true;
-            return SamplingConvergenceDecision {
-                continuation: ContinuationDisposition::TerminalCompletionRequired,
-                directive: Some(
-                    "Turn-efficiency limit reached: tool-call volume doubled after the consolidation directive while task state stayed unchanged and child runtime remained negligible. No further tools are available for this turn. Complete now from existing evidence, truthfully reporting any blocker or incomplete validation."
-                        .to_string(),
-                ),
-                proven_loop_activated: false,
-                authoritative_wait: None,
-            };
-        }
         if exceeds_turn_efficiency_guard && self.turn_efficiency_guard.is_none() {
             // The first high-volume negligible-runtime observation is only a
             // consolidation signal. Preserve its exact cycle and settled state
@@ -2407,6 +2425,16 @@ impl SamplingReasoningGovernor {
             self.last_state_revision = Some(settled_revision);
             return SamplingConvergenceDecision::default();
         };
+        if cycle.kind == DeterministicCycleKind::Empty {
+            // A tool-free continuation is a protocol/model signal, not an
+            // action/result cycle. It provides no semantic identity that the
+            // host can prove repeated, so it must never spend the convergence
+            // budget or escalate tool restrictions.
+            self.clear_broad_source_pass_gate();
+            self.reset_convergence();
+            self.last_state_revision = Some(settled_revision);
+            return SamplingConvergenceDecision::default();
+        }
 
         let mut fixed_point_broad_source_evidence = cycle.broad_source_evidence_by_action.clone();
         if repeated_cycle {
@@ -2425,7 +2453,7 @@ impl SamplingReasoningGovernor {
                 }
             }
         }
-        if repeated_cycle || cycle.kind == DeterministicCycleKind::Empty {
+        if repeated_cycle {
             self.consecutive_no_progress = self.consecutive_no_progress.saturating_add(1);
             self.consecutive_obligation_no_progress =
                 self.consecutive_obligation_no_progress.saturating_add(1);
@@ -2445,7 +2473,6 @@ impl SamplingReasoningGovernor {
             self.directive_issued = false;
             self.proven_loop_active = false;
         }
-        let cycle_is_nonempty = cycle.kind != DeterministicCycleKind::Empty;
         if let Some((action_identity, failure_fingerprint)) = cycle.repeated_failure.as_ref() {
             self.dispatch_ledger
                 .lock()
@@ -2460,30 +2487,24 @@ impl SamplingReasoningGovernor {
         self.last_broad_source_evidence_by_action = cycle.broad_source_evidence_by_action.clone();
         self.last_state_revision = Some(settled_revision.clone());
 
-        let repeated_failure = repeated_cycle
-            && matches!(
-                cycle.kind,
-                DeterministicCycleKind::ToolFailure | DeterministicCycleKind::NestedToolFailure
-            );
         // The first successful structured observation initializes the counter
         // at zero because it may be new evidence. An exact repetition against
         // the same settled state increments it to one, which is already the
         // requested two-observation fixed point. Ambiguous or merely empty
         // cycles retain the more conservative three-observation threshold.
-        let threshold = if repeated_cycle && cycle_is_nonempty {
-            1
-        } else {
-            3
-        };
+        let threshold = if repeated_cycle { 1 } else { 3 };
         if self.consecutive_no_progress < threshold
             && self.consecutive_obligation_no_progress < threshold
         {
             return SamplingConvergenceDecision::default();
         }
 
-        let proven_loop_activated = (repeated_failure
-            || self.directive_issued && repeated_cycle && cycle_is_nonempty)
-            && !self.proven_loop_active;
+        // Even an exact repeated failure gets one model-visible convergence
+        // advisory before tools are removed. This keeps the terminal boundary
+        // deterministic without turning the second failed recovery attempt
+        // directly into forced completion.
+        let proven_loop_activated =
+            self.directive_issued && repeated_cycle && !self.proven_loop_active;
         if proven_loop_activated {
             self.proven_loop_active = true;
         }
@@ -2554,10 +2575,8 @@ impl SamplingReasoningGovernor {
 
     fn settled_revision_key(&self, settled: &SamplingRequestSettledState) -> String {
         format!(
-            "mutation={};validation_status={:?};validation_revision={:?};plan={};input={};tool_exposure={}",
+            "mutation={};plan={};input={};tool_exposure={}",
             settled.mutation_revision,
-            settled.validation_status,
-            settled.validation_revision,
             self.plan_revision,
             self.input_revision,
             settled.tool_exposure_revision,
@@ -2589,47 +2608,35 @@ impl SamplingReasoningGovernor {
             self.plan = Some(plan.clone());
             self.plan_revision = self.plan_revision.saturating_add(1);
         }
+        let saw_validation = collector.saw_validation();
         if let Some(failure) = outcomes
             .iter()
             .filter(|outcome| outcome.is_failure_evidence())
             .min_by_key(|outcome| outcome.ordinal)
         {
-            let trigger = match failure.kind {
-                SamplingToolOutcomeKind::Failure => ReasoningPolicyTrigger::ToolFailed,
-                SamplingToolOutcomeKind::Blocked => ReasoningPolicyTrigger::ToolBlocked,
-                SamplingToolOutcomeKind::Timeout => ReasoningPolicyTrigger::ToolTimedOut,
-                SamplingToolOutcomeKind::RecoverableCancellation => {
-                    ReasoningPolicyTrigger::ToolCancelled
+            let trigger = if saw_validation {
+                if failure.kind == SamplingToolOutcomeKind::Timeout {
+                    ReasoningPolicyTrigger::ValidationTimedOut
+                } else {
+                    ReasoningPolicyTrigger::ValidationFailed
                 }
-                SamplingToolOutcomeKind::Skipped => ReasoningPolicyTrigger::ToolBlocked,
-                SamplingToolOutcomeKind::Yielded => unreachable!("yielded is not a failure"),
-                SamplingToolOutcomeKind::Success => unreachable!("success is not a failure"),
+            } else {
+                match failure.kind {
+                    SamplingToolOutcomeKind::Failure => ReasoningPolicyTrigger::ToolFailed,
+                    SamplingToolOutcomeKind::Blocked => ReasoningPolicyTrigger::ToolBlocked,
+                    SamplingToolOutcomeKind::Timeout => ReasoningPolicyTrigger::ToolTimedOut,
+                    SamplingToolOutcomeKind::RecoverableCancellation => {
+                        ReasoningPolicyTrigger::ToolCancelled
+                    }
+                    SamplingToolOutcomeKind::Skipped => ReasoningPolicyTrigger::ToolBlocked,
+                    SamplingToolOutcomeKind::Yielded => unreachable!("yielded is not a failure"),
+                    SamplingToolOutcomeKind::Success => unreachable!("success is not a failure"),
+                }
             };
             self.transition_to(SamplingReasoningPhase::Diagnose, trigger);
             return;
         }
-        let validation_changed = settled.validation_status != baselines.validation_status;
-        if validation_changed
-            && matches!(
-                settled.validation_status,
-                ValidationFreshnessStatus::FailedAfterLastMutation
-                    | ValidationFreshnessStatus::TimedOut
-            )
-        {
-            self.transition_to(
-                SamplingReasoningPhase::Diagnose,
-                if settled.validation_status == ValidationFreshnessStatus::TimedOut {
-                    ReasoningPolicyTrigger::ValidationTimedOut
-                } else {
-                    ReasoningPolicyTrigger::ValidationFailed
-                },
-            );
-            return;
-        }
-        let fresh_validation = settled.validation_revision != baselines.validation_revision
-            && settled.validation_revision == Some(settled.mutation_revision)
-            && settled.validation_status == ValidationFreshnessStatus::PassedAfterLastMutation;
-        if fresh_validation {
+        if saw_validation {
             self.transition_to(
                 if self.plan.as_ref().is_some_and(plan_is_unfinished) {
                     SamplingReasoningPhase::Verify
@@ -2971,32 +2978,32 @@ mod tests {
         collector
     }
 
-    fn settled(
-        mutation_revision: u64,
-        validation_status: ValidationFreshnessStatus,
-        validation_revision: Option<u64>,
-    ) -> SamplingRequestSettledState {
+    fn settled(mutation_revision: u64) -> SamplingRequestSettledState {
         SamplingRequestSettledState {
             mutation_revision,
-            validation_status,
-            validation_revision,
             tool_exposure_revision: 0,
         }
     }
 
+    fn validation_collector(outcome: SamplingToolOutcomeKind) -> SamplingRequestSignalCollector {
+        let collector = collector_with(outcome);
+        collector
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .saw_validation = true;
+        collector
+    }
+
     fn settle_plan(governor: &mut SamplingReasoningGovernor, plan: UpdatePlanArgs) {
-        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baselines = governor.baselines(0);
         let collector = SamplingRequestSignalCollector::default();
         collector.push(SamplingToolOutcome::plain(
             0,
             SamplingToolOutcomeKind::Success,
             Some(plan),
         ));
-        governor.settle(
-            &baselines,
-            &collector,
-            &settled(0, ValidationFreshnessStatus::None, None),
-        );
+        governor.settle(&baselines, &collector, &settled(0));
     }
 
     #[test]
@@ -3111,8 +3118,8 @@ mod tests {
     #[test]
     fn kd4_latency_stable_continuation_protocol_terminal_elides_sampling_only_when_unchanged() {
         let governor = SamplingReasoningGovernor::new(Some(&ReasoningPhaseEfforts::default()));
-        let baselines = governor.baselines(7, ValidationFreshnessStatus::None, None);
-        let unchanged = settled(7, ValidationFreshnessStatus::None, None);
+        let baselines = governor.baselines(7);
+        let unchanged = settled(7);
 
         let empty_collector = governor.collector(&baselines);
         let proven = governor.continuation_generation_request(
@@ -3163,7 +3170,7 @@ mod tests {
             SamplingGenerationDisposition::DecisionBearing
         );
 
-        let changed = settled(8, ValidationFreshnessStatus::None, None);
+        let changed = settled(8);
         let changed_state = governor.continuation_generation_request(
             &baselines,
             &empty_collector,
@@ -3240,7 +3247,7 @@ mod tests {
     }
 
     #[test]
-    fn earliest_failure_wins_and_validation_failure_is_a_fallback() {
+    fn earliest_failure_wins() {
         let config = config();
         let mut governor = SamplingReasoningGovernor::new(Some(&config));
         let collector = SamplingRequestSignalCollector::default();
@@ -3254,34 +3261,10 @@ mod tests {
             SamplingToolOutcomeKind::Blocked,
             None,
         ));
-        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
-        governor.settle(
-            &baseline,
-            &collector,
-            &settled(
-                0,
-                ValidationFreshnessStatus::FailedAfterLastMutation,
-                Some(0),
-            ),
-        );
+        let baseline = governor.baselines(0);
+        governor.settle(&baseline, &collector, &settled(0));
         assert_eq!(governor.phase(), Some(SamplingReasoningPhase::Diagnose));
         assert_eq!(governor.trigger(), ReasoningPolicyTrigger::ToolBlocked);
-
-        let mut validation_only = SamplingReasoningGovernor::new(Some(&config));
-        let baseline = validation_only.baselines(0, ValidationFreshnessStatus::None, None);
-        validation_only.settle(
-            &baseline,
-            &SamplingRequestSignalCollector::default(),
-            &settled(
-                0,
-                ValidationFreshnessStatus::FailedAfterLastMutation,
-                Some(0),
-            ),
-        );
-        assert_eq!(
-            validation_only.trigger(),
-            ReasoningPolicyTrigger::ValidationFailed
-        );
     }
 
     #[test]
@@ -3399,16 +3382,9 @@ mod tests {
     #[test]
     fn deferred_tool_activation_changes_relevant_state_identity() {
         let governor = SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines_with_tool_exposure_revision(
-            0,
-            ValidationFreshnessStatus::None,
-            None,
-            4,
-        );
+        let baselines = governor.baselines_with_tool_exposure_revision(0, 4);
         let settled = SamplingRequestSettledState {
             mutation_revision: 0,
-            validation_status: ValidationFreshnessStatus::None,
-            validation_revision: None,
             tool_exposure_revision: 5,
         };
 
@@ -3454,11 +3430,11 @@ mod tests {
             Some(ReasoningEffort::Medium)
         );
 
-        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baseline = governor.baselines(0);
         governor.settle(
             &baseline,
             &collector_with(SamplingToolOutcomeKind::Success),
-            &settled(0, ValidationFreshnessStatus::None, None),
+            &settled(0),
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Inspect);
         assert_eq!(
@@ -3468,11 +3444,11 @@ mod tests {
             Some(ReasoningEffort::Low)
         );
 
-        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baseline = governor.baselines(0);
         governor.settle(
             &baseline,
             &SamplingRequestSignalCollector::default(),
-            &settled(1, ValidationFreshnessStatus::None, None),
+            &settled(1),
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Implement);
         assert_eq!(
@@ -3482,11 +3458,11 @@ mod tests {
             Some(ReasoningEffort::High)
         );
 
-        let baseline = governor.baselines(1, ValidationFreshnessStatus::None, None);
+        let baseline = governor.baselines(1);
         governor.settle(
             &baseline,
             &collector_with(SamplingToolOutcomeKind::Failure),
-            &settled(1, ValidationFreshnessStatus::None, None),
+            &settled(1),
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
         assert_eq!(
@@ -3496,15 +3472,11 @@ mod tests {
             Some(ReasoningEffort::High)
         );
 
-        let baseline = governor.baselines(1, ValidationFreshnessStatus::None, None);
+        let baseline = governor.baselines(1);
         governor.settle(
             &baseline,
-            &collector_with(SamplingToolOutcomeKind::Success),
-            &settled(
-                1,
-                ValidationFreshnessStatus::PassedAfterLastMutation,
-                Some(1),
-            ),
+            &validation_collector(SamplingToolOutcomeKind::Success),
+            &settled(1),
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Finalize);
         assert_eq!(
@@ -3562,11 +3534,11 @@ mod tests {
         for (starting_phase, resulting_phase, expected_configured_effort) in cases {
             let mut governor = SamplingReasoningGovernor::new(Some(&config));
             governor.phase = starting_phase;
-            let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+            let baseline = governor.baselines(0);
             governor.settle(
                 &baseline,
                 &collector_with(SamplingToolOutcomeKind::Success),
-                &settled(0, ValidationFreshnessStatus::None, None),
+                &settled(0),
             );
 
             assert_eq!(
@@ -3644,44 +3616,32 @@ mod tests {
         for (outcome, expected_trigger) in cases {
             let mut governor = SamplingReasoningGovernor::new(Some(&config));
             governor.phase = SamplingReasoningPhase::Finalize;
-            let baselines = governor.baselines(1, ValidationFreshnessStatus::None, None);
-            governor.settle(
-                &baselines,
-                &collector_with_read_and(outcome),
-                &settled(
-                    2,
-                    ValidationFreshnessStatus::PassedAfterLastMutation,
-                    Some(2),
-                ),
-            );
+            let baselines = governor.baselines(1);
+            governor.settle(&baselines, &collector_with_read_and(outcome), &settled(2));
             assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
             assert_eq!(governor.trigger(), expected_trigger);
         }
     }
 
     #[test]
-    fn changed_validation_dominates_a_competing_read() {
+    fn current_validation_failure_dominates_a_competing_read() {
         let config = config();
         let cases = [
             (
-                ValidationFreshnessStatus::FailedAfterLastMutation,
+                SamplingToolOutcomeKind::Failure,
                 ReasoningPolicyTrigger::ValidationFailed,
             ),
             (
-                ValidationFreshnessStatus::TimedOut,
+                SamplingToolOutcomeKind::Timeout,
                 ReasoningPolicyTrigger::ValidationTimedOut,
             ),
         ];
 
-        for (validation_status, expected_trigger) in cases {
+        for (outcome, expected_trigger) in cases {
             let mut governor = SamplingReasoningGovernor::new(Some(&config));
             governor.phase = SamplingReasoningPhase::Finalize;
-            let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
-            governor.settle(
-                &baselines,
-                &collector_with(SamplingToolOutcomeKind::Success),
-                &settled(0, validation_status, Some(0)),
-            );
+            let baselines = governor.baselines(0);
+            governor.settle(&baselines, &validation_collector(outcome), &settled(0));
             assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
             assert_eq!(governor.trigger(), expected_trigger);
         }
@@ -3691,30 +3651,22 @@ mod tests {
     fn fresh_validation_uses_final_revision_and_active_plan_state() {
         let config = config();
         let mut no_plan = SamplingReasoningGovernor::new(Some(&config));
-        let baseline = no_plan.baselines(1, ValidationFreshnessStatus::None, None);
+        let baseline = no_plan.baselines(1);
         no_plan.settle(
             &baseline,
-            &collector_with(SamplingToolOutcomeKind::Success),
-            &settled(
-                1,
-                ValidationFreshnessStatus::PassedAfterLastMutation,
-                Some(1),
-            ),
+            &validation_collector(SamplingToolOutcomeKind::Success),
+            &settled(1),
         );
         assert_eq!(no_plan.phase, SamplingReasoningPhase::Finalize);
         assert_eq!(no_plan.trigger(), ReasoningPolicyTrigger::ValidationPassed);
 
         let mut active_plan = SamplingReasoningGovernor::new(Some(&config));
         settle_plan(&mut active_plan, plan(&[StepStatus::InProgress]));
-        let baseline = active_plan.baselines(1, ValidationFreshnessStatus::None, None);
+        let baseline = active_plan.baselines(1);
         active_plan.settle(
             &baseline,
-            &collector_with(SamplingToolOutcomeKind::Success),
-            &settled(
-                1,
-                ValidationFreshnessStatus::PassedAfterLastMutation,
-                Some(1),
-            ),
+            &validation_collector(SamplingToolOutcomeKind::Success),
+            &settled(1),
         );
         assert_eq!(active_plan.phase, SamplingReasoningPhase::Verify);
         assert_eq!(
@@ -3724,56 +3676,16 @@ mod tests {
     }
 
     #[test]
-    fn validation_then_concurrent_mutation_is_stale_but_final_revision_validation_is_fresh() {
-        let config = config();
-        let mut stale = SamplingReasoningGovernor::new(Some(&config));
-        let baseline = stale.baselines(1, ValidationFreshnessStatus::None, None);
-        stale.settle(
-            &baseline,
-            &collector_with(SamplingToolOutcomeKind::Success),
-            &settled(
-                2,
-                ValidationFreshnessStatus::StaleAfterLastMutation,
-                Some(1),
-            ),
-        );
-        assert_eq!(stale.phase, SamplingReasoningPhase::Implement);
-        assert_eq!(stale.trigger(), ReasoningPolicyTrigger::WorkspaceMutation);
-
-        let mut fresh = SamplingReasoningGovernor::new(Some(&config));
-        let baseline = fresh.baselines(1, ValidationFreshnessStatus::None, None);
-        fresh.settle(
-            &baseline,
-            &collector_with(SamplingToolOutcomeKind::Success),
-            &settled(
-                2,
-                ValidationFreshnessStatus::PassedAfterLastMutation,
-                Some(2),
-            ),
-        );
-        assert_eq!(fresh.phase, SamplingReasoningPhase::Finalize);
-        assert_eq!(fresh.trigger(), ReasoningPolicyTrigger::ValidationPassed);
-    }
-
-    #[test]
-    fn request_baselines_prevent_stale_mutation_validation_and_plan_signals() {
+    fn unchanged_read_does_not_invent_validation_or_plan_signals() {
         let config = config();
         let mut governor = SamplingReasoningGovernor::new(Some(&config));
         settle_plan(&mut governor, plan(&[StepStatus::InProgress]));
         governor.phase = SamplingReasoningPhase::Finalize;
-        let baseline = governor.baselines(
-            4,
-            ValidationFreshnessStatus::FailedAfterLastMutation,
-            Some(4),
-        );
+        let baseline = governor.baselines(4);
         governor.settle(
             &baseline,
             &collector_with(SamplingToolOutcomeKind::Success),
-            &settled(
-                4,
-                ValidationFreshnessStatus::FailedAfterLastMutation,
-                Some(4),
-            ),
+            &settled(4),
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Finalize);
         assert_eq!(
@@ -3787,11 +3699,11 @@ mod tests {
         let config = config();
         let mut governor = SamplingReasoningGovernor::new(Some(&config));
         governor.phase = SamplingReasoningPhase::Finalize;
-        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baseline = governor.baselines(0);
         governor.settle(
             &baseline,
             &collector_with_read_and_plan(plan(&[StepStatus::InProgress])),
-            &settled(0, ValidationFreshnessStatus::None, None),
+            &settled(0),
         );
 
         assert_eq!(governor.phase, SamplingReasoningPhase::Implement);
@@ -3816,19 +3728,19 @@ mod tests {
         let config = config();
         let mut governor = SamplingReasoningGovernor::new(Some(&config));
         governor.host_diagnose();
-        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baseline = governor.baselines(0);
         governor.settle(
             &baseline,
             &collector_with(SamplingToolOutcomeKind::Success),
-            &settled(0, ValidationFreshnessStatus::None, None),
+            &settled(0),
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
 
-        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baseline = governor.baselines(0);
         governor.settle(
             &baseline,
             &collector_with(SamplingToolOutcomeKind::Success),
-            &settled(1, ValidationFreshnessStatus::StaleAfterLastMutation, None),
+            &settled(1),
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Implement);
 
@@ -3842,7 +3754,7 @@ mod tests {
         let config = config();
         for reverse_completion in [false, true] {
             let mut governor = SamplingReasoningGovernor::new(Some(&config));
-            let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+            let baseline = governor.baselines(0);
             let collector = SamplingRequestSignalCollector::default();
             let first = collector.register_tool_call();
             let second = collector.register_tool_call();
@@ -3863,11 +3775,7 @@ mod tests {
                 collector.push(first_outcome);
                 collector.push(second_outcome);
             }
-            governor.settle(
-                &baseline,
-                &collector,
-                &settled(0, ValidationFreshnessStatus::None, None),
-            );
+            governor.settle(&baseline, &collector, &settled(0));
             assert_eq!(governor.phase, SamplingReasoningPhase::Verify);
         }
     }
@@ -3877,18 +3785,18 @@ mod tests {
         let config = config();
         let mut governor = SamplingReasoningGovernor::new(Some(&config));
         governor.phase = SamplingReasoningPhase::Finalize;
-        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baseline = governor.baselines(0);
         governor.settle(
             &baseline,
             &SamplingRequestSignalCollector::default(),
-            &settled(0, ValidationFreshnessStatus::None, None),
+            &settled(0),
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Finalize);
 
         governor.settle(
             &baseline,
             &collector_with(SamplingToolOutcomeKind::RecoverableCancellation),
-            &settled(0, ValidationFreshnessStatus::None, None),
+            &settled(0),
         );
         assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
     }
@@ -3904,7 +3812,7 @@ mod tests {
         ] {
             let mut governor = SamplingReasoningGovernor::new(Some(&config));
             governor.phase = SamplingReasoningPhase::Finalize;
-            let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+            let baseline = governor.baselines(0);
             let collector = SamplingRequestSignalCollector::default();
             let ordinal = collector.register_tool_call();
             collector.push(SamplingToolOutcome::from_signal(
@@ -3913,17 +3821,13 @@ mod tests {
                 None,
                 None,
             ));
-            governor.settle(
-                &baseline,
-                &collector,
-                &settled(0, ValidationFreshnessStatus::None, None),
-            );
+            governor.settle(&baseline, &collector, &settled(0));
             assert_eq!(governor.phase, SamplingReasoningPhase::Finalize);
         }
 
         let mut governor = SamplingReasoningGovernor::new(Some(&config));
         governor.phase = SamplingReasoningPhase::Finalize;
-        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baseline = governor.baselines(0);
         let collector = SamplingRequestSignalCollector::default();
         let ordinal = collector.register_tool_call();
         collector.push(SamplingToolOutcome::from_signal(
@@ -3934,11 +3838,7 @@ mod tests {
             None,
             None,
         ));
-        governor.settle(
-            &baseline,
-            &collector,
-            &settled(0, ValidationFreshnessStatus::None, None),
-        );
+        governor.settle(&baseline, &collector, &settled(0));
         assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
         assert_eq!(governor.trigger(), ReasoningPolicyTrigger::ToolBlocked);
     }
@@ -3947,7 +3847,7 @@ mod tests {
     fn nested_code_mode_failure_overrides_successful_cell_and_retains_evidence() {
         let config = config();
         let mut governor = SamplingReasoningGovernor::new(Some(&config));
-        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baseline = governor.baselines(0);
         let collector = governor.collector(&baseline);
         let outer_ordinal = collector
             .register_deterministic_tool_call(
@@ -3979,9 +3879,12 @@ mod tests {
                 "plan": nested_plan,
                 "source_closure_established": true,
                 "source_closure": source_evidence,
-                "failure": { "fingerprint": "nested.plan.blocked" },
+                "failure": {
+                    "fingerprint": "nested.plan.blocked",
+                    "retryable": false,
+                },
             })),
-            result: json!({"message": "nested tool was blocked"}),
+            result: &json!({"message": "nested tool was blocked"}),
             canonical_artifact_required: true,
         });
         collector.push(SamplingToolOutcome::plain(
@@ -4014,7 +3917,7 @@ mod tests {
                 .is_some_and(|key| key.starts_with("NestedToolFailure:nested.plan.blocked:"))
         );
 
-        let settled_state = settled(0, ValidationFreshnessStatus::None, None);
+        let settled_state = settled(0);
         governor.settle(&baseline, &collector, &settled_state);
         assert_eq!(governor.phase, SamplingReasoningPhase::Diagnose);
         assert_eq!(governor.trigger(), ReasoningPolicyTrigger::ToolBlocked);
@@ -4056,7 +3959,7 @@ mod tests {
                 .is_none()
         );
 
-        let changed_state = governor.baselines(1, ValidationFreshnessStatus::None, None);
+        let changed_state = governor.baselines(1);
         let changed = governor.collector(&changed_state);
         assert!(
             changed
@@ -4070,6 +3973,63 @@ mod tests {
                 .suppressed_failure
                 .is_none()
         );
+    }
+
+    #[test]
+    fn retryable_exec_and_mcp_failures_do_not_arm_pre_dispatch_suppression() {
+        let cases = [
+            (
+                ToolName::plain("exec_command"),
+                ToolPayload::Function {
+                    arguments: r#"{"cmd":"cargo test -p codex-core focused"}"#.to_string(),
+                },
+            ),
+            (
+                ToolName::namespaced("mcp__example__", "read"),
+                ToolPayload::Function {
+                    arguments: r#"{"uri":"memo://codex/example-note"}"#.to_string(),
+                },
+            ),
+        ];
+
+        for (tool_name, payload) in cases {
+            let mut governor = SamplingReasoningGovernor::new(None);
+            let baseline = governor.baselines(0);
+            let settled_state = settled(0);
+            let first = governor.collector(&baseline);
+            let registration =
+                first.register_deterministic_tool_call(&tool_name, &payload, "transient-failure");
+            first.record_response_result(
+                registration.ordinal,
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
+                Some(json!({
+                    "failure_signature": "io.locked",
+                    "retryable": true,
+                })),
+                &successful_tool_response(
+                    "transient-failure",
+                    r#"{"failure_signature":"io.locked","retryable":true}"#,
+                ),
+                false,
+            );
+
+            assert_eq!(
+                governor.evaluate_convergence(&baseline, &first, &settled_state),
+                SamplingConvergenceDecision::default()
+            );
+            let retry = governor.collector(&baseline);
+            assert!(
+                retry
+                    .register_deterministic_tool_call(
+                        &tool_name,
+                        &payload,
+                        "transient-failure-retry",
+                    )
+                    .suppressed_failure
+                    .is_none(),
+                "retryable {tool_name} failure must dispatch again"
+            );
+        }
     }
 
     #[test]
@@ -4089,7 +4049,7 @@ mod tests {
                 )])),
                 outcome_context: ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
                 signal: None,
-                result: json!({"path": path}),
+                result: &json!({"path": path}),
                 canonical_artifact_required: false,
             });
         }
@@ -4108,7 +4068,7 @@ mod tests {
             source_dependencies: Some(BTreeSet::new()),
             outcome_context: ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
             signal: None,
-            result: json!({"status": "passed"}),
+            result: &json!({"status": "passed"}),
             canonical_artifact_required: false,
         });
         collector.record_code_mode_result(CodeModeToolResult {
@@ -4121,7 +4081,7 @@ mod tests {
             )])),
             outcome_context: ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
             signal: None,
-            result: json!({"path": "/repo/src/foo.rs"}),
+            result: &json!({"path": "/repo/src/foo.rs"}),
             canonical_artifact_required: false,
         });
         assert!(
@@ -4133,11 +4093,45 @@ mod tests {
     }
 
     #[test]
+    fn nested_code_mode_observation_borrows_result_value() {
+        let collector = SamplingRequestSignalCollector::default();
+        let tool_name = ToolName::plain("read_tool_output");
+        let payload = ToolPayload::Function {
+            arguments: "{}".to_string(),
+        };
+        let nested_result = json!({
+            "artifact_id": "artifact-1",
+            "output": "retained nested evidence",
+        });
+        let output = nested_result["output"]
+            .as_str()
+            .expect("nested output string");
+        let output_ptr = output.as_ptr();
+
+        collector.record_code_mode_result(CodeModeToolResult {
+            cell_id: "cell-borrowed-result",
+            tool_name: &tool_name,
+            payload: &payload,
+            source_dependencies: None,
+            outcome_context: ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            signal: None,
+            result: &nested_result,
+            canonical_artifact_required: false,
+        });
+
+        assert_eq!(collector.snapshot().len(), 1);
+        assert_eq!(
+            nested_result["output"].as_str().map(str::as_ptr),
+            Some(output_ptr)
+        );
+    }
+
+    #[test]
     fn unfinished_mutation_obligation_moves_status_only_plan_update_to_implement() {
         let config = config();
         let mut governor = SamplingReasoningGovernor::new(Some(&config));
         governor.phase = SamplingReasoningPhase::Finalize;
-        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baseline = governor.baselines(0);
         let collector = governor.collector(&baseline);
         collector.push(SamplingToolOutcome::from_signal(
             0,
@@ -4151,11 +4145,7 @@ mod tests {
         ));
 
         assert!(collector.snapshot()[0].unfinished_mutation_obligation);
-        governor.settle(
-            &baseline,
-            &collector,
-            &settled(0, ValidationFreshnessStatus::None, None),
-        );
+        governor.settle(&baseline, &collector, &settled(0));
 
         assert_eq!(governor.phase, SamplingReasoningPhase::Implement);
         assert_eq!(governor.trigger(), ReasoningPolicyTrigger::PlanUpdated);
@@ -4165,7 +4155,7 @@ mod tests {
     fn nested_code_mode_success_drives_plan_and_artifact_classification() {
         let config = config();
         let mut governor = SamplingReasoningGovernor::new(Some(&config));
-        let baseline = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baseline = governor.baselines(0);
         let collector = governor.collector(&baseline);
         let outer_ordinal = collector
             .register_deterministic_tool_call(
@@ -4190,7 +4180,7 @@ mod tests {
                 "plan": nested_plan,
                 "source_evidence": { "identity": "source-v1" },
             })),
-            result: json!({"message": "plan updated"}),
+            result: &json!({"message": "plan updated"}),
             canonical_artifact_required: true,
         });
         collector.push(SamplingToolOutcome::plain(
@@ -4200,19 +4190,10 @@ mod tests {
         ));
 
         assert_eq!(
-            collector.generation_purpose(
-                &baseline,
-                &settled(0, ValidationFreshnessStatus::None, None),
-                false,
-                false,
-            ),
+            collector.generation_purpose(&baseline, &settled(0), false, false,),
             Some(TurnTimingGenerationPurpose::ArtifactContinuation)
         );
-        governor.settle(
-            &baseline,
-            &collector,
-            &settled(0, ValidationFreshnessStatus::None, None),
-        );
+        governor.settle(&baseline, &collector, &settled(0));
         assert_eq!(governor.phase, SamplingReasoningPhase::Implement);
         assert_eq!(governor.trigger(), ReasoningPolicyTrigger::PlanUpdated);
     }
@@ -4264,11 +4245,9 @@ mod tests {
     fn unchanged_state(
         governor: &SamplingReasoningGovernor,
     ) -> (SamplingRequestBaselines, SamplingRequestSettledState) {
-        let baselines = governor.baselines(7, ValidationFreshnessStatus::None, None);
+        let baselines = governor.baselines(7);
         let settled = SamplingRequestSettledState {
             mutation_revision: 7,
-            validation_status: ValidationFreshnessStatus::None,
-            validation_revision: None,
             tool_exposure_revision: 0,
         };
         (baselines, settled)
@@ -4473,7 +4452,7 @@ mod tests {
             SamplingConvergenceDecision::default()
         );
 
-        let changed_baselines = governor.baselines(8, ValidationFreshnessStatus::None, None);
+        let changed_baselines = governor.baselines(8);
         let changed_settled = SamplingRequestSettledState {
             mutation_revision: 8,
             ..settled
@@ -4703,8 +4682,8 @@ mod tests {
     #[test]
     fn direct_canonical_artifact_requirement_reaches_governor() {
         let governor = SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
-        let settled = settled(0, ValidationFreshnessStatus::None, None);
+        let baselines = governor.baselines(0);
+        let settled = settled(0);
         let collector = governor.collector(&baselines);
         let ordinal = collector.register_tool_call();
 
@@ -4827,7 +4806,7 @@ mod tests {
             read_only_pass_collector(&governor, &baselines, changed_action, "new-evidence");
         assert!(registration.suppressed_source_pass.is_none());
 
-        let changed_baselines = governor.baselines(8, ValidationFreshnessStatus::None, None);
+        let changed_baselines = governor.baselines(8);
         let (_, registration) =
             read_only_pass_collector(&governor, &changed_baselines, arguments, "new-state");
         assert!(registration.suppressed_source_pass.is_none());
@@ -4866,7 +4845,7 @@ mod tests {
             read_only_pass_collector(&governor, &baselines, new_action, "new-evidence");
         assert!(new_registration.suppressed_source_pass.is_none());
 
-        let changed_baselines = governor.baselines(8, ValidationFreshnessStatus::None, None);
+        let changed_baselines = governor.baselines(8);
         let (_, changed_state_registration) =
             read_only_pass_collector(&governor, &changed_baselines, first_action, "new-state");
         assert!(changed_state_registration.suppressed_source_pass.is_none());
@@ -5051,11 +5030,11 @@ mod tests {
     }
 
     #[test]
-    fn kd4_latency_stable_continuation_failure_gets_one_tool_free_completion() {
+    fn stable_continuation_failure_gets_an_advisory_before_tool_free_completion() {
         let mut governor = SamplingReasoningGovernor::new(None);
         let (baselines, settled) = unchanged_state(&governor);
 
-        for generation in 1..=2 {
+        for generation in 1..=3 {
             let collector = direct_failure_collector(&governor, &baselines, "io.locked");
             assert!(
                 collector
@@ -5063,17 +5042,17 @@ mod tests {
                     .is_some_and(|key| key.starts_with("ToolFailure:io.locked:"))
             );
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(decision.directive.is_some(), generation == 2);
-            assert_eq!(decision.proven_loop_activated, generation == 2);
+            assert_eq!(decision.directive.is_some(), generation >= 2);
+            assert_eq!(decision.proven_loop_activated, generation == 3);
             assert_eq!(
                 decision.continuation,
-                if generation == 2 {
+                if generation == 3 {
                     ContinuationDisposition::TerminalCompletionRequired
                 } else {
                     ContinuationDisposition::ModelRequired
                 }
             );
-            if generation == 2 {
+            if generation == 3 {
                 let completion = governor
                     .continuation_generation_request(&baselines, &collector, &settled, false, false)
                     .require_terminal_completion();
@@ -5085,7 +5064,7 @@ mod tests {
     #[test]
     fn write_stdin_stable_failures_remain_suppressed() {
         let governor = SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baselines = governor.baselines(0);
         let collector = governor.collector(&baselines);
         let tool_name = ToolName::plain("write_stdin");
         let payload = ToolPayload::Function {
@@ -5113,6 +5092,56 @@ mod tests {
                 .map(|guard| guard.failure_fingerprint),
             Some("prior.poll.failure".to_string())
         );
+        assert!(collector.has_process_monitor());
+        assert!(!collector.observed_successful_process_monitor());
+    }
+
+    #[test]
+    fn successful_write_stdin_observation_is_relevant_progress() {
+        let governor = SamplingReasoningGovernor::new(None);
+        let (baselines, _) = unchanged_state(&governor);
+        let collector = governor.collector(&baselines);
+        let registration = collector.register_deterministic_tool_call(
+            &ToolName::plain("write_stdin"),
+            &ToolPayload::Function {
+                arguments: r#"{"session_id":7,"chars":"","yield_time_ms":30000}"#.to_string(),
+            },
+            "poll-success",
+        );
+        collector.record_response_result(
+            registration.ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+            None,
+            &successful_tool_response("poll-success", r#"{"session_id":7,"running":true}"#),
+            false,
+        );
+
+        assert!(collector.has_process_monitor());
+        assert!(collector.observed_successful_process_monitor());
+    }
+
+    #[test]
+    fn yielded_write_stdin_observation_is_relevant_progress() {
+        let governor = SamplingReasoningGovernor::new(None);
+        let (baselines, _) = unchanged_state(&governor);
+        let collector = governor.collector(&baselines);
+        let registration = collector.register_deterministic_tool_call(
+            &ToolName::plain("write_stdin"),
+            &ToolPayload::Function {
+                arguments: r#"{"session_id":7,"chars":"","yield_time_ms":30000}"#.to_string(),
+            },
+            "poll-yielded",
+        );
+        collector.record_response_result(
+            registration.ordinal,
+            ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
+            None,
+            &successful_tool_response("poll-yielded", r#"{"session_id":7,"running":true}"#),
+            false,
+        );
+
+        assert!(collector.has_process_monitor());
+        assert!(collector.observed_successful_process_monitor());
     }
 
     #[test]
@@ -5147,7 +5176,7 @@ mod tests {
     #[test]
     fn direct_tool_errors_receive_a_stable_failure_fingerprint() {
         let governor = SamplingReasoningGovernor::new(None);
-        let baselines = governor.baselines(0, ValidationFreshnessStatus::None, None);
+        let baselines = governor.baselines(0);
         let collector = governor.collector(&baselines);
         let registration = collector.register_deterministic_tool_call(
             &ToolName::plain("read_tool_output"),
@@ -5199,7 +5228,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_failure_strategies_converge_after_one_narrow_recovery() {
+    fn distinct_failure_strategies_allow_narrow_successful_recovery() {
         let mut governor = SamplingReasoningGovernor::new(None);
         let (baselines, settled) = unchanged_state(&governor);
 
@@ -5219,15 +5248,22 @@ mod tests {
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
             assert_eq!(
                 decision.continuation,
-                if generation + 1 == DISTINCT_FAILURE_RECOVERY_LIMIT as usize {
-                    ContinuationDisposition::TerminalCompletionRequired
-                } else {
-                    ContinuationDisposition::ModelRequired
-                }
+                ContinuationDisposition::ModelRequired
             );
             assert_eq!(decision.directive.is_some(), generation == 1);
             assert!(!decision.proven_loop_activated);
         }
+
+        let narrower_success = structured_tool_pass_collector(
+            &governor,
+            &baselines,
+            r#"{"command":"inspect-narrower-input"}"#,
+            "narrower-evidence",
+        );
+        assert_eq!(
+            governor.evaluate_convergence(&baselines, &narrower_success, &settled),
+            SamplingConvergenceDecision::default()
+        );
     }
 
     #[test]
@@ -5295,10 +5331,16 @@ mod tests {
             "permission.denied",
         );
         assert_eq!(
-            governor
-                .evaluate_convergence(&baselines, &recovery, &settled)
-                .continuation,
-            ContinuationDisposition::TerminalCompletionRequired
+            governor.evaluate_convergence(&baselines, &recovery, &settled),
+            SamplingConvergenceDecision {
+                continuation: ContinuationDisposition::ModelRequired,
+                directive: Some(
+                    "Failure-recovery advisory: multiple distinct strategies failed while relevant state remained unchanged. Use a narrower or materially different recovery strategy; if none remains, truthfully report the failures and any blocker."
+                        .to_string(),
+                ),
+                proven_loop_activated: false,
+                authoritative_wait: None,
+            }
         );
 
         let mut mixed_governor = SamplingReasoningGovernor::new(None);
@@ -5486,7 +5528,17 @@ mod tests {
             TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL
                 * u64::try_from(TURN_EFFICIENCY_TOOL_CALL_THRESHOLD).unwrap(),
         );
-        let advisory = governor.evaluate_convergence(&baselines, &first, &settled);
+        let initial = governor.evaluate_convergence(&baselines, &first, &settled);
+        assert_eq!(initial.continuation, ContinuationDisposition::ModelRequired);
+        assert!(initial.directive.is_none());
+        assert!(!initial.proven_loop_activated);
+
+        let repeated = high_volume_tool_pass_collector(&governor, &baselines, "same-result");
+        repeated.record_child_runtime(
+            TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL
+                * u64::try_from(TURN_EFFICIENCY_TOOL_CALL_THRESHOLD).unwrap(),
+        );
+        let advisory = governor.evaluate_convergence(&baselines, &repeated, &settled);
         assert_eq!(
             advisory.continuation,
             ContinuationDisposition::ModelRequired
@@ -5494,12 +5546,14 @@ mod tests {
         assert!(advisory.directive.is_some());
         assert!(!advisory.proven_loop_activated);
 
-        let repeated = high_volume_tool_pass_collector(&governor, &baselines, "same-result");
-        repeated.record_child_runtime(
+        let repeated_after_advisory =
+            high_volume_tool_pass_collector(&governor, &baselines, "same-result");
+        repeated_after_advisory.record_child_runtime(
             TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL
                 * u64::try_from(TURN_EFFICIENCY_TOOL_CALL_THRESHOLD).unwrap(),
         );
-        let terminal = governor.evaluate_convergence(&baselines, &repeated, &settled);
+        let terminal =
+            governor.evaluate_convergence(&baselines, &repeated_after_advisory, &settled);
         assert_eq!(
             terminal.continuation,
             ContinuationDisposition::TerminalCompletionRequired
@@ -5509,7 +5563,7 @@ mod tests {
     }
 
     #[test]
-    fn eighth_sequential_tiny_call_requests_consolidation_without_forcing_completion() {
+    fn changing_sequential_tiny_calls_do_not_request_consolidation() {
         let mut governor = SamplingReasoningGovernor::new(None);
         let (baselines, settled) = unchanged_state(&governor);
 
@@ -5524,17 +5578,17 @@ mod tests {
                 decision.continuation,
                 ContinuationDisposition::ModelRequired
             );
-            assert_eq!(decision.directive.is_some(), generation == 8);
+            assert!(decision.directive.is_none());
             assert!(!decision.proven_loop_activated);
         }
     }
 
     #[test]
-    fn changed_tiny_call_cycles_eventually_exhaust_turn_efficiency_budget() {
+    fn changed_tiny_call_cycles_remain_recoverable_without_efficiency_advisory() {
         let mut governor = SamplingReasoningGovernor::new(None);
         let (baselines, settled) = unchanged_state(&governor);
 
-        for generation in 1..=TURN_EFFICIENCY_TERMINAL_TOOL_CALL_THRESHOLD {
+        for generation in 1..=TURN_EFFICIENCY_TOOL_CALL_THRESHOLD * 2 {
             let arguments = format!(r#"{{"command":"inspect-{generation}"}}"#);
             let evidence = format!("evidence-{generation}");
             let collector =
@@ -5543,17 +5597,9 @@ mod tests {
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
             assert_eq!(
                 decision.continuation,
-                if generation == TURN_EFFICIENCY_TERMINAL_TOOL_CALL_THRESHOLD {
-                    ContinuationDisposition::TerminalCompletionRequired
-                } else {
-                    ContinuationDisposition::ModelRequired
-                }
+                ContinuationDisposition::ModelRequired
             );
-            assert_eq!(
-                decision.directive.is_some(),
-                generation == TURN_EFFICIENCY_TOOL_CALL_THRESHOLD
-                    || generation == TURN_EFFICIENCY_TERMINAL_TOOL_CALL_THRESHOLD
-            );
+            assert!(decision.directive.is_none());
             assert!(!decision.proven_loop_activated);
         }
     }
@@ -5634,14 +5680,14 @@ mod tests {
     }
 
     #[test]
-    fn no_progress_counter_directs_but_never_proves_an_empty_loop() {
+    fn empty_tool_free_cycles_never_spend_the_no_progress_budget() {
         let mut governor = SamplingReasoningGovernor::new(None);
         let (baselines, settled) = unchanged_state(&governor);
 
-        for generation in 1..=4 {
+        for _ in 1..=4 {
             let collector = governor.collector(&baselines);
             let decision = governor.evaluate_convergence(&baselines, &collector, &settled);
-            assert_eq!(decision.directive.is_some(), generation >= 3);
+            assert!(decision.directive.is_none());
             assert!(!decision.proven_loop_activated);
         }
     }

@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
-// macOS and Windows CI can spend tens of seconds starting app-server
+// Windows CI can spend tens of seconds starting app-server
 // subprocesses or processing test RPCs under load.
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);

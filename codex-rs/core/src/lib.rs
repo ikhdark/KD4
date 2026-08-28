@@ -51,7 +51,6 @@ mod guardian;
 mod hook_runtime;
 mod image_preparation;
 mod installation_id;
-mod latency_switches;
 pub(crate) mod mcp;
 mod mcp_skill_dependencies;
 mod mcp_tool_approval_templates;

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use codex_analytics::PluginInstallRequestSource;
 use codex_analytics::PluginInstallRequested;
@@ -47,6 +48,8 @@ use crate::tools::handlers::request_plugin_install_spec::create_request_plugin_i
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::router::ToolSuggestPresentation;
+
+const PLUGIN_MCP_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct RecommendedPluginInstallArgs {
@@ -379,7 +382,7 @@ fn disabled_install_request(tool: &DiscoverableTool) -> ToolSuggestDisabledTool 
 }
 
 async fn verify_request_plugin_install_completed(
-    session: &crate::session::session::Session,
+    session: &Arc<crate::session::session::Session>,
     turn: &crate::session::turn_context::TurnContext,
     manager: &codex_mcp::McpConnectionManager,
     tool: &DiscoverableTool,
@@ -434,15 +437,29 @@ async fn verify_request_plugin_install_completed(
                 config.as_ref(),
                 session.services.plugins_manager.as_ref(),
             );
+            let mcp_servers_completed = if plugin_installed {
+                refresh_requested_mcp_servers_after_install(
+                    session,
+                    turn,
+                    config.as_ref(),
+                    &plugin.mcp_server_names,
+                    plugin.id.as_str(),
+                )
+                .await
+            } else {
+                false
+            };
+            let current_runtime = session.services.latest_mcp_runtime();
             let accessible_connectors = refresh_missing_requested_connectors(
                 turn,
-                manager,
+                current_runtime.manager(),
                 &plugin.app_connector_ids,
                 plugin.id.as_str(),
             )
             .await;
             verified_local_plugin_install_completed(
                 plugin_installed,
+                mcp_servers_completed,
                 &plugin.app_connector_ids,
                 accessible_connectors.as_deref(),
             )
@@ -500,14 +517,53 @@ fn verified_remote_plugin_install_completed(
 
 fn verified_local_plugin_install_completed(
     plugin_installed: bool,
+    mcp_servers_completed: bool,
     expected_connector_ids: &[String],
     accessible_connectors: Option<&[AppInfo]>,
 ) -> bool {
     plugin_installed
+        && mcp_servers_completed
         && (expected_connector_ids.is_empty()
             || accessible_connectors.is_some_and(|accessible_connectors| {
                 all_requested_connectors_picked_up(expected_connector_ids, accessible_connectors)
             }))
+}
+
+async fn refresh_requested_mcp_servers_after_install(
+    session: &Arc<crate::session::session::Session>,
+    turn: &crate::session::turn_context::TurnContext,
+    config: &crate::config::Config,
+    expected_mcp_server_names: &[String],
+    tool_id: &str,
+) -> bool {
+    if expected_mcp_server_names.is_empty() {
+        return true;
+    }
+
+    session
+        .refresh_mcp_servers_now(turn, config, Some(session.mcp_elicitation_reviewer()))
+        .await;
+    let runtime = session.services.latest_mcp_runtime();
+    let manager = runtime.manager();
+    let ready = tokio::time::timeout(PLUGIN_MCP_READY_TIMEOUT, async {
+        for server_name in expected_mcp_server_names {
+            if !manager
+                .wait_for_server_ready(server_name, PLUGIN_MCP_READY_TIMEOUT)
+                .await
+            {
+                return false;
+            }
+        }
+        true
+    })
+    .await
+    .unwrap_or(false);
+    if !ready {
+        warn!(
+            "installed plugin {tool_id} did not expose every requested MCP server before the readiness timeout"
+        );
+    }
+    ready
 }
 
 fn is_remote_plugin_install_suggestion(plugin_id: &str) -> bool {

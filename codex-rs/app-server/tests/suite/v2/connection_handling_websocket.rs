@@ -56,7 +56,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::http::header::ORIGIN;
 
-// macOS and Windows CI can spend tens of seconds starting the app-server test
+// Windows CI can spend tens of seconds starting the app-server test
 // binary before it accepts JSON-RPC or reports its websocket bind
 // address.
 
@@ -548,6 +548,9 @@ async fn websocket_transport_rejects_short_signed_bearer_secret_configuration() 
     let shared_secret_file = codex_home.path().join("app-server-signing-secret");
     std::fs::write(&shared_secret_file, "too-short\n")?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let state_db_path = codex_state::state_db_path(codex_home.path());
+    let corrupt_state = b"not a sqlite database";
+    std::fs::write(&state_db_path, corrupt_state)?;
 
     let output = run_websocket_server_to_completion_with_args(
         codex_home.path(),
@@ -569,6 +572,11 @@ async fn websocket_transport_rejects_short_signed_bearer_secret_configuration() 
         stderr.contains("must be at least 32 bytes"),
         "unexpected stderr: {stderr}"
     );
+    assert_eq!(
+        std::fs::read(state_db_path)?,
+        corrupt_state,
+        "websocket auth preflight must not touch or recover the state database"
+    );
 
     Ok(())
 }
@@ -578,6 +586,9 @@ async fn websocket_transport_rejects_unauthenticated_non_loopback_startup() -> R
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let state_db_path = codex_state::state_db_path(codex_home.path());
+    let corrupt_state = b"not a sqlite database";
+    std::fs::write(&state_db_path, corrupt_state)?;
 
     let output =
         run_websocket_server_to_completion_with_args(codex_home.path(), "ws://0.0.0.0:0", &[])
@@ -590,6 +601,11 @@ async fn websocket_transport_rejects_unauthenticated_non_loopback_startup() -> R
     assert!(
         stderr.contains("refusing to start non-loopback websocket listener"),
         "unexpected stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(state_db_path)?,
+        corrupt_state,
+        "websocket bind-safety preflight must not touch or recover the state database"
     );
 
     Ok(())

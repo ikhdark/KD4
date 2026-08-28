@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::ErrorKind;
@@ -219,6 +220,9 @@ async fn explicit_remote_control_startup_fails_when_disabled_by_requirements() -
     )?;
     let system_requirements_path = codex_home.path().join("requirements.toml");
     let socket_path = codex_home.path().join("app-server.sock");
+    let state_db_path = codex_state::state_db_path(codex_home.path());
+    let corrupt_state = b"not a sqlite database";
+    std::fs::write(&state_db_path, corrupt_state)?;
     let transport =
         AppServerTransport::from_listen_url(&format!("unix://{}", socket_path.display()))?;
     let _codex_home_guard = EnvVarGuard::set("CODEX_HOME", codex_home.path().as_os_str());
@@ -251,13 +255,23 @@ async fn explicit_remote_control_startup_fails_when_disabled_by_requirements() -
         REMOTE_CONTROL_DISABLED_BY_REQUIREMENTS_MESSAGE
     );
     assert!(!socket_path.exists());
+    assert_eq!(
+        std::fs::read(state_db_path)?,
+        corrupt_state,
+        "managed-policy rejection must not touch or recover the state database"
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn listen_off_honors_persisted_remote_control_enable() -> Result<()> {
+async fn listen_off_honors_persisted_remote_control_enable_with_residency_before_initialize()
+-> Result<()> {
     let codex_home = TempDir::new()?;
     let listener = configured_remote_control_listener(codex_home.path()).await?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        "enforce_residency = \"us\"\n",
+    )?;
     let websocket_url = format!(
         "ws://{}/backend-api/wham/remote/control/server",
         listener.local_addr()?
@@ -290,6 +304,13 @@ async fn listen_off_honors_persisted_remote_control_enable() -> Result<()> {
             || request
                 .request_line
                 .starts_with("POST /backend-api/wham/remote/control/server/refresh ")
+    );
+    assert_eq!(
+        request
+            .headers
+            .get("x-openai-internal-codex-residency")
+            .map(String::as_str),
+        Some("us")
     );
     Ok(())
 }
@@ -1071,6 +1092,7 @@ impl Drop for ClientManagementRemoteControlBackend {
 
 struct HttpRequest {
     request_line: String,
+    headers: HashMap<String, String>,
     body: String,
     reader: BufReader<TcpStream>,
 }
@@ -1106,18 +1128,22 @@ async fn read_http_request(listener: &TcpListener) -> Result<HttpRequest> {
         let mut request_line = String::new();
         reader.read_line(&mut request_line).await?;
         let mut content_length = 0;
+        let mut headers = HashMap::new();
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).await?;
             if line == "\r\n" {
                 break;
             }
+            let line = line.trim_end();
             if let Some(value) = line
-                .trim_end()
                 .strip_prefix("content-length:")
-                .or_else(|| line.trim_end().strip_prefix("Content-Length:"))
+                .or_else(|| line.strip_prefix("Content-Length:"))
             {
                 content_length = value.trim().parse::<usize>()?;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
             }
         }
         let mut body = vec![0; content_length];
@@ -1133,6 +1159,7 @@ async fn read_http_request(listener: &TcpListener) -> Result<HttpRequest> {
 
         return Ok(HttpRequest {
             request_line,
+            headers,
             body: String::from_utf8(body)?,
             reader,
         });

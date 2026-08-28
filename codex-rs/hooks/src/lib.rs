@@ -56,6 +56,7 @@ pub use events::permission_request::PermissionRequestDecision;
 pub use events::permission_request::PermissionRequestOutcome;
 pub use events::permission_request::PermissionRequestRequest;
 pub use events::post_tool_use::PostToolUseOutcome;
+pub use events::post_tool_use::PostToolUsePlan;
 pub use events::post_tool_use::PostToolUseRequest;
 pub use events::pre_tool_use::PreToolUseOutcome;
 pub use events::pre_tool_use::PreToolUseRequest;

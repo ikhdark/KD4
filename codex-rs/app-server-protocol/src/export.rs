@@ -45,7 +45,6 @@ const IGNORED_DEFINITIONS: &[&str] = &["Option<()>"];
 const JSON_V1_ALLOWLIST: &[&str] = &["InitializeParams", "InitializeResponse"];
 const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
     "EnvironmentShellInfo",
-    "PathUri",
     "RemoteControlClient",
     "RemoteControlClientsListOrder",
     "ThreadBackgroundTerminal",
@@ -1107,7 +1106,7 @@ fn build_flat_v2_schema(bundle: &Value) -> Result<Value> {
         .unwrap_or("CodexAppServerProtocol");
     let mut flat_definitions = v2_definitions.clone();
     let mut shared_definitions = Map::new();
-    let mut non_v2_refs = HashSet::new();
+    let mut non_v2_refs = collect_non_v2_refs(&Value::Object(v2_definitions.clone()));
 
     for shared in FLAT_V2_SHARED_DEFINITIONS {
         let Some(shared_schema) = definitions.get(*shared) else {
@@ -2583,6 +2582,10 @@ mod tests {
                     "title": "ServerRequestResolvedNotificationPayload",
                     "type": "string"
                 },
+                "PathUri": {
+                    "title": "PathUri",
+                    "type": "string"
+                },
                 "v2": {
                     "ThreadStartParams": {
                         "title": "ThreadStartParams",
@@ -2595,7 +2598,8 @@ mod tests {
                         "title": "ThreadStartResponse",
                         "type": "object",
                         "properties": {
-                            "ok": { "type": "boolean" }
+                            "ok": { "type": "boolean" },
+                            "cwdUri": { "$ref": "#/definitions/PathUri" }
                         }
                     },
                     "ThreadStartedEventMsg": {
@@ -2631,6 +2635,7 @@ mod tests {
         assert_eq!(definitions.contains_key("ThreadStartedNotification"), true);
         assert_eq!(definitions.contains_key("SharedHelper"), true);
         assert_eq!(definitions.contains_key("SharedLeaf"), true);
+        assert_eq!(definitions.contains_key("PathUri"), true);
         assert_eq!(definitions.contains_key("InitializeParams"), true);
         assert_eq!(
             definitions.contains_key("ServerRequestResolvedNotificationPayload"),
@@ -2903,6 +2908,7 @@ permissionProfile?: string | null};
         let definitions = flat_v2_bundle["definitions"]
             .as_object()
             .expect("flat v2 bundle should include definitions");
+        assert_eq!(definitions.contains_key("PathUri"), true);
         let client_request_methods: BTreeSet<String> = definitions["ClientRequest"]["oneOf"]
             .as_array()
             .expect("flat v2 ClientRequest should remain a oneOf")

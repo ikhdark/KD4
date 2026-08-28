@@ -2,6 +2,7 @@ use crate::FunctionCallError;
 use crate::agent::task_capabilities::normalize_absolute_repo_path;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::tools::command_execution::CompletedValidation;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
 use codex_agent_task_store::AttemptState;
@@ -41,6 +42,7 @@ pub(crate) struct ToolEventCtx<'a> {
     pub turn: &'a TurnContext,
     pub call_id: &'a str,
     pub turn_diff_tracker: Option<&'a SharedTurnDiffTracker>,
+    pub completed_validation: Option<&'a CompletedValidation>,
 }
 
 impl<'a> ToolEventCtx<'a> {
@@ -55,7 +57,16 @@ impl<'a> ToolEventCtx<'a> {
             turn,
             call_id,
             turn_diff_tracker,
+            completed_validation: None,
         }
+    }
+
+    pub fn with_completed_validation(
+        mut self,
+        completed_validation: Option<&'a CompletedValidation>,
+    ) -> Self {
+        self.completed_validation = completed_validation;
+        self
     }
 }
 
@@ -65,12 +76,16 @@ pub(crate) enum ToolEventStage<'a> {
     Success {
         output: ExecToolCallOutput,
         applied_patch_delta: Option<&'a AppliedPatchDelta>,
+        formatted_output: Option<String>,
     },
     Failure(ToolEventFailure<'a>),
 }
 
 pub(crate) enum ToolEventFailure<'a> {
-    Output(ExecToolCallOutput),
+    Output {
+        output: ExecToolCallOutput,
+        formatted_output: Option<String>,
+    },
     Message(String),
     Denied {
         message: String,
@@ -182,6 +197,7 @@ pub(crate) async fn emit_exec_command_begin(
 pub(crate) enum ToolEmitter {
     Shell {
         command: Vec<String>,
+        model_command_text: Option<String>,
         cwd: PathUri,
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
@@ -194,6 +210,7 @@ pub(crate) enum ToolEmitter {
     },
     UnifiedExec {
         command: Vec<String>,
+        model_command_text: Option<String>,
         cwd: PathUri,
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
@@ -212,6 +229,7 @@ impl ToolEmitter {
         let parsed_cmd = parse_command(&command);
         Self::Shell {
             command,
+            model_command_text: None,
             cwd: PathUri::from_abs_path(&cwd),
             source,
             parsed_cmd,
@@ -241,12 +259,26 @@ impl ToolEmitter {
         let parsed_cmd = parse_command(command);
         Self::UnifiedExec {
             command: command.to_vec(),
+            model_command_text: None,
             cwd,
             source,
             parsed_cmd,
             process_id,
             environment_id,
         }
+    }
+
+    pub fn with_model_command_text(mut self, command_text: String) -> Self {
+        match &mut self {
+            Self::Shell {
+                model_command_text, ..
+            }
+            | Self::UnifiedExec {
+                model_command_text, ..
+            } => *model_command_text = Some(command_text),
+            Self::ApplyPatch { .. } => {}
+        }
+        self
     }
 
     pub async fn emit(&self, ctx: ToolEventCtx<'_>, stage: ToolEventStage<'_>) {
@@ -258,6 +290,7 @@ impl ToolEmitter {
                     source,
                     parsed_cmd,
                     environment_id,
+                    ..
                 },
                 stage,
             ) => {
@@ -329,6 +362,7 @@ impl ToolEmitter {
                 ToolEventStage::Success {
                     output,
                     applied_patch_delta,
+                    ..
                 },
             ) => {
                 let status = if output.exit_code == 0 {
@@ -351,7 +385,7 @@ impl ToolEmitter {
             }
             (
                 Self::ApplyPatch { changes, .. },
-                ToolEventStage::Failure(ToolEventFailure::Output(output)),
+                ToolEventStage::Failure(ToolEventFailure::Output { output, .. }),
             ) => {
                 emit_patch_end(
                     ctx,
@@ -415,6 +449,7 @@ impl ToolEmitter {
                     parsed_cmd,
                     process_id,
                     environment_id,
+                    ..
                 },
                 stage,
             ) => {
@@ -447,8 +482,19 @@ impl ToolEmitter {
     ) -> String {
         let truncation_policy = ctx.turn.model_info.truncation_policy.into();
         match self {
-            Self::Shell { command, .. } | Self::UnifiedExec { command, .. } => {
-                let command_text = command.join(" ");
+            Self::Shell {
+                command,
+                model_command_text,
+                ..
+            }
+            | Self::UnifiedExec {
+                command,
+                model_command_text,
+                ..
+            } => {
+                let command_text = model_command_text
+                    .clone()
+                    .unwrap_or_else(|| command.join(" "));
                 let projected = super::project_exec_output_for_model_with_budget(
                     output,
                     truncation_policy,
@@ -476,6 +522,7 @@ impl ToolEmitter {
                 let event = ToolEventStage::Success {
                     output,
                     applied_patch_delta,
+                    formatted_output: Some(content.clone()),
                 };
                 let result = if exit_code == 0 {
                     Ok(content)
@@ -486,7 +533,10 @@ impl ToolEmitter {
             }
             Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output }))) => {
                 let response = self.format_exec_output_for_model(&output, ctx);
-                let event = ToolEventStage::Failure(ToolEventFailure::Output(*output));
+                let event = ToolEventStage::Failure(ToolEventFailure::Output {
+                    output: *output,
+                    formatted_output: Some(response.clone()),
+                });
                 let result = Err(FunctionCallError::RespondToModel(response));
                 (event, result)
             }
@@ -499,8 +549,12 @@ impl ToolEmitter {
                     (Self::ApplyPatch { .. }, Some(delta)) => ToolEventStage::Success {
                         output: *output,
                         applied_patch_delta: Some(delta),
+                        formatted_output: Some(response.clone()),
                     },
-                    _ => ToolEventStage::Failure(ToolEventFailure::Output(*output)),
+                    _ => ToolEventStage::Failure(ToolEventFailure::Output {
+                        output: *output,
+                        formatted_output: Some(response.clone()),
+                    }),
                 };
                 let result = Err(FunctionCallError::RespondToModel(response));
                 (event, result)
@@ -544,7 +598,7 @@ impl ToolEmitter {
                     message: bounded.clone(),
                     applied_patch_delta,
                 });
-                let result = Err(FunctionCallError::RespondToModel(bounded));
+                let result = Err(FunctionCallError::DeniedToModel(bounded));
                 (event, result)
             }
         };
@@ -639,18 +693,24 @@ async fn emit_exec_stage(
             )
             .await;
         }
-        ToolEventStage::Success { output, .. }
-        | ToolEventStage::Failure(ToolEventFailure::Output(output)) => {
+        ToolEventStage::Success {
+            output,
+            formatted_output,
+            ..
+        }
+        | ToolEventStage::Failure(ToolEventFailure::Output {
+            output,
+            formatted_output,
+        }) => {
             let exec_result = ExecCommandResult {
                 stdout: output.stdout.text.clone(),
                 stderr: output.stderr.text.clone(),
                 aggregated_output: output.aggregated_output.text.clone(),
                 exit_code: output.exit_code,
                 duration: output.duration,
-                formatted_output: format_exec_output_str(
-                    &output,
-                    ctx.turn.model_info.truncation_policy.into(),
-                ),
+                formatted_output: formatted_output.unwrap_or_else(|| {
+                    format_exec_output_str(&output, ctx.turn.model_info.truncation_policy.into())
+                }),
                 status: if output.exit_code == 0 {
                     ExecCommandStatus::Completed
                 } else {
@@ -690,6 +750,18 @@ async fn emit_exec_stage(
         }
         ToolEventStage::Skipped(output) => {
             tracing::info!(%output, "exec tool completed with a skipped outcome");
+            let text = output.to_string();
+            let exec_result = ExecCommandResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                aggregated_output: text.clone(),
+                exit_code: -1,
+                duration: Duration::ZERO,
+                formatted_output: text,
+                status: ExecCommandStatus::Declined,
+                timed_out: false,
+            };
+            emit_exec_end(ctx, exec_input, exec_result).await;
         }
     }
 }
@@ -721,8 +793,8 @@ pub(crate) async fn begin_exec_mutation_evidence(
     let Some(store) = coordinator.store() else {
         return;
     };
-    let Ok(task) = coordinator
-        .get_agent_task(binding.assignment_id, Some(0))
+    let Ok(authorization) = coordinator
+        .get_agent_task_authorization(binding.assignment_id)
         .await
     else {
         tracing::warn!(
@@ -731,8 +803,8 @@ pub(crate) async fn begin_exec_mutation_evidence(
         );
         return;
     };
-    if task.current_attempt.attempt_id != binding.attempt_id
-        || task.current_attempt.state != AttemptState::Active
+    if authorization.current_attempt.attempt_id != binding.attempt_id
+        || authorization.current_attempt.state != AttemptState::Active
     {
         tracing::warn!(
             attempt_id = %binding.attempt_id,
@@ -860,26 +932,37 @@ async fn emit_exec_end(
     finish_exec_mutation_evidence(ctx).await;
     let possible_mutation = mutation.may_have_mutated();
     let mutation_paths = mutation.paths();
-    let (validation_result, bound_plan_step) = ctx
-        .session
-        .services
-        .command_execution
-        .validation_result_with_plan_step_for_call(ctx.call_id)
-        .await
-        .map_or((None, None), |(result, bound_plan_step)| {
-            (Some(result), bound_plan_step)
-        });
-    let successful_validation_identity = validation_result
-        .as_ref()
-        .filter(|result| result.status.is_success())
-        .and_then(|result| serde_json::to_string(&result.proof_key).ok());
-    let workspace_identity_required = (possible_mutation
-        && exec_result.status != ExecCommandStatus::Declined)
-        || successful_validation_identity.is_some();
-    let current_workspace_identity = if workspace_identity_capture_required(
-        workspace_identity_required,
-        observed_workspace_identity.as_ref(),
-    ) {
+    let (validation_result, bound_plan_step, bound_work_unit) =
+        ctx.completed_validation
+            .map_or((None, None, None), |completed| {
+                (
+                    Some(completed.result.clone()),
+                    completed.bound_plan_step.clone(),
+                    completed.bound_work_unit.clone(),
+                )
+            });
+    let generation_batch = if possible_mutation
+        && exec_result.status != ExecCommandStatus::Declined
+        && observed_workspace_identity.is_none()
+    {
+        match ctx.turn_diff_tracker {
+            Some(tracker) => tracker
+                .lock()
+                .await
+                .workspace_evidence_generation_batch_for_call(ctx.call_id),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let defer_workspace_identity = generation_batch.is_some();
+    let workspace_identity_required =
+        possible_mutation && exec_result.status != ExecCommandStatus::Declined;
+    let current_workspace_identity = if !defer_workspace_identity
+        && workspace_identity_capture_required(
+            workspace_identity_required,
+            observed_workspace_identity.as_ref(),
+        ) {
         match native_cwd.as_ref() {
             Some(cwd) => {
                 ctx.session
@@ -914,13 +997,15 @@ async fn emit_exec_end(
                 .git_workspace
                 .note_host_workspace_mutation();
         }
-        ctx.session
-            .invalidate_tool_history_source_dependencies(
-                ctx.turn.config.codex_home.as_path(),
-                mutation_paths,
-                current_workspace_identity.as_ref(),
-            )
-            .await;
+        if !defer_workspace_identity {
+            ctx.session
+                .invalidate_tool_history_source_dependencies(
+                    ctx.turn.config.codex_home.as_path(),
+                    mutation_paths,
+                    current_workspace_identity.as_ref(),
+                )
+                .await;
+        }
     }
     let observed_mutation_revision = if exec_result.status != ExecCommandStatus::Declined
         && let Some(tracker) = ctx.turn_diff_tracker
@@ -934,15 +1019,31 @@ async fn emit_exec_end(
             native_cwd.as_ref().map(AbsolutePathBuf::as_path),
             mutation.clone(),
         );
-        tracker.record_workspace_freshness_observation(
-            successful_validation_identity,
-            current_workspace_identity.clone(),
-        );
         Some(tracker.current_mutation_revision())
     } else {
         None
     };
-    if let Some(observed_mutation_revision) = observed_mutation_revision {
+    let mutation_deferred = generation_batch.is_some_and(|batch| {
+        batch.record_mutation(
+            ctx.call_id,
+            native_cwd.as_ref().map_or_else(
+                || ctx.turn.config.cwd.clone().to_path_buf(),
+                codex_utils_absolute_path::AbsolutePathBuf::to_path_buf,
+            ),
+            mutation_paths.cloned(),
+            /*observe_command_ledger*/ true,
+        )
+    });
+    if defer_workspace_identity && !mutation_deferred {
+        ctx.session
+            .invalidate_tool_history_source_dependencies(
+                ctx.turn.config.codex_home.as_path(),
+                mutation_paths,
+                None,
+            )
+            .await;
+    }
+    if !mutation_deferred && let Some(observed_mutation_revision) = observed_mutation_revision {
         ctx.session
             .services
             .command_execution
@@ -963,10 +1064,8 @@ async fn emit_exec_end(
             &ctx.session.services.task_evidence,
         )
         .await;
-    let implementation_identity_hash = if possible_mutation {
+    let implementation_identity_hash = if possible_mutation || validation_result.is_some() {
         None
-    } else if let Some(validation_result) = validation_result.as_ref() {
-        Some(validation_result.proof_key.implementation_identity.clone())
     } else {
         crate::tasks::completion_review::implementation_identity_for_evidence(ctx.session, &ledger)
             .await
@@ -975,6 +1074,11 @@ async fn emit_exec_end(
         .as_ref()
         .is_some_and(|result| result.status.is_success())
         .then_some(bound_plan_step)
+        .flatten();
+    let bound_work_unit = validation_result
+        .as_ref()
+        .is_some_and(|result| result.status.is_success())
+        .then_some(bound_work_unit)
         .flatten();
     ledger
         .record_command_bound_with_validation_result(
@@ -991,6 +1095,9 @@ async fn emit_exec_end(
             bound_plan_step
                 .as_ref()
                 .map(|(step_id, revision)| (step_id.as_str(), *revision)),
+            bound_work_unit
+                .as_ref()
+                .map(|(work_unit_id, revision)| (work_unit_id.as_str(), *revision)),
         )
         .await;
     ctx.session
@@ -1052,7 +1159,25 @@ async fn emit_patch_end(
                 })
                 .collect::<BTreeSet<_>>()
         });
-        let current_workspace_identity = if affected_paths.is_some() {
+        let generation_batch = match ctx.turn_diff_tracker {
+            Some(tracker) => tracker
+                .lock()
+                .await
+                .workspace_evidence_generation_batch_for_call(ctx.call_id),
+            None => None,
+        };
+        let mutation_deferred = generation_batch.is_some_and(|batch| {
+            batch.record_mutation(
+                ctx.call_id,
+                evidence_cwd.as_ref().map_or_else(
+                    || ctx.turn.config.cwd.clone().to_path_buf(),
+                    codex_utils_absolute_path::AbsolutePathBuf::to_path_buf,
+                ),
+                affected_paths.clone(),
+                /*observe_command_ledger*/ false,
+            )
+        });
+        let current_workspace_identity = if affected_paths.is_some() && !mutation_deferred {
             match evidence_cwd.as_ref() {
                 Some(cwd) => {
                     crate::git_workspace::capture_workspace_evidence_identity(cwd.as_path()).await
@@ -1062,13 +1187,15 @@ async fn emit_patch_end(
         } else {
             None
         };
-        ctx.session
-            .invalidate_tool_history_source_dependencies(
-                ctx.turn.config.codex_home.as_path(),
-                affected_paths.as_ref(),
-                current_workspace_identity.as_ref(),
-            )
-            .await;
+        if !mutation_deferred {
+            ctx.session
+                .invalidate_tool_history_source_dependencies(
+                    ctx.turn.config.codex_home.as_path(),
+                    affected_paths.as_ref(),
+                    current_workspace_identity.as_ref(),
+                )
+                .await;
+        }
     }
     let outcome = match &status {
         PatchApplyStatus::Completed => "completed",
@@ -1103,30 +1230,24 @@ async fn emit_patch_end(
         .await;
 
     if let Some(tracker) = ctx.turn_diff_tracker {
-        let (should_emit_turn_diff, unified_diff) = {
+        let unified_diff = {
             let mut guard = tracker.lock().await;
-            let had_unified_diff = guard.has_unified_diff();
-            let tracker_changed = match tracker_update {
+            match tracker_update {
                 TurnDiffTrackerUpdate::Track {
                     environment_id,
                     delta,
                 } => {
                     guard.track_delta(environment_id.as_deref().unwrap_or_default(), delta);
-                    true
+                    guard.take_unified_diff_if_changed()
                 }
                 TurnDiffTrackerUpdate::Invalidate => {
                     guard.record_unknown_mutation();
-                    true
+                    guard.take_unified_diff_if_changed()
                 }
-                TurnDiffTrackerUpdate::None => false,
-            };
-            let unified_diff = guard.get_unified_diff();
-            (
-                tracker_changed && (had_unified_diff || unified_diff.is_some()),
-                unified_diff.unwrap_or_default(),
-            )
+                TurnDiffTrackerUpdate::None => None,
+            }
         };
-        if should_emit_turn_diff {
+        if let Some(unified_diff) = unified_diff {
             ctx.session
                 .send_event(ctx.turn, EventMsg::TurnDiff(TurnDiffEvent { unified_diff }))
                 .await;
@@ -1147,6 +1268,7 @@ mod tests {
     use codex_protocol::error::CodexErr;
     use codex_protocol::error::SandboxErr;
     use codex_protocol::exec_output::ExecToolCallOutput;
+    use codex_protocol::exec_output::StreamOutput;
     use codex_protocol::items::TurnItem;
     use codex_protocol::protocol::PatchApplyStatus;
     use codex_protocol::protocol::SessionSource;
@@ -1286,6 +1408,122 @@ mod tests {
             .status()
             .expect("launch git init");
         assert!(status.success(), "git init failed");
+    }
+
+    #[tokio::test]
+    async fn completed_validation_is_persisted_and_invalidated_by_a_covered_mutation() {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        initialize_git_repository(&repo);
+        tokio::fs::create_dir_all(repo.join("src"))
+            .await
+            .expect("source directory");
+        tokio::fs::write(repo.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")
+            .await
+            .expect("source fixture");
+
+        let (mut session, turn, _rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        let evidence_path = enable_task_evidence_for_repo(&mut session, &repo).await;
+        let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("absolute cwd");
+        let validation_command = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "-p".to_string(),
+            "fixture".to_string(),
+            "focused_validation".to_string(),
+        ];
+        let completed_validation = CompletedValidation {
+            result: codex_protocol::validation::ValidationResult {
+                argv: validation_command.clone(),
+                covered_paths: vec!["src/lib.rs".to_string()],
+                call_id: "validation-call".to_string(),
+                process_id: None,
+                status: codex_protocol::validation::ValidationTerminalStatus::Succeeded,
+                duration_ms: 7,
+                summary: Some("focused validation succeeded".to_string()),
+                failure_excerpt: None,
+                raw_artifact_ref: None,
+                raw_artifact_sha256: None,
+            },
+            bound_plan_step: None,
+            bound_work_unit: None,
+            focused_validation_token: None,
+        };
+        let validation = ToolEmitter::shell(
+            validation_command.clone(),
+            cwd.clone(),
+            ExecCommandSource::Agent,
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        );
+        validation
+            .begin(ToolEventCtx::new(
+                session.as_ref(),
+                turn.as_ref(),
+                "validation-call",
+                None,
+            ))
+            .await;
+        validation
+            .finish(
+                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "validation-call", None)
+                    .with_completed_validation(Some(&completed_validation)),
+                Ok(ExecToolCallOutput::default()),
+                None,
+            )
+            .await
+            .expect("validation event completes");
+
+        let mutation_command = vec!["touch".to_string(), "src/lib.rs".to_string()];
+        let mutation = ToolEmitter::shell(
+            mutation_command,
+            cwd,
+            ExecCommandSource::Agent,
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        );
+        mutation
+            .begin(ToolEventCtx::new(
+                session.as_ref(),
+                turn.as_ref(),
+                "mutation-call",
+                None,
+            ))
+            .await;
+        tokio::fs::write(repo.join("src/lib.rs"), "pub fn value() -> u8 { 2 }\n")
+            .await
+            .expect("covered mutation");
+        mutation
+            .finish(
+                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "mutation-call", None),
+                Ok(ExecToolCallOutput::default()),
+                None,
+            )
+            .await
+            .expect("mutation event completes");
+
+        let bytes = tokio::fs::read(evidence_path)
+            .await
+            .expect("task evidence file");
+        let document: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("valid task evidence");
+        let receipt = document["command_receipts"]
+            .as_array()
+            .expect("command receipts")
+            .iter()
+            .find(|receipt| receipt["validation_call_id"] == "validation-call")
+            .expect("persisted validation receipt");
+        assert_eq!(receipt["command"], serde_json::json!(validation_command));
+        assert_eq!(receipt["validation_result"]["callId"], "validation-call");
+        assert_eq!(
+            receipt["validation_result"]["coveredPaths"],
+            serde_json::json!(["src/lib.rs"])
+        );
+        assert!(
+            receipt["validation_invalidated_at_revision"]
+                .as_u64()
+                .is_some_and(|revision| revision > 0),
+            "a later covered mutation must invalidate the persisted validation"
+        );
     }
 
     fn set_turn_environments(turn: &mut Arc<TurnContext>, environments: &[(&str, &Path)]) {
@@ -1459,8 +1697,8 @@ mod tests {
             )
             .await
             .expect_err("rejection should be returned to the model");
-        let FunctionCallError::RespondToModel(model_text) = error else {
-            panic!("expected model-visible rejection");
+        let FunctionCallError::DeniedToModel(model_text) = error else {
+            panic!("expected structured model-visible denial");
         };
 
         assert!(model_text.len() < rejection.len());
@@ -1481,7 +1719,66 @@ mod tests {
         assert_eq!(item.aggregated_output.as_deref(), Some(model_text.as_str()));
         assert_eq!(item.formatted_output.as_deref(), Some(model_text.as_str()));
         assert_eq!(tracker.lock().await.current_mutation_revision(), 0);
-        assert!(!tracker.lock().await.has_unvalidated_mutation());
+    }
+
+    #[tokio::test]
+    async fn completed_item_reuses_the_model_output_projection() {
+        let (session, turn, rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        let dir = tempdir().expect("tempdir");
+        let cwd = AbsolutePathBuf::from_absolute_path(dir.path()).expect("absolute cwd");
+        let raw_output = (0..900)
+            .map(|index| {
+                if index == 420 {
+                    "error[E0599]: no method named `repair_bug` found".to_string()
+                } else {
+                    format!("build log {index}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = ExecToolCallOutput {
+            exit_code: 101,
+            stdout: StreamOutput::new(String::new()),
+            stderr: StreamOutput::new(raw_output.clone()),
+            aggregated_output: StreamOutput::new(raw_output.clone()),
+            duration: Duration::from_millis(25),
+            timed_out: false,
+        };
+        let emitter = ToolEmitter::shell(
+            vec![
+                "powershell.exe".to_string(),
+                "-EncodedCommand".to_string(),
+                "opaque-payload".to_string(),
+            ],
+            cwd,
+            ExecCommandSource::Agent,
+            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        )
+        .with_model_command_text("cargo test -p codex-core focused_contract".to_string());
+
+        let error = emitter
+            .finish(
+                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", None),
+                Ok(output),
+                None,
+            )
+            .await
+            .expect_err("nonzero output is returned to the model");
+        let FunctionCallError::RespondToModel(model_text) = error else {
+            panic!("expected model-visible command failure");
+        };
+        assert!(model_text.contains("failure-focused lines, final status lines, tail"));
+
+        let completed = rx_event.recv().await.expect("item completed event");
+        let EventMsg::ItemCompleted(event) = completed.msg else {
+            panic!("expected item completed event");
+        };
+        let TurnItem::CommandExecution(item) = event.item else {
+            panic!("expected command execution item");
+        };
+        assert_eq!(item.formatted_output.as_deref(), Some(model_text.as_str()));
+        assert_eq!(item.aggregated_output.as_deref(), Some(raw_output.as_str()));
     }
 
     #[tokio::test]
@@ -1500,6 +1797,23 @@ mod tests {
         );
         let (attempt_id, store) =
             enable_typed_task_for_repo(&mut session, &mut turn, &repo, &["protected.txt"]).await;
+        let assignment_id = session
+            .services
+            .agent_control
+            .task_coordinator()
+            .binding_for_source(&turn.session_source)
+            .expect("typed task binding")
+            .assignment_id;
+        let capsule_dir = repo
+            .join(".typed-task-home")
+            .join("agent-task-coordination")
+            .join("task_capsules");
+        std::fs::create_dir_all(&capsule_dir).expect("create capsule directory");
+        std::fs::write(
+            capsule_dir.join(format!("{assignment_id}.json")),
+            "{not-json",
+        )
+        .expect("write corrupt task capsule");
         let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("absolute cwd");
         let command = vec!["rm".to_string(), "protected.txt".to_string()];
         let mutation = crate::turn_diff_tracker::command_mutation(&command, Some(&repo));
@@ -1950,7 +2264,11 @@ mod tests {
         )
         .await
         .expect("apply patch");
-        tracker.lock().await.track_delta("", &delta);
+        {
+            let mut tracker = tracker.lock().await;
+            tracker.track_delta("", &delta);
+            assert!(tracker.take_unified_diff_if_changed().is_some());
+        }
 
         emit_patch_end(
             ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
@@ -1970,40 +2288,5 @@ mod tests {
                 break;
             }
         }
-    }
-
-    #[tokio::test]
-    async fn exec_completion_records_timeout_in_validation_freshness() {
-        let (session, turn, _rx_event) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-        tracker.lock().await.record_unknown_mutation();
-        let dir = tempdir().expect("tempdir");
-        let cwd = AbsolutePathBuf::from_absolute_path(dir.path()).expect("absolute cwd");
-        let emitter = ToolEmitter::shell(
-            vec!["cargo".to_string(), "test".to_string()],
-            cwd,
-            ExecCommandSource::Agent,
-            String::new(),
-        );
-        let output = ExecToolCallOutput {
-            exit_code: 1,
-            timed_out: true,
-            ..Default::default()
-        };
-
-        emitter
-            .finish(
-                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
-                Ok(output),
-                None,
-            )
-            .await
-            .expect_err("timed out validation should fail for the model");
-
-        assert_eq!(
-            tracker.lock().await.validation_freshness_status(),
-            crate::turn_diff_tracker::ValidationFreshnessStatus::TimedOut
-        );
     }
 }

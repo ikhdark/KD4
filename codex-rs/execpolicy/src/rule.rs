@@ -7,8 +7,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 use shlex::try_join;
-use std::any::Any;
-use std::fmt::Debug;
 use std::sync::Arc;
 
 /// Matches a single command token, either a fixed string or one of several allowed alternatives.
@@ -140,6 +138,23 @@ pub struct PrefixRule {
     pub justification: Option<String>,
 }
 
+impl PrefixRule {
+    pub fn program(&self) -> &str {
+        self.pattern.first.as_ref()
+    }
+
+    pub fn matches(&self, cmd: &[String]) -> Option<RuleMatch> {
+        self.pattern
+            .matches_prefix(cmd)
+            .map(|matched_prefix| RuleMatch::PrefixRuleMatch {
+                matched_prefix,
+                decision: self.decision,
+                resolved_program: None,
+                justification: self.justification.clone(),
+            })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkRuleProtocol {
     Http,
@@ -237,36 +252,7 @@ pub(crate) fn normalize_network_rule_host(raw: &str) -> Result<String> {
     Ok(normalized)
 }
 
-pub trait Rule: Any + Debug + Send + Sync {
-    fn program(&self) -> &str;
-
-    fn matches(&self, cmd: &[String]) -> Option<RuleMatch>;
-
-    fn as_any(&self) -> &dyn Any;
-}
-
-pub type RuleRef = Arc<dyn Rule>;
-
-impl Rule for PrefixRule {
-    fn program(&self) -> &str {
-        self.pattern.first.as_ref()
-    }
-
-    fn matches(&self, cmd: &[String]) -> Option<RuleMatch> {
-        self.pattern
-            .matches_prefix(cmd)
-            .map(|matched_prefix| RuleMatch::PrefixRuleMatch {
-                matched_prefix,
-                decision: self.decision,
-                resolved_program: None,
-                justification: self.justification.clone(),
-            })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+pub type RuleRef = Arc<PrefixRule>;
 
 /// Count how many rules match each provided example and error if any example is unmatched.
 pub(crate) fn validate_match_examples(

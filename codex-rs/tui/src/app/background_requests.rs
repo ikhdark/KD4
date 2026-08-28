@@ -304,13 +304,11 @@ impl App {
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             let cwd_for_event = cwd.clone();
-            let source_for_event = source.clone();
             let result = fetch_marketplace_add(request_handle, cwd, source)
                 .await
                 .map_err(|err| format!("Failed to add marketplace: {err}"));
             app_event_tx.send(AppEvent::MarketplaceAddLoaded {
                 cwd: cwd_for_event,
-                source: source_for_event,
                 result,
             });
         });
@@ -613,9 +611,9 @@ impl App {
         thread_id: ThreadId,
         event: FeedbackThreadEvent,
     ) {
-        let (sender, store) = {
+        let (forwarder, store) = {
             let channel = self.ensure_thread_channel(thread_id);
-            (channel.sender.clone(), Arc::clone(&channel.store))
+            (channel.forwarder.clone(), Arc::clone(&channel.store))
         };
 
         let should_send = {
@@ -635,19 +633,7 @@ impl App {
         };
 
         if should_send {
-            match sender.try_send(ThreadBufferedEvent::FeedbackSubmission(event)) {
-                Ok(()) => {}
-                Err(TrySendError::Full(event)) => {
-                    tokio::spawn(async move {
-                        if let Err(err) = sender.send(event).await {
-                            tracing::warn!("thread {thread_id} event channel closed: {err}");
-                        }
-                    });
-                }
-                Err(TrySendError::Closed(_)) => {
-                    tracing::warn!("thread {thread_id} event channel closed");
-                }
-            }
+            forwarder.try_send(thread_id, ThreadBufferedEvent::FeedbackSubmission(event));
         }
     }
 

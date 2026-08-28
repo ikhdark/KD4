@@ -220,6 +220,25 @@ async fn load_config_normalizes_relative_cwd_override() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+async fn show_raw_agent_reasoning_runtime_override_wins_over_config() -> std::io::Result<()> {
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            show_raw_agent_reasoning: Some(false),
+            ..Default::default()
+        },
+        ConfigOverrides {
+            show_raw_agent_reasoning: Some(true),
+            ..Default::default()
+        },
+        tempdir()?.abs(),
+    )
+    .await?;
+
+    assert!(config.show_raw_agent_reasoning);
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_config_canonicalizes_chatgpt_base_url_once_at_the_boundary() -> std::io::Result<()> {
     let codex_home = tempdir()?;
     let config = Config::load_from_base_config_with_overrides(
@@ -534,6 +553,22 @@ direct_only_tool_namespaces = ["mcp__history", "mcp__notes"]
         vec!["mcp__history".to_string(), "mcp__notes".to_string()]
     );
     assert!(config.features.enabled(Feature::CodeMode));
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_preserves_explicit_kd4_workflow_override() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config_toml: ConfigToml = toml::from_str("kd4_workflow_enabled = false")
+        .expect("TOML deserialization should succeed");
+    let config = Config::load_from_base_config_with_overrides(
+        config_toml,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(config.kd4_workflow_enabled, Some(false));
     Ok(())
 }
 
@@ -3809,7 +3844,11 @@ trust_level = "trusted"
         /*permission_profile_constraint*/ None,
     )
     .await;
-    assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
+    if cfg!(windows) {
+        assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
+    } else {
+        assert_matches!(resolution, SandboxPolicy::WorkspaceWrite { .. });
+    }
 
     let sandbox_workspace_write = format!(
         r#"
@@ -3836,7 +3875,11 @@ exclude_slash_tmp = true
         /*permission_profile_constraint*/ None,
     )
     .await;
-    assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
+    if cfg!(windows) {
+        assert_eq!(resolution, SandboxPolicy::new_read_only_policy());
+    } else {
+        assert_matches!(resolution, SandboxPolicy::WorkspaceWrite { .. });
+    }
 }
 
 #[tokio::test]
@@ -3917,10 +3960,10 @@ exclude_slash_tmp = true
                 #[cfg(windows)]
                 {
                     assert_eq!(
-                        sandbox_policy,
-                        SandboxPolicy::new_read_only_policy(),
+                        &sandbox_policy,
+                        &SandboxPolicy::new_read_only_policy(),
                         "legacy workspace-write should keep the existing Windows downgrade when \
-                         the experimental Windows sandbox is disabled"
+                         the Windows sandbox is disabled"
                     );
                     assert_eq!(
                         file_system_policy,
@@ -4988,6 +5031,28 @@ async fn sqlite_home_defaults_to_codex_home_for_workspace_write() -> std::io::Re
     Ok(())
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn non_utf8_sqlite_home_env_value_keeps_precedence() {
+    #[cfg(unix)]
+    let configured = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![b's', b'q', b'l', b'i', b't', b'e', 0xff])
+    };
+    #[cfg(windows)]
+    let configured = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xd800])
+    };
+
+    let cwd = std::env::current_dir().expect("current directory");
+
+    assert_eq!(
+        resolve_sqlite_home_env_value(configured.clone(), &cwd),
+        Some(cwd.join(configured))
+    );
+}
+
 #[tokio::test]
 async fn workspace_write_includes_configured_writable_root_once_without_memories_root()
 -> std::io::Result<()> {
@@ -5390,8 +5455,6 @@ async fn canonical_feature_toggle_loads() -> std::io::Result<()> {
     .await?;
 
     assert!(config.features.enabled(Feature::UnifiedExec));
-
-    assert!(config.unified_exec_enabled);
 
     Ok(())
 }
@@ -8901,10 +8964,11 @@ trust_level = "untrusted"
     .await;
 
     // Verify that untrusted projects get WorkspaceWrite (or ReadOnly on Windows due to downgrade)
-    assert!(
-        matches!(resolution, SandboxPolicy::ReadOnly { .. }),
-        "Expected ReadOnly on Windows, got {resolution:?}"
-    );
+    if cfg!(windows) {
+        assert_matches!(resolution, SandboxPolicy::ReadOnly { .. });
+    } else {
+        assert_matches!(resolution, SandboxPolicy::WorkspaceWrite { .. });
+    }
 
     Ok(())
 }
@@ -8953,6 +9017,7 @@ async fn derive_sandbox_policy_falls_back_to_read_only_for_implicit_defaults() -
     Ok(())
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn derive_sandbox_policy_preserves_windows_downgrade_for_unsupported_fallback()
 -> anyhow::Result<()> {
@@ -9213,13 +9278,17 @@ async fn test_untrusted_project_gets_unless_trusted_approval_policy() -> anyhow:
     );
 
     // Verify that untrusted projects still get WorkspaceWrite sandbox (or ReadOnly on Windows)
-    assert!(
-        matches!(
-            &config.legacy_sandbox_policy(),
+    if cfg!(windows) {
+        assert_matches!(
+            config.legacy_sandbox_policy(),
             SandboxPolicy::ReadOnly { .. }
-        ),
-        "Expected ReadOnly on Windows"
-    );
+        );
+    } else {
+        assert_matches!(
+            config.legacy_sandbox_policy(),
+            SandboxPolicy::WorkspaceWrite { .. }
+        );
+    }
 
     Ok(())
 }

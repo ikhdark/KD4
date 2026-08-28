@@ -4,6 +4,7 @@ use codex_agent_task_store::AdmittedAssignment;
 use codex_agent_task_store::AgentReceipt;
 use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
+use codex_agent_task_store::AgentTaskAuthorization;
 use codex_agent_task_store::AgentTaskBinding;
 use codex_agent_task_store::AgentTaskBindingDraft;
 use codex_agent_task_store::Assignment;
@@ -24,7 +25,6 @@ use codex_agent_task_store::TaskActor;
 use codex_agent_task_store::ValidationCall;
 use codex_agent_task_store::ValidationCallStatus;
 use codex_agent_task_store::ValidationEvidence;
-use codex_agent_task_store::ValidationProofKind;
 use codex_agent_task_store::WorkspaceActorKind;
 use codex_agent_task_store::WorkspaceActorRegistration;
 use codex_agent_task_store::WorkspaceStrategy;
@@ -39,9 +39,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
-use tokio::sync::Notify;
 use tokio::sync::OnceCell;
-use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::task_metrics::TASK_FIRST_MEANINGFUL_PROGRESS_DURATION_METRIC;
@@ -54,22 +52,7 @@ pub(crate) struct FocusedValidationToken {
     attempt_id: codex_agent_task_store::AttemptId,
     call_id: String,
     command_summary: String,
-    resolved_executable: String,
     evidence: ValidationEvidence,
-}
-
-impl FocusedValidationToken {
-    pub(crate) fn call_id(&self) -> &str {
-        &self.call_id
-    }
-
-    pub(crate) fn shared_from_call_id(&self) -> Option<&str> {
-        self.evidence.shared_from_call_id.as_deref()
-    }
-
-    pub(crate) fn lease_expires_at(&self) -> Option<chrono::DateTime<Utc>> {
-        self.evidence.lease_expires_at
-    }
 }
 
 #[derive(Default)]
@@ -87,36 +70,6 @@ struct TaskMetricIndex {
     configured_capacity: Option<u32>,
 }
 
-struct ValidationWaiterEntry {
-    notify: Arc<Notify>,
-    registrations: usize,
-}
-
-struct ValidationWaitRegistration {
-    call_id: String,
-    waiters: Arc<Mutex<HashMap<String, ValidationWaiterEntry>>>,
-    notify: Arc<Notify>,
-}
-
-impl Drop for ValidationWaitRegistration {
-    fn drop(&mut self) {
-        let mut waiters = self
-            .waiters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let remove = waiters.get_mut(&self.call_id).is_some_and(|entry| {
-            if !Arc::ptr_eq(&entry.notify, &self.notify) {
-                return false;
-            }
-            entry.registrations = entry.registrations.saturating_sub(1);
-            entry.registrations == 0
-        });
-        if remove {
-            waiters.remove(&self.call_id);
-        }
-    }
-}
-
 const MAX_DIAGNOSTIC_ATTEMPT_IDENTITIES: usize = 4_096;
 
 /// Shared typed-task persistence and identity index for one root agent tree.
@@ -130,9 +83,8 @@ pub(crate) struct AgentTaskCoordinator {
     root_session_id: Arc<OnceCell<String>>,
     bindings: Arc<RwLock<BindingIndex>>,
     metrics: Arc<Mutex<TaskMetricIndex>>,
-    validation_waiters: Arc<Mutex<HashMap<String, ValidationWaiterEntry>>>,
     #[cfg(test)]
-    validation_wait_armed_hook: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    fail_next_agent_task_read: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgentTaskCoordinator {
@@ -403,9 +355,42 @@ impl AgentTaskCoordinator {
         assignment_id: AssignmentId,
         observation_limit: Option<usize>,
     ) -> StoreResult<AgentTask> {
+        #[cfg(test)]
+        if self
+            .fail_next_agent_task_read
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StoreError::CorruptData(
+                "injected agent-task read failure".to_string(),
+            ));
+        }
         self.required_store()?
             .get_agent_task(assignment_id, observation_limit)
             .await
+    }
+
+    pub(crate) async fn get_agent_task_authorization(
+        &self,
+        assignment_id: AssignmentId,
+    ) -> StoreResult<AgentTaskAuthorization> {
+        #[cfg(test)]
+        if self
+            .fail_next_agent_task_read
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StoreError::CorruptData(
+                "injected agent-task read failure".to_string(),
+            ));
+        }
+        self.required_store()?
+            .get_agent_task_authorization(assignment_id)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_agent_task_read_for_test(&self) {
+        self.fail_next_agent_task_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) async fn get_agent_task_binding(
@@ -439,13 +424,11 @@ impl AgentTaskCoordinator {
         session_source: &SessionSource,
         call_id: String,
         command_summary: String,
-        resolved_executable: String,
     ) -> StoreResult<Option<FocusedValidationToken>> {
         self.begin_focused_validation_for_source_with_evidence(
             session_source,
             call_id,
             command_summary,
-            resolved_executable,
             ValidationEvidence::default(),
         )
         .await
@@ -456,7 +439,6 @@ impl AgentTaskCoordinator {
         session_source: &SessionSource,
         call_id: String,
         command_summary: String,
-        resolved_executable: String,
         evidence: ValidationEvidence,
     ) -> StoreResult<Option<FocusedValidationToken>> {
         let Some(binding) = self.binding_for_source(session_source) else {
@@ -467,7 +449,6 @@ impl AgentTaskCoordinator {
             attempt_id: binding.attempt_id,
             call_id,
             command_summary,
-            resolved_executable,
             evidence,
         };
         let store = self.required_store()?;
@@ -476,8 +457,6 @@ impl AgentTaskCoordinator {
                 call_id: token.call_id.clone(),
                 attempt_id: token.attempt_id,
                 command_summary: token.command_summary.clone(),
-                resolved_executable: Some(token.resolved_executable.clone()),
-                proof_kind: ValidationProofKind::Focused,
                 evidence: token.evidence.clone(),
                 status: ValidationCallStatus::Running,
                 recorded_at: Utc::now(),
@@ -496,109 +475,18 @@ impl AgentTaskCoordinator {
         Ok(Some(token))
     }
 
-    pub(crate) async fn get_validation_call(
+    pub(crate) async fn heartbeat_focused_validation(
         &self,
-        call_id: String,
-    ) -> StoreResult<Option<ValidationCall>> {
-        self.required_store()?.get_validation_call(call_id).await
-    }
-
-    pub(crate) fn notify_validation_call(&self, call_id: &str) {
-        let waiter = self
-            .validation_waiters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(call_id)
-            .map(|entry| Arc::clone(&entry.notify));
-        if let Some(waiter) = waiter {
-            waiter.notify_waiters();
-        }
-    }
-
-    #[cfg(test)]
-    fn set_validation_wait_armed_hook(&self, hook: tokio::sync::mpsc::UnboundedSender<String>) {
-        *self
-            .validation_wait_armed_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
-    }
-
-    #[cfg(test)]
-    fn report_validation_wait_armed(&self, call_id: &str) {
-        if let Some(hook) = self
-            .validation_wait_armed_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            let _ = hook.send(call_id.to_string());
-        }
-    }
-
-    /// Waits for a persisted validation call without model-visible polling.
-    ///
-    /// The notifier is installed before the first authoritative read so a
-    /// terminal transition cannot be missed. Deadline wakeup returns the last
-    /// authoritative store state to the caller for bounded recovery.
-    pub(crate) async fn wait_for_validation_call_terminal(
-        &self,
-        call_id: &str,
-        cancellation: &CancellationToken,
-        deadline: chrono::DateTime<Utc>,
-    ) -> StoreResult<Option<ValidationCall>> {
-        let registration = {
-            let mut waiters = self
-                .validation_waiters
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let entry =
-                waiters
-                    .entry(call_id.to_string())
-                    .or_insert_with(|| ValidationWaiterEntry {
-                        notify: Arc::new(Notify::new()),
-                        registrations: 0,
-                    });
-            entry.registrations = entry.registrations.saturating_add(1);
-            ValidationWaitRegistration {
-                call_id: call_id.to_string(),
-                waiters: Arc::clone(&self.validation_waiters),
-                notify: Arc::clone(&entry.notify),
-            }
-        };
-        let waiter = Arc::clone(&registration.notify);
-        loop {
-            let notified = waiter.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            #[cfg(test)]
-            self.report_validation_wait_armed(call_id);
-            let current = self.get_validation_call(call_id.to_string()).await?;
-            if current
-                .as_ref()
-                .is_some_and(|call| call.status.is_terminal())
-            {
-                return Ok(current);
-            }
-            let Ok(remaining) = (deadline - Utc::now()).to_std() else {
-                return Ok(current);
-            };
-            tokio::select! {
-                _ = &mut notified => {}
-                _ = cancellation.cancelled() => return Ok(None),
-                _ = tokio::time::sleep(remaining) => {
-                    return self.get_validation_call(call_id.to_string()).await;
-                }
-            }
-        }
-    }
-
-    pub(crate) async fn heartbeat_validation_call(
-        &self,
-        call_id: String,
-        lease_expires_at: chrono::DateTime<Utc>,
+        token: &FocusedValidationToken,
     ) -> StoreResult<bool> {
         self.required_store()?
-            .heartbeat_validation_call(call_id, lease_expires_at)
+            .heartbeat_validation_call(
+                token.call_id.clone(),
+                Utc::now()
+                    + chrono::Duration::seconds(
+                        codex_agent_task_store::MAX_VALIDATION_LEASE_SECONDS,
+                    ),
+            )
             .await
     }
 
@@ -608,25 +496,8 @@ impl AgentTaskCoordinator {
         token: FocusedValidationToken,
         status: ValidationCallStatus,
     ) -> StoreResult<()> {
-        self.finish_focused_validation_with_output(token, status, None, None)
+        self.finish_focused_validation_with_result(token, status, None, None, None)
             .await
-    }
-
-    pub(crate) async fn finish_focused_validation_with_output(
-        &self,
-        token: FocusedValidationToken,
-        status: ValidationCallStatus,
-        retained_output_ref: Option<String>,
-        output_summary: Option<String>,
-    ) -> StoreResult<()> {
-        self.finish_focused_validation_with_result(
-            token,
-            status,
-            retained_output_ref,
-            output_summary,
-            None,
-        )
-        .await
     }
 
     pub(crate) async fn finish_focused_validation_with_result(
@@ -651,20 +522,16 @@ impl AgentTaskCoordinator {
         evidence.retained_output_ref = retained_output_ref;
         evidence.output_summary = output_summary;
         evidence.validation_result = validation_result;
-        let call_id = token.call_id.clone();
         store
             .record_validation_call(ValidationCall {
                 call_id: token.call_id,
                 attempt_id: token.attempt_id,
                 command_summary: token.command_summary,
-                resolved_executable: Some(token.resolved_executable),
-                proof_kind: ValidationProofKind::Focused,
                 evidence,
                 status,
                 recorded_at: Utc::now(),
             })
             .await?;
-        self.notify_validation_call(&call_id);
         Ok(())
     }
 

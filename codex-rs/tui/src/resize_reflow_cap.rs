@@ -62,23 +62,15 @@ fn auto_resize_reflow_max_rows(
         TerminalName::WindowsTerminal => WINDOWS_TERMINAL_RESIZE_REFLOW_MAX_ROWS,
         TerminalName::WezTerm => WEZTERM_RESIZE_REFLOW_MAX_ROWS,
         TerminalName::Alacritty => ALACRITTY_RESIZE_REFLOW_MAX_ROWS,
-        TerminalName::AppleTerminal
-        | TerminalName::Ghostty
-        | TerminalName::Iterm2
-        | TerminalName::WarpTerminal
-        | TerminalName::Kitty
-        | TerminalName::Konsole
-        | TerminalName::GnomeTerminal
-        | TerminalName::Vte
-        | TerminalName::Dumb
-        | TerminalName::Unknown => DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS,
+        TerminalName::WarpTerminal | TerminalName::Dumb | TerminalName::Unknown => {
+            DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_terminal_detection::Multiplexer;
 
     fn test_terminal(name: TerminalName) -> TerminalInfo {
         TerminalInfo {
@@ -86,7 +78,6 @@ mod tests {
             term_program: None,
             version: None,
             term: None,
-            multiplexer: None,
         }
     }
 
@@ -101,7 +92,7 @@ mod tests {
             (TerminalName::WezTerm, WEZTERM_RESIZE_REFLOW_MAX_ROWS),
             (TerminalName::Alacritty, ALACRITTY_RESIZE_REFLOW_MAX_ROWS),
             (
-                TerminalName::Ghostty,
+                TerminalName::WarpTerminal,
                 DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS,
             ),
             (
@@ -163,13 +154,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_terminal_uses_fallback_even_under_multiplexer() {
+    fn unknown_terminal_uses_fallback() {
         let terminal = TerminalInfo {
             name: TerminalName::Unknown,
             term_program: None,
             version: None,
             term: Some("xterm-256color".to_string()),
-            multiplexer: Some(Multiplexer::Tmux { version: None }),
         };
         let config = TerminalResizeReflowConfig::default();
 

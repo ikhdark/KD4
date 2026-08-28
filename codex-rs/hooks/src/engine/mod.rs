@@ -12,6 +12,7 @@ use crate::events::interrupt::InterruptRequest;
 use crate::events::permission_request::PermissionRequestOutcome;
 use crate::events::permission_request::PermissionRequestRequest;
 use crate::events::post_tool_use::PostToolUseOutcome;
+use crate::events::post_tool_use::PostToolUsePlan;
 use crate::events::post_tool_use::PostToolUseRequest;
 use crate::events::pre_tool_use::PreToolUseOutcome;
 use crate::events::pre_tool_use::PreToolUseRequest;
@@ -140,6 +141,12 @@ impl ClaudeHooksEngine {
         &self.warnings
     }
 
+    pub(crate) fn has_handler_for(&self, event_name: HookEventName) -> bool {
+        self.handlers
+            .iter()
+            .any(|handler| handler.event_name == event_name)
+    }
+
     pub(crate) fn preview_session_start(
         &self,
         request: &SessionStartRequest,
@@ -162,7 +169,24 @@ impl ClaudeHooksEngine {
         &self,
         request: &PostToolUseRequest,
     ) -> Vec<HookRunSummary> {
-        crate::events::post_tool_use::preview(&self.handlers, request)
+        let plan = self.plan_post_tool_use(&request.tool_name, &request.matcher_aliases);
+        self.preview_planned_post_tool_use(&plan, &request.tool_use_id)
+    }
+
+    pub(crate) fn plan_post_tool_use(
+        &self,
+        tool_name: &str,
+        matcher_aliases: &[String],
+    ) -> PostToolUsePlan {
+        crate::events::post_tool_use::plan(&self.handlers, tool_name, matcher_aliases)
+    }
+
+    pub(crate) fn preview_planned_post_tool_use(
+        &self,
+        plan: &PostToolUsePlan,
+        tool_use_id: &str,
+    ) -> Vec<HookRunSummary> {
+        crate::events::post_tool_use::preview(plan, tool_use_id)
     }
 
     pub(crate) async fn run_session_start(
@@ -200,9 +224,17 @@ impl ClaudeHooksEngine {
         &self,
         request: PostToolUseRequest,
     ) -> PostToolUseOutcome {
+        let plan = self.plan_post_tool_use(&request.tool_name, &request.matcher_aliases);
+        self.run_planned_post_tool_use(plan, request).await
+    }
+
+    pub(crate) async fn run_planned_post_tool_use(
+        &self,
+        plan: PostToolUsePlan,
+        request: PostToolUseRequest,
+    ) -> PostToolUseOutcome {
         let session_id = request.session_id;
-        let mut outcome =
-            crate::events::post_tool_use::run(&self.handlers, &self.shell, request).await;
+        let mut outcome = crate::events::post_tool_use::run(plan, &self.shell, request).await;
         outcome.additional_contexts = self
             .maybe_spill_texts(session_id, outcome.additional_contexts)
             .await;

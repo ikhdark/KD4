@@ -25,6 +25,7 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::TurnStatus;
 use codex_code_mode::CodeModeSessionProvider;
+use codex_code_mode::FallbackCodeModeSessionProvider;
 use codex_code_mode::InProcessCodeModeSessionProvider;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_config::types::WindowsSandboxModeToml;
@@ -90,7 +91,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::sync::OwnedRwLockReadGuard;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::OwnedMutexGuard;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tracing::instrument;
@@ -145,6 +147,20 @@ pub struct NewThread {
 pub struct ThreadSettingsReconstruction {
     pub fallback: PersistedThreadSettings,
     pub explicit_overrides: PersistedThreadSettingsOverrideMask,
+    /// Exact reduction already computed by a caller that needed the same settings to load config.
+    pub precomputed: Option<PersistedThreadSettings>,
+}
+
+fn resolve_persisted_thread_settings(
+    history: &InitialHistory,
+    reconstruction: &mut ThreadSettingsReconstruction,
+) -> PersistedThreadSettings {
+    reconstruction.precomputed.take().unwrap_or_else(|| {
+        reduce_persisted_thread_settings(
+            history.get_rollout_items(),
+            std::mem::take(&mut reconstruction.fallback),
+        )
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +224,7 @@ pub struct ThreadManager {
 pub struct ThreadCreatedThreadGuard {
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
-    _threads: OwnedRwLockReadGuard<HashMap<ThreadId, Arc<CodexThread>>>,
+    _thread_registry_lease: OwnedMutexGuard<()>,
 }
 
 impl ThreadCreatedThreadGuard {
@@ -285,10 +301,13 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
+    thread_registry_leases: std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<AsyncMutex<()>>>>,
     thread_created_tx: broadcast::Sender<ThreadId>,
     thread_created_instances: std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<CodexThread>>>,
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
+    models_manager_provider_id: String,
+    models_manager_provider: ModelProviderInfo,
     environment_manager: Arc<EnvironmentManager>,
     skills_service: Arc<SkillsService>,
     plugins_manager: Arc<PluginsManager>,
@@ -319,6 +338,20 @@ pub fn build_models_manager(
     )
 }
 
+fn models_manager_for_config(
+    shared_models_manager: &SharedModelsManager,
+    shared_provider_id: &str,
+    shared_provider: &ModelProviderInfo,
+    config: &Config,
+    auth_manager: Arc<AuthManager>,
+) -> SharedModelsManager {
+    if config.model_provider_id == shared_provider_id && config.model_provider == *shared_provider {
+        Arc::clone(shared_models_manager)
+    } else {
+        build_models_manager(config, auth_manager)
+    }
+}
+
 pub fn thread_store_from_config(
     config: &Config,
     state_db: Option<StateDbHandle>,
@@ -343,8 +376,26 @@ pub fn thread_store_from_config(
 pub(crate) async fn rollback_created_thread_persistence(
     thread_store: &Arc<dyn ThreadStore>,
     thread_id: ThreadId,
-) {
-    let persistence_removed = match thread_store
+) -> bool {
+    if let Some(local_store) = thread_store.as_any().downcast_ref::<LocalThreadStore>() {
+        let staged_delete = match local_store.stage_thread_deletes(&[thread_id]).await {
+            Ok(staged_delete) => staged_delete,
+            Err(err) => {
+                warn!("failed to stage persistence for rolled-back thread {thread_id}: {err}");
+                return false;
+            }
+        };
+        if let Some(state_db) = local_store.state_db().await
+            && let Err(err) = state_db.delete_thread(thread_id).await
+        {
+            warn!("failed to remove state DB rows for rolled-back thread {thread_id}: {err}");
+            return false;
+        }
+        staged_delete.commit().await;
+        return true;
+    }
+
+    match thread_store
         .delete_thread(DeleteThreadParams { thread_id })
         .await
     {
@@ -353,19 +404,6 @@ pub(crate) async fn rollback_created_thread_persistence(
             warn!("failed to remove persistence for rolled-back thread {thread_id}: {err}");
             false
         }
-    };
-    if !persistence_removed {
-        return;
-    }
-
-    let Some(local_store) = thread_store.as_any().downcast_ref::<LocalThreadStore>() else {
-        return;
-    };
-    let Some(state_db) = local_store.state_db().await else {
-        return;
-    };
-    if let Err(err) = state_db.delete_thread(thread_id).await {
-        warn!("failed to remove state DB rows for rolled-back thread {thread_id}: {err}");
     }
 }
 
@@ -417,7 +455,6 @@ fn apply_reconstructed_settings_to_config(
     }
 
     let workspace_roots = if let Some(workspace_roots) = settings.workspace_roots.as_ref() {
-        config.workspace_roots_explicit = true;
         Some(workspace_roots.clone())
     } else if config.cwd != previous_cwd && config.workspace_roots.contains(&previous_cwd) {
         let mut retargeted = Vec::with_capacity(config.workspace_roots.len());
@@ -518,14 +555,24 @@ fn apply_reconstructed_settings_to_config(
 }
 
 fn remove_explicit_overrides_and_retarget_roots(
+    config: &mut Config,
     settings: &mut PersistedThreadSettings,
     mask: &PersistedThreadSettingsOverrideMask,
-    explicit_cwd: &AbsolutePathBuf,
-) {
+) -> CodexResult<()> {
+    let explicit_cwd = config.cwd.clone();
     let persisted_cwd = settings
         .environments
         .as_ref()
         .map(|environments| environments.legacy_fallback_cwd.clone());
+    if mask.model_provider_id
+        && !mask.model
+        && settings.model.is_some()
+        && settings.model_provider_id.as_deref() != Some(config.model_provider_id.as_str())
+    {
+        return Err(CodexErr::InvalidRequest(
+            "model must be supplied when changing model_provider on resume or fork".to_string(),
+        ));
+    }
     settings.remove_explicit_overrides(mask);
     if mask.environments
         && !mask.workspace_roots
@@ -540,6 +587,7 @@ fn remove_explicit_overrides_and_retarget_roots(
         let mut seen = HashSet::new();
         workspace_roots.retain(|root| seen.insert(root.clone()));
     }
+    Ok(())
 }
 
 /// Construct the default SQLite-backed agent graph store when local state is available.
@@ -587,15 +635,21 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                thread_registry_leases: std::sync::Mutex::new(HashMap::new()),
                 thread_created_tx,
                 thread_created_instances: std::sync::Mutex::new(HashMap::new()),
                 models_manager: build_models_manager(config, auth_manager.clone()),
+                models_manager_provider_id: config.model_provider_id.clone(),
+                models_manager_provider: config.model_provider.clone(),
                 environment_manager,
                 skills_service,
                 plugins_manager,
                 mcp_manager,
                 code_mode_session_provider: if config.features.enabled(Feature::CodeModeHost) {
-                    Arc::new(ProcessOwnedCodeModeSessionProvider::default())
+                    Arc::new(FallbackCodeModeSessionProvider::new(
+                        Arc::new(ProcessOwnedCodeModeSessionProvider::default()),
+                        Arc::new(InProcessCodeModeSessionProvider),
+                    ))
                 } else {
                     Arc::new(InProcessCodeModeSessionProvider)
                 },
@@ -620,9 +674,12 @@ impl ThreadManager {
         let Some(state) = Arc::get_mut(&mut self.state) else {
             unreachable!("new thread manager state should not be shared");
         };
-        state.code_mode_session_provider = Arc::new(
-            ProcessOwnedCodeModeSessionProvider::with_host_program(host_program),
-        );
+        state.code_mode_session_provider = Arc::new(FallbackCodeModeSessionProvider::new(
+            Arc::new(ProcessOwnedCodeModeSessionProvider::with_host_program(
+                host_program,
+            )),
+            Arc::new(InProcessCodeModeSessionProvider),
+        ));
         self
     }
 
@@ -707,8 +764,11 @@ impl ThreadManager {
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
+                thread_registry_leases: std::sync::Mutex::new(HashMap::new()),
                 thread_created_tx,
                 thread_created_instances: std::sync::Mutex::new(HashMap::new()),
+                models_manager_provider_id: OPENAI_PROVIDER_ID.to_string(),
+                models_manager_provider: provider.clone(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
                     .models_manager(
                         OPENAI_PROVIDER_ID,
@@ -1181,17 +1241,15 @@ impl ThreadManager {
         auth_manager: Arc<AuthManager>,
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
-        reconstruction: ThreadSettingsReconstruction,
+        mut reconstruction: ThreadSettingsReconstruction,
     ) -> CodexResult<NewThread> {
-        let mut persisted_settings = reduce_persisted_thread_settings(
-            initial_history.get_rollout_items(),
-            reconstruction.fallback,
-        );
+        let mut persisted_settings =
+            resolve_persisted_thread_settings(&initial_history, &mut reconstruction);
         remove_explicit_overrides_and_retarget_roots(
+            &mut config,
             &mut persisted_settings,
             &reconstruction.explicit_overrides,
-            &config.cwd,
-        );
+        )?;
         apply_reconstructed_settings_to_config(&mut config, &persisted_settings)?;
         let environments = persisted_settings
             .environments
@@ -1364,8 +1422,7 @@ impl ThreadManager {
         if let Err(err) = expected_thread.shutdown_and_wait().await {
             warn!("failed to shut down rolled-back thread {thread_id}: {err}");
         }
-        rollback_created_thread_persistence(&self.state.thread_store, thread_id).await;
-        true
+        rollback_created_thread_persistence(&self.state.thread_store, thread_id).await
     }
 
     /// Roll back a resumed thread that failed before its creator could publish
@@ -1423,9 +1480,8 @@ impl ThreadManager {
             }
         }
 
-        let mut tracked_threads = self.state.threads.write().await;
         for thread_id in &report.completed {
-            tracked_threads.remove(thread_id);
+            self.state.remove_thread(thread_id).await;
         }
 
         report
@@ -1550,7 +1606,7 @@ impl ThreadManager {
         thread_source: Option<ThreadSource>,
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
-        reconstruction: ThreadSettingsReconstruction,
+        mut reconstruction: ThreadSettingsReconstruction,
     ) -> CodexResult<NewThread> {
         // `forked_from_id()` describes this history's existing lineage. When
         // forking a resumed thread, the child copies the resumed thread itself.
@@ -1574,12 +1630,12 @@ impl ThreadManager {
         let history = fork_history_from_snapshot(snapshot, history, interrupted_marker);
         let mut config = config;
         let mut persisted_settings =
-            reduce_persisted_thread_settings(history.get_rollout_items(), reconstruction.fallback);
+            resolve_persisted_thread_settings(&history, &mut reconstruction);
         remove_explicit_overrides_and_retarget_roots(
+            &mut config,
             &mut persisted_settings,
             &reconstruction.explicit_overrides,
-            &config.cwd,
-        );
+        )?;
         apply_reconstructed_settings_to_config(&mut config, &persisted_settings)?;
         let environments = persisted_settings
             .environments
@@ -1727,6 +1783,7 @@ impl ThreadManagerState {
 
     /// Remove a thread from the manager by ID, returning it when present.
     pub(crate) async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
+        let _thread_registry_lease = self.acquire_thread_registry_lease(*thread_id).await;
         let removed = self.threads.write().await.remove(thread_id);
         if let Some(thread) = removed.as_ref() {
             self.forget_thread_created_instance_if_same(thread_id, thread);
@@ -1740,6 +1797,7 @@ impl ThreadManagerState {
         thread_id: &ThreadId,
         expected_thread: &Arc<CodexThread>,
     ) -> bool {
+        let _thread_registry_lease = self.acquire_thread_registry_lease(*thread_id).await;
         let mut threads = self.threads.write().await;
         if !threads
             .get(thread_id)
@@ -1773,8 +1831,8 @@ impl ThreadManagerState {
         &self,
         thread_id: ThreadId,
     ) -> Option<ThreadCreatedThreadGuard> {
-        let threads = Arc::clone(&self.threads).read_owned().await;
-        let loaded_thread = Arc::clone(threads.get(&thread_id)?);
+        let thread_registry_lease = self.acquire_thread_registry_lease(thread_id).await;
+        let loaded_thread = Arc::clone(self.threads.read().await.get(&thread_id)?);
         let created_instances = self
             .thread_created_instances
             .lock()
@@ -1787,8 +1845,27 @@ impl ThreadManagerState {
         Some(ThreadCreatedThreadGuard {
             thread_id,
             thread: notified_thread,
-            _threads: threads,
+            _thread_registry_lease: thread_registry_lease,
         })
+    }
+
+    async fn acquire_thread_registry_lease(&self, thread_id: ThreadId) -> OwnedMutexGuard<()> {
+        let thread_registry_lease = {
+            let mut leases = self
+                .thread_registry_leases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            leases.retain(|_, lease| lease.strong_count() > 0);
+            leases
+                .get(&thread_id)
+                .and_then(std::sync::Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let lease = Arc::new(AsyncMutex::new(()));
+                    leases.insert(thread_id, Arc::downgrade(&lease));
+                    lease
+                })
+        };
+        thread_registry_lease.lock_owned().await
     }
 
     fn forget_thread_created_instance_if_same(
@@ -2176,6 +2253,9 @@ impl ThreadManagerState {
         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
         let rollback_persistence_on_finalize_error = !is_resumed_thread && !config.ephemeral;
         if let InitialHistory::Resumed(resumed) = &initial_history {
+            let _thread_registry_lease = self
+                .acquire_thread_registry_lease(resumed.conversation_id)
+                .await;
             let mut threads = self.threads.write().await;
             if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
                 if thread.is_running() {
@@ -2221,6 +2301,13 @@ impl ThreadManagerState {
                 forked_from_thread_id,
             )
             .await;
+        let models_manager = models_manager_for_config(
+            &self.models_manager,
+            &self.models_manager_provider_id,
+            &self.models_manager_provider,
+            &config,
+            Arc::clone(&auth_manager),
+        );
         let CodexSpawnOk {
             codex, thread_id, ..
         } = Box::pin(Codex::spawn(CodexSpawnArgs {
@@ -2229,7 +2316,7 @@ impl ThreadManagerState {
             user_instructions,
             installation_id: self.installation_id.clone(),
             auth_manager,
-            models_manager: Arc::clone(&self.models_manager),
+            models_manager,
             environment_manager: Arc::clone(&self.environment_manager),
             skills_service: Arc::clone(&self.skills_service),
             plugins_manager: Arc::clone(&self.plugins_manager),
@@ -2311,6 +2398,7 @@ impl ThreadManagerState {
         };
 
         {
+            let _thread_registry_lease = self.acquire_thread_registry_lease(thread_id).await;
             let mut threads = self.threads.write().await;
             if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
                 let thread = Arc::new(CodexThread::new(
@@ -2342,6 +2430,7 @@ impl ThreadManagerState {
         thread_id: ThreadId,
         thread: &Arc<CodexThread>,
     ) {
+        let _thread_registry_lease = self.acquire_thread_registry_lease(thread_id).await;
         let threads = self.threads.read().await;
         if !threads
             .get(&thread_id)

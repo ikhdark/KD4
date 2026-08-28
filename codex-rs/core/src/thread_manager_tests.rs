@@ -40,6 +40,30 @@ use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+#[test]
+fn precomputed_thread_settings_bypass_a_second_history_reduction() {
+    let mut reconstruction = ThreadSettingsReconstruction {
+        fallback: PersistedThreadSettings {
+            model: Some("fallback-model".to_string()),
+            ..Default::default()
+        },
+        precomputed: Some(PersistedThreadSettings {
+            model: Some("precomputed-model".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let resolved = resolve_persisted_thread_settings(&InitialHistory::New, &mut reconstruction);
+
+    assert_eq!(resolved.model.as_deref(), Some("precomputed-model"));
+    assert_eq!(
+        reconstruction.fallback.model.as_deref(),
+        Some("fallback-model")
+    );
+    assert!(reconstruction.precomputed.is_none());
+}
+
 fn run_thread_manager_test_with_stack<F, Fut>(test_name: &'static str, test: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -428,6 +452,69 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
 }
 
 #[tokio::test]
+async fn thread_created_guard_only_blocks_replacement_of_the_guarded_thread() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let guarded = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start guarded thread");
+    let unrelated = manager
+        .start_thread(config)
+        .await
+        .expect("start unrelated thread");
+    manager
+        .state
+        .notify_thread_created(guarded.thread_id, &guarded.thread)
+        .await;
+
+    let guard = manager
+        .acquire_thread_created_thread(guarded.thread_id)
+        .await
+        .expect("acquire notified thread");
+    let removed_unrelated = tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.remove_thread(&unrelated.thread_id),
+    )
+    .await
+    .expect("unrelated removal must not wait for another thread's guard");
+    assert!(removed_unrelated.is_some());
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            manager.remove_thread(&guarded.thread_id),
+        )
+        .await
+        .is_err(),
+        "guarded thread removal must wait for its own guard"
+    );
+    drop(guard);
+    assert!(manager.remove_thread(&guarded.thread_id).await.is_some());
+
+    guarded
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown guarded thread");
+    unrelated
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown unrelated thread");
+}
+
+#[tokio::test]
 async fn code_mode_session_provider_is_shared_across_threads() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
@@ -483,6 +570,83 @@ async fn code_mode_session_provider_is_shared_across_threads() {
             timed_out: Vec::new(),
         }
     );
+}
+
+#[tokio::test]
+async fn provider_override_builds_a_provider_specific_models_manager() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.model = Some("startup-model".to_string());
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let startup = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start startup-provider thread");
+
+    let mut override_config = config;
+    override_config.model_provider_id = "override-provider".to_string();
+    override_config.model_provider.name = "Override provider".to_string();
+    override_config.model_provider.base_url = Some("http://127.0.0.1:9/v1".to_string());
+    override_config.model = Some("override-model".to_string());
+    let overridden = manager
+        .start_thread(override_config)
+        .await
+        .expect("start override-provider thread");
+
+    let startup_models_manager = &startup.thread.codex.session.services.models_manager;
+    let overridden_models_manager = &overridden.thread.codex.session.services.models_manager;
+    assert!(Arc::ptr_eq(
+        startup_models_manager,
+        &manager.state.models_manager
+    ));
+    assert!(!Arc::ptr_eq(
+        overridden_models_manager,
+        &manager.state.models_manager
+    ));
+
+    startup
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown startup-provider thread");
+    overridden
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown override-provider thread");
+}
+
+#[tokio::test]
+async fn cross_provider_reconstruction_requires_an_explicit_model() {
+    let mut config = test_config().await;
+    config.model_provider_id = "new-provider".to_string();
+    let mut settings = PersistedThreadSettings {
+        model: Some("persisted-model".to_string()),
+        model_provider_id: Some("old-provider".to_string()),
+        ..Default::default()
+    };
+    let mask = PersistedThreadSettingsOverrideMask {
+        model_provider_id: true,
+        ..Default::default()
+    };
+
+    let err = remove_explicit_overrides_and_retarget_roots(&mut config, &mut settings, &mask)
+        .expect_err("provider-only cross-provider reconstruction should fail");
+
+    assert!(matches!(
+        err,
+        CodexErr::InvalidRequest(message)
+            if message.contains("model must be supplied")
+    ));
 }
 
 #[tokio::test]
@@ -1321,6 +1485,31 @@ async fn rollback_thread_spawn_removes_exact_thread_and_persistence() {
 
     let calls = in_memory_store.calls().await;
     assert_eq!(calls.delete_thread, 1);
+}
+
+#[tokio::test]
+async fn rollback_created_thread_persistence_restores_rollout_when_state_delete_fails() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let state_db = init_state_db(&config).await.expect("state db");
+    let thread_store = thread_store_from_config(&config, Some(state_db.clone()));
+    let thread_id = ThreadId::new();
+    let rollout_dir = config.codex_home.join("sessions/2025/01/03");
+    std::fs::create_dir_all(&rollout_dir).expect("create rollout directory");
+    let rollout_path = rollout_dir.join(format!("rollout-2025-01-03T15-00-00-{thread_id}.jsonl"));
+    std::fs::write(&rollout_path, "").expect("write rollout");
+
+    state_db.close().await;
+
+    assert!(!rollback_created_thread_persistence(&thread_store, thread_id).await);
+    assert!(
+        rollout_path.exists(),
+        "failed state deletion must restore the staged rollout"
+    );
 }
 
 #[tokio::test]

@@ -26,6 +26,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_thread_store::CreateThreadParams;
 use codex_thread_store::InMemoryThreadStore;
+use codex_thread_store::ResumeThreadParams;
 use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -117,7 +118,7 @@ async fn get_conversation_summary_by_thread_id_reads_rollout() -> Result<()> {
 }
 
 #[tokio::test]
-async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> Result<()> {
+async fn get_conversation_summary_reads_configured_in_memory_store() -> Result<()> {
     let codex_home = TempDir::new()?;
     let store_id = Uuid::new_v4().to_string();
     create_config_toml_with_in_memory_thread_store(codex_home.path(), &store_id)?;
@@ -201,6 +202,36 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
     assert_eq!(summary.path, PathBuf::new());
     assert_eq!(summary.cwd, PathBuf::new());
     assert_eq!(summary.model_provider, "test");
+
+    let rollout_path = codex_home.path().join("in-memory-rollout.jsonl");
+    store
+        .resume_thread(ResumeThreadParams {
+            thread_id,
+            rollout_path: Some(rollout_path.clone()),
+            history: None,
+            include_archived: false,
+            metadata: ThreadPersistenceMetadata {
+                cwd: None,
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Disabled,
+            },
+        })
+        .await?;
+
+    let result = client
+        .sender()
+        .request(ClientRequest::GetConversationSummary {
+            request_id: RequestId::Integer(2),
+            params: GetConversationSummaryParams::RolloutPath {
+                rollout_path: rollout_path.clone(),
+            },
+        })
+        .await?
+        .expect("getConversationSummary by rollout path should succeed");
+    let GetConversationSummaryResponse { summary } = serde_json::from_value(result)?;
+
+    assert_eq!(summary.conversation_id, thread_id);
+    assert_eq!(summary.path, rollout_path);
 
     client.shutdown().await?;
     Ok(())

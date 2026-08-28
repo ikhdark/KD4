@@ -73,6 +73,57 @@ fn login_rejects_removed_api_key_argument() -> Result<()> {
 }
 
 #[test]
+fn tui_add_dir_rejection_precedes_state_database_initialization() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let additional_dir = TempDir::new()?;
+    let state_db_path = codex_home.path().join("state_5.sqlite");
+    let mut cmd = codex_command(codex_home.path())?;
+
+    cmd.env("CODEX_SQLITE_HOME", codex_home.path())
+        .env_remove("CODEX_EXEC_SERVER_URL")
+        .args(["--sandbox", "read-only", "--add-dir"])
+        .arg(additional_dir.path())
+        .assert()
+        .failure()
+        .stderr(contains("Error adding directories"));
+
+    assert!(
+        !state_db_path.exists(),
+        "add-dir rejection must not create the state database"
+    );
+    Ok(())
+}
+
+#[test]
+fn tui_login_restriction_precedes_state_database_initialization() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "cli_auth_credentials_store = \"file\"\nforced_login_method = \"chatgpt\"\n",
+    )?;
+    std::fs::write(
+        codex_home.path().join("auth.json"),
+        serde_json::to_vec(&json!({"OPENAI_API_KEY": "sk-test"}))?,
+    )?;
+    let state_db_path = codex_home.path().join("state_5.sqlite");
+    let mut cmd = codex_command(codex_home.path())?;
+
+    cmd.env("CODEX_SQLITE_HOME", codex_home.path())
+        .env_remove("CODEX_EXEC_SERVER_URL")
+        .env_remove("CODEX_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .assert()
+        .failure()
+        .stderr(contains("ChatGPT login is required"));
+
+    assert!(
+        !state_db_path.exists(),
+        "login restriction must not create the state database"
+    );
+    Ok(())
+}
+
+#[test]
 fn login_with_access_token_rejects_invalid_jwt() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_file_auth_config(codex_home.path())?;

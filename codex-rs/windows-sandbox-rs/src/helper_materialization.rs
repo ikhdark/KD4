@@ -203,8 +203,14 @@ pub(crate) fn copy_helper_if_needed(
 
 fn cached_helper_path(cache_key: &str) -> Option<PathBuf> {
     let cache = HELPER_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let guard = cache.lock().ok()?;
-    guard.get(cache_key).cloned()
+    let mut guard = cache.lock().ok()?;
+    let path = guard.get(cache_key)?.clone();
+    if path.is_file() {
+        Some(path)
+    } else {
+        guard.remove(cache_key);
+        None
+    }
 }
 
 fn store_helper_path(cache_key: String, path: PathBuf) {
@@ -400,6 +406,7 @@ mod tests {
     use super::HelperMaterializationStatus;
     use super::RESOURCES_DIRNAME;
     use super::bundled_executable_path_for_exe;
+    use super::cached_helper_path;
     use super::copy_from_source_if_needed;
     use super::destination_is_fresh;
     use super::dev_build_suffix;
@@ -407,6 +414,7 @@ mod tests {
     use super::helper_version_suffix;
     use super::materialized_file_name;
     use super::resolve_exe_for_launch_with_status;
+    use super::store_helper_path;
     use pretty_assertions::assert_eq;
     use std::fs;
     use std::path::Path;
@@ -461,6 +469,20 @@ mod tests {
             b"runner-v1".as_slice(),
             fs::read(&destination).expect("read destination")
         );
+    }
+
+    #[test]
+    fn deleted_cached_helper_path_is_invalidated() {
+        let tmp = TempDir::new().expect("tempdir");
+        let helper = tmp.path().join("cached-helper.exe");
+        let cache_key = format!("deleted-helper|{}", tmp.path().display());
+        fs::write(&helper, b"runner-v1").expect("write helper");
+        store_helper_path(cache_key.clone(), helper.clone());
+        assert_eq!(cached_helper_path(&cache_key), Some(helper.clone()));
+
+        fs::remove_file(&helper).expect("delete cached helper");
+
+        assert_eq!(cached_helper_path(&cache_key), None);
     }
 
     #[test]

@@ -12,12 +12,50 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+#[cfg(test)]
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::RolloutItem;
 
+#[cfg(test)]
 pub(crate) fn initial_history_has_prior_user_turns(conversation_history: &InitialHistory) -> bool {
-    conversation_history.scan_rollout_items(rollout_item_is_user_turn_boundary)
+    let items = conversation_history.get_rollout_items();
+    let mut tracker = PriorUserTurnTracker::default();
+    for (idx, item) in items.iter().enumerate() {
+        tracker.observe(items, idx, item);
+    }
+    tracker.has_prior_user_turns()
+}
+
+#[derive(Default)]
+pub(crate) struct PriorUserTurnTracker {
+    rollback_turn_positions: Vec<usize>,
+    user_turn_positions: Vec<usize>,
+}
+
+impl PriorUserTurnTracker {
+    pub(crate) fn observe(&mut self, items: &[RolloutItem], idx: usize, item: &RolloutItem) {
+        if is_rollback_instruction_turn_boundary(items, idx, item) {
+            self.rollback_turn_positions.push(idx);
+        }
+        if rollout_item_is_user_turn_boundary(item) {
+            self.user_turn_positions.push(idx);
+        }
+        if let RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) = item {
+            let num_turns = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
+            if let Some(rollback_start_idx) = apply_rollback_to_instruction_turn_positions(
+                &mut self.rollback_turn_positions,
+                num_turns,
+            ) {
+                self.user_turn_positions
+                    .retain(|position| *position < rollback_start_idx);
+            }
+        }
+    }
+
+    pub(crate) fn has_prior_user_turns(&self) -> bool {
+        !self.user_turn_positions.is_empty()
+    }
 }
 
 fn rollout_item_is_user_turn_boundary(item: &RolloutItem) -> bool {

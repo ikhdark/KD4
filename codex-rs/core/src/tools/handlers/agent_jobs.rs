@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use tokio::sync::watch::Receiver;
 use tokio::time::Duration;
 use tokio::time::Instant;
@@ -45,6 +46,7 @@ const DEFAULT_AGENT_JOB_CONCURRENCY: usize = 16;
 const MAX_AGENT_JOB_CONCURRENCY: usize = 64;
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_AGENT_JOB_ITEM_TIMEOUT: Duration = Duration::from_secs(60 * 30);
+const ORPHANED_AGENT_JOB_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const PARENT_TOOL_CANCELLATION_REASON: &str = "cancelled by parent tool request";
 const MAX_SCHEMA_VALIDATION_ERRORS: usize = 5;
 const AGENT_JOB_OUTPUT_COLUMNS: [&str; 10] = [
@@ -59,6 +61,8 @@ const AGENT_JOB_OUTPUT_COLUMNS: [&str; 10] = [
     "reported_at",
     "completed_at",
 ];
+static ACTIVE_AGENT_JOB_RECONCILERS: LazyLock<std::sync::Mutex<HashSet<String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
 #[derive(Debug, Deserialize)]
 struct SpawnAgentsOnCsvArgs {
@@ -143,8 +147,7 @@ async fn build_runner_options(
         ));
     }
     let max_concurrency = normalize_concurrency(requested_concurrency, agent_max_threads);
-    let base_instructions = session.get_base_instructions().await;
-    let mut spawn_config = build_agent_spawn_config(&base_instructions, turn.as_ref())?;
+    let mut spawn_config = build_agent_spawn_config(turn.as_ref())?;
     apply_spawn_agent_model_defaults_and_overrides(
         session,
         turn.as_ref(),
@@ -550,6 +553,60 @@ async fn export_job_csv_snapshot(
     let output_path = PathBuf::from(job.output_csv_path.clone());
     write_job_csv_atomically(output_path, csv_content).await?;
     Ok(())
+}
+
+pub(crate) async fn reconcile_orphaned_agent_jobs_after_restart(
+    db: Arc<codex_state::StateRuntime>,
+) -> anyhow::Result<()> {
+    let jobs = db.reconcile_orphaned_agent_jobs_after_restart().await?;
+    let mut export_errors = Vec::new();
+    for job in jobs {
+        if let Err(error) = export_job_csv_snapshot(db.clone(), &job).await {
+            export_errors.push(format!("{}: {error}", job.id));
+        }
+    }
+    if export_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "failed to export reconciled agent job snapshots: {}",
+            export_errors.join("; ")
+        ))
+    }
+}
+
+pub(crate) fn start_orphaned_agent_job_reconciler(db: Arc<codex_state::StateRuntime>) {
+    let runner_instance_id = db.agent_job_runner_instance_id().to_string();
+    {
+        let mut active = ACTIVE_AGENT_JOB_RECONCILERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !active.insert(runner_instance_id.clone()) {
+            return;
+        }
+    }
+    let weak_db = Arc::downgrade(&db);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(ORPHANED_AGENT_JOB_RECONCILIATION_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Some(db) = weak_db.upgrade() else {
+                break;
+            };
+            if db.is_closed() {
+                break;
+            }
+            if let Err(error) = reconcile_orphaned_agent_jobs_after_restart(db).await {
+                tracing::warn!(%error, "failed to reconcile expired agent job runner leases");
+            }
+        }
+        ACTIVE_AGENT_JOB_RECONCILERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(runner_instance_id.as_str());
+    });
 }
 
 async fn write_job_csv_atomically(output_path: PathBuf, csv_content: String) -> anyhow::Result<()> {

@@ -29,6 +29,7 @@ use crate::tools::MCP_TOOLS_CACHE_WRITE_DURATION_METRIC;
 use crate::tools::ToolInfo;
 
 const MCP_TOOLS_CACHE_PUBLISH_DURATION_METRIC: &str = "codex.mcp.tools.cache_publish.duration_ms";
+const CODEX_APPS_TOOLS_CACHE_CAPACITY: usize = 32;
 pub(crate) const DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU: &str = "codex";
 
 /// Everything that identifies a Codex Apps catalog.
@@ -67,7 +68,53 @@ pub fn codex_apps_tools_cache_key(
 /// catalog. New entries may seed from disk; live entries read from memory only.
 #[derive(Clone, Default)]
 pub struct CodexAppsToolsCache {
-    entries: Arc<Mutex<HashMap<CodexAppsToolsCacheIdentity, Arc<CodexAppsToolsCacheEntry>>>>,
+    entries: Arc<Mutex<CodexAppsToolsCacheEntries>>,
+}
+
+#[derive(Default)]
+struct CodexAppsToolsCacheEntries {
+    by_identity: HashMap<CodexAppsToolsCacheIdentity, RetainedCodexAppsToolsCacheEntry>,
+    next_access: u64,
+}
+
+struct RetainedCodexAppsToolsCacheEntry {
+    entry: Arc<CodexAppsToolsCacheEntry>,
+    last_access: u64,
+}
+
+impl CodexAppsToolsCacheEntries {
+    fn context_entry(
+        &mut self,
+        identity: CodexAppsToolsCacheIdentity,
+    ) -> Arc<CodexAppsToolsCacheEntry> {
+        self.next_access = self.next_access.saturating_add(1);
+        let last_access = self.next_access;
+        let retained = self.by_identity.entry(identity.clone()).or_insert_with(|| {
+            RetainedCodexAppsToolsCacheEntry {
+                entry: Arc::new(CodexAppsToolsCacheEntry::new(identity)),
+                last_access,
+            }
+        });
+        retained.last_access = last_access;
+        let entry = Arc::clone(&retained.entry);
+        self.prune_idle_entries();
+        entry
+    }
+
+    fn prune_idle_entries(&mut self) {
+        while self.by_identity.len() > CODEX_APPS_TOOLS_CACHE_CAPACITY {
+            let Some(identity) = self
+                .by_identity
+                .iter()
+                .filter(|(_, retained)| Arc::strong_count(&retained.entry) == 1)
+                .min_by_key(|(_, retained)| retained.last_access)
+                .map(|(identity, _)| identity.clone())
+            else {
+                break;
+            };
+            self.by_identity.remove(&identity);
+        }
+    }
 }
 
 static SHARED_CODEX_APPS_TOOLS_CACHE: LazyLock<CodexAppsToolsCache> =
@@ -229,11 +276,7 @@ impl CodexAppsToolsCache {
             codex_home,
             auth_key,
         };
-        let mut entries = lock_unpoisoned(&self.entries);
-        let entry = entries
-            .entry(identity.clone())
-            .or_insert_with(|| Arc::new(CodexAppsToolsCacheEntry::new(identity)))
-            .clone();
+        let entry = lock_unpoisoned(&self.entries).context_entry(identity);
         CodexAppsToolsCacheContext { entry }
     }
 }

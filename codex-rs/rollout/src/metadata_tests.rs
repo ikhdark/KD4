@@ -16,6 +16,7 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::UserMessageEvent;
 use codex_state::BackfillStatus;
 use codex_state::ThreadMetadataBuilder;
 use pretty_assertions::assert_eq;
@@ -90,6 +91,61 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
     assert_eq!(outcome.parent_thread_id, Some(parent_thread_id));
     assert_eq!(outcome.memory_mode, None);
     assert_eq!(outcome.parse_errors, 0);
+}
+
+#[tokio::test]
+async fn listing_pass_supplies_reconciliation_extraction_without_reopening_rollout() {
+    let dir = tempdir().expect("tempdir");
+    let uuid = Uuid::new_v4();
+    let id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = dir
+        .path()
+        .join(format!("rollout-2026-01-27T12-34-56-{uuid}.jsonl"));
+    let lines = [
+        RolloutLine {
+            timestamp: "2026-01-27T12:34:56Z".to_string(),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    session_id: id.into(),
+                    id,
+                    timestamp: "2026-01-27T12:34:56Z".to_string(),
+                    cwd: dir.path().to_path_buf(),
+                    originator: "cli".to_string(),
+                    cli_version: "0.0.0".to_string(),
+                    ..SessionMeta::default()
+                },
+                git: None,
+            }),
+        },
+        RolloutLine {
+            timestamp: "2026-01-27T12:35:00Z".to_string(),
+            item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "listing preview".to_string(),
+                ..Default::default()
+            })),
+        },
+    ];
+    let mut file = File::create(&path).expect("create rollout");
+    for line in lines {
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&line).expect("rollout json")
+        )
+        .expect("write rollout");
+    }
+    drop(file);
+
+    let item = crate::list::read_thread_item_from_rollout(path.clone())
+        .await
+        .expect("listing item");
+    assert_eq!(item.thread_id, Some(id));
+
+    let (outcome, cache_hit) = extract_metadata_from_rollout_with_cache_status(&path, "")
+        .await
+        .expect("cached extraction");
+    assert!(cache_hit);
+    assert_eq!(outcome.metadata.id, id);
 }
 
 #[tokio::test]

@@ -28,16 +28,13 @@ pub(crate) fn legacy_compatible_permission_profile(
             AbsolutePathBuf::from_absolute_path(std::path::PathBuf::from(tmpdir)).ok()
         })
         .is_some_and(|tmpdir| file_system_policy.can_write_path_with_cwd(tmpdir.as_path(), cwd));
-    let slash_tmp = Path::new("/tmp");
-    let slash_tmp_writable = slash_tmp.is_absolute()
-        && slash_tmp.is_dir()
-        && file_system_policy.can_write_path_with_cwd(slash_tmp, cwd);
-
     PermissionProfile::workspace_write_with(
         &writable_roots,
         network_policy,
         !tmpdir_writable,
-        !slash_tmp_writable,
+        // The legacy slash-tmp bit remains on the wire, but has no Windows
+        // runtime meaning and must never add a writable POSIX path.
+        true,
     )
 }
 
@@ -54,8 +51,8 @@ mod tests {
 
     #[test]
     fn compatibility_profile_preserves_unbridgeable_write_roots() {
-        let cwd = AbsolutePathBuf::try_from("/workspace/project").expect("absolute cwd");
-        let extra_root = AbsolutePathBuf::try_from("/workspace/extra").expect("absolute root");
+        let cwd = AbsolutePathBuf::try_from(r"C:\workspace\project").expect("absolute cwd");
+        let extra_root = AbsolutePathBuf::try_from(r"C:\workspace\extra").expect("absolute root");
         let permission_profile: PermissionProfile = PermissionProfile::Managed {
             network: NetworkSandboxPolicy::Restricted,
             file_system: ManagedFileSystemPermissions::Restricted {

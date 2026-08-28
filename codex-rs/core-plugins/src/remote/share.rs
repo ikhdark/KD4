@@ -1,9 +1,10 @@
 use super::*;
 use crate::plugin_bundle_archive::PluginBundlePackError;
 use crate::plugin_bundle_archive::pack_plugin_bundle_tar_gz;
-use codex_http_client::RequestBuilder;
+use codex_http_client::RouteAwareClientPool;
+use codex_http_client::RouteAwareRequestBuilder;
 use codex_login::CodexAuth;
-use codex_login::default_client::create_client_without_request_logging;
+use codex_login::default_client::default_headers;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use http::Method;
 use http::StatusCode;
@@ -145,6 +146,28 @@ pub async fn save_remote_plugin_share(
     access_policy: RemotePluginShareAccessPolicy,
 ) -> Result<RemotePluginShareSaveResult, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
+    let client = &config.http_clients;
+    save_remote_plugin_share_with_client(
+        client,
+        config,
+        auth,
+        codex_home,
+        plugin_path,
+        remote_plugin_id,
+        access_policy,
+    )
+    .await
+}
+
+async fn save_remote_plugin_share_with_client(
+    client: &RouteAwareClientPool,
+    config: &RemotePluginServiceConfig,
+    auth: &CodexAuth,
+    codex_home: &Path,
+    plugin_path: &AbsolutePathBuf,
+    remote_plugin_id: Option<&str>,
+    access_policy: RemotePluginShareAccessPolicy,
+) -> Result<RemotePluginShareSaveResult, RemotePluginCatalogError> {
     let plugin_path_for_archive = plugin_path.as_path().to_path_buf();
     let (filename, archive_bytes) = tokio::task::spawn_blocking(move || {
         let filename = archive_filename(&plugin_path_for_archive)?;
@@ -154,6 +177,7 @@ pub async fn save_remote_plugin_share(
     .await
     .map_err(RemotePluginCatalogError::ArchiveJoin)??;
     let upload = create_workspace_plugin_upload(
+        client,
         config,
         auth,
         &filename,
@@ -164,11 +188,12 @@ pub async fn save_remote_plugin_share(
     let etag = upload
         .etag
         .ok_or(RemotePluginCatalogError::MissingUploadEtag)?;
-    put_workspace_plugin_upload(&upload.upload_url, archive_bytes).await?;
+    put_workspace_plugin_upload(client, &upload.upload_url, archive_bytes).await?;
     let share_targets = access_policy.share_targets;
     let share_targets =
         ensure_unlisted_workspace_target(auth, access_policy.discoverability, share_targets)?;
     let response = finalize_workspace_plugin_upload(
+        client,
         config,
         auth,
         remote_plugin_id,
@@ -209,17 +234,22 @@ pub async fn list_remote_plugin_shares(
     codex_home: &Path,
 ) -> Result<Vec<RemotePluginShareSummary>, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
-    let created_plugins = fetch_created_workspace_plugins(config, auth).await?;
+    let client = &config.http_clients;
+    let created_plugins = fetch_created_workspace_plugins(client, config, auth).await?;
     if created_plugins.is_empty() {
         return Ok(Vec::new());
     }
 
-    let installed_by_id =
-        fetch_installed_plugins_for_scope(config, auth, RemotePluginScope::Workspace)
-            .await?
-            .into_iter()
-            .map(|plugin| (plugin.plugin.id.clone(), plugin))
-            .collect::<BTreeMap<_, _>>();
+    let installed_by_id = fetch_installed_plugins_for_scope_with_client(
+        client,
+        config,
+        auth,
+        RemotePluginScope::Workspace,
+    )
+    .await?
+    .into_iter()
+    .map(|plugin| (plugin.plugin.id.clone(), plugin))
+    .collect::<BTreeMap<_, _>>();
     let local_plugin_paths =
         local_paths::load_plugin_share_local_paths(codex_home).map_err(|err| {
             RemotePluginCatalogError::UnexpectedResponse(format!(
@@ -282,7 +312,7 @@ pub async fn delete_remote_plugin_share(
         "{}/public/plugins/workspace/{remote_plugin_id}",
         config.chatgpt_base_url
     );
-    let client = create_client_without_request_logging()?;
+    let client = &config.http_clients;
     let request = authenticated_request(client.delete(&url), auth)?;
     send_and_expect_status(request, &url, &[StatusCode::NO_CONTENT]).await?;
     if let Err(err) = local_paths::remove_plugin_share_local_path(codex_home, remote_plugin_id) {
@@ -317,7 +347,7 @@ pub async fn update_remote_plugin_share_targets(
         "{}/ps/plugins/{remote_plugin_id}/shares",
         config.chatgpt_base_url
     );
-    let client = create_client_without_request_logging()?;
+    let client = &config.http_clients;
     let request = authenticated_request(client.request(Method::PUT, &url), auth)?.json(
         &RemotePluginShareUpdateTargetsRequest {
             discoverability,
@@ -359,6 +389,7 @@ fn ensure_unlisted_workspace_target(
 }
 
 async fn fetch_created_workspace_plugins(
+    client: &RouteAwareClientPool,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
 ) -> Result<Vec<RemotePluginDirectoryItem>, RemotePluginCatalogError> {
@@ -366,7 +397,7 @@ async fn fetch_created_workspace_plugins(
     let mut page_token = None;
     loop {
         let response =
-            get_created_workspace_plugins_page(config, auth, page_token.as_deref()).await?;
+            get_created_workspace_plugins_page(client, config, auth, page_token.as_deref()).await?;
         plugins.extend(response.plugins);
         let Some(next_page_token) = response.pagination.next_page_token else {
             break;
@@ -377,12 +408,12 @@ async fn fetch_created_workspace_plugins(
 }
 
 async fn get_created_workspace_plugins_page(
+    client: &RouteAwareClientPool,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
     page_token: Option<&str>,
 ) -> Result<RemotePluginListResponse, RemotePluginCatalogError> {
     let url = format!("{}/ps/plugins/workspace/created", config.chatgpt_base_url);
-    let client = create_client_without_request_logging()?;
     let mut request = authenticated_request(client.get(&url), auth)?;
     request = request.query(&[("limit", REMOTE_PLUGIN_LIST_PAGE_LIMIT)]);
     if let Some(page_token) = page_token {
@@ -392,6 +423,7 @@ async fn get_created_workspace_plugins_page(
 }
 
 async fn create_workspace_plugin_upload(
+    client: &RouteAwareClientPool,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
     filename: &str,
@@ -402,7 +434,6 @@ async fn create_workspace_plugin_upload(
         "{}/public/plugins/workspace/upload-url",
         config.chatgpt_base_url
     );
-    let client = create_client_without_request_logging()?;
     let request = authenticated_request(client.post(&url), auth)?.json(
         &RemoteWorkspacePluginUploadUrlRequest {
             filename,
@@ -415,12 +446,13 @@ async fn create_workspace_plugin_upload(
 }
 
 async fn put_workspace_plugin_upload(
+    client: &RouteAwareClientPool,
     upload_url: &str,
     archive_bytes: Vec<u8>,
 ) -> Result<(), RemotePluginCatalogError> {
-    let client = create_client_without_request_logging()?;
     let request = client
         .request(Method::PUT, upload_url)
+        .headers(default_headers())
         .timeout(REMOTE_PLUGIN_CATALOG_TIMEOUT)
         .header("x-ms-blob-type", "BlockBlob")
         .header("Content-Type", "application/gzip")
@@ -445,6 +477,7 @@ async fn put_workspace_plugin_upload(
 }
 
 async fn finalize_workspace_plugin_upload(
+    client: &RouteAwareClientPool,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
     remote_plugin_id: Option<&str>,
@@ -458,7 +491,6 @@ async fn finalize_workspace_plugin_upload(
     } else {
         format!("{}/public/plugins/workspace", config.chatgpt_base_url)
     };
-    let client = create_client_without_request_logging()?;
     let request = authenticated_request(client.post(&url), auth)?.json(&body);
     send_and_decode(request, &url).await
 }
@@ -497,7 +529,7 @@ fn archive_plugin_for_upload_with_limit(
 }
 
 async fn send_and_expect_status(
-    request: RequestBuilder,
+    request: RouteAwareRequestBuilder,
     url_for_error: &str,
     expected_statuses: &[StatusCode],
 ) -> Result<(), RemotePluginCatalogError> {

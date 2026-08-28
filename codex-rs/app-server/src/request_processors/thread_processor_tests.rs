@@ -53,6 +53,43 @@ fn thread_list_trusts_the_store_cwd_filter_contract() {
     assert!(!list_threads_common.contains("paths_match_after_normalization"));
 }
 
+#[test]
+fn forked_resume_moves_history_into_core_without_cloning_its_buffer() {
+    let items = vec![codex_protocol::protocol::RolloutItem::EventMsg(
+        codex_protocol::protocol::EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                client_id: None,
+                message: "forked history".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+                ..Default::default()
+            },
+        ),
+    )];
+    let original_buffer = items.as_ptr();
+
+    let (core_history, response_history, initial_page) = super::prepare_resume_response_history(
+        codex_protocol::protocol::InitialHistory::Forked(items),
+        /*include_turns*/ false,
+        /*initial_turns_page*/ None,
+    )
+    .expect("prepare forked resume history");
+
+    let codex_protocol::protocol::InitialHistory::Forked(core_items) = core_history else {
+        panic!("expected forked core history");
+    };
+    assert_eq!(core_items.as_ptr(), original_buffer);
+    assert!(initial_page.is_none());
+    match response_history {
+        super::ResumeResponseHistory::Forked { preview, turns, .. } => {
+            assert_eq!(preview, "forked history");
+            assert!(turns.is_none());
+        }
+        super::ResumeResponseHistory::Resumed(_) => panic!("expected forked response history"),
+    }
+}
+
 mod fork_config_snapshot_reuse_tests {
     use std::cell::Cell;
 
@@ -165,8 +202,10 @@ mod thread_list_cwd_filter_tests {
 
 mod background_terminal_pagination_tests {
     use super::super::paginate_background_terminals;
+    use super::super::thread_background_terminal_from_core;
     use codex_app_server_protocol::ThreadBackgroundTerminal;
     use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
 
     fn terminal(process_id: &str) -> ThreadBackgroundTerminal {
@@ -176,7 +215,8 @@ mod background_terminal_pagination_tests {
             item_id: format!("item-{process_id}"),
             process_id: process_id.to_string(),
             command: format!("command-{process_id}"),
-            cwd: AbsolutePathBuf::from_absolute_path(cwd).expect("absolute cwd"),
+            cwd: Some(AbsolutePathBuf::from_absolute_path(cwd).expect("absolute cwd")),
+            cwd_uri: PathUri::parse("file:///C:/tmp").expect("valid cwd URI"),
             os_pid: None,
             cpu_percent: None,
             rss_kb: None,
@@ -235,6 +275,28 @@ mod background_terminal_pagination_tests {
 
         assert_eq!(data, vec![terminal("2374420115")]);
         assert_eq!(next_cursor, Some("2374420115".to_string()));
+    }
+
+    #[test]
+    fn terminal_adapter_preserves_mixed_native_and_foreign_cwds() {
+        let native_cwd = AbsolutePathBuf::from_absolute_path(r"C:\tmp").expect("absolute cwd");
+        let native = thread_background_terminal_from_core(codex_core::BackgroundTerminalInfo {
+            item_id: "native".to_string(),
+            process_id: "1".to_string(),
+            command: "native-command".to_string(),
+            cwd: PathUri::from_abs_path(&native_cwd),
+        });
+        let foreign_uri = PathUri::parse("file:///home/remote/project").expect("foreign cwd URI");
+        let foreign = thread_background_terminal_from_core(codex_core::BackgroundTerminalInfo {
+            item_id: "foreign".to_string(),
+            process_id: "2".to_string(),
+            command: "foreign-command".to_string(),
+            cwd: foreign_uri.clone(),
+        });
+
+        assert_eq!(native.cwd, Some(native_cwd));
+        assert_eq!(foreign.cwd, None);
+        assert_eq!(foreign.cwd_uri, foreign_uri);
     }
 }
 
@@ -588,6 +650,85 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
+    fn resume_initial_page_paginates_the_already_reconstructed_turns() {
+        let make_turn = |id: &str| Turn {
+            id: id.to_string(),
+            items: vec![ThreadItem::UserMessage {
+                id: format!("{id}-message"),
+                client_id: None,
+                content: vec![V2UserInput::Text {
+                    text: id.to_string(),
+                    text_elements: Vec::new(),
+                }],
+            }],
+            items_view: TurnItemsView::Full,
+            error: None,
+            status: TurnStatus::Completed,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            completion: None,
+            timing: None,
+            surfaced_result: None,
+            reasoning_policy_history: None,
+        };
+        let turns = vec![
+            make_turn("turn-1"),
+            make_turn("turn-2"),
+            make_turn("turn-3"),
+        ];
+
+        let page = build_thread_resume_initial_turns_page(
+            &turns,
+            &ThreadResumeInitialTurnsPageParams {
+                limit: Some(2),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::NotLoaded),
+            },
+        )
+        .expect("initial page");
+
+        assert_eq!(
+            page.data
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-3", "turn-2"]
+        );
+        assert!(page.data.iter().all(|turn| turn.items.is_empty()));
+        assert!(page.next_cursor.is_some());
+    }
+
+    #[test]
+    fn resume_initial_page_still_reconstructs_when_full_turns_are_excluded() {
+        let items = vec![RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                client_id: None,
+                message: "persisted".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+                ..Default::default()
+            },
+        ))];
+
+        let page = build_thread_resume_initial_turns_page_from_history(
+            &items,
+            ThreadStatus::Idle,
+            /*has_live_running_thread*/ false,
+            /*active_turn*/ None,
+            &ThreadResumeInitialTurnsPageParams {
+                limit: Some(1),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::NotLoaded),
+            },
+        )
+        .expect("initial page");
+
+        assert_eq!(page.data.len(), 1);
+    }
+
+    #[test]
     fn validate_dynamic_tools_rejects_empty_namespace() {
         let tools = vec![dynamic_tool(
             Some(""),
@@ -743,11 +884,7 @@ mod thread_processor_behavior_tests {
             updated_at: updated_at.with_timezone(&Utc),
             recency_at: updated_at.with_timezone(&Utc),
             archived_at: None,
-            cwd: if cfg!(windows) {
-                PathBuf::from(r"\\?\C:\")
-            } else {
-                PathBuf::from("/tmp")
-            },
+            cwd: PathBuf::from(r"\\?\C:\"),
             cli_version: "0.0.0".to_string(),
             source: SessionSource::Cli,
             history_mode: Default::default(),
@@ -773,14 +910,7 @@ mod thread_processor_behavior_tests {
             summary.updated_at.as_deref(),
             Some("2025-01-02T03:04:06.789Z")
         );
-        assert_eq!(
-            summary.cwd,
-            if cfg!(windows) {
-                PathBuf::from(r"C:\")
-            } else {
-                PathBuf::from("/tmp")
-            }
-        );
+        assert_eq!(summary.cwd, PathBuf::from(r"C:\"));
     }
 
     #[test]
@@ -1022,6 +1152,7 @@ mod thread_processor_behavior_tests {
             approval_policy: None,
             approvals_reviewer: None,
             sandbox: None,
+            permission_profile: None,
             permissions: None,
             config: None,
             base_instructions: None,

@@ -31,6 +31,7 @@ from .v2_all import ItemGuardianApprovalReviewCompletedNotification
 from .v2_all import ItemGuardianApprovalReviewStartedNotification
 from .v2_all import ItemStartedNotification
 from .v2_all import McpServerOauthLoginCompletedNotification
+from .v2_all import McpServerStartupCompletedNotification
 from .v2_all import McpServerStatusUpdatedNotification
 from .v2_all import McpToolCallProgressNotification
 from .v2_all import ModelReroutedNotification
@@ -94,6 +95,7 @@ GeneratedNotificationPayload: TypeAlias = (
     | ItemGuardianApprovalReviewStartedNotification
     | ItemStartedNotification
     | McpServerOauthLoginCompletedNotification
+    | McpServerStartupCompletedNotification
     | McpServerStatusUpdatedNotification
     | McpToolCallProgressNotification
     | ModelReroutedNotification
@@ -164,6 +166,7 @@ NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "item/reasoning/textDelta": ReasoningTextDeltaNotification,
     "item/started": ItemStartedNotification,
     "mcpServer/oauthLogin/completed": McpServerOauthLoginCompletedNotification,
+    "mcpServer/startup/completed": McpServerStartupCompletedNotification,
     "mcpServer/startupStatus/updated": McpServerStatusUpdatedNotification,
     "model/rerouted": ModelReroutedNotification,
     "model/safetyBuffering/updated": ModelSafetyBufferingUpdatedNotification,

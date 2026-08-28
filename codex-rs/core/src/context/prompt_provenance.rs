@@ -151,6 +151,11 @@ pub(crate) struct PromptProvenanceSidecar {
 }
 
 impl PromptProvenanceSidecar {
+    #[cfg(test)]
+    pub(crate) fn shares_contributions_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.contributions_by_item, &other.contributions_by_item)
+    }
+
     pub(crate) fn from_assembled_items(
         items: &[ResponseItem],
         manifest: &StableContextManifest,
@@ -221,12 +226,28 @@ impl PromptProvenanceSidecar {
     /// Adds provenance for an exact fragment supplied by a built-in assembly
     /// site. This deliberately compares the already-rendered contribution and
     /// does not infer categories from markers or prompt prose.
+    #[cfg(test)]
     pub(crate) fn with_exact_fragment(
         &self,
         items: &[ResponseItem],
         fragment: &str,
         category: PromptContextCategory,
     ) -> Self {
+        self.with_exact_fragments(items, std::iter::once((fragment, category)))
+    }
+
+    /// Adds provenance for multiple built-in fragments in one history pass.
+    /// If assembly supplied the same text more than once, the last category
+    /// wins, matching repeated `with_exact_fragment` calls.
+    pub(crate) fn with_exact_fragments<'a>(
+        &self,
+        items: &[ResponseItem],
+        fragments: impl IntoIterator<Item = (&'a str, PromptContextCategory)>,
+    ) -> Self {
+        let fragments = fragments.into_iter().collect::<Vec<_>>();
+        if fragments.is_empty() {
+            return self.clone();
+        }
         let mut contributions_by_item = self.contributions_by_item.as_ref().clone();
         for item in items {
             let ResponseItem::Message { content, .. } = item else {
@@ -241,8 +262,15 @@ impl PromptProvenanceSidecar {
                 .unwrap_or_else(|| vec![None; content.len()]);
             let mut changed = false;
             for (index, content_item) in content.iter().enumerate() {
-                if matches!(content_item, ContentItem::InputText { text } if text == fragment) {
-                    categories[index] = Some(category);
+                let ContentItem::InputText { text } = content_item else {
+                    continue;
+                };
+                if let Some((_, category)) = fragments
+                    .iter()
+                    .rev()
+                    .find(|(fragment, _)| text.as_str() == *fragment)
+                {
+                    categories[index] = Some(*category);
                     changed = true;
                 }
             }
@@ -538,16 +566,17 @@ fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
             PromptContextCategory::EnvironmentPermissions
         }
         StableContextKind::Memory => PromptContextCategory::Memory,
-        StableContextKind::RootCoordinator | StableContextKind::MultiAgent => {
-            PromptContextCategory::AgentRole
-        }
+        StableContextKind::RootCoordinator
+        | StableContextKind::MultiAgent
+        | StableContextKind::MultiAgentUsageHint => PromptContextCategory::AgentRole,
         StableContextKind::RequestUserInput
         | StableContextKind::Wait
         | StableContextKind::DynamicHistory
         | StableContextKind::TaskModelGuidance
         | StableContextKind::TaskEvidence
         | StableContextKind::ModelSwitch
-        | StableContextKind::Personality => PromptContextCategory::OtherInjected,
+        | StableContextKind::Personality
+        | StableContextKind::DeveloperInstructions => PromptContextCategory::OtherInjected,
     }
 }
 
@@ -647,6 +676,33 @@ mod tests {
             .expect("breakdown should build");
 
         assert!(breakdown.bytes(PromptContextCategory::EnvironmentPermissions) > 0);
+        assert_eq!(breakdown.bytes(PromptContextCategory::History), 0);
+    }
+
+    #[test]
+    fn assembly_site_exact_fragments_classify_multiple_categories_together() {
+        let permissions = "opaque rendered permissions contribution";
+        let role = "opaque rendered role contribution";
+        let items = vec![
+            message("developer", permissions, Some("turn-2")),
+            message("developer", role, Some("turn-2")),
+        ];
+        let sidecar = PromptProvenanceSidecar::from_assembled_items(
+            &items,
+            &StableContextManifest::default(),
+        )
+        .with_exact_fragments(
+            &items,
+            [
+                (permissions, PromptContextCategory::EnvironmentPermissions),
+                (role, PromptContextCategory::AgentRole),
+            ],
+        );
+        let breakdown = PromptContextBreakdown::from_response_items(&items, &sidecar)
+            .expect("breakdown should build");
+
+        assert!(breakdown.bytes(PromptContextCategory::EnvironmentPermissions) > 0);
+        assert!(breakdown.bytes(PromptContextCategory::AgentRole) > 0);
         assert_eq!(breakdown.bytes(PromptContextCategory::History), 0);
     }
 }

@@ -211,7 +211,7 @@ async fn apply_metadata_update(
         .as_deref()
         .is_some_and(|path| rollout_path_is_archived(store.config.codex_home.as_path(), path));
     let state_db = store.state_db().await;
-    let sqlite_write_result: ThreadStoreResult<()> = if let Some(state_db) = state_db.as_ref() {
+    let sqlite_write_result = if let Some(state_db) = state_db.as_ref() {
         let patch = patch.clone();
         async {
             let existing =
@@ -348,6 +348,19 @@ async fn apply_metadata_update(
                             "failed to advance thread recency_at for {thread_id}: {err}"
                         ),
                     })?;
+                metadata = state_db
+                    .get_thread(thread_id)
+                    .await
+                    .map_err(|err| ThreadStoreError::Internal {
+                        message: format!(
+                            "failed to read advanced thread recency_at for {thread_id}: {err}"
+                        ),
+                    })?
+                    .ok_or_else(|| ThreadStoreError::Internal {
+                        message: format!(
+                            "thread metadata unavailable after advancing recency_at: {thread_id}"
+                        ),
+                    })?;
             }
             if let Some(memory_mode) = patch.memory_mode {
                 state_db
@@ -357,27 +370,39 @@ async fn apply_metadata_update(
                         message: format!("failed to update memory mode for {thread_id}: {err}"),
                     })?;
             }
-            Ok(())
+            Ok(Some(metadata))
         }
         .await
     } else {
-        Ok(())
+        Ok(None)
     };
-    match (state_db.is_some(), sqlite_write_result) {
-        (true, Ok(())) => {}
+    let updated_metadata = match (state_db.is_some(), sqlite_write_result) {
+        (true, Ok(metadata)) => metadata,
         (true, Err(err)) if require_sqlite_write || !sqlite_write_error_is_best_effort(&err) => {
             return Err(err);
         }
         (true, Err(err)) => {
             warn!("state db update_thread_metadata failed for {thread_id}: {err}");
+            None
         }
-        (false, Ok(())) => {}
+        (false, Ok(metadata)) => metadata,
         (false, Err(err)) if require_sqlite_write || !sqlite_write_error_is_best_effort(&err) => {
             return Err(err);
         }
         (false, Err(err)) => {
             warn!("state db update_thread_metadata failed for {thread_id}: {err}");
+            None
         }
+    };
+    if let Some(metadata) = updated_metadata
+        && (include_archived
+            || (metadata.archived_at.is_none()
+                && !rollout_path_is_archived(
+                    store.config.codex_home.as_path(),
+                    metadata.rollout_path.as_path(),
+                )))
+    {
+        return read_thread::stored_thread_from_sqlite_metadata(store, metadata).await;
     }
 
     read_thread::read_thread(
@@ -1603,7 +1628,7 @@ mod tests {
             .await
             .expect("apply later observed metadata");
 
-        assert_eq!(thread.preview, "Hello from user");
+        assert_eq!(thread.preview, "Later preview");
         assert_eq!(
             thread.first_user_message.as_deref(),
             Some("Later first message")

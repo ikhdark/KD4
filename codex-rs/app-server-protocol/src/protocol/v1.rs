@@ -68,11 +68,9 @@ pub struct InitializeResponse {
     pub user_agent: String,
     /// Absolute path to the server's $CODEX_HOME directory.
     pub codex_home: AbsolutePathBuf,
-    /// Platform family for the running app-server target, for example
-    /// `"unix"` or `"windows"`.
+    /// Platform family for the running app-server target: `"windows"`.
     pub platform_family: String,
-    /// Operating system for the running app-server target, for example
-    /// `"macos"`, `"linux"`, or `"windows"`.
+    /// Operating system for the running app-server target: `"windows"`.
     pub platform_os: String,
     /// Build metadata for the running app-server binary.
     #[serde(default, skip_serializing_if = "Option::is_none")]

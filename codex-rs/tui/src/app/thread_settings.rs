@@ -101,7 +101,7 @@ impl App {
             cwd,
             approval_policy,
             approvals_reviewer,
-            permission_profile: _,
+            permission_profile,
             active_permission_profile,
             windows_sandbox_level: _,
             model,
@@ -120,6 +120,11 @@ impl App {
             cwd: cwd.clone(),
             approval_policy: *approval_policy,
             approvals_reviewer: approvals_reviewer.map(AppServerApprovalsReviewer::from),
+            permission_profile: if active_permission_profile.is_none() {
+                permission_profile.clone()
+            } else {
+                None
+            },
             permissions: active_permission_profile
                 .as_ref()
                 .map(|profile| profile.id.clone()),
@@ -178,10 +183,12 @@ fn apply_thread_settings_to_session(session: &mut ThreadSessionState, settings: 
     session.service_tier = settings.service_tier.clone();
     session.approval_policy = settings.approval_policy;
     session.approvals_reviewer = settings.approvals_reviewer.to_core();
-    session.permission_profile = PermissionProfile::from_legacy_sandbox_policy_for_cwd(
-        &settings.sandbox_policy.to_core(),
-        settings.cwd.as_path(),
-    );
+    session.permission_profile = settings.permission_profile.clone().unwrap_or_else(|| {
+        PermissionProfile::from_legacy_sandbox_policy_for_cwd(
+            &settings.sandbox_policy.to_core(),
+            settings.cwd.as_path(),
+        )
+    });
     session.active_permission_profile = settings.active_permission_profile.clone().map(Into::into);
     session.set_cwd_retargeting_implicit_runtime_workspace_root(settings.cwd.clone());
     session.personality = settings.personality;
@@ -199,6 +206,7 @@ fn thread_settings_update_has_changes(params: &ThreadSettingsUpdateParams) -> bo
         || params.approval_policy.is_some()
         || params.approvals_reviewer.is_some()
         || params.sandbox_policy.is_some()
+        || params.permission_profile.is_some()
         || params.permissions.is_some()
         || params.model.is_some()
         || params.service_tier.is_some()

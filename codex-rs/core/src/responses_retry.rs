@@ -9,6 +9,7 @@ use crate::session::turn_context::TurnContext;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
+use http::StatusCode;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -34,19 +35,13 @@ pub(crate) async fn handle_retryable_response_stream_error(
     request: ResponsesStreamRequest,
     cancellation_token: &CancellationToken,
 ) -> Result<(), CodexErr> {
-    // Sampling requests have already exhausted the provider's request retry policy before a
-    // transport timeout reaches this layer. Retrying it again as a stream failure multiplies
-    // request_max_retries by stream_max_retries and can leave the turn looking stuck for minutes.
-    // Compaction requests intentionally keep their existing outer timeout retry behavior.
     if !should_retry_response_stream(request, &err) {
         return Err(err);
     }
 
     if *retries >= max_retries
-        && client_session.try_switch_fallback_transport(
-            &turn_context.session_telemetry,
-            &turn_context.model_info,
-        )
+        && should_switch_fallback_transport(&err)
+        && client_session.try_switch_fallback_transport(&turn_context.session_telemetry)
     {
         turn_context.turn_timing_state.record_model_fallback();
         sess.send_event(
@@ -56,7 +51,9 @@ pub(crate) async fn handle_retryable_response_stream_error(
             }),
         )
         .await;
-        *retries = 0;
+        // The loop itself supplies one immediate HTTPS fallback attempt. Keep the provider retry
+        // budget exhausted so a failed fallback does not start a second full retry window.
+        exhaust_retry_budget_for_http_fallback(retries, max_retries);
         return Ok(());
     }
 
@@ -81,6 +78,10 @@ pub(crate) async fn handle_retryable_response_stream_error(
     Err(err)
 }
 
+fn exhaust_retry_budget_for_http_fallback(retries: &mut u64, max_retries: u64) {
+    *retries = max_retries;
+}
+
 async fn wait_for_retry_delay(
     delay: Duration,
     cancellation_token: &CancellationToken,
@@ -92,9 +93,21 @@ async fn wait_for_retry_delay(
 }
 
 fn should_retry_response_stream(request: ResponsesStreamRequest, err: &CodexErr) -> bool {
-    !matches!(
-        (request, err),
-        (ResponsesStreamRequest::Sampling, CodexErr::RequestTimeout)
+    let _ = request;
+    err.is_retryable()
+        && !matches!(
+            err,
+            CodexErr::UnexpectedStatus(error) if error.status == StatusCode::UNAUTHORIZED
+        )
+}
+
+fn should_switch_fallback_transport(err: &CodexErr) -> bool {
+    matches!(
+        err,
+        CodexErr::RequestTimeout
+            | CodexErr::ConnectionFailed(_)
+            | CodexErr::ResponseStreamFailed(_)
+            | CodexErr::UnexpectedStatus(_)
     )
 }
 

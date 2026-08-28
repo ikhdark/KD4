@@ -1,4 +1,5 @@
 use super::super::clients::list_remote_control_clients;
+use super::super::clients::list_remote_control_clients_with_client;
 use super::super::clients::revoke_remote_control_client;
 use super::*;
 use codex_app_server_protocol::RemoteControlClient;
@@ -8,6 +9,7 @@ use codex_app_server_protocol::RemoteControlClientsListResponse;
 use codex_app_server_protocol::RemoteControlClientsRevokeParams;
 use codex_app_server_protocol::RemoteControlClientsRevokeResponse;
 use codex_login::AuthKeyringBackendKind;
+use codex_login::default_client::create_client_without_request_logging;
 use pretty_assertions::assert_eq;
 
 fn client_management_handle(
@@ -33,6 +35,9 @@ fn client_management_handle(
         pairing_persistence_key: watch::channel(None).0,
         pairing_persistence_key_required: false,
         auth_manager,
+        http_clients: remote_control_http_clients(codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        )),
     }
 }
 
@@ -222,7 +227,9 @@ async fn list_remote_control_clients_recovers_auth_after_unauthorized() {
     )
     .expect("fresh auth should save");
 
-    let response = list_remote_control_clients(
+    let client = create_client_without_request_logging().expect("shared HTTP client should build");
+    let response = list_remote_control_clients_with_client(
+        &client,
         &remote_control_url,
         &auth_manager,
         RemoteControlClientsListParams {

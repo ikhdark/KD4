@@ -1016,6 +1016,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn durability_regression_not_found_worker_remains_recoverable() {
+        assert!(runtime_status_allows_nonproductive_recovery(
+            &AgentStatus::NotFound
+        ));
+        assert!(runtime_status_allows_nonproductive_recovery(
+            &AgentStatus::Running
+        ));
+        assert!(!runtime_status_allows_nonproductive_recovery(
+            &AgentStatus::Completed(None)
+        ));
+        assert!(!runtime_status_allows_nonproductive_recovery(
+            &AgentStatus::Errored("permanent failure".to_string())
+        ));
+    }
+
+    #[test]
     fn durable_receipt_pointer_never_embeds_receipt_contents() {
         let pointer = durable_receipt_pointer("assignment-1".to_string(), true);
 
@@ -1881,7 +1897,7 @@ async fn nudge_stalled_assignments(
             continue;
         };
         let status = session.services.agent_control.get_status(thread_id).await;
-        if is_final(&status) {
+        if !runtime_status_allows_nonproductive_recovery(&status) {
             continue;
         }
         match store
@@ -1970,6 +1986,10 @@ async fn nudge_stalled_assignments(
         }
     }
     nudged
+}
+
+fn runtime_status_allows_nonproductive_recovery(status: &AgentStatus) -> bool {
+    matches!(status, AgentStatus::NotFound) || !is_final(status)
 }
 
 fn is_strict_agent_descendant(caller: &AgentPath, candidate: &str) -> bool {

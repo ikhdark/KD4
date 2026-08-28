@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
@@ -36,7 +39,103 @@ pub struct LiveThread {
     history_mode: ThreadHistoryMode,
     thread_store: Arc<dyn ThreadStore>,
     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
+    terminal_events: Arc<StdMutex<TerminalEventIndex>>,
     persistence_telemetry: RolloutPersistenceTelemetry,
+}
+
+struct TerminalEventIndex {
+    by_turn_id: HashMap<String, EventMsg>,
+    trusted: bool,
+    pending_terminal_appends: usize,
+    revision: u64,
+}
+
+impl TerminalEventIndex {
+    fn trusted_empty() -> Self {
+        Self {
+            by_turn_id: HashMap::new(),
+            trusted: true,
+            pending_terminal_appends: 0,
+            revision: 0,
+        }
+    }
+
+    fn from_items(items: &[RolloutItem]) -> Self {
+        let mut index = Self::trusted_empty();
+        index.observe_items(items);
+        index
+    }
+
+    fn observe_items(&mut self, items: &[RolloutItem]) {
+        for item in items {
+            let RolloutItem::EventMsg(event) = item else {
+                continue;
+            };
+            let Some(turn_id) = terminal_event_turn_id(event) else {
+                continue;
+            };
+            self.by_turn_id
+                .entry(turn_id.to_string())
+                .or_insert_with(|| event.clone());
+        }
+    }
+}
+
+struct TerminalAppendGuard {
+    index: Arc<StdMutex<TerminalEventIndex>>,
+    active: bool,
+}
+
+impl TerminalAppendGuard {
+    fn new(index: Arc<StdMutex<TerminalEventIndex>>, items: &[RolloutItem]) -> Self {
+        let active = items.iter().any(|item| {
+            matches!(item, RolloutItem::EventMsg(event) if terminal_event_turn_id(event).is_some())
+        });
+        if active {
+            let mut terminal_events = index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            terminal_events.pending_terminal_appends += 1;
+            terminal_events.revision = terminal_events.revision.wrapping_add(1);
+        }
+        Self { index, active }
+    }
+
+    fn commit(mut self, items: &[RolloutItem]) {
+        if self.active {
+            let mut terminal_events = self
+                .index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            terminal_events.observe_items(items);
+            terminal_events.pending_terminal_appends -= 1;
+            terminal_events.revision = terminal_events.revision.wrapping_add(1);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for TerminalAppendGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut terminal_events = self
+            .index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        terminal_events.pending_terminal_appends -= 1;
+        terminal_events.trusted = false;
+        terminal_events.revision = terminal_events.revision.wrapping_add(1);
+    }
+}
+
+fn terminal_event_turn_id(event: &EventMsg) -> Option<&str> {
+    match event {
+        EventMsg::TurnComplete(event) => Some(event.turn_id.as_str()),
+        EventMsg::TurnAborted(event) => event.turn_id.as_deref(),
+        _ => None,
+    }
 }
 
 /// Owns a live thread while session initialization is still fallible.
@@ -109,6 +208,7 @@ impl LiveThread {
             history_mode,
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+            terminal_events: Arc::new(StdMutex::new(TerminalEventIndex::trusted_empty())),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         })
     }
@@ -121,6 +221,10 @@ impl LiveThread {
         let thread_id = params.thread_id;
         let should_load_history = params.history.is_none();
         let include_archived = params.include_archived;
+        let mut terminal_events = params
+            .history
+            .as_deref()
+            .map(|history| TerminalEventIndex::from_items(history));
         let mut metadata_sync = ThreadMetadataSync::for_resume(&params);
         thread_store.resume_thread(params).await?;
         if should_load_history {
@@ -131,7 +235,10 @@ impl LiveThread {
                 })
                 .await
             {
-                Ok(history) => metadata_sync.record_resume_history(&history.items),
+                Ok(history) => {
+                    metadata_sync.record_resume_history(&history.items);
+                    terminal_events = Some(TerminalEventIndex::from_items(&history.items));
+                }
                 Err(err) => {
                     if let Err(discard_err) = thread_store.discard_thread(thread_id).await {
                         warn!(
@@ -147,6 +254,9 @@ impl LiveThread {
             history_mode,
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+            terminal_events: Arc::new(StdMutex::new(
+                terminal_events.unwrap_or_else(TerminalEventIndex::trusted_empty),
+            )),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         })
     }
@@ -157,6 +267,20 @@ impl LiveThread {
         fields(item_count = raw_items.len())
     )]
     pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        self.append_items_with_durability(raw_items, true).await
+    }
+
+    /// Queue items in canonical order and defer rollout plus metadata durability to the next
+    /// persist/flush/shutdown barrier.
+    pub async fn append_items_ordered(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        self.append_items_with_durability(raw_items, false).await
+    }
+
+    async fn append_items_with_durability(
+        &self,
+        raw_items: &[RolloutItem],
+        durable: bool,
+    ) -> ThreadStoreResult<()> {
         // Empty appends are intentionally ignored rather than represented as zero-sized batches.
         if raw_items.is_empty() {
             return Ok(());
@@ -168,12 +292,18 @@ impl LiveThread {
         } else {
             (persisted_rollout_items(raw_items, self.history_mode), None)
         };
-        self.thread_store
-            .append_items(AppendThreadItemsParams {
-                thread_id: self.thread_id,
-                items: raw_items.to_vec(),
-            })
-            .await?;
+        let terminal_append =
+            TerminalAppendGuard::new(Arc::clone(&self.terminal_events), items.as_slice());
+        let params = AppendThreadItemsParams {
+            thread_id: self.thread_id,
+            items: raw_items.to_vec(),
+        };
+        if durable {
+            self.thread_store.append_items(params).await?;
+        } else {
+            self.thread_store.append_items_ordered(params).await?;
+        }
+        terminal_append.commit(items.as_slice());
         if let Some(measurement) = measurement.as_ref() {
             self.persistence_telemetry
                 .record_batch(raw_items, measurement);
@@ -186,7 +316,7 @@ impl LiveThread {
             .lock()
             .await
             .observe_appended_items(items.as_slice());
-        if let Some(update) = update {
+        if durable && let Some(update) = update {
             self.thread_store
                 .update_thread_metadata(UpdateThreadMetadataParams {
                     thread_id: self.thread_id,
@@ -214,9 +344,9 @@ impl LiveThread {
     }
 
     pub async fn shutdown(&self) -> ThreadStoreResult<()> {
+        self.thread_store.shutdown_thread(self.thread_id).await?;
         self.flush_pending_metadata_update_for_existing_history()
-            .await?;
-        self.thread_store.shutdown_thread(self.thread_id).await
+            .await
     }
 
     pub async fn discard(&self) -> ThreadStoreResult<()> {
@@ -233,6 +363,47 @@ impl LiveThread {
                 include_archived,
             })
             .await
+    }
+
+    /// Returns the first terminal event persisted for `turn_id`.
+    ///
+    /// Successful live appends and resume history keep this lookup process-local. A full history
+    /// read is reserved for an ambiguous append whose future was cancelled or returned an error.
+    pub async fn terminal_event(
+        &self,
+        turn_id: &str,
+        include_archived: bool,
+    ) -> ThreadStoreResult<Option<EventMsg>> {
+        let revision = {
+            let terminal_events = self
+                .terminal_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if terminal_events.trusted && terminal_events.pending_terminal_appends == 0 {
+                return Ok(terminal_events.by_turn_id.get(turn_id).cloned());
+            }
+            terminal_events.revision
+        };
+
+        let history = self.load_history(include_archived).await?;
+        let loaded_event = history.items.iter().find_map(|item| {
+            let RolloutItem::EventMsg(event) = item else {
+                return None;
+            };
+            (terminal_event_turn_id(event) == Some(turn_id)).then(|| event.clone())
+        });
+        let mut terminal_events = self
+            .terminal_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if terminal_events.revision == revision && terminal_events.pending_terminal_appends == 0 {
+            let next_revision = terminal_events.revision;
+            *terminal_events = TerminalEventIndex::from_items(&history.items);
+            terminal_events.revision = next_revision;
+        } else if terminal_events.trusted && terminal_events.pending_terminal_appends == 0 {
+            return Ok(terminal_events.by_turn_id.get(turn_id).cloned());
+        }
+        Ok(loaded_event)
     }
 
     pub async fn read_thread(

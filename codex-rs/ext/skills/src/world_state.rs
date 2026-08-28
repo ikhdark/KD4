@@ -2,6 +2,8 @@ use codex_extension_api::ContextualUserFragment;
 use codex_extension_api::PreviousWorldStateSection;
 use codex_extension_api::RenderedWorldStateFragment;
 use codex_extension_api::WorldStateSectionContribution;
+use codex_protocol::protocol::ENVIRONMENT_SKILLS_INSTRUCTIONS_CLOSE_TAG;
+use codex_protocol::protocol::ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use serde_json::json;
@@ -52,14 +54,23 @@ pub(crate) fn executor_skills_world_state_section(
             };
             Some(RenderedWorldStateFragment::new(
                 "developer",
-                (SKILLS_INSTRUCTIONS_OPEN_TAG, SKILLS_INSTRUCTIONS_CLOSE_TAG),
+                (
+                    ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG,
+                    ENVIRONMENT_SKILLS_INSTRUCTIONS_CLOSE_TAG,
+                ),
                 body,
             ))
         })
         .with_legacy_matcher(|role, text| {
             role == "developer"
-                && text.trim_start().starts_with(SKILLS_INSTRUCTIONS_OPEN_TAG)
-                && text.trim_end().ends_with(SKILLS_INSTRUCTIONS_CLOSE_TAG)
+                && ((text
+                    .trim_start()
+                    .starts_with(ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG)
+                    && text
+                        .trim_end()
+                        .ends_with(ENVIRONMENT_SKILLS_INSTRUCTIONS_CLOSE_TAG))
+                    || (text.trim_start().starts_with(SKILLS_INSTRUCTIONS_OPEN_TAG)
+                        && text.trim_end().ends_with(SKILLS_INSTRUCTIONS_CLOSE_TAG)))
         });
     match retained_body {
         Some(body) => contribution.with_retained_fragment_matcher(move |role, text| {

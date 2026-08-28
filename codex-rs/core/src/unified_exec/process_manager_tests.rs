@@ -117,9 +117,9 @@ fn unified_exec_env_injects_defaults() {
         ("LC_CTYPE".to_string(), "C.UTF-8".to_string()),
         ("LC_ALL".to_string(), "C.UTF-8".to_string()),
         ("COLORTERM".to_string(), String::new()),
-        ("PAGER".to_string(), "cat".to_string()),
-        ("GIT_PAGER".to_string(), "cat".to_string()),
-        ("GH_PAGER".to_string(), "cat".to_string()),
+        ("PAGER".to_string(), "more.com".to_string()),
+        ("GIT_PAGER".to_string(), "more.com".to_string()),
+        ("GH_PAGER".to_string(), "more.com".to_string()),
         ("CODEX_CI".to_string(), "1".to_string()),
     ]);
 
@@ -629,6 +629,7 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     };
     let mut request = ExecRequest {
         command: vec!["bash".to_string(), "-lc".to_string(), "true".to_string()],
+        codex_home: cwd.clone(),
         cwd: cwd.clone().into(),
         env: HashMap::from([
             ("HOME".to_string(), "/client-home".to_string()),
@@ -798,6 +799,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
             bytes: 0,
         },
         shell_type: crate::shell::ShellType::Sh,
+        shell_wrapper_is_owned: true,
         hook_command: "echo before".to_string(),
         process_id: 123,
         yield_time_ms: 1000,
@@ -815,13 +817,11 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         tty: true,
         sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
         additional_permissions: None,
+        additional_permissions_uri: None,
         additional_permissions_preapproved: false,
         justification: None,
         prefix_rule: None,
         validation_launch: None,
-        validation_observation: Arc::new(std::sync::Mutex::new(None)),
-        validation_leader: Arc::new(std::sync::Mutex::new(None)),
-        validation_waiter: None,
         known_delta: None,
     };
 
@@ -833,6 +833,8 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
 
     emit_failed_initial_exec_end_if_unstored(
         /*process_started_alive*/ false,
+        None,
+        Instant::now(),
         &context,
         &request,
         turn.cwd().clone().into(),
@@ -840,6 +842,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         "PRE_DENIAL_MARKER".to_string(),
         "Network access denied".to_string(),
         Duration::from_millis(7),
+        None,
     )
     .await;
 
@@ -864,6 +867,315 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         item.aggregated_output.as_deref(),
         Some("PRE_DENIAL_MARKER\nNetwork access denied")
     );
+}
+
+#[tokio::test]
+async fn spawned_sandbox_denied_validation_publishes_failed_result() {
+    let (session, turn, rx_event) = crate::session::tests::make_session_and_context_with_rx().await;
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "call-unified-validation-denied".to_string(),
+    );
+    let mut request = ExecCommandRequest {
+        command: vec!["cargo".to_string(), "test".to_string()],
+        command_for_safety: vec!["cargo".to_string(), "test".to_string()],
+        attempt_key: crate::tools::command_execution::CommandAttemptKey::new(
+            "exec_command",
+            "test",
+            "test-cwd",
+            &["cargo".to_string(), "test".to_string()],
+        ),
+        raw_output_artifact: crate::tools::command_output_artifact::RawOutputArtifact::Failed {
+            id: None,
+            message: "test fixture".to_string(),
+            owned_path: None,
+            bytes: 0,
+        },
+        shell_type: crate::shell::ShellType::Sh,
+        shell_wrapper_is_owned: false,
+        hook_command: "cargo test".to_string(),
+        process_id: 124,
+        yield_time_ms: 1_000,
+        max_output_tokens: None,
+        cwd: turn.cwd().clone().into(),
+        normalization_cwd: None,
+        sandbox_cwd: turn.cwd().clone().into(),
+        turn_environment: turn
+            .environments
+            .primary()
+            .cloned()
+            .expect("primary environment"),
+        network: None,
+        tty: true,
+        sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+        additional_permissions: None,
+        additional_permissions_uri: None,
+        additional_permissions_preapproved: false,
+        justification: None,
+        prefix_rule: None,
+        validation_launch: Some(crate::validation_admission::ValidationLaunchPlan {
+            classification: crate::validation_admission::classify_validation(
+                &crate::tools::handlers::command_shape::CommandInvocation::Argv {
+                    program: "cargo".to_string(),
+                    args: vec!["test".to_string()],
+                },
+            ),
+            authorization_revision: 0,
+            explicitly_tagged: true,
+            structured_route: Some(codex_protocol::plan_tool::ValidationRoute {
+                leaves: vec![codex_protocol::plan_tool::ValidationRouteLeaf {
+                    argv: vec!["cargo".to_string(), "test".to_string()],
+                    covered_paths: vec!["core/src/lib.rs".to_string()],
+                    timeout_ms: 30_000,
+                }],
+                ordering: Default::default(),
+            }),
+            bound_plan_step: None,
+            bound_work_unit: None,
+            validation_call_id: Some("validation-call-id".to_string()),
+            turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
+            focused_validation_token: None,
+        }),
+        known_delta: None,
+    };
+    let manager = UnifiedExecProcessManager::default();
+    let registration = PendingProcessRegistration::new(
+        Arc::clone(&manager.process_store),
+        &context,
+        request.attempt_key.clone(),
+        request.process_id,
+    );
+    let error = UnifiedExecError::sandbox_denied(
+        "sandbox denied".to_string(),
+        codex_protocol::exec_output::ExecToolCallOutput {
+            exit_code: 126,
+            aggregated_output: codex_protocol::exec_output::StreamOutput::new(
+                "SANDBOX_DENIED_MARKER".to_string(),
+            ),
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        emit_spawned_validation_launch_error_if_needed(
+            &registration,
+            &mut request,
+            &context,
+            turn.cwd().clone().into(),
+            Instant::now(),
+            &error,
+        )
+        .await
+    );
+
+    let event = tokio::time::timeout(Duration::from_secs(1), rx_event.recv())
+        .await
+        .expect("timed out waiting for failed validation command item")
+        .expect("event channel closed");
+    let codex_protocol::protocol::EventMsg::ItemCompleted(completed_event) = event.msg else {
+        panic!("expected ItemCompleted event");
+    };
+    let codex_protocol::items::TurnItem::CommandExecution(item) = completed_event.item else {
+        panic!("expected CommandExecution item");
+    };
+    assert_eq!(item.id, "call-unified-validation-denied");
+    assert_eq!(
+        item.status,
+        codex_protocol::items::CommandExecutionStatus::Failed
+    );
+    assert_eq!(
+        item.aggregated_output.as_deref(),
+        Some("SANDBOX_DENIED_MARKER")
+    );
+    assert_eq!(
+        turn.turn_timing_state
+            .complete_snapshot()
+            .protocol_timing()
+            .counters
+            .executed_validation_count,
+        1,
+        "the spawned validation must publish exactly one terminal result",
+    );
+}
+
+#[tokio::test]
+async fn spawned_validation_survives_a_later_retry_launch_error() {
+    let (session, turn, rx_event) = crate::session::tests::make_session_and_context_with_rx().await;
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "call-unified-validation-retry-error".to_string(),
+    );
+    let command = if cfg!(windows) {
+        vec![
+            "cmd.exe".to_string(),
+            "/D".to_string(),
+            "/S".to_string(),
+            "/C".to_string(),
+            "exit /b 126".to_string(),
+        ]
+    } else {
+        vec!["sh".to_string(), "-c".to_string(), "exit 126".to_string()]
+    };
+    let mut request = ExecCommandRequest {
+        command: command.clone(),
+        command_for_safety: command.clone(),
+        attempt_key: crate::tools::command_execution::CommandAttemptKey::new(
+            "exec_command",
+            "test",
+            "test-cwd",
+            &command,
+        ),
+        raw_output_artifact: crate::tools::command_output_artifact::RawOutputArtifact::Failed {
+            id: None,
+            message: "test fixture".to_string(),
+            owned_path: None,
+            bytes: 0,
+        },
+        shell_type: if cfg!(windows) {
+            crate::shell::ShellType::PowerShell
+        } else {
+            crate::shell::ShellType::Sh
+        },
+        shell_wrapper_is_owned: false,
+        hook_command: command.join(" "),
+        process_id: 125,
+        yield_time_ms: 1_000,
+        max_output_tokens: None,
+        cwd: turn.cwd().clone().into(),
+        normalization_cwd: None,
+        sandbox_cwd: turn.cwd().clone().into(),
+        turn_environment: turn
+            .environments
+            .primary()
+            .cloned()
+            .expect("primary environment"),
+        network: None,
+        tty: false,
+        sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+        additional_permissions: None,
+        additional_permissions_uri: None,
+        additional_permissions_preapproved: false,
+        justification: None,
+        prefix_rule: None,
+        validation_launch: Some(crate::validation_admission::ValidationLaunchPlan {
+            classification: crate::validation_admission::classify_validation(
+                &crate::tools::handlers::command_shape::CommandInvocation::Argv {
+                    program: command[0].clone(),
+                    args: command[1..].to_vec(),
+                },
+            ),
+            authorization_revision: 0,
+            explicitly_tagged: true,
+            structured_route: Some(codex_protocol::plan_tool::ValidationRoute {
+                leaves: vec![codex_protocol::plan_tool::ValidationRouteLeaf {
+                    argv: command.clone(),
+                    covered_paths: vec!["core/src/lib.rs".to_string()],
+                    timeout_ms: 30_000,
+                }],
+                ordering: Default::default(),
+            }),
+            bound_plan_step: None,
+            bound_work_unit: None,
+            validation_call_id: Some("validation-retry-call-id".to_string()),
+            turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
+            focused_validation_token: None,
+        }),
+        known_delta: None,
+    };
+    let manager = UnifiedExecProcessManager::default();
+    let mut registration = PendingProcessRegistration::new(
+        Arc::clone(&manager.process_store),
+        &context,
+        request.attempt_key.clone(),
+        request.process_id,
+    );
+    let exec_request = ExecRequest::new(
+        command,
+        turn.config.codex_home.clone(),
+        turn.cwd().clone(),
+        std::env::vars().collect(),
+        None,
+        None,
+        crate::exec::ExecExpiration::DefaultTimeout,
+        crate::exec::ExecCapturePolicy::ShellTool,
+        codex_sandboxing::SandboxType::None,
+        turn.config.effective_workspace_roots(),
+        turn.windows_sandbox_level,
+        false,
+        turn.permission_profile(),
+        None,
+    );
+    let process = manager
+        .open_session_with_prepared_exec_env(
+            request.process_id,
+            &exec_request,
+            false,
+            None,
+            Box::new(crate::unified_exec::NoopSpawnLifecycle),
+            None,
+            turn.environments
+                .primary()
+                .expect("turn environment")
+                .environment
+                .as_ref(),
+            &registration.pending_spawns(),
+        )
+        .await
+        .expect("the initial validation attempt must spawn");
+    if !process.has_exited() {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            process.cancellation_token().cancelled(),
+        )
+        .await
+        .expect("the validation fixture must exit");
+    }
+    assert_eq!(process.exit_code(), Some(126));
+
+    let error = UnifiedExecError::create_process("retry approval was denied".to_string());
+    assert!(
+        emit_spawned_validation_launch_error_if_needed(
+            &registration,
+            &mut request,
+            &context,
+            turn.cwd().clone().into(),
+            Instant::now(),
+            &error,
+        )
+        .await,
+        "the terminal retry error must retain the already executed validation attempt",
+    );
+
+    let event = tokio::time::timeout(Duration::from_secs(1), rx_event.recv())
+        .await
+        .expect("timed out waiting for failed validation command item")
+        .expect("event channel closed");
+    let codex_protocol::protocol::EventMsg::ItemCompleted(completed_event) = event.msg else {
+        panic!("expected ItemCompleted event");
+    };
+    let codex_protocol::items::TurnItem::CommandExecution(item) = completed_event.item else {
+        panic!("expected CommandExecution item");
+    };
+    assert_eq!(item.id, "call-unified-validation-retry-error");
+    assert_eq!(
+        item.status,
+        codex_protocol::items::CommandExecutionStatus::Failed
+    );
+    // The ordinary tool event still reports the later launch error, while the
+    // validation result is completed from the earlier spawned process.
+    assert_eq!(item.exit_code, Some(-1));
+    assert_eq!(
+        turn.turn_timing_state
+            .complete_snapshot()
+            .protocol_timing()
+            .counters
+            .executed_validation_count,
+        1,
+        "the executed validation call must publish exactly one terminal result",
+    );
+    registration.cleanup().await.expect("cleanup succeeds");
 }
 
 #[test]

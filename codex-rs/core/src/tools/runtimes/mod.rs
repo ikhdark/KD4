@@ -26,16 +26,97 @@ use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxType;
+use codex_sandboxing::windows_sandbox_uses_elevated_backend;
+use codex_shell_command::escape_powershell_single_quoted as powershell_single_quote;
+use codex_shell_command::powershell::ProvenPowershellDirectArgv;
 use codex_shell_command::powershell::extract_powershell_command;
+use codex_shell_command::powershell::prefix_powershell_script_with_utf8;
+use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
+use std::path::Path;
 
 const SHELL_SNAPSHOT_REPLAY_METRIC: &str = "codex.shell_snapshot_replay";
 
 pub(crate) mod apply_patch;
 pub(crate) mod shell;
 pub(crate) mod unified_exec;
+
+pub(crate) async fn prove_noprofile_powershell_direct_argv_async(
+    command: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> Option<ProvenPowershellDirectArgv> {
+    let command = command.to_vec();
+    let cwd = cwd.to_path_buf();
+    let env = env.clone();
+    crate::tools::run_blocking_command_analysis(move || {
+        prove_noprofile_powershell_command_as_direct_argv(&command, &cwd, &env)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+pub(crate) struct ShellCommandPreparation<'a> {
+    pub(crate) command: &'a [String],
+    pub(crate) command_for_approval: &'a [String],
+    pub(crate) shell: &'a Shell,
+    pub(crate) shell_snapshot: Option<&'a ShellSnapshotFile>,
+    pub(crate) explicit_env_overrides: &'a HashMap<String, String>,
+    pub(crate) env: &'a mut HashMap<String, String>,
+    pub(crate) shell_type: &'a ShellType,
+    pub(crate) sandbox_shell_type: Option<&'a ShellType>,
+    pub(crate) sandbox: SandboxType,
+    pub(crate) windows_sandbox_level: WindowsSandboxLevel,
+    pub(crate) enforce_managed_network: bool,
+    pub(crate) approved_powershell_direct_argv: Option<&'a Vec<String>>,
+    pub(crate) proof_cwd: Option<&'a Path>,
+}
+
+/// Applies the shared snapshot, sandbox-profile, and PowerShell handoff pipeline
+/// used by direct shell and unified exec launches.
+pub(crate) async fn prepare_shell_command(input: ShellCommandPreparation<'_>) -> Vec<String> {
+    let runtime_path_prepends = RuntimePathPrepends;
+    let command = maybe_wrap_shell_lc_with_snapshot_file_and_powershell_projection(
+        input.command,
+        Some(input.command_for_approval),
+        input.shell,
+        input.shell_snapshot,
+        input.explicit_env_overrides,
+        input.env,
+        &runtime_path_prepends,
+    );
+    let command = disable_powershell_profile_for_elevated_windows_sandbox(
+        &command,
+        input.sandbox_shell_type,
+        input.sandbox,
+        input.windows_sandbox_level,
+        input.enforce_managed_network,
+    );
+    if input.shell_type != &ShellType::PowerShell {
+        return command;
+    }
+
+    let proof_command = if command.as_slice() == input.command {
+        input.command_for_approval
+    } else {
+        &command
+    };
+    let approved_direct_command = if let (Some(approved), Some(cwd)) =
+        (input.approved_powershell_direct_argv, input.proof_cwd)
+    {
+        prove_noprofile_powershell_direct_argv_async(proof_command, cwd, input.env)
+            .await
+            .and_then(|proof| proof.into_command_for_state(proof_command, cwd, input.env))
+            .filter(|direct| direct == approved)
+            .map(|_| command.clone())
+    } else {
+        None
+    };
+    approved_direct_command.unwrap_or_else(|| prefix_powershell_script_with_utf8(&command))
+}
 
 /// Shared helper to construct sandbox transform inputs from a tokenized command line and native
 /// working directory. Validates that at least a program is present.
@@ -98,10 +179,11 @@ pub(crate) fn disable_powershell_profile_for_elevated_windows_sandbox(
     shell_type: Option<&ShellType>,
     sandbox: SandboxType,
     windows_sandbox_level: WindowsSandboxLevel,
+    enforce_managed_network: bool,
 ) -> Vec<String> {
     if shell_type != Some(&ShellType::PowerShell)
         || sandbox != SandboxType::WindowsRestrictedToken
-        || windows_sandbox_level != WindowsSandboxLevel::Elevated
+        || !windows_sandbox_uses_elevated_backend(windows_sandbox_level, enforce_managed_network)
         || command.is_empty()
     {
         return command.to_vec();
@@ -165,6 +247,27 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot_file(
     env: &mut HashMap<String, String>,
     runtime_path_prepends: &RuntimePathPrepends,
 ) -> Vec<String> {
+    maybe_wrap_shell_lc_with_snapshot_file_and_powershell_projection(
+        command,
+        /*powershell_projection*/ None,
+        session_shell,
+        shell_snapshot,
+        explicit_env_overrides,
+        env,
+        runtime_path_prepends,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn maybe_wrap_shell_lc_with_snapshot_file_and_powershell_projection(
+    command: &[String],
+    powershell_projection: Option<&[String]>,
+    session_shell: &Shell,
+    shell_snapshot: Option<&ShellSnapshotFile>,
+    explicit_env_overrides: &HashMap<String, String>,
+    env: &mut HashMap<String, String>,
+    runtime_path_prepends: &RuntimePathPrepends,
+) -> Vec<String> {
     let Some(snapshot) = shell_snapshot else {
         return command.to_vec();
     };
@@ -180,8 +283,9 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot_file(
         );
     }
     let metrics = codex_otel::global();
-    maybe_wrap_shell_lc_with_snapshot_source(
+    maybe_wrap_shell_lc_with_snapshot_source_and_powershell_projection(
         command,
+        powershell_projection,
         session_shell,
         &snapshot_path,
         snapshot.contents(),
@@ -234,9 +338,35 @@ fn maybe_wrap_shell_lc_with_snapshot_and_metrics(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn maybe_wrap_shell_lc_with_snapshot_source(
     command: &[String],
+    session_shell: &Shell,
+    snapshot_path: &str,
+    snapshot_contents: &str,
+    explicit_env_overrides: &HashMap<String, String>,
+    env: &HashMap<String, String>,
+    runtime_path_prepends: &RuntimePathPrepends,
+    metrics: Option<&MetricsClient>,
+) -> Vec<String> {
+    maybe_wrap_shell_lc_with_snapshot_source_and_powershell_projection(
+        command,
+        /*powershell_projection*/ None,
+        session_shell,
+        snapshot_path,
+        snapshot_contents,
+        explicit_env_overrides,
+        env,
+        runtime_path_prepends,
+        metrics,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_wrap_shell_lc_with_snapshot_source_and_powershell_projection(
+    command: &[String],
+    powershell_projection: Option<&[String]>,
     session_shell: &Shell,
     snapshot_path: &str,
     snapshot_contents: &str,
@@ -248,6 +378,7 @@ fn maybe_wrap_shell_lc_with_snapshot_source(
     match session_shell.shell_type {
         ShellType::PowerShell => maybe_wrap_powershell_with_snapshot(
             command,
+            powershell_projection,
             session_shell,
             snapshot_path,
             snapshot_contents,
@@ -259,8 +390,10 @@ fn maybe_wrap_shell_lc_with_snapshot_source(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maybe_wrap_powershell_with_snapshot(
     command: &[String],
+    powershell_projection: Option<&[String]>,
     session_shell: &Shell,
     snapshot_path: &str,
     snapshot_contents: &str,
@@ -276,7 +409,9 @@ fn maybe_wrap_powershell_with_snapshot(
         return command.to_vec();
     }
 
-    let Some((command_shell, original_script)) = extract_powershell_command(command) else {
+    let inspectable_command = powershell_projection.unwrap_or(command);
+    let Some((command_shell, original_script)) = extract_powershell_command(inspectable_command)
+    else {
         record_shell_snapshot_replay(metrics, "skipped", "unsupported_command");
         return command.to_vec();
     };
@@ -457,10 +592,6 @@ fn is_valid_powershell_env_name(name: &str) -> bool {
     !name.is_empty() && !name.contains(['\0', '='])
 }
 
-fn powershell_single_quote(input: &str) -> String {
-    input.replace('\'', "''")
-}
-
 #[cfg(test)]
 mod disable_powershell_profile_tests {
     use super::*;
@@ -479,6 +610,7 @@ mod disable_powershell_profile_tests {
             Some(&ShellType::PowerShell),
             SandboxType::WindowsRestrictedToken,
             WindowsSandboxLevel::Elevated,
+            false,
         );
 
         assert_eq!(
@@ -505,6 +637,7 @@ mod disable_powershell_profile_tests {
             Some(&ShellType::PowerShell),
             SandboxType::WindowsRestrictedToken,
             WindowsSandboxLevel::Elevated,
+            false,
         );
 
         assert_eq!(
@@ -532,6 +665,7 @@ mod disable_powershell_profile_tests {
             Some(&ShellType::PowerShell),
             SandboxType::WindowsRestrictedToken,
             WindowsSandboxLevel::Elevated,
+            false,
         );
 
         assert_eq!(rewritten, command);
@@ -550,9 +684,37 @@ mod disable_powershell_profile_tests {
             Some(&ShellType::PowerShell),
             SandboxType::WindowsRestrictedToken,
             WindowsSandboxLevel::RestrictedToken,
+            false,
         );
 
         assert_eq!(rewritten, command);
+    }
+
+    #[test]
+    fn inserts_no_profile_when_managed_network_promotes_restricted_token_backend() {
+        let command = vec![
+            "powershell.exe".to_string(),
+            "-Command".to_string(),
+            "Write-Output ok".to_string(),
+        ];
+
+        let rewritten = disable_powershell_profile_for_elevated_windows_sandbox(
+            &command,
+            Some(&ShellType::PowerShell),
+            SandboxType::WindowsRestrictedToken,
+            WindowsSandboxLevel::RestrictedToken,
+            true,
+        );
+
+        assert_eq!(
+            rewritten,
+            vec![
+                "powershell.exe".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Write-Output ok".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -568,6 +730,7 @@ mod disable_powershell_profile_tests {
             Some(&ShellType::PowerShell),
             SandboxType::None,
             WindowsSandboxLevel::Elevated,
+            false,
         );
 
         assert_eq!(rewritten, command);
@@ -586,6 +749,7 @@ mod disable_powershell_profile_tests {
             Some(&ShellType::Bash),
             SandboxType::WindowsRestrictedToken,
             WindowsSandboxLevel::Elevated,
+            false,
         );
 
         assert_eq!(rewritten, command);
@@ -626,6 +790,48 @@ mod shell_snapshot_replay_tests {
         );
 
         assert_eq!(rewritten, command);
+    }
+
+    #[test]
+    fn powershell_snapshot_replay_uses_the_inspectable_encoded_command_projection() {
+        let shell = Shell {
+            shell_type: ShellType::PowerShell,
+            shell_path: "pwsh".into(),
+        };
+        let encoded_command = vec![
+            "pwsh".to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-EncodedCommand".to_string(),
+            "opaque-encoded-payload".to_string(),
+        ];
+        let safety_projection = vec![
+            "pwsh".to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "Write-Output ready".to_string(),
+        ];
+
+        let rewritten = maybe_wrap_shell_lc_with_snapshot_source_and_powershell_projection(
+            &encoded_command,
+            Some(&safety_projection),
+            &shell,
+            "snapshot.ps1",
+            &format!("# Snapshot file\n{POWERSHELL_SNAPSHOT_FORMAT_HEADER}\n"),
+            &HashMap::new(),
+            &HashMap::new(),
+            &RuntimePathPrepends,
+            None,
+        );
+
+        assert_ne!(rewritten, encoded_command);
+        assert_eq!(rewritten.get(1).map(String::as_str), Some("-NoProfile"));
+        assert_eq!(rewritten.get(2).map(String::as_str), Some("-Command"));
+        let wrapper = rewritten.get(3).expect("PowerShell wrapper script");
+        assert!(wrapper.contains("snapshot.ps1"));
+        assert!(wrapper.contains("Write-Output ready"));
+        assert!(!wrapper.contains("opaque-encoded-payload"));
     }
 
     #[test]
@@ -732,7 +938,8 @@ mod shell_snapshot_replay_tests {
                 "Microsoft.PowerShell.Utility\\Write-Output ((Invoke-CodexSnapshotFunction) + '|' + $env:CODEX_TEST_OVERRIDE + '|' + (Microsoft.PowerShell.Management\\Test-Path -LiteralPath 'Env:{CODEX_PERMISSION_PROFILE_ENV_VAR}'))"
             ),
             /*use_login_shell*/ true,
-        );
+        )
+        .expect("PowerShell args");
         let explicit_overrides =
             HashMap::from([("CODEX_TEST_OVERRIDE".to_string(), "current".to_string())]);
         let mut env = std::env::vars().collect::<HashMap<_, _>>();
@@ -775,10 +982,12 @@ mod shell_snapshot_replay_tests {
         .expect("write broken PowerShell snapshot");
         let shell = crate::shell::get_shell(ShellType::PowerShell, /*path*/ None)
             .expect("PowerShell is required on Windows");
-        let original = shell.derive_exec_args(
-            "Microsoft.PowerShell.Utility\\Write-Output 'command-ran'",
-            /*use_login_shell*/ true,
-        );
+        let original = shell
+            .derive_exec_args(
+                "Microsoft.PowerShell.Utility\\Write-Output 'command-ran'",
+                /*use_login_shell*/ true,
+            )
+            .expect("PowerShell args");
 
         let rewritten = maybe_wrap_shell_lc_with_snapshot(
             &original,
@@ -814,7 +1023,9 @@ mod shell_snapshot_replay_tests {
         .expect("write PowerShell snapshot");
         let shell = crate::shell::get_shell(ShellType::PowerShell, /*path*/ None)
             .expect("PowerShell is required on Windows");
-        let command = shell.derive_exec_args("Write-Output ok", /*use_login_shell*/ true);
+        let command = shell
+            .derive_exec_args("Write-Output ok", /*use_login_shell*/ true)
+            .expect("PowerShell args");
         let env = std::env::vars().collect::<HashMap<_, _>>();
         let metrics = MetricsClient::new(
             MetricsConfig::in_memory(

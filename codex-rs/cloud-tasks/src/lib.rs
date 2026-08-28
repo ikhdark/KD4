@@ -15,6 +15,9 @@ use codex_cloud_tasks_client::TaskStatus;
 use codex_cloud_tasks_client::append_error_log;
 use codex_git_utils::current_branch_name;
 use codex_git_utils::default_branch_name;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::default_client::get_codex_user_agent;
 use codex_utils_cli::CliConfigOverrides;
 use owo_colors::OwoColorize;
@@ -47,6 +50,11 @@ struct BackendContext {
     backend: Arc<dyn codex_cloud_tasks_client::CloudBackend>,
     base_url: CloudBaseUrl,
     auth_manager: Option<Arc<codex_login::AuthManager>>,
+    environment_http_clients: RouteAwareClientPool,
+}
+
+fn environment_http_clients(http_client_factory: &HttpClientFactory) -> RouteAwareClientPool {
+    RouteAwareClientPool::new(http_client_factory.clone(), ClientRouteClass::Api)
 }
 
 async fn init_backend(
@@ -67,6 +75,7 @@ async fn init_backend(
         http_client_factory,
         chatgpt_base_url: base_url,
     } = load_auth_manager(config_overrides, base_url_override.as_deref()).await;
+    let environment_http_clients = environment_http_clients(&http_client_factory);
 
     #[cfg(debug_assertions)]
     if use_mock {
@@ -74,6 +83,7 @@ async fn init_backend(
             backend: Arc::new(codex_cloud_tasks_mock_client::MockClient),
             base_url,
             auth_manager,
+            environment_http_clients,
         });
     }
 
@@ -125,6 +135,7 @@ async fn init_backend(
         backend: Arc::new(http),
         base_url,
         auth_manager,
+        environment_http_clients,
     })
 }
 
@@ -214,7 +225,12 @@ async fn resolve_environment_id(ctx: &BackendContext, requested: &str) -> anyhow
         return Err(anyhow!("environment id must not be empty"));
     }
     let headers = build_chatgpt_headers(ctx.auth_manager.as_deref()).await;
-    let environments = crate::env_detect::list_environments(&ctx.base_url, &headers).await?;
+    let environments = crate::env_detect::list_environments(
+        &ctx.environment_http_clients,
+        &ctx.base_url,
+        &headers,
+    )
+    .await?;
     if environments.is_empty() {
         return Err(anyhow!(
             "no cloud environments are available for this workspace"
@@ -763,6 +779,25 @@ fn spawn_apply(
     true
 }
 
+fn spawn_task_list_refresh(
+    app: &mut app::App,
+    backend: &Arc<dyn codex_cloud_tasks_client::CloudBackend>,
+    tx: &UnboundedSender<app::AppEvent>,
+) {
+    let generation = app.begin_task_list_refresh();
+    let env = app.env_filter.clone();
+    let backend = Arc::clone(backend);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = app::load_tasks(&*backend, env.as_deref()).await;
+        let _ = tx.send(app::AppEvent::TasksLoaded {
+            generation,
+            env,
+            result,
+        });
+    });
+}
+
 // logging helper lives in util module
 
 // (no standalone patch summarizer needed – UI displays raw diffs)
@@ -799,6 +834,7 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
         backend,
         base_url,
         auth_manager,
+        environment_http_clients: environment_http_client,
     } = init_backend("codex_cloud_tui", &config_overrides).await?;
     let backend = backend;
     let base_url = Arc::new(base_url);
@@ -850,9 +886,7 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
     ));
     // Non-blocking initial load so the in-box spinner can animate
     app.status = "Loading tasks…".to_string();
-    app.refresh_inflight = true;
     // New list generation; reset background enrichment coordination
-    app.list_generation = app.list_generation.saturating_add(1);
     app.in_flight.clear();
     // reset any in-flight enrichment state
 
@@ -869,25 +903,21 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
     use tokio::sync::mpsc::unbounded_channel;
     let (tx, mut rx) = unbounded_channel::<app::AppEvent>();
     // Kick off the initial load in background
-    {
-        let backend = Arc::clone(&backend);
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let res = app::load_tasks(&*backend, /*env*/ None).await;
-            let _ = tx.send(app::AppEvent::TasksLoaded {
-                env: None,
-                result: res,
-            });
-        });
-    }
+    spawn_task_list_refresh(&mut app, &backend, &tx);
     // Fetch environment list in parallel so the header can show friendly names quickly.
     {
         let tx = tx.clone();
         let base_url = Arc::clone(&base_url);
         let auth_manager = auth_manager.clone();
+        let environment_http_client = environment_http_client.clone();
         tokio::spawn(async move {
             let headers = build_chatgpt_headers(auth_manager.as_deref()).await;
-            let res = crate::env_detect::list_environments(base_url.as_ref(), &headers).await;
+            let res = crate::env_detect::list_environments(
+                &environment_http_client,
+                base_url.as_ref(),
+                &headers,
+            )
+            .await;
             let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
         });
     }
@@ -898,11 +928,13 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
         let tx = tx.clone();
         let base_url = Arc::clone(&base_url);
         let auth_manager = auth_manager.clone();
+        let environment_http_client = environment_http_client.clone();
         tokio::spawn(async move {
             // Build headers: UA + ChatGPT auth if available
             let headers = build_chatgpt_headers(auth_manager.as_deref()).await;
             // Run autodetect. If it fails, we keep using "All".
             let res = crate::env_detect::autodetect_environment_id(
+                &environment_http_client,
                 base_url.as_ref(),
                 &headers,
                 /*desired_label*/ None,
@@ -995,31 +1027,29 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
             maybe_app_event = rx.recv() => {
                 if let Some(ev) = maybe_app_event {
                     match ev {
-                        app::AppEvent::TasksLoaded { env, result } => {
-                            // Only apply results for the current filter to avoid races.
-                            if env.as_deref() != app.env_filter.as_deref() {
-                                append_error_log(format!(
-                                    "refresh.drop: env={} current={}",
-                                    env.clone().unwrap_or_else(|| "<all>".to_string()),
-                                    app.env_filter.clone().unwrap_or_else(|| "<all>".to_string())
-                                ));
-                                continue;
-                            }
-                            app.refresh_inflight = false;
-                            match result {
-                                Ok(tasks) => {
+                        app::AppEvent::TasksLoaded { generation, env, result } => {
+                            match app.apply_tasks_loaded(generation, env.as_deref(), result) {
+                                app::TasksLoadedOutcome::Stale => {
+                                    append_error_log(format!(
+                                        "refresh.drop: generation={} current_generation={} env={} current_env={}",
+                                        generation,
+                                        app.list_generation,
+                                        env.clone().unwrap_or_else(|| "<all>".to_string()),
+                                        app.env_filter
+                                            .clone()
+                                            .unwrap_or_else(|| "<all>".to_string())
+                                    ));
+                                    continue;
+                                }
+                                app::TasksLoadedOutcome::Loaded { count } => {
                                     append_error_log(format!(
                                         "refresh.apply: env={} count={}",
                                         env.clone().unwrap_or_else(|| "<all>".to_string()),
-                                        tasks.len()
+                                        count
                                     ));
-                                    app.tasks = tasks;
-                                    if app.selected >= app.tasks.len() { app.selected = app.tasks.len().saturating_sub(1); }
-                                    app.status = "Loaded tasks".to_string();
                                 }
-                                Err(e) => {
-                                    append_error_log(format!("refresh load_tasks failed: {e}"));
-                                    app.status = format!("Failed to load tasks: {e}");
+                                app::TasksLoadedOutcome::Failed { error } => {
+                                    append_error_log(format!("refresh load_tasks failed: {error}"));
                                 }
                             }
                             needs_redraw = true;
@@ -1033,16 +1063,8 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                     app.new_task = None;
                                     // Refresh tasks in background for current filter
                                     app.status = format!("Submitted as {} — refreshing…", created.id.0);
-                                    app.refresh_inflight = true;
-                                    app.list_generation = app.list_generation.saturating_add(1);
                                     needs_redraw = true;
-                                    let backend = Arc::clone(&backend);
-                                    let tx = tx.clone();
-                                    let env_sel = app.env_filter.clone();
-                                    tokio::spawn(async move {
-                                        let res = app::load_tasks(&*backend, env_sel.as_deref()).await;
-                                        let _ = tx.send(app::AppEvent::TasksLoaded { env: env_sel, result: res });
-                                    });
+                                    spawn_task_list_refresh(&mut app, &backend, &tx);
                                     let _ = frame_tx.send(Instant::now());
                                 }
                                 Err(msg) => {
@@ -1103,32 +1125,28 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                     }
                                     app.env_filter = Some(sel.id);
                                     app.status = "Loading tasks…".to_string();
-                                    app.refresh_inflight = true;
-                                    app.list_generation = app.list_generation.saturating_add(1);
                                     app.in_flight.clear();
                             // reset spinner state
                                     needs_redraw = true;
-                                    {
-                                        let backend = Arc::clone(&backend);
-                                        let tx = tx.clone();
-                                        let env_sel = app.env_filter.clone();
-                                        tokio::spawn(async move {
-                                            let res = app::load_tasks(&*backend, env_sel.as_deref()).await;
-                                            let _ = tx.send(app::AppEvent::TasksLoaded { env: env_sel, result: res });
-                                        });
-                                    }
+                                    spawn_task_list_refresh(&mut app, &backend, &tx);
                                     // Proactively fetch environments to resolve a friendly name for the header.
                                     app.env_loading = true;
                                     {
                                         let tx = tx.clone();
                                         let base_url = Arc::clone(&base_url);
                                         let auth_manager = auth_manager.clone();
+                                        let environment_http_client = environment_http_client.clone();
                                         tokio::spawn(async move {
                                             let headers = build_chatgpt_headers(
                                                 auth_manager.as_deref(),
                                             )
                                             .await;
-                                            let res = crate::env_detect::list_environments(base_url.as_ref(), &headers).await;
+                                            let res = crate::env_detect::list_environments(
+                                                &environment_http_client,
+                                                base_url.as_ref(),
+                                                &headers,
+                                            )
+                                            .await;
                                             let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
                                         });
                                     }
@@ -1339,13 +1357,7 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                         app.apply_modal = None;
                                         app.diff_overlay = None;
                                         // Refresh tasks after successful apply
-                                        let backend = Arc::clone(&backend);
-                                        let tx = tx.clone();
-                                        let env_sel = app.env_filter.clone();
-                                        tokio::spawn(async move {
-                                            let res = app::load_tasks(&*backend, env_sel.as_deref()).await;
-                                            let _ = tx.send(app::AppEvent::TasksLoaded { env: env_sel, result: res });
-                                        });
+                                        spawn_task_list_refresh(&mut app, &backend, &tx);
                                     }
                                 }
                                 Err(e) => {
@@ -1510,12 +1522,18 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                     let tx = tx.clone();
                                     let base_url = Arc::clone(&base_url);
                                     let auth_manager = auth_manager.clone();
+                                    let environment_http_client = environment_http_client.clone();
                                     tokio::spawn(async move {
                                         let headers = build_chatgpt_headers(
                                             auth_manager.as_deref(),
                                         )
                                         .await;
-                                        let res = crate::env_detect::list_environments(base_url.as_ref(), &headers).await;
+                                        let res = crate::env_detect::list_environments(
+                                            &environment_http_client,
+                                            base_url.as_ref(),
+                                            &headers,
+                                        )
+                                        .await;
                                         let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
                                     });
                             }
@@ -1700,12 +1718,18 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                         let tx = tx.clone();
                                         let base_url = Arc::clone(&base_url);
                                         let auth_manager = auth_manager.clone();
+                                        let environment_http_client = environment_http_client.clone();
                                         tokio::spawn(async move {
                                             let headers = build_chatgpt_headers(
                                                 auth_manager.as_deref(),
                                             )
                                             .await;
-                                            let res = crate::env_detect::list_environments(base_url.as_ref(), &headers).await;
+                                            let res = crate::env_detect::list_environments(
+                                                &environment_http_client,
+                                                base_url.as_ref(),
+                                                &headers,
+                                            )
+                                            .await;
                                             let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
                                         });
                                     }
@@ -1818,18 +1842,10 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                         }
                                         // Trigger tasks refresh with the selected filter
                                         app.status = "Loading tasks…".to_string();
-                                        app.refresh_inflight = true;
-                                        app.list_generation = app.list_generation.saturating_add(1);
                                         app.in_flight.clear();
                                         // reset spinner state
                                         needs_redraw = true;
-                                        let backend = Arc::clone(&backend);
-                                        let tx = tx.clone();
-                                        let env_sel = app.env_filter.clone();
-                                        tokio::spawn(async move {
-                                            let res = app::load_tasks(&*backend, env_sel.as_deref()).await;
-                                            let _ = tx.send(app::AppEvent::TasksLoaded { env: env_sel, result: res });
-                                        });
+                                        spawn_task_list_refresh(&mut app, &backend, &tx);
                                     }
                                 }
                                 _ => {}
@@ -1856,19 +1872,11 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                         app.env_filter.clone().unwrap_or_else(|| "<all>".to_string())
                                     ));
                                     app.status = "Refreshing…".to_string();
-                                    app.refresh_inflight = true;
-                                    app.list_generation = app.list_generation.saturating_add(1);
                                     app.in_flight.clear();
                                         // reset spinner state
                                     needs_redraw = true;
                                     // Spawn background refresh
-                                    let backend = Arc::clone(&backend);
-                                    let tx = tx.clone();
-                                    let env_sel = app.env_filter.clone();
-                                    tokio::spawn(async move {
-                                        let res = app::load_tasks(&*backend, env_sel.as_deref()).await;
-                                        let _ = tx.send(app::AppEvent::TasksLoaded { env: env_sel, result: res });
-                                    });
+                                    spawn_task_list_refresh(&mut app, &backend, &tx);
                                 }
                                 KeyCode::Char('o') | KeyCode::Char('O') => {
                                     app.env_modal = Some(app::EnvModalState { query: String::new(), selected: 0 });
@@ -1880,12 +1888,18 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                                     let tx = tx.clone();
                                     let base_url = Arc::clone(&base_url);
                                     let auth_manager = auth_manager.clone();
+                                    let environment_http_client = environment_http_client.clone();
                                     tokio::spawn(async move {
                                         let headers = build_chatgpt_headers(
                                             auth_manager.as_deref(),
                                         )
                                         .await;
-                                        let res = crate::env_detect::list_environments(base_url.as_ref(), &headers).await;
+                                        let res = crate::env_detect::list_environments(
+                                            &environment_http_client,
+                                            base_url.as_ref(),
+                                            &headers,
+                                        )
+                                        .await;
                                         let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
                                     });
                                     }

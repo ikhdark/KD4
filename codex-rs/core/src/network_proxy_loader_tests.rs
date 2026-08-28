@@ -18,6 +18,17 @@ use std::collections::BTreeMap;
 use std::fs;
 use tempfile::tempdir;
 
+#[tokio::test(flavor = "current_thread")]
+async fn confirmed_performance_config_metadata_probe_uses_blocking_pool() {
+    let async_thread = std::thread::current().id();
+
+    let blocking_thread = run_blocking_config_probe(|| std::thread::current().id())
+        .await
+        .unwrap();
+
+    assert_ne!(blocking_thread, async_thread);
+}
+
 #[test]
 fn higher_precedence_profile_network_overlays_domain_entries() {
     let lower_network: toml::Value = toml::from_str(
@@ -261,7 +272,7 @@ async fn malformed_custom_rules_preserve_managed_denied_domain() {
     )
     .expect("layer stack should be valid");
 
-    let state = build_config_state_from_layers(&layers)
+    let state = build_config_state_from_layers(&layers, temp_dir.path())
         .await
         .expect("proxy state should tolerate malformed custom rules");
 

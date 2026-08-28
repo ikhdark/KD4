@@ -53,7 +53,9 @@ async fn timed_out_request(partial_response: Option<&'static [u8]>) -> io::Error
             .expect("test should report request completion");
     });
 
+    let client = create_client_without_request_logging().expect("test HTTP client");
     let err = send_remote_control_server_request::<_, serde_json::Value>(
+        &client,
         &url,
         &auth(),
         "installation-id",

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use uuid::Uuid;
 
 use crate::ExecServerError;
 use crate::ExecServerRuntimePaths;
@@ -412,6 +413,7 @@ fn optional_environment_value(name: &str) -> Option<String> {
 /// paths used by filesystem helpers.
 #[derive(Clone)]
 pub struct Environment {
+    approval_scope_id: String,
     exec_server_url: Option<String>,
     remote_client: Option<LazyRemoteExecServerClient>,
     // Dropping the environment stops unfinished background startup work.
@@ -426,6 +428,7 @@ impl Environment {
     /// Builds a test-only local environment without configured sandbox helper paths.
     pub fn default_for_tests() -> Self {
         Self {
+            approval_scope_id: Uuid::new_v4().to_string(),
             exec_server_url: None,
             remote_client: None,
             startup_task: Arc::new(Mutex::new(None)),
@@ -491,6 +494,7 @@ impl Environment {
 
     pub(crate) fn local(local_runtime_paths: ExecServerRuntimePaths) -> Self {
         Self {
+            approval_scope_id: Uuid::new_v4().to_string(),
             exec_server_url: None,
             remote_client: None,
             startup_task: Arc::new(Mutex::new(None)),
@@ -536,6 +540,7 @@ impl Environment {
             Arc::new(RemoteFileSystem::new(client.clone()));
 
         Self {
+            approval_scope_id: Uuid::new_v4().to_string(),
             exec_server_url,
             remote_client: Some(client.clone()),
             startup_task: Arc::new(Mutex::new(None)),
@@ -548,6 +553,12 @@ impl Environment {
 
     pub fn is_remote(&self) -> bool {
         self.remote_client.is_some()
+    }
+
+    /// Returns the opaque identity used to scope reusable approvals to this
+    /// concrete environment instance.
+    pub fn approval_scope_id(&self) -> &str {
+        &self.approval_scope_id
     }
 
     /// Returns the remote exec-server URL when this environment is remote.
@@ -601,14 +612,14 @@ impl Environment {
         }
     }
 
-    /// Returns whether initial startup has either succeeded or permanently failed.
+    /// Returns whether the initial startup attempt has completed.
     pub fn startup_finished(&self) -> bool {
         self.remote_client
             .as_ref()
             .is_none_or(LazyRemoteExecServerClient::startup_finished)
     }
 
-    /// Waits for initial startup. A failed startup is never attempted again.
+    /// Waits for initial startup, retrying a previous transient failure when possible.
     pub async fn wait_until_ready(&self) -> Result<(), ExecServerError> {
         match &self.remote_client {
             Some(client) => client.wait_until_ready().await,
@@ -663,9 +674,14 @@ mod tests {
     use crate::environment_provider::EnvironmentDefault;
     use crate::environment_provider::EnvironmentProviderSnapshot;
     use codex_utils_path_uri::PathUri;
+    use futures::SinkExt;
+    use futures::StreamExt;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
     use tokio::net::TcpListener;
     use tokio::time::timeout;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::Message;
 
     fn test_runtime_paths() -> ExecServerRuntimePaths {
         ExecServerRuntimePaths::new(std::env::current_exe().expect("current exe"))
@@ -1059,6 +1075,7 @@ mod tests {
         assert!(second.is_remote());
         assert_eq!(second.exec_server_url(), Some("ws://127.0.0.1:9876"));
         assert!(!Arc::ptr_eq(&first, &second));
+        assert_ne!(first.approval_scope_id(), second.approval_scope_id());
     }
 
     #[tokio::test]
@@ -1080,6 +1097,159 @@ mod tests {
             .await
             .expect("environment should start connecting when registered")
             .expect("accept connection");
+    }
+
+    #[tokio::test]
+    async fn rejects_non_windows_before_process_or_filesystem_access() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket listener");
+        let environment = Environment::remote_inner(
+            format!("ws://{}", listener.local_addr().expect("listener address")),
+            /*local_runtime_paths*/ None,
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("connection");
+            let mut websocket = accept_async(stream).await.expect("websocket handshake");
+
+            let initialize = websocket
+                .next()
+                .await
+                .expect("initialize frame")
+                .expect("initialize frame should read");
+            let Message::Text(initialize) = initialize else {
+                panic!("expected initialize text frame");
+            };
+            let initialize: serde_json::Value =
+                serde_json::from_str(initialize.as_ref()).expect("initialize JSON");
+            assert_eq!(initialize["method"], "initialize");
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": initialize["id"],
+                        "result": { "sessionId": "non-windows-session" }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("initialize response");
+
+            let initialized = websocket
+                .next()
+                .await
+                .expect("initialized frame")
+                .expect("initialized frame should read");
+            let Message::Text(initialized) = initialized else {
+                panic!("expected initialized text frame");
+            };
+            let initialized: serde_json::Value =
+                serde_json::from_str(initialized.as_ref()).expect("initialized JSON");
+            assert_eq!(initialized["method"], "initialized");
+
+            let environment_info = websocket
+                .next()
+                .await
+                .expect("environment info frame")
+                .expect("environment info frame should read");
+            let Message::Text(environment_info) = environment_info else {
+                panic!("expected environment info text frame");
+            };
+            let environment_info: serde_json::Value =
+                serde_json::from_str(environment_info.as_ref()).expect("environment info JSON");
+            assert_eq!(environment_info["method"], "environment/info");
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": environment_info["id"],
+                        "result": {
+                            "operatingSystem": "linux",
+                            "shell": {
+                                "name": "powershell",
+                                "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+                            },
+                            "cwd": "file:///C:/workspace"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("environment info response");
+
+            loop {
+                match timeout(Duration::from_millis(250), websocket.next()).await {
+                    Err(_) | Ok(None) | Ok(Some(Ok(Message::Close(_)))) => break,
+                    Ok(Some(Ok(Message::Ping(payload)))) => websocket
+                        .send(Message::Pong(payload))
+                        .await
+                        .expect("pong should write"),
+                    Ok(Some(Ok(Message::Pong(_)))) => {}
+                    Ok(Some(Ok(Message::Text(message)))) => {
+                        let request: serde_json::Value = serde_json::from_str(message.as_ref())
+                            .expect("post-rejection request JSON");
+                        panic!(
+                            "non-Windows startup must reject before process/filesystem access, got {}",
+                            request["method"]
+                        );
+                    }
+                    Ok(Some(Ok(Message::Binary(message)))) => {
+                        let request: serde_json::Value = serde_json::from_slice(message.as_ref())
+                            .expect("post-rejection request JSON");
+                        panic!(
+                            "non-Windows startup must reject before process/filesystem access, got {}",
+                            request["method"]
+                        );
+                    }
+                    Ok(Some(Ok(Message::Frame(_)))) => {}
+                    // Startup rejection may tear down the websocket without a
+                    // close handshake. Any process or filesystem request would
+                    // have arrived as a text or binary frame above.
+                    Ok(Some(Err(_))) => break,
+                }
+            }
+        });
+
+        let exec_backend = environment.get_exec_backend();
+        let filesystem = environment.get_filesystem();
+        let metadata_path =
+            PathUri::parse("file:///C:/workspace/file.txt").expect("Windows metadata path URI");
+        let process = exec_backend.start(crate::ExecParams {
+            process_id: ProcessId::from("must-not-start"),
+            argv: successful_process_argv(),
+            cwd: PathUri::parse("file:///C:/workspace").expect("Windows cwd URI"),
+            env_policy: None,
+            env: Default::default(),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
+        });
+        let metadata = filesystem.get_metadata(&metadata_path, /*sandbox*/ None);
+        let (process_result, metadata_result) = tokio::join!(process, metadata);
+
+        let Err(process_error) = process_result else {
+            panic!("process access must reject");
+        };
+        assert!(
+            process_error
+                .to_string()
+                .contains("unsupported operating system `linux`")
+        );
+        let Err(metadata_error) = metadata_result else {
+            panic!("filesystem access must reject");
+        };
+        assert!(
+            metadata_error
+                .to_string()
+                .contains("unsupported operating system `linux`")
+        );
+        timeout(Duration::from_secs(1), server)
+            .await
+            .expect("mock server should finish")
+            .expect("mock server should not panic");
     }
 
     #[tokio::test]

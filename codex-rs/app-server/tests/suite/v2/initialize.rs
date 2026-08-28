@@ -190,8 +190,8 @@ async fn initialize_response_includes_local_runtime_metadata() -> Result<()> {
     let message = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.initialize_with_client_info(ClientInfo {
-            name: "codex_vscode".to_string(),
-            title: Some("Codex VS Code Extension".to_string()),
+            name: "codex_desktop".to_string(),
+            title: Some("Codex Desktop".to_string()),
             version: "0.1.0".to_string(),
         }),
     )
@@ -232,6 +232,60 @@ async fn initialize_response_includes_local_runtime_metadata() -> Result<()> {
     assert_eq!(local_watermark.version, "kd4");
     assert_eq!(local_watermark.label, "Codex KD4");
     assert!(local_watermark.detail.contains("Local Codex KD4"));
+
+    let receipt_path = codex_home
+        .path()
+        .join("runtime/desktop-app-server-runtime.json");
+    fs_wait::wait_for_path_exists(&receipt_path, Duration::from_secs(5)).await?;
+    let receipt: Value = serde_json::from_slice(&std::fs::read(receipt_path)?)?;
+    assert_eq!(receipt["schemaVersion"], 1);
+    assert_eq!(receipt["clientName"], "codex_desktop");
+    assert_eq!(
+        receipt["codexHome"],
+        codex_home.path().to_string_lossy().as_ref()
+    );
+    assert_eq!(receipt["buildCommit"], build_info.commit);
+    assert_eq!(receipt["buildBuilt"], build_info.built);
+    assert!(receipt["pid"].as_u64().is_some_and(|pid| pid > 0));
+    assert!(
+        receipt["executablePath"]
+            .as_str()
+            .is_some_and(|path| !path.is_empty())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn initialize_non_desktop_client_does_not_write_desktop_runtime_receipt() -> Result<()> {
+    let responses = Vec::new();
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.initialize_with_client_info(ClientInfo {
+            name: "codex_vscode".to_string(),
+            title: Some("Codex VS Code Extension".to_string()),
+            version: "0.1.0".to_string(),
+        }),
+    )
+    .await??;
+
+    let receipt_path = codex_home
+        .path()
+        .join("runtime/desktop-app-server-runtime.json");
+    let receipt = fs_wait::wait_for_path_exists(&receipt_path, Duration::from_secs(1)).await;
+    assert!(
+        receipt.is_err(),
+        "non-Desktop client wrote {receipt_path:?}"
+    );
 
     Ok(())
 }

@@ -18,6 +18,13 @@ use zip::CompressionMethod;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
+fn test_http_clients() -> RouteAwareClientPool {
+    create_client_pool_without_request_logging(
+        HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+        ClientRouteClass::Api,
+    )
+}
+
 #[test]
 fn git_command_sanitizes_ambient_repository_environment() {
     let command = git_command(Path::new("git"));
@@ -108,6 +115,7 @@ async fn run_sync_with_transport_overrides(
     let git_binary = git_binary.into();
     let api_base_url = api_base_url.into();
     let backup_archive_api_url = backup_archive_api_url.into();
+    let http_clients = test_http_clients();
     tokio::task::spawn_blocking(move || {
         let git_binary = PathBuf::from(git_binary);
         sync_openai_plugins_repo_with_transport_overrides(
@@ -115,6 +123,7 @@ async fn run_sync_with_transport_overrides(
             Some(git_binary.as_path()),
             &api_base_url,
             &backup_archive_api_url,
+            &http_clients,
         )
     })
     .await
@@ -128,12 +137,14 @@ async fn run_sync_without_git(
 ) -> Result<String, String> {
     let api_base_url = api_base_url.into();
     let backup_archive_api_url = backup_archive_api_url.into();
+    let http_clients = test_http_clients();
     tokio::task::spawn_blocking(move || {
         sync_openai_plugins_repo_with_transport_overrides(
             codex_home.as_path(),
             /*git_binary*/ None,
             &api_base_url,
             &backup_archive_api_url,
+            &http_clients,
         )
     })
     .await
@@ -145,8 +156,13 @@ async fn run_http_sync(
     api_base_url: impl Into<String>,
 ) -> Result<String, String> {
     let api_base_url = api_base_url.into();
+    let http_clients = test_http_clients();
     tokio::task::spawn_blocking(move || {
-        sync_openai_plugins_repo_via_http(codex_home.as_path(), &api_base_url)
+        sync_openai_plugins_repo_via_http_with_clients(
+            codex_home.as_path(),
+            &api_base_url,
+            &http_clients,
+        )
     })
     .await
     .expect("sync task should join")
@@ -222,6 +238,43 @@ async fn sync_openai_plugins_repo_uses_http_without_git_transport() {
     )
     .await
     .expect("HTTP sync should succeed");
+
+    assert_eq!(synced_sha, sha);
+    assert_curated_gmail_repo(&curated_plugins_repo_path(tmp.path()));
+}
+
+#[tokio::test]
+async fn startup_sync_http_fallback_uses_configured_proxy_routes() {
+    let tmp = tempdir().expect("tempdir");
+    let proxy = MockServer::start().await;
+    let sha = "9876543210abcdef9876543210abcdef98765432";
+    mount_github_repo_and_ref(&proxy, sha).await;
+    mount_github_zipball(&proxy, sha, curated_repo_zipball_bytes(sha)).await;
+    let api_base_url = "http://curated-sync.test";
+    for request_url in [
+        format!("{api_base_url}/repos/openai/plugins"),
+        format!("{api_base_url}/repos/openai/plugins/git/ref/heads/main"),
+        format!("{api_base_url}/repos/openai/plugins/zipball/{sha}"),
+    ] {
+        codex_http_client::cache_system_proxy_route_for_test(&request_url, proxy.uri());
+    }
+    let http_clients = create_client_pool_without_request_logging(
+        HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::RespectSystemProxy),
+        ClientRouteClass::Api,
+    );
+    let codex_home = tmp.path().to_path_buf();
+    let synced_sha = tokio::task::spawn_blocking(move || {
+        sync_openai_plugins_repo_with_transport_overrides(
+            &codex_home,
+            /*git_binary*/ None,
+            api_base_url,
+            "http://127.0.0.1:9/backend-api/plugins/export/curated",
+            &http_clients,
+        )
+    })
+    .await
+    .expect("sync task should join")
+    .expect("startup sync should use configured proxy routes");
 
     assert_eq!(synced_sha, sha);
     assert_curated_gmail_repo(&curated_plugins_repo_path(tmp.path()));

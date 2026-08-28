@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use codex_git_utils::get_git_repo_root;
 use codex_protocol::models::ShellCommandToolCallParams;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathConvention;
 
 use crate::FunctionCallError;
 use crate::agent::task_capabilities::is_independent_review_source;
@@ -22,10 +22,11 @@ use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
-use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
+use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair_async;
 use crate::tools::handlers::command_search::classify_rg_search_narrowing;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
+use crate::tools::handlers::resolve_repository_root;
 use crate::tools::handlers::resolve_workdir_base_path;
 use crate::tools::handlers::rewrite_function_command_invocation;
 use crate::tools::hook_names::HookToolName;
@@ -36,21 +37,18 @@ use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use crate::validation_admission::ValidationAdmission;
 use crate::validation_admission::ValidationLaunchPlan;
-use crate::validation_admission::ValidationLeader;
-use crate::validation_admission::ValidationLeaderOwnership;
-use crate::validation_admission::ValidationRegistration;
-use crate::validation_admission::admit_validation;
+use crate::validation_admission::admit_validation_invocations;
 use codex_tools::ToolSpec;
 
 use super::super::shell_spec::CommandToolOptions;
-use super::super::shell_spec::create_shell_command_tool;
+use super::super::shell_spec::create_shell_command_tool_for_policy;
+use super::super::unified_exec::ExecCommandHandler;
+use super::super::unified_exec::ExecCommandHandlerOptions;
 use super::RunExecLikeArgs;
-use super::ValidationProofPreparation;
-use super::ValidationProofPreparationArgs;
+use super::ValidationLaunchPreparationArgs;
 use super::parse_shell_command_hook_invocation;
-use super::prepare_validation_proof;
+use super::prepare_validation_launch;
 use super::run_exec_like;
-use super::shell_command_payload_command;
 use super::validation_environment_hash;
 use super::validation_structured_output;
 
@@ -67,39 +65,6 @@ pub(super) fn effective_stall_timeout_ms(
     (stall_timeout_ms < hard_timeout_ms).then_some(stall_timeout_ms)
 }
 
-#[derive(Default)]
-pub(super) struct ValidationRegistrationRoles {
-    pub(super) execution: Option<ValidationLeaderOwnership>,
-    pub(super) worker_waiter: Option<ValidationLeader>,
-    pub(super) owner_waiter: Option<ValidationLeader>,
-}
-
-pub(super) fn validation_registration_roles(
-    registration: ValidationRegistration,
-) -> ValidationRegistrationRoles {
-    match registration {
-        ValidationRegistration::Leader { execution, waiter } => ValidationRegistrationRoles {
-            execution: Some(*execution),
-            worker_waiter: None,
-            owner_waiter: Some(waiter),
-        },
-        ValidationRegistration::Follower(waiter) => ValidationRegistrationRoles {
-            execution: None,
-            worker_waiter: Some(waiter),
-            owner_waiter: None,
-        },
-    }
-}
-
-pub(super) async fn await_validation_execution<T>(
-    task: tokio::task::JoinHandle<T>,
-    owner_waiter: Option<ValidationLeader>,
-) -> Result<T, tokio::task::JoinError> {
-    let result = task.await;
-    drop(owner_waiter);
-    result
-}
-
 pub struct ShellCommandHandler {
     options: ShellCommandHandlerOptions,
 }
@@ -107,10 +72,46 @@ pub struct ShellCommandHandler {
 #[derive(Clone, Copy)]
 pub(crate) struct ShellCommandHandlerOptions {
     pub(crate) allow_login_shell: bool,
+    pub(crate) allow_escalated_sandbox_permissions: bool,
     pub(crate) exec_permission_approvals_enabled: bool,
 }
 
 impl ShellCommandHandler {
+    fn forward_arguments_to_unified_exec(
+        arguments: &str,
+        environment_id: &str,
+        allow_login_shell: bool,
+    ) -> Result<String, FunctionCallError> {
+        let mut value: serde_json::Value = serde_json::from_str(arguments).map_err(|err| {
+            FunctionCallError::RespondToModel(format!("invalid shell_command arguments: {err}"))
+        })?;
+        let object = value.as_object_mut().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "shell_command arguments must be a JSON object".to_string(),
+            )
+        })?;
+        if let Some(command) = object.remove("command") {
+            object.insert("cmd".to_string(), command);
+        }
+        object.insert(
+            "environment_id".to_string(),
+            serde_json::Value::String(environment_id.to_string()),
+        );
+        if !allow_login_shell && !object.contains_key("login") {
+            object.insert("login".to_string(), serde_json::Value::Bool(false));
+        }
+        if !object.contains_key("yield_time_ms")
+            && let Some(timeout_ms) = object.get("timeout_ms").cloned()
+        {
+            object.insert("yield_time_ms".to_string(), timeout_ms);
+        }
+        serde_json::to_string(&value).map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to forward shell_command arguments: {err}"
+            ))
+        })
+    }
+
     pub(super) fn effective_allow_login_shell(
         session_source: &codex_protocol::protocol::SessionSource,
         allow_login_shell: bool,
@@ -137,7 +138,9 @@ impl ShellCommandHandler {
 
     #[cfg(test)]
     pub(super) fn base_command(shell: &Shell, command: &str, use_login_shell: bool) -> Vec<String> {
-        shell.derive_exec_args(command, use_login_shell)
+        shell
+            .derive_exec_args(command, use_login_shell)
+            .expect("test shell must be executable on Windows")
     }
 
     #[cfg(test)]
@@ -176,7 +179,7 @@ impl ShellCommandHandler {
         shell: &Shell,
     ) -> Result<ExecParams, FunctionCallError> {
         let use_login_shell = Self::resolve_use_login_shell(params.login, allow_login_shell)?;
-        let command = invocation.to_exec_args(shell, use_login_shell);
+        let command = invocation.to_exec_args(shell, use_login_shell)?;
 
         let mut env = create_env(
             &turn_context.config.permissions.shell_environment_policy,
@@ -187,6 +190,7 @@ impl ShellCommandHandler {
 
         Ok(ExecParams {
             command,
+            codex_home: turn_context.config.codex_home.clone(),
             cwd,
             expiration: params.timeout_ms.into(),
             capture_policy: ExecCapturePolicy::ShellTool,
@@ -209,6 +213,7 @@ impl Default for ShellCommandHandler {
     fn default() -> Self {
         Self::new(ShellCommandHandlerOptions {
             allow_login_shell: false,
+            allow_escalated_sandbox_permissions: false,
             exec_permission_approvals_enabled: false,
         })
     }
@@ -220,10 +225,13 @@ impl ToolExecutor<ToolInvocation> for ShellCommandHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_shell_command_tool(CommandToolOptions {
-            allow_login_shell: self.options.allow_login_shell,
-            exec_permission_approvals_enabled: self.options.exec_permission_approvals_enabled,
-        })
+        create_shell_command_tool_for_policy(
+            CommandToolOptions {
+                allow_login_shell: self.options.allow_login_shell,
+                exec_permission_approvals_enabled: self.options.exec_permission_approvals_enabled,
+            },
+            self.options.allow_escalated_sandbox_permissions,
+        )
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
@@ -238,8 +246,44 @@ impl ToolExecutor<ToolInvocation> for ShellCommandHandler {
 impl ShellCommandHandler {
     pub(crate) async fn handle_call(
         &self,
-        invocation: ToolInvocation,
+        mut invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let Some(turn_environment) = invocation.step_context.environments.primary().cloned() else {
+            return Err(FunctionCallError::RespondToModel(
+                "shell is unavailable in this session".to_string(),
+            ));
+        };
+        let cwd_uses_native_convention =
+            turn_environment.cwd().infer_path_convention() == Some(PathConvention::native());
+        if !cwd_uses_native_convention {
+            let turn = &invocation.step_context.turn;
+            let allow_login_shell = Self::effective_allow_login_shell(
+                &turn.session_source,
+                turn.config.permissions.allow_login_shell,
+            );
+            let ToolPayload::Function { arguments } = &mut invocation.payload else {
+                return Err(FunctionCallError::RespondToModel(
+                    "unsupported payload for shell_command handler".to_string(),
+                ));
+            };
+            *arguments = Self::forward_arguments_to_unified_exec(
+                arguments,
+                &turn_environment.environment_id,
+                allow_login_shell,
+            )?;
+            return ExecCommandHandler::new(ExecCommandHandlerOptions {
+                allow_login_shell: self.options.allow_login_shell,
+                allow_escalated_sandbox_permissions: self
+                    .options
+                    .allow_escalated_sandbox_permissions,
+                exec_permission_approvals_enabled: self.options.exec_permission_approvals_enabled,
+                include_environment_id: true,
+                include_shell_parameter: true,
+            })
+            .handle_call(invocation)
+            .await;
+        }
+
         let ToolInvocation {
             session,
             step_context,
@@ -256,12 +300,6 @@ impl ShellCommandHandler {
             return Err(FunctionCallError::RespondToModel(format!(
                 "unsupported payload for shell_command handler: {tool_name}"
             )));
-        };
-
-        let Some(turn_environment) = step_context.environments.primary().cloned() else {
-            return Err(FunctionCallError::RespondToModel(
-                "shell is unavailable in this session".to_string(),
-            ));
         };
 
         let environment_cwd = turn_environment.cwd().to_abs_path().map_err(|err| {
@@ -294,33 +332,31 @@ impl ShellCommandHandler {
             session_shell.as_ref(),
         )?;
         let original_safety_command =
-            original_invocation.to_safety_args(&original_safety_shell, use_login_shell);
+            original_invocation.to_safety_args(&original_safety_shell, use_login_shell)?;
         let original_shell_type = if original_invocation.is_argv() {
             None
         } else {
             Some(original_safety_shell.shell_type)
         };
-        let preflight = preflight_invocation_with_equivalent_repair(
+        let preflight = preflight_invocation_with_equivalent_repair_async(
             &original_invocation,
             &original_safety_command,
             original_shell_type,
         )
+        .await
         .map_err(|issue| {
             FunctionCallError::RespondToModel(format!(
                 "{issue}\nRegenerate the command and call `shell_command` again."
             ))
         })?;
         let command_repaired = preflight.repaired();
+        let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
-        let repair_notice = preflight.repair_notice;
-        let git_repository = get_git_repo_root(cwd.as_path());
-        let repository = git_repository.clone().unwrap_or_else(|| cwd.to_path_buf());
-        let repository_key = repository.to_string_lossy();
-        let validation_admission = admit_validation(
+        let mut repair_notice = preflight.repair_notice;
+        let validation_admission = admit_validation_invocations(
             &turn.validation_authorization,
-            session.services.state_db.as_deref(),
-            repository_key.as_bytes(),
-            &command_invocation,
+            &validation_invocations,
+            params.validation.is_some(),
         )
         .await;
         let mut validation_launch = match validation_admission {
@@ -338,31 +374,47 @@ impl ShellCommandHandler {
             }
             ValidationAdmission::Execute {
                 authorization_revision,
-                observation,
-            } => observation.map(|observation| ValidationLaunchPlan {
-                invocation: command_invocation.clone(),
+                is_validation,
+                classification,
+            } => is_validation.then(|| ValidationLaunchPlan {
+                classification,
                 authorization_revision,
-                observation: Some(observation),
-                proof_key: None,
+                explicitly_tagged: params.validation.is_some(),
                 structured_route: None,
                 bound_plan_step: None,
+                bound_work_unit: None,
                 validation_call_id: None,
                 turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
-                force_fresh: params.force_fresh.unwrap_or(false),
+                focused_validation_token: None,
             }),
         };
+        super::downgrade_unattributed_validation(
+            &mut validation_launch,
+            params.validation.is_some(),
+            &mut repair_notice,
+        );
         let direct_validation_route = if validation_launch.is_some() {
             let context = params.validation.as_ref().ok_or_else(|| {
                 FunctionCallError::RespondToModel(
-                    "validation commands require `validation` metadata stating the uncertainty, covered_paths, and covered_contracts"
+                    "validation commands require direct argv and `validation.covered_paths`"
                         .to_string(),
+                )
+            })?;
+            let validation_repository = super::validation_repository_root_if_needed(
+                true,
+                cwd.as_path(),
+                turn.config.cwd.as_path(),
+            );
+            let repository = validation_repository.as_ref().ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "validation effective cwd must be inside a repository".to_string(),
                 )
             })?;
             Some(
                 super::direct_validation_route(
                     context,
                     &command_invocation,
-                    &repository,
+                    repository,
                     params.timeout_ms.unwrap_or(10_000),
                 )
                 .map_err(FunctionCallError::RespondToModel)?,
@@ -383,14 +435,15 @@ impl ShellCommandHandler {
             original_safety_shell
         };
         let safety_command = if command_repaired {
-            command_invocation.to_safety_args(&safety_shell, use_login_shell)
+            command_invocation.to_safety_args(&safety_shell, use_login_shell)?
         } else {
             original_safety_command.clone()
         };
-        let shell_type = if command_invocation.is_argv() {
-            None
-        } else {
+        let shell_wrapper_is_owned = !command_invocation.is_argv();
+        let shell_type = if shell_wrapper_is_owned {
             Some(safety_shell.shell_type)
+        } else {
+            None
         };
         let is_powershell_script = command_invocation.is_powershell_script();
         let exec_params = Self::to_exec_params_with_shell(
@@ -436,74 +489,59 @@ impl ShellCommandHandler {
             )
             .await;
         let validation_cwd = exec_params.cwd.to_string_lossy().into_owned();
-        let ValidationRegistrationRoles {
-            execution: validation_leader,
-            worker_waiter: validation_waiter,
-            owner_waiter: validation_owner_waiter,
-        } = match prepare_validation_proof(ValidationProofPreparationArgs {
+        prepare_validation_launch(ValidationLaunchPreparationArgs {
             session: session.as_ref(),
-            turn: turn.as_ref(),
             validation_launch: &mut validation_launch,
             direct_validation_route: direct_validation_route.as_ref(),
-            repository_key: repository_key.as_bytes(),
-            cwd: &validation_cwd,
-            command_invocation: &command_invocation,
-            environment: &exec_params.env,
-            environment_hash: &environment_hash,
-            execution_context: &runtime_context,
-            repository_epoch,
             call_id: &call_id,
-            cancellation_token: &cancellation_token,
-            force_fresh: params.force_fresh.unwrap_or(false),
         })
-        .await?
-        {
-            ValidationProofPreparation::NotValidation => ValidationRegistrationRoles::default(),
-            ValidationProofPreparation::Reused(output) => return Ok(boxed_tool_output(output)),
-            ValidationProofPreparation::Registered(registration) => {
-                validation_registration_roles(registration)
-            }
-        };
-        let attempt_key = CommandAttemptKey::new(
-            tool_name.name.as_str(),
-            &turn_environment.environment_id,
-            validation_cwd,
-            &exec_params.command,
-        )
-        .with_environment_fingerprint(&environment_hash)
-        .with_timeout_ms(exec_params.expiration.timeout_ms())
-        .with_sandbox_context(&sandbox_context)
-        .with_input_context(&prefix_rule)
-        .with_runtime_context(&runtime_context)
-        .with_repository_epoch(repository_epoch)
-        .with_workspace_identity(workspace_identity.as_deref());
-        let search = classify_rg_search_narrowing(
-            &safety_command,
-            shell_type,
-            exec_params.cwd.as_path(),
-            &repository,
-        )
-        .map_err(FunctionCallError::RespondToModel)?;
-        let attempt_key = attempt_key.with_search_narrowing(
-            &turn.sub_id,
-            repository.to_string_lossy().as_ref(),
-            search,
-        );
-        session
-            .services
-            .command_execution
-            .admit_search_narrowing(&attempt_key)
-            .await
+        .await?;
+        let attempt_key = if validation_launch.is_none() {
+            let repository = resolve_repository_root(exec_params.cwd.as_path());
+            let attempt_key = CommandAttemptKey::new(
+                tool_name.name.as_str(),
+                &turn_environment.environment_id,
+                validation_cwd,
+                &exec_params.command,
+            )
+            .with_environment_fingerprint(&environment_hash)
+            .with_timeout_ms(exec_params.expiration.timeout_ms())
+            .with_sandbox_context(&sandbox_context)
+            .with_input_context(&prefix_rule)
+            .with_runtime_context(&runtime_context)
+            .with_repository_epoch(repository_epoch)
+            .with_workspace_identity(workspace_identity.as_deref());
+            let search = classify_rg_search_narrowing(
+                &safety_command,
+                shell_type,
+                exec_params.cwd.as_path(),
+                &repository,
+            )
             .map_err(FunctionCallError::RespondToModel)?;
-        let mut run_args = RunExecLikeArgs {
+            let attempt_key = attempt_key.with_search_narrowing(
+                &turn.sub_id,
+                repository.to_string_lossy().as_ref(),
+                search,
+            );
+            session
+                .services
+                .command_execution
+                .admit_search_narrowing(&attempt_key)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+            Some(attempt_key)
+        } else {
+            None
+        };
+        let run_args = RunExecLikeArgs {
             tool_name,
             exec_params,
-            environment_hash,
             stall_timeout_ms,
             cancellation_token,
             hook_command,
             safety_command,
             shell_type,
+            shell_wrapper_is_owned,
             is_powershell_script,
             additional_permissions: params.additional_permissions.clone(),
             prefix_rule,
@@ -512,30 +550,14 @@ impl ShellCommandHandler {
             turn_environment,
             tracker,
             call_id,
-            track_validation_freshness: true,
-            attempt_key: Some(attempt_key),
+            track_command_mutations: true,
+            attempt_key,
             repair_notice,
+            command_repaired,
             force_fresh: params.force_fresh.unwrap_or(false),
             validation_launch,
-            validation_leader,
-            validation_waiter,
         };
-        if let Some(leader) = run_args.validation_leader.as_ref() {
-            run_args.cancellation_token = leader.cancellation_token();
-            await_validation_execution(
-                tokio::spawn(async move { run_exec_like(run_args).await }),
-                validation_owner_waiter,
-            )
-            .await
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "shared validation execution task failed: {error}"
-                ))
-            })?
-            .map(boxed_tool_output)
-        } else {
-            run_exec_like(run_args).await.map(boxed_tool_output)
-        }
+        run_exec_like(run_args).await.map(boxed_tool_output)
     }
 }
 
@@ -591,6 +613,11 @@ impl CoreToolRuntime for ShellCommandHandler {
             })
     }
 
+    fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
+        matches!(&invocation.payload, ToolPayload::Function { .. })
+            .then(HookToolName::shell_command)
+    }
+
     fn with_updated_hook_input(
         &self,
         mut invocation: ToolInvocation,
@@ -621,11 +648,14 @@ impl CoreToolRuntime for ShellCommandHandler {
     ) -> Option<PostToolUsePayload> {
         let tool_response =
             result.post_tool_use_response(&invocation.call_id, &invocation.payload)?;
-        let command = shell_command_payload_command(&invocation.payload)?;
+        let ToolPayload::Function { arguments } = &invocation.payload else {
+            return None;
+        };
+        let command = parse_shell_command_hook_invocation(arguments).ok()?;
         Some(PostToolUsePayload {
             tool_name: HookToolName::shell_command(),
             tool_use_id: invocation.call_id.clone(),
-            tool_input: serde_json::json!({ "command": command }),
+            tool_input: command.hook_input(),
             tool_response,
         })
     }

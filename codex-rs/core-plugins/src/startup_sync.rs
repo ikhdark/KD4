@@ -6,8 +6,10 @@ use std::process::Output;
 use std::process::Stdio;
 use std::time::Duration;
 
-use codex_http_client::HttpClient;
-use codex_http_client::RequestBuilder;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
+use codex_http_client::RouteAwareRequestBuilder;
 use codex_otel::CURATED_PLUGINS_STARTUP_SYNC_FINAL_METRIC;
 use codex_otel::CURATED_PLUGINS_STARTUP_SYNC_METRIC;
 use serde::Deserialize;
@@ -15,7 +17,7 @@ use tempfile::TempDir;
 use tracing::warn;
 use zip::ZipArchive;
 
-use codex_login::default_client::create_client_without_request_logging;
+use codex_login::default_client::create_client_pool_without_request_logging;
 
 const GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const GITHUB_API_ACCEPT_HEADER: &str = "application/vnd.github+json";
@@ -93,14 +95,20 @@ fn curated_plugins_sha_path(codex_home: &Path) -> PathBuf {
     codex_home.join(CURATED_PLUGINS_SHA_FILE)
 }
 
-pub fn sync_openai_plugins_repo(codex_home: &Path) -> Result<String, String> {
+pub fn sync_openai_plugins_repo(
+    codex_home: &Path,
+    http_client_factory: HttpClientFactory,
+) -> Result<String, String> {
     let git_binary = Some(PathBuf::from("git"));
+    let http_clients =
+        create_client_pool_without_request_logging(http_client_factory, ClientRouteClass::Api);
 
     sync_openai_plugins_repo_with_transport_overrides(
         codex_home,
         git_binary.as_deref(),
         GITHUB_API_BASE_URL,
         CURATED_PLUGINS_BACKUP_ARCHIVE_API_URL,
+        &http_clients,
     )
 }
 
@@ -109,6 +117,7 @@ fn sync_openai_plugins_repo_with_transport_overrides(
     git_binary: Option<&Path>,
     api_base_url: &str,
     backup_archive_api_url: &str,
+    http_clients: &RouteAwareClientPool,
 ) -> Result<String, String> {
     let _file_guard = lock_curated_plugins_startup_sync(codex_home)?;
 
@@ -129,7 +138,7 @@ fn sync_openai_plugins_repo_with_transport_overrides(
                 error = %err,
                 "git sync failed for curated plugin sync; falling back to GitHub HTTP"
             );
-            match sync_openai_plugins_repo_via_http(codex_home, api_base_url) {
+            match sync_openai_plugins_repo_via_http(codex_home, api_base_url, http_clients) {
                 Ok(remote_sha) => {
                     emit_curated_plugins_startup_sync_metric("http", "success");
                     emit_curated_plugins_startup_sync_final_metric("http", "success");
@@ -157,6 +166,7 @@ fn sync_openai_plugins_repo_with_transport_overrides(
                         let result = sync_openai_plugins_repo_via_backup_archive(
                             codex_home,
                             backup_archive_api_url,
+                            http_clients,
                         );
                         let status = if result.is_ok() { "success" } else { "failure" };
                         emit_curated_plugins_startup_sync_metric("export_archive", status);
@@ -314,6 +324,15 @@ fn run_git_in_repo(
 fn sync_openai_plugins_repo_via_http(
     codex_home: &Path,
     api_base_url: &str,
+    http_clients: &RouteAwareClientPool,
+) -> Result<String, String> {
+    sync_openai_plugins_repo_via_http_with_clients(codex_home, api_base_url, http_clients)
+}
+
+fn sync_openai_plugins_repo_via_http_with_clients(
+    codex_home: &Path,
+    api_base_url: &str,
+    http_clients: &RouteAwareClientPool,
 ) -> Result<String, String> {
     let repo_path = curated_plugins_repo_path(codex_home);
     let sha_path = codex_home.join(CURATED_PLUGINS_SHA_FILE);
@@ -321,7 +340,7 @@ fn sync_openai_plugins_repo_via_http(
         .enable_all()
         .build()
         .map_err(|err| format!("failed to create curated plugins sync runtime: {err}"))?;
-    let remote_sha = runtime.block_on(fetch_curated_repo_remote_sha(api_base_url))?;
+    let remote_sha = runtime.block_on(fetch_curated_repo_remote_sha(http_clients, api_base_url))?;
     let local_sha = read_sha_file(&sha_path);
 
     if local_sha.as_deref() == Some(remote_sha.as_str()) && repo_path.is_dir() {
@@ -329,7 +348,11 @@ fn sync_openai_plugins_repo_via_http(
     }
 
     let staged_repo_dir = prepare_curated_repo_parent_and_temp_dir(&repo_path)?;
-    let zipball_bytes = runtime.block_on(fetch_curated_repo_zipball(api_base_url, &remote_sha))?;
+    let zipball_bytes = runtime.block_on(fetch_curated_repo_zipball(
+        http_clients,
+        api_base_url,
+        &remote_sha,
+    ))?;
     extract_zipball_to_dir(&zipball_bytes, staged_repo_dir.path())?;
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
     activate_curated_repo(&repo_path, staged_repo_dir)?;
@@ -340,6 +363,7 @@ fn sync_openai_plugins_repo_via_http(
 fn sync_openai_plugins_repo_via_backup_archive(
     codex_home: &Path,
     backup_archive_api_url: &str,
+    http_clients: &RouteAwareClientPool,
 ) -> Result<String, String> {
     let repo_path = curated_plugins_repo_path(codex_home);
     let sha_path = curated_plugins_sha_path(codex_home);
@@ -350,6 +374,7 @@ fn sync_openai_plugins_repo_via_backup_archive(
     let staged_repo_dir = prepare_curated_repo_parent_and_temp_dir(&repo_path)?;
     let zipball_bytes = runtime.block_on(fetch_curated_repo_backup_archive_zip(
         backup_archive_api_url,
+        http_clients,
     ))?;
     extract_zipball_to_dir(&zipball_bytes, staged_repo_dir.path())?;
     ensure_marketplace_manifest_exists(staged_repo_dir.path())?;
@@ -735,12 +760,14 @@ fn ensure_git_success(output: &Output, context: &str) -> Result<(), String> {
     }
 }
 
-async fn fetch_curated_repo_remote_sha(api_base_url: &str) -> Result<String, String> {
+async fn fetch_curated_repo_remote_sha(
+    http_clients: &RouteAwareClientPool,
+    api_base_url: &str,
+) -> Result<String, String> {
     let api_base_url = api_base_url.trim_end_matches('/');
     let repo_url = format!("{api_base_url}/repos/{OPENAI_PLUGINS_OWNER}/{OPENAI_PLUGINS_REPO}");
-    let client = create_client_without_request_logging()
-        .map_err(|err| format!("failed to build HTTP client: {err}"))?;
-    let repo_body = fetch_github_text(&client, &repo_url, "get curated plugins repository").await?;
+    let repo_body =
+        fetch_github_text(http_clients, &repo_url, "get curated plugins repository").await?;
     let repo_summary: GitHubRepositorySummary =
         serde_json::from_str(&repo_body).map_err(|err| {
             format!("failed to parse curated plugins repository response from {repo_url}: {err}")
@@ -753,7 +780,7 @@ async fn fetch_curated_repo_remote_sha(api_base_url: &str) -> Result<String, Str
 
     let git_ref_url = format!("{repo_url}/git/ref/heads/{}", repo_summary.default_branch);
     let git_ref_body =
-        fetch_github_text(&client, &git_ref_url, "get curated plugins HEAD ref").await?;
+        fetch_github_text(http_clients, &git_ref_url, "get curated plugins HEAD ref").await?;
     let git_ref: GitHubGitRefSummary = serde_json::from_str(&git_ref_body).map_err(|err| {
         format!("failed to parse curated plugins ref response from {git_ref_url}: {err}")
     })?;
@@ -767,24 +794,27 @@ async fn fetch_curated_repo_remote_sha(api_base_url: &str) -> Result<String, Str
 }
 
 async fn fetch_curated_repo_zipball(
+    http_clients: &RouteAwareClientPool,
     api_base_url: &str,
     remote_sha: &str,
 ) -> Result<Vec<u8>, String> {
     let api_base_url = api_base_url.trim_end_matches('/');
     let repo_url = format!("{api_base_url}/repos/{OPENAI_PLUGINS_OWNER}/{OPENAI_PLUGINS_REPO}");
     let zipball_url = format!("{repo_url}/zipball/{remote_sha}");
-    let client = create_client_without_request_logging()
-        .map_err(|err| format!("failed to build HTTP client: {err}"))?;
-    fetch_github_bytes(&client, &zipball_url, "download curated plugins archive").await
+    fetch_github_bytes(
+        http_clients,
+        &zipball_url,
+        "download curated plugins archive",
+    )
+    .await
 }
 
 async fn fetch_curated_repo_backup_archive_zip(
     backup_archive_api_url: &str,
+    http_clients: &RouteAwareClientPool,
 ) -> Result<Vec<u8>, String> {
-    let client = create_client_without_request_logging()
-        .map_err(|err| format!("failed to build HTTP client: {err}"))?;
     let export_body = fetch_public_text(
-        &client,
+        http_clients,
         backup_archive_api_url,
         "get curated plugins export archive metadata",
     )
@@ -802,7 +832,7 @@ async fn fetch_curated_repo_backup_archive_zip(
     }
 
     fetch_public_bytes(
-        &client,
+        http_clients,
         &export_response.download_url,
         "download curated plugins export archive",
     )
@@ -900,11 +930,11 @@ fn read_git_ref_sha(git_dir: &Path, reference: &str) -> Result<String, String> {
 }
 
 async fn fetch_github_text(
-    client: &HttpClient,
+    http_clients: &RouteAwareClientPool,
     url: &str,
     context: &str,
 ) -> Result<String, String> {
-    let response = github_request(client, url)
+    let response = github_request(http_clients, url)
         .send()
         .await
         .map_err(|err| format!("failed to {context} from {url}: {err}"))?;
@@ -919,11 +949,11 @@ async fn fetch_github_text(
 }
 
 async fn fetch_github_bytes(
-    client: &HttpClient,
+    http_clients: &RouteAwareClientPool,
     url: &str,
     context: &str,
 ) -> Result<Vec<u8>, String> {
-    let response = github_request(client, url)
+    let response = github_request(http_clients, url)
         .send()
         .await
         .map_err(|err| format!("failed to {context} from {url}: {err}"))?;
@@ -942,11 +972,11 @@ async fn fetch_github_bytes(
 }
 
 async fn fetch_public_text(
-    client: &HttpClient,
+    http_clients: &RouteAwareClientPool,
     url: &str,
     context: &str,
 ) -> Result<String, String> {
-    let response = client
+    let response = http_clients
         .get(url)
         .timeout(CURATED_PLUGINS_BACKUP_ARCHIVE_TIMEOUT)
         .send()
@@ -963,11 +993,11 @@ async fn fetch_public_text(
 }
 
 async fn fetch_public_bytes(
-    client: &HttpClient,
+    http_clients: &RouteAwareClientPool,
     url: &str,
     context: &str,
 ) -> Result<Vec<u8>, String> {
-    let response = client
+    let response = http_clients
         .get(url)
         .timeout(CURATED_PLUGINS_BACKUP_ARCHIVE_TIMEOUT)
         .send()
@@ -987,8 +1017,8 @@ async fn fetch_public_bytes(
     Ok(body.to_vec())
 }
 
-fn github_request(client: &HttpClient, url: &str) -> RequestBuilder {
-    client
+fn github_request(http_clients: &RouteAwareClientPool, url: &str) -> RouteAwareRequestBuilder {
+    http_clients
         .get(url)
         .timeout(CURATED_PLUGINS_HTTP_TIMEOUT)
         .header("accept", GITHUB_API_ACCEPT_HEADER)

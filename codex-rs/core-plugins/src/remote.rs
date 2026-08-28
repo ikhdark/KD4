@@ -11,10 +11,13 @@ use codex_app_server_protocol::PluginInterface;
 use codex_app_server_protocol::PluginRemoteErrorData;
 use codex_app_server_protocol::PluginRemoteErrorReason;
 use codex_app_server_protocol::SkillInterface;
-use codex_http_client::HttpError;
-use codex_http_client::RequestBuilder;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
+use codex_http_client::RouteAwareRequestBuilder;
+use codex_http_client::RouteAwareRequestError;
 use codex_login::CodexAuth;
-use codex_login::default_client::create_client_without_request_logging;
+use codex_login::default_client::default_headers;
 use codex_plugin::AppConnectorId;
 use codex_plugin::AppDeclaration;
 use codex_plugin::PluginCapabilitySummary;
@@ -121,9 +124,31 @@ const REMOTE_INSTALLED_MARKETPLACE_DISPLAY_ORDER: [(&str, &str); 6] = [
     ),
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RemotePluginServiceConfig {
     pub chatgpt_base_url: String,
+    pub(crate) http_clients: RouteAwareClientPool,
+}
+
+impl RemotePluginServiceConfig {
+    pub fn new(chatgpt_base_url: String, http_client_factory: HttpClientFactory) -> Self {
+        Self {
+            chatgpt_base_url,
+            http_clients:
+                RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
+                    http_client_factory,
+                    ClientRouteClass::Api,
+                ),
+        }
+    }
+
+    pub fn outbound_proxy_policy(&self) -> codex_http_client::OutboundProxyPolicy {
+        self.http_clients.outbound_proxy_policy()
+    }
+
+    pub fn http_clients(&self) -> &RouteAwareClientPool {
+        &self.http_clients
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,7 +340,7 @@ pub enum RemotePluginCatalogError {
     Request {
         url: String,
         #[source]
-        source: HttpError,
+        source: RouteAwareRequestError,
     },
 
     #[error("remote plugin catalog request to {url} failed with status {status}: {body}")]
@@ -757,6 +782,7 @@ pub async fn fetch_remote_marketplaces(
     global_catalog_cache_path: Option<&Path>,
 ) -> Result<Vec<RemoteMarketplace>, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
+    let client = &config.http_clients;
     let mut marketplaces = Vec::new();
     let needs_workspace_installed = sources.iter().any(|source| {
         matches!(
@@ -765,7 +791,15 @@ pub async fn fetch_remote_marketplaces(
         )
     });
     let workspace_installed_plugins = if needs_workspace_installed {
-        Some(fetch_installed_plugins_for_scope(config, auth, RemotePluginScope::Workspace).await?)
+        Some(
+            fetch_installed_plugins_for_scope_with_client(
+                client,
+                config,
+                auth,
+                RemotePluginScope::Workspace,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -781,7 +815,8 @@ pub async fn fetch_remote_marketplaces(
                         )
                 {
                     let installed_plugins =
-                        fetch_installed_plugins_for_scope(config, auth, scope).await?;
+                        fetch_installed_plugins_for_scope_with_client(client, config, auth, scope)
+                            .await?;
                     if let Some(marketplace) = build_remote_marketplace(
                         scope.marketplace_name(),
                         scope.marketplace_display_name(),
@@ -794,8 +829,8 @@ pub async fn fetch_remote_marketplaces(
                     continue;
                 }
                 let (directory_plugins, installed_plugins) = tokio::try_join!(
-                    fetch_directory_plugins_for_scope(config, auth, scope),
-                    fetch_installed_plugins_for_scope(config, auth, scope),
+                    fetch_directory_plugins_for_scope_with_client(client, config, auth, scope),
+                    fetch_installed_plugins_for_scope_with_client(client, config, auth, scope),
                 )?;
                 let directory_plugins_for_cache =
                     global_catalog_cache_path.map(|_| directory_plugins.clone());
@@ -822,8 +857,8 @@ pub async fn fetch_remote_marketplaces(
             RemoteMarketplaceSource::CreatedByMeRemote => {
                 let scope = RemotePluginScope::User;
                 let (directory_plugins, installed_plugins) = tokio::try_join!(
-                    fetch_directory_plugins_for_scope(config, auth, scope),
-                    fetch_installed_plugins_for_scope(config, auth, scope),
+                    fetch_directory_plugins_for_scope_with_client(client, config, auth, scope),
+                    fetch_installed_plugins_for_scope_with_client(client, config, auth, scope),
                 )?;
                 if let Some(marketplace) = build_remote_marketplace(
                     scope.marketplace_name(),
@@ -838,7 +873,8 @@ pub async fn fetch_remote_marketplaces(
             RemoteMarketplaceSource::WorkspaceDirectory => {
                 let scope = RemotePluginScope::Workspace;
                 let directory_plugins =
-                    fetch_directory_plugins_for_scope(config, auth, scope).await?;
+                    fetch_directory_plugins_for_scope_with_client(client, config, auth, scope)
+                        .await?;
                 if let Some(marketplace) = build_remote_marketplace(
                     scope.marketplace_name(),
                     scope.marketplace_display_name(),
@@ -853,7 +889,8 @@ pub async fn fetch_remote_marketplaces(
                 // The shared endpoint is the source of truth for plugins explicitly shared
                 // with the user. Installed unlisted plugins that are not returned there are
                 // link-installed and stay in the separate unlisted bucket.
-                let shared_plugins = fetch_shared_workspace_plugins(config, auth).await?;
+                let shared_plugins =
+                    fetch_shared_workspace_plugins_with_client(client, config, auth).await?;
                 let shared_plugin_ids = shared_plugins
                     .iter()
                     .map(|plugin| plugin.id.clone())
@@ -919,8 +956,14 @@ pub async fn fetch_and_cache_global_remote_plugin_catalog(
     auth: Option<&CodexAuth>,
 ) -> Result<(), RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
-    let plugins =
-        fetch_directory_plugins_for_scope(config, auth, RemotePluginScope::Global).await?;
+    let client = &config.http_clients;
+    let plugins = fetch_directory_plugins_for_scope_with_client(
+        client,
+        config,
+        auth,
+        RemotePluginScope::Global,
+    )
+    .await?;
     catalog_cache::write_cached_global_directory_plugins(codex_home, config, auth, &plugins);
     Ok(())
 }
@@ -932,7 +975,7 @@ pub async fn fetch_recommended_plugins(
 ) -> Result<RecommendedPluginsMode, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
     let url = format!("{}/ps/plugins/suggested", config.chatgpt_base_url);
-    let client = create_client_without_request_logging()?;
+    let client = &config.http_clients;
     let request = authenticated_request(client.get(&url), auth)?
         .timeout(RECOMMENDED_PLUGINS_TIMEOUT)
         .query(&[("scope", "GLOBAL")]);
@@ -1039,15 +1082,17 @@ pub async fn fetch_openai_curated_remote_collection_marketplace(
     auth: Option<&CodexAuth>,
 ) -> Result<Option<RemoteMarketplace>, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
+    let client = &config.http_clients;
     let scope = RemotePluginScope::Global;
     let (directory_plugins, installed_plugins) = tokio::try_join!(
-        fetch_directory_plugins_for_scope_with_collection(
+        fetch_directory_plugins_for_scope_with_optional_collection_with_client(
+            client,
             config,
             auth,
             scope,
-            OPENAI_CURATED_REMOTE_COLLECTION_KEY,
+            Some(OPENAI_CURATED_REMOTE_COLLECTION_KEY),
         ),
-        fetch_installed_plugins_for_scope(config, auth, scope),
+        fetch_installed_plugins_for_scope_with_client(client, config, auth, scope),
     )?;
 
     build_remote_marketplace(
@@ -1101,19 +1146,31 @@ pub(crate) async fn fetch_remote_installed_plugins(
     auth: Option<&CodexAuth>,
 ) -> Result<Vec<RemoteInstalledPlugin>, RemotePluginCatalogError> {
     let auth = ensure_chatgpt_auth(auth)?;
+    let client = &config.http_clients;
+    fetch_remote_installed_plugins_with_client(client, config, auth).await
+}
+
+async fn fetch_remote_installed_plugins_with_client(
+    client: &RouteAwareClientPool,
+    config: &RemotePluginServiceConfig,
+    auth: &CodexAuth,
+) -> Result<Vec<RemoteInstalledPlugin>, RemotePluginCatalogError> {
     let global = async {
         let scope = RemotePluginScope::Global;
-        let installed_plugins = fetch_installed_plugins_for_scope(config, auth, scope).await?;
+        let installed_plugins =
+            fetch_installed_plugins_for_scope_with_client(client, config, auth, scope).await?;
         Ok::<_, RemotePluginCatalogError>((scope, installed_plugins))
     };
     let workspace = async {
         let scope = RemotePluginScope::Workspace;
-        let installed_plugins = fetch_installed_plugins_for_scope(config, auth, scope).await?;
+        let installed_plugins =
+            fetch_installed_plugins_for_scope_with_client(client, config, auth, scope).await?;
         Ok::<_, RemotePluginCatalogError>((scope, installed_plugins))
     };
     let user = async {
         let scope = RemotePluginScope::User;
-        let installed_plugins = fetch_installed_plugins_for_scope(config, auth, scope).await?;
+        let installed_plugins =
+            fetch_installed_plugins_for_scope_with_client(client, config, auth, scope).await?;
         Ok::<_, RemotePluginCatalogError>((scope, installed_plugins))
     };
 
@@ -1241,7 +1298,7 @@ pub async fn fetch_remote_plugin_skill_detail(
     }
 
     let url = remote_plugin_skill_detail_url(config, plugin_id, skill_name)?;
-    let client = create_client_without_request_logging()?;
+    let client = &config.http_clients;
     let request = authenticated_request(client.get(&url), auth)?;
     let response: RemotePluginSkillDetailResponse = send_and_decode(request, &url).await?;
     if response.plugin_id != plugin_id {
@@ -1396,7 +1453,7 @@ pub async fn install_remote_plugin(
     // marketplace name is not validated before sending the install mutation.
 
     let url = format!("{}/ps/plugins/{plugin_id}/install", config.chatgpt_base_url);
-    let client = create_client_without_request_logging()?;
+    let client = &config.http_clients;
     let request = authenticated_request(
         client
             .post(&url)
@@ -1491,7 +1548,7 @@ pub async fn uninstall_remote_plugin(
         "{}/ps/plugins/{remote_plugin_id}/uninstall",
         config.chatgpt_base_url
     );
-    let client = create_client_without_request_logging()?;
+    let client = &config.http_clients;
     let request = authenticated_request(client.post(&url), auth)?;
     let response: RemotePluginMutationResponse = send_and_decode(request, &url).await?;
     if response.id != remote_plugin_id {
@@ -1799,33 +1856,20 @@ fn normalize_remote_default_prompt(prompt: &str) -> Option<String> {
     Some(prompt.to_string())
 }
 
-async fn fetch_directory_plugins_for_scope(
+async fn fetch_directory_plugins_for_scope_with_client(
+    client: &RouteAwareClientPool,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
     scope: RemotePluginScope,
 ) -> Result<Vec<RemotePluginDirectoryItem>, RemotePluginCatalogError> {
-    fetch_directory_plugins_for_scope_with_optional_collection(
-        config, auth, scope, /*collection*/ None,
+    fetch_directory_plugins_for_scope_with_optional_collection_with_client(
+        client, config, auth, scope, /*collection*/ None,
     )
     .await
 }
 
-async fn fetch_directory_plugins_for_scope_with_collection(
-    config: &RemotePluginServiceConfig,
-    auth: &CodexAuth,
-    scope: RemotePluginScope,
-    collection: &str,
-) -> Result<Vec<RemotePluginDirectoryItem>, RemotePluginCatalogError> {
-    fetch_directory_plugins_for_scope_with_optional_collection(
-        config,
-        auth,
-        scope,
-        Some(collection),
-    )
-    .await
-}
-
-async fn fetch_directory_plugins_for_scope_with_optional_collection(
+async fn fetch_directory_plugins_for_scope_with_optional_collection_with_client(
+    client: &RouteAwareClientPool,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
     scope: RemotePluginScope,
@@ -1834,9 +1878,15 @@ async fn fetch_directory_plugins_for_scope_with_optional_collection(
     let mut plugins = Vec::new();
     let mut page_token = None;
     loop {
-        let response =
-            get_remote_plugin_list_page(config, auth, scope, page_token.as_deref(), collection)
-                .await?;
+        let response = get_remote_plugin_list_page(
+            client,
+            config,
+            auth,
+            scope,
+            page_token.as_deref(),
+            collection,
+        )
+        .await?;
         plugins.extend(response.plugins);
         let Some(next_page_token) = response.pagination.next_page_token else {
             break;
@@ -1846,7 +1896,8 @@ async fn fetch_directory_plugins_for_scope_with_optional_collection(
     Ok(plugins)
 }
 
-async fn fetch_shared_workspace_plugins(
+async fn fetch_shared_workspace_plugins_with_client(
+    client: &RouteAwareClientPool,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
 ) -> Result<Vec<RemotePluginDirectoryItem>, RemotePluginCatalogError> {
@@ -1854,7 +1905,8 @@ async fn fetch_shared_workspace_plugins(
     let mut page_token = None;
     loop {
         let response =
-            get_remote_shared_workspace_plugins_page(config, auth, page_token.as_deref()).await?;
+            get_remote_shared_workspace_plugins_page(client, config, auth, page_token.as_deref())
+                .await?;
         plugins.extend(response.plugins);
         let Some(next_page_token) = response.pagination.next_page_token else {
             break;
@@ -1869,13 +1921,40 @@ async fn fetch_installed_plugins_for_scope(
     auth: &CodexAuth,
     scope: RemotePluginScope,
 ) -> Result<Vec<RemotePluginInstalledItem>, RemotePluginCatalogError> {
-    fetch_installed_plugins_for_scope_with_download_url(
-        config, auth, scope, /*include_download_urls*/ false,
+    let client = &config.http_clients;
+    fetch_installed_plugins_for_scope_with_client(client, config, auth, scope).await
+}
+
+async fn fetch_installed_plugins_for_scope_with_download_url(
+    config: &RemotePluginServiceConfig,
+    auth: &CodexAuth,
+    scope: RemotePluginScope,
+    include_download_urls: bool,
+) -> Result<Vec<RemotePluginInstalledItem>, RemotePluginCatalogError> {
+    fetch_installed_plugins_for_scope_with_download_url_with_client(
+        &config.http_clients,
+        config,
+        auth,
+        scope,
+        include_download_urls,
     )
     .await
 }
 
-async fn fetch_installed_plugins_for_scope_with_download_url(
+async fn fetch_installed_plugins_for_scope_with_client(
+    client: &RouteAwareClientPool,
+    config: &RemotePluginServiceConfig,
+    auth: &CodexAuth,
+    scope: RemotePluginScope,
+) -> Result<Vec<RemotePluginInstalledItem>, RemotePluginCatalogError> {
+    fetch_installed_plugins_for_scope_with_download_url_with_client(
+        client, config, auth, scope, /*include_download_urls*/ false,
+    )
+    .await
+}
+
+async fn fetch_installed_plugins_for_scope_with_download_url_with_client(
+    client: &RouteAwareClientPool,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
     scope: RemotePluginScope,
@@ -1885,6 +1964,7 @@ async fn fetch_installed_plugins_for_scope_with_download_url(
     let mut page_token = None;
     loop {
         let response = get_remote_plugin_installed_page(
+            client,
             config,
             auth,
             scope,
@@ -1902,6 +1982,7 @@ async fn fetch_installed_plugins_for_scope_with_download_url(
 }
 
 async fn get_remote_plugin_list_page(
+    client: &RouteAwareClientPool,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
     scope: RemotePluginScope,
@@ -1909,7 +1990,6 @@ async fn get_remote_plugin_list_page(
     collection: Option<&str>,
 ) -> Result<RemotePluginListResponse, RemotePluginCatalogError> {
     let url = format!("{}/ps/plugins/list", config.chatgpt_base_url);
-    let client = create_client_without_request_logging()?;
     let mut request = authenticated_request(client.get(&url), auth)?;
     request = request.query(&[("scope", scope.api_value())]);
     request = request.query(&[("limit", REMOTE_PLUGIN_LIST_PAGE_LIMIT)]);
@@ -1923,12 +2003,12 @@ async fn get_remote_plugin_list_page(
 }
 
 async fn get_remote_shared_workspace_plugins_page(
+    client: &RouteAwareClientPool,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
     page_token: Option<&str>,
 ) -> Result<RemotePluginListResponse, RemotePluginCatalogError> {
     let url = format!("{}/ps/plugins/workspace/shared", config.chatgpt_base_url);
-    let client = create_client_without_request_logging()?;
     let mut request = authenticated_request(client.get(&url), auth)?;
     request = request.query(&[("limit", REMOTE_PLUGIN_LIST_PAGE_LIMIT)]);
     if let Some(page_token) = page_token {
@@ -1938,6 +2018,7 @@ async fn get_remote_shared_workspace_plugins_page(
 }
 
 async fn get_remote_plugin_installed_page(
+    client: &RouteAwareClientPool,
     config: &RemotePluginServiceConfig,
     auth: &CodexAuth,
     scope: RemotePluginScope,
@@ -1945,7 +2026,6 @@ async fn get_remote_plugin_installed_page(
     include_download_urls: bool,
 ) -> Result<RemotePluginInstalledResponse, RemotePluginCatalogError> {
     let url = format!("{}/ps/plugins/installed", config.chatgpt_base_url);
-    let client = create_client_without_request_logging()?;
     let mut request = authenticated_request(client.get(&url), auth)?;
     request = request.query(&[("scope", scope.api_value())]);
     if include_download_urls {
@@ -1964,7 +2044,7 @@ async fn fetch_plugin_detail(
     include_download_urls: bool,
 ) -> Result<RemotePluginDirectoryItem, RemotePluginCatalogError> {
     let url = format!("{}/ps/plugins/{plugin_id}", config.chatgpt_base_url);
-    let client = create_client_without_request_logging()?;
+    let client = &config.http_clients;
     let mut request = authenticated_request(client.get(&url), auth)?;
     if include_download_urls {
         request = request.query(&[("includeDownloadUrls", true)]);
@@ -2004,17 +2084,18 @@ fn ensure_chatgpt_auth(auth: Option<&CodexAuth>) -> Result<&CodexAuth, RemotePlu
 }
 
 fn authenticated_request(
-    request: RequestBuilder,
+    request: RouteAwareRequestBuilder,
     auth: &CodexAuth,
-) -> Result<RequestBuilder, RemotePluginCatalogError> {
+) -> Result<RouteAwareRequestBuilder, RemotePluginCatalogError> {
     Ok(request
         .timeout(REMOTE_PLUGIN_CATALOG_TIMEOUT)
+        .headers(default_headers())
         .headers(codex_model_provider::auth_provider_from_auth(auth).to_auth_headers())
         .header(OAI_PRODUCT_SKU_HEADER, CODEX_PRODUCT_SKU))
 }
 
 async fn send_and_decode<T: for<'de> Deserialize<'de>>(
-    request: RequestBuilder,
+    request: RouteAwareRequestBuilder,
     url: &str,
 ) -> Result<T, RemotePluginCatalogError> {
     let response = request

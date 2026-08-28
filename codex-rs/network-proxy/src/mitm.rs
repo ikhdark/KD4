@@ -46,6 +46,7 @@ use rama_net::stream::SocketInfo;
 use rama_net::tls::server::TlsPeekStream;
 use rama_tls_rustls::server::TlsAcceptorData;
 use rama_tls_rustls::server::TlsAcceptorLayer;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context as TaskContext;
@@ -149,16 +150,18 @@ impl std::fmt::Debug for MitmState {
 }
 
 impl MitmState {
-    pub(crate) fn new(config: MitmUpstreamConfig) -> Result<Self> {
+    pub(crate) fn new(config: MitmUpstreamConfig, codex_home: &Path) -> Result<Self> {
         ensure_rustls_crypto_provider();
 
         // MITM exists when HTTPS policy depends on the inner request: limited-mode method clamps
         // and host-specific hooks both need visibility after CONNECT is established. We
         // generate a process-local CA and issue per-host leaf certs so we can terminate TLS and
         // apply policy.
-        let ca = ManagedMitmCa::load_or_create()?;
-        let upstream_tls_root_store =
-            crate::certs::upstream_tls_root_store(&crate::certs::ca_env_from_process())?;
+        let ca = ManagedMitmCa::load_or_create(codex_home)?;
+        let upstream_tls_root_store = crate::certs::upstream_tls_root_store(
+            codex_home,
+            &crate::certs::ca_env_from_process(),
+        )?;
 
         let upstream = if config.allow_upstream_proxy {
             UpstreamClient::from_env_proxy_with_allow_local_binding(
@@ -341,6 +344,7 @@ async fn evaluate_mitm_policy(
             "CONNECT not supported inside MITM",
         )));
     }
+    let request_policy = policy.app_state.request_policy_snapshot().await?;
 
     let method = req.method().as_str().to_string();
     let log_path = path_for_log(req.uri());
@@ -366,8 +370,7 @@ async fn evaluate_mitm_policy(
     // CONNECT already handled allowlist/denylist + decider policy. Re-check local/private
     // resolution here to defend against DNS rebinding between CONNECT and inner HTTPS requests.
     if matches!(
-        policy
-            .app_state
+        request_policy
             .host_blocked(&policy.target_host, policy.target_port)
             .await?,
         HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal)
@@ -375,7 +378,7 @@ async fn evaluate_mitm_policy(
         let reason = HostBlockReason::NotAllowedLocal.as_str();
         let _ = policy
             .app_state
-            .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+            .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
                 host: policy.target_host.clone(),
                 reason: reason.to_string(),
                 client: client.clone(),
@@ -394,16 +397,12 @@ async fn evaluate_mitm_policy(
         return Ok(MitmPolicyDecision::Block(blocked_text_response(reason)));
     }
 
-    let hook_actions = match policy
-        .app_state
-        .evaluate_mitm_hook_request(&policy.target_host, req)
-        .await?
-    {
+    let hook_actions = match request_policy.evaluate_mitm_hook_request(&policy.target_host, req) {
         HookEvaluation::Matched { actions } => Some(actions),
         HookEvaluation::HookedHostNoMatch => {
             let _ = policy
                 .app_state
-                .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+                .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
                     host: policy.target_host.clone(),
                     reason: REASON_MITM_HOOK_DENIED.to_string(),
                     client: client.clone(),
@@ -429,7 +428,7 @@ async fn evaluate_mitm_policy(
     if !policy.mode.allows_method(&method) {
         let _ = policy
             .app_state
-            .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+            .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
                 host: policy.target_host.clone(),
                 reason: REASON_METHOD_NOT_ALLOWED.to_string(),
                 client: client.clone(),

@@ -118,6 +118,13 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
     );
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
+    let approval_scope_id = turn_context
+        .environments
+        .primary()
+        .expect("primary environment")
+        .environment
+        .approval_scope_id()
+        .to_string();
 
     let requested_permissions = RequestPermissionProfile {
         network: Some(NetworkPermissions {
@@ -156,9 +163,7 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
         })
     );
     assert_eq!(
-        session
-            .granted_turn_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
-            .await,
+        session.granted_turn_permissions(&approval_scope_id).await,
         Some(requested_permissions.into())
     );
 

@@ -1,6 +1,6 @@
 # Codex CLI
 
-Codex CLI is a coding agent from OpenAI that runs locally on your computer.
+Codex CLI is a coding agent from OpenAI that runs locally on Windows.
 
 ## Install
 

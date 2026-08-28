@@ -1,5 +1,6 @@
 mod streamable_http_test_support;
 
+use std::path::PathBuf;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -182,6 +183,7 @@ async fn identifies_expired_unrefreshable_token_startup_error() -> anyhow::Resul
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "spawned by reports_auth_status_for_persisted_credentials"]
 async fn persisted_credentials_auth_status_child() -> anyhow::Result<()> {
+    let codex_home = child_codex_home()?;
     let first_login_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/.well-known/oauth-authorization-server/mcp"))
@@ -210,6 +212,7 @@ async fn persisted_credentials_auth_status_child() -> anyhow::Result<()> {
         expires_at: Some(0),
     };
     save_oauth_tokens(
+        &codex_home,
         SERVER_NAME,
         &tokens,
         OAuthCredentialsStoreMode::File,
@@ -239,6 +242,7 @@ async fn persisted_credentials_auth_status_child() -> anyhow::Result<()> {
         expires_at: Some(now.saturating_add(/*rhs*/ 60_000)),
     };
     save_oauth_tokens(
+        &codex_home,
         SERVER_NAME,
         &tokens,
         OAuthCredentialsStoreMode::File,
@@ -262,6 +266,7 @@ async fn persisted_credentials_auth_status_child() -> anyhow::Result<()> {
         expires_at: Some(0),
     };
     save_oauth_tokens(
+        &codex_home,
         SERVER_NAME,
         &tokens,
         OAuthCredentialsStoreMode::File,
@@ -274,7 +279,9 @@ async fn persisted_credentials_auth_status_child() -> anyhow::Result<()> {
 }
 
 async fn auth_status(server_url: &str) -> anyhow::Result<McpAuthState> {
+    let codex_home = child_codex_home()?;
     determine_streamable_http_auth_status(
+        &codex_home,
         SERVER_NAME,
         server_url,
         /*bearer_token_env_var*/ None,
@@ -289,6 +296,7 @@ async fn auth_status(server_url: &str) -> anyhow::Result<McpAuthState> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "spawned by refreshes_expired_persisted_token_before_initialize"]
 async fn oauth_startup_child() -> anyhow::Result<()> {
+    let codex_home = child_codex_home()?;
     let server_url = std::env::var(CHILD_SERVER_URL_ENV)?;
 
     // Save an expired access token with a valid refresh token so startup must
@@ -308,6 +316,7 @@ async fn oauth_startup_child() -> anyhow::Result<()> {
         expires_at: Some(0),
     };
     save_oauth_tokens(
+        &codex_home,
         SERVER_NAME,
         &tokens,
         OAuthCredentialsStoreMode::File,
@@ -319,6 +328,7 @@ async fn oauth_startup_child() -> anyhow::Result<()> {
     // persisted OAuth credentials and the startup refresh under test.
     let client = RmcpClient::new_streamable_http_client(
         SERVER_NAME,
+        codex_home,
         &server_url,
         /*bearer_token*/ None,
         /*http_headers*/ None,
@@ -337,6 +347,7 @@ async fn oauth_startup_child() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "spawned by identifies_expired_unrefreshable_token_startup_error"]
 async fn expired_unrefreshable_startup_child() -> anyhow::Result<()> {
+    let codex_home = child_codex_home()?;
     let server_url = std::env::var(CHILD_SERVER_URL_ENV)?;
     let response = OAuthTokenResponse::new(
         AccessToken::new(EXPIRED_ACCESS_TOKEN.to_string()),
@@ -351,6 +362,7 @@ async fn expired_unrefreshable_startup_child() -> anyhow::Result<()> {
         expires_at: Some(0),
     };
     save_oauth_tokens(
+        &codex_home,
         SERVER_NAME,
         &tokens,
         OAuthCredentialsStoreMode::File,
@@ -359,6 +371,7 @@ async fn expired_unrefreshable_startup_child() -> anyhow::Result<()> {
 
     let client = RmcpClient::new_streamable_http_client(
         SERVER_NAME,
+        codex_home,
         &server_url,
         /*bearer_token*/ None,
         /*http_headers*/ None,
@@ -375,4 +388,10 @@ async fn expired_unrefreshable_startup_child() -> anyhow::Result<()> {
         .expect_err("expired token without a refresh token should fail startup");
     assert!(is_authentication_required_error(&error));
     Ok(())
+}
+
+fn child_codex_home() -> anyhow::Result<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("CODEX_HOME must be set for OAuth startup child"))
 }

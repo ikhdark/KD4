@@ -3,7 +3,6 @@ use anyhow::Result;
 use anyhow::anyhow;
 use base64::Engine as _;
 use codex_utils_der::first_der_item;
-use codex_utils_home_dir::find_codex_home;
 use rama_net::tls::ApplicationProtocol;
 use rama_tls_rustls::dep::pki_types::CertificateDer;
 use rama_tls_rustls::dep::pki_types::PrivateKeyDer;
@@ -50,8 +49,8 @@ static MANAGED_MITM_CAS: LazyLock<Mutex<HashMap<PathBuf, Arc<ManagedMitmCa>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl ManagedMitmCa {
-    pub(super) fn load_or_create() -> Result<Arc<Self>> {
-        let proxy_dir = managed_ca_dir()?;
+    pub(super) fn load_or_create(codex_home: &Path) -> Result<Arc<Self>> {
+        let proxy_dir = codex_home.join(MANAGED_MITM_CA_DIR);
         let mut managed_cas = MANAGED_MITM_CAS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -184,16 +183,11 @@ pub(crate) struct ManagedMitmCaTrustBundle {
     pub(crate) startup_env_values: HashMap<&'static str, String>,
 }
 
-fn managed_ca_dir() -> Result<PathBuf> {
-    let codex_home =
-        find_codex_home().context("failed to resolve CODEX_HOME for managed MITM CA")?;
-    Ok(codex_home.join(MANAGED_MITM_CA_DIR).to_path_buf())
-}
-
 pub(crate) fn managed_ca_trust_bundle(
+    codex_home: &Path,
     env: &HashMap<&'static str, String>,
 ) -> Result<ManagedMitmCaTrustBundle> {
-    let ca = ManagedMitmCa::load_or_create()?;
+    let ca = ManagedMitmCa::load_or_create(codex_home)?;
     managed_ca_trust_bundle_for_cert_path(ca.certificate_path(), env)
 }
 
@@ -217,9 +211,10 @@ fn managed_ca_trust_bundle_for_cert_path(
 }
 
 pub(crate) fn upstream_tls_root_store(
+    codex_home: &Path,
     env: &HashMap<&'static str, String>,
 ) -> Result<Arc<rustls::RootCertStore>> {
-    let ca = ManagedMitmCa::load_or_create()?;
+    let ca = ManagedMitmCa::load_or_create(codex_home)?;
     upstream_tls_root_store_for_cert_path(ca.certificate_path(), env)
 }
 
@@ -430,9 +425,10 @@ fn is_generated_managed_ca_artifact_path(path: &Path, proxy_dir: &Path, prefix: 
 
 /// Returns whether `path` points at a current Codex-generated MITM CA bundle.
 pub fn is_managed_mitm_ca_trust_bundle_path(path: &str) -> bool {
-    let Ok(proxy_dir) = managed_ca_dir() else {
+    let Ok(codex_home) = codex_utils_home_dir::find_codex_home() else {
         return false;
     };
+    let proxy_dir = codex_home.join(MANAGED_MITM_CA_DIR);
     is_generated_trust_bundle_path(Path::new(path), &proxy_dir)
 }
 
@@ -675,8 +671,8 @@ fn write_atomic_create_new(path: &Path, contents: &[u8], mode: u32) -> Result<()
         .with_context(|| format!("failed to fsync {}", tmp_path.display()))?;
     drop(file);
 
-    // Create the final file using "create-new" semantics (no overwrite). `rename` on Unix can
-    // overwrite existing files, so prefer a hard-link, which fails if the destination exists.
+    // Create the final file using "create-new" semantics (no overwrite). Prefer a hard link so
+    // publishing fails if the destination already exists.
     match fs::hard_link(&tmp_path, path) {
         Ok(()) => {
             fs::remove_file(&tmp_path)
@@ -757,6 +753,18 @@ mod tests {
     use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
+
+    #[test]
+    fn managed_ca_uses_explicit_codex_home() {
+        let codex_home = tempdir().unwrap();
+
+        let ca = ManagedMitmCa::load_or_create(codex_home.path()).unwrap();
+
+        assert!(
+            ca.certificate_path()
+                .starts_with(codex_home.path().join(MANAGED_MITM_CA_DIR))
+        );
+    }
 
     #[test]
     fn managed_ca_private_key_is_not_persisted() {

@@ -32,17 +32,7 @@ pub(crate) async fn on_call_response(
         }
     };
 
-    let DynamicToolCallResponse {
-        content_items,
-        success,
-    } = response.clone();
-    let core_response = CoreDynamicToolResponse {
-        content_items: content_items
-            .into_iter()
-            .map(CoreDynamicToolCallOutputContentItem::from)
-            .collect(),
-        success,
-    };
+    let core_response = into_core_response(response);
     if let Err(err) = conversation
         .submit(Op::DynamicToolResponse {
             id: call_id.clone(),
@@ -51,6 +41,20 @@ pub(crate) async fn on_call_response(
         .await
     {
         error!("failed to submit DynamicToolResponse: {err}");
+    }
+}
+
+fn into_core_response(response: DynamicToolCallResponse) -> CoreDynamicToolResponse {
+    let DynamicToolCallResponse {
+        content_items,
+        success,
+    } = response;
+    CoreDynamicToolResponse {
+        content_items: content_items
+            .into_iter()
+            .map(CoreDynamicToolCallOutputContentItem::from)
+            .collect(),
+        success,
     }
 }
 
@@ -89,4 +93,33 @@ fn fallback_response(message: &str) -> (DynamicToolCallResponse, Option<String>)
         },
         Some(message.to_string()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_response_conversion_moves_owned_content() {
+        let text = "owned dynamic tool response".to_string();
+        let text_ptr = text.as_ptr();
+        let response = DynamicToolCallResponse {
+            content_items: vec![DynamicToolCallOutputContentItem::InputText { text }],
+            success: true,
+        };
+
+        let core_response = into_core_response(response);
+        let CoreDynamicToolCallOutputContentItem::InputText { text } =
+            &core_response.content_items[0]
+        else {
+            panic!("dynamic text should remain text after protocol conversion");
+        };
+
+        assert!(core_response.success);
+        assert_eq!(
+            text.as_ptr(),
+            text_ptr,
+            "the protocol conversion should move owned response strings",
+        );
+    }
 }

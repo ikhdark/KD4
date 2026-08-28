@@ -41,7 +41,6 @@ pub use self::frame_requester::FrameRequester;
 use crate::custom_terminal;
 use crate::custom_terminal::Terminal as CustomTerminal;
 use crate::insert_history::HistoryLineWrapPolicy;
-use crate::insert_history::InsertHistoryMode;
 use crate::notifications::DesktopNotificationBackend;
 use crate::notifications::detect_backend;
 use crate::terminal_hyperlinks::HyperlinkLine;
@@ -57,7 +56,6 @@ mod frame_rate_limiter;
 mod frame_requester;
 
 mod keyboard_modes;
-mod terminal_stderr;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -72,7 +70,6 @@ pub type Terminal = CustomTerminal<CrosstermBackend<Stdout>>;
 pub(crate) struct InitializedTerminal {
     pub(crate) terminal: Terminal,
     pub(crate) enhanced_keys_supported: bool,
-    pub(crate) stderr_guard: terminal_stderr::TerminalStderrGuard,
 }
 
 pub(crate) fn running_in_vscode_terminal() -> bool {
@@ -301,16 +298,7 @@ fn restore_common(
 /// Uses a strong keyboard reset so the parent shell recovers even if a
 /// terminal missed the stack pop that normally pairs with [`set_modes`].
 pub fn restore_after_exit() -> Result<()> {
-    let mut first_error =
-        restore_common(RawModeRestore::Disable, KeyboardRestore::ResetAfterExit).err();
-    if let Err(err) = terminal_stderr::finish() {
-        first_error.get_or_insert(err);
-    }
-
-    match first_error {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
+    restore_common(RawModeRestore::Disable, KeyboardRestore::ResetAfterExit)
 }
 
 /// Restore the terminal to its original state, but keep raw mode enabled.
@@ -365,11 +353,9 @@ pub(crate) fn init() -> Result<InitializedTerminal> {
     probe_windows_default_colors();
 
     let tui = CustomTerminal::with_options_and_cursor_position(backend, cursor_pos)?;
-    let stderr_guard = terminal_stderr::TerminalStderrGuard::install()?;
     Ok(InitializedTerminal {
         terminal: tui,
         enhanced_keys_supported,
-        stderr_guard,
     })
 }
 
@@ -381,8 +367,6 @@ fn cursor_position_with_crossterm(backend: &mut CrosstermBackend<Stdout>) -> Pos
 }
 
 fn detect_keyboard_enhancement_supported() -> bool {
-    // Non-Unix startup keeps the existing crossterm keyboard probe path because it already knows
-    // how to interpret platform-specific event sources.
     supports_keyboard_enhancement().unwrap_or(/*default*/ false)
 }
 
@@ -446,12 +430,8 @@ pub struct Tui {
     enhanced_keys_supported: bool,
     notification_backend: Option<DesktopNotificationBackend>,
     notification_condition: NotificationCondition,
-    // Raw terminal-wrapped history needs a non-scroll-region insertion path in Zellij.
-    is_zellij: bool,
     // When false, enter_alt_screen() becomes a no-op.
     alt_screen_enabled: bool,
-    // Keeps unmanaged process stderr writes out of the inline viewport.
-    _stderr_guard: terminal_stderr::TerminalStderrGuard,
 }
 
 struct PendingHistoryLines {
@@ -472,19 +452,13 @@ where
 }
 
 impl Tui {
-    pub(crate) fn new(
-        terminal: Terminal,
-        enhanced_keys_supported: bool,
-        stderr_guard: terminal_stderr::TerminalStderrGuard,
-    ) -> Self {
+    pub(crate) fn new(terminal: Terminal, enhanced_keys_supported: bool) -> Self {
         let (draw_tx, _) = broadcast::channel(1);
         let frame_requester = FrameRequester::new(draw_tx.clone());
 
         // Cache this to avoid contention with the event reader.
         supports_color::on_cached(supports_color::Stream::Stdout);
         let _ = crate::terminal_palette::default_colors();
-        let is_zellij = codex_terminal_detection::terminal_info().is_zellij();
-
         Self {
             frame_requester,
             draw_tx,
@@ -499,9 +473,7 @@ impl Tui {
             enhanced_keys_supported,
             notification_backend: Some(detect_backend(NotificationMethod::default())),
             notification_condition: NotificationCondition::default(),
-            is_zellij,
             alt_screen_enabled: true,
-            _stderr_guard: stderr_guard,
         }
     }
 
@@ -545,8 +517,8 @@ impl Tui {
     /// Temporarily restore terminal state to run an external interactive program `f`.
     ///
     /// This pauses crossterm's stdin polling by dropping the underlying event stream, restores
-    /// terminal modes and stderr while keeping raw mode enabled, then re-applies Codex TUI modes
-    /// and stderr suppression before resuming events.
+    /// terminal modes while keeping raw mode enabled, then re-applies Codex TUI modes before
+    /// resuming events.
     pub async fn with_restored<R, F, Fut>(&mut self, f: F) -> R
     where
         F: FnOnce() -> Fut,
@@ -564,15 +536,8 @@ impl Tui {
         if let Err(err) = restore_keep_raw() {
             tracing::warn!("failed to restore terminal modes before external program: {err}");
         }
-        if let Err(err) = terminal_stderr::pause() {
-            tracing::warn!("failed to restore terminal stderr before external program: {err}");
-        }
-
         let output = f().await;
 
-        if let Err(err) = terminal_stderr::resume() {
-            tracing::warn!("failed to suppress terminal stderr after external program: {err}");
-        }
         if let Err(err) = set_modes() {
             tracing::warn!("failed to re-enable terminal modes after external program: {err}");
         }
@@ -747,22 +712,15 @@ impl Tui {
     fn flush_pending_history_lines(
         terminal: &mut Terminal,
         pending_history_lines: &mut Vec<PendingHistoryLines>,
-        is_zellij: bool,
     ) -> Result<()> {
         if pending_history_lines.is_empty() {
             return Ok(());
         }
 
         for batch in pending_history_lines.iter() {
-            let mode = if is_zellij && batch.wrap_policy == HistoryLineWrapPolicy::Terminal {
-                InsertHistoryMode::ZellijRaw
-            } else {
-                InsertHistoryMode::Standard
-            };
-            crate::insert_history::insert_history_hyperlink_lines_with_mode_and_wrap_policy(
+            crate::insert_history::insert_history_hyperlink_lines_with_wrap_policy(
                 terminal,
                 batch.lines.clone(),
-                mode,
                 batch.wrap_policy,
             )?;
         }
@@ -810,11 +768,7 @@ impl Tui {
                 terminal.set_viewport_area(area);
             }
 
-            Self::flush_pending_history_lines(
-                terminal,
-                &mut self.pending_history_lines,
-                self.is_zellij,
-            )?;
+            Self::flush_pending_history_lines(terminal, &mut self.pending_history_lines)?;
 
             // Update the y position for suspending so Ctrl-Z can place the cursor correctly.
 
@@ -899,11 +853,7 @@ impl Tui {
             let terminal = &mut self.terminal;
             let needs_full_repaint =
                 Self::update_inline_viewport_for_resize_reflow(terminal, height)?;
-            Self::flush_pending_history_lines(
-                terminal,
-                &mut self.pending_history_lines,
-                self.is_zellij,
-            )?;
+            Self::flush_pending_history_lines(terminal, &mut self.pending_history_lines)?;
 
             if needs_full_repaint {
                 terminal.invalidate_viewport();
@@ -926,8 +876,8 @@ impl Tui {
         {
             let last_known_cursor_pos = terminal.last_known_cursor_pos;
             // If we resized AND the cursor moved, we adjust the viewport area to keep the
-            // cursor in the same position. This is a heuristic that seems to work well
-            // at least in iTerm2.
+            // cursor in the same position. This heuristic keeps the viewport
+            // stable across Windows terminal resize reports.
             if cursor_pos.y != last_known_cursor_pos.y {
                 let offset = Offset {
                     x: 0,

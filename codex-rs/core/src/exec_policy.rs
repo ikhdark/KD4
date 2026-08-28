@@ -25,7 +25,9 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::protocol::AskForApproval;
 use codex_shell_command::is_dangerous_command::command_might_be_dangerous;
+use codex_shell_command::is_dangerous_command::direct_argv_might_be_dangerous;
 use codex_shell_command::is_safe_command::is_known_safe_command;
+use codex_shell_command::is_safe_command::is_known_safe_direct_argv;
 use thiserror::Error;
 use tokio::fs;
 use tokio::sync::Semaphore;
@@ -102,14 +104,18 @@ static BANNED_PREFIX_SUGGESTIONS: &[&[&str]] = &[
 /// words being evaluated by exec-policy.
 ///
 /// The command tokens may be the original argv or a shell-specific lowering of
-/// a wrapper such as `bash -lc ...` or `powershell.exe -Command ...`. We only
-/// need to distinguish the PowerShell case because its safelist and dangerous
-/// heuristics operate on PowerShell-flavored inner command words rather than
-/// the generic command classifier.
+/// a wrapper such as `bash -lc ...` or `powershell.exe -Command ...`. Direct
+/// argv must remain distinct because shell-looking executable names do not
+/// establish that Codex owns the wrapper or that its inner script is what the
+/// selected executable will run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecPolicyCommandOrigin {
     /// Use the generic unmatched-command heuristics.
     Generic,
+
+    /// The command came from structured direct argv and must be classified
+    /// without unwrapping a shell-looking executable.
+    DirectArgv,
 
     /// The command words came from the `-Command` body of a top-level
     /// PowerShell wrapper, so use PowerShell-specific unmatched-command
@@ -274,6 +280,23 @@ impl ExecPolicyManager {
         &self,
         req: ExecApprovalRequest<'_>,
     ) -> ExecApprovalRequirement {
+        self.create_exec_approval_requirement(req, /*shell_wrapper_is_owned*/ true)
+            .await
+    }
+
+    pub(crate) async fn create_exec_approval_requirement_for_direct_argv(
+        &self,
+        req: ExecApprovalRequest<'_>,
+    ) -> ExecApprovalRequirement {
+        self.create_exec_approval_requirement(req, /*shell_wrapper_is_owned*/ false)
+            .await
+    }
+
+    async fn create_exec_approval_requirement(
+        &self,
+        req: ExecApprovalRequest<'_>,
+        shell_wrapper_is_owned: bool,
+    ) -> ExecApprovalRequirement {
         let ExecApprovalRequest {
             command,
             command_for_safety,
@@ -283,13 +306,25 @@ impl ExecPolicyManager {
             sandbox_permissions,
             prefix_rule,
         } = req;
-        let policy_command = command_for_safety.unwrap_or(command);
+        let policy_command = if shell_wrapper_is_owned {
+            command_for_safety.unwrap_or(command)
+        } else {
+            command
+        };
         let exec_policy = self.current();
         let ExecPolicyCommands {
             commands,
             used_complex_parsing,
             command_origin,
-        } = commands_for_exec_policy(policy_command);
+        } = if shell_wrapper_is_owned {
+            commands_for_exec_policy(policy_command)
+        } else {
+            ExecPolicyCommands {
+                commands: vec![policy_command.to_vec()],
+                used_complex_parsing: false,
+                command_origin: ExecPolicyCommandOrigin::DirectArgv,
+            }
+        };
         // Keep heredoc prefix parsing for rule evaluation so existing
         // allow/prompt/forbidden rules still apply, but avoid auto-derived
         // amendments when only the heredoc fallback parser matched.
@@ -653,6 +688,8 @@ pub(crate) fn render_decision_for_unmatched_command(
     let is_known_safe = match command_origin {
         ExecPolicyCommandOrigin::Generic => is_known_safe_command(command),
 
+        ExecPolicyCommandOrigin::DirectArgv => is_known_safe_direct_argv(command),
+
         ExecPolicyCommandOrigin::PowerShell => {
             codex_shell_command::is_safe_command::is_safe_powershell_words(command)
         }
@@ -682,6 +719,8 @@ pub(crate) fn render_decision_for_unmatched_command(
     // forbid the command.
     let command_is_dangerous = match command_origin {
         ExecPolicyCommandOrigin::Generic => command_might_be_dangerous(command),
+
+        ExecPolicyCommandOrigin::DirectArgv => direct_argv_might_be_dangerous(command),
 
         ExecPolicyCommandOrigin::PowerShell => {
             codex_shell_command::is_dangerous_command::is_dangerous_powershell_words(command)

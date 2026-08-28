@@ -21,16 +21,29 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         (self.repo_root / "owner").mkdir()
         (self.repo_root / "src").mkdir()
         (self.repo_root / "tests").mkdir()
+        (self.repo_root / "src" / "__init__.py").write_text("", encoding="utf-8")
+        (self.repo_root / "tests" / "__init__.py").write_text("", encoding="utf-8")
         (self.repo_root / "src" / "feature.py").write_text(
             "def main():\n    return 'live'\n",
             encoding="utf-8",
         )
         (self.repo_root / "src" / "registry.py").write_text(
-            "COMMANDS = {'feature': main}\n",
+            "from src.feature import main\n\nCOMMANDS = {'feature': main}\n",
             encoding="utf-8",
         )
         (self.repo_root / "tests" / "test_feature.py").write_text(
-            "def test_feature_is_live():\n    pass\n",
+            textwrap.dedent(
+                """
+                import unittest
+
+                from src.registry import COMMANDS
+
+
+                class FeatureRegistrationTest(unittest.TestCase):
+                    def test_feature_is_live(self):
+                        self.assertEqual(COMMANDS["feature"](), "live")
+                """
+            ),
             encoding="utf-8",
         )
 
@@ -52,7 +65,7 @@ class CheckKd4FeaturesTest(unittest.TestCase):
                 summary = "fixture"
                 upstream_equivalent = "none"
                 config_keys = []
-                runtime_verification = {{ kind = "contract_test", path = "tests/test_feature.py", symbol = "test_feature_is_live", command = ["python", "-m", "unittest", "tests.test_feature.test_feature_is_live"] }}
+                runtime_verification = {{ kind = "contract_test", path = "tests/test_feature.py", symbol = "test_feature_is_live", command = ["python", "-m", "unittest", "tests.test_feature.FeatureRegistrationTest.test_feature_is_live"] }}
                 {feature_body}
                 """
             ),
@@ -270,10 +283,89 @@ class CheckKd4FeaturesTest(unittest.TestCase):
                 "python",
                 "-m",
                 "unittest",
-                "tests.test_feature.test_feature_is_live",
+                "tests.test_feature.FeatureRegistrationTest.test_feature_is_live",
             ],
             cwd=self.repo_root,
             check=False,
+        )
+
+    def test_default_cli_executes_registration_contract(self) -> None:
+        manifest = self.write_manifest(self.valid_evidence())
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = check_kd4_features.main(
+                [
+                    "--manifest",
+                    str(manifest),
+                    "--repo-root",
+                    str(self.repo_root),
+                ]
+            )
+
+        self.assertEqual(exit_code, 0, output.getvalue())
+        self.assertIn("KD4 RUNTIME VERIFICATION [feature]", output.getvalue())
+
+    def test_default_cli_rejects_unimported_registration(self) -> None:
+        (self.repo_root / "src" / "registry.py").write_text(
+            "COMMANDS = {'feature': main}\n",
+            encoding="utf-8",
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            exit_code = check_kd4_features.main(
+                [
+                    "--manifest",
+                    str(self.write_manifest(self.valid_evidence())),
+                    "--repo-root",
+                    str(self.repo_root),
+                ]
+            )
+
+        self.assertNotEqual(exit_code, 0)
+
+    def test_default_cli_rejects_dead_registration(self) -> None:
+        (self.repo_root / "src" / "registry.py").write_text(
+            "from src.feature import main\n\nCOMMANDS = {}\n",
+            encoding="utf-8",
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            exit_code = check_kd4_features.main(
+                [
+                    "--manifest",
+                    str(self.write_manifest(self.valid_evidence())),
+                    "--repo-root",
+                    str(self.repo_root),
+                ]
+            )
+
+        self.assertNotEqual(exit_code, 0)
+
+    def test_pass_only_runtime_verification_is_rejected_before_execution(self) -> None:
+        (self.repo_root / "tests" / "test_feature.py").write_text(
+            textwrap.dedent(
+                """
+                import unittest
+
+
+                class FeatureRegistrationTest(unittest.TestCase):
+                    def test_feature_is_live(self):
+                        pass
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        result = check_kd4_features.validate_manifest(
+            self.write_manifest(self.valid_evidence()),
+            repo_root=self.repo_root,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn(
+            "vacuous-runtime-verification",
+            {finding.code for finding in result.findings},
         )
 
     def test_planned_feature_cannot_retain_live_route_evidence(self) -> None:
@@ -891,6 +983,43 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["featureCount"], 1)
         self.assertEqual(payload["runtimeStatusCounts"], {})
+        self.assertEqual(payload["runtimeVerificationExitCode"], 0)
+
+    @mock.patch.object(check_kd4_features.subprocess, "run")
+    def test_json_cli_reports_runtime_verification_failure(
+        self, run: mock.Mock
+    ) -> None:
+        run.return_value = mock.Mock(returncode=7)
+        manifest = self.write_manifest(self.valid_evidence())
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = check_kd4_features.main(
+                [
+                    "--manifest",
+                    str(manifest),
+                    "--repo-root",
+                    str(self.repo_root),
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(exit_code, 7)
+        payload = json.loads(output.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["runtimeVerificationExitCode"], 7)
+        run.assert_called_once_with(
+            [
+                "python",
+                "-m",
+                "unittest",
+                "tests.test_feature.FeatureRegistrationTest.test_feature_is_live",
+            ],
+            cwd=self.repo_root,
+            check=False,
+            stdout=check_kd4_features.subprocess.DEVNULL,
+            stderr=check_kd4_features.subprocess.DEVNULL,
+        )
 
     def test_missing_upstream_commit_is_rejected(self) -> None:
         manifest = self.write_manifest(self.valid_evidence())

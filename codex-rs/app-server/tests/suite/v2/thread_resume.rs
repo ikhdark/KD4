@@ -31,6 +31,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SessionSource;
+use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadGoalClearResponse;
 use codex_app_server_protocol::ThreadGoalSetResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
@@ -89,8 +90,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
-use core_test_support::skip_if_remote;
-use core_test_support::skip_if_wine_exec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::fs::FileTimes;
@@ -281,11 +280,6 @@ async fn thread_resume_with_empty_path_uses_running_thread_id() -> Result<()> {
 
 #[tokio::test]
 async fn thread_resume_running_thread_uses_cached_instruction_sources() -> Result<()> {
-    skip_if_remote!(
-        Ok(()),
-        "cached instruction-source fixture is outside the selected remote cwd"
-    );
-
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -3573,6 +3567,11 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id.clone(),
             exclude_turns: true,
+            initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                limit: Some(1),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::NotLoaded),
+            }),
             ..Default::default()
         })
         .await?;
@@ -3582,24 +3581,23 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
     )
     .await??;
     let ThreadResumeResponse {
-        thread: resumed, ..
+        thread: resumed,
+        initial_turns_page,
+        ..
     } = to_response::<ThreadResumeResponse>(resume_resp)?;
 
     assert_eq!(resumed.id, thread.id);
     assert_eq!(resumed.status, ThreadStatus::Idle);
     assert!(resumed.turns.is_empty());
+    let initial_turns_page = initial_turns_page.expect("requested initial turns page");
+    assert_eq!(initial_turns_page.data.len(), 1);
+    assert!(initial_turns_page.data[0].items.is_empty());
 
     Ok(())
 }
 
 #[tokio::test]
 async fn thread_resume_replays_pending_command_execution_request_approval() -> Result<()> {
-    // TODO(anp): Remove after shell approval replay can route target-native cwd across host OSes.
-    skip_if_wine_exec!(
-        Ok(()),
-        "shell approval replay rejects the Windows cwd on the Linux host"
-    );
-
     let responses = vec![
         create_final_assistant_message_sse_response("seeded")?,
         create_shell_command_sse_response(
@@ -3741,12 +3739,6 @@ async fn thread_resume_replays_pending_command_execution_request_approval() -> R
 
 #[tokio::test]
 async fn thread_resume_replays_pending_file_change_request_approval() -> Result<()> {
-    // TODO(anp): Remove after apply-patch approval fixtures use a target-native workspace.
-    skip_if_remote!(
-        Ok(()),
-        "apply-patch approval fixture is only materialized on the host"
-    );
-
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
     std::fs::create_dir(&codex_home)?;

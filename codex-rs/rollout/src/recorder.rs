@@ -115,7 +115,11 @@ pub enum RolloutRecorderParams {
 }
 
 enum RolloutCmd {
-    AddItems(Vec<RolloutItem>),
+    AddItems {
+        items: Vec<RolloutItem>,
+        flush_if_materialized: bool,
+        accepted: Option<oneshot::Sender<()>>,
+    },
     Persist {
         ack: oneshot::Sender<std::io::Result<()>>,
     },
@@ -125,6 +129,11 @@ enum RolloutCmd {
     },
     Shutdown {
         ack: oneshot::Sender<std::io::Result<()>>,
+    },
+    #[cfg(test)]
+    Pause {
+        entered: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
     },
 }
 
@@ -947,6 +956,26 @@ impl RolloutRecorder {
     }
 
     pub async fn record_canonical_items(&self, items: &[RolloutItem]) -> std::io::Result<()> {
+        self.record_canonical_items_with_flush(items, true, false)
+            .await
+    }
+
+    /// Queue canonical items in writer order without forcing the writer to flush. A later
+    /// persist/flush/shutdown command is the durability barrier for the queued prefix.
+    pub async fn record_canonical_items_ordered(
+        &self,
+        items: &[RolloutItem],
+    ) -> std::io::Result<()> {
+        self.record_canonical_items_with_flush(items, false, true)
+            .await
+    }
+
+    async fn record_canonical_items_with_flush(
+        &self,
+        items: &[RolloutItem],
+        flush_if_materialized: bool,
+        wait_for_acceptance: bool,
+    ) -> std::io::Result<()> {
         let enqueue_guard = self
             .writer_task
             .enqueue_gate
@@ -957,9 +986,19 @@ impl RolloutRecorder {
         if items.is_empty() {
             return Ok(());
         }
+        let (accepted, acceptance) = if wait_for_acceptance {
+            let (accepted, acceptance) = oneshot::channel();
+            (Some(accepted), Some(acceptance))
+        } else {
+            (None, None)
+        };
         let result = self
             .tx
-            .send(RolloutCmd::AddItems(items.to_vec()))
+            .send(RolloutCmd::AddItems {
+                items: items.to_vec(),
+                flush_if_materialized,
+                accepted,
+            })
             .await
             .map_err(|e| {
                 self.writer_task.terminal_failure().unwrap_or_else(|| {
@@ -967,7 +1006,15 @@ impl RolloutRecorder {
                 })
             });
         drop(enqueue_guard);
-        result
+        result?;
+        if let Some(acceptance) = acceptance {
+            acceptance.await.map_err(|e| {
+                self.writer_task.terminal_failure().unwrap_or_else(|| {
+                    IoError::other(format!("failed waiting for rollout item acceptance: {e}"))
+                })
+            })?;
+        }
+        Ok(())
     }
 
     /// Materialize the rollout file and persist all buffered items.
@@ -1031,17 +1078,50 @@ impl RolloutRecorder {
     pub async fn load_rollout_items(
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+        let mut items = Vec::new();
+        let (thread_id, parse_errors) =
+            Self::for_each_rollout_item(path, |item| items.push(item)).await?;
+        tracing::debug!(
+            "Resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
+            items.len(),
+            thread_id,
+            parse_errors,
+        );
+        Ok((items, thread_id, parse_errors))
+    }
+
+    /// Visit each valid rollout item without retaining the full rollout in memory.
+    pub async fn for_each_rollout_item<F>(
+        path: &Path,
+        mut visit: F,
+    ) -> std::io::Result<(Option<ThreadId>, usize)>
+    where
+        F: FnMut(RolloutItem),
+    {
+        Self::for_each_rollout_item_with_record_number(path, |item, _record_number| visit(item))
+            .await
+    }
+
+    /// Visit each valid rollout item together with its one-based non-empty record number.
+    pub(crate) async fn for_each_rollout_item_with_record_number<F>(
+        path: &Path,
+        mut visit: F,
+    ) -> std::io::Result<(Option<ThreadId>, usize)>
+    where
+        F: FnMut(RolloutItem, usize),
+    {
         trace!("Resuming rollout from {path:?}");
-        let mut items: Vec<RolloutItem> = Vec::new();
         let mut thread_id: Option<ThreadId> = None;
         let mut parse_errors = 0usize;
         let mut reader = compression::open_rollout_line_reader(path).await?;
         let mut saw_non_empty_line = false;
+        let mut record_number = 0usize;
         while let Some(line) = reader.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
             saw_non_empty_line = true;
+            record_number = record_number.saturating_add(1);
             let mut v: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1060,8 +1140,14 @@ impl RolloutRecorder {
                 continue;
             }
 
+            if thread_id.is_none() {
+                // Validate the small compatibility discriminator before consuming the JSON value.
+                // This preserves the unknown-mode guard without cloning the whole rollout line.
+                reject_unknown_thread_history_mode(&v)?;
+            }
+
             // Parse the rollout line structure
-            match serde_json::from_value::<RolloutLine>(v.clone()) {
+            match serde_json::from_value::<RolloutLine>(v) {
                 Ok(rollout_line) => {
                     let item = rollout_line.item;
                     // Use the FIRST SessionMeta encountered in the file as the canonical
@@ -1071,15 +1157,9 @@ impl RolloutRecorder {
                     {
                         thread_id = Some(session_meta_line.meta.id);
                     }
-                    items.push(item);
+                    visit(item, record_number);
                 }
                 Err(e) => {
-                    if thread_id.is_none() {
-                        // The first SessionMeta belongs to this rollout. Later SessionMeta lines
-                        // can be copied from fork history, so only validate unknown history modes
-                        // before we have parsed the rollout's own SessionMeta.
-                        reject_unknown_thread_history_mode(&v)?;
-                    }
                     trace!("failed to parse rollout line: {e}");
                     parse_errors = parse_errors.saturating_add(1);
                 }
@@ -1089,13 +1169,7 @@ impl RolloutRecorder {
             return Err(IoError::other("empty session file"));
         }
 
-        tracing::debug!(
-            "Resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
-            items.len(),
-            thread_id,
-            parse_errors,
-        );
-        Ok((items, thread_id, parse_errors))
+        Ok((thread_id, parse_errors))
     }
 
     async fn existing_tool_manifests(
@@ -1581,6 +1655,8 @@ impl LockedRolloutFile {
             _append_lock: self.append_lock,
             #[cfg(test)]
             write_fault: None,
+            #[cfg(test)]
+            append_transaction_count: 0,
         }
     }
 }
@@ -1840,53 +1916,41 @@ impl RolloutWriterState {
         Ok(())
     }
 
-    async fn write_session_meta_if_needed(&mut self) -> std::io::Result<()> {
+    async fn session_meta_item_if_needed(&self) -> std::io::Result<Option<RolloutItem>> {
         let Some(session_meta) = self.meta.as_ref().cloned() else {
-            return Ok(());
+            return Ok(None);
         };
-        write_session_meta(
-            self.writer.as_mut(),
-            session_meta,
-            &self.cwd,
-            self.known_repository_context.clone(),
-        )
-        .await?;
-        self.meta = None;
-        Ok(())
+        let git_info = match self.known_repository_context.clone() {
+            Some(repository_context) => repository_context.map(|context| context.git_info),
+            None if get_git_repo_root(&self.cwd).is_some() => collect_git_info(&self.cwd).await,
+            None => None,
+        };
+        Ok(Some(RolloutItem::SessionMeta(SessionMetaLine {
+            meta: session_meta,
+            git: git_info,
+        })))
     }
 
     async fn write_pending_once(&mut self) -> std::io::Result<()> {
         self.ensure_writer_open().await?;
-        self.write_session_meta_if_needed().await?;
-
-        self.write_pending_items_once().await?;
-
-        if let Some(writer) = self.writer.as_mut() {
-            writer.file.flush().await?;
-        }
-        Ok(())
-    }
-
-    async fn write_pending_items_once(&mut self) -> std::io::Result<()> {
+        let session_meta_item = self.session_meta_item_if_needed().await?;
         let Some(writer) = self.writer.as_mut() else {
             return Err(IoError::other("rollout writer is not open"));
         };
 
-        let mut written_count = 0usize;
-        let mut write_result = Ok(());
-        for item in &self.pending_items {
-            if let Err(err) = writer.write_rollout_item(item).await {
-                write_result = Err(err);
-                break;
-            }
-            written_count += 1;
+        let items = session_meta_item
+            .iter()
+            .chain(self.pending_items.iter())
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            return Ok(());
         }
-
-        if written_count > 0 {
-            self.pending_items.drain(..written_count);
+        writer.write_rollout_items(&items).await?;
+        if session_meta_item.is_some() {
+            self.meta = None;
         }
-
-        write_result
+        self.pending_items.clear();
+        Ok(())
     }
 }
 
@@ -1915,9 +1979,18 @@ async fn rollout_writer(
     // Process rollout commands
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            RolloutCmd::AddItems(items) => {
+            RolloutCmd::AddItems {
+                items,
+                flush_if_materialized,
+                accepted,
+            } => {
                 state.add_items(items);
-                state.flush_if_materialized().await;
+                if let Some(accepted) = accepted {
+                    let _ = accepted.send(());
+                }
+                if flush_if_materialized {
+                    state.flush_if_materialized().await;
+                }
             }
             RolloutCmd::Persist { ack } => {
                 let _ = ack.send(state.persist().await);
@@ -1936,32 +2009,14 @@ async fn rollout_writer(
                     let _ = ack.send(Err(err));
                 }
             },
+            #[cfg(test)]
+            RolloutCmd::Pause { entered, resume } => {
+                let _ = entered.send(());
+                let _ = resume.await;
+            }
         }
     }
 
-    Ok(())
-}
-
-async fn write_session_meta(
-    mut writer: Option<&mut JsonlWriter>,
-    session_meta: SessionMeta,
-    cwd: &Path,
-    known_repository_context: Option<Option<RepositoryContext>>,
-) -> std::io::Result<()> {
-    let git_info = match known_repository_context {
-        Some(repository_context) => repository_context.map(|context| context.git_info),
-        None if get_git_repo_root(cwd).is_some() => collect_git_info(cwd).await,
-        None => None,
-    };
-    let session_meta_line = SessionMetaLine {
-        meta: session_meta,
-        git: git_info,
-    };
-
-    let rollout_item = RolloutItem::SessionMeta(session_meta_line);
-    if let Some(writer) = writer.as_mut() {
-        writer.write_rollout_item(&rollout_item).await?;
-    }
     Ok(())
 }
 
@@ -2009,6 +2064,8 @@ struct JsonlWriter {
     _append_lock: compression::RolloutAppendLock,
     #[cfg(test)]
     write_fault: Option<JsonlWriteFault>,
+    #[cfg(test)]
+    append_transaction_count: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2034,6 +2091,21 @@ struct RolloutLineRef<'a> {
 
 impl JsonlWriter {
     async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::Result<()> {
+        self.write_rollout_items(&[rollout_item]).await
+    }
+
+    async fn write_rollout_items(&mut self, rollout_items: &[&RolloutItem]) -> std::io::Result<()> {
+        if rollout_items.is_empty() {
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        for rollout_item in rollout_items {
+            bytes.extend_from_slice(&Self::serialize_rollout_item(rollout_item)?);
+        }
+        self.write_transaction(&bytes).await
+    }
+
+    fn serialize_rollout_item(rollout_item: &RolloutItem) -> std::io::Result<Vec<u8>> {
         let timestamp_format: &[FormatItem] = format_description!(
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
         );
@@ -2046,12 +2118,16 @@ impl JsonlWriter {
             format_version: CURRENT_ROLLOUT_FORMAT_VERSION,
             item: rollout_item,
         };
-        self.write_line(&line).await
-    }
-    async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<()> {
-        let mut json = serde_json::to_string(item)?;
+        let mut json = serde_json::to_string(&line)?;
         json.push('\n');
-        let line = json.as_bytes();
+        Ok(json.into_bytes())
+    }
+
+    async fn write_transaction(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            self.append_transaction_count += 1;
+        }
         let path = self.path.clone();
         let _write_lock = tokio::task::spawn_blocking(move || {
             compression::lock_rollout_for_write_blocking(path.as_path())
@@ -2059,12 +2135,12 @@ impl JsonlWriter {
         .await
         .map_err(IoError::other)??;
         let append_start = self.file.metadata().await?.len();
-        let write_result = self.write_line_bytes(line).await;
+        let write_result = self.write_line_bytes(bytes).await;
         let Err(append_error) = write_result else {
             return Ok(());
         };
 
-        match self.recover_failed_append(append_start, line).await {
+        match self.recover_failed_append(append_start, bytes).await {
             Ok(FailedAppendRecovery::Committed) => Ok(()),
             Ok(FailedAppendRecovery::RolledBack) => Err(append_error),
             Err(recovery_error) => Err(IoError::other(RolloutAppendRecoveryError {

@@ -46,10 +46,9 @@ outputCollectedAtMs: number | null, processSpawnedAtMs: number | null, processEx
 deliveredAtMs: number | null,
 /**
  * The direct tool output was committed to model-visible conversation
- * history and the best-effort rollout persistence attempt returned.
- * This does not prove that a rollout recorder existed, that its append
- * succeeded, or that storage was flushed. Nested code-mode calls are
- * represented by the outer direct tool output and leave this absent.
+ * history. Durable rollout persistence is tracked independently by the
+ * tool-closure ledger. Nested code-mode calls are represented by the outer
+ * direct tool output and leave this absent.
  */
 outputModelVisibleAtMs: number | null,
 /**

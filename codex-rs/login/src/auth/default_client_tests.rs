@@ -47,6 +47,15 @@ fn test_get_codex_user_agent() {
 }
 
 #[test]
+fn platform_user_agent_is_cached() {
+    let first = platform_user_agent();
+    let second = platform_user_agent();
+
+    assert!(std::ptr::eq(first, second));
+    assert!(!first.is_empty());
+}
+
+#[test]
 fn is_first_party_originator_matches_known_values() {
     assert_eq!(is_first_party_originator(DEFAULT_ORIGINATOR), true);
     assert_eq!(is_first_party_originator("codex-tui"), true);
@@ -113,6 +122,28 @@ fn add_originator_header_omits_invalid_originator() {
     add_originator_header(&mut headers, "invalid\noriginator");
 
     assert!(headers.is_empty());
+}
+
+#[tokio::test]
+async fn reqwest_default_client_build_does_not_wait_for_route_serialization() {
+    let held_permit = ROUTE_AWARE_CLIENT_BUILD_PERMIT
+        .acquire()
+        .await
+        .expect("route-aware build permit");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        create_client_for_route_async(
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            "https://example.test/default-route".to_string(),
+            ClientRouteClass::Auth,
+        ),
+    )
+    .await;
+    drop(held_permit);
+
+    result
+        .expect("reqwest-default build must not wait for the route-aware permit")
+        .expect("reqwest-default client should build");
 }
 
 #[tokio::test]

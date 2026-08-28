@@ -190,8 +190,8 @@ impl<C: Sync> ExtensionRegistry<C> {
         &self.token_usage_contributors
     }
 
-    /// Claims the first rendered approval-review prompt accepted by an
-    /// installed contributor.
+    /// Claims the first rendered approval-review prompt accepted by an installed contributor.
+    /// Hosts call this before falling back to Guardian review.
     pub async fn approval_review(
         &self,
         session_store: &ExtensionData,

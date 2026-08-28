@@ -102,7 +102,6 @@ pub fn collect_code_mode_tool_definitions<'a>(
         .map(codex_code_mode::augment_tool_definition)
         .collect::<Vec<_>>();
     tool_definitions.sort_by(|left, right| left.name.cmp(&right.name));
-    tool_definitions.dedup_by(|left, right| left.name == right.name);
     tool_definitions
 }
 

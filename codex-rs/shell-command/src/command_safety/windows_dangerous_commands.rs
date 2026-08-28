@@ -23,6 +23,12 @@ pub fn is_dangerous_command_windows(command: &[String]) -> bool {
     is_direct_gui_launch(command)
 }
 
+/// Checks only hazards intrinsic to the exact executable argv. Structured
+/// direct argv must not be reinterpreted as an owned PowerShell or CMD wrapper.
+pub(super) fn is_dangerous_direct_argv_windows(command: &[String]) -> bool {
+    is_direct_gui_launch(command)
+}
+
 fn is_dangerous_powershell(command: &[String]) -> bool {
     let Some((exe, rest)) = command.split_first() else {
         return false;

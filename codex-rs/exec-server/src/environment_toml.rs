@@ -759,7 +759,7 @@ initialize_timeout_sec = 34.0
 id = "ssh-dev"
 program = "ssh"
 args = ["dev", "codex exec-server --listen stdio"]
-cwd = "/tmp"
+cwd = 'C:\workspace'
 [environments.env]
 CODEX_LOG = "debug"
 "#,
@@ -794,7 +794,7 @@ CODEX_LOG = "debug"
                     "CODEX_LOG".to_string(),
                     "debug".to_string(),
                 )])),
-                cwd: Some(PathBuf::from("/tmp")),
+                cwd: Some(PathBuf::from(r"C:\workspace")),
                 ..Default::default()
             }
         );

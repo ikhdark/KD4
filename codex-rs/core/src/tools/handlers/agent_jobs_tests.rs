@@ -369,6 +369,80 @@ async fn atomic_csv_write_failure_leaves_no_partial_destination() {
 }
 
 #[tokio::test]
+async fn durability_regression_restart_reconciles_and_exports_partial_csv() {
+    let (tempdir, owner_db, job) = create_running_job(/*item_count*/ 2).await;
+    let completed_thread_id = ThreadId::new().to_string();
+    assert!(
+        owner_db
+            .mark_agent_job_item_running_with_thread(
+                job.id.as_str(),
+                "item-0",
+                completed_thread_id.as_str(),
+            )
+            .await
+            .expect("bind completed item")
+    );
+    assert!(
+        owner_db
+            .report_agent_job_item_result(
+                job.id.as_str(),
+                "item-0",
+                completed_thread_id.as_str(),
+                &json!({"result": "kept"}),
+            )
+            .await
+            .expect("complete first item")
+    );
+
+    let db =
+        codex_state::StateRuntime::init(tempdir.path().join("state"), "test-provider".to_string())
+            .await
+            .expect("initialize parallel state runtime");
+    reconcile_orphaned_agent_jobs_after_restart(db.clone())
+        .await
+        .expect("preserve job owned by a live parallel runtime");
+    assert_eq!(
+        db.get_agent_job(job.id.as_str())
+            .await
+            .expect("load live foreign job")
+            .expect("live foreign job should exist")
+            .status,
+        codex_state::AgentJobStatus::Running
+    );
+
+    owner_db.close().await;
+    reconcile_orphaned_agent_jobs_after_restart(db.clone())
+        .await
+        .expect("reconcile restarted job and export its partial snapshot");
+
+    let stored_job = db
+        .get_agent_job(job.id.as_str())
+        .await
+        .expect("load reconciled job")
+        .expect("reconciled job should exist");
+    assert_eq!(stored_job.status, codex_state::AgentJobStatus::Failed);
+    assert_eq!(
+        stored_job.last_error.as_deref(),
+        Some(codex_state::StateRuntime::AGENT_JOB_RESTART_ERROR)
+    );
+    let progress = db
+        .get_agent_job_progress(job.id.as_str())
+        .await
+        .expect("load reconciled progress");
+    assert_eq!(progress.completed_items, 1);
+    assert_eq!(progress.failed_items, 1);
+    assert_eq!(progress.pending_items, 0);
+    assert_eq!(progress.running_items, 0);
+
+    let csv = tokio::fs::read_to_string(job.output_csv_path.as_str())
+        .await
+        .expect("read reconciled partial csv");
+    assert!(csv.contains("completed"));
+    assert!(csv.contains("kept"));
+    assert!(csv.contains(codex_state::StateRuntime::AGENT_JOB_RESTART_ERROR));
+}
+
+#[tokio::test]
 async fn runner_settles_non_limit_spawn_failure_without_retrying() {
     let (_tempdir, db, job) = create_running_job(/*item_count*/ 1).await;
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;

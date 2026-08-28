@@ -16,8 +16,9 @@ use crate::session::step_context::StepContext;
 #[cfg(test)]
 use crate::session::turn_context::TurnContext;
 use codex_api::OPENAI_FILE_UPLOAD_LIMIT_BYTES;
-use codex_api::delete_openai_file;
-use codex_api::upload_openai_file;
+use codex_api::delete_openai_file_with_pool;
+use codex_api::openai_file_http_client_pool;
+use codex_api::upload_openai_file_with_pool;
 #[cfg(test)]
 use codex_login::CodexAuth;
 use codex_utils_path_uri::PathConvention;
@@ -107,6 +108,7 @@ pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
     let upload_auth = codex_model_provider::auth_provider_from_auth(auth);
     let turn_context = step_context.turn.as_ref();
     let http_client_factory = turn_context.config.http_client_factory();
+    let http_clients = openai_file_http_client_pool(&http_client_factory);
     let base_url = &turn_context.config.chatgpt_base_url;
     let mut uploaded_file_ids = Vec::new();
     let mut rewritten_arguments = arguments.clone();
@@ -122,13 +124,8 @@ pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
         );
         let mut rewritten_values = Vec::with_capacity(staged_files.len());
         for staged in staged_files {
-            match upload_staged_openai_file(
-                base_url,
-                upload_auth.as_ref(),
-                &http_client_factory,
-                staged,
-            )
-            .await
+            match upload_staged_openai_file(base_url, upload_auth.as_ref(), &http_clients, staged)
+                .await
             {
                 Ok((rewritten, file_id)) => {
                     uploaded_file_ids.push(file_id);
@@ -137,10 +134,10 @@ pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
                 Err(error) => {
                     let mut rollback_errors = Vec::new();
                     for file_id in uploaded_file_ids.iter().rev() {
-                        if let Err(rollback_error) = delete_openai_file(
+                        if let Err(rollback_error) = delete_openai_file_with_pool(
                             base_url,
                             upload_auth.as_ref(),
-                            &http_client_factory,
+                            &http_clients,
                             file_id,
                         )
                         .await
@@ -324,7 +321,7 @@ fn validate_relative_file_path(
 async fn upload_staged_openai_file(
     base_url: &str,
     auth: &dyn codex_api::AuthProvider,
-    http_client_factory: &codex_http_client::HttpClientFactory,
+    http_clients: &codex_http_client::RouteAwareClientPool,
     staged: StagedOpenAiFile,
 ) -> Result<(JsonValue, String), String> {
     let StagedOpenAiFile {
@@ -343,10 +340,10 @@ async fn upload_staged_openai_file(
     let file_size_bytes =
         u64::try_from(contents.len()).map_err(|error| contextualize_error(error.to_string()))?;
     let contents = futures::stream::once(async move { Ok::<_, std::io::Error>(contents.into()) });
-    let uploaded = upload_openai_file(
+    let uploaded = upload_openai_file_with_pool(
         base_url,
         auth,
-        http_client_factory,
+        http_clients,
         file_name,
         file_size_bytes,
         contents,
@@ -386,10 +383,12 @@ async fn build_uploaded_argument_value(
     .await?;
     let upload_auth = codex_model_provider::auth_provider_from_auth(auth);
     let turn_context = step_context.turn.as_ref();
+    let http_client_factory = turn_context.config.http_client_factory();
+    let http_clients = openai_file_http_client_pool(&http_client_factory);
     upload_staged_openai_file(
         &turn_context.config.chatgpt_base_url,
         upload_auth.as_ref(),
-        &turn_context.config.http_client_factory(),
+        &http_clients,
         staged,
     )
     .await

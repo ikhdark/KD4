@@ -51,7 +51,11 @@ fn remote_plugin_uninstall_effects(
     result: &Result<(), RemotePluginCatalogError>,
 ) -> RemotePluginUninstallEffects {
     RemotePluginUninstallEffects {
-        track_success: result.is_ok(),
+        // Cache removal starts only after the backend uninstall has committed.
+        track_success: matches!(
+            result,
+            Ok(()) | Err(RemotePluginCatalogError::CacheRemove(_))
+        ),
         // The remote mutation has committed before local cache removal begins.
         refresh_caches: matches!(
             result,
@@ -585,9 +589,10 @@ impl PluginRequestProcessor {
             !explicit_marketplace_kinds && config.features.enabled(Feature::RemotePlugin);
         let use_remote_global_catalog =
             include_global_remote && auth_mode.is_some_and(DomainAuthMode::uses_codex_backend);
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = RemotePluginServiceConfig::new(
+            config.chatgpt_base_url.clone(),
+            config.http_client_factory(),
+        );
         let refresh_global_remote_catalog_cache = use_remote_global_catalog
             && codex_core_plugins::remote::has_cached_global_remote_plugin_catalog(
                 config.codex_home.as_path(),
@@ -1037,9 +1042,10 @@ impl PluginRequestProcessor {
                 );
                 let share_context = match share_context {
                     Some(context) => {
-                        let remote_plugin_service_config = RemotePluginServiceConfig {
-                            chatgpt_base_url: config.chatgpt_base_url.clone(),
-                        };
+                        let remote_plugin_service_config = RemotePluginServiceConfig::new(
+                            config.chatgpt_base_url.clone(),
+                            config.http_client_factory(),
+                        );
                         match codex_core_plugins::remote::fetch_remote_plugin_share_context(
                             &remote_plugin_service_config,
                             auth.as_ref(),
@@ -1145,9 +1151,10 @@ impl PluginRequestProcessor {
                         "remote plugin read is not enabled for marketplace {remote_marketplace_name}"
                     )));
                 }
-                let remote_plugin_service_config = RemotePluginServiceConfig {
-                    chatgpt_base_url: config.chatgpt_base_url.clone(),
-                };
+                let remote_plugin_service_config = RemotePluginServiceConfig::new(
+                    config.chatgpt_base_url.clone(),
+                    config.http_client_factory(),
+                );
                 validate_remote_plugin_id(&plugin_name)?;
                 let remote_detail = codex_core_plugins::remote::fetch_remote_plugin_detail(
                     &remote_plugin_service_config,
@@ -1203,9 +1210,10 @@ impl PluginRequestProcessor {
         }
 
         let auth = self.auth_manager.auth().await;
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = RemotePluginServiceConfig::new(
+            config.chatgpt_base_url.clone(),
+            config.http_client_factory(),
+        );
         let remote_skill_detail = codex_core_plugins::remote::fetch_remote_plugin_skill_detail(
             &remote_plugin_service_config,
             auth.as_ref(),
@@ -1256,9 +1264,10 @@ impl PluginRequestProcessor {
             validate_client_plugin_share_targets(share_targets)?;
         }
 
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = RemotePluginServiceConfig::new(
+            config.chatgpt_base_url.clone(),
+            config.http_client_factory(),
+        );
         let access_policy = codex_core_plugins::remote::RemotePluginShareAccessPolicy {
             discoverability: discoverability.map(remote_plugin_share_discoverability),
             share_targets: share_targets.map(remote_plugin_share_targets),
@@ -1299,9 +1308,10 @@ impl PluginRequestProcessor {
         }
         validate_client_plugin_share_targets(&share_targets)?;
 
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = RemotePluginServiceConfig::new(
+            config.chatgpt_base_url.clone(),
+            config.http_client_factory(),
+        );
         let result = codex_core_plugins::remote::update_remote_plugin_share_targets(
             &remote_plugin_service_config,
             auth.as_ref(),
@@ -1329,9 +1339,10 @@ impl PluginRequestProcessor {
         _params: PluginShareListParams,
     ) -> Result<PluginShareListResponse, JSONRPCErrorError> {
         let (config, auth) = self.load_plugin_share_config_and_auth().await?;
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = RemotePluginServiceConfig::new(
+            config.chatgpt_base_url.clone(),
+            config.http_client_factory(),
+        );
         let data = codex_core_plugins::remote::list_remote_plugin_shares(
             &remote_plugin_service_config,
             auth.as_ref(),
@@ -1368,9 +1379,10 @@ impl PluginRequestProcessor {
             return Err(invalid_request("invalid remote plugin id"));
         }
 
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = RemotePluginServiceConfig::new(
+            config.chatgpt_base_url.clone(),
+            config.http_client_factory(),
+        );
         let result = codex_core_plugins::remote::checkout_remote_plugin_share(
             &remote_plugin_service_config,
             auth.as_ref(),
@@ -1401,9 +1413,10 @@ impl PluginRequestProcessor {
             return Err(invalid_request("invalid remote plugin id"));
         }
 
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = RemotePluginServiceConfig::new(
+            config.chatgpt_base_url.clone(),
+            config.http_client_factory(),
+        );
         codex_core_plugins::remote::delete_remote_plugin_share(
             &remote_plugin_service_config,
             auth.as_ref(),
@@ -1541,9 +1554,10 @@ impl PluginRequestProcessor {
         validate_remote_plugin_id(&remote_plugin_id)?;
 
         let auth = self.auth_manager.auth().await;
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = RemotePluginServiceConfig::new(
+            config.chatgpt_base_url.clone(),
+            config.http_client_factory(),
+        );
         let remote_detail =
             codex_core_plugins::remote::fetch_remote_plugin_detail_with_download_urls(
                 &remote_plugin_service_config,
@@ -1618,6 +1632,7 @@ impl PluginRequestProcessor {
         let result = codex_core_plugins::remote_bundle::download_and_install_remote_plugin_bundle(
             config.codex_home.to_path_buf(),
             validated_bundle,
+            remote_plugin_service_config.http_clients(),
         )
         .await
         .map_err(|err| {
@@ -1874,12 +1889,14 @@ impl PluginRequestProcessor {
             let keyring_backend_kind = config.auth_keyring_backend_kind();
             let callback_port = config.mcp_oauth_callback_port;
             let callback_url = config.mcp_oauth_callback_url.clone();
+            let codex_home = config.codex_home.clone();
             let outgoing = Arc::clone(&self.outgoing);
             let notification_name = name.clone();
 
             tokio::spawn(async move {
                 let oauth_client_id = server.oauth_client_id();
                 let first_attempt = perform_oauth_login_silent(
+                    &codex_home,
                     &name,
                     &oauth_config.url,
                     store_mode,
@@ -1897,6 +1914,7 @@ impl PluginRequestProcessor {
                 let final_result = match first_attempt {
                     Err(err) if should_retry_without_scopes(&resolved_scopes, &err) => {
                         perform_oauth_login_silent(
+                            &codex_home,
                             &name,
                             &oauth_config.url,
                             store_mode,
@@ -2028,9 +2046,10 @@ impl PluginRequestProcessor {
         validate_remote_plugin_id(&plugin_id)?;
 
         let auth = self.auth_manager.auth().await;
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
-        };
+        let remote_plugin_service_config = RemotePluginServiceConfig::new(
+            config.chatgpt_base_url.clone(),
+            config.http_client_factory(),
+        );
         let uninstall_target = codex_core_plugins::remote::resolve_remote_plugin_uninstall_target(
             &remote_plugin_service_config,
             auth.as_ref(),
@@ -2073,11 +2092,27 @@ impl PluginRequestProcessor {
                 auth.clone(),
                 Some(self.effective_plugins_changed_callback()),
             );
+            plugins_manager.maybe_start_remote_installed_plugin_bundle_sync(
+                &config.plugins_config_input(),
+                auth.clone(),
+                Some(self.effective_plugins_changed_callback()),
+            );
         }
 
-        uninstall_result.map_err(|err| {
-            remote_plugin_catalog_error_to_jsonrpc(err, "uninstall remote plugin")
-        })?;
+        match uninstall_result {
+            Ok(()) => {}
+            Err(RemotePluginCatalogError::CacheRemove(err)) => {
+                warn!(
+                    "remote plugin uninstall committed but local cache cleanup failed; scheduled reconciliation: {err}"
+                );
+            }
+            Err(err) => {
+                return Err(remote_plugin_catalog_error_to_jsonrpc(
+                    err,
+                    "uninstall remote plugin",
+                ));
+            }
+        }
         Ok(PluginUninstallResponse {})
     }
 }

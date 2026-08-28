@@ -209,11 +209,11 @@
       "description": "Local fork watermark for desktop-visible runtime proof."
     },
     "platformFamily": {
-      "description": "Platform family for the running app-server target, for example `\"unix\"` or `\"windows\"`.",
+      "description": "Platform family for the running app-server target: `\"windows\"`.",
       "type": "string"
     },
     "platformOs": {
-      "description": "Operating system for the running app-server target, for example `\"macos\"`, `\"linux\"`, or `\"windows\"`.",
+      "description": "Operating system for the running app-server target: `\"windows\"`.",
       "type": "string"
     },
     "runtimeInfo": {

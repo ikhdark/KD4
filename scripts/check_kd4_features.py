@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import subprocess
@@ -70,45 +71,80 @@ class CheckResult:
 def execute_runtime_verification(
     manifest_path: Path,
     *,
-    feature_id: str,
+    feature_id: str | None,
     repo_root: Path,
+    quiet: bool = False,
 ) -> int:
-    """Execute one manifest-declared narrow runtime verification command."""
+    """Execute one selected, or every enabled, runtime verification command."""
     try:
         with manifest_path.open("rb") as manifest_file:
             manifest = tomllib.load(manifest_file)
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        print(f"runtime verification manifest could not be read: {exc}")
+        if not quiet:
+            print(f"runtime verification manifest could not be read: {exc}")
         return 2
 
-    matching = [
+    eligible = [
         feature
         for feature in manifest.get("features", [])
-        if isinstance(feature, dict) and feature.get("id") == feature_id
+        if isinstance(feature, dict)
+        and feature.get("status") == "enabled"
+        and feature.get("capability_kind") == "runtime"
     ]
-    if len(matching) != 1:
-        print(f"runtime verification feature must resolve exactly once: {feature_id!r}")
+    matching = (
+        [feature for feature in eligible if feature.get("id") == feature_id]
+        if feature_id is not None
+        else eligible
+    )
+    if feature_id is not None and len(matching) != 1:
+        if not quiet:
+            print(
+                f"runtime verification feature must resolve exactly once: {feature_id!r}"
+            )
         return 2
-    feature = matching[0]
-    verification = feature.get("runtime_verification")
-    command = verification.get("command") if isinstance(verification, dict) else None
-    if (
-        feature.get("status") != "enabled"
-        or feature.get("capability_kind") != "runtime"
-        or not isinstance(command, list)
-        or not command
-        or not all(isinstance(argument, str) and argument for argument in command)
-    ):
-        print(f"feature has no executable enabled runtime verification: {feature_id!r}")
-        return 2
+    for feature in matching:
+        current_feature_id = feature.get("id")
+        verification = feature.get("runtime_verification")
+        command = verification.get("command") if isinstance(verification, dict) else None
+        if (
+            not isinstance(current_feature_id, str)
+            or not isinstance(command, list)
+            or not command
+            or not all(isinstance(argument, str) and argument for argument in command)
+        ):
+            if not quiet:
+                print(
+                    "feature has no executable enabled runtime verification: "
+                    f"{current_feature_id!r}"
+                )
+            return 2
 
-    execution_root = repo_root / "codex-rs" if command[0] == "cargo" else repo_root
-    try:
-        completed = subprocess.run(command, cwd=execution_root, check=False)
-    except OSError as exc:
-        print(f"runtime verification could not start for {feature_id!r}: {exc}")
-        return 2
-    return completed.returncode
+        execution_root = repo_root / "codex-rs" if command[0] == "cargo" else repo_root
+        if not quiet:
+            print(
+                f"KD4 RUNTIME VERIFICATION [{current_feature_id}]: {' '.join(command)}"
+            )
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=execution_root,
+                check=False,
+                **(
+                    {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+                    if quiet
+                    else {}
+                ),
+            )
+        except OSError as exc:
+            if not quiet:
+                print(
+                    "runtime verification could not start for "
+                    f"{current_feature_id!r}: {exc}"
+                )
+            return 2
+        if completed.returncode != 0:
+            return completed.returncode
+    return 0
 
 
 def _safe_repo_path(
@@ -670,6 +706,46 @@ def _validate_runtime_verification(
             )
         )
         return False
+    if path.suffix.lower() == ".py":
+        try:
+            module = ast.parse(text)
+        except SyntaxError as exc:
+            findings.append(
+                Finding(
+                    "error",
+                    "invalid-runtime-verification",
+                    f"{verification.get('path')} is not valid Python: {exc}",
+                    feature_id,
+                )
+            )
+            return False
+        matching_tests = [
+            node
+            for node in ast.walk(module)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == symbol
+        ]
+        if not matching_tests or all(
+            all(
+                isinstance(statement, ast.Pass)
+                or (
+                    isinstance(statement, ast.Expr)
+                    and isinstance(statement.value, ast.Constant)
+                    and isinstance(statement.value.value, str)
+                )
+                for statement in test.body
+            )
+            for test in matching_tests
+        ):
+            findings.append(
+                Finding(
+                    "error",
+                    "vacuous-runtime-verification",
+                    f"{verification.get('path')} test {symbol!r} has no executable contract body",
+                    feature_id,
+                )
+            )
+            return False
     return True
 
 
@@ -1389,7 +1465,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--run-runtime-verification",
         metavar="FEATURE_ID",
-        help="After static validation passes, execute only this feature's declared runtime test.",
+        help="Execute only this feature's declared runtime test instead of every enabled runtime test.",
     )
     return parser
 
@@ -1403,7 +1479,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         manifest_path, repo_root=args.repo_root, strict=args.strict
     )
     if args.json:
-        print(json.dumps(result.to_json(), sort_keys=True))
+        runtime_exit_code = (
+            execute_runtime_verification(
+                manifest_path,
+                feature_id=args.run_runtime_verification,
+                repo_root=args.repo_root,
+                quiet=True,
+            )
+            if result.ok
+            else None
+        )
+        payload = result.to_json()
+        payload["runtimeVerificationExitCode"] = runtime_exit_code
+        payload["ok"] = result.ok and runtime_exit_code == 0
+        print(json.dumps(payload, sort_keys=True))
+        return 1 if runtime_exit_code is None else runtime_exit_code
     else:
         verdict = "PASSED" if result.ok else "FAILED"
         counts = ", ".join(
@@ -1420,13 +1510,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     if not result.ok:
         return 1
-    if args.run_runtime_verification:
-        return execute_runtime_verification(
-            manifest_path,
-            feature_id=args.run_runtime_verification,
-            repo_root=args.repo_root,
-        )
-    return 0
+    return execute_runtime_verification(
+        manifest_path,
+        feature_id=args.run_runtime_verification,
+        repo_root=args.repo_root,
+    )
 
 
 if __name__ == "__main__":

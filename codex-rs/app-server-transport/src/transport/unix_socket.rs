@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_tungstenite::accept_async;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -47,6 +48,7 @@ async fn run_control_socket_acceptor(
     socket_guard: ControlSocketFileGuard,
 ) {
     let _socket_guard = socket_guard;
+    let connection_tasks = TaskTracker::new();
     loop {
         let stream = tokio::select! {
             _ = shutdown_token.cancelled() => {
@@ -72,19 +74,32 @@ async fn run_control_socket_acceptor(
         };
 
         let transport_event_tx = transport_event_tx.clone();
-        tokio::spawn(async move {
-            let websocket_stream = match accept_async(stream).await {
-                Ok(websocket_stream) => websocket_stream,
-                Err(err) => {
-                    warn!("failed to upgrade control socket websocket connection: {err}");
-                    return;
-                }
-            };
-            let (websocket_writer, websocket_reader) = websocket_stream.split();
-            run_websocket_connection(websocket_writer, websocket_reader, transport_event_tx).await;
+        let connection_shutdown = shutdown_token.clone();
+        connection_tasks.spawn(async move {
+            tokio::select! {
+                _ = connection_shutdown.cancelled() => {}
+                _ = run_control_socket_connection(stream, transport_event_tx) => {}
+            }
         });
     }
+    connection_tasks.close();
+    connection_tasks.wait().await;
     info!("control socket acceptor shutting down");
+}
+
+async fn run_control_socket_connection(
+    stream: UnixStream,
+    transport_event_tx: mpsc::Sender<TransportEvent>,
+) {
+    let websocket_stream = match accept_async(stream).await {
+        Ok(websocket_stream) => websocket_stream,
+        Err(err) => {
+            warn!("failed to upgrade control socket websocket connection: {err}");
+            return;
+        }
+    };
+    let (websocket_writer, websocket_reader) = websocket_stream.split();
+    run_websocket_connection(websocket_writer, websocket_reader, transport_event_tx).await;
 }
 
 pub async fn prepare_control_socket_path(socket_path: &Path) -> IoResult<()> {

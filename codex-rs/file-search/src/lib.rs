@@ -159,10 +159,9 @@ pub struct FileSearchSession {
 impl FileSearchSession {
     /// Update the query. This should be cheap relative to re-walking.
     pub fn update_query(&self, pattern_text: &str) {
-        let _ = self
-            .inner
-            .work_tx
-            .send(WorkSignal::QueryUpdated(pattern_text.to_string()));
+        self.inner
+            .latest_query
+            .update(pattern_text, &self.inner.work_tx);
     }
 }
 
@@ -230,6 +229,7 @@ fn create_session_with_walk_limits(
         shutdown: Arc::new(AtomicBool::new(false)),
         reporter,
         work_tx,
+        latest_query: LatestQuery::default(),
     });
 
     let matcher_inner = inner.clone();
@@ -307,13 +307,49 @@ struct SessionInner {
     shutdown: Arc<AtomicBool>,
     reporter: Arc<dyn SessionReporter>,
     work_tx: Sender<WorkSignal>,
+    latest_query: LatestQuery,
 }
 
 enum WorkSignal {
-    QueryUpdated(String),
+    QueryUpdated,
     NucleoNotify,
     WalkComplete,
     Shutdown,
+}
+
+#[derive(Default)]
+struct LatestQuery {
+    value: Mutex<String>,
+    notification_queued: AtomicBool,
+}
+
+impl LatestQuery {
+    fn update(&self, query: &str, work_tx: &Sender<WorkSignal>) {
+        if let Ok(mut latest) = self.value.lock() {
+            latest.clear();
+            latest.push_str(query);
+        } else {
+            return;
+        }
+        if self
+            .notification_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if work_tx.send(WorkSignal::QueryUpdated).is_err() {
+            self.notification_queued.store(false, Ordering::Release);
+        }
+    }
+
+    fn read_for_worker(&self) -> String {
+        self.notification_queued.store(false, Ordering::Release);
+        self.value
+            .lock()
+            .map(|latest| latest.clone())
+            .unwrap_or_default()
+    }
 }
 
 fn coalescing_nucleo_notify(
@@ -533,7 +569,8 @@ fn matcher_worker(
                     break;
                 };
                 match signal {
-                    WorkSignal::QueryUpdated(query) => {
+                    WorkSignal::QueryUpdated => {
+                        let query = inner.latest_query.read_for_worker();
                         let append = query.starts_with(&last_query);
                         nucleo.pattern.reparse(
                             0,
@@ -746,6 +783,28 @@ mod tests {
         notify_queued.store(false, Ordering::Release);
         notify();
         assert!(matches!(work_rx.recv(), Ok(WorkSignal::NucleoNotify)));
+    }
+
+    #[test]
+    fn rapid_query_updates_queue_only_the_latest_query() {
+        let (work_tx, work_rx) = unbounded();
+        let latest_query = LatestQuery::default();
+
+        for index in 0..FILE_SEARCH_MAX_WALK_ENTRIES {
+            latest_query.update(&format!("query-{index}"), &work_tx);
+        }
+
+        assert_eq!(work_rx.len(), 1);
+        assert!(matches!(work_rx.recv(), Ok(WorkSignal::QueryUpdated)));
+        assert_eq!(
+            latest_query.read_for_worker(),
+            format!("query-{}", FILE_SEARCH_MAX_WALK_ENTRIES - 1)
+        );
+        assert!(work_rx.is_empty());
+
+        latest_query.update("next-query", &work_tx);
+        assert!(matches!(work_rx.recv(), Ok(WorkSignal::QueryUpdated)));
+        assert_eq!(latest_query.read_for_worker(), "next-query");
     }
 
     #[derive(Default)]

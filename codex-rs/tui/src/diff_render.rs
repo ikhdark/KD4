@@ -357,7 +357,6 @@ pub(crate) fn create_diff_summary(
 // Shared row for per-file presentation
 #[derive(Clone)]
 struct Row {
-    #[allow(dead_code)]
     path: PathBuf,
     move_path: Option<PathBuf>,
     added: usize,

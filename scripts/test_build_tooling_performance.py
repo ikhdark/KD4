@@ -704,41 +704,30 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn('app-server-schema-regenerate owner experimental="":', justfile)
         self.assertIn("cargo nextest run -p codex-app-server-protocol -E", justfile)
 
-    def test_agents_current_nested_instruction_layout_and_budget_are_explicit(
+    def test_agents_root_only_instruction_layout_and_budget_are_explicit(
         self,
     ) -> None:
-        expected_agent_files = [
-            ".codex/AGENTS.md",
-            "AGENTS.md",
-            "codex-rs/AGENTS.md",
-            "codex-rs/core/AGENTS.md",
-            "codex-rs/prompts/AGENTS.md",
-            "codex-rs/protocol/AGENTS.md",
-            "codex-rs/shell-command/AGENTS.md",
-            "codex-rs/tui/src/bottom_pane/AGENTS.md",
-            "scripts/AGENTS.md",
-            "scripts/codex_package/AGENTS.md",
-            "scripts/install/AGENTS.md",
-        ]
+        expected_agent_files = ["AGENTS.md"]
+        discovered_agent_files = subprocess.run(
+            [
+                "git",
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                ":(glob)**/AGENTS.md",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+            creationflags=CREATE_NO_WINDOW,
+        ).stdout.splitlines()
         actual_agent_files = sorted(
-            subprocess.run(
-                [
-                    "git",
-                    "ls-files",
-                    "--cached",
-                    "--others",
-                    "--exclude-standard",
-                    "--",
-                    ":(glob)**/AGENTS.md",
-                ],
-                cwd=REPO_ROOT,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=True,
-                creationflags=CREATE_NO_WINDOW,
-            ).stdout.splitlines()
+            path for path in discovered_agent_files if (REPO_ROOT / path).is_file()
         )
         actual_eol_attributes = subprocess.run(
             ["git", "check-attr", "eol", "--", *expected_agent_files],
@@ -753,54 +742,25 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         expected_eol_attributes = [f"{path}: eol: lf" for path in expected_agent_files]
         root_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         normalized_root = " ".join(root_text.split())
-        workspace_text = (REPO_ROOT / ".codex" / "AGENTS.md").read_text(
-            encoding="utf-8"
-        )
 
         self.assertEqual(actual_agent_files, sorted(expected_agent_files))
         self.assertEqual(actual_eol_attributes, expected_eol_attributes)
         self.assertIn(
-            "Read every applicable `AGENTS.md` from the repository root through "
-            "each path touched",
+            "Read the root `AGENTS.md` in full",
             normalized_root,
         )
-        self.assertIn("`.codex/AGENTS.md` covers workspace routing", normalized_root)
-        self.assertIn("The root `AGENTS.md` still applies", workspace_text)
-        rust_parent = REPO_ROOT / "codex-rs" / "AGENTS.md"
-        core_policy = REPO_ROOT / "codex-rs" / "core" / "AGENTS.md"
         source_map = REPO_ROOT / "SOURCEMAP.md"
-        rust_instruction_chain = [
-            REPO_ROOT / "AGENTS.md",
-            rust_parent,
-            core_policy,
-        ]
-        rust_parent_bytes = rust_instruction_chain[1].stat().st_size
-        rust_chain_bytes = sum(path.stat().st_size for path in rust_instruction_chain)
-        rust_parent_text = rust_parent.read_text(encoding="utf-8")
-        core_policy_text = core_policy.read_text(encoding="utf-8")
+        root_policy_bytes = (REPO_ROOT / "AGENTS.md").stat().st_size
         source_map_text = source_map.read_text(encoding="utf-8")
 
         self.assertLessEqual(
-            rust_parent_bytes,
-            4 * 1024,
-            "codex-rs/AGENTS.md should keep detailed routing in SOURCEMAP.md",
-        )
-        self.assertLessEqual(
-            rust_chain_bytes,
+            root_policy_bytes,
             16 * 1024,
-            "the root + codex-rs + core automatic instruction chain is too large",
-        )
-        self.assertIn("[`../SOURCEMAP.md`](../SOURCEMAP.md)", rust_parent_text)
-        self.assertIn("[`../../SOURCEMAP.md`](../../SOURCEMAP.md)", core_policy_text)
-        self.assertEqual((rust_parent.parent / "../SOURCEMAP.md").resolve(), source_map)
-        self.assertEqual(
-            (core_policy.parent / "../../SOURCEMAP.md").resolve(), source_map
+            "the root automatic instruction file is too large",
         )
         self.assertIn("## Validation routes", source_map_text)
         self.assertIn("## Rust workflow reference", source_map_text)
         self.assertIn("just rust-build-doctor", source_map_text)
-        self.assertIn("Tool-search breadth changes must preserve", core_policy_text)
-        self.assertIn("core_test_support::responses", core_policy_text)
 
 
 if __name__ == "__main__":

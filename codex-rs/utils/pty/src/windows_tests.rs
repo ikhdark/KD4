@@ -127,7 +127,9 @@ async fn assert_terminate_kills_descendant(
     };
     let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
     wait_for_output_contains(&mut output_rx, READY_MARKER, /*timeout_ms*/ 10_000).await?;
-    session.request_terminate();
+    session
+        .request_terminate()
+        .expect("request process termination");
     let (_, exit_code) = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 10_000).await;
     assert_ne!(
         exit_code, -1,

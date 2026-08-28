@@ -671,9 +671,6 @@ fn terminal_summary(check: &DoctorCheck) -> String {
         let version = detail::detail_value(check, "terminal version");
         parts.push(version.map_or(terminal.clone(), |version| format!("{terminal} {version}")));
     }
-    if let Some(multiplexer) = detail::detail_value(check, "multiplexer") {
-        parts.push(multiplexer);
-    }
     if let Some(term) = detail::detail_value(check, "TERM") {
         parts.push(format!("TERM={term}"));
     }
@@ -1132,19 +1129,19 @@ mod tests {
                 CheckStatus::Ok,
                 "OS language en-US",
             )
-            .detail("os: macOS 15.0")
+            .detail("os: Windows 11")
             .detail("os language: en-US")
             .detail("VISUAL: code --wait")
-            .detail("EDITOR: vim")
-            .detail("PAGER: less -R")
+            .detail("EDITOR: notepad.exe")
+            .detail("PAGER: more.com")
             .detail("GIT_PAGER: delta")
-            .detail("GH_PAGER: less")
-            .detail("LESS: -FRX"),
+            .detail("GH_PAGER: more.com")
+            .detail("LESS: FRX"),
             DoctorCheck::new(
                 "runtime.provenance",
                 "runtime",
                 CheckStatus::Ok,
-                "running local build on darwin-arm64",
+                "running local build on windows-x86_64",
             ),
             DoctorCheck::new(
                 "installation",
@@ -1164,7 +1161,7 @@ mod tests {
                 CheckStatus::Ok,
                 "git version 2.54.0",
             )
-            .detail("selected git: /usr/bin/git")
+            .detail(r"selected git: C:\Program Files\Git\cmd\git.exe")
             .detail("git version: git version 2.54.0")
             .detail("repo detected: true"),
             DoctorCheck::new(
@@ -1250,20 +1247,20 @@ Notes
 
 Environment
   ✓ system       en-US
-      os                       macOS 15.0
+      os                       Windows 11
       OS language              en-US
       VISUAL                   code --wait
-      EDITOR                   vim
-      PAGER                    less -R
+      EDITOR                   notepad.exe
+      PAGER                    more.com
       GIT_PAGER                delta
-      GH_PAGER                 less
-      LESS                     -FRX
-  ✓ runtime      running local build on darwin-arm64
+      GH_PAGER                 more.com
+      LESS                     FRX
+  ✓ runtime      running local build on windows-x86_64
   ✓ install      consistent
       managed by               npm: no · bun: no · pnpm: no · package root —
   ✓ search       search is OK (bundled)
   ✓ git          git version 2.54.0
-      selected git             /usr/bin/git
+      selected git             C:\\Program Files\\Git\\cmd\\git.exe
       version                  git version 2.54.0
       repo detected            true
   ⚠ terminal     narrow terminal
@@ -1321,7 +1318,7 @@ Notes
 
 Environment
   ✓ system       en-US
-  ✓ runtime      running local build on darwin-arm64
+  ✓ runtime      running local build on windows-x86_64
   ✓ install      consistent
   ✓ search       search is OK (bundled)
   ✓ git          git version 2.54.0
@@ -1429,7 +1426,7 @@ Notes
 
 Environment
   [ok] system       en-US
-  [ok] runtime      running local build on darwin-arm64
+  [ok] runtime      running local build on windows-x86_64
   [ok] install      consistent
   [ok] search       search is OK (bundled)
   [ok] git          git version 2.54.0
@@ -1490,8 +1487,8 @@ Run codex doctor without --summary for detailed diagnostics.
                     CheckStatus::Warning,
                     "width 79 cols - output may wrap (recommended >=80)",
                 )
-                .detail("terminal: Ghostty")
-                .detail("terminal version: 1.3.1")
+                .detail("terminal: Windows Terminal")
+                .detail("terminal version: 1.23.0")
                 .detail("terminal size: 79x26")
                 .issue(
                     super::super::DoctorIssue::new(
@@ -1512,7 +1509,7 @@ Run codex doctor without --summary for detailed diagnostics.
         );
         assert!(rendered.contains("▸ terminal size            79x26 (expected >= 80 columns)"));
         assert!(rendered.contains("→ resize the window to at least 80 columns"));
-        assert!(!rendered.contains("⚠ terminal     Ghostty 1.3.1"));
+        assert!(!rendered.contains("⚠ terminal     Windows Terminal 1.23.0"));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::CodeModeToolKind;
 use crate::ToolDefinition;
+use crate::runtime::MAX_OUTSTANDING_CALLBACKS_PER_CELL;
 
 #[derive(Debug, PartialEq)]
 enum DelegateEvent {
@@ -217,6 +218,42 @@ fn blocking_tool() -> ToolDefinition {
     }
 }
 
+#[tokio::test]
+async fn flattened_tool_identifier_collisions_are_rejected_before_cell_start() {
+    let service = InProcessCodeModeSession::new();
+    let result = service
+        .execute(ExecuteRequest {
+            enabled_tools: vec![
+                ToolDefinition {
+                    name: "acme__lookup".to_string(),
+                    tool_name: ToolName::plain("acme__lookup"),
+                    description: "plain tool".to_string(),
+                    kind: CodeModeToolKind::Function,
+                    input_schema: None,
+                    output_schema: None,
+                },
+                ToolDefinition {
+                    name: "acme__lookup".to_string(),
+                    tool_name: ToolName::namespaced("acme", "lookup"),
+                    description: "namespaced tool".to_string(),
+                    kind: CodeModeToolKind::Function,
+                    input_schema: None,
+                    output_schema: None,
+                },
+            ],
+            ..execute_request("text('unreachable');")
+        })
+        .await;
+
+    let Err(error) = result else {
+        panic!("normalized tool identifier collision should reject cell startup");
+    };
+    assert_eq!(
+        error,
+        "code mode tool identifier collision: `acme__lookup` and `acmelookup` both normalize to `acme__lookup`"
+    );
+}
+
 async fn next_event(events_rx: &mut mpsc::UnboundedReceiver<DelegateEvent>) -> DelegateEvent {
     tokio::time::timeout(Duration::from_secs(2), events_rx.recv())
         .await
@@ -334,6 +371,50 @@ text(results.length);
         }
     );
     assert_eq!(delegate.started.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test]
+async fn outstanding_tool_and_notification_callbacks_share_a_finite_budget() {
+    let (delegate, _events_rx) = BlockingDelegate::new();
+    let service = InProcessCodeModeSession::with_delegate(delegate);
+    let half_limit = MAX_OUTSTANDING_CALLBACKS_PER_CELL / 2;
+    let source = format!(
+        r#"
+for (let index = 0; index < {half_limit}; index += 1) {{
+  notify(`pending-${{index}}`);
+}}
+for (let index = 0; index < {half_limit}; index += 1) {{
+  tools.block({{index}});
+}}
+const overflow = await tools.block({{overflow: true}}).then(
+  () => "unexpected success",
+  (error) => String(error),
+);
+text(overflow);
+"#
+    );
+    let cell = service
+        .execute(ExecuteRequest {
+            enabled_tools: vec![blocking_tool()],
+            source,
+            yield_time_ms: Some(60_000),
+            ..execute_request("")
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cell.initial_response().await.unwrap(),
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: format!(
+                    "code mode cell exceeded its limit of {MAX_OUTSTANDING_CALLBACKS_PER_CELL} outstanding tool and notification callbacks"
+                ),
+            }],
+            error_text: None,
+        }
+    );
 }
 
 #[tokio::test]

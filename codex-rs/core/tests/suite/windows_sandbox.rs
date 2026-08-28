@@ -168,6 +168,7 @@ async fn windows_restricted_token_rejects_exact_and_glob_deny_read_policy() -> a
                 "type secret.env >NUL 2>NUL & echo exact secret 1>future.env 2>NUL & type future.env 2>NUL & type public.txt & exit /B 0"
                     .to_string(),
             ],
+            codex_home: cwd.clone(),
             cwd: cwd.clone(),
             expiration: 10_000.into(),
             capture_policy: ExecCapturePolicy::ShellTool,
@@ -256,6 +257,7 @@ async fn windows_elevated_enforces_deny_read_and_protects_setup_marker() -> anyh
                     setup_marker.display()
                 ),
             ],
+            codex_home: cwd.clone(),
             cwd: cwd.clone(),
             expiration: 10_000.into(),
             capture_policy: ExecCapturePolicy::ShellTool,

@@ -189,7 +189,6 @@ use tokio::select;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
 use toml::Value as TomlValue;
@@ -1253,10 +1252,9 @@ See the Codex keymap documentation for supported actions and examples."
                     self.handle_key_event(tui, app_server, key_event).await;
                 }
                 TuiEvent::Paste(pasted) => {
-                    // Many terminals convert newlines to \r when pasting (e.g., iTerm2),
-                    // but tui-textarea expects \n. Normalize CR to LF.
+                    // Windows terminals can convert pasted newlines to \r, but
+                    // tui-textarea expects \n. Normalize CR to LF.
                     // [tui-textarea]: https://github.com/rhysd/tui-textarea/blob/4d18622eeac13b309e0ff6a55a46ac6706da68cf/src/textarea.rs#L782-L783
-                    // [iTerm2]: https://github.com/gnachman/iTerm2/blob/5d0c0d9f68523cbd0494dad5422998964a2ecd8d/sources/iTermPasteHelper.m#L206-L216
                     let pasted = pasted.replace("\r", "\n");
                     self.chat_widget.handle_paste(pasted);
                 }

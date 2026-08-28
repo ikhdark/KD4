@@ -26,7 +26,7 @@ pub(super) struct ManagedConfigFromMdm {
 
 #[derive(Debug, Clone)]
 pub(super) struct LoadedConfigLayers {
-    /// If present, data read from a file such as `/etc/codex/managed_config.toml`.
+    /// If present, data read from the Windows managed-config file.
     pub managed_config: Option<MangedConfigFromFile>,
     /// Reserved compatibility field; managed preferences are not loaded on Windows.
     pub managed_config_from_mdm: Option<ManagedConfigFromMdm>,

@@ -250,6 +250,7 @@ async fn install_planned_mcp_dependencies(
                 return Err("MCP dependency installation was cancelled".to_string());
             }
             result = perform_oauth_login(
+                &config.codex_home,
                 name,
                 &oauth_config.url,
                 config.mcp_oauth_credentials_store_mode,
@@ -270,6 +271,7 @@ async fn install_planned_mcp_dependencies(
                         return Err("MCP dependency installation was cancelled".to_string());
                     }
                     result = perform_oauth_login(
+                        &config.codex_home,
                         name,
                         &oauth_config.url,
                         config.mcp_oauth_credentials_store_mode,

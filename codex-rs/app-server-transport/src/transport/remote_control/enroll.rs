@@ -6,6 +6,8 @@ use super::protocol::StartRemoteControlPairingResponse;
 use axum::http::HeaderMap;
 use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_protocol::RemoteControlPairingStatusResponse;
+use codex_http_client::HttpClient;
+#[cfg(test)]
 use codex_login::default_client::create_client_without_request_logging;
 use codex_state::RemoteControlEnrollmentRecord;
 use codex_state::StateRuntime;
@@ -44,8 +46,18 @@ pub(super) enum RemoteControlServerTokenRefreshRequirement {
 }
 
 impl RemoteControlEnrollment {
+    #[cfg(test)]
     pub(super) async fn start_pairing(
         &self,
+        request: StartRemoteControlPairingRequest,
+    ) -> io::Result<RemoteControlPairingStartResponse> {
+        let client = create_client_without_request_logging()?;
+        self.start_pairing_with_client(&client, request).await
+    }
+
+    pub(super) async fn start_pairing_with_client(
+        &self,
+        client: &HttpClient,
         request: StartRemoteControlPairingRequest,
     ) -> io::Result<RemoteControlPairingStartResponse> {
         if self.server_token_refresh_requirement()
@@ -58,7 +70,7 @@ impl RemoteControlEnrollment {
             .as_deref()
             .ok_or_else(pairing_unavailable_error)?;
 
-        let response = create_client_without_request_logging()?
+        let response = client
             .post(&self.remote_control_target.pair_url)
             .timeout(REMOTE_CONTROL_PAIRING_TIMEOUT)
             .bearer_auth(remote_control_token)
@@ -139,8 +151,18 @@ impl RemoteControlEnrollment {
         })
     }
 
+    #[cfg(test)]
     pub(super) async fn pairing_status(
         &self,
+        request: RemoteControlPairingStatusRequest,
+    ) -> io::Result<RemoteControlPairingStatusResponse> {
+        let client = create_client_without_request_logging()?;
+        self.pairing_status_with_client(&client, request).await
+    }
+
+    pub(super) async fn pairing_status_with_client(
+        &self,
+        client: &HttpClient,
         request: RemoteControlPairingStatusRequest,
     ) -> io::Result<RemoteControlPairingStatusResponse> {
         if self.server_token_refresh_requirement()
@@ -153,7 +175,7 @@ impl RemoteControlEnrollment {
             .as_deref()
             .ok_or_else(pairing_unavailable_error)?;
 
-        let response = create_client_without_request_logging()?
+        let response = client
             .post(&self.remote_control_target.pair_status_url)
             .timeout(REMOTE_CONTROL_PAIRING_TIMEOUT)
             .bearer_auth(remote_control_token)

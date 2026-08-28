@@ -299,7 +299,7 @@ async fn failed_watch_does_not_commit_a_logical_registration() {
         .expect("watcher inner")
         .lock()
         .expect("inner lock")
-        .fail_next_watch = true;
+        .fail_watch_attempts = 1;
     let result = subscriber.register_paths(vec![WatchPath {
         path: root.clone(),
         recursive: false,
@@ -307,15 +307,32 @@ async fn failed_watch_does_not_commit_a_logical_registration() {
 
     assert!(result.is_err());
     assert_eq!(watcher.watch_counts_for_test(&root), None);
-    let state = watcher.state.read().expect("state lock");
-    assert!(
-        state
-            .subscribers
-            .get(&subscriber.id)
-            .expect("subscriber")
-            .watched_paths
-            .is_empty()
-    );
+    {
+        let state = watcher.state.read().expect("state lock");
+        assert!(
+            state
+                .subscribers
+                .get(&subscriber.id)
+                .expect("subscriber")
+                .watched_paths
+                .is_empty()
+        );
+    }
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let reconciled = {
+                let inner = watcher.inner.as_ref().expect("watcher inner");
+                let inner = inner.lock().expect("inner lock");
+                !inner.degraded_paths.contains(&root)
+            };
+            if reconciled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed registration should reconcile its degraded backend state");
 }
 
 #[tokio::test]
@@ -414,6 +431,121 @@ async fn recursive_registration_downgrades_to_non_recursive_after_drop() {
 }
 
 #[tokio::test]
+async fn failed_nonempty_mode_downgrade_is_reconciled() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path().join("watched-dir");
+    std::fs::create_dir(&root).expect("create root");
+
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, _rx) = watcher.add_subscriber();
+    let _non_recursive = subscriber.register_path(root.clone(), /*recursive*/ false);
+    let recursive = subscriber.register_path(root.clone(), /*recursive*/ true);
+    watcher
+        .inner
+        .as_ref()
+        .expect("watcher inner")
+        .lock()
+        .expect("inner lock")
+        .fail_next_unwatch = true;
+
+    drop(recursive);
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let reconciled = {
+                let inner = watcher.inner.as_ref().expect("watcher inner");
+                let inner = inner.lock().expect("inner lock");
+                inner.watched_paths.get(&root) == Some(&RecursiveMode::NonRecursive)
+                    && !inner.degraded_paths.contains(&root)
+            };
+            if reconciled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed nonempty downgrade should be reconciled");
+}
+
+#[tokio::test]
+async fn failed_mode_restore_is_reconciled() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path().join("watched-dir");
+    std::fs::create_dir(&root).expect("create root");
+
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, _rx) = watcher.add_subscriber();
+    let _non_recursive = subscriber.register_path(root.clone(), /*recursive*/ false);
+    let recursive = subscriber.register_path(root.clone(), /*recursive*/ true);
+    watcher
+        .inner
+        .as_ref()
+        .expect("watcher inner")
+        .lock()
+        .expect("inner lock")
+        .fail_watch_attempts = 2;
+
+    drop(recursive);
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let reconciled = {
+                let inner = watcher.inner.as_ref().expect("watcher inner");
+                let inner = inner.lock().expect("inner lock");
+                inner.watched_paths.get(&root) == Some(&RecursiveMode::NonRecursive)
+                    && !inner.degraded_paths.contains(&root)
+            };
+            if reconciled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("missing backend watch after a failed restore should be reconciled");
+}
+
+#[tokio::test]
+async fn failed_old_watch_release_after_move_is_reconciled() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let requested = temp_dir.path().join("created-dir");
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, _rx) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(requested.clone(), /*recursive*/ false);
+    std::fs::create_dir(&requested).expect("create requested directory");
+    watcher
+        .inner
+        .as_ref()
+        .expect("watcher inner")
+        .lock()
+        .expect("inner lock")
+        .fail_next_unwatch = true;
+
+    watcher
+        .send_paths_for_test(vec![temp_dir.path().to_path_buf()])
+        .await;
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let reconciled = {
+                let inner = watcher.inner.as_ref().expect("watcher inner");
+                let inner = inner.lock().expect("inner lock");
+                inner.watched_paths.get(&requested) == Some(&RecursiveMode::NonRecursive)
+                    && !inner.watched_paths.contains_key(temp_dir.path())
+                    && !inner.degraded_paths.contains(temp_dir.path())
+            };
+            if reconciled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed release of a fallback watch should be reconciled");
+}
+
+#[tokio::test]
 async fn unregister_holds_state_lock_until_unwatch_finishes() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let root = temp_dir.path().join("watched-dir");
@@ -494,6 +626,40 @@ async fn matching_subscribers_are_notified() {
 
     let plugins_event = timeout(TEST_THROTTLE_INTERVAL, plugins_rx.recv()).await;
     assert_eq!(plugins_event.is_err(), true);
+}
+
+#[tokio::test]
+async fn stable_descendant_events_skip_actual_path_resolution() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let skills = temp_dir.path().join("skills");
+    let plugins = temp_dir.path().join("plugins");
+    std::fs::create_dir(&skills).expect("create skills dir");
+    std::fs::create_dir(&plugins).expect("create plugins dir");
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, rx) = watcher.add_subscriber();
+    let _skills = subscriber.register_path(skills.clone(), /*recursive*/ true);
+    let _plugins = subscriber.register_path(plugins, /*recursive*/ true);
+
+    watcher
+        .send_paths_for_test(vec![skills.join("rust").join("SKILL.md")])
+        .await;
+
+    assert_eq!(
+        watcher.take_actual_watch_path_resolution_count_for_test(),
+        0
+    );
+    let mut rx = ThrottledWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
+    let event = timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("skills change timeout")
+        .expect("skills change");
+    assert_eq!(
+        event,
+        FileWatcherEvent {
+            paths: vec![skills.join("rust").join("SKILL.md")],
+            rescan_required: false,
+        }
+    );
 }
 
 #[tokio::test]
@@ -850,4 +1016,20 @@ async fn dropping_live_watcher_releases_inner_watcher() {
     drop(watcher);
 
     assert_eq!(weak_inner.upgrade().is_none(), true);
+}
+
+#[test]
+fn reconciliation_requests_are_coalesced_to_one_pending_wakeup() {
+    let (reconcile_tx, mut reconcile_rx) = mpsc::channel(1);
+
+    for _ in 0..10_000 {
+        request_reconciliation(&reconcile_tx);
+    }
+
+    assert_eq!(reconcile_rx.len(), 1);
+    assert_eq!(reconcile_rx.try_recv(), Ok(()));
+    assert!(matches!(
+        reconcile_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }

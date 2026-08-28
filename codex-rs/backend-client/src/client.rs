@@ -179,8 +179,12 @@ impl Client {
         auth: &CodexAuth,
         http_client_factory: HttpClientFactory,
     ) -> Self {
-        Self::new(base_url, http_client_factory)
-            .with_user_agent(get_codex_user_agent())
+        Self::new(base_url, http_client_factory).with_auth(auth)
+    }
+
+    /// Applies a current auth snapshot while preserving this client's shared transport pool.
+    pub fn with_auth(self, auth: &CodexAuth) -> Self {
+        self.with_user_agent(get_codex_user_agent())
             .with_auth_provider(codex_model_provider::auth_provider_from_auth(auth))
     }
 
@@ -1077,6 +1081,34 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
             ],
             [Some("Bearer e30.e30.c2ln"), Some("workspace-123")]
+        );
+    }
+
+    #[test]
+    fn cloned_client_refreshes_auth_without_replacing_its_transport_pool() {
+        let template = Client::new(
+            "https://chatgpt.com/backend-api",
+            HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+        );
+        let first = template
+            .clone()
+            .with_auth(&CodexAuth::from_api_key("sk-first"));
+        let second = template.with_auth(&CodexAuth::from_api_key("sk-second"));
+
+        assert!(first.http.shares_cache_with(&second.http));
+        assert_eq!(
+            first
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-first")
+        );
+        assert_eq!(
+            second
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-second")
         );
     }
 

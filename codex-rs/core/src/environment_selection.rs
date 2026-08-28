@@ -216,23 +216,13 @@ impl ThreadEnvironments {
                     }
                     info = environment.info() => info,
                 };
-                match info {
-                    Ok(info) => match Shell::from_environment_shell_info(info.shell) {
-                        Ok(shell) => Some(shell),
-                        Err(err) => {
-                            tracing::warn!(
-                                "failed to resolve shell for environment `{environment_id}`: {err}"
-                            );
-                            None
-                        }
-                    },
-                    Err(err) => {
-                        tracing::warn!(
-                            "failed to get info for environment `{environment_id}`: {err}"
-                        );
-                        None
-                    }
-                }
+                let info = info.map_err(Arc::new)?;
+                let shell = Shell::from_environment_shell_info(info.shell).map_err(|err| {
+                    Arc::new(ExecServerError::Protocol(format!(
+                        "invalid shell for environment `{environment_id}`: {err}"
+                    )))
+                })?;
+                Some(shell)
             } else {
                 Some(local_shell)
             };
@@ -478,7 +468,14 @@ mod tests {
             .send(Message::Text(
                 serde_json::json!({
                     "id": info["id"],
-                    "result": { "shell": { "name": "zsh", "path": "/bin/zsh" } }
+                    "result": {
+                        "operatingSystem": "windows",
+                        "shell": {
+                            "name": "powershell",
+                            "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+                        },
+                        "cwd": "file:///C:/workspace"
+                    }
                 })
                 .to_string()
                 .into(),

@@ -51,9 +51,9 @@ mod imp {
 
     /// Queries OSC 10 and OSC 11 default colors under one shared deadline.
     ///
-    /// The Windows path uses raw console handles because crossterm's public color query helper is
-    /// currently Unix-only. Failures and missing responses are reported as `Ok(None)` by callers so
-    /// terminals without OSC 10/11 support keep the existing conservative palette fallback.
+    /// Uses raw Windows console handles so the probe can use a short, caller-controlled deadline.
+    /// Failures and missing responses are reported as `Ok(None)` by callers so terminals without
+    /// OSC 10/11 support keep the conservative palette fallback.
     pub(crate) fn default_colors(timeout: Duration) -> io::Result<Option<DefaultColors>> {
         let Ok(output) = std_handle(STD_OUTPUT_HANDLE) else {
             return Ok(None);

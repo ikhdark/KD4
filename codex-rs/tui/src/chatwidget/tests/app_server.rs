@@ -17,6 +17,7 @@ fn thread_settings_for_test(
             sandbox_policy: codex_app_server_protocol::SandboxPolicy::ReadOnly {
                 network_access: false,
             },
+            permission_profile: Some(PermissionProfile::read_only()),
             active_permission_profile: Some(
                 codex_app_server_protocol::ActivePermissionProfile::read_only(),
             ),
@@ -604,6 +605,64 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
 }
 
 #[tokio::test]
+async fn live_reasoning_policy_phase_updates_the_working_status() {
+    use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::protocol::ReasoningPolicyPhase;
+    use codex_protocol::protocol::ReasoningPolicySnapshot;
+    use codex_protocol::protocol::ReasoningPolicySource;
+    use codex_protocol::protocol::ReasoningPolicyTrigger;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.handle_server_notification(
+        ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: AppServerTurn {
+                id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: Vec::new(),
+                status: AppServerTurnStatus::InProgress,
+                error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
+                reasoning_policy_history: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::TurnReasoningPolicyUpdated(
+            codex_app_server_protocol::TurnReasoningPolicyUpdatedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                snapshot: ReasoningPolicySnapshot {
+                    sequence: 1,
+                    timestamp: 1,
+                    phase: ReasoningPolicyPhase::Verify,
+                    configured_effort: Some(ReasoningEffort::High),
+                    effective_effort: Some(ReasoningEffort::High),
+                    request_effort: Some(ReasoningEffort::High),
+                    source: ReasoningPolicySource::TurnFallback,
+                    model: "test-model".to_string(),
+                    trigger: ReasoningPolicyTrigger::UserInput,
+                },
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible");
+    assert_eq!(status.header(), "Verifying");
+}
+
+#[tokio::test]
 async fn live_app_server_turn_completed_renders_completion_gate() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -915,13 +974,37 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
         /*replay_kind*/ None,
     );
 
-    let cells = drain_insert_history(&mut rx);
+    let cells = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(cell),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
         cells.len(),
         1,
         "expected one completed command history cell"
     );
-    let blob = lines_to_single_string(cells.first().expect("command cell"));
+    let cell = cells.first().expect("command cell");
+    let exec_cell = cell
+        .as_any()
+        .downcast_ref::<crate::exec_cell::ExecCell>()
+        .expect("exec cell");
+    let output = exec_cell
+        .iter_calls()
+        .next()
+        .and_then(|call| call.output.as_ref())
+        .expect("completed command output");
+    assert!(
+        output.formatted_output.is_none(),
+        "identical preview and transcript output should share one string"
+    );
+    assert!(
+        lines_to_single_string(&cell.raw_lines()).contains("Hello, world!"),
+        "the shared output should remain available to transcript rendering"
+    );
+
+    let blob = lines_to_single_string(&cell.display_lines(/*width*/ 80));
     assert_chatwidget_snapshot!(
         "live_app_server_command_execution_strips_shell_wrapper",
         blob

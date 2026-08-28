@@ -9,6 +9,7 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartSource;
 use codex_core::config::Config;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_protocol::models::PermissionProfile;
 use serde_json::Value;
 
 /// Caller-owned values that vary between embedded and remote app-server transports.
@@ -36,6 +37,10 @@ pub fn thread_start_params_from_config(
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: Some(config.approvals_reviewer.into()),
         sandbox: sandbox_override_from_config(config, overrides.permissions.as_ref()),
+        permission_profile: permission_profile_override_from_config(
+            config,
+            overrides.permissions.as_ref(),
+        ),
         permissions: overrides.permissions,
         config: thread_config_overrides_from_config(config),
         developer_instructions: overrides.developer_instructions,
@@ -66,6 +71,10 @@ pub fn thread_resume_params_from_config(
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override,
         sandbox: sandbox_override_from_config(config, overrides.permissions.as_ref()),
+        permission_profile: permission_profile_override_from_config(
+            config,
+            overrides.permissions.as_ref(),
+        ),
         permissions: overrides.permissions,
         config: thread_config_overrides_from_config(config),
         developer_instructions: overrides.developer_instructions,
@@ -90,6 +99,10 @@ pub fn thread_fork_params_from_config(
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: Some(config.approvals_reviewer.into()),
         sandbox: sandbox_override_from_config(config, overrides.permissions.as_ref()),
+        permission_profile: permission_profile_override_from_config(
+            config,
+            overrides.permissions.as_ref(),
+        ),
         permissions: overrides.permissions,
         config: thread_config_overrides_from_config(config),
         base_instructions: config.base_instructions.clone(),
@@ -162,4 +175,13 @@ fn sandbox_override_from_config(
             config.cwd.as_path(),
         )
     }
+}
+
+fn permission_profile_override_from_config(
+    config: &Config,
+    permissions: Option<&String>,
+) -> Option<PermissionProfile> {
+    permissions
+        .is_none()
+        .then(|| config.permissions.effective_permission_profile())
 }

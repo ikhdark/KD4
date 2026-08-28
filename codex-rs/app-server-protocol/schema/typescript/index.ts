@@ -62,6 +62,7 @@ export type { NextSampleBlockReason } from "./NextSampleBlockReason";
 export type { OverloadErrorData } from "./OverloadErrorData";
 export type { OverloadReason } from "./OverloadReason";
 export type { ParsedCommand } from "./ParsedCommand";
+export type { PathUri } from "./PathUri";
 export type { PermissionProfile } from "./PermissionProfile";
 export type { Personality } from "./Personality";
 export type { PlanType } from "./PlanType";

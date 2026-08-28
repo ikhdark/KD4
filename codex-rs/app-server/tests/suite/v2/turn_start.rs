@@ -78,8 +78,6 @@ use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_utils_absolute_path::test_support::PathExt;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
-use core_test_support::skip_if_remote;
-use core_test_support::skip_if_wine_exec;
 use indexmap::IndexMap;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -2026,11 +2024,6 @@ async fn turn_start_forwards_custom_local_image_detail() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
-    // TODO(anp): Remove after shell-command approval routing supports target-native Windows cwd.
-    skip_if_wine_exec!(
-        Ok(()),
-        "shell-command approval routing requires a host-native cwd under Wine-exec"
-    );
     skip_if_no_network!(Ok(()));
 
     let tmp = TempDir::new()?;
@@ -2196,11 +2189,6 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_exec_approval_decline_v2() -> Result<()> {
-    // TODO(anp): Remove after command approval routing accepts target-native Windows cwd.
-    skip_if_wine_exec!(
-        Ok(()),
-        "command approval routing rejects the selected Windows cwd on the Linux host"
-    );
     skip_if_no_network!(Ok(()));
 
     let tmp = TempDir::new()?;
@@ -2346,8 +2334,6 @@ async fn turn_start_exec_approval_decline_v2() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
-    // TODO(anp): Materialize cwd and shell-display fixtures in the selected remote environment.
-    skip_if_remote!(Ok(()), "cwd fixtures are only materialized on the host");
     skip_if_no_network!(Ok(()));
 
     let tmp = TempDir::new()?;
@@ -2427,6 +2413,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
                 exclude_tmpdir_env_var: true,
                 exclude_slash_tmp: true,
             }),
+            permission_profile: None,
             permissions: None,
             model: Some("mock-model".to_string()),
             effort: Some(ReasoningEffort::Medium),
@@ -2467,6 +2454,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             approval_policy: Some(codex_app_server_protocol::AskForApproval::Never),
             approvals_reviewer: None,
             sandbox_policy: Some(codex_app_server_protocol::SandboxPolicy::DangerFullAccess),
+            permission_profile: None,
             permissions: None,
             model: Some("mock-model".to_string()),
             effort: Some(ReasoningEffort::Medium),
@@ -2678,11 +2666,6 @@ fn environment_params(ids: Option<&[&str]>, cwd: &Path) -> Option<Vec<TurnEnviro
 
 #[tokio::test]
 async fn turn_start_file_change_approval_v2() -> Result<()> {
-    // TODO(anp): Materialize apply-patch workspaces in the selected remote environment.
-    skip_if_remote!(
-        Ok(()),
-        "apply-patch workspace fixture is only materialized on the host"
-    );
     skip_if_no_network!(Ok(()));
 
     let tmp = TempDir::new()?;
@@ -2855,11 +2838,6 @@ async fn turn_start_file_change_approval_v2() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_does_not_stream_apply_patch_change_updates_without_feature_v2() -> Result<()> {
-    // TODO(anp): Materialize apply-patch workspaces in the selected remote environment.
-    skip_if_remote!(
-        Ok(()),
-        "apply-patch workspace fixture is only materialized on the host"
-    );
     skip_if_no_network!(Ok(()));
 
     let tmp = TempDir::new()?;
@@ -2961,11 +2939,6 @@ async fn turn_start_does_not_stream_apply_patch_change_updates_without_feature_v
 
 #[tokio::test]
 async fn turn_start_streams_apply_patch_change_updates_v2() -> Result<()> {
-    // TODO(anp): Materialize apply-patch workspaces in the selected remote environment.
-    skip_if_remote!(
-        Ok(()),
-        "apply-patch workspace fixture is only materialized on the host"
-    );
     skip_if_no_network!(Ok(()));
 
     let tmp = TempDir::new()?;
@@ -3703,11 +3676,6 @@ config_file = "./custom-role.toml"
 
 #[tokio::test]
 async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Result<()> {
-    // TODO(anp): Materialize apply-patch workspaces in the selected remote environment.
-    skip_if_remote!(
-        Ok(()),
-        "apply-patch workspace fixture is only materialized on the host"
-    );
     skip_if_no_network!(Ok(()));
 
     let tmp = TempDir::new()?;
@@ -3894,11 +3862,6 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
 
 #[tokio::test]
 async fn turn_start_file_change_approval_decline_v2() -> Result<()> {
-    // TODO(anp): Materialize apply-patch workspaces in the selected remote environment.
-    skip_if_remote!(
-        Ok(()),
-        "apply-patch workspace fixture is only materialized on the host"
-    );
     skip_if_no_network!(Ok(()));
 
     let tmp = TempDir::new()?;
@@ -4056,13 +4019,7 @@ async fn turn_start_file_change_approval_decline_v2() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "process id reporting differs on Windows"]
 async fn command_execution_notifications_include_process_id() -> Result<()> {
-    // TODO(anp): Add target-Windows process-id expectations for remote executors.
-    skip_if_wine_exec!(
-        Ok(()),
-        "process id reporting differs for a Windows executor"
-    );
     skip_if_no_network!(Ok(()));
 
     let responses = vec![

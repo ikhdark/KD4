@@ -55,7 +55,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::PatchApplyUpdatedEvent;
 use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
-use codex_sandboxing::policy_transforms::merge_permission_profiles;
+use codex_sandboxing::policy_transforms::merge_uri_permission_profiles;
 use codex_sandboxing::policy_transforms::normalize_additional_permissions;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -350,7 +350,7 @@ fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String> {
 async fn effective_patch_permissions(
     session: &Session,
     turn: &TurnContext,
-    environment_id: &str,
+    approval_scope_id: &str,
     action: &ApplyPatchAction,
     cwd: &PathUri,
 ) -> std::io::Result<(
@@ -365,16 +365,19 @@ async fn effective_patch_permissions(
             return external_patch_permissions(turn, file_paths).ok_or(error);
         }
     };
-    let granted_permissions = merge_permission_profiles(
+    let granted_permissions = merge_uri_permission_profiles(
         session
-            .granted_session_permissions(environment_id)
+            .granted_session_permissions(approval_scope_id)
             .await
             .as_ref(),
         session
-            .granted_turn_permissions(environment_id)
+            .granted_turn_permissions(approval_scope_id)
             .await
             .as_ref(),
     );
+    let granted_permissions = granted_permissions
+        .map(AdditionalPermissionProfile::try_from)
+        .transpose()?;
     let base_file_system_sandbox_policy = turn.file_system_sandbox_policy();
     let file_system_sandbox_policy = effective_file_system_sandbox_policy(
         &base_file_system_sandbox_policy,
@@ -392,7 +395,7 @@ async fn effective_patch_permissions(
     };
     let effective_additional_permissions = apply_granted_turn_permissions(
         session,
-        environment_id,
+        approval_scope_id,
         native_cwd.as_path(),
         crate::sandboxing::SandboxPermissions::UseDefault,
         write_permissions_for_paths(&native_file_paths, &file_system_sandbox_policy, &native_cwd),
@@ -424,6 +427,7 @@ fn external_patch_permissions(
             crate::tools::handlers::EffectiveAdditionalPermissions {
                 sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
                 additional_permissions: None,
+                additional_permissions_uri: None,
                 permissions_preapproved: false,
             },
             codex_protocol::permissions::FileSystemSandboxPolicy::external_sandbox(),
@@ -518,7 +522,7 @@ impl ApplyPatchHandler {
                     effective_patch_permissions(
                         session.as_ref(),
                         turn.as_ref(),
-                        &turn_environment.environment_id,
+                        turn_environment.environment.approval_scope_id(),
                         &changes,
                         turn_environment.cwd(),
                     )
@@ -637,6 +641,10 @@ impl CoreToolRuntime for ApplyPatchHandler {
         })
     }
 
+    fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
+        matches!(&invocation.payload, ToolPayload::Custom { .. }).then(HookToolName::apply_patch)
+    }
+
     fn with_updated_hook_input(
         &self,
         mut invocation: ToolInvocation,
@@ -672,6 +680,7 @@ impl CoreToolRuntime for ApplyPatchHandler {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn intercept_apply_patch(
+    is_validation: bool,
     command: &[String],
     cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
@@ -682,6 +691,9 @@ pub(crate) async fn intercept_apply_patch(
     call_id: &str,
     tool_name: &str,
 ) -> Result<Option<FunctionToolOutput>, ApplyPatchInterceptionError> {
+    if is_validation {
+        return Ok(None);
+    }
     let sandbox = turn.file_system_sandbox_context(/*additional_permissions*/ None, cwd);
     match codex_apply_patch::maybe_parse_apply_patch_verified_for_environment(
         command,
@@ -707,7 +719,7 @@ pub(crate) async fn intercept_apply_patch(
                 effective_patch_permissions(
                     session.as_ref(),
                     turn.as_ref(),
-                    &turn_environment.environment_id,
+                    turn_environment.environment.approval_scope_id(),
                     &changes,
                     cwd,
                 )

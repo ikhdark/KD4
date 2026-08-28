@@ -199,8 +199,11 @@ impl RequestIdSequencer {
 }
 
 struct ExecRunArgs {
-    in_process_start_args: InProcessClientStartArgs,
-    state_db: Option<StateDbHandle>,
+    arg0_paths: Arg0DispatchPaths,
+    cli_overrides: Vec<(String, codex_config::TomlValue)>,
+    loader_overrides: LoaderOverrides,
+    strict_config: bool,
+    cloud_config_bundle: CloudConfigBundleLoader,
     command: Option<ExecCommand>,
     config: Config,
     resume_approvals_reviewer_override: Option<codex_app_server_protocol::ApprovalsReviewer>,
@@ -520,39 +523,12 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     if let Some(context) = traceparent_context_from_env() {
         set_parent_from_context(&exec_span, context);
     }
-    let local_runtime_paths =
-        ExecServerRuntimePaths::from_optional_path(arg0_paths.codex_self_exe.clone())?;
-    let state_db = codex_core::init_state_db(&config).await;
-    let environment_manager = if run_loader_overrides.ignore_user_config {
-        EnvironmentManager::from_env(Some(local_runtime_paths)).await?
-    } else {
-        EnvironmentManager::from_codex_home(config.codex_home.clone(), Some(local_runtime_paths))
-            .await?
-    };
-    let in_process_start_args = InProcessClientStartArgs {
+    run_exec_session(ExecRunArgs {
         arg0_paths,
-        config: std::sync::Arc::new(config.clone()),
         cli_overrides: run_cli_overrides,
         loader_overrides: run_loader_overrides,
         strict_config,
         cloud_config_bundle: run_cloud_config_bundle,
-        feedback: CodexFeedback::new(),
-        log_db: None,
-        state_db: state_db.clone(),
-        environment_manager: std::sync::Arc::new(environment_manager),
-        config_warnings: Vec::new(),
-        session_source: SessionSource::Exec,
-        enable_codex_api_key_env: true,
-        client_name: "codex_exec".to_string(),
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        experimental_api: true,
-        mcp_server_openai_form_elicitation: false,
-        opt_out_notification_methods: Vec::new(),
-        channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
-    };
-    run_exec_session(ExecRunArgs {
-        in_process_start_args,
-        state_db,
         command,
         config,
         resume_approvals_reviewer_override,
@@ -614,8 +590,11 @@ async fn load_bootstrap_config_or_exit(
 
 async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     let ExecRunArgs {
-        in_process_start_args,
-        state_db,
+        arg0_paths,
+        cli_overrides,
+        loader_overrides,
+        strict_config,
+        cloud_config_bundle,
         command,
         config,
         resume_approvals_reviewer_override,
@@ -737,6 +716,37 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    let local_runtime_paths =
+        ExecServerRuntimePaths::from_optional_path(arg0_paths.codex_self_exe.clone())?;
+    let state_db = codex_core::init_state_db(&config).await;
+    let environment_manager = if loader_overrides.ignore_user_config {
+        EnvironmentManager::from_env(Some(local_runtime_paths)).await?
+    } else {
+        EnvironmentManager::from_codex_home(config.codex_home.clone(), Some(local_runtime_paths))
+            .await?
+    };
+    let in_process_start_args = InProcessClientStartArgs {
+        arg0_paths,
+        config: std::sync::Arc::new(config.clone()),
+        cli_overrides,
+        loader_overrides,
+        strict_config,
+        cloud_config_bundle,
+        feedback: CodexFeedback::new(),
+        log_db: None,
+        state_db: state_db.clone(),
+        environment_manager: std::sync::Arc::new(environment_manager),
+        config_warnings: Vec::new(),
+        session_source: SessionSource::Exec,
+        enable_codex_api_key_env: true,
+        client_name: "codex_exec".to_string(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        experimental_api: true,
+        mcp_server_openai_form_elicitation: false,
+        opt_out_notification_methods: Vec::new(),
+        channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+    };
+
     let mut request_ids = RequestIdSequencer::new();
     let mut client = InProcessAppServerClient::start(in_process_start_args)
         .await
@@ -834,6 +844,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         approval_policy: Some(default_approval_policy.into()),
                         approvals_reviewer: None,
                         sandbox_policy: None,
+                        permission_profile: None,
                         permissions: None,
                         model: None,
                         service_tier: None,

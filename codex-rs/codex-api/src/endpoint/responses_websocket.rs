@@ -22,6 +22,8 @@ use serde_json::Value;
 use serde_json::map::Map as JsonMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -45,8 +47,111 @@ use url::Url;
 
 struct WsStream {
     tx_command: mpsc::Sender<WsCommand>,
-    rx_message: mpsc::UnboundedReceiver<Result<Message, WsError>>,
+    rx_message: WsIngressReceiver,
+    rx_failure: Option<oneshot::Receiver<WsIngressFailure>>,
+    pending_failure: Option<WsError>,
     pump_task: tokio::task::JoinHandle<()>,
+}
+
+const WEBSOCKET_INGRESS_CAPACITY: usize = 1600;
+const WEBSOCKET_INGRESS_MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+const WEBSOCKET_INGRESS_OVERFLOW_MESSAGE: &str =
+    "responses websocket ingress queue exceeded its bounded capacity";
+
+struct StagedWsMessage {
+    message: Message,
+    payload_bytes: usize,
+}
+
+#[derive(Clone)]
+struct WsIngressSender {
+    tx: mpsc::Sender<StagedWsMessage>,
+    queued_bytes: Arc<AtomicUsize>,
+    max_queued_bytes: usize,
+}
+
+struct WsIngressReceiver {
+    rx: mpsc::Receiver<StagedWsMessage>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WsIngressSendError {
+    Full,
+    Closed,
+}
+
+#[derive(Debug)]
+enum WsIngressFailure {
+    Transport(WsError),
+    Overflow(WsError),
+}
+
+fn ws_ingress_channel(
+    capacity: usize,
+    max_queued_bytes: usize,
+) -> (WsIngressSender, WsIngressReceiver) {
+    let (tx, rx) = mpsc::channel(capacity);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    (
+        WsIngressSender {
+            tx,
+            queued_bytes: Arc::clone(&queued_bytes),
+            max_queued_bytes,
+        },
+        WsIngressReceiver { rx, queued_bytes },
+    )
+}
+
+impl WsIngressSender {
+    fn try_send(&self, message: Message) -> Result<(), WsIngressSendError> {
+        let payload_bytes = message.len();
+        if self
+            .queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued_bytes| {
+                queued_bytes
+                    .checked_add(payload_bytes)
+                    .filter(|next| *next <= self.max_queued_bytes)
+            })
+            .is_err()
+        {
+            return Err(WsIngressSendError::Full);
+        }
+
+        let staged = StagedWsMessage {
+            message,
+            payload_bytes,
+        };
+        match self.tx.try_send(staged) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(staged)) => {
+                self.queued_bytes
+                    .fetch_sub(staged.payload_bytes, Ordering::AcqRel);
+                Err(WsIngressSendError::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(staged)) => {
+                self.queued_bytes
+                    .fetch_sub(staged.payload_bytes, Ordering::AcqRel);
+                Err(WsIngressSendError::Closed)
+            }
+        }
+    }
+}
+
+impl WsIngressReceiver {
+    async fn recv(&mut self) -> Option<Message> {
+        let staged = self.rx.recv().await?;
+        self.queued_bytes
+            .fetch_sub(staged.payload_bytes, Ordering::AcqRel);
+        Some(staged.message)
+    }
+
+    fn try_recv(&mut self) -> Option<Message> {
+        let staged = self.rx.try_recv().ok()?;
+        self.queued_bytes
+            .fetch_sub(staged.payload_bytes, Ordering::AcqRel);
+        Some(staged.message)
+    }
 }
 
 enum WsCommand {
@@ -59,10 +164,15 @@ enum WsCommand {
 impl WsStream {
     fn new(inner: WebSocketConnection) -> Self {
         let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(32);
-        let (tx_message, rx_message) = mpsc::unbounded_channel::<Result<Message, WsError>>();
+        let (tx_message, rx_message) = ws_ingress_channel(
+            WEBSOCKET_INGRESS_CAPACITY,
+            WEBSOCKET_INGRESS_MAX_QUEUED_BYTES,
+        );
+        let (tx_failure, rx_failure) = oneshot::channel();
 
         let pump_task = tokio::spawn(async move {
             let mut inner = inner;
+            let mut tx_failure = Some(tx_failure);
             loop {
                 tokio::select! {
                     command = rx_command.recv() => {
@@ -87,7 +197,9 @@ impl WsStream {
                         match message {
                             Ok(Message::Ping(payload)) => {
                                 if let Err(err) = inner.send(Message::Pong(payload)).await {
-                                    let _ = tx_message.send(Err(err));
+                                    if let Some(tx_failure) = tx_failure.take() {
+                                        let _ = tx_failure.send(WsIngressFailure::Transport(err));
+                                    }
                                     break;
                                 }
                             }
@@ -97,15 +209,28 @@ impl WsStream {
                             | Message::Close(_)
                             | Message::Frame(_))) => {
                                 let is_close = matches!(message, Message::Close(_));
-                                if tx_message.send(Ok(message)).is_err() {
-                                    break;
+                                match tx_message.try_send(message) {
+                                    Ok(()) => {}
+                                    Err(WsIngressSendError::Full) => {
+                                        if let Some(tx_failure) = tx_failure.take() {
+                                            let _ = tx_failure.send(WsIngressFailure::Overflow(
+                                                WsError::Io(std::io::Error::other(
+                                                    WEBSOCKET_INGRESS_OVERFLOW_MESSAGE,
+                                                )),
+                                            ));
+                                        }
+                                        break;
+                                    }
+                                    Err(WsIngressSendError::Closed) => break,
                                 }
                                 if is_close {
                                     break;
                                 }
                             }
                             Err(err) => {
-                                let _ = tx_message.send(Err(err));
+                                if let Some(tx_failure) = tx_failure.take() {
+                                    let _ = tx_failure.send(WsIngressFailure::Transport(err));
+                                }
                                 break;
                             }
                         }
@@ -117,6 +242,8 @@ impl WsStream {
         Self {
             tx_command,
             rx_message,
+            rx_failure: Some(rx_failure),
+            pending_failure: None,
             pump_task,
         }
     }
@@ -138,7 +265,35 @@ impl WsStream {
     }
 
     async fn next(&mut self) -> Option<Result<Message, WsError>> {
-        self.rx_message.recv().await
+        loop {
+            if let Some(error) = self.pending_failure.take() {
+                if let Some(message) = self.rx_message.try_recv() {
+                    self.pending_failure = Some(error);
+                    return Some(Ok(message));
+                }
+                return Some(Err(error));
+            }
+
+            if let Some(rx_failure) = self.rx_failure.as_mut() {
+                tokio::select! {
+                    biased;
+                    failure = rx_failure => {
+                        self.rx_failure = None;
+                        match failure {
+                            Ok(WsIngressFailure::Overflow(error)) => return Some(Err(error)),
+                            Ok(WsIngressFailure::Transport(error)) => {
+                                self.pending_failure = Some(error);
+                                continue;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    message = self.rx_message.recv() => return message.map(Ok),
+                }
+            } else {
+                return self.rx_message.recv().await.map(Ok);
+            }
+        }
     }
 
     fn is_closed(&self) -> bool {
@@ -210,7 +365,7 @@ impl ResponsesWebsocketConnection {
             connection_reused,
             turn_state,
             || {},
-            || {},
+            |_| {},
             || {},
         )
         .await
@@ -228,7 +383,7 @@ impl ResponsesWebsocketConnection {
         connection_reused: bool,
         turn_state: Option<Arc<OnceLock<String>>>,
         queue_started: impl FnOnce(),
-        dispatch_ready: impl FnOnce() + Send + 'static,
+        dispatch_ready: impl FnOnce(u64) + Send + 'static,
         stream_established: impl FnOnce() + Send + 'static,
     ) -> Result<ResponseStream, ApiError> {
         let (tx_event, rx_event) =
@@ -239,6 +394,7 @@ impl ResponsesWebsocketConnection {
         let upstream_request_id = metadata.upstream_request_id().map(str::to_string);
         let telemetry = self.telemetry.clone();
         let request_text = serialize_websocket_request(request)?;
+        let encoded_request_bytes = u64::try_from(request_text.len()).unwrap_or(u64::MAX);
         let (tx_send_complete, rx_send_complete) = oneshot::channel();
         queue_started();
 
@@ -261,7 +417,7 @@ impl ResponsesWebsocketConnection {
                         return;
                     };
 
-                    dispatch_ready();
+                    dispatch_ready(encoded_request_bytes);
                     let send_result = send_websocket_request(
                         ws_stream,
                         request_text,
@@ -661,7 +817,9 @@ async fn run_websocket_response_stream(
                     Ok(events) => events,
                     Err(ResponsesEventError::Parse(error)) => {
                         debug!("failed to parse websocket event: {error}, data: {text}");
-                        continue;
+                        return Err(ApiError::Stream(format!(
+                            "failed to parse websocket event: {error}"
+                        )));
                     }
                     Err(ResponsesEventError::Api(error)) => return Err(error),
                 };
@@ -777,7 +935,7 @@ mod tests {
     #[tokio::test]
     async fn connection_reports_closed_after_websocket_pump_exits() {
         let (tx_command, rx_command) = mpsc::channel::<WsCommand>(1);
-        let (_tx_message, rx_message) = mpsc::unbounded_channel();
+        let (_tx_message, rx_message) = ws_ingress_channel(1, 1);
         let (tx_done, rx_done) = oneshot::channel();
         let pump_task = tokio::spawn(async move {
             let _rx_command = rx_command;
@@ -787,6 +945,8 @@ mod tests {
             WsStream {
                 tx_command,
                 rx_message,
+                rx_failure: None,
+                pending_failure: None,
                 pump_task,
             },
             Duration::from_secs(1),
@@ -808,7 +968,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_callbacks_separate_socket_queue_from_transport_send() {
         let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(1);
-        let (tx_message, rx_message) = mpsc::unbounded_channel();
+        let (tx_message, rx_message) = ws_ingress_channel(1, 1024);
         let events = Arc::new(StdMutex::new(Vec::new()));
         let pump_events = Arc::clone(&events);
         let pump_task = tokio::spawn(async move {
@@ -823,6 +983,8 @@ mod tests {
             WsStream {
                 tx_command,
                 rx_message,
+                rx_failure: None,
+                pending_failure: None,
                 pump_task,
             },
             Duration::from_secs(1),
@@ -851,6 +1013,8 @@ mod tests {
         let queue_events = Arc::clone(&events);
         let dispatch_events = Arc::clone(&events);
         let established_events = Arc::clone(&events);
+        let expected_request_bytes =
+            u64::try_from(serialize_websocket_request(&request).unwrap().len()).unwrap();
 
         let stream = connection
             .stream_request_with_dispatch_ready(
@@ -858,7 +1022,10 @@ mod tests {
                 false,
                 None,
                 move || queue_events.lock().unwrap().push("queue"),
-                move || dispatch_events.lock().unwrap().push("dispatch"),
+                move |request_bytes| {
+                    assert_eq!(request_bytes, expected_request_bytes);
+                    dispatch_events.lock().unwrap().push("dispatch");
+                },
                 move || established_events.lock().unwrap().push("established"),
             )
             .await
@@ -871,6 +1038,169 @@ mod tests {
         );
         drop(stream);
         drop(tx_message);
+    }
+
+    #[tokio::test]
+    async fn websocket_ingress_enforces_item_and_byte_limits() {
+        let (item_tx, mut item_rx) = ws_ingress_channel(1, 1024);
+        item_tx
+            .try_send(Message::Text("first".into()))
+            .expect("first item should fit");
+        assert_eq!(
+            item_tx.try_send(Message::Text("second".into())),
+            Err(WsIngressSendError::Full)
+        );
+        assert_eq!(item_rx.recv().await, Some(Message::Text("first".into())));
+        item_tx
+            .try_send(Message::Text("second".into()))
+            .expect("capacity should be released after receive");
+
+        let (byte_tx, mut byte_rx) = ws_ingress_channel(2, 3);
+        byte_tx
+            .try_send(Message::Text("ab".into()))
+            .expect("first payload should fit byte budget");
+        assert_eq!(
+            byte_tx.try_send(Message::Text("cd".into())),
+            Err(WsIngressSendError::Full)
+        );
+        assert_eq!(byte_rx.recv().await, Some(Message::Text("ab".into())));
+        byte_tx
+            .try_send(Message::Text("cd".into()))
+            .expect("byte budget should be released after receive");
+    }
+
+    #[tokio::test]
+    async fn websocket_ingress_failure_preempts_staged_messages() {
+        let (tx_command, _rx_command) = mpsc::channel::<WsCommand>(1);
+        let (tx_message, rx_message) = ws_ingress_channel(1, 1024);
+        tx_message
+            .try_send(Message::Text("queued".into()))
+            .expect("message should be staged");
+        let (tx_failure, rx_failure) = oneshot::channel();
+        tx_failure
+            .send(WsIngressFailure::Overflow(WsError::Io(
+                std::io::Error::other(WEBSOCKET_INGRESS_OVERFLOW_MESSAGE),
+            )))
+            .expect("failure receiver should be open");
+        let pump_task = tokio::spawn(async {});
+        let mut stream = WsStream {
+            tx_command,
+            rx_message,
+            rx_failure: Some(rx_failure),
+            pending_failure: None,
+            pump_task,
+        };
+
+        let error = stream
+            .next()
+            .await
+            .expect("failure should be emitted")
+            .expect_err("overflow should fail the stream");
+        assert!(
+            error
+                .to_string()
+                .contains(WEBSOCKET_INGRESS_OVERFLOW_MESSAGE)
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_ingress_transport_failure_follows_staged_messages() {
+        let (tx_command, _rx_command) = mpsc::channel::<WsCommand>(1);
+        let (tx_message, rx_message) = ws_ingress_channel(1, 1024);
+        let queued = Message::Text("queued".into());
+        tx_message
+            .try_send(queued.clone())
+            .expect("message should be staged");
+        let (tx_failure, rx_failure) = oneshot::channel();
+        tx_failure
+            .send(WsIngressFailure::Transport(WsError::ConnectionClosed))
+            .expect("failure receiver should be open");
+        let mut stream = WsStream {
+            tx_command,
+            rx_message,
+            rx_failure: Some(rx_failure),
+            pending_failure: None,
+            pump_task: tokio::spawn(async {}),
+        };
+
+        let message = stream
+            .next()
+            .await
+            .expect("message should be emitted")
+            .expect("staged message should precede the transport failure");
+        assert_eq!(message, queued);
+        assert!(matches!(
+            stream.next().await.expect("failure should be emitted"),
+            Err(WsError::ConnectionClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn protocol_errors_stop_before_completed() {
+        let completed = json!({
+            "type": "response.completed",
+            "response": {"id": "resp1"}
+        })
+        .to_string();
+
+        for (case, payload) in [
+            (
+                "invalid output item",
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {"type": "message"}
+                })
+                .to_string(),
+            ),
+            (
+                "malformed json",
+                r#"{"type":"response.output_item.done""#.to_string(),
+            ),
+        ] {
+            let (tx_command, _rx_command) = mpsc::channel::<WsCommand>(1);
+            let (tx_message, rx_message) = ws_ingress_channel(2, 1024);
+            tx_message
+                .try_send(Message::Text(payload.into()))
+                .expect("invalid event should fit ingress queue");
+            tx_message
+                .try_send(Message::Text(completed.clone().into()))
+                .expect("completion should fit ingress queue");
+            drop(tx_message);
+            let mut ws_stream = WsStream {
+                tx_command,
+                rx_message,
+                rx_failure: None,
+                pending_failure: None,
+                pump_task: tokio::spawn(std::future::pending()),
+            };
+            let (tx_event, mut rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(2);
+
+            let error = run_websocket_response_stream(
+                &mut ws_stream,
+                tx_event,
+                Duration::from_secs(1),
+                /*telemetry*/ None,
+                ResponsesStreamMetadata::default(),
+                /*turn_state*/ None,
+            )
+            .await
+            .expect_err("protocol error should terminate before completion");
+
+            match error {
+                ApiError::Stream(message) => {
+                    assert!(
+                        message.contains("response.output_item.done")
+                            || message.contains("failed to parse websocket event"),
+                        "case {case}: {message}"
+                    );
+                }
+                other => panic!("unexpected error for {case}: {other:?}"),
+            }
+            assert!(
+                rx_event.recv().await.is_none(),
+                "case {case} emitted a response event"
+            );
+        }
     }
 
     #[test]

@@ -27,13 +27,16 @@ use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermiss
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::FileSystemPermissions as CoreFileSystemPermissions;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
 use codex_protocol::permissions::FileSystemAccessMode as CoreFileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath as CoreFileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry as CoreFileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSpecialPath as CoreFileSystemSpecialPath;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
@@ -232,8 +235,10 @@ fn thread_resume_response_round_trips_initial_turns_page() {
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::User,
         sandbox: SandboxPolicy::DangerFullAccess,
+        permission_profile: None,
         active_permission_profile: None,
         reasoning_effort: None,
+        selected_environment: None,
         initial_turns_page: Some(TurnsPage {
             data: Vec::new(),
             next_cursor: Some("cursor_next".to_string()),
@@ -604,6 +609,7 @@ fn permissions_request_approval_uses_request_permission_profile() {
         "environmentId": "remote",
         "startedAtMs": 1,
         "cwd": absolute_path_string("repo"),
+        "cwdUri": PathUri::from_abs_path(&absolute_path("repo")),
         "reason": "Select a workspace root",
         "permissions": {
             "network": {
@@ -618,6 +624,10 @@ fn permissions_request_approval_uses_request_permission_profile() {
     .expect("permissions request should deserialize");
 
     assert_eq!(params.cwd, absolute_path("repo"));
+    assert_eq!(
+        params.cwd_uri,
+        PathUri::from_abs_path(&absolute_path("repo"))
+    );
     assert_eq!(params.environment_id.as_deref(), Some("remote"));
     assert_eq!(
         params.permissions,
@@ -640,24 +650,49 @@ fn permissions_request_approval_uses_request_permission_profile() {
         }
     );
 
+    let cwd_uri = params.cwd_uri.clone();
     assert_eq!(
-        CoreRequestPermissionProfile::try_from(params.permissions)
-            .expect("API paths should convert to native paths"),
+        params
+            .permissions
+            .into_core_with_cwd(&cwd_uri)
+            .expect("API paths should convert to path URIs"),
         CoreRequestPermissionProfile {
             network: Some(CoreNetworkPermissions {
                 enabled: Some(true),
             }),
             file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
-                Some(vec![
-                    AbsolutePathBuf::try_from(PathBuf::from(read_only_path))
+                Some(vec![PathUri::from_abs_path(
+                    &AbsolutePathBuf::try_from(PathBuf::from(read_only_path))
                         .expect("path must be absolute"),
-                ]),
-                Some(vec![
-                    AbsolutePathBuf::try_from(PathBuf::from(read_write_path))
+                ),]),
+                Some(vec![PathUri::from_abs_path(
+                    &AbsolutePathBuf::try_from(PathBuf::from(read_write_path))
                         .expect("path must be absolute"),
-                ]),
+                ),]),
             )),
         }
+    );
+}
+
+#[test]
+fn permissions_request_approval_requires_legacy_cwd() {
+    let err = serde_json::from_value::<PermissionsRequestApprovalParams>(json!({
+        "threadId": "thr_123",
+        "turnId": "turn_123",
+        "itemId": "call_123",
+        "startedAtMs": 1,
+        "cwdUri": "file:///remote/repo",
+        "reason": null,
+        "permissions": {
+            "network": null,
+            "fileSystem": null,
+        },
+    }))
+    .expect_err("legacy cwd must remain required for stable API compatibility");
+
+    assert!(
+        err.to_string().contains("missing field `cwd`"),
+        "unexpected error: {err}"
     );
 }
 
@@ -669,6 +704,7 @@ fn permissions_request_approval_rejects_macos_permissions() {
         "itemId": "call_123",
         "startedAtMs": 1,
         "cwd": absolute_path_string("repo"),
+        "cwdUri": PathUri::from_abs_path(&absolute_path("repo")),
         "reason": "Select a workspace root",
         "permissions": {
             "network": null,
@@ -941,6 +977,38 @@ fn permission_profile_selection_uses_id_string() {
         fork.permissions,
         Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string())
     );
+}
+
+#[test]
+fn canonical_permission_profile_round_trips_without_legacy_projection() {
+    let permission_profile = PermissionProfile::Managed {
+        file_system: ManagedFileSystemPermissions::Unrestricted,
+        network: NetworkSandboxPolicy::Restricted,
+    };
+    let encoded_profile =
+        serde_json::to_value(&permission_profile).expect("permission profile should serialize");
+
+    let start: ThreadStartParams = serde_json::from_value(json!({
+        "permissionProfile": encoded_profile,
+        "sandbox": "danger-full-access",
+    }))
+    .expect("thread/start params should preserve the canonical profile");
+    assert_eq!(start.permission_profile, Some(permission_profile.clone()));
+    assert_eq!(
+        serde_json::to_value(start)
+            .expect("thread/start params should serialize")
+            .get("permissionProfile"),
+        Some(&encoded_profile)
+    );
+
+    let turn: TurnStartParams = serde_json::from_value(json!({
+        "threadId": "thread-1",
+        "input": [],
+        "permissionProfile": encoded_profile,
+        "sandboxPolicy": { "type": "dangerFullAccess" },
+    }))
+    .expect("turn/start params should preserve the canonical profile");
+    assert_eq!(turn.permission_profile, Some(permission_profile));
 }
 
 #[test]
@@ -2357,6 +2425,36 @@ fn mcp_server_status_updated_serializes_failure_reason() {
                 "status": "failed",
                 "error": "OAuth credentials expired",
                 "failureReason": "reauthenticationRequired",
+            },
+        })
+    );
+}
+
+#[test]
+fn mcp_server_startup_completed_serializes_aggregate_result() {
+    let notification =
+        ServerNotification::McpServerStartupCompleted(McpServerStartupCompletedNotification {
+            thread_id: Some("thread-1".to_string()),
+            ready: vec!["alpha".to_string()],
+            failed: vec![McpServerStartupFailure {
+                server: "beta".to_string(),
+                error: "beta handshake failed".to_string(),
+            }],
+            cancelled: vec!["gamma".to_string()],
+        });
+
+    assert_eq!(
+        serde_json::to_value(notification).expect("notification should serialize"),
+        json!({
+            "method": "mcpServer/startup/completed",
+            "params": {
+                "threadId": "thread-1",
+                "ready": ["alpha"],
+                "failed": [{
+                    "server": "beta",
+                    "error": "beta handshake failed",
+                }],
+                "cancelled": ["gamma"],
             },
         })
     );
@@ -4242,6 +4340,7 @@ fn turn_start_params_preserve_explicit_null_service_tier() {
         approval_policy: None,
         approvals_reviewer: None,
         sandbox_policy: None,
+        permission_profile: None,
         permissions: None,
         model: None,
         service_tier: None,

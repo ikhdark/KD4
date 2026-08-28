@@ -43,6 +43,7 @@ pub(crate) struct ToolDispatchTimingSnapshot {
     pub retry_count: u32,
     pub reentry_count: u32,
     pub outcome: Option<&'static str>,
+    pub first_poll_at_ms: Option<u64>,
     pub item_to_first_poll_ms: Option<u64>,
     pub parallel_gate_wait_ms: Option<u64>,
     pub authorization_state_coordination_ms: Option<u64>,
@@ -82,6 +83,7 @@ pub(crate) struct ToolDispatchTiming {
     reentry_count: AtomicU32,
     item_accepted_at: Instant,
     first_poll_at: OnceLock<Instant>,
+    first_poll_at_ms: OnceLock<u64>,
     parallel_gate_admitted_at: OnceLock<Instant>,
     authorization_state_coordination: OnceLock<Duration>,
     handler_entry_at: OnceLock<Instant>,
@@ -143,6 +145,7 @@ impl ToolDispatchTiming {
             reentry_count: AtomicU32::new(0),
             item_accepted_at,
             first_poll_at: OnceLock::new(),
+            first_poll_at_ms: OnceLock::new(),
             parallel_gate_admitted_at: OnceLock::new(),
             authorization_state_coordination: OnceLock::new(),
             handler_entry_at: OnceLock::new(),
@@ -221,7 +224,11 @@ impl ToolDispatchTiming {
     }
 
     pub(crate) fn mark_first_poll(&self) {
-        let _ = self.first_poll_at.set(Instant::now());
+        if self.first_poll_at.set(Instant::now()).is_ok()
+            && let Some(turn_timing) = self.turn_timing.as_ref()
+        {
+            let _ = self.first_poll_at_ms.set(turn_timing.monotonic_offset_ms());
+        }
     }
 
     pub(crate) fn mark_parallel_gate_admitted(&self) {
@@ -242,8 +249,15 @@ impl ToolDispatchTiming {
     }
 
     pub(crate) fn mark_handler_exit(&self) {
-        let _ = self.handler_exit_at.set(Instant::now());
-        self.record_boundary(ToolLifecycleBoundary::HandlerReturn);
+        if self.handler_exit_at.set(Instant::now()).is_ok() {
+            self.record_boundary(ToolLifecycleBoundary::HandlerReturn);
+        }
+    }
+
+    pub(crate) fn mark_handler_exit_if_entered(&self) {
+        if self.handler_entry_at.get().is_some() {
+            self.mark_handler_exit();
+        }
     }
 
     fn record_phase(target: &OnceLock<Duration>, duration: Duration) {
@@ -295,8 +309,9 @@ impl ToolDispatchTiming {
     }
 
     pub(crate) fn mark_exec_process_exited(&self) {
-        let _ = self.exec_process_exited_at.set(Instant::now());
-        self.record_boundary(ToolLifecycleBoundary::ProcessExit);
+        if self.exec_process_exited_at.set(Instant::now()).is_ok() {
+            self.record_boundary(ToolLifecycleBoundary::ProcessExit);
+        }
     }
 
     pub(crate) fn mark_relay_enqueue(&self) -> bool {
@@ -383,6 +398,7 @@ impl ToolDispatchTiming {
             retry_count: self.retry_count.load(Ordering::Acquire),
             reentry_count: self.reentry_count.load(Ordering::Acquire),
             outcome: self.outcome.get().copied(),
+            first_poll_at_ms: self.first_poll_at_ms.get().copied(),
             item_to_first_poll_ms: first_poll_at
                 .and_then(|at| duration_ms(at.saturating_duration_since(self.item_accepted_at))),
             parallel_gate_wait_ms: first_poll_at.and_then(|first_poll_at| {
@@ -562,6 +578,7 @@ use codex_rollout_trace::ToolDispatchTraceContext;
 /// Keeps registry early-return paths paired with trace end events.
 pub(crate) struct ToolDispatchTrace {
     context: ToolDispatchTraceContext,
+    terminal_tasks: tokio_util::task::TaskTracker,
 }
 
 impl ToolDispatchTrace {
@@ -571,7 +588,10 @@ impl ToolDispatchTrace {
             .services
             .rollout_thread_trace
             .start_tool_dispatch_trace(|| tool_dispatch_invocation(invocation));
-        Self { context }
+        Self {
+            context,
+            terminal_tasks: invocation.session.terminal_tasks.clone(),
+        }
     }
 
     pub(crate) fn record_completed(
@@ -580,33 +600,50 @@ impl ToolDispatchTrace {
         call_id: &str,
         payload: &ToolPayload,
         result: &dyn ToolOutput,
-    ) {
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         if !self.context.is_enabled() {
-            return;
+            return Box::pin(async {});
         }
 
         let Some(result_payload) = tool_dispatch_result(invocation, call_id, payload, result)
         else {
-            return;
+            return Box::pin(async {});
         };
         let status = execution_status_for_outcome(result.outcome_context());
         let context = self.context.clone();
-        defer_trace_recording(move || context.record_completed(status, result_payload));
+        let terminal_tasks = self.terminal_tasks.clone();
+        Box::pin(async move {
+            defer_trace_recording(&terminal_tasks, move || {
+                context.record_completed(status, result_payload);
+            })
+            .await;
+        })
     }
 
-    pub(crate) fn record_failed(&self, error: &FunctionCallError) {
+    pub(crate) fn record_failed(
+        &self,
+        error: &FunctionCallError,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         if !self.context.is_enabled() {
-            return;
+            return Box::pin(async {});
         }
         let context = self.context.clone();
         let error = error.to_string();
-        defer_trace_recording(move || context.record_failed(error));
+        let terminal_tasks = self.terminal_tasks.clone();
+        Box::pin(async move {
+            defer_trace_recording(&terminal_tasks, move || context.record_failed(error)).await;
+        })
     }
 }
 
-fn defer_trace_recording(record: impl FnOnce() + Send + 'static) {
+async fn defer_trace_recording(
+    terminal_tasks: &tokio_util::task::TaskTracker,
+    record: impl FnOnce() + Send + 'static,
+) {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        drop(runtime.spawn_blocking(record));
+        if let Err(err) = terminal_tasks.spawn_blocking_on(record, &runtime).await {
+            tracing::warn!("rollout trace recording task failed: {err}");
+        }
     } else {
         record();
     }

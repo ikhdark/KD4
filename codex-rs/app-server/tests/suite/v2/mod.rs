@@ -6,7 +6,6 @@ mod attestation;
 mod auto_env;
 mod client_metadata;
 mod collaboration_mode_list;
-#[cfg(unix)]
 mod command_exec;
 mod compaction;
 mod config_rpc;

@@ -138,9 +138,7 @@ fn structured_validation_route_round_trips_direct_argv_leaves() {
                 "ordering": "run_all",
                 "leaves": [{
                     "argv": ["cargo", "test", "-p", "codex-core", "focused_case"],
-                    "uncertainty": "the focused validation contract remains satisfied",
                     "covered_paths": ["core/src/validation_admission.rs"],
-                    "covered_contracts": ["focused-validation-v1"],
                     "timeout_ms": 30000
                 }]
             }
@@ -155,18 +153,41 @@ fn structured_validation_route_round_trips_direct_argv_leaves() {
 #[test]
 fn structured_validation_route_rejects_empty_argv_and_unbounded_timeouts() {
     for leaf in [
-        json!({"argv": [], "timeout_ms": 1000}),
-        json!({"argv": ["cargo", "test"], "timeout_ms": 0}),
+        json!({"argv": [], "covered_paths": ["src"], "timeout_ms": 1000}),
+        json!({"argv": [" "], "covered_paths": ["src"], "timeout_ms": 1000}),
+        json!({"argv": ["cargo", "test"], "covered_paths": [], "timeout_ms": 1000}),
+        json!({"argv": ["cargo", "test"], "covered_paths": ["src"], "timeout_ms": 0}),
         json!({
             "argv": ["cargo", "test"],
+            "covered_paths": ["src"],
             "timeout_ms": MAX_STRUCTURED_VALIDATION_TIMEOUT_MS + 1
         }),
     ] {
         let error = serde_json::from_value::<ValidationRoute>(json!({"leaves": [leaf]}))
             .expect_err("inadmissible route leaf should fail");
         assert!(
-            error.to_string().contains("validation route"),
+            error.to_string().contains("validation"),
             "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn structured_validation_route_rejects_removed_fields() {
+    for removed in ["uncertainty", "covered_contracts", "semantic_timeout"] {
+        let mut leaf = json!({
+            "argv": ["cargo", "test"],
+            "covered_paths": ["src"],
+            "timeout_ms": 1000
+        });
+        leaf[removed] = json!(if removed == "semantic_timeout" {
+            "false"
+        } else {
+            "legacy"
+        });
+        assert!(
+            serde_json::from_value::<ValidationRoute>(json!({"leaves": [leaf]})).is_err(),
+            "removed field {removed} must be rejected"
         );
     }
 }

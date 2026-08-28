@@ -849,7 +849,7 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manual_compact_uses_custom_prompt() {
+async fn manual_compact_openai_provider_uses_custom_prompt_locally() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -865,7 +865,7 @@ async fn manual_compact_uses_custom_prompt() {
 
     let custom_prompt = "Use this compact prompt instead";
 
-    let model_provider = non_openai_model_provider(&server);
+    let model_provider = openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         config.compact_prompt = Some(custom_prompt.to_string());
@@ -927,19 +927,17 @@ async fn manual_compact_uses_custom_prompt() {
         }
     }
 
-    let used_prompt = found_custom_prompt || found_default_prompt;
-    if used_prompt {
-        assert!(found_custom_prompt, "custom prompt should be injected");
-        assert!(
-            !found_default_prompt,
-            "default prompt should be replaced when a compact prompt is used"
-        );
-    } else {
-        assert!(
-            !found_default_prompt,
-            "summarization prompt should not appear if compaction omits a prompt"
-        );
-    }
+    assert!(found_custom_prompt, "custom prompt should be injected");
+    assert!(
+        !found_default_prompt,
+        "default prompt should be replaced when a compact prompt is used"
+    );
+    assert!(
+        input
+            .iter()
+            .all(|item| item.get("type").and_then(Value::as_str) != Some("compaction_trigger")),
+        "custom prompt must not be routed through remote compaction"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1631,7 +1629,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 
-async fn auto_compact_runs_after_token_limit_hit() {
+async fn auto_compact_openai_provider_with_custom_prompt_uses_local_route() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -1658,7 +1656,7 @@ async fn auto_compact_runs_after_token_limit_hit() {
 
     let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
 
-    let model_provider = non_openai_model_provider(&server);
+    let model_provider = openai_model_provider(&server);
 
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
@@ -3449,6 +3447,116 @@ async fn manual_compact_non_retryable_failure_is_not_retried() {
         request_log.requests().len(),
         2,
         "non-retryable compact failure should make exactly one compact request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_rejects_invalid_summary_without_committing_output() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let rejected_summary = "## Goal\npreserve the active task\n\n## Next action\nretry compaction";
+    let user_turn = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed("r1"),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m2", rejected_summary),
+        ev_completed("r2"),
+    ]);
+    let followup_turn = sse(vec![
+        ev_assistant_message("m3", "FOLLOWUP_REPLY"),
+        ev_completed("r3"),
+    ]);
+    let request_log =
+        mount_sse_sequence(&server, vec![user_turn, compact_turn, followup_turn]).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_auto_compact_token_limit = Some(200_000);
+        })
+        .build(&server)
+        .await
+        .expect("build codex");
+    let codex = &test.codex;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "first turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit user input");
+    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    let error = wait_for_event(codex, |event| matches!(event, EventMsg::Error(_))).await;
+    let EventMsg::Error(error) = error else {
+        unreachable!("predicate only accepts error events");
+    };
+    assert!(error.message.contains("compaction handoff is incomplete"));
+    let completion =
+        wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completion) = completion else {
+        unreachable!("predicate only accepts turn-complete events");
+    };
+    assert!(
+        completion.error.is_some(),
+        "standalone compact failure must be terminally unsuccessful"
+    );
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "after rejected compact".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit follow-up input");
+    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex.flush_rollout().await.expect("flush rollout");
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    let followup_body = requests[2].body_json().to_string();
+    assert!(body_contains_text(&followup_body, "first turn"));
+    assert!(body_contains_text(&followup_body, FIRST_REPLY));
+    assert!(body_contains_text(&followup_body, "after rejected compact"));
+    assert!(
+        !body_contains_text(&followup_body, rejected_summary),
+        "rejected compaction output must not enter live history"
+    );
+
+    let rollout = fs::read_to_string(rollout_path).expect("read rollout");
+    assert!(
+        !body_contains_text(&rollout, rejected_summary),
+        "rejected compaction output must not be persisted"
+    );
+    assert!(
+        rollout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+            .all(|line| !matches!(line.item, RolloutItem::Compacted(_))),
+        "failed compaction must not persist a compacted checkpoint"
     );
 }
 

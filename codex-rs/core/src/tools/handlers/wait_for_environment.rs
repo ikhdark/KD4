@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::FunctionCallError;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -87,11 +88,14 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
                     )));
                 };
 
-                environment.wait_until_ready().await.map_err(|_| {
-                    FunctionCallError::RespondToModel(format!(
-                        "Environment `{environment_id}` failed to start and is unavailable. Continue without it."
-                    ))
-                })?;
+                if environment.wait_until_ready().await.is_err() {
+                    return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                        format!(
+                            "Environment `{environment_id}` failed to start and is unavailable. Continue without it."
+                        ),
+                        Some(true),
+                    )));
+                }
             }
 
             Ok(boxed_tool_output(JsonToolOutput::new(json!({

@@ -35,6 +35,17 @@ pub struct PostToolUseRequest {
     pub tool_response: Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct PostToolUsePlan {
+    matched: Vec<ConfiguredHandler>,
+}
+
+impl PostToolUsePlan {
+    pub fn is_empty(&self) -> bool {
+        self.matched.is_empty()
+    }
+}
+
 #[derive(Debug)]
 pub struct PostToolUseOutcome {
     pub hook_events: Vec<HookCompletedEvent>,
@@ -50,34 +61,35 @@ struct PostToolUseHandlerData {
     feedback_messages_for_model: Vec<String>,
 }
 
-pub(crate) fn preview(
+pub(crate) fn plan(
     handlers: &[ConfiguredHandler],
-    request: &PostToolUseRequest,
-) -> Vec<HookRunSummary> {
-    let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
-    dispatcher::select_handlers_for_matcher_inputs(
-        handlers,
-        HookEventName::PostToolUse,
-        &matcher_inputs,
-    )
-    .into_iter()
-    .map(|handler| {
-        common::hook_run_for_tool_use(dispatcher::running_summary(&handler), &request.tool_use_id)
-    })
-    .collect()
-}
-
-pub(crate) async fn run(
-    handlers: &[ConfiguredHandler],
-    shell: &CommandShell,
-    request: PostToolUseRequest,
-) -> PostToolUseOutcome {
-    let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
+    tool_name: &str,
+    matcher_aliases: &[String],
+) -> PostToolUsePlan {
+    let matcher_inputs = common::matcher_inputs(tool_name, matcher_aliases);
     let matched = dispatcher::select_handlers_for_matcher_inputs(
         handlers,
         HookEventName::PostToolUse,
         &matcher_inputs,
     );
+    PostToolUsePlan { matched }
+}
+
+pub(crate) fn preview(plan: &PostToolUsePlan, tool_use_id: &str) -> Vec<HookRunSummary> {
+    plan.matched
+        .iter()
+        .map(|handler| {
+            common::hook_run_for_tool_use(dispatcher::running_summary(handler), tool_use_id)
+        })
+        .collect()
+}
+
+pub(crate) async fn run(
+    plan: PostToolUsePlan,
+    shell: &CommandShell,
+    request: PostToolUseRequest,
+) -> PostToolUseOutcome {
+    let matched = plan.matched;
     if matched.is_empty() {
         return PostToolUseOutcome {
             hook_events: Vec::new(),
@@ -323,6 +335,7 @@ mod tests {
     use super::PostToolUseHandlerData;
     use super::command_input_json;
     use super::parse_completed;
+    use super::plan;
     use super::preview;
     use crate::engine::ConfiguredHandler;
     use crate::engine::command_runner::CommandRunResult;
@@ -520,7 +533,8 @@ mod tests {
     #[test]
     fn preview_and_completed_run_ids_include_tool_use_id() {
         let request = request_for_tool_use("tool-call-456");
-        let runs = preview(&[handler()], &request);
+        let plan = plan(&[handler()], &request.tool_name, &request.matcher_aliases);
+        let runs = preview(&plan, &request.tool_use_id);
 
         assert_eq!(runs.len(), 1);
         assert_eq!(
@@ -544,7 +558,8 @@ mod tests {
     #[test]
     fn serialization_failure_run_ids_include_tool_use_id() {
         let request = request_for_tool_use("tool-call-456");
-        let runs = preview(&[handler()], &request);
+        let plan = plan(&[handler()], &request.tool_name, &request.matcher_aliases);
+        let runs = preview(&plan, &request.tool_use_id);
 
         let completed = common::serialization_failure_hook_events_for_tool_use(
             vec![handler()],
@@ -555,6 +570,16 @@ mod tests {
 
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].run.id, runs[0].id);
+    }
+
+    #[test]
+    fn confirmed_performance_post_tool_use_plan_reuses_selected_handlers() {
+        let request = request_for_tool_use("tool-call-456");
+        let plan = plan(&[handler()], &request.tool_name, &request.matcher_aliases);
+
+        assert_eq!(plan.matched.len(), 1);
+        assert_eq!(preview(&plan, &request.tool_use_id).len(), 1);
+        assert_eq!(preview(&plan, "another-call").len(), 1);
     }
 
     fn handler() -> ConfiguredHandler {

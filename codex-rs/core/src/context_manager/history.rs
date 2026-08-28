@@ -14,6 +14,7 @@ use crate::stable_context::StableContextManifest;
 use crate::stable_context::StableContextTarget;
 use crate::stable_context::project_stable_context;
 use crate::tool_history::ModelGenerationId;
+#[cfg(test)]
 use crate::tool_history::ToolHistoryCandidate;
 use crate::tool_history::ToolHistoryProjection;
 use crate::tool_history::ToolHistoryState;
@@ -42,15 +43,20 @@ use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::approx_tokens_from_byte_count_i64;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 use codex_utils_output_truncation::truncate_text;
+use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::io::Cursor;
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
+use std::sync::Weak;
 
 const PREPARED_HISTORY_POLICY_VERSION: u16 = 6;
 const PREPARED_HISTORY_HASH_DOMAIN: &[u8] = b"codex.pending-turn.prepared-history.v6";
@@ -62,39 +68,247 @@ pub(crate) struct PreparedHistoryPolicy {
     stable_context_target: StableContextTarget,
 }
 
+#[derive(Debug)]
+enum PreparedPromptItemsSource {
+    Shared(Arc<[ResponseItem]>),
+    Appended {
+        prefix: PreparedPromptItems,
+        suffix: Arc<[ResponseItem]>,
+    },
+    Prefix {
+        source: PreparedPromptItems,
+    },
+}
+
+#[derive(Debug)]
+struct PreparedPromptItemsInner {
+    source: PreparedPromptItemsSource,
+    len: usize,
+    flattened: OnceLock<Arc<[ResponseItem]>>,
+}
+
+/// Persistent prompt items. Safe history appends add one shared suffix instead
+/// of copying every prepared projection's full prefix. A projection is flattened
+/// once, on demand, when a transport-facing caller asks for a shared slice.
+#[derive(Clone, Debug)]
+struct PreparedPromptItems(Arc<PreparedPromptItemsInner>);
+
+impl PreparedPromptItems {
+    fn from_shared(items: Arc<[ResponseItem]>) -> Self {
+        let flattened = OnceLock::new();
+        let _ = flattened.set(Arc::clone(&items));
+        Self(Arc::new(PreparedPromptItemsInner {
+            len: items.len(),
+            source: PreparedPromptItemsSource::Shared(items),
+            flattened,
+        }))
+    }
+
+    fn appended(&self, suffix: Arc<[ResponseItem]>) -> Self {
+        if suffix.is_empty() {
+            return self.clone();
+        }
+        Self(Arc::new(PreparedPromptItemsInner {
+            len: self.0.len.saturating_add(suffix.len()),
+            source: PreparedPromptItemsSource::Appended {
+                prefix: self.clone(),
+                suffix,
+            },
+            flattened: OnceLock::new(),
+        }))
+    }
+
+    fn truncated(&self, len: usize) -> Self {
+        let len = len.min(self.0.len);
+        if len == self.0.len {
+            return self.clone();
+        }
+        Self(Arc::new(PreparedPromptItemsInner {
+            len,
+            source: PreparedPromptItemsSource::Prefix {
+                source: self.clone(),
+            },
+            flattened: OnceLock::new(),
+        }))
+    }
+
+    fn shared(&self) -> Arc<[ResponseItem]> {
+        Arc::clone(self.0.flattened.get_or_init(|| {
+            let mut chunks = Vec::new();
+            self.collect_prefix_chunks(self.0.len, &mut chunks);
+
+            let mut flattened = Vec::with_capacity(self.0.len);
+            for (chunk, len) in chunks {
+                flattened.extend_from_slice(&chunk[..len]);
+            }
+            flattened.into()
+        }))
+    }
+
+    fn collect_prefix_chunks(&self, len: usize, chunks: &mut Vec<(Arc<[ResponseItem]>, usize)>) {
+        let mut current = self.clone();
+        let mut remaining = len.min(self.0.len);
+        let mut reversed = Vec::new();
+        loop {
+            match &current.0.source {
+                PreparedPromptItemsSource::Shared(items) => {
+                    if remaining > 0 {
+                        reversed.push((Arc::clone(items), remaining));
+                    }
+                    break;
+                }
+                PreparedPromptItemsSource::Appended { prefix, suffix } => {
+                    let suffix_len = remaining.saturating_sub(prefix.0.len).min(suffix.len());
+                    if suffix_len > 0 {
+                        reversed.push((Arc::clone(suffix), suffix_len));
+                    }
+                    remaining = remaining.min(prefix.0.len);
+                    current = prefix.clone();
+                }
+                PreparedPromptItemsSource::Prefix { source } => {
+                    remaining = remaining.min(source.0.len);
+                    current = source.clone();
+                }
+            }
+        }
+        chunks.extend(reversed.into_iter().rev());
+    }
+
+    fn get(&self, index: usize) -> Option<&ResponseItem> {
+        if index >= self.0.len {
+            return None;
+        }
+        match &self.0.source {
+            PreparedPromptItemsSource::Shared(items) => items.get(index),
+            PreparedPromptItemsSource::Appended { prefix, suffix } => {
+                if index < prefix.0.len {
+                    prefix.get(index)
+                } else {
+                    suffix.get(index - prefix.0.len)
+                }
+            }
+            PreparedPromptItemsSource::Prefix { source } => source.get(index),
+        }
+    }
+
+    fn as_slice(&self) -> &[ResponseItem] {
+        let _ = self.shared();
+        let Some(flattened) = self.0.flattened.get() else {
+            unreachable!("shared prompt items must be materialized");
+        };
+        flattened.as_ref()
+    }
+
+    fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    #[cfg(test)]
+    fn is_materialized(&self) -> bool {
+        self.0.flattened.get().is_some()
+    }
+}
+
+pub(crate) type SharedPromptProjections = [Arc<[ResponseItem]>; 4];
+
+#[derive(Clone, Debug)]
+struct CompactedPromptProjections([PreparedPromptItems; 4]);
+
+impl CompactedPromptProjections {
+    fn from_shared(projections: SharedPromptProjections) -> Self {
+        let mut prepared_by_source =
+            Vec::<(Arc<[ResponseItem]>, PreparedPromptItems)>::with_capacity(4);
+        let prepared = projections
+            .into_iter()
+            .map(|projection| {
+                if let Some((_, prepared)) = prepared_by_source
+                    .iter()
+                    .find(|(source, _)| Arc::ptr_eq(source, &projection))
+                {
+                    return prepared.clone();
+                }
+
+                let prepared = PreparedPromptItems::from_shared(Arc::clone(&projection));
+                prepared_by_source.push((projection, prepared.clone()));
+                prepared
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("prompt projections have a fixed width"));
+        Self(prepared)
+    }
+
+    fn shared(&self) -> SharedPromptProjections {
+        std::array::from_fn(|index| self.0[index].shared())
+    }
+
+    fn appended(&self, suffix: Arc<[ResponseItem]>) -> Self {
+        let compacted_suffix = compact_acknowledged_tool_search_outputs(suffix);
+        let mut advanced = Vec::<PreparedPromptItems>::with_capacity(4);
+        for (index, projection) in self.0.iter().enumerate() {
+            if let Some(prior_index) = self.0[..index]
+                .iter()
+                .position(|prior| prior.shares_storage_with(projection))
+            {
+                advanced.push(advanced[prior_index].clone());
+                continue;
+            }
+
+            let mut prefix = projection.clone();
+            if let Some(last @ ResponseItem::ToolSearchOutput { tools, .. }) =
+                projection.get(projection.0.len.saturating_sub(1))
+                && !tools.is_empty()
+            {
+                let compacted_last = compact_tool_search_output(last);
+                prefix = projection
+                    .truncated(projection.0.len - 1)
+                    .appended(vec![compacted_last].into());
+            }
+            advanced.push(prefix.appended(Arc::clone(&compacted_suffix)));
+        }
+
+        Self(
+            advanced
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("prompt projections have a fixed width")),
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedPromptInput {
-    items: Arc<[ResponseItem]>,
-    fallback_items: Arc<[ResponseItem]>,
-    unreplaced_items: Arc<[ResponseItem]>,
-    unreplaced_fallback_items: Arc<[ResponseItem]>,
+    items: PreparedPromptItems,
+    fallback_items: PreparedPromptItems,
+    unreplaced_items: PreparedPromptItems,
+    unreplaced_fallback_items: PreparedPromptItems,
     tool_history_substitutions: Arc<[ToolHistorySubstitution]>,
     fallback_tool_history_substitutions: Arc<[ToolHistorySubstitution]>,
     stable_context_manifest: StableContextManifest,
     prompt_provenance: PromptProvenanceSidecar,
-    fingerprint: Option<[u8; 32]>,
+    fingerprint: Option<PreparedHistoryFingerprint>,
     policy: PreparedHistoryPolicy,
+    compacted_tool_search_outputs: Arc<OnceLock<CompactedPromptProjections>>,
 }
 
 impl PreparedPromptInput {
     pub(crate) fn items(&self) -> &[ResponseItem] {
-        &self.items
+        self.items.as_slice()
     }
 
     pub(crate) fn shared_items(&self) -> Arc<[ResponseItem]> {
-        Arc::clone(&self.items)
+        self.items.shared()
     }
 
     pub(crate) fn shared_fallback_items(&self) -> Arc<[ResponseItem]> {
-        Arc::clone(&self.fallback_items)
+        self.fallback_items.shared()
     }
 
     pub(crate) fn shared_unreplaced_items(&self) -> Arc<[ResponseItem]> {
-        Arc::clone(&self.unreplaced_items)
+        self.unreplaced_items.shared()
     }
 
     pub(crate) fn shared_unreplaced_fallback_items(&self) -> Arc<[ResponseItem]> {
-        Arc::clone(&self.unreplaced_fallback_items)
+        self.unreplaced_fallback_items.shared()
     }
 
     pub(crate) fn tool_history_substitutions(&self) -> Arc<[ToolHistorySubstitution]> {
@@ -115,21 +329,170 @@ impl PreparedPromptInput {
 
     pub(crate) fn fingerprint(&self) -> Option<[u8; 32]> {
         self.fingerprint
+            .as_ref()
+            .map(|fingerprint| fingerprint.digest)
+    }
+
+    pub(crate) fn compacted_tool_search_outputs(
+        &self,
+        build: impl FnOnce(SharedPromptProjections) -> SharedPromptProjections,
+    ) -> SharedPromptProjections {
+        self.compacted_tool_search_outputs
+            .get_or_init(|| {
+                CompactedPromptProjections::from_shared(build([
+                    self.shared_items(),
+                    self.shared_fallback_items(),
+                    self.shared_unreplaced_items(),
+                    self.shared_unreplaced_fallback_items(),
+                ]))
+            })
+            .shared()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compacted_tool_search_outputs_are_materialized(&self) -> Option<[bool; 4]> {
+        self.compacted_tool_search_outputs
+            .get()
+            .map(|projections| std::array::from_fn(|index| projections.0[index].is_materialized()))
+    }
+}
+
+pub(crate) fn compact_acknowledged_tool_search_outputs(
+    input: Arc<[ResponseItem]>,
+) -> Arc<[ResponseItem]> {
+    let last_index = input.len().saturating_sub(1);
+    if !input.iter().take(last_index).any(
+        |item| matches!(item, ResponseItem::ToolSearchOutput { tools, .. } if !tools.is_empty()),
+    ) {
+        return input;
+    }
+
+    input
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            if index < last_index {
+                compact_tool_search_output(item)
+            } else {
+                item.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn compact_tool_search_output(item: &ResponseItem) -> ResponseItem {
+    let mut item = item.clone();
+    if let ResponseItem::ToolSearchOutput { tools, .. } = &mut item {
+        *tools = tools
+            .iter()
+            .map(compact_tool_search_tool_identity)
+            .collect();
+    }
+    item
+}
+
+fn compact_tool_search_tool_identity(tool: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = tool.as_object() else {
+        return tool.clone();
+    };
+    let Some(name) = object.get("name") else {
+        return tool.clone();
+    };
+
+    let mut identity = serde_json::Map::new();
+    if let Some(kind) = object.get("type") {
+        identity.insert("type".to_string(), kind.clone());
+    }
+    identity.insert("name".to_string(), name.clone());
+    if let Some(tools) = object.get("tools").and_then(serde_json::Value::as_array) {
+        identity.insert(
+            "tools".to_string(),
+            serde_json::Value::Array(
+                tools
+                    .iter()
+                    .map(compact_tool_search_tool_identity)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(identity)
+}
+
+#[derive(Clone, Debug)]
+struct PreparedHistoryFingerprint {
+    hasher: Sha256,
+    digest: [u8; 32],
+    #[cfg(test)]
+    last_update_item_count: usize,
+}
+
+impl PreparedHistoryFingerprint {
+    fn new(
+        items: &[ResponseItem],
+        manifest: &StableContextManifest,
+        policy: PreparedHistoryPolicy,
+    ) -> serde_json::Result<Self> {
+        let mut hasher = Sha256::new();
+        hasher.update(PREPARED_HISTORY_HASH_DOMAIN);
+        hasher.update(policy.version.to_be_bytes());
+        hasher.update([u8::from(policy.supports_images)]);
+        hasher.update([match policy.stable_context_target {
+            StableContextTarget::Sampling => 1,
+            StableContextTarget::FailOpen => 0,
+        }]);
+        hasher.update(manifest.fingerprint());
+        hash_prepared_history_items(&mut hasher, items)?;
+        let digest = hasher.clone().finalize().into();
+        Ok(Self {
+            hasher,
+            digest,
+            #[cfg(test)]
+            last_update_item_count: items.len(),
+        })
+    }
+
+    fn append(&self, items: &[ResponseItem]) -> serde_json::Result<Self> {
+        let mut hasher = self.hasher.clone();
+        hash_prepared_history_items(&mut hasher, items)?;
+        let digest = hasher.clone().finalize().into();
+        Ok(Self {
+            hasher,
+            digest,
+            #[cfg(test)]
+            last_update_item_count: items.len(),
+        })
     }
 }
 
 #[derive(Clone, Debug)]
 struct PreparedHistoryCacheEntry {
-    source_items: Arc<Vec<ResponseItem>>,
+    source_items: Weak<Vec<ResponseItem>>,
     projection_revision: u64,
     prepared: PreparedPromptInput,
-    pending_source_items: Option<Arc<Vec<ResponseItem>>>,
+    pending_source_items: Option<Weak<Vec<ResponseItem>>>,
     pending_append: Vec<ResponseItem>,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedAppendSource {
+    Prepared,
+    Pending,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ItemTokenEstimateCacheNamespace {
+    history_version: u64,
+    projection_revision: u64,
+    projection_kind: u8,
+    policy_version: u16,
+    supports_images: bool,
+    stable_context_target: u8,
 }
 
 #[derive(Debug, Clone, Default)]
 enum RealizedContextBaseline {
-    Known(Box<TurnContextItem>),
+    Known(Arc<TurnContextItem>),
     #[default]
     Unknown,
 }
@@ -146,6 +509,8 @@ pub(crate) struct ContextManager {
     projection_revision: u64,
     tool_history: Arc<ToolHistoryState>,
     prepared_history: Arc<StdMutex<Option<PreparedHistoryCacheEntry>>>,
+    item_token_estimates:
+        Arc<StdMutex<HashMap<ItemTokenEstimateCacheNamespace, HashMap<String, i64>>>>,
     token_info: Option<TokenUsageInfo>,
     /// Reference context snapshot used for diffing and producing model-visible
     /// settings update items.
@@ -159,7 +524,7 @@ pub(crate) struct ContextManager {
     /// whose non-diff fragments no longer exist in the surviving history.
     realized_context_baseline: RealizedContextBaseline,
     /// World state most recently appended to model-visible history.
-    world_state_baseline: Option<WorldStateSnapshot>,
+    world_state_baseline: Option<Arc<WorldStateSnapshot>>,
 }
 
 impl ContextManager {
@@ -170,6 +535,7 @@ impl ContextManager {
             projection_revision: 0,
             tool_history: Arc::new(ToolHistoryState::default()),
             prepared_history: Arc::new(StdMutex::new(None)),
+            item_token_estimates: Arc::new(StdMutex::new(HashMap::new())),
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
             ),
@@ -188,7 +554,7 @@ impl ContextManager {
 
     pub(crate) fn set_reference_context_item(&mut self, item: Option<TurnContextItem>) {
         self.realized_context_baseline = item.map_or(RealizedContextBaseline::Unknown, |item| {
-            RealizedContextBaseline::Known(Box::new(item))
+            RealizedContextBaseline::Known(Arc::new(item))
         });
     }
 
@@ -204,25 +570,48 @@ impl ContextManager {
         world_state: &WorldState,
     ) -> (Vec<Box<dyn ContextualUserFragment>>, Option<WorldStateItem>) {
         let (fragments, snapshot) = world_state
-            .render_history_diff_with_snapshot(self.world_state_baseline.as_ref(), &self.items);
+            .render_history_diff_with_snapshot(self.world_state_baseline.as_deref(), &self.items);
         let rollout_item = self.world_state_baseline.as_ref().map_or_else(
             || Some(WorldStateItem::full(snapshot.clone().into_value())),
             |previous| {
                 snapshot
-                    .merge_patch_from(previous)
+                    .merge_patch_from(previous.as_ref())
                     .map(WorldStateItem::patch)
             },
         );
-        self.world_state_baseline = Some(snapshot);
+        self.world_state_baseline = Some(Arc::new(snapshot));
         (fragments, rollout_item)
     }
 
     pub(crate) fn set_world_state_baseline(&mut self, snapshot: WorldStateSnapshot) {
-        self.world_state_baseline = Some(snapshot);
+        self.world_state_baseline = Some(Arc::new(snapshot));
     }
 
     pub(crate) fn world_state_baseline(&self) -> Option<WorldStateSnapshot> {
-        self.world_state_baseline.clone()
+        self.world_state_baseline
+            .as_ref()
+            .map(|snapshot| snapshot.as_ref().clone())
+    }
+
+    #[cfg(test)]
+    fn baselines_share_storage_with(&self, other: &Self) -> bool {
+        let realized_context_is_shared = match (
+            &self.realized_context_baseline,
+            &other.realized_context_baseline,
+        ) {
+            (RealizedContextBaseline::Known(left), RealizedContextBaseline::Known(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            (RealizedContextBaseline::Unknown, RealizedContextBaseline::Unknown) => true,
+            _ => false,
+        };
+        let world_state_is_shared = match (&self.world_state_baseline, &other.world_state_baseline)
+        {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+        realized_context_is_shared && world_state_is_shared
     }
 
     pub(crate) fn mark_realized_context_unknown(&mut self) {
@@ -245,21 +634,47 @@ impl ContextManager {
         I: IntoIterator,
         I::Item: std::ops::Deref<Target = ResponseItem>,
     {
-        let pre_append_source = Arc::clone(&self.items);
-        let mut appended = Vec::new();
-        for item in items {
-            let item_ref = item.deref();
-            if !is_api_message(item_ref) {
-                continue;
-            }
-
-            let processed = self.process_item(item_ref, policy);
-            Arc::make_mut(&mut self.items).push(processed.clone());
-            appended.push(processed);
+        let appended = items
+            .into_iter()
+            .filter_map(|item| {
+                let item = item.deref();
+                is_api_message(item).then(|| self.process_item(item, policy))
+            })
+            .collect::<Vec<_>>();
+        if appended.is_empty() {
+            return;
         }
-        if !appended.is_empty() {
-            self.advance_prepared_history_for_append(&appended, &pre_append_source);
-        }
+        let prepared_append = {
+            let mut cache = self
+                .prepared_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let source = cache.as_ref().and_then(|entry| {
+                if weak_ptr_eq_arc(&entry.source_items, &self.items) {
+                    Some(PreparedAppendSource::Prepared)
+                } else if entry
+                    .pending_source_items
+                    .as_ref()
+                    .is_some_and(|source| weak_ptr_eq_arc(source, &self.items))
+                {
+                    Some(PreparedAppendSource::Pending)
+                } else {
+                    None
+                }
+            });
+            source.and_then(|source| {
+                cache.take().map(|mut entry| {
+                    // `Arc::make_mut` dissociates weak pointers by moving the Arc
+                    // allocation. Drop cache-owned identities first so a unique raw
+                    // history allocation can be extended in place.
+                    entry.source_items = Weak::new();
+                    entry.pending_source_items = None;
+                    (entry, source)
+                })
+            })
+        };
+        Arc::make_mut(&mut self.items).extend(appended.iter().cloned());
+        self.advance_prepared_history_for_append(&appended, prepared_append);
     }
 
     /// Returns the history prepared for sending to the model. This applies a proper
@@ -300,25 +715,24 @@ impl ContextManager {
             supports_images: input_modalities.contains(&InputModality::Image),
             stable_context_target,
         };
-        let source_items = Arc::clone(&self.items);
-        if crate::latency_switches::history_identity_enabled()
-            && let Some(prepared) = self
-                .prepared_history
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .filter(|entry| {
-                    Arc::ptr_eq(&entry.source_items, &source_items)
-                        && entry.projection_revision == self.projection_revision
-                        && entry.prepared.policy == policy
-                })
-                .map(|entry| {
-                    let mut prepared = entry.prepared.clone();
-                    prepared.stable_context_manifest = prepared
-                        .stable_context_manifest
-                        .with_local_reused(/*local_reused*/ true);
-                    prepared
-                })
+        let source_items = Arc::downgrade(&self.items);
+        if let Some(prepared) = self
+            .prepared_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|entry| {
+                weak_ptr_eq_arc(&entry.source_items, &self.items)
+                    && entry.projection_revision == self.projection_revision
+                    && entry.prepared.policy == policy
+            })
+            .map(|entry| {
+                let mut prepared = entry.prepared.clone();
+                prepared.stable_context_manifest = prepared
+                    .stable_context_manifest
+                    .with_local_reused(/*local_reused*/ true);
+                prepared
+            })
         {
             return prepared;
         }
@@ -331,22 +745,24 @@ impl ContextManager {
         let items = projection.items;
         let prompt_provenance =
             PromptProvenanceSidecar::from_assembled_items(&items, &projection.manifest);
-        let fingerprint = crate::latency_switches::history_identity_enabled()
-            .then(|| prepared_history_fingerprint(&items, &projection.manifest, policy).ok())
-            .flatten();
+        let fingerprint =
+            PreparedHistoryFingerprint::new(&items, &projection.manifest, policy).ok();
+        let items = PreparedPromptItems::from_shared(items);
+        let fallback_items = PreparedPromptItems::from_shared(projection.fallback_items);
         let prepared = PreparedPromptInput {
-            unreplaced_items: Arc::clone(&items),
-            unreplaced_fallback_items: Arc::clone(&projection.fallback_items),
+            unreplaced_items: items.clone(),
+            unreplaced_fallback_items: fallback_items.clone(),
             items,
-            fallback_items: projection.fallback_items,
+            fallback_items,
             tool_history_substitutions: Arc::from([]),
             fallback_tool_history_substitutions: Arc::from([]),
             stable_context_manifest: projection.manifest,
             prompt_provenance,
             fingerprint,
             policy,
+            compacted_tool_search_outputs: Arc::new(OnceLock::new()),
         };
-        if crate::latency_switches::history_identity_enabled() && prepared.fingerprint.is_some() {
+        if prepared.fingerprint.is_some() {
             *self
                 .prepared_history
                 .lock()
@@ -394,12 +810,12 @@ impl ContextManager {
         let tool_history = Arc::clone(&self.tool_history);
         let prepared = self.prepare_for_prompt_target(input_modalities, target);
         let projection = tool_history.project_workspace_freshness_with_cache(
-            Arc::clone(&prepared.items),
+            prepared.shared_items(),
             workspace_identity,
             git_workspace,
         );
         let fallback_projection = tool_history.project_workspace_freshness_with_cache(
-            Arc::clone(&prepared.fallback_items),
+            prepared.shared_fallback_items(),
             workspace_identity,
             git_workspace,
         );
@@ -438,8 +854,8 @@ impl ContextManager {
             }
             None => tool_history.project_with_workspace_identity(items, workspace_identity),
         };
-        let projection = project(Arc::clone(&prepared.items));
-        let fallback_projection = project(Arc::clone(&prepared.fallback_items));
+        let projection = project(prepared.shared_items());
+        let fallback_projection = project(prepared.shared_fallback_items());
         apply_tool_history_projection(prepared, projection, fallback_projection)
     }
 
@@ -452,47 +868,47 @@ impl ContextManager {
         (*self.tool_history).clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn register_tool_history_candidate(&mut self, candidate: ToolHistoryCandidate) {
+        // Candidates are projected after canonical prompt preparation, so they do not invalidate
+        // the normalized history cache.
         Arc::make_mut(&mut self.tool_history).register(candidate);
-        self.invalidate_prepared_history();
     }
 
-    pub(crate) fn register_workspace_evidence(
-        &mut self,
-        observation: crate::tool_history::WorkspaceEvidenceObservation,
-    ) {
-        Arc::make_mut(&mut self.tool_history).register_workspace_evidence(observation);
-        self.invalidate_prepared_history();
-    }
-
+    #[cfg(test)]
     pub(crate) fn register_non_workspace_code_mode_call(&mut self, call_id: String) {
         Arc::make_mut(&mut self.tool_history).register_non_workspace_code_mode_call(call_id);
         self.invalidate_prepared_history();
     }
 
-    pub(crate) fn invalidate_tool_history_source_dependencies(
+    pub(crate) fn apply_tool_history_mutation(
         &mut self,
-        affected_paths: Option<&std::collections::BTreeSet<std::path::PathBuf>>,
-        current_workspace_identity: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
+        mutation: &crate::tool_history::ToolHistoryMutation,
     ) -> bool {
-        let changed = Arc::make_mut(&mut self.tool_history)
-            .invalidate_source_dependencies(affected_paths, current_workspace_identity);
+        let changed = mutation.apply(Arc::make_mut(&mut self.tool_history));
         if changed {
             self.invalidate_prepared_history();
         }
         changed
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_tool_history_consumed(
         &mut self,
         input: &[ResponseItem],
         generation: ModelGenerationId,
     ) -> bool {
-        let changed = Arc::make_mut(&mut self.tool_history).mark_consumed(input, generation);
-        if changed {
-            self.invalidate_prepared_history();
-        }
-        changed
+        // Consumption changes receipt eligibility, which is also applied after the cache lookup.
+        Arc::make_mut(&mut self.tool_history).mark_consumed(input, generation)
+    }
+
+    pub(crate) fn mark_tool_history_consumed_with_delta(
+        &mut self,
+        input: &[ResponseItem],
+        generation: ModelGenerationId,
+    ) -> std::collections::BTreeSet<String> {
+        // Keep the same post-cache projection boundary while returning the changed call IDs.
+        Arc::make_mut(&mut self.tool_history).mark_consumed_with_delta(input, generation)
     }
 
     /// Prepares the bounded prompt used by completion finalization from this
@@ -574,14 +990,9 @@ impl ContextManager {
     // Estimate token usage using byte-based heuristics from the truncation helpers.
     // This is a coarse lower bound, not a tokenizer-accurate count.
     pub(crate) fn estimate_token_count(&self, turn_context: &TurnContext) -> Option<i64> {
-        let model_info = &turn_context.model_info;
-        let personality = turn_context.personality.or(turn_context.config.personality);
-        let base_instructions = BaseInstructions {
-            text: model_info.get_model_instructions(personality),
-        };
         self.estimate_prepared_token_count_with_base_instructions(
-            &model_info.input_modalities,
-            &base_instructions,
+            &turn_context.model_info.input_modalities,
+            turn_context.base_instructions.as_ref(),
         )
     }
 
@@ -593,7 +1004,12 @@ impl ContextManager {
         let prepared = self
             .clone()
             .prepare_for_prompt_target(input_modalities, StableContextTarget::Sampling);
-        Self::estimate_items_token_count_with_base_instructions(prepared.items(), base_instructions)
+        self.estimate_prepared_items_token_count(
+            prepared.items(),
+            base_instructions,
+            /*pending_user_boundary*/ false,
+            prepared.policy,
+        )
     }
 
     #[cfg(test)]
@@ -606,13 +1022,116 @@ impl ContextManager {
 
     pub(crate) fn estimate_token_count_after_pending_user_boundary(
         &self,
+        input_modalities: &[InputModality],
         base_instructions: &BaseInstructions,
     ) -> Option<i64> {
-        Self::estimate_items_token_count(
-            self.raw_items(),
+        let prepared = self
+            .clone()
+            .prepare_for_prompt_target(input_modalities, StableContextTarget::Sampling);
+        self.estimate_prepared_items_token_count(
+            prepared.items(),
             base_instructions,
             /*pending_user_boundary*/ true,
+            prepared.policy,
         )
+    }
+
+    fn estimate_prepared_items_token_count(
+        &self,
+        items: &[ResponseItem],
+        base_instructions: &BaseInstructions,
+        pending_user_boundary: bool,
+        policy: PreparedHistoryPolicy,
+    ) -> Option<i64> {
+        self.estimate_cached_items_token_count(
+            items,
+            base_instructions,
+            pending_user_boundary,
+            policy,
+        )
+    }
+
+    fn estimate_cached_items_token_count(
+        &self,
+        items: &[ResponseItem],
+        base_instructions: &BaseInstructions,
+        pending_user_boundary: bool,
+        policy: PreparedHistoryPolicy,
+    ) -> Option<i64> {
+        let base_tokens =
+            i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
+        let last_instruction_boundary = pending_user_boundary
+            .then_some(items.len())
+            .or_else(|| items.iter().rposition(is_user_turn_boundary));
+        let items_tokens = items
+            .iter()
+            .enumerate()
+            .filter(|(index, item)| !is_resolved_reasoning(*index, item, last_instruction_boundary))
+            .map(|(_, item)| self.estimate_item_token_count_cached(item, policy))
+            .fold(0i64, i64::saturating_add);
+
+        Some(base_tokens.saturating_add(items_tokens))
+    }
+
+    fn estimate_item_token_count_cached(
+        &self,
+        item: &ResponseItem,
+        policy: PreparedHistoryPolicy,
+    ) -> i64 {
+        let Some(item_id) = item.id() else {
+            return estimate_item_token_count(item);
+        };
+        let projection_kind = 1;
+        let policy_version = policy.version;
+        let supports_images = policy.supports_images;
+        let stable_context_target = match policy.stable_context_target {
+            StableContextTarget::Sampling => 1,
+            StableContextTarget::FailOpen => 0,
+        };
+        let namespace = ItemTokenEstimateCacheNamespace {
+            history_version: self.history_version,
+            projection_revision: self.projection_revision,
+            projection_kind,
+            policy_version,
+            supports_images,
+            stable_context_target,
+        };
+        let mut estimates = self
+            .item_token_estimates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(estimate) = estimates
+            .get(&namespace)
+            .and_then(|items| items.get(item_id.as_str()))
+            .copied()
+        {
+            return estimate;
+        }
+
+        let estimate = estimate_item_token_count(item);
+        estimates
+            .entry(namespace)
+            .or_default()
+            .insert(item_id.to_string(), estimate);
+        estimate
+    }
+
+    #[cfg(test)]
+    fn cached_item_token_estimate_count(&self) -> usize {
+        self.item_token_estimates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(HashMap::len)
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn cached_item_token_estimate_namespace_count(&self) -> usize {
+        self.item_token_estimates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     pub(crate) fn estimate_items_token_count_with_base_instructions(
@@ -1067,37 +1586,73 @@ fn prepared_append_is_complete_and_safe(items: &[ResponseItem], supports_images:
 }
 
 impl ContextManager {
+    fn clear_item_token_estimates(&self) {
+        self.item_token_estimates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    fn advance_item_token_estimates_for_append(
+        &self,
+        previous_revision: u64,
+        preserved_policy: PreparedHistoryPolicy,
+    ) {
+        let mut estimates = self
+            .item_token_estimates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut current = HashMap::with_capacity(estimates.len());
+        for (mut namespace, item_estimates) in estimates.drain() {
+            let prepared_projection_is_preserved = namespace.projection_kind == 1
+                && namespace.policy_version == preserved_policy.version
+                && namespace.supports_images == preserved_policy.supports_images
+                && namespace.stable_context_target
+                    == match preserved_policy.stable_context_target {
+                        StableContextTarget::Sampling => 1,
+                        StableContextTarget::FailOpen => 0,
+                    };
+            if namespace.history_version == self.history_version
+                && namespace.projection_revision == previous_revision
+                && prepared_projection_is_preserved
+            {
+                namespace.projection_revision = self.projection_revision;
+                current.insert(namespace, item_estimates);
+            }
+        }
+        *estimates = current;
+    }
+
     fn advance_prepared_history_for_append(
         &mut self,
         appended: &[ResponseItem],
-        pre_append_source: &Arc<Vec<ResponseItem>>,
+        prepared_append: Option<(PreparedHistoryCacheEntry, PreparedAppendSource)>,
     ) {
         let previous_revision = self.projection_revision;
         self.projection_revision = self.projection_revision.saturating_add(1);
-        let mut cache = self
-            .prepared_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(mut entry) = cache.take() else {
+        let Some((mut entry, pre_append_source)) = prepared_append else {
+            *self
+                .prepared_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            self.clear_item_token_estimates();
             return;
         };
         if entry.projection_revision != previous_revision {
+            self.clear_item_token_estimates();
             return;
         }
-        let append = if Arc::ptr_eq(&entry.source_items, pre_append_source)
-            && entry.pending_append.is_empty()
-        {
-            appended.to_vec()
-        } else if entry
-            .pending_source_items
-            .as_ref()
-            .is_some_and(|source| Arc::ptr_eq(source, pre_append_source))
-        {
-            let mut pending = std::mem::take(&mut entry.pending_append);
-            pending.extend_from_slice(appended);
-            pending
-        } else {
-            return;
+        let append = match pre_append_source {
+            PreparedAppendSource::Prepared if entry.pending_append.is_empty() => appended.to_vec(),
+            PreparedAppendSource::Pending => {
+                let mut pending = std::mem::take(&mut entry.pending_append);
+                pending.extend_from_slice(appended);
+                pending
+            }
+            PreparedAppendSource::Prepared => {
+                self.clear_item_token_estimates();
+                return;
+            }
         };
         if !prepared_append_is_complete_and_safe(&append, entry.prepared.policy.supports_images) {
             const MAX_PENDING_PREPARED_APPEND_ITEMS: usize = 64;
@@ -1105,37 +1660,89 @@ impl ContextManager {
                 && prepared_append_can_be_completed(&append, entry.prepared.policy.supports_images)
             {
                 entry.projection_revision = self.projection_revision;
-                entry.pending_source_items = Some(Arc::clone(&self.items));
+                entry.pending_source_items = Some(Arc::downgrade(&self.items));
                 entry.pending_append = append;
-                *cache = Some(entry);
+                *self
+                    .prepared_history
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entry);
             }
+            self.clear_item_token_estimates();
             return;
         }
-        let mut items = entry.prepared.items.to_vec();
-        items.extend_from_slice(&append);
-        let items: Arc<[ResponseItem]> = items.into();
-        let mut fallback_items = entry.prepared.fallback_items.to_vec();
-        fallback_items.extend_from_slice(&append);
-        let fallback_items: Arc<[ResponseItem]> = fallback_items.into();
-        let mut unreplaced_items = entry.prepared.unreplaced_items.to_vec();
-        unreplaced_items.extend_from_slice(&append);
-        let unreplaced_items: Arc<[ResponseItem]> = unreplaced_items.into();
-        let mut unreplaced_fallback_items = entry.prepared.unreplaced_fallback_items.to_vec();
-        unreplaced_fallback_items.extend_from_slice(&append);
-        let unreplaced_fallback_items: Arc<[ResponseItem]> = unreplaced_fallback_items.into();
-        let Ok(fingerprint) = prepared_history_fingerprint(
-            &items,
-            &entry.prepared.stable_context_manifest,
-            entry.prepared.policy,
-        ) else {
+        let append: Arc<[ResponseItem]> = append.into();
+        let items = entry.prepared.items.appended(Arc::clone(&append));
+        let fallback_items = if entry
+            .prepared
+            .fallback_items
+            .shares_storage_with(&entry.prepared.items)
+        {
+            items.clone()
+        } else {
+            entry.prepared.fallback_items.appended(Arc::clone(&append))
+        };
+        let unreplaced_items = if entry
+            .prepared
+            .unreplaced_items
+            .shares_storage_with(&entry.prepared.items)
+        {
+            items.clone()
+        } else if entry
+            .prepared
+            .unreplaced_items
+            .shares_storage_with(&entry.prepared.fallback_items)
+        {
+            fallback_items.clone()
+        } else {
+            entry
+                .prepared
+                .unreplaced_items
+                .appended(Arc::clone(&append))
+        };
+        let unreplaced_fallback_items = if entry
+            .prepared
+            .unreplaced_fallback_items
+            .shares_storage_with(&entry.prepared.items)
+        {
+            items.clone()
+        } else if entry
+            .prepared
+            .unreplaced_fallback_items
+            .shares_storage_with(&entry.prepared.fallback_items)
+        {
+            fallback_items.clone()
+        } else if entry
+            .prepared
+            .unreplaced_fallback_items
+            .shares_storage_with(&entry.prepared.unreplaced_items)
+        {
+            unreplaced_items.clone()
+        } else {
+            entry
+                .prepared
+                .unreplaced_fallback_items
+                .appended(Arc::clone(&append))
+        };
+        let Some(fingerprint) = entry
+            .prepared
+            .fingerprint
+            .as_ref()
+            .and_then(|fingerprint| fingerprint.append(&append).ok())
+        else {
+            self.clear_item_token_estimates();
             return;
         };
-        let prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
-            &items,
-            &entry.prepared.stable_context_manifest,
-        );
-        *cache = Some(PreparedHistoryCacheEntry {
-            source_items: Arc::clone(&self.items),
+        let preserved_policy = entry.prepared.policy;
+        let prompt_provenance = entry.prepared.prompt_provenance.clone();
+        let compacted_tool_search_outputs = Arc::new(OnceLock::new());
+        if let Some(compacted) = entry.prepared.compacted_tool_search_outputs.get() {
+            let _ = compacted_tool_search_outputs.set(compacted.appended(Arc::clone(&append)));
+        }
+        *self
+            .prepared_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PreparedHistoryCacheEntry {
+            source_items: Arc::downgrade(&self.items),
             projection_revision: self.projection_revision,
             prepared: PreparedPromptInput {
                 items,
@@ -1150,10 +1757,12 @@ impl ContextManager {
                 prompt_provenance,
                 fingerprint: Some(fingerprint),
                 policy: entry.prepared.policy,
+                compacted_tool_search_outputs,
             },
             pending_source_items: None,
             pending_append: Vec::new(),
         });
+        self.advance_item_token_estimates_for_append(previous_revision, preserved_policy);
     }
 
     fn invalidate_prepared_history(&mut self) {
@@ -1162,6 +1771,7 @@ impl ContextManager {
             .prepared_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.clear_item_token_estimates();
     }
 }
 
@@ -1170,43 +1780,106 @@ fn apply_tool_history_projection(
     projection: ToolHistoryProjection,
     fallback_projection: ToolHistoryProjection,
 ) -> PreparedPromptInput {
-    prepared.items = projection.items;
-    prepared.unreplaced_items = projection.unreplaced_items;
+    let prepared_items = prepared.items.shared();
+    let prepared_unreplaced_items = if prepared
+        .unreplaced_items
+        .shares_storage_with(&prepared.items)
+    {
+        Arc::clone(&prepared_items)
+    } else {
+        prepared.unreplaced_items.shared()
+    };
+    let prepared_fallback_items = prepared.fallback_items.shared();
+    let prepared_unreplaced_fallback_items = if prepared
+        .unreplaced_fallback_items
+        .shares_storage_with(&prepared.fallback_items)
+    {
+        Arc::clone(&prepared_fallback_items)
+    } else {
+        prepared.unreplaced_fallback_items.shared()
+    };
+    if Arc::ptr_eq(&projection.items, &prepared_items)
+        && Arc::ptr_eq(&projection.unreplaced_items, &prepared_unreplaced_items)
+        && projection.substitutions.as_ref() == prepared.tool_history_substitutions.as_ref()
+        && Arc::ptr_eq(&fallback_projection.items, &prepared_fallback_items)
+        && Arc::ptr_eq(
+            &fallback_projection.unreplaced_items,
+            &prepared_unreplaced_fallback_items,
+        )
+        && fallback_projection.substitutions.as_ref()
+            == prepared.fallback_tool_history_substitutions.as_ref()
+    {
+        return prepared;
+    }
+
+    let projected_items = projection.items;
+    let projected_unreplaced_items = projection.unreplaced_items;
+    let fallback_projected_items = fallback_projection.items;
+    let fallback_projected_unreplaced_items = fallback_projection.unreplaced_items;
+
+    let items = PreparedPromptItems::from_shared(Arc::clone(&projected_items));
+    let unreplaced_items = if Arc::ptr_eq(&projected_unreplaced_items, &projected_items) {
+        items.clone()
+    } else {
+        PreparedPromptItems::from_shared(Arc::clone(&projected_unreplaced_items))
+    };
+    let fallback_items = if Arc::ptr_eq(&fallback_projected_items, &projected_items) {
+        items.clone()
+    } else if Arc::ptr_eq(&fallback_projected_items, &projected_unreplaced_items) {
+        unreplaced_items.clone()
+    } else {
+        PreparedPromptItems::from_shared(Arc::clone(&fallback_projected_items))
+    };
+    let unreplaced_fallback_items =
+        if Arc::ptr_eq(&fallback_projected_unreplaced_items, &projected_items) {
+            items.clone()
+        } else if Arc::ptr_eq(
+            &fallback_projected_unreplaced_items,
+            &projected_unreplaced_items,
+        ) {
+            unreplaced_items.clone()
+        } else if Arc::ptr_eq(
+            &fallback_projected_unreplaced_items,
+            &fallback_projected_items,
+        ) {
+            fallback_items.clone()
+        } else {
+            PreparedPromptItems::from_shared(Arc::clone(&fallback_projected_unreplaced_items))
+        };
+
+    prepared.items = items;
+    prepared.unreplaced_items = unreplaced_items;
     prepared.tool_history_substitutions = projection.substitutions;
-    prepared.fallback_items = fallback_projection.items;
-    prepared.unreplaced_fallback_items = fallback_projection.unreplaced_items;
+    prepared.fallback_items = fallback_items;
+    prepared.unreplaced_fallback_items = unreplaced_fallback_items;
     prepared.fallback_tool_history_substitutions = fallback_projection.substitutions;
     prepared.prompt_provenance = PromptProvenanceSidecar::from_assembled_items(
-        &prepared.items,
+        prepared.items(),
         &prepared.stable_context_manifest,
     );
-    prepared.fingerprint = crate::latency_switches::history_identity_enabled()
-        .then(|| {
-            prepared_history_fingerprint(
-                &prepared.items,
-                &prepared.stable_context_manifest,
-                prepared.policy,
-            )
-            .ok()
-        })
-        .flatten();
+    prepared.fingerprint = PreparedHistoryFingerprint::new(
+        prepared.items(),
+        &prepared.stable_context_manifest,
+        prepared.policy,
+    )
+    .ok();
+    prepared.compacted_tool_search_outputs = Arc::new(OnceLock::new());
     prepared
 }
 
+#[cfg(test)]
 fn prepared_history_fingerprint(
     items: &[ResponseItem],
     manifest: &StableContextManifest,
     policy: PreparedHistoryPolicy,
 ) -> serde_json::Result<[u8; 32]> {
-    let mut hasher = Sha256::new();
-    hasher.update(PREPARED_HISTORY_HASH_DOMAIN);
-    hasher.update(policy.version.to_be_bytes());
-    hasher.update([u8::from(policy.supports_images)]);
-    hasher.update([match policy.stable_context_target {
-        StableContextTarget::Sampling => 1,
-        StableContextTarget::FailOpen => 0,
-    }]);
-    hasher.update(manifest.fingerprint());
+    PreparedHistoryFingerprint::new(items, manifest, policy).map(|fingerprint| fingerprint.digest)
+}
+
+fn hash_prepared_history_items(
+    hasher: &mut Sha256,
+    items: &[ResponseItem],
+) -> serde_json::Result<()> {
     for item in items {
         // Turn IDs are rollout bookkeeping, not model-visible history. Normalize
         // them out so reconstruction and compaction do not churn an otherwise
@@ -1217,7 +1890,11 @@ fn prepared_history_fingerprint(
         hasher.update((encoded.len() as u64).to_be_bytes());
         hasher.update(encoded);
     }
-    Ok(hasher.finalize().into())
+    Ok(())
+}
+
+fn weak_ptr_eq_arc<T>(weak: &Weak<T>, strong: &Arc<T>) -> bool {
+    std::ptr::eq(weak.as_ptr(), Arc::as_ptr(strong))
 }
 
 pub(crate) fn truncate_function_output_payload(
@@ -1318,8 +1995,8 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
             ..
         } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
         item => {
-            let raw = serde_json::to_string(item)
-                .map(|serialized| i64::try_from(serialized.len()).unwrap_or(i64::MAX))
+            let raw = serialized_json_len(item)
+                .map(|serialized_len| i64::try_from(serialized_len).unwrap_or(i64::MAX))
                 .unwrap_or_default();
             let (image_payload_bytes, image_replacement_bytes) =
                 image_data_url_estimate_adjustment(item);
@@ -1335,6 +2012,28 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
                 .saturating_add(encrypted_replacement_bytes)
         }
     }
+}
+
+#[derive(Default)]
+struct SerializedByteCounter {
+    bytes: usize,
+}
+
+impl Write for SerializedByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_len<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<usize> {
+    let mut counter = SerializedByteCounter::default();
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.bytes)
 }
 
 /// Returns the base64 payload byte length for inline image data URLs that are

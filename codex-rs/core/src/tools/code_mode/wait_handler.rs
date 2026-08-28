@@ -14,6 +14,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
+use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
@@ -422,6 +423,10 @@ impl CoreToolRuntime for CodeModeWaitHandler {
         None
     }
 
+    fn post_tool_use_hook_name(&self, _invocation: &ToolInvocation) -> Option<HookToolName> {
+        None
+    }
+
     fn post_tool_use_payload(
         &self,
         _invocation: &ToolInvocation,
@@ -436,6 +441,9 @@ impl CoreToolRuntime for CodeModeWaitHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::ActiveTurn;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -589,6 +597,64 @@ mod tests {
         ));
         assert_eq!(result.drained_observations, 0);
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn injected_response_item_wakes_a_suspended_owner_observer() {
+        let (session, _turn_context) = crate::session::tests::make_session_and_context().await;
+        let turn_state = {
+            let mut active_turn = session.active_turn.lock().await;
+            Arc::clone(
+                &active_turn
+                    .get_or_insert_with(ActiveTurn::default)
+                    .turn_state,
+            )
+        };
+        let (activity_rx, pending_activity) = session
+            .input_queue
+            .subscribe_activity(Some(turn_state.as_ref()))
+            .await;
+        assert_eq!(pending_activity, None);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let held = tokio::spawn(async move {
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            hold_until_state_change(
+                move || async move {
+                    let _ = started_tx.send(());
+                    std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>().await
+                },
+                &cancellation,
+                activity_rx,
+                pending_activity,
+                "wait cancelled",
+            )
+            .await
+        });
+
+        started_rx.await.expect("observer started");
+        session
+            .inject_if_running(vec![ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "The active goal objective was updated.".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }])
+            .await
+            .expect("active-turn injection should succeed");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), held)
+            .await
+            .expect("injected response item should wake immediately")
+            .expect("held wait task")
+            .expect("injected response item is non-terminal");
+        assert!(matches!(
+            result.exit,
+            OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Steer)
+        ));
     }
 
     #[tokio::test(start_paused = true)]

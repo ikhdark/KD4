@@ -54,6 +54,7 @@ pub(crate) struct NetworkApprovalSpec {
     pub trigger: GuardianNetworkAccessTrigger,
     pub command: String,
     pub environment_id: String,
+    pub approval_scope_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +191,7 @@ impl Drop for NetworkApprovalRegistration {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct HostApprovalKey {
     environment_id: String,
+    approval_scope_id: String,
     host: String,
     protocol: &'static str,
     port: u16,
@@ -200,9 +202,11 @@ impl HostApprovalKey {
         request: &NetworkPolicyRequest,
         protocol: NetworkApprovalProtocol,
         environment_id: String,
+        approval_scope_id: String,
     ) -> Self {
         Self {
             environment_id,
+            approval_scope_id,
             host: request.host.to_ascii_lowercase(),
             protocol: protocol_key_label(protocol),
             port: request.port,
@@ -300,6 +304,7 @@ struct ActiveNetworkApprovalCall {
     trigger: GuardianNetworkAccessTrigger,
     command: String,
     environment_id: String,
+    approval_scope_id: String,
     cancellation_token: CancellationToken,
 }
 
@@ -312,6 +317,7 @@ enum ActiveNetworkApprovalAttribution {
 struct NetworkRequestAttribution {
     owner_call: Option<Arc<ActiveNetworkApprovalCall>>,
     environment_id: Option<String>,
+    approval_scope_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -338,6 +344,15 @@ impl Default for NetworkApprovalService {
     }
 }
 
+async fn guardian_denial_outcome(
+    session: &Session,
+    review_id: &str,
+    has_owner: bool,
+) -> Option<NetworkApprovalOutcome> {
+    let message = guardian_rejection_message(session, review_id).await;
+    has_owner.then_some(NetworkApprovalOutcome::DeniedByPolicy(message))
+}
+
 impl NetworkApprovalService {
     /// Replace the target session's approval cache with the source session's
     /// currently approved hosts.
@@ -348,6 +363,9 @@ impl NetworkApprovalService {
         other_approved_hosts.extend(approved_hosts.iter().cloned());
     }
 
+    // Registration persists one correlated approval record; splitting the fields
+    // would obscure that atomic boundary.
+    #[allow(clippy::too_many_arguments)]
     async fn register_call(
         &self,
         registration_id: String,
@@ -355,6 +373,7 @@ impl NetworkApprovalService {
         trigger: GuardianNetworkAccessTrigger,
         command: String,
         environment_id: String,
+        approval_scope_id: String,
         cancellation_token: CancellationToken,
     ) {
         let mut calls = self.calls.lock().await;
@@ -367,6 +386,7 @@ impl NetworkApprovalService {
                 trigger,
                 command,
                 environment_id,
+                approval_scope_id,
                 cancellation_token,
             }),
         );
@@ -424,9 +444,11 @@ impl NetworkApprovalService {
                 .environment_id
                 .clone()
                 .unwrap_or_else(|| call.environment_id.clone());
+            let approval_scope_id = call.approval_scope_id.clone();
             return (call.environment_id == environment_id).then_some(NetworkRequestAttribution {
                 owner_call: Some(call),
                 environment_id: Some(environment_id),
+                approval_scope_id: Some(approval_scope_id),
             });
         }
 
@@ -438,9 +460,13 @@ impl NetworkApprovalService {
                 ActiveNetworkApprovalAttribution::None
                 | ActiveNetworkApprovalAttribution::Ambiguous => None,
             };
+            let approval_scope_id = owner_call
+                .as_ref()
+                .map(|call| call.approval_scope_id.clone());
             return Some(NetworkRequestAttribution {
                 owner_call,
                 environment_id: Some(environment_id),
+                approval_scope_id,
             });
         }
 
@@ -448,12 +474,15 @@ impl NetworkApprovalService {
             ActiveNetworkApprovalAttribution::None => Some(NetworkRequestAttribution {
                 owner_call: None,
                 environment_id: None,
+                approval_scope_id: None,
             }),
             ActiveNetworkApprovalAttribution::Single(call) => {
                 let environment_id = call.environment_id.clone();
+                let approval_scope_id = call.approval_scope_id.clone();
                 Some(NetworkRequestAttribution {
                     owner_call: Some(call),
                     environment_id: Some(environment_id),
+                    approval_scope_id: Some(approval_scope_id),
                 })
             }
             ActiveNetworkApprovalAttribution::Ambiguous => None,
@@ -598,6 +627,7 @@ impl NetworkApprovalService {
         let Some(NetworkRequestAttribution {
             owner_call,
             environment_id: active_environment_id,
+            approval_scope_id: active_approval_scope_id,
         }) = self.resolve_request_attribution(&request).await
         else {
             return NetworkDecision::deny(REASON_NOT_ALLOWED);
@@ -611,7 +641,24 @@ impl NetworkApprovalService {
         }) else {
             return NetworkDecision::deny(REASON_NOT_ALLOWED);
         };
-        let key = HostApprovalKey::from_request(&request, protocol, environment_id.clone());
+        let Some(approval_scope_id) = active_approval_scope_id.or_else(|| {
+            turn_context.as_ref().and_then(|turn_context| {
+                turn_context
+                    .environments
+                    .turn_environments
+                    .iter()
+                    .find(|environment| environment.environment_id == environment_id)
+                    .map(|environment| environment.environment.approval_scope_id().to_string())
+            })
+        }) else {
+            return NetworkDecision::deny(REASON_NOT_ALLOWED);
+        };
+        let key = HostApprovalKey::from_request(
+            &request,
+            protocol,
+            environment_id.clone(),
+            approval_scope_id,
+        );
 
         {
             let denied_hosts = self.session_denied_hosts.lock().await;
@@ -846,13 +893,12 @@ impl NetworkApprovalService {
             },
             ReviewDecision::Denied | ReviewDecision::Abort => {
                 if let Some(review_id) = guardian_review_id.as_deref() {
-                    if let Some(owner_call) = owner_call.as_ref() {
-                        let message = guardian_rejection_message(session.as_ref(), review_id).await;
-                        self.record_call_outcome(
-                            &owner_call.registration_id,
-                            NetworkApprovalOutcome::DeniedByPolicy(message),
-                        )
-                        .await;
+                    let outcome =
+                        guardian_denial_outcome(session.as_ref(), review_id, owner_call.is_some())
+                            .await;
+                    if let (Some(owner_call), Some(outcome)) = (owner_call.as_ref(), outcome) {
+                        self.record_call_outcome(&owner_call.registration_id, outcome)
+                            .await;
                     }
                 } else if let Some(owner_call) = owner_call.as_ref() {
                     self.record_call_outcome(
@@ -942,6 +988,7 @@ pub(crate) async fn begin_network_approval(
         trigger,
         command,
         environment_id,
+        approval_scope_id,
     } = match spec {
         Some(spec) => spec,
         None => return Ok(None),
@@ -964,6 +1011,7 @@ pub(crate) async fn begin_network_approval(
             trigger,
             command,
             environment_id,
+            approval_scope_id,
             cancellation_token.clone(),
         )
         .await;

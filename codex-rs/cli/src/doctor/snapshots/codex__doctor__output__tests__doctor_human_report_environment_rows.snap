@@ -11,20 +11,20 @@ Notes
 
 Environment
   ✓ system       en-US
-      os                       macOS 15.0
+      os                       Windows 11
       OS language              en-US
       VISUAL                   code --wait
-      EDITOR                   vim
-      PAGER                    less -R
+      EDITOR                   notepad.exe
+      PAGER                    more.com
       GIT_PAGER                delta
-      GH_PAGER                 less
-      LESS                     -FRX
-  ✓ runtime      running local build on darwin-arm64
+      GH_PAGER                 more.com
+      LESS                     FRX
+  ✓ runtime      running local build on windows-x86_64
   ✓ install      consistent
       managed by               npm: no · bun: no · pnpm: no · package root —
   ✓ search       search is OK (bundled)
   ✓ git          git version 2.54.0
-      selected git             /usr/bin/git
+      selected git             C:\Program Files\Git\cmd\git.exe
       version                  git version 2.54.0
       repo detected            true
   ⚠ terminal     narrow terminal

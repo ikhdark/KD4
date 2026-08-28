@@ -42,6 +42,16 @@ use shell_output_summary::summarize_shell_output_for_model;
 pub(crate) const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
 pub(crate) const EXEC_COMMAND_TOOL_NAME: &str = "exec_command";
 
+pub(crate) async fn run_blocking_command_analysis<T, F>(
+    operation: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation).await
+}
+
 pub(crate) fn is_shell_family_tool_name(tool_name: &ToolName) -> bool {
     tool_name.namespace.is_none()
         && matches!(

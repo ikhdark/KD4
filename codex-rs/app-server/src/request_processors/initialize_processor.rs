@@ -186,6 +186,16 @@ impl InitializeRequestProcessor {
             .send_response(connection_request_id, response)
             .await;
 
+        if let Err(err) = crate::runtime_provenance::write_desktop_runtime_receipt(
+            self.config.codex_home.as_path(),
+            &name,
+        ) {
+            tracing::warn!(
+                error = %err,
+                "failed to publish app-server runtime receipt after initialization"
+            );
+        }
+
         if let Some(outbound_initialized) = outbound_initialized {
             outbound_initialized.store(true, Ordering::Release);
             return Ok(true);

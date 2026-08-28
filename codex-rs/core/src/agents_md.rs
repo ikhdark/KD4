@@ -57,6 +57,13 @@ const PROJECT_DOC_RENDERED_OVERHEAD_BYTES: usize = 4 * 1024;
 const PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES: usize = 256;
 const PROJECT_DISCOVERY_REUSE_METRIC: &str = "codex.project_discovery_reuse";
 
+fn project_instruction_source_header(source_path: &PathUri) -> String {
+    format!(
+        "## AGENTS.md instructions from {}\n\n",
+        source_path.inferred_native_path_string()
+    )
+}
+
 enum ProjectDiscoveryReuse {
     Hit(PathUri),
     Miss(&'static str),
@@ -128,6 +135,60 @@ struct LoadedProjectDoc {
 struct ProjectDocCandidate {
     path: PathUri,
     size: u64,
+    modified_at_ms: i64,
+}
+
+pub(crate) struct ProjectInstructionsDiscovery {
+    environments: Vec<EnvironmentProjectInstructionsDiscovery>,
+    #[cfg(test)]
+    config_identity: usize,
+}
+
+struct EnvironmentProjectInstructionsDiscovery {
+    environment_id: String,
+    cwd: PathUri,
+    filesystem: Arc<dyn ExecutorFileSystem>,
+    result: io::Result<Vec<ProjectDocCandidate>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectInstructionsSourceFingerprint(
+    Vec<EnvironmentProjectInstructionsFingerprint>,
+);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EnvironmentProjectInstructionsFingerprint {
+    environment_id: String,
+    cwd: PathUri,
+    candidates: Vec<ProjectDocCandidate>,
+}
+
+impl ProjectInstructionsDiscovery {
+    #[cfg(test)]
+    pub(crate) fn config_identity(&self) -> usize {
+        self.config_identity
+    }
+
+    pub(crate) fn source_fingerprint(&self) -> Option<ProjectInstructionsSourceFingerprint> {
+        let mut environments = Vec::with_capacity(self.environments.len());
+        for discovery in &self.environments {
+            let candidates = discovery.result.as_ref().ok()?;
+            // Some remote filesystems cannot provide a meaningful mtime. Do not
+            // treat size alone as a trustworthy content identity in that case.
+            if candidates
+                .iter()
+                .any(|candidate| candidate.modified_at_ms <= 0)
+            {
+                return None;
+            }
+            environments.push(EnvironmentProjectInstructionsFingerprint {
+                environment_id: discovery.environment_id.clone(),
+                cwd: discovery.cwd.clone(),
+                candidates: candidates.clone(),
+            });
+        }
+        Some(ProjectInstructionsSourceFingerprint(environments))
+    }
 }
 
 struct ProjectDocRead {
@@ -161,11 +222,80 @@ pub(crate) async fn load_project_instructions(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn load_project_instructions_with_markers(
     config: &Config,
     user_instructions: Option<UserInstructions>,
     environments: &TurnEnvironmentSnapshot,
     project_root_markers: &[String],
+) -> ProjectInstructionsLoad {
+    let discovery = discover_project_instructions_with_markers(
+        Arc::new(config.clone()),
+        environments,
+        project_root_markers,
+    )
+    .await;
+    load_project_instructions_from_discovery(config, user_instructions, discovery).await
+}
+
+pub(crate) async fn discover_project_instructions_with_markers(
+    config: Arc<Config>,
+    environments: &TurnEnvironmentSnapshot,
+    project_root_markers: &[String],
+) -> ProjectInstructionsDiscovery {
+    #[cfg(test)]
+    let config_identity = Arc::as_ptr(&config) as usize;
+    if config.project_doc_max_bytes == 0 {
+        return ProjectInstructionsDiscovery {
+            environments: Vec::new(),
+            #[cfg(test)]
+            config_identity,
+        };
+    }
+
+    let project_root_markers: Arc<[String]> = Arc::from(project_root_markers.to_vec());
+    let environments =
+        futures::stream::iter(environments.turn_environments.clone().into_iter().map(
+            move |turn_environment| {
+                let config = Arc::clone(&config);
+                let project_root_markers = Arc::clone(&project_root_markers);
+                let environment_id = turn_environment.environment_id.clone();
+                let environment = Arc::clone(&turn_environment.environment);
+                let cwd = turn_environment.cwd().clone();
+                async move {
+                    let filesystem = environment.get_filesystem();
+                    let result = agents_md_paths_with_markers(
+                        config.as_ref(),
+                        &cwd,
+                        filesystem.as_ref(),
+                        !environment.is_remote(),
+                        project_root_markers.as_ref(),
+                    )
+                    .await;
+                    EnvironmentProjectInstructionsDiscovery {
+                        environment_id,
+                        cwd,
+                        filesystem,
+                        result,
+                    }
+                }
+            },
+        ))
+        .buffered(MAX_CONCURRENT_DIRECTORY_SEARCHES)
+        .collect::<Vec<_>>()
+        .await;
+
+    ProjectInstructionsDiscovery {
+        environments,
+        #[cfg(test)]
+        config_identity,
+    }
+}
+
+pub(crate) async fn load_project_instructions_from_discovery(
+    config: &Config,
+    user_instructions: Option<UserInstructions>,
+    discovery: ProjectInstructionsDiscovery,
 ) -> ProjectInstructionsLoad {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
     let mut remaining_source_bytes = config.project_doc_max_bytes;
@@ -182,40 +312,19 @@ pub(crate) async fn load_project_instructions_with_markers(
         };
     }
 
-    let config = Arc::new(config.clone());
-    let project_root_markers: Arc<[String]> = Arc::from(project_root_markers.to_vec());
-    let discoveries =
-        futures::stream::iter(environments.turn_environments.clone().into_iter().map(
-            |turn_environment| {
-                let config = Arc::clone(&config);
-                let project_root_markers = Arc::clone(&project_root_markers);
-                async move {
-                    let environment_id = turn_environment.environment_id.clone();
-                    let environment = turn_environment.environment.clone();
-                    let cwd = turn_environment.cwd().clone();
-                    let filesystem = environment.get_filesystem();
-                    let result = agents_md_paths_with_markers(
-                        config.as_ref(),
-                        &cwd,
-                        filesystem.as_ref(),
-                        !environment.is_remote(),
-                        project_root_markers.as_ref(),
-                    )
-                    .await;
-                    (environment_id, cwd, filesystem, result)
-                }
-            },
-        ))
-        .buffered(MAX_CONCURRENT_DIRECTORY_SEARCHES)
-        .collect::<Vec<_>>()
-        .await;
-
-    let contributing_environments = discoveries
+    let contributing_environments = discovery
+        .environments
         .iter()
-        .filter(|(_, _, _, result)| matches!(result, Ok(paths) if !paths.is_empty()))
+        .filter(|discovery| matches!(&discovery.result, Ok(paths) if !paths.is_empty()))
         .count();
     let mut first_project_environment = true;
-    for (environment_id, cwd, filesystem, result) in discoveries {
+    for EnvironmentProjectInstructionsDiscovery {
+        environment_id,
+        cwd,
+        filesystem,
+        result,
+    } in discovery.environments
+    {
         match result {
             Ok(candidates) if !candidates.is_empty() => {
                 let mut generated_overhead = 0usize;
@@ -227,7 +336,7 @@ pub(crate) async fn load_project_instructions_with_markers(
                         generated_overhead += 2;
                     }
                     generated_overhead += format!(
-                        "for `{}` with root {}\n\n",
+                        "for `{}` with cwd {}\n\n",
                         environment_id,
                         cwd.inferred_native_path_string()
                     )
@@ -435,10 +544,11 @@ fn render_project_docs(
     }) = project_docs.next()
     {
         let separator_bytes = usize::from(!entries.is_empty()) * 2;
+        let source_header_bytes = project_instruction_source_header(&candidate.path).len();
         let Some((text, retained_bytes)) = render_project_doc_to_budget(
             &mut read,
             &candidate.path,
-            remaining.saturating_sub(separator_bytes),
+            remaining.saturating_sub(separator_bytes + source_header_bytes),
         ) else {
             omitted_documents.push(ProjectDocOmission {
                 environment_id: environment_id.to_string(),
@@ -480,7 +590,8 @@ fn render_project_docs(
             },
         });
         retained_source_bytes = retained_source_bytes.saturating_add(retained_bytes);
-        remaining = remaining.saturating_sub(rendered_bytes + separator_bytes);
+        remaining =
+            remaining.saturating_sub(rendered_bytes + separator_bytes + source_header_bytes);
     }
     entries.reverse();
     loaded.entries.extend(entries);
@@ -918,6 +1029,7 @@ async fn agents_md_paths_with_metrics_and_markers(
                         return Ok(Some(ProjectDocCandidate {
                             path: candidate,
                             size: metadata.size,
+                            modified_at_ms: metadata.modified_at_ms,
                         }));
                     }
                     Ok(_) => {}
@@ -1277,7 +1389,11 @@ impl LoadedAgentsMd {
             has_previous = true;
         }
         for entry in &self.entries {
-            let is_project = matches!(&entry.provenance, InstructionProvenance::Project { .. });
+            let source_path = match &entry.provenance {
+                InstructionProvenance::Project { source_path, .. } => Some(source_path),
+                InstructionProvenance::Internal => None,
+            };
+            let is_project = source_path.is_some();
             if has_previous {
                 // The project-doc marker tells the model where workspace-scoped
                 // instructions begin, so it is only needed on the transition
@@ -1288,6 +1404,9 @@ impl LoadedAgentsMd {
                     "\n\n"
                 };
                 output.push_str(separator);
+            }
+            if let Some(source_path) = source_path {
+                output.push_str(&project_instruction_source_header(source_path));
             }
             output.push_entry(&entry.contents);
             has_previous = true;
@@ -1312,9 +1431,9 @@ impl LoadedAgentsMd {
         for entry in &self.entries {
             match &entry.provenance {
                 InstructionProvenance::Project {
+                    source_path,
                     environment_id,
                     cwd,
-                    ..
                 } => {
                     if has_previous {
                         output.push_str("\n\n");
@@ -1325,11 +1444,12 @@ impl LoadedAgentsMd {
                     let environment = (environment_id.as_str(), cwd);
                     if previous_environment != Some(environment) {
                         output.push_str(&format!(
-                            "for `{}` with root {}\n\n",
+                            "for `{}` with cwd {}\n\n",
                             environment_id,
                             cwd.inferred_native_path_string()
                         ));
                     }
+                    output.push_str(&project_instruction_source_header(source_path));
                     output.push_entry(&entry.contents);
                     previous_environment = Some(environment);
                 }

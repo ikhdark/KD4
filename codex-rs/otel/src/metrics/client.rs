@@ -123,6 +123,17 @@ impl MetricsClientInner {
         }
         let attributes = self.attributes(tags)?;
 
+        self.record_counter(name, description, inc, &attributes);
+        Ok(())
+    }
+
+    fn record_counter(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        inc: i64,
+        attributes: &[KeyValue],
+    ) {
         let mut counters = self
             .counters
             .lock()
@@ -139,8 +150,7 @@ impl MetricsClientInner {
                 None => builder.build(),
             }
         });
-        counter.add(inc as u64, &attributes);
-        Ok(())
+        counter.add(inc as u64, attributes);
     }
 
     fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()> {
@@ -218,6 +228,19 @@ impl MetricsClientInner {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
 
+        self.record_duration_histogram(name, value, unit, description, boundaries, &attributes);
+        Ok(())
+    }
+
+    fn record_duration_histogram(
+        &self,
+        name: &str,
+        value: f64,
+        unit: &'static str,
+        description: &str,
+        boundaries: &'static [f64],
+        attributes: &[KeyValue],
+    ) {
         let mut histograms = self
             .duration_histograms
             .lock()
@@ -235,7 +258,35 @@ impl MetricsClientInner {
                 .with_boundaries(boundaries.to_vec())
                 .build()
         });
-        histogram.record(value, &attributes);
+        histogram.record(value, attributes);
+    }
+
+    fn counter_and_duration(
+        &self,
+        count_name: &str,
+        duration_name: &str,
+        inc: i64,
+        duration: Duration,
+        tags: &[(&str, &str)],
+    ) -> Result<()> {
+        validate_metric_name(count_name)?;
+        validate_metric_name(duration_name)?;
+        if inc < 0 {
+            return Err(MetricsError::NegativeCounterIncrement {
+                name: count_name.to_string(),
+                inc,
+            });
+        }
+        let attributes = self.attributes(tags)?;
+        self.record_counter(count_name, /*description*/ None, inc, &attributes);
+        self.record_duration_histogram(
+            duration_name,
+            duration.as_millis().min(i64::MAX as u128) as f64,
+            MILLISECOND_DURATION_UNIT,
+            MILLISECOND_DURATION_DESCRIPTION,
+            MILLISECOND_DURATION_BOUNDARIES,
+            &attributes,
+        );
         Ok(())
     }
 
@@ -399,6 +450,19 @@ impl MetricsClient {
             MILLISECOND_DURATION_BOUNDARIES,
             tags,
         )
+    }
+
+    /// Record a counter increment and its duration with one validated attribute set.
+    pub fn record_count_and_duration(
+        &self,
+        count_name: &str,
+        duration_name: &str,
+        inc: i64,
+        duration: Duration,
+        tags: &[(&str, &str)],
+    ) -> Result<()> {
+        self.0
+            .counter_and_duration(count_name, duration_name, inc, duration, tags)
     }
 
     /// Record a duration in seconds using a histogram with an instrument description.

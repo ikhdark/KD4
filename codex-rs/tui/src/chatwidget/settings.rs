@@ -519,10 +519,12 @@ impl ChatWidget {
         self.set_approvals_reviewer(settings.approvals_reviewer.to_core());
         self.config.personality = settings.personality;
 
-        let permission_profile = PermissionProfile::from_legacy_sandbox_policy_for_cwd(
-            &settings.sandbox_policy.to_core(),
-            settings.cwd.as_path(),
-        );
+        let permission_profile = settings.permission_profile.take().unwrap_or_else(|| {
+            PermissionProfile::from_legacy_sandbox_policy_for_cwd(
+                &settings.sandbox_policy.to_core(),
+                settings.cwd.as_path(),
+            )
+        });
         let permission_snapshot = PermissionProfileSnapshot::from_session_snapshot(
             permission_profile,
             settings.active_permission_profile.take().map(Into::into),

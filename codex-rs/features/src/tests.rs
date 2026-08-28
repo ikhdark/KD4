@@ -1,5 +1,6 @@
 use crate::Feature;
 use crate::FeatureConfigSource;
+use crate::FeatureConsumer;
 use crate::FeatureOverrides;
 use crate::FeatureToml;
 use crate::Features;
@@ -27,6 +28,7 @@ fn feature_metadata_is_exhaustive_and_single_sourced() {
         assert_eq!(feature.key(), spec.key);
         assert_eq!(feature.stage(), spec.stage);
         assert_eq!(feature.default_enabled(), spec.default_enabled);
+        assert_eq!(feature.consumer(), spec.consumer);
     }
 }
 
@@ -50,6 +52,7 @@ fn machine_readable_registry_projection_uses_evaluated_defaults() {
                 .map(|spec| serde_json::json!({
                     "key": spec.key,
                     "defaultEnabled": spec.default_enabled,
+                    "consumer": spec.consumer,
                 }))
                 .collect::<Vec<_>>()
         )
@@ -276,6 +279,77 @@ fn browser_controls_are_stable_and_enabled_by_default() {
     assert_eq!(Feature::ComputerUse.stage(), Stage::Stable);
     assert_eq!(Feature::ComputerUse.default_enabled(), true);
     assert_eq!(feature_for_key("computer_use"), Some(Feature::ComputerUse));
+
+    for feature in [
+        Feature::InAppBrowser,
+        Feature::BrowserUse,
+        Feature::BrowserUseFullCdpAccess,
+        Feature::BrowserUseExternal,
+        Feature::ComputerUse,
+    ] {
+        assert_eq!(feature.consumer(), FeatureConsumer::Client);
+    }
+}
+
+#[test]
+fn client_only_features_are_not_read_by_rust_runtime_sources() {
+    fn visit_rs_sources(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(path).expect("read Rust workspace directory") {
+            let entry = entry.expect("read Rust workspace entry");
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                visit_rs_sources(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("features crate is in the Rust workspace");
+    let mut files = Vec::new();
+    visit_rs_sources(workspace, &mut files);
+    let client_only_names = [
+        "Feature::InAppBrowser",
+        "Feature::BrowserUse",
+        "Feature::BrowserUseFullCdpAccess",
+        "Feature::BrowserUseExternal",
+        "Feature::ComputerUse",
+    ];
+    let mut violations = Vec::new();
+
+    for path in files {
+        let relative = path
+            .strip_prefix(workspace)
+            .expect("workspace-relative path");
+        if relative.starts_with("features")
+            || relative
+                .components()
+                .any(|component| component.as_os_str() == "tests")
+            || path.file_name().is_some_and(|name| name == "tests.rs")
+            || path
+                .file_stem()
+                .is_some_and(|name| name.to_string_lossy().ends_with("_tests"))
+        {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read Rust source");
+        for name in client_only_names {
+            if source.contains(name) {
+                violations.push(format!("{} reads {name}", relative.display()));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "client-only feature flags must not select Rust runtime behavior:\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]

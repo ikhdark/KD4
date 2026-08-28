@@ -12,6 +12,7 @@ import type { TurnTimingModelRequest } from "./TurnTimingModelRequest";
 import type { TurnTimingPreFirstModelOutput } from "./TurnTimingPreFirstModelOutput";
 import type { TurnTimingTerminalization } from "./TurnTimingTerminalization";
 import type { TurnTimingToolCall } from "./TurnTimingToolCall";
+import type { TurnTimingToolClosure } from "./TurnTimingToolClosure";
 import type { TurnTimingUnions } from "./TurnTimingUnions";
 
 /**
@@ -41,6 +42,12 @@ modelRequests?: Array<TurnTimingModelRequest>,
  * the canonical `exclusive` partition.
  */
 toolCalls?: Array<TurnTimingToolCall>, toolCallTimingOverflow: number,
+/**
+ * Exact accepted-call closure ledger. A terminal event is publishable only
+ * when every accepted direct and nested execution has timing, a terminal
+ * outcome, and exactly one persisted projection.
+ */
+toolClosure: TurnTimingToolClosure,
 /**
  * Provider usage observed on generations where neither relevant
  * structured state nor the next-correct-action changed. This is a

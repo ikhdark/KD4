@@ -13,6 +13,14 @@ const MANAGED_ROOT_WARNING_THRESHOLD: usize = 384;
 const MANAGED_ROOT_LIMIT: usize = 512;
 const MANAGED_ROOT_RECLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound for synchronous Windows process operations moved off Tokio's
+/// async worker threads.
+pub const WINDOWS_PROCESS_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Creation flag used when Job membership must be established before any
+/// child code is allowed to run.
+pub const WINDOWS_CREATE_SUSPENDED: u32 = winapi::um::winbase::CREATE_SUSPENDED;
+
 static MANAGED_ROOT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_MANAGED_ROOT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_RECLAIMER_ID: AtomicU64 = AtomicU64::new(1);
@@ -188,9 +196,6 @@ impl ManagedRootProcess {
     }
 
     /// Open a normally running Windows root by PID and attach it to the Job.
-    ///
-    /// Do not pair this with `CREATE_SUSPENDED`: Tokio does not retain the
-    /// primary thread handle needed for a reliable `ResumeThread` call.
     pub fn attach(&self, pid: u32) -> io::Result<()> {
         use std::os::windows::io::FromRawHandle;
         use std::os::windows::io::OwnedHandle;
@@ -206,6 +211,14 @@ impl ManagedRootProcess {
         self.job.assign_process(raw.cast())
     }
 
+    /// Attach a `CREATE_SUSPENDED` child to the Job and then resume all of its
+    /// threads. Enumerating the new process's threads recovers the primary
+    /// thread handle that `std::process` and Tokio do not expose.
+    pub fn attach_and_resume(&self, pid: u32) -> io::Result<()> {
+        self.attach(pid)?;
+        resume_process_threads(pid)
+    }
+
     pub fn terminate(&self) -> io::Result<()> {
         self.job.terminate()
     }
@@ -213,6 +226,78 @@ impl ManagedRootProcess {
     pub fn preserve_descendants(&self) -> io::Result<()> {
         self.job.preserve_descendants()
     }
+}
+
+/// Run a synchronous Windows process operation on Tokio's blocking pool with
+/// a bounded wait so a stuck loader cannot stall an async worker thread.
+pub async fn run_windows_process_operation<T, F>(timeout: Duration, operation: F) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+{
+    tokio::time::timeout(timeout, tokio::task::spawn_blocking(operation))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "Windows process operation did not return within {} seconds",
+                    timeout.as_secs_f64()
+                ),
+            )
+        })?
+        .map_err(|error| io::Error::other(format!("Windows process task failed: {error}")))?
+}
+
+fn resume_process_threads(pid: u32) -> io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::io::OwnedHandle;
+    use winapi::shared::minwindef::FALSE;
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::processthreadsapi::OpenThread;
+    use winapi::um::processthreadsapi::ResumeThread;
+    use winapi::um::tlhelp32::CreateToolhelp32Snapshot;
+    use winapi::um::tlhelp32::TH32CS_SNAPTHREAD;
+    use winapi::um::tlhelp32::THREADENTRY32;
+    use winapi::um::tlhelp32::Thread32First;
+    use winapi::um::tlhelp32::Thread32Next;
+    use winapi::um::winnt::THREAD_SUSPEND_RESUME;
+
+    let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if raw_snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw_snapshot.cast()) };
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = size_of::<THREADENTRY32>() as u32;
+    let mut has_entry = unsafe { Thread32First(snapshot.as_raw_handle().cast(), &mut entry) } != 0;
+    let mut resumed = 0usize;
+
+    while has_entry {
+        if entry.th32OwnerProcessID == pid {
+            let raw_thread =
+                unsafe { OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID) };
+            if raw_thread.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let thread = unsafe { OwnedHandle::from_raw_handle(raw_thread.cast()) };
+            if unsafe { ResumeThread(thread.as_raw_handle().cast()) } == u32::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            resumed += 1;
+        }
+        has_entry = unsafe { Thread32Next(snapshot.as_raw_handle().cast(), &mut entry) } != 0;
+    }
+
+    if resumed == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no thread found for suspended process {pid}"),
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for ManagedRootProcess {

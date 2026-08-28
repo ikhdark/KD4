@@ -48,6 +48,7 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 
 const GIT_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_CHANGE_JOURNAL_CAPACITY: usize = 4_096;
+const RETAINED_REPOSITORY_CAPACITY: usize = 64;
 const GENERATED_CODEX_EVAL_PATHSPEC: &str = ":(exclude).codex/evals/**";
 const PROJECT_DISCOVERY_REUSE_METRIC: &str = "codex.project_discovery_reuse";
 const ROOT_DISCOVERY_CONCURRENCY: usize = 4;
@@ -616,10 +617,49 @@ struct CachedWorkspaceEvidenceIdentity {
     identity: Option<WorkspaceEvidenceIdentity>,
 }
 
+struct RetainedSourceWatchRegistration {
+    generation: u64,
+    _registration: WatchRegistration,
+}
+
+#[derive(Default)]
+struct RepositoryRetention {
+    source_watch_registrations: HashMap<PathBuf, RetainedSourceWatchRegistration>,
+    latest_workspace_evidence: HashMap<PathBuf, CachedWorkspaceEvidenceIdentity>,
+    access_order: VecDeque<PathBuf>,
+    next_registration_generation: u64,
+}
+
+impl RepositoryRetention {
+    fn touch(&mut self, repo_root: &Path) {
+        if let Some(index) = self
+            .access_order
+            .iter()
+            .position(|retained| retained == repo_root)
+        {
+            self.access_order.remove(index);
+        }
+        self.access_order.push_back(repo_root.to_path_buf());
+        while self.access_order.len() > RETAINED_REPOSITORY_CAPACITY {
+            let Some(evicted) = self.access_order.pop_front() else {
+                break;
+            };
+            self.source_watch_registrations.remove(&evicted);
+            self.latest_workspace_evidence.remove(&evicted);
+        }
+    }
+
+    fn allocate_registration_generation(&mut self) -> u64 {
+        self.next_registration_generation = self.next_registration_generation.saturating_add(1);
+        self.next_registration_generation
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct WorkspaceEvidenceCaptureKey {
     repo_root: PathBuf,
     watcher_generation: u64,
+    source_watcher_generation: u64,
     host_mutation_generation: u64,
 }
 
@@ -642,9 +682,11 @@ pub(crate) struct GitWorkspaceCache {
     host_mutation_generation: AtomicU64,
     watcher_reliable: AtomicBool,
     watcher_subscriber: Option<FileWatcherSubscriber>,
-    source_watch_registrations: StdMutex<HashMap<PathBuf, WatchRegistration>>,
+    source_watcher_generation: AtomicU64,
+    source_watcher_reliable: AtomicBool,
+    source_watcher_subscriber: Option<FileWatcherSubscriber>,
+    repository_retention: StdMutex<RepositoryRetention>,
     source_change_journal: StdMutex<SourceChangeJournal>,
-    latest_workspace_evidence: StdMutex<HashMap<PathBuf, CachedWorkspaceEvidenceIdentity>>,
     in_flight_workspace_evidence:
         StdMutex<HashMap<WorkspaceEvidenceCaptureKey, InFlightWorkspaceEvidenceCapture>>,
     workspace_evidence_capture_sequence: AtomicU64,
@@ -668,6 +710,8 @@ pub(crate) struct WorkspaceChangeObservation {
 pub(crate) struct SourcePathChangeObservation {
     watcher_epoch: u64,
     watcher_generation: u64,
+    #[serde(default)]
+    registration_generation: u64,
     repo_root: PathBuf,
     path: PathBuf,
     #[serde(default)]
@@ -677,7 +721,8 @@ pub(crate) struct SourcePathChangeObservation {
 #[derive(Clone, Debug)]
 struct SourceChangeEvent {
     generation: u64,
-    changed_paths: Option<Vec<PathBuf>>,
+    exact_path_keys: Option<Vec<String>>,
+    subtree_keys: Option<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -685,6 +730,144 @@ struct SourceChangeJournal {
     retained_floor: u64,
     latest_generation: u64,
     events: VecDeque<SourceChangeEvent>,
+    exact_path_generations: HashMap<String, VecDeque<u64>>,
+    subtree_generations: HashMap<String, VecDeque<u64>>,
+    coarse_generations: VecDeque<u64>,
+    #[cfg(test)]
+    freshness_lookup_count: usize,
+}
+
+impl SourceChangeJournal {
+    fn record(&mut self, generation: u64, changed_paths: Option<Vec<PathBuf>>) {
+        let (exact_path_keys, subtree_keys) = if let Some(changed_paths) = changed_paths {
+            let exact_path_keys = changed_paths
+                .iter()
+                .map(|path| source_change_path_key(path))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let subtree_keys = changed_paths
+                .iter()
+                .flat_map(|path| path.ancestors())
+                .map(source_change_path_key)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            for key in &exact_path_keys {
+                self.exact_path_generations
+                    .entry(key.clone())
+                    .or_default()
+                    .push_back(generation);
+            }
+            for key in &subtree_keys {
+                self.subtree_generations
+                    .entry(key.clone())
+                    .or_default()
+                    .push_back(generation);
+            }
+            (Some(exact_path_keys), Some(subtree_keys))
+        } else {
+            self.coarse_generations.push_back(generation);
+            (None, None)
+        };
+        self.latest_generation = generation;
+        self.events.push_back(SourceChangeEvent {
+            generation,
+            exact_path_keys,
+            subtree_keys,
+        });
+        while self.events.len() > SOURCE_CHANGE_JOURNAL_CAPACITY {
+            if let Some(removed) = self.events.pop_front() {
+                self.remove(&removed);
+                self.retained_floor = removed.generation;
+            }
+        }
+    }
+
+    fn remove(&mut self, event: &SourceChangeEvent) {
+        if let Some(keys) = &event.exact_path_keys {
+            for key in keys {
+                remove_indexed_generation(&mut self.exact_path_generations, key, event.generation);
+            }
+        } else if self.coarse_generations.front() == Some(&event.generation) {
+            self.coarse_generations.pop_front();
+        }
+        if let Some(keys) = &event.subtree_keys {
+            for key in keys {
+                remove_indexed_generation(&mut self.subtree_generations, key, event.generation);
+            }
+        }
+    }
+
+    fn path_changed_since(&mut self, observation: &SourcePathChangeObservation) -> bool {
+        self.record_freshness_lookup();
+        if self
+            .coarse_generations
+            .back()
+            .is_some_and(|generation| *generation > observation.watcher_generation)
+        {
+            return true;
+        }
+        for ancestor in observation.path.ancestors() {
+            let key = source_change_path_key(ancestor);
+            self.record_freshness_lookup();
+            if index_has_generation_after(
+                &self.exact_path_generations,
+                &key,
+                observation.watcher_generation,
+            ) {
+                return true;
+            }
+        }
+        if observation.recursive {
+            let key = source_change_path_key(&observation.path);
+            self.record_freshness_lookup();
+            if index_has_generation_after(
+                &self.subtree_generations,
+                &key,
+                observation.watcher_generation,
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn record_freshness_lookup(&mut self) {
+        #[cfg(test)]
+        {
+            self.freshness_lookup_count += 1;
+        }
+    }
+}
+
+fn remove_indexed_generation(
+    index: &mut HashMap<String, VecDeque<u64>>,
+    key: &str,
+    generation: u64,
+) {
+    let remove_entry = if let Some(generations) = index.get_mut(key) {
+        if generations.front() == Some(&generation) {
+            generations.pop_front();
+        }
+        generations.is_empty()
+    } else {
+        false
+    };
+    if remove_entry {
+        index.remove(key);
+    }
+}
+
+fn index_has_generation_after(
+    index: &HashMap<String, VecDeque<u64>>,
+    key: &str,
+    generation: u64,
+) -> bool {
+    index
+        .get(key)
+        .and_then(|generations| generations.back())
+        .is_some_and(|indexed_generation| *indexed_generation > generation)
 }
 
 impl GitWorkspaceCache {
@@ -708,13 +891,20 @@ impl GitWorkspaceCache {
     }
 
     fn with_watcher(watcher: Option<Arc<FileWatcher>>) -> Arc<Self> {
-        let (watcher_subscriber, receiver) = match watcher {
-            Some(watcher) => {
-                let (subscriber, receiver) = watcher.add_subscriber();
-                (Some(subscriber), Some(receiver))
-            }
-            None => (None, None),
-        };
+        let (watcher_subscriber, receiver, source_watcher_subscriber, source_receiver) =
+            match watcher {
+                Some(watcher) => {
+                    let (subscriber, receiver) = watcher.add_subscriber();
+                    let (source_subscriber, source_receiver) = watcher.add_subscriber();
+                    (
+                        Some(subscriber),
+                        Some(receiver),
+                        Some(source_subscriber),
+                        Some(source_receiver),
+                    )
+                }
+                None => (None, None, None, None),
+            };
         let watcher_epoch = (u64::from(std::process::id()) << 32)
             | NEXT_WATCHER_EPOCH.fetch_add(1, Ordering::Relaxed);
         let cache = Arc::new(Self {
@@ -724,9 +914,11 @@ impl GitWorkspaceCache {
             host_mutation_generation: AtomicU64::new(0),
             watcher_reliable: AtomicBool::new(watcher_subscriber.is_some()),
             watcher_subscriber,
-            source_watch_registrations: StdMutex::new(HashMap::new()),
+            source_watcher_generation: AtomicU64::new(0),
+            source_watcher_reliable: AtomicBool::new(source_watcher_subscriber.is_some()),
+            source_watcher_subscriber,
+            repository_retention: StdMutex::new(RepositoryRetention::default()),
             source_change_journal: StdMutex::new(SourceChangeJournal::default()),
-            latest_workspace_evidence: StdMutex::new(HashMap::new()),
             in_flight_workspace_evidence: StdMutex::new(HashMap::new()),
             workspace_evidence_capture_sequence: AtomicU64::new(0),
             #[cfg(test)]
@@ -743,7 +935,23 @@ impl GitWorkspaceCache {
         {
             let weak_cache = Arc::downgrade(&cache);
             runtime.spawn(async move {
-                while let Some(event) = receiver.recv().await {
+                while let Some(_event) = receiver.recv().await {
+                    let Some(cache) = weak_cache.upgrade() else {
+                        return;
+                    };
+                    cache.watcher_generation.fetch_add(1, Ordering::AcqRel);
+                }
+                if let Some(cache) = weak_cache.upgrade() {
+                    cache.invalidate_for_watcher_failure().await;
+                }
+            });
+        }
+        if let Some(mut source_receiver) = source_receiver
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let weak_cache = Arc::downgrade(&cache);
+            runtime.spawn(async move {
+                while let Some(event) = source_receiver.recv().await {
                     let Some(cache) = weak_cache.upgrade() else {
                         return;
                     };
@@ -751,7 +959,7 @@ impl GitWorkspaceCache {
                     cache.record_source_change_event(changed_paths);
                 }
                 if let Some(cache) = weak_cache.upgrade() {
-                    cache.invalidate_for_watcher_failure().await;
+                    cache.invalidate_source_watcher();
                 }
             });
         }
@@ -765,6 +973,11 @@ impl GitWorkspaceCache {
         state.root = None;
         state.metadata.clear();
         state.project_namespaces.clear();
+    }
+
+    fn invalidate_source_watcher(&self) {
+        self.source_watcher_reliable.store(false, Ordering::Release);
+        self.record_source_change_event(None);
     }
 
     /// Returns a freshly captured content-based workspace identity.
@@ -795,6 +1008,7 @@ impl GitWorkspaceCache {
         let key = WorkspaceEvidenceCaptureKey {
             repo_root: repo_root.clone(),
             watcher_generation: self.watcher_generation.load(Ordering::Acquire),
+            source_watcher_generation: self.source_watcher_generation.load(Ordering::Acquire),
             host_mutation_generation: self.host_mutation_generation.load(Ordering::Acquire),
         };
         let (in_flight_capture, coalesced) = {
@@ -865,22 +1079,24 @@ impl GitWorkspaceCache {
             }
         }
         let capture_sequence = in_flight_capture.capture_sequence;
-        let mut latest = self
-            .latest_workspace_evidence
+        let mut retention = self
+            .repository_retention
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if latest
+        if retention
+            .latest_workspace_evidence
             .get(&repo_root)
             .is_none_or(|cached| cached.capture_sequence <= capture_sequence)
         {
-            latest.insert(
-                repo_root,
+            retention.latest_workspace_evidence.insert(
+                repo_root.clone(),
                 CachedWorkspaceEvidenceIdentity {
                     capture_sequence,
                     identity: capture.identity.clone(),
                 },
             );
         }
+        retention.touch(&repo_root);
         capture
     }
 
@@ -893,11 +1109,15 @@ impl GitWorkspaceCache {
         repo_root: &Path,
     ) -> Option<WorkspaceEvidenceIdentity> {
         let repo_root = canonical_workspace_evidence_root(repo_root);
-        self.latest_workspace_evidence
+        let mut retention = self
+            .repository_retention
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&repo_root)
-            .and_then(|cached| cached.identity.clone())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cached = retention.latest_workspace_evidence.get(&repo_root).cloned();
+        if cached.is_some() {
+            retention.touch(&repo_root);
+        }
+        cached.and_then(|cached| cached.identity)
     }
 
     #[cfg(test)]
@@ -1107,7 +1327,7 @@ impl GitWorkspaceCache {
 
     async fn project_namespace(&self, source: &GitWorkspaceMetadataSource) -> Option<String> {
         let watcher_generation = self.watcher_generation.load(Ordering::Acquire);
-        let dependencies = StableMetadataDependencies::capture_project_namespace(source);
+        let dependencies = StableMetadataDependencies::capture_project_namespace(source).await;
         if self.watcher_reliable.load(Ordering::Acquire)
             && let Some(dependencies) = dependencies.as_ref()
         {
@@ -1124,7 +1344,8 @@ impl GitWorkspaceCache {
 
         let namespace = collect_project_namespace(source.cwd.as_path()).await;
         if let Some(before_dependencies) = dependencies {
-            let after_dependencies = StableMetadataDependencies::capture_project_namespace(source);
+            let after_dependencies =
+                StableMetadataDependencies::capture_project_namespace(source).await;
             if after_dependencies.as_ref() == Some(&before_dependencies)
                 && self.watcher_reliable.load(Ordering::Acquire)
                 && self.watcher_generation.load(Ordering::Acquire) == watcher_generation
@@ -1173,6 +1394,12 @@ impl GitWorkspaceCache {
             .then(|| self.watcher_generation.load(Ordering::Acquire))
     }
 
+    fn reliable_source_watcher_generation(&self) -> Option<u64> {
+        self.source_watcher_reliable
+            .load(Ordering::Acquire)
+            .then(|| self.source_watcher_generation.load(Ordering::Acquire))
+    }
+
     fn record_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) -> u64 {
         let changed_paths = changed_paths.map(|paths| {
             paths
@@ -1185,26 +1412,17 @@ impl GitWorkspaceCache {
 
     fn record_filtered_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) -> u64 {
         if changed_paths.as_ref().is_some_and(Vec::is_empty) {
-            return self.watcher_generation.load(Ordering::Acquire);
+            return self.source_watcher_generation.load(Ordering::Acquire);
         }
         let generation = self
-            .watcher_generation
+            .source_watcher_generation
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
         let mut journal = self
             .source_change_journal
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        journal.latest_generation = generation;
-        journal.events.push_back(SourceChangeEvent {
-            generation,
-            changed_paths,
-        });
-        while journal.events.len() > SOURCE_CHANGE_JOURNAL_CAPACITY {
-            if let Some(removed) = journal.events.pop_front() {
-                journal.retained_floor = removed.generation;
-            }
-        }
+        journal.record(generation, changed_paths);
         generation
     }
 
@@ -1218,7 +1436,7 @@ impl GitWorkspaceCache {
         path: &Path,
         recursive: bool,
     ) -> Option<SourcePathChangeObservation> {
-        if !self.watcher_reliable.load(Ordering::Acquire) {
+        if !self.source_watcher_reliable.load(Ordering::Acquire) {
             return None;
         }
         let repo_root = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
@@ -1226,27 +1444,41 @@ impl GitWorkspaceCache {
         if !path_is_same_or_descendant(&path, &repo_root) {
             return None;
         }
-        {
-            let mut registrations = self
-                .source_watch_registrations
+        let registration_generation = {
+            let mut retention = self
+                .repository_retention
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !registrations.contains_key(&repo_root) {
-                let registration = self
-                    .watcher_subscriber
-                    .as_ref()?
-                    .register_paths(vec![WatchPath {
-                        path: repo_root.clone(),
-                        recursive: true,
-                    }])
-                    .ok()?;
-                registrations.insert(repo_root.clone(), registration);
-            }
-        }
-        let watcher_generation = self.reliable_watcher_generation()?;
+            let generation =
+                if let Some(registration) = retention.source_watch_registrations.get(&repo_root) {
+                    registration.generation
+                } else {
+                    let registration = self
+                        .source_watcher_subscriber
+                        .as_ref()?
+                        .register_paths(vec![WatchPath {
+                            path: repo_root.clone(),
+                            recursive: true,
+                        }])
+                        .ok()?;
+                    let generation = retention.allocate_registration_generation();
+                    retention.source_watch_registrations.insert(
+                        repo_root.clone(),
+                        RetainedSourceWatchRegistration {
+                            generation,
+                            _registration: registration,
+                        },
+                    );
+                    generation
+                };
+            retention.touch(&repo_root);
+            generation
+        };
+        let watcher_generation = self.reliable_source_watcher_generation()?;
         Some(SourcePathChangeObservation {
             watcher_epoch: self.watcher_epoch,
             watcher_generation,
+            registration_generation,
             repo_root,
             path,
             recursive,
@@ -1262,13 +1494,29 @@ impl GitWorkspaceCache {
         {
             return false;
         }
-        let Some(current_generation) = self.reliable_watcher_generation() else {
+        let Some(current_generation) = self.reliable_source_watcher_generation() else {
             return false;
         };
         if current_generation < observation.watcher_generation {
             return false;
         }
-        let journal = self
+        {
+            let mut retention = self
+                .repository_retention
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let registration_is_current = retention
+                .source_watch_registrations
+                .get(&observation.repo_root)
+                .is_some_and(|registration| {
+                    registration.generation == observation.registration_generation
+                });
+            if !registration_is_current {
+                return false;
+            }
+            retention.touch(&observation.repo_root);
+        }
+        let mut journal = self
             .source_change_journal
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1277,21 +1525,16 @@ impl GitWorkspaceCache {
         {
             return false;
         }
-        journal
-            .events
-            .iter()
-            .filter(|event| event.generation > observation.watcher_generation)
-            .all(|event| {
-                event.changed_paths.as_ref().is_some_and(|paths| {
-                    paths.iter().all(|changed| {
-                        let changed_ancestor =
-                            path_is_same_or_descendant(&observation.path, changed);
-                        let changed_descendant = observation.recursive
-                            && path_is_same_or_descendant(changed, &observation.path);
-                        !changed_ancestor && !changed_descendant
-                    })
-                })
-            })
+        !journal.path_changed_since(observation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_source_change_freshness_lookup_count_for_test(&self) -> usize {
+        let mut journal = self
+            .source_change_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut journal.freshness_lookup_count)
     }
 
     pub(crate) fn begin_workspace_change_observation(
@@ -1331,6 +1574,7 @@ impl GitWorkspaceCache {
 
     pub(crate) fn note_host_workspace_mutation(&self) {
         self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
+        self.watcher_generation.fetch_add(1, Ordering::AcqRel);
         self.record_source_change_event(None);
     }
 
@@ -1442,7 +1686,11 @@ fn canonical_workspace_evidence_root(repo_root: &Path) -> PathBuf {
 }
 
 fn path_is_same_or_descendant(path: &Path, ancestor: &Path) -> bool {
-    path_is_same_or_descendant_with_case_sensitivity(path, ancestor, !cfg!(windows))
+    path_is_same_or_descendant_with_case_sensitivity(path, ancestor, false)
+}
+
+fn source_change_path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
 fn path_is_same_or_descendant_with_case_sensitivity(
@@ -1474,31 +1722,36 @@ struct StableMetadataDependencies {
 
 impl StableMetadataDependencies {
     async fn capture(source: &GitWorkspaceMetadataSource) -> Option<Self> {
-        let executable = which::which("git").ok()?;
-        let executable = executable.canonicalize().unwrap_or(executable);
-        let (git_dir, common_dir, head_ref) = resolve_git_dirs(&source.repo_root)?;
-        let mut paths = vec![
-            (executable.clone(), false),
-            (source.repo_root.join(".git").into_path_buf(), true),
-            (git_dir.join("HEAD"), true),
-            (git_dir.join("commondir"), true),
-            (git_dir.join("config.worktree"), true),
-            (common_dir.join("config"), true),
-            (common_dir.join("packed-refs"), true),
-            (common_dir.join("reftable").join("tables.list"), true),
-            (common_dir.join("shallow"), true),
-            (common_dir.join("info").join("grafts"), true),
-            (common_dir.join("refs").join("replace"), false),
-        ];
-        if let Some(head_ref) = head_ref {
-            paths.push((common_dir.join(head_ref), true));
-        }
-        paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        paths.dedup_by(|left, right| left.0 == right.0);
-        let files = paths
-            .into_iter()
-            .map(|(path, hash_contents)| dependency_fingerprint(path, hash_contents))
-            .collect::<Option<Vec<_>>>()?;
+        let repo_root = source.repo_root.clone();
+        let (executable, files) = run_blocking_git_metadata(move || {
+            let executable = which::which("git").ok()?;
+            let executable = executable.canonicalize().unwrap_or(executable);
+            let (git_dir, common_dir, head_ref) = resolve_git_dirs(&repo_root)?;
+            let mut paths = vec![
+                (executable.clone(), false),
+                (repo_root.join(".git").into_path_buf(), true),
+                (git_dir.join("HEAD"), true),
+                (git_dir.join("commondir"), true),
+                (git_dir.join("config.worktree"), true),
+                (common_dir.join("config"), true),
+                (common_dir.join("packed-refs"), true),
+                (common_dir.join("reftable").join("tables.list"), true),
+                (common_dir.join("shallow"), true),
+                (common_dir.join("info").join("grafts"), true),
+                (common_dir.join("refs").join("replace"), false),
+            ];
+            if let Some(head_ref) = head_ref {
+                paths.push((common_dir.join(head_ref), true));
+            }
+            paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            paths.dedup_by(|left, right| left.0 == right.0);
+            let files = paths
+                .into_iter()
+                .map(|(path, hash_contents)| dependency_fingerprint(path, hash_contents))
+                .collect::<Option<Vec<_>>>()?;
+            Some((executable, files))
+        })
+        .await?;
         let config_signature = git_config_signature(&executable, source.cwd.as_path()).await?;
         Some(Self {
             files,
@@ -1506,42 +1759,54 @@ impl StableMetadataDependencies {
         })
     }
 
-    fn capture_project_namespace(source: &GitWorkspaceMetadataSource) -> Option<Self> {
-        let executable = which::which("git").ok()?;
-        let executable = executable.canonicalize().unwrap_or(executable);
-        let git_marker = source.repo_root.join(".git").into_path_buf();
-        let (git_dir, common_dir, head_ref) = resolve_git_dirs(&source.repo_root)?;
-        let mut paths = vec![
-            (executable, false),
-            (git_dir.join("HEAD"), true),
-            (git_dir.join("commondir"), true),
-            (git_dir.join("config.worktree"), true),
-            (common_dir.join("config"), true),
-            (common_dir.join("packed-refs"), true),
-            (common_dir.join("reftable").join("tables.list"), true),
-            (common_dir.join("shallow"), true),
-            (common_dir.join("info").join("grafts"), true),
-            (common_dir.join("refs").join("replace"), false),
-        ];
-        if git_marker.is_file() {
-            paths.push((git_marker, true));
-        }
-        if let Some(head_ref) = head_ref {
-            paths.push((common_dir.join(head_ref), true));
-        }
-        paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        paths.dedup_by(|left, right| left.0 == right.0);
-        let files = paths
-            .into_iter()
-            .map(|(path, hash_contents)| dependency_fingerprint(path, hash_contents))
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self {
-            files,
-            // Namespace dependencies are represented by the repository files above. Avoid a
-            // separate `git config --list` process on every cache lookup.
-            config_signature: [0; 32],
+    async fn capture_project_namespace(source: &GitWorkspaceMetadataSource) -> Option<Self> {
+        let repo_root = source.repo_root.clone();
+        run_blocking_git_metadata(move || {
+            let executable = which::which("git").ok()?;
+            let executable = executable.canonicalize().unwrap_or(executable);
+            let git_marker = repo_root.join(".git").into_path_buf();
+            let (git_dir, common_dir, head_ref) = resolve_git_dirs(&repo_root)?;
+            let mut paths = vec![
+                (executable, false),
+                (git_dir.join("HEAD"), true),
+                (git_dir.join("commondir"), true),
+                (git_dir.join("config.worktree"), true),
+                (common_dir.join("config"), true),
+                (common_dir.join("packed-refs"), true),
+                (common_dir.join("reftable").join("tables.list"), true),
+                (common_dir.join("shallow"), true),
+                (common_dir.join("info").join("grafts"), true),
+                (common_dir.join("refs").join("replace"), false),
+            ];
+            if git_marker.is_file() {
+                paths.push((git_marker, true));
+            }
+            if let Some(head_ref) = head_ref {
+                paths.push((common_dir.join(head_ref), true));
+            }
+            paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            paths.dedup_by(|left, right| left.0 == right.0);
+            let files = paths
+                .into_iter()
+                .map(|(path, hash_contents)| dependency_fingerprint(path, hash_contents))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Self {
+                files,
+                // Namespace dependencies are represented by the repository files above. Avoid a
+                // separate `git config --list` process on every cache lookup.
+                config_signature: [0; 32],
+            })
         })
+        .await
     }
+}
+
+async fn run_blocking_git_metadata<T, F>(capture: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Option<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(capture).await.ok().flatten()
 }
 
 async fn collect_project_namespace(cwd: &Path) -> Option<String> {

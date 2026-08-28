@@ -30,7 +30,7 @@ impl Session {
                     .map(TurnInput::ResponseItem)
                     .collect::<Vec<_>>();
                 self.input_queue
-                    .extend_pending_input_for_turn_state(
+                    .extend_pending_input_for_active_turn_state(
                         active_turn.turn_state.as_ref(),
                         &pending_input,
                     )
@@ -69,6 +69,24 @@ impl Session {
             ));
         }
 
+        let Ok(task_start_permit) = self.task_start_gate.acquire().await else {
+            unreachable!("session-owned task-start semaphore is never closed");
+        };
+        if self.input_queue.has_trigger_turn_mailbox_items().await {
+            drop(task_start_permit);
+            self.maybe_start_turn_for_pending_work().await;
+            return Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
+                input,
+            ));
+        }
+        if self.collaboration_mode().await.mode == ModeKind::Plan {
+            return Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::PlanMode,
+                input,
+            ));
+        }
+
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
             if active_turn.is_some() {
@@ -84,6 +102,7 @@ impl Session {
 
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             self.clear_reserved_idle_turn(&turn_state).await;
+            drop(task_start_permit);
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
@@ -96,6 +115,7 @@ impl Session {
             .await;
         if turn_context.collaboration_mode.mode == ModeKind::Plan {
             self.clear_reserved_idle_turn(&turn_state).await;
+            drop(task_start_permit);
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PlanMode,
@@ -106,6 +126,7 @@ impl Session {
             .await;
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             self.clear_reserved_idle_turn(&turn_state).await;
+            drop(task_start_permit);
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
@@ -143,8 +164,20 @@ impl Session {
                 input,
             ));
         }
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
+        let start_result = self
+            .start_task_with_admission(
+                &task_start_permit,
+                turn_context,
+                Vec::new(),
+                RegularTask::new(),
+            )
             .await;
+        if start_result.is_err() {
+            return Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::Busy,
+                input,
+            ));
+        }
         startup_guard.disarm();
         Ok(())
     }
@@ -171,5 +204,48 @@ impl Session {
             }
         };
         self.record_conversation_items(turn_context, &items).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::InputQueueActivity;
+    use codex_protocol::models::ContentItem;
+
+    fn objective_update_item() -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "The active goal objective was updated.".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_response_item_is_pending_steering_before_subscription() {
+        let (session, _turn_context) = crate::session::tests::make_session_and_context().await;
+        let turn_state = {
+            let mut active_turn = session.active_turn.lock().await;
+            Arc::clone(
+                &active_turn
+                    .get_or_insert_with(ActiveTurn::default)
+                    .turn_state,
+            )
+        };
+
+        session
+            .inject_if_running(vec![objective_update_item()])
+            .await
+            .expect("active-turn injection should succeed");
+
+        let (_activity_rx, pending_activity) = session
+            .input_queue
+            .subscribe_activity(Some(turn_state.as_ref()))
+            .await;
+        assert_eq!(pending_activity, Some(InputQueueActivity::Steer));
     }
 }

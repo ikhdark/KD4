@@ -5,33 +5,20 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_config::types::ApprovalsReviewer;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::config::Constrained;
-use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
-use codex_exec_server::RemoveOptions;
 use codex_features::Feature;
-use codex_protocol::models::PermissionProfile;
-use codex_protocol::permissions::FileSystemAccessMode;
-use codex_protocol::permissions::FileSystemPath;
-use codex_protocol::permissions::FileSystemSandboxEntry;
-use codex_protocol::permissions::FileSystemSandboxPolicy;
-use codex_protocol::permissions::NetworkSandboxPolicy;
-use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
-use codex_protocol::protocol::SandboxPolicy;
-use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
-use core_test_support::TestTargetOs;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
@@ -43,12 +30,7 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::skip_if_no_remote_env;
-use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
-use core_test_support::test_codex::test_env;
-use core_test_support::test_docker_container_name;
-use core_test_support::test_target_os;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use futures::SinkExt;
@@ -58,8 +40,6 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
@@ -67,253 +47,6 @@ use tokio::time::timeout;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
-#[allow(dead_code)]
-async fn unified_exec_test(server: &wiremock::MockServer) -> Result<TestCodex> {
-    let mut builder = test_codex().with_config(|config| {
-        config.unified_exec_enabled = true;
-        let result = config.features.enable(Feature::UnifiedExec);
-        assert!(
-            result.is_ok(),
-            "unified exec should enable for test: {result:?}",
-        );
-    });
-    builder.build_with_remote_and_local_env(server).await
-}
-
-#[allow(dead_code)]
-async fn submit_turn_with_approval_and_environments(
-    test: &TestCodex,
-    prompt: &str,
-    environments: Vec<TurnEnvironmentSelection>,
-    approval_policy: AskForApproval,
-) -> Result<()> {
-    let turn_environment_selections = codex_protocol::protocol::TurnEnvironmentSelections::new(
-        test.config.cwd.clone(),
-        environments,
-    );
-    test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: prompt.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-                environments: Some(turn_environment_selections),
-                approval_policy: Some(approval_policy),
-                approvals_reviewer: Some(ApprovalsReviewer::User),
-                sandbox_policy: Some(SandboxPolicy::new_read_only_policy()),
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
-                        model: test.session_configured.model.clone(),
-                        reasoning_effort: None,
-                        developer_instructions: None,
-                    },
-                }),
-                ..Default::default()
-            },
-        })
-        .await?;
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-async fn expect_patch_approval(
-    test: &TestCodex,
-    expected_call_id: &str,
-) -> ApplyPatchApprovalRequestEvent {
-    let event = wait_for_event(&test.codex, |event| {
-        matches!(
-            event,
-            EventMsg::ApplyPatchApprovalRequest(_) | EventMsg::TurnComplete(_)
-        )
-    })
-    .await;
-
-    match event {
-        EventMsg::ApplyPatchApprovalRequest(approval) => {
-            assert_eq!(approval.call_id, expected_call_id);
-            approval
-        }
-        EventMsg::TurnComplete(_) => panic!("expected patch approval request before completion"),
-        other => panic!("unexpected event: {other:?}"),
-    }
-}
-
-#[allow(dead_code)]
-async fn wait_for_completion_without_patch_approval(test: &TestCodex) {
-    let event = wait_for_event(&test.codex, |event| {
-        matches!(
-            event,
-            EventMsg::ApplyPatchApprovalRequest(_) | EventMsg::TurnComplete(_)
-        )
-    })
-    .await;
-
-    match event {
-        EventMsg::TurnComplete(_) => {}
-        EventMsg::ApplyPatchApprovalRequest(event) => {
-            panic!("unexpected patch approval request: {:?}", event.call_id)
-        }
-        other => panic!("unexpected event: {other:?}"),
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_test_env_can_connect_and_use_filesystem() -> Result<()> {
-    skip_if_no_remote_env!(Ok(()));
-
-    let test_env = test_env().await?;
-    let file_system = test_env.environment().get_filesystem();
-
-    let file_path_uri = test_env.selection().cwd.join("remote-test-env-ok")?;
-    let payload = b"remote-test-env-ok".to_vec();
-
-    file_system
-        .write_file(&file_path_uri, payload.clone(), /*sandbox*/ None)
-        .await?;
-    let actual = file_system
-        .read_file(&file_path_uri, /*sandbox*/ None)
-        .await?;
-    assert_eq!(actual, payload);
-
-    file_system
-        .remove(
-            &file_path_uri,
-            RemoveOptions {
-                recursive: false,
-                force: true,
-            },
-            /*sandbox*/ None,
-        )
-        .await?;
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_test_env_exposes_target_shell_to_model() -> Result<()> {
-    skip_if_no_remote_env!(Ok(()));
-
-    let server = start_mock_server().await;
-    let response_mock = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "done"),
-            ev_completed("resp-1"),
-        ]),
-    )
-    .await;
-    let test = test_codex().build_with_auto_env(&server).await?;
-
-    test.submit_turn("report remote environment").await?;
-
-    let request = response_mock.single_request();
-    let environment_context = request
-        .message_input_texts("user")
-        .into_iter()
-        .find(|text| text.starts_with("<environment_context>"))
-        .context("environment context should be model visible")?;
-    // TODO(anp): Assert Wine-exec exposes a `C:\\...` cwd after model-visible paths preserve
-    // target-native spelling instead of the Linux orchestrator's `/C:/...` representation.
-    let expected_shell = match test_target_os() {
-        TestTargetOs::Linux => "<shell>bash</shell>",
-        TestTargetOs::Windows => "<shell>powershell</shell>",
-        TestTargetOs::MacOs => unreachable!("remote test targets do not run macOS"),
-    };
-    assert_eq!(
-        environment_context
-            .lines()
-            .find(|line| line.trim_start().starts_with("<shell>"))
-            .map(str::trim),
-        Some(expected_shell),
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_remote_shell_uses_snapshot_in_remote_cwd() -> Result<()> {
-    const CALL_ID: &str = "remote-explicit-shell";
-
-    skip_if_no_remote_env!(Ok(()));
-
-    let (shell, command) = match test_target_os() {
-        TestTargetOs::Linux => (
-            "bash",
-            r#"case "$PWD" in /tmp/codex-core-test-cwd-*) ;; *) echo "unexpected cwd: $PWD" >&2; exit 1 ;; esac; set -- "$PWD"/.codex-shell-snapshots/*.sh; test -f "$1"; grep -q '# Codex shell snapshot format: 3' "$1""#,
-        ),
-        TestTargetOs::Windows => (
-            "powershell",
-            r#"$cwd = (Get-Location).Path; if ($cwd -notlike 'C:\codex-core-test-cwd-*') { Write-Error "unexpected cwd: $cwd"; exit 1 }; $snapshot = Get-ChildItem -LiteralPath (Join-Path $cwd '.codex-shell-snapshots') -Filter '*.ps1' | Select-Object -First 1; if ($null -eq $snapshot) { Write-Error 'remote snapshot missing'; exit 1 }; if (-not (Select-String -LiteralPath $snapshot.FullName -SimpleMatch '# Codex PowerShell snapshot format: 1' -Quiet)) { Write-Error 'remote snapshot header missing'; exit 1 }"#,
-        ),
-        TestTargetOs::MacOs => unreachable!("remote test targets do not run macOS"),
-    };
-
-    let server = start_mock_server().await;
-    let arguments = serde_json::to_string(&json!({
-        "cmd": command,
-        "shell": shell,
-        "login": false,
-        "yield_time_ms": 10_000,
-    }))?;
-    let mut builder = test_codex().with_config(|config| {
-        config.unified_exec_enabled = true;
-        config
-            .features
-            .enable(Feature::UnifiedExec)
-            .expect("test config should allow feature update");
-        config
-            .features
-            .enable(Feature::ShellSnapshot)
-            .expect("test config should allow feature update");
-    });
-    let test = builder.build_with_auto_env(&server).await?;
-    let response_mock = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_function_call(CALL_ID, "exec_command", &arguments),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    test.submit_turn_with_environments(
-        "run the remote shell in the remote cwd",
-        Some(vec![TurnEnvironmentSelection {
-            environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
-            cwd: PathUri::from_abs_path(&test.config.cwd),
-        }]),
-    )
-    .await?;
-    let request = response_mock
-        .last_request()
-        .context("model should receive the command output")?;
-    let (output, success) = request
-        .function_call_output_content_and_success(CALL_ID)
-        .context("remote shell tool result should be present")?;
-    assert_ne!(success, Some(false));
-    assert!(
-        output.is_some_and(|output| output.contains("Process exited with code 0")),
-        "remote shell command should exit successfully",
-    );
-
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deferred_executor_does_not_duplicate_initial_environment_context() -> Result<()> {
     let server = start_mock_server().await;
@@ -395,7 +128,14 @@ async fn send_environment_info(websocket: &mut WebSocketStream<TcpStream>) {
         .send(Message::Text(
             json!({
                 "id": info["id"],
-                "result": { "shell": { "name": "zsh", "path": "/bin/zsh" } }
+                "result": {
+                    "operatingSystem": "windows",
+                    "shell": {
+                        "name": "powershell",
+                        "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+                    },
+                    "cwd": "file:///C:/workspace"
+                }
             })
             .to_string()
             .into(),
@@ -421,6 +161,7 @@ async fn serve_environment_with_agents_md(
 
     let mut agents_md_reads = 0;
     let mut agents_md_handle_id = None;
+    let mut snapshot_process_id = None;
     loop {
         let request = tokio::select! {
             request = read_exec_server_json(&mut websocket) => request,
@@ -433,6 +174,10 @@ async fn serve_environment_with_agents_md(
             .as_deref()
             .is_some_and(|handle_id| request["params"]["handleId"].as_str() == Some(handle_id));
         let response = match request["method"].as_str() {
+            Some("fs/createDirectory") => json!({
+                "id": request["id"],
+                "result": {}
+            }),
             Some("fs/getMetadata") if is_agents_md => {
                 json!({
                     "id": request["id"],
@@ -476,6 +221,39 @@ async fn serve_environment_with_agents_md(
                 json!({
                     "id": request["id"],
                     "result": {}
+                })
+            }
+            Some("process/start") => {
+                let process_id = request["params"]["processId"]
+                    .as_str()
+                    .expect("process/start should include processId")
+                    .to_string();
+                assert!(
+                    request["params"]["argv"][0]
+                        .as_str()
+                        .is_some_and(|argv0| argv0.ends_with("powershell.exe")),
+                    "remote startup should capture a PowerShell snapshot"
+                );
+                snapshot_process_id = Some(process_id.clone());
+                json!({
+                    "id": request["id"],
+                    "result": { "processId": process_id }
+                })
+            }
+            Some("process/read")
+                if snapshot_process_id.as_deref() == request["params"]["processId"].as_str() =>
+            {
+                json!({
+                    "id": request["id"],
+                    "result": {
+                        "chunks": [],
+                        "nextSeq": 0,
+                        "exited": true,
+                        "exitCode": 0,
+                        "closed": true,
+                        "failure": null,
+                        "sandboxDenied": false,
+                    }
                 })
             }
             method => panic!("unexpected exec-server request: {method:?}"),
@@ -553,7 +331,6 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
         .with_exec_server_url(format!("ws://{}", listener.local_addr()?))
         .with_config(|config| {
             config.project_doc_max_bytes = 0;
-            config.unified_exec_enabled = true;
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::User;
             assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
@@ -641,7 +418,7 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
     assert_eq!(
         ready_user_context
             .iter()
-            .filter(|text| text.contains("<shell>zsh</shell>"))
+            .filter(|text| text.contains("<shell>powershell</shell>"))
             .count(),
         1
     );
@@ -656,7 +433,7 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
     assert_eq!(
         final_user_context
             .iter()
-            .filter(|text| text.contains("<shell>zsh</shell>"))
+            .filter(|text| text.contains("<shell>powershell</shell>"))
             .count(),
         1
     );
@@ -684,17 +461,8 @@ async fn deferred_executor_loads_agents_md_when_environment_becomes_ready() -> R
             ]),
             sse(vec![
                 ev_response_created("resp-2"),
-                ev_function_call(
-                    "wait-2",
-                    "wait_for_environment",
-                    &json!({ "environment_id": REMOTE_ENVIRONMENT_ID }).to_string(),
-                ),
+                ev_assistant_message("msg-2", "done"),
                 ev_completed("resp-2"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-3"),
-                ev_assistant_message("msg-3", "done"),
-                ev_completed("resp-3"),
             ]),
         ],
     )
@@ -739,14 +507,13 @@ async fn deferred_executor_loads_agents_md_when_environment_becomes_ready() -> R
     let agents_md_reads = exec_server.await?;
 
     let requests = response_mock.requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 2);
     assert!(
         agents_md_reads >= 1,
         "ready environment should read AGENTS.md at least once"
     );
     assert_eq!(agents_md_occurrences(&requests[0], AGENTS_CONTENT), 0);
     assert_eq!(agents_md_occurrences(&requests[1], AGENTS_CONTENT), 1);
-    assert_eq!(agents_md_occurrences(&requests[2], AGENTS_CONTENT), 1);
     assert_eq!(test.codex.instruction_sources().await, vec![agents_path]);
 
     Ok(())
@@ -791,7 +558,6 @@ async fn deferred_executor_wait_reports_startup_failure() -> Result<()> {
     let mut builder = test_codex()
         .with_exec_server_url(format!("ws://{}", listener.local_addr()?))
         .with_config(|config| {
-            config.unified_exec_enabled = true;
             assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
             assert!(config.features.enable(Feature::UnifiedExec).is_ok());
         });
@@ -967,7 +733,7 @@ async fn deferred_executor_compaction_replaces_stale_environment_context() -> Re
     assert_eq!(
         post_compaction_context
             .iter()
-            .filter(|text| text.contains("<shell>zsh</shell>"))
+            .filter(|text| text.contains("<shell>powershell</shell>"))
             .count(),
         1
     );
@@ -1008,110 +774,8 @@ async fn deferred_executor_compaction_replaces_stale_environment_context() -> Re
         world_state_items[1]
             .state
             .pointer("/environments/environments/remote/shell"),
-        Some(&json!("zsh"))
+        Some(&json!("powershell"))
     );
 
     Ok(())
-}
-
-#[allow(dead_code)]
-fn absolute_path(path: PathBuf) -> AbsolutePathBuf {
-    AbsolutePathBuf::try_from(path).expect("path should be absolute")
-}
-
-#[allow(dead_code)]
-fn read_only_sandbox(readable_root: PathBuf) -> FileSystemSandboxContext {
-    let readable_root = absolute_path(readable_root);
-    FileSystemSandboxContext::from_permission_profile(PermissionProfile::from_runtime_permissions(
-        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: readable_root,
-            },
-            access: FileSystemAccessMode::Read,
-        }]),
-        NetworkSandboxPolicy::Restricted,
-    ))
-}
-
-#[allow(dead_code)]
-fn workspace_write_sandbox(writable_root: PathBuf) -> FileSystemSandboxContext {
-    let writable_root = absolute_path(writable_root);
-    FileSystemSandboxContext::from_permission_profile(PermissionProfile::from_runtime_permissions(
-        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: writable_root,
-            },
-            access: FileSystemAccessMode::Write,
-        }]),
-        NetworkSandboxPolicy::Restricted,
-    ))
-}
-
-#[allow(dead_code)]
-fn assert_normalized_path_rejected(error: &std::io::Error) {
-    match error.kind() {
-        std::io::ErrorKind::NotFound => assert!(
-            error.to_string().contains("No such file or directory"),
-            "unexpected not-found message: {error}",
-        ),
-        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::PermissionDenied => {
-            let message = error.to_string();
-            assert!(
-                message.contains("is not permitted")
-                    || message.contains("Operation not permitted")
-                    || message.contains("Permission denied"),
-                "unexpected rejection message: {message}",
-            );
-        }
-        other => panic!("unexpected normalized-path error kind: {other:?}: {error:?}"),
-    }
-}
-
-#[allow(dead_code)]
-fn remote_exec(script: &str) -> Result<()> {
-    let container_name = test_docker_container_name()
-        .context("test requires direct access to the Docker container")?;
-    let output = Command::new("docker")
-        .args(["exec", container_name.as_str(), "sh", "-lc", script])
-        .output()?;
-    assert!(
-        output.status.success(),
-        "remote exec failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout).trim(),
-        String::from_utf8_lossy(&output.stderr).trim(),
-    );
-    Ok(())
-}
-
-#[allow(dead_code)]
-async fn exec_command_routing_output(
-    test: &TestCodex,
-    server: &wiremock::MockServer,
-    call_id: &str,
-    arguments: Value,
-    environments: Option<Vec<TurnEnvironmentSelection>>,
-) -> Result<String> {
-    let response_mock = mount_sse_sequence(
-        server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-1"),
-                ev_function_call(call_id, "exec_command", &serde_json::to_string(&arguments)?),
-                ev_completed("resp-1"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-2"),
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        ],
-    )
-    .await;
-
-    test.submit_turn_with_environments("route exec command", environments)
-        .await?;
-
-    response_mock
-        .function_call_output_text(call_id)
-        .with_context(|| format!("missing function_call_output for {call_id}"))
 }

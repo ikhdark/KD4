@@ -179,6 +179,7 @@ impl TurnCodexErrorFact {
 pub enum CodexErrKind {
     TurnAborted,
     Stream,
+    PreDispatchRetryExhausted,
     ContextWindowExceeded,
     ThreadNotFound,
     AgentLimitReached,
@@ -230,6 +231,7 @@ impl From<&CodexErr> for CodexErrKind {
         match error {
             CodexErr::TurnAborted => CodexErrKind::TurnAborted,
             CodexErr::Stream(..) => CodexErrKind::Stream,
+            CodexErr::PreDispatchRetryExhausted(_) => CodexErrKind::PreDispatchRetryExhausted,
             CodexErr::ContextWindowExceeded => CodexErrKind::ContextWindowExceeded,
             CodexErr::ThreadNotFound(_) => CodexErrKind::ThreadNotFound,
             CodexErr::AgentLimitReached { .. } => CodexErrKind::AgentLimitReached,
@@ -240,7 +242,9 @@ impl From<&CodexErr> for CodexErrKind {
             CodexErr::RequestTimeout => CodexErrKind::RequestTimeout,
             CodexErr::Spawn => CodexErrKind::Spawn,
             CodexErr::Interrupted => CodexErrKind::Interrupted,
-            CodexErr::UnexpectedStatus(_) => CodexErrKind::UnexpectedStatus,
+            CodexErr::UnexpectedStatus(_) | CodexErr::RegionRestricted(_) => {
+                CodexErrKind::UnexpectedStatus
+            }
             CodexErr::InvalidRequest(_) => CodexErrKind::InvalidRequest,
             CodexErr::InvalidImageRequest() => CodexErrKind::InvalidImageRequest,
             CodexErr::UsageLimitReached(_) => CodexErrKind::UsageLimitReached,
@@ -639,8 +643,42 @@ pub(crate) enum PluginState {
 
 #[cfg(test)]
 mod tests {
+    use super::CodexErrKind;
     use super::CompactionStrategy;
+    use codex_protocol::error::CodexErr;
+    use codex_protocol::error::UnexpectedResponseError;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn pre_dispatch_retry_exhausted_has_distinct_analytics_kind() {
+        let kind = CodexErrKind::from(&CodexErr::PreDispatchRetryExhausted(
+            "connection reset".to_string(),
+        ));
+
+        assert_eq!(
+            serde_json::to_value(kind).expect("serialize error kind"),
+            serde_json::json!("pre_dispatch_retry_exhausted")
+        );
+    }
+
+    #[test]
+    fn region_restriction_keeps_unexpected_status_analytics_kind() {
+        let kind = CodexErrKind::from(&CodexErr::RegionRestricted(UnexpectedResponseError {
+            status: "403".parse().expect("valid status"),
+            body: String::new(),
+            user_message: None,
+            url: None,
+            cf_ray: None,
+            request_id: None,
+            identity_authorization_error: None,
+            identity_error_code: None,
+        }));
+
+        assert_eq!(
+            serde_json::to_value(kind).expect("serialize error kind"),
+            serde_json::json!("unexpected_status")
+        );
+    }
 
     #[test]
     fn compaction_strategy_has_only_memento_variant() {

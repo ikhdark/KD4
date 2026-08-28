@@ -2,6 +2,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use codex_api::AgentIdentityTelemetry;
@@ -47,6 +48,14 @@ pub(crate) struct OpenAiModelsEndpoint {
     provider_info: ModelProviderInfo,
     auth_manager: Option<Arc<AuthManager>>,
     transport_builder: Arc<dyn ModelsTransportBuilder>,
+    transport_cache: Mutex<Option<CachedModelsTransport>>,
+}
+
+#[derive(Debug)]
+struct CachedModelsTransport {
+    http_client_factory: HttpClientFactory,
+    request_url: String,
+    transport: ReqwestTransport,
 }
 
 impl OpenAiModelsEndpoint {
@@ -58,6 +67,7 @@ impl OpenAiModelsEndpoint {
             provider_info,
             auth_manager,
             transport_builder: Arc::new(RouteAwareModelsTransportBuilder),
+            transport_cache: Mutex::new(None),
         }
     }
 
@@ -120,8 +130,7 @@ impl OpenAiModelsEndpoint {
         });
         timeout(MODELS_REFRESH_TIMEOUT, async {
             let transport = self
-                .transport_builder
-                .build(http_client_factory, request_url.clone())
+                .transport_for(http_client_factory, request_url.clone())
                 .await?;
             let client = ModelsClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry));
@@ -145,6 +154,46 @@ impl OpenAiModelsEndpoint {
         })
         .await
         .map_err(|_| CodexErr::Timeout)?
+    }
+
+    async fn transport_for(
+        &self,
+        http_client_factory: HttpClientFactory,
+        request_url: String,
+    ) -> std::io::Result<ReqwestTransport> {
+        {
+            let cache = self
+                .transport_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = cache.as_ref()
+                && cached.http_client_factory == http_client_factory
+                && cached.request_url == request_url
+            {
+                return Ok(cached.transport.clone());
+            }
+        }
+
+        let transport = self
+            .transport_builder
+            .build(http_client_factory.clone(), request_url.clone())
+            .await?;
+        let mut cache = self
+            .transport_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cache.as_ref()
+            && cached.http_client_factory == http_client_factory
+            && cached.request_url == request_url
+        {
+            return Ok(cached.transport.clone());
+        }
+        *cache = Some(CachedModelsTransport {
+            http_client_factory,
+            request_url,
+            transport: transport.clone(),
+        });
+        Ok(transport)
     }
 
     fn auth_env(&self) -> AuthEnvTelemetry {
@@ -326,6 +375,8 @@ impl RequestTelemetry for ModelsRequestTelemetry {
 mod tests {
     use std::num::NonZeroU64;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use super::*;
     use codex_http_client::OutboundProxyPolicy;
@@ -344,6 +395,7 @@ mod tests {
     #[derive(Debug)]
     struct RecordingTransportBuilder {
         observed_request: Arc<Mutex<Option<(OutboundProxyPolicy, String)>>>,
+        build_count: Arc<AtomicUsize>,
     }
 
     impl ModelsTransportBuilder for RecordingTransportBuilder {
@@ -353,7 +405,9 @@ mod tests {
             request_url: String,
         ) -> ModelsTransportFuture<'_> {
             let observed_request = Arc::clone(&self.observed_request);
+            let build_count = Arc::clone(&self.build_count);
             Box::pin(async move {
+                build_count.fetch_add(1, Ordering::SeqCst);
                 *observed_request
                     .lock()
                     .expect("observed request lock should not be poisoned") =
@@ -421,7 +475,9 @@ mod tests {
             auth_manager: None,
             transport_builder: Arc::new(RecordingTransportBuilder {
                 observed_request: Arc::clone(&observed_request),
+                build_count: Arc::new(AtomicUsize::new(0)),
             }),
+            transport_cache: Mutex::new(None),
         };
 
         endpoint
@@ -444,6 +500,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_requests_reuse_transport_for_same_factory_and_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param("client_version", "0.0.0"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ModelsResponse { models: Vec::new() }),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let endpoint = OpenAiModelsEndpoint {
+            provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
+            auth_manager: None,
+            transport_builder: Arc::new(RecordingTransportBuilder {
+                observed_request: Arc::new(Mutex::new(None)),
+                build_count: Arc::clone(&build_count),
+            }),
+            transport_cache: Mutex::new(None),
+        };
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+
+        endpoint
+            .list_models("0.0.0", factory.clone())
+            .await
+            .expect("first models request should succeed");
+        endpoint
+            .list_models("0.0.0", factory)
+            .await
+            .expect("second models request should succeed");
+
+        assert_eq!(build_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn model_transport_cache_is_keyed_by_factory_and_exact_url() {
+        let build_count = Arc::new(AtomicUsize::new(0));
+        let endpoint = OpenAiModelsEndpoint {
+            provider_info: ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+            auth_manager: None,
+            transport_builder: Arc::new(RecordingTransportBuilder {
+                observed_request: Arc::new(Mutex::new(None)),
+                build_count: Arc::clone(&build_count),
+            }),
+            transport_cache: Mutex::new(None),
+        };
+        let default_factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+
+        endpoint
+            .transport_for(
+                default_factory.clone(),
+                "https://example.com/models?a=1".to_string(),
+            )
+            .await
+            .expect("first transport should build");
+        endpoint
+            .transport_for(
+                default_factory.clone(),
+                "https://example.com/models?a=1".to_string(),
+            )
+            .await
+            .expect("identical route should reuse the transport");
+        endpoint
+            .transport_for(
+                HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+                "https://example.com/models?a=1".to_string(),
+            )
+            .await
+            .expect("changed policy should rebuild the transport");
+        endpoint
+            .transport_for(
+                default_factory,
+                "https://example.com/models?a=2".to_string(),
+            )
+            .await
+            .expect("changed URL should rebuild the transport");
+
+        assert_eq!(build_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
     async fn conditional_model_request_sends_etag_and_accepts_not_modified() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -459,6 +598,7 @@ mod tests {
             provider_info: ModelProviderInfo::create_openai_provider(Some(server.uri())),
             auth_manager: None,
             transport_builder: Arc::new(RouteAwareModelsTransportBuilder),
+            transport_cache: Mutex::new(None),
         };
 
         let result = endpoint

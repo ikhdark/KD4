@@ -35,12 +35,15 @@
 //! - those subprocess tests also scrub inherited CA environment variables before launch so their
 //!   result depends only on the test fixtures and env vars set by the test itself
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 
 use codex_utils_der::first_der_item;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
@@ -50,6 +53,8 @@ use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::pem::SectionKind;
 use rustls_pki_types::pem::{self};
+use sha2::Digest;
+use sha2::Sha256;
 use thiserror::Error;
 use tracing::info;
 use tracing::warn;
@@ -58,6 +63,64 @@ pub const CODEX_CA_CERT_ENV: &str = "CODEX_CA_CERTIFICATE";
 pub const SSL_CERT_FILE_ENV: &str = "SSL_CERT_FILE";
 const CA_CERT_HINT: &str = "If you set CODEX_CA_CERTIFICATE or SSL_CERT_FILE, ensure it points to a PEM file containing one or more CERTIFICATE blocks, or unset it to use system roots.";
 type PemSection = (SectionKind, Vec<u8>);
+
+static NATIVE_ROOT_STORE: LazyLock<RootCertStore> = LazyLock::new(|| {
+    let mut root_store = RootCertStore::empty();
+    let rustls_native_certs::CertificateResult { certs, errors, .. } =
+        rustls_native_certs::load_native_certs();
+    if !errors.is_empty() {
+        warn!(
+            native_root_error_count = errors.len(),
+            "encountered errors while loading native root certificates"
+        );
+    }
+    let _ = root_store.add_parsable_certificates(certs);
+    root_store
+});
+static RUSTLS_CLIENT_CONFIGS: LazyLock<Mutex<HashMap<CaBundleCacheKey, Arc<ClientConfig>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static REQWEST_CA_CERTIFICATES: LazyLock<
+    Mutex<HashMap<CaBundleCacheKey, Arc<Vec<reqwest::Certificate>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CaBundleCacheKey {
+    source_env: Option<&'static str>,
+    path: Option<PathBuf>,
+    pem_sha256: Option<[u8; 32]>,
+}
+
+impl CaBundleCacheKey {
+    fn new(bundle: Option<&ConfiguredCaBundle>, pem_data: Option<&[u8]>) -> Self {
+        Self {
+            source_env: bundle.map(|bundle| bundle.source_env),
+            path: bundle.map(|bundle| bundle.path.clone()),
+            pem_sha256: pem_data.map(|pem_data| Sha256::digest(pem_data).into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CustomCaPolicy {
+    HonorProcessEnvironment,
+    ExplicitRootSet,
+}
+static DEFAULT_RUSTLS_CLIENT_CONFIG: LazyLock<Arc<ClientConfig>> = LazyLock::new(|| {
+    ensure_rustls_crypto_provider();
+    Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(native_root_store().clone())
+            .with_no_client_auth(),
+    )
+});
+
+fn native_root_store() -> &'static RootCertStore {
+    &NATIVE_ROOT_STORE
+}
+
+fn default_rustls_client_config() -> Arc<ClientConfig> {
+    Arc::clone(&DEFAULT_RUSTLS_CLIENT_CONFIG)
+}
 
 /// Describes why a transport using shared custom CA support could not be constructed.
 ///
@@ -125,6 +188,10 @@ pub enum BuildCustomCaTransportError {
     #[error("Failed to build HTTP client while using system root certificates: {0}")]
     BuildClientWithSystemRoots(#[source] reqwest::Error),
 
+    /// Reqwest rejected the final client configuration while using caller-supplied roots.
+    #[error("Failed to build HTTP client while using the explicit root certificate set: {0}")]
+    BuildClientWithExplicitRoots(#[source] reqwest::Error),
+
     /// One parsed certificate block could not be registered with the websocket TLS root store.
     #[error(
         "Failed to register certificate #{certificate_index} from {} selected by {} in rustls root store: {source}. {hint}",
@@ -152,7 +219,10 @@ impl From<BuildCustomCaTransportError> for io::Error {
                 io::Error::new(io::ErrorKind::InvalidData, error)
             }
             BuildCustomCaTransportError::BuildClientWithCustomCa { .. }
-            | BuildCustomCaTransportError::BuildClientWithSystemRoots(_) => io::Error::other(error),
+            | BuildCustomCaTransportError::BuildClientWithSystemRoots(_)
+            | BuildCustomCaTransportError::BuildClientWithExplicitRoots(_) => {
+                io::Error::other(error)
+            }
         }
     }
 }
@@ -178,6 +248,13 @@ pub fn build_reqwest_client_with_custom_ca(
     build_reqwest_client_with_env(&ProcessEnv, builder)
 }
 
+pub(crate) fn build_reqwest_client_with_custom_ca_policy(
+    builder: reqwest::ClientBuilder,
+    custom_ca_policy: CustomCaPolicy,
+) -> Result<reqwest::Client, BuildCustomCaTransportError> {
+    build_reqwest_client_with_env_and_policy(&ProcessEnv, builder, custom_ca_policy)
+}
+
 /// Builds a blocking reqwest client that honors Codex custom CA environment variables.
 ///
 /// This is the blocking sibling of [`build_reqwest_client_with_custom_ca`]. Callers supply their
@@ -187,6 +264,13 @@ pub fn build_blocking_reqwest_client_with_custom_ca(
     builder: reqwest::blocking::ClientBuilder,
 ) -> Result<reqwest::blocking::Client, BuildCustomCaTransportError> {
     build_blocking_reqwest_client_with_env(&ProcessEnv, builder)
+}
+
+pub(crate) fn build_blocking_reqwest_client_with_custom_ca_policy(
+    builder: reqwest::blocking::ClientBuilder,
+    custom_ca_policy: CustomCaPolicy,
+) -> Result<reqwest::blocking::Client, BuildCustomCaTransportError> {
+    build_blocking_reqwest_client_with_env_and_policy(&ProcessEnv, builder, custom_ca_policy)
 }
 
 /// Builds a rustls client config when a Codex custom CA bundle is configured.
@@ -202,7 +286,10 @@ pub fn build_blocking_reqwest_client_with_custom_ca(
 /// enterprise root CA bundle as HTTPS traffic.
 pub fn maybe_build_rustls_client_config_with_custom_ca()
 -> Result<Option<Arc<ClientConfig>>, BuildCustomCaTransportError> {
-    maybe_build_rustls_client_config_with_env(&ProcessEnv)
+    let Some(bundle) = ProcessEnv.configured_ca_bundle() else {
+        return Ok(None);
+    };
+    cached_rustls_client_config(Some(&bundle)).map(Some)
 }
 
 /// Builds a rustls client config using native roots and any configured Codex custom CA bundle.
@@ -212,7 +299,8 @@ pub fn maybe_build_rustls_client_config_with_custom_ca()
 /// transport library.
 pub fn build_rustls_client_config_with_custom_ca()
 -> Result<Arc<ClientConfig>, BuildCustomCaTransportError> {
-    build_rustls_client_config_with_env(&ProcessEnv)
+    let bundle = ProcessEnv.configured_ca_bundle();
+    cached_rustls_client_config(bundle.as_ref())
 }
 
 /// Builds a reqwest client for spawned subprocess tests that exercise CA behavior.
@@ -229,6 +317,7 @@ pub fn build_reqwest_client_for_subprocess_tests(
     build_reqwest_client_with_env(&ProcessEnv, builder.no_proxy())
 }
 
+#[cfg(test)]
 fn maybe_build_rustls_client_config_with_env(
     env_source: &dyn EnvSource,
 ) -> Result<Option<Arc<ClientConfig>>, BuildCustomCaTransportError> {
@@ -239,50 +328,110 @@ fn maybe_build_rustls_client_config_with_env(
     build_rustls_client_config(Some(&bundle)).map(Some)
 }
 
-fn build_rustls_client_config_with_env(
-    env_source: &dyn EnvSource,
-) -> Result<Arc<ClientConfig>, BuildCustomCaTransportError> {
-    let bundle = env_source.configured_ca_bundle();
-    build_rustls_client_config(bundle.as_ref())
-}
-
-fn build_rustls_client_config(
+fn cached_rustls_client_config(
     bundle: Option<&ConfiguredCaBundle>,
 ) -> Result<Arc<ClientConfig>, BuildCustomCaTransportError> {
-    ensure_rustls_crypto_provider();
-
-    // Start from the platform roots so websocket callers keep the same baseline trust behavior
-    // they would get from tungstenite's default rustls connector, then layer in the Codex custom
-    // CA bundle on top when configured.
-    let mut root_store = RootCertStore::empty();
-    let rustls_native_certs::CertificateResult { certs, errors, .. } =
-        rustls_native_certs::load_native_certs();
-    if !errors.is_empty() {
-        warn!(
-            native_root_error_count = errors.len(),
-            "encountered errors while loading native root certificates"
-        );
+    let pem_data = bundle.map(ConfiguredCaBundle::read_pem_data).transpose()?;
+    let key = CaBundleCacheKey::new(bundle, pem_data.as_deref());
+    let mut configs = RUSTLS_CLIENT_CONFIGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(config) = configs.get(&key) {
+        return Ok(config.clone());
     }
-    let _ = root_store.add_parsable_certificates(certs);
 
-    if let Some(bundle) = bundle {
-        let certificates = bundle.load_certificates()?;
-        for (idx, cert) in certificates.into_iter().enumerate() {
-            if let Err(source) = root_store.add(cert) {
+    let config = build_rustls_client_config_from_pem_data(bundle, pem_data.as_deref())?;
+    configs.retain(|cached_key, _| cached_key.source_env != key.source_env);
+    configs.insert(key, config.clone());
+    Ok(config)
+}
+
+fn cached_reqwest_certificates(
+    bundle: &ConfiguredCaBundle,
+) -> Result<Arc<Vec<reqwest::Certificate>>, BuildCustomCaTransportError> {
+    let pem_data = bundle.read_pem_data()?;
+    let key = CaBundleCacheKey::new(Some(bundle), Some(&pem_data));
+    let mut cached = REQWEST_CA_CERTIFICATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(certificates) = cached.get(&key) {
+        return Ok(certificates.clone());
+    }
+
+    let certificates = bundle
+        .load_certificates_from_pem_data(&pem_data)?
+        .into_iter()
+        .enumerate()
+        .map(|(idx, cert)| {
+            reqwest::Certificate::from_der(cert.as_ref()).map_err(|source| {
                 warn!(
                     source_env = bundle.source_env,
                     ca_path = %bundle.path.display(),
                     certificate_index = idx + 1,
                     error = %source,
-                    "failed to register CA certificate in rustls root store"
+                    "failed to register CA certificate"
                 );
-                return Err(BuildCustomCaTransportError::RegisterRustlsCertificate {
+                BuildCustomCaTransportError::RegisterCertificate {
                     source_env: bundle.source_env,
                     path: bundle.path.clone(),
                     certificate_index: idx + 1,
                     source,
-                });
-            }
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let certificates = Arc::new(certificates);
+    cached.retain(|cached_key, _| cached_key.source_env != key.source_env);
+    cached.insert(key, certificates.clone());
+    Ok(certificates)
+}
+
+#[cfg(test)]
+fn build_rustls_client_config(
+    bundle: Option<&ConfiguredCaBundle>,
+) -> Result<Arc<ClientConfig>, BuildCustomCaTransportError> {
+    let pem_data = bundle.map(ConfiguredCaBundle::read_pem_data).transpose()?;
+    build_rustls_client_config_from_pem_data(bundle, pem_data.as_deref())
+}
+
+fn build_rustls_client_config_from_pem_data(
+    bundle: Option<&ConfiguredCaBundle>,
+    pem_data: Option<&[u8]>,
+) -> Result<Arc<ClientConfig>, BuildCustomCaTransportError> {
+    let Some(bundle) = bundle else {
+        return Ok(default_rustls_client_config());
+    };
+    let Some(pem_data) = pem_data else {
+        return Err(BuildCustomCaTransportError::InvalidCaFile {
+            source_env: bundle.source_env,
+            path: bundle.path.clone(),
+            detail: "configured CA bundle PEM data was not loaded".to_string(),
+        });
+    };
+
+    ensure_rustls_crypto_provider();
+
+    // Start from the platform roots so websocket callers keep the same baseline trust behavior
+    // they would get from tungstenite's default rustls connector, then layer in the Codex custom
+    // CA bundle on top when configured.
+    let mut root_store = native_root_store().clone();
+
+    let certificates = bundle.load_certificates_from_pem_data(pem_data)?;
+    for (idx, cert) in certificates.into_iter().enumerate() {
+        if let Err(source) = root_store.add(cert) {
+            warn!(
+                source_env = bundle.source_env,
+                ca_path = %bundle.path.display(),
+                certificate_index = idx + 1,
+                error = %source,
+                "failed to register CA certificate in rustls root store"
+            );
+            return Err(BuildCustomCaTransportError::RegisterRustlsCertificate {
+                source_env: bundle.source_env,
+                path: bundle.path.clone(),
+                certificate_index: idx + 1,
+                source,
+            });
         }
     }
 
@@ -297,14 +446,29 @@ fn build_rustls_client_config(
 ///
 /// This exists so tests can exercise precedence behavior deterministically without mutating the
 /// real process environment. It selects the CA bundle, delegates file parsing to
-/// [`ConfiguredCaBundle::load_certificates`], preserves the caller's chosen `reqwest` builder
+/// the shared content-keyed certificate cache, preserves the caller's chosen `reqwest` builder
 /// configuration, forces rustls when a custom CA is configured, and finally registers each parsed
 /// certificate with that builder.
 fn build_reqwest_client_with_env(
     env_source: &dyn EnvSource,
-    mut builder: reqwest::ClientBuilder,
+    builder: reqwest::ClientBuilder,
 ) -> Result<reqwest::Client, BuildCustomCaTransportError> {
-    if let Some(bundle) = env_source.configured_ca_bundle() {
+    build_reqwest_client_with_env_and_policy(
+        env_source,
+        builder,
+        CustomCaPolicy::HonorProcessEnvironment,
+    )
+}
+
+fn build_reqwest_client_with_env_and_policy(
+    env_source: &dyn EnvSource,
+    mut builder: reqwest::ClientBuilder,
+    custom_ca_policy: CustomCaPolicy,
+) -> Result<reqwest::Client, BuildCustomCaTransportError> {
+    if let Some(bundle) = matches!(custom_ca_policy, CustomCaPolicy::HonorProcessEnvironment)
+        .then(|| env_source.configured_ca_bundle())
+        .flatten()
+    {
         ensure_rustls_crypto_provider();
         info!(
             source_env = bundle.source_env,
@@ -313,27 +477,8 @@ fn build_reqwest_client_with_env(
         );
         builder = builder.use_rustls_tls();
 
-        let certificates = bundle.load_certificates()?;
-
-        for (idx, cert) in certificates.iter().enumerate() {
-            let certificate = match reqwest::Certificate::from_der(cert.as_ref()) {
-                Ok(certificate) => certificate,
-                Err(source) => {
-                    warn!(
-                        source_env = bundle.source_env,
-                        ca_path = %bundle.path.display(),
-                        certificate_index = idx + 1,
-                        error = %source,
-                        "failed to register CA certificate"
-                    );
-                    return Err(BuildCustomCaTransportError::RegisterCertificate {
-                        source_env: bundle.source_env,
-                        path: bundle.path.clone(),
-                        certificate_index: idx + 1,
-                        source,
-                    });
-                }
-            };
+        let certificates = cached_reqwest_certificates(&bundle)?;
+        for certificate in certificates.iter().cloned() {
             builder = builder.add_root_certificate(certificate);
         }
         return match builder.build() {
@@ -354,31 +499,62 @@ fn build_reqwest_client_with_env(
         };
     }
 
-    info!(
-        codex_ca_certificate_configured = false,
-        ssl_cert_file_configured = false,
-        "using system root certificates because no CA override environment variable was selected"
-    );
+    match custom_ca_policy {
+        CustomCaPolicy::HonorProcessEnvironment => info!(
+            codex_ca_certificate_configured = false,
+            ssl_cert_file_configured = false,
+            "using system root certificates because no CA override environment variable was selected"
+        ),
+        CustomCaPolicy::ExplicitRootSet => info!(
+            "using the caller's explicit root certificate set without process custom CA augmentation"
+        ),
+    }
 
     match builder.build() {
         Ok(client) => Ok(client),
-        Err(source) => {
-            warn!(
-                error = %source,
-                "failed to build client while using system root certificates"
-            );
-            Err(BuildCustomCaTransportError::BuildClientWithSystemRoots(
-                source,
-            ))
-        }
+        Err(source) => match custom_ca_policy {
+            CustomCaPolicy::HonorProcessEnvironment => {
+                warn!(
+                    error = %source,
+                    "failed to build client while using system root certificates"
+                );
+                Err(BuildCustomCaTransportError::BuildClientWithSystemRoots(
+                    source,
+                ))
+            }
+            CustomCaPolicy::ExplicitRootSet => {
+                warn!(
+                    error = %source,
+                    "failed to build client while using the explicit root certificate set"
+                );
+                Err(BuildCustomCaTransportError::BuildClientWithExplicitRoots(
+                    source,
+                ))
+            }
+        },
     }
 }
 
 fn build_blocking_reqwest_client_with_env(
     env_source: &dyn EnvSource,
-    mut builder: reqwest::blocking::ClientBuilder,
+    builder: reqwest::blocking::ClientBuilder,
 ) -> Result<reqwest::blocking::Client, BuildCustomCaTransportError> {
-    if let Some(bundle) = env_source.configured_ca_bundle() {
+    build_blocking_reqwest_client_with_env_and_policy(
+        env_source,
+        builder,
+        CustomCaPolicy::HonorProcessEnvironment,
+    )
+}
+
+fn build_blocking_reqwest_client_with_env_and_policy(
+    env_source: &dyn EnvSource,
+    mut builder: reqwest::blocking::ClientBuilder,
+    custom_ca_policy: CustomCaPolicy,
+) -> Result<reqwest::blocking::Client, BuildCustomCaTransportError> {
+    if let Some(bundle) = matches!(custom_ca_policy, CustomCaPolicy::HonorProcessEnvironment)
+        .then(|| env_source.configured_ca_bundle())
+        .flatten()
+    {
         ensure_rustls_crypto_provider();
         info!(
             source_env = bundle.source_env,
@@ -387,26 +563,8 @@ fn build_blocking_reqwest_client_with_env(
         );
         builder = builder.use_rustls_tls();
 
-        let certificates = bundle.load_certificates()?;
-        for (idx, cert) in certificates.iter().enumerate() {
-            let certificate = match reqwest::Certificate::from_der(cert.as_ref()) {
-                Ok(certificate) => certificate,
-                Err(source) => {
-                    warn!(
-                        source_env = bundle.source_env,
-                        ca_path = %bundle.path.display(),
-                        certificate_index = idx + 1,
-                        error = %source,
-                        "failed to register CA certificate"
-                    );
-                    return Err(BuildCustomCaTransportError::RegisterCertificate {
-                        source_env: bundle.source_env,
-                        path: bundle.path.clone(),
-                        certificate_index: idx + 1,
-                        source,
-                    });
-                }
-            };
+        let certificates = cached_reqwest_certificates(&bundle)?;
+        for certificate in certificates.iter().cloned() {
             builder = builder.add_root_certificate(certificate);
         }
 
@@ -425,17 +583,31 @@ fn build_blocking_reqwest_client_with_env(
         });
     }
 
-    info!(
-        codex_ca_certificate_configured = false,
-        ssl_cert_file_configured = false,
-        "using system root certificates because no CA override environment variable was selected"
-    );
-    builder.build().map_err(|source| {
-        warn!(
-            error = %source,
-            "failed to build blocking client while using system root certificates"
-        );
-        BuildCustomCaTransportError::BuildClientWithSystemRoots(source)
+    match custom_ca_policy {
+        CustomCaPolicy::HonorProcessEnvironment => info!(
+            codex_ca_certificate_configured = false,
+            ssl_cert_file_configured = false,
+            "using system root certificates because no CA override environment variable was selected"
+        ),
+        CustomCaPolicy::ExplicitRootSet => info!(
+            "using the caller's explicit root certificate set without process custom CA augmentation"
+        ),
+    }
+    builder.build().map_err(|source| match custom_ca_policy {
+        CustomCaPolicy::HonorProcessEnvironment => {
+            warn!(
+                error = %source,
+                "failed to build blocking client while using system root certificates"
+            );
+            BuildCustomCaTransportError::BuildClientWithSystemRoots(source)
+        }
+        CustomCaPolicy::ExplicitRootSet => {
+            warn!(
+                error = %source,
+                "failed to build blocking client while using the explicit root certificate set"
+            );
+            BuildCustomCaTransportError::BuildClientWithExplicitRoots(source)
+        }
     })
 }
 
@@ -508,16 +680,11 @@ struct ConfiguredCaBundle {
 }
 
 impl ConfiguredCaBundle {
-    /// Loads certificates from this selected CA bundle.
-    ///
-    /// The bundle already represents the output of environment-precedence selection, so this is
-    /// the natural point where the file-loading phase begins. The method owns the high-level
-    /// success/failure logs for that phase and keeps the source env and path together for lower-
-    /// level parsing and error shaping.
-    fn load_certificates(
+    fn load_certificates_from_pem_data(
         &self,
+        pem_data: &[u8],
     ) -> Result<Vec<CertificateDer<'static>>, BuildCustomCaTransportError> {
-        match self.parse_certificates() {
+        match self.parse_certificates(pem_data) {
             Ok(certificates) => {
                 info!(
                     source_env = self.source_env,
@@ -547,9 +714,9 @@ impl ConfiguredCaBundle {
     /// section iterator to classify them.
     fn parse_certificates(
         &self,
+        pem_data: &[u8],
     ) -> Result<Vec<CertificateDer<'static>>, BuildCustomCaTransportError> {
-        let pem_data = self.read_pem_data()?;
-        let normalized_pem = NormalizedPem::from_pem_data(self.source_env, &self.path, &pem_data);
+        let normalized_pem = NormalizedPem::from_pem_data(self.source_env, &self.path, pem_data);
 
         let mut certificates = Vec::new();
         let mut logged_crl_presence = false;
@@ -721,17 +888,30 @@ impl NormalizedPem {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::fs::FileTimes;
+    use std::fs::OpenOptions;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
     use super::BuildCustomCaTransportError;
     use super::CODEX_CA_CERT_ENV;
+    use super::CaBundleCacheKey;
+    use super::ConfiguredCaBundle;
+    use super::CustomCaPolicy;
     use super::EnvSource;
+    use super::RUSTLS_CLIENT_CONFIGS;
     use super::SSL_CERT_FILE_ENV;
     use super::build_blocking_reqwest_client_with_env;
+    use super::build_blocking_reqwest_client_with_env_and_policy;
+    use super::build_reqwest_client_with_env_and_policy;
+    use super::build_rustls_client_config;
+    use super::cached_reqwest_certificates;
+    use super::cached_rustls_client_config;
     use super::maybe_build_rustls_client_config_with_env;
+    use super::native_root_store;
 
     const TEST_CERT: &str = include_str!("../tests/fixtures/test-ca.pem");
 
@@ -812,6 +992,120 @@ mod tests {
     }
 
     #[test]
+    fn rustls_native_root_store_is_reused() {
+        let first = native_root_store();
+        let second = native_root_store();
+
+        assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
+    fn rustls_client_config_is_reused_for_same_ca_state() {
+        let first = cached_rustls_client_config(None).expect("build first rustls config");
+        let second = cached_rustls_client_config(None).expect("reuse rustls config");
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn rustls_client_config_cache_detects_same_metadata_ca_rotation() {
+        const ROTATION_TEST_SOURCE: &str = "CODEX_CA_CERTIFICATE_ROTATION_TEST";
+        let temp_dir = TempDir::new().expect("tempdir");
+        let first_pem = format!("# rotation A\n{TEST_CERT}");
+        let second_pem = format!("# rotation B\n{TEST_CERT}");
+        assert_eq!(first_pem.len(), second_pem.len());
+        let cert_path = write_cert_file(&temp_dir, "rotating-ca.pem", &first_pem);
+        let original_metadata = fs::metadata(&cert_path).expect("first CA metadata");
+        let original_modified = original_metadata.modified().expect("first CA mtime");
+        let bundle = ConfiguredCaBundle {
+            source_env: ROTATION_TEST_SOURCE,
+            path: cert_path.clone(),
+        };
+
+        let first = cached_rustls_client_config(Some(&bundle)).expect("first rustls config");
+        let first_key = CaBundleCacheKey::new(Some(&bundle), Some(first_pem.as_bytes()));
+        fs::write(&cert_path, second_pem).expect("rotate CA contents");
+        OpenOptions::new()
+            .write(true)
+            .open(&cert_path)
+            .expect("open rotated CA")
+            .set_times(FileTimes::new().set_modified(original_modified))
+            .expect("restore CA mtime");
+        let rotated_metadata = fs::metadata(&cert_path).expect("rotated CA metadata");
+        assert_eq!(rotated_metadata.len(), original_metadata.len());
+        assert_eq!(
+            rotated_metadata.modified().expect("rotated CA mtime"),
+            original_modified
+        );
+
+        let second = cached_rustls_client_config(Some(&bundle)).expect("rotated rustls config");
+        let reused = cached_rustls_client_config(Some(&bundle)).expect("reused rustls config");
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&second, &reused));
+        let configs = RUSTLS_CLIENT_CONFIGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!configs.contains_key(&first_key));
+        assert_eq!(
+            configs
+                .keys()
+                .filter(|key| key.source_env == Some(ROTATION_TEST_SOURCE))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reqwest_certificate_cache_reuses_content_and_detects_same_metadata_rotation() {
+        const ROTATION_TEST_SOURCE: &str = "CODEX_REQWEST_CA_CERTIFICATE_ROTATION_TEST";
+        let temp_dir = TempDir::new().expect("tempdir");
+        let first_pem = format!("# rotation A\n{TEST_CERT}");
+        let second_pem = format!("# rotation B\n{TEST_CERT}");
+        assert_eq!(first_pem.len(), second_pem.len());
+        let cert_path = write_cert_file(&temp_dir, "rotating-reqwest-ca.pem", &first_pem);
+        let original_metadata = fs::metadata(&cert_path).expect("first CA metadata");
+        let original_modified = original_metadata.modified().expect("first CA mtime");
+        let bundle = ConfiguredCaBundle {
+            source_env: ROTATION_TEST_SOURCE,
+            path: cert_path.clone(),
+        };
+
+        let first = cached_reqwest_certificates(&bundle).expect("first parsed certificates");
+        let reused = cached_reqwest_certificates(&bundle).expect("reused parsed certificates");
+        assert!(Arc::ptr_eq(&first, &reused));
+
+        fs::write(&cert_path, second_pem).expect("rotate CA contents");
+        OpenOptions::new()
+            .write(true)
+            .open(&cert_path)
+            .expect("open rotated CA")
+            .set_times(FileTimes::new().set_modified(original_modified))
+            .expect("restore CA mtime");
+        let rotated_metadata = fs::metadata(&cert_path).expect("rotated CA metadata");
+        assert_eq!(rotated_metadata.len(), original_metadata.len());
+        assert_eq!(
+            rotated_metadata.modified().expect("rotated CA mtime"),
+            original_modified
+        );
+
+        let rotated = cached_reqwest_certificates(&bundle).expect("rotated parsed certificates");
+        assert!(!Arc::ptr_eq(&first, &rotated));
+        assert!(Arc::ptr_eq(
+            &rotated,
+            &cached_reqwest_certificates(&bundle).expect("reused rotated certificates")
+        ));
+    }
+
+    #[test]
+    fn default_rustls_client_config_is_reused() {
+        let first = build_rustls_client_config(None).expect("first default rustls config");
+        let second = build_rustls_client_config(None).expect("second default rustls config");
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn rustls_config_reports_invalid_ca_file() {
         let temp_dir = TempDir::new().expect("tempdir");
         let cert_path = write_cert_file(&temp_dir, "empty.pem", "");
@@ -841,5 +1135,39 @@ mod tests {
             error,
             BuildCustomCaTransportError::InvalidCaFile { .. }
         ));
+    }
+
+    #[test]
+    fn explicit_async_roots_ignore_process_custom_ca_file() {
+        let env = map_env(&[(CODEX_CA_CERT_ENV, "missing-process-ca.pem")]);
+        let certificate = reqwest::Certificate::from_pem(TEST_CERT.as_bytes())
+            .expect("valid explicit CA certificate");
+
+        let client = build_reqwest_client_with_env_and_policy(
+            &env,
+            reqwest::Client::builder()
+                .no_proxy()
+                .tls_certs_only(vec![certificate]),
+            CustomCaPolicy::ExplicitRootSet,
+        );
+
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn explicit_blocking_roots_ignore_process_custom_ca_file() {
+        let env = map_env(&[(CODEX_CA_CERT_ENV, "missing-process-ca.pem")]);
+        let certificate = reqwest::Certificate::from_pem(TEST_CERT.as_bytes())
+            .expect("valid explicit CA certificate");
+
+        let client = build_blocking_reqwest_client_with_env_and_policy(
+            &env,
+            reqwest::blocking::Client::builder()
+                .no_proxy()
+                .tls_certs_only(vec![certificate]),
+            CustomCaPolicy::ExplicitRootSet,
+        );
+
+        assert!(client.is_ok());
     }
 }

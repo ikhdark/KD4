@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CapSids {
@@ -30,6 +32,19 @@ pub struct CapSids {
     /// later workspace sandboxes.
     #[serde(default)]
     pub writable_root_by_path: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct CachedCapSids {
+    caps: CapSids,
+    #[cfg(test)]
+    disk_load_count: usize,
+}
+
+static CAP_SIDS_CACHE: OnceLock<Mutex<HashMap<String, CachedCapSids>>> = OnceLock::new();
+
+fn cap_sids_cache() -> &'static Mutex<HashMap<String, CachedCapSids>> {
+    CAP_SIDS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn cap_sid_file(codex_home: &Path) -> PathBuf {
@@ -54,7 +69,7 @@ fn persist_caps(path: &Path, caps: &CapSids) -> Result<()> {
     Ok(())
 }
 
-pub fn load_or_create_cap_sids(codex_home: &Path) -> Result<CapSids> {
+fn load_or_create_cap_sids_from_disk(codex_home: &Path) -> Result<CapSids> {
     let path = cap_sid_file(codex_home);
     if path.exists() {
         let txt = fs::read_to_string(&path)
@@ -85,6 +100,39 @@ pub fn load_or_create_cap_sids(codex_home: &Path) -> Result<CapSids> {
     Ok(caps)
 }
 
+fn cached_cap_sids<'a>(
+    codex_home: &Path,
+    cache: &'a mut HashMap<String, CachedCapSids>,
+) -> Result<&'a mut CachedCapSids> {
+    let key = canonical_path_key(&cap_sid_file(codex_home));
+    if !cache.contains_key(&key) {
+        let caps = load_or_create_cap_sids_from_disk(codex_home)?;
+        cache.insert(
+            key.clone(),
+            CachedCapSids {
+                caps,
+                #[cfg(test)]
+                disk_load_count: 1,
+            },
+        );
+    }
+    cache
+        .get_mut(&key)
+        .ok_or_else(|| anyhow::anyhow!("capability SID cache insertion failed"))
+}
+
+/// Loads the process-stable capability SID set once per Codex home.
+///
+/// The file is mutated only through the helpers in this module, which update the
+/// cached value while holding the same lock. This avoids reopening and parsing
+/// the SID file for every sandboxed command without changing SID persistence.
+pub fn load_or_create_cap_sids(codex_home: &Path) -> Result<CapSids> {
+    let mut cache = cap_sids_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(cached_cap_sids(codex_home, &mut cache)?.caps.clone())
+}
+
 /// Returns the workspace-specific capability SID for `cwd`, creating and persisting it if missing.
 pub fn workspace_cap_sid_for_cwd(codex_home: &Path, cwd: &Path) -> Result<String> {
     workspace_cap_sid_for_key(codex_home, canonical_path_key(cwd))
@@ -92,13 +140,16 @@ pub fn workspace_cap_sid_for_cwd(codex_home: &Path, cwd: &Path) -> Result<String
 
 fn workspace_cap_sid_for_key(codex_home: &Path, key: String) -> Result<String> {
     let path = cap_sid_file(codex_home);
-    let mut caps = load_or_create_cap_sids(codex_home)?;
-    if let Some(sid) = caps.workspace_by_cwd.get(&key) {
+    let mut cache = cap_sids_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cached = cached_cap_sids(codex_home, &mut cache)?;
+    if let Some(sid) = cached.caps.workspace_by_cwd.get(&key) {
         return Ok(sid.clone());
     }
     let sid = make_random_cap_sid_string();
-    caps.workspace_by_cwd.insert(key, sid.clone());
-    persist_caps(&path, &caps)?;
+    cached.caps.workspace_by_cwd.insert(key, sid.clone());
+    persist_caps(&path, &cached.caps)?;
     Ok(sid)
 }
 
@@ -110,14 +161,27 @@ pub fn writable_root_cap_sid_for_path(codex_home: &Path, root: &Path) -> Result<
 
 fn writable_root_cap_sid_for_key(codex_home: &Path, key: String) -> Result<String> {
     let path = cap_sid_file(codex_home);
-    let mut caps = load_or_create_cap_sids(codex_home)?;
-    if let Some(sid) = caps.writable_root_by_path.get(&key) {
+    let mut cache = cap_sids_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cached = cached_cap_sids(codex_home, &mut cache)?;
+    if let Some(sid) = cached.caps.writable_root_by_path.get(&key) {
         return Ok(sid.clone());
     }
     let sid = make_random_cap_sid_string();
-    caps.writable_root_by_path.insert(key, sid.clone());
-    persist_caps(&path, &caps)?;
+    cached.caps.writable_root_by_path.insert(key, sid.clone());
+    persist_caps(&path, &cached.caps)?;
     Ok(sid)
+}
+
+#[cfg(test)]
+fn cap_sid_disk_load_count(codex_home: &Path) -> usize {
+    let key = canonical_path_key(&cap_sid_file(codex_home));
+    cap_sids_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .map_or(0, |cached| cached.disk_load_count)
 }
 
 pub fn workspace_write_cap_sid_for_root(
@@ -158,6 +222,7 @@ pub fn workspace_write_root_specificity(root: &Path) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::cap_sid_disk_load_count;
     use super::load_or_create_cap_sids;
     use super::make_random_cap_sid_string;
     use super::workspace_cap_sid_for_cwd;
@@ -166,6 +231,19 @@ mod tests {
     use super::writable_root_cap_sid_for_path;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    #[test]
+    fn repeated_cap_sid_loads_reuse_the_process_cache() {
+        let home = TempDir::new().expect("temp dir");
+
+        let first = load_or_create_cap_sids(home.path()).expect("first cap SID load");
+        let second = load_or_create_cap_sids(home.path()).expect("cached cap SID load");
+
+        assert_eq!(first.workspace, second.workspace);
+        assert_eq!(first.readonly, second.readonly);
+        assert_eq!(cap_sid_disk_load_count(home.path()), 1);
+    }
 
     #[test]
     fn generated_cap_sid_matches_windows_capability_shape() {

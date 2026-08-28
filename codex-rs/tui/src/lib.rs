@@ -735,6 +735,27 @@ fn should_load_configured_environments(
     !loader_overrides.ignore_user_config && !app_server_target.uses_remote_workspace()
 }
 
+async fn create_environment_manager_for_target(
+    codex_home: &Path,
+    local_runtime_paths: ExecServerRuntimePaths,
+    loader_overrides: &LoaderOverrides,
+    app_server_target: &AppServerTarget,
+) -> std::io::Result<Arc<EnvironmentManager>> {
+    if app_server_target.uses_remote_workspace() {
+        return Ok(Arc::new(EnvironmentManager::without_environments()));
+    }
+
+    let environment_manager =
+        if should_load_configured_environments(loader_overrides, app_server_target) {
+            EnvironmentManager::from_codex_home(codex_home.to_path_buf(), Some(local_runtime_paths))
+                .await
+        } else {
+            EnvironmentManager::from_env(Some(local_runtime_paths)).await
+        }
+        .map_err(std::io::Error::other)?;
+    Ok(Arc::new(environment_manager))
+}
+
 fn latest_session_cwd_filter<'a>(
     uses_remote_workspace: bool,
     remote_cwd_override: Option<&'a Path>,
@@ -874,14 +895,13 @@ pub async fn run_main(
 
     let local_runtime_paths =
         ExecServerRuntimePaths::from_optional_path(arg0_paths.codex_self_exe.clone())?;
-    let environment_manager =
-        if should_load_configured_environments(&loader_overrides, &app_server_target) {
-            EnvironmentManager::from_codex_home(codex_home.clone(), Some(local_runtime_paths)).await
-        } else {
-            EnvironmentManager::from_env(Some(local_runtime_paths)).await
-        }
-        .map(Arc::new)
-        .map_err(std::io::Error::other)?;
+    let environment_manager = create_environment_manager_for_target(
+        &codex_home,
+        local_runtime_paths,
+        &loader_overrides,
+        &app_server_target,
+    )
+    .await?;
     let cwd = cli.cwd.clone();
     let config_cwd =
         config_cwd_for_app_server_target(cwd.as_deref(), &app_server_target, &environment_manager)?;
@@ -1015,6 +1035,40 @@ pub async fn run_main(
     )
     .await;
 
+    set_default_client_residency_requirement(config.enforce_residency.value());
+
+    if let Some(warning) = add_dir_warning_message(
+        &cli.add_dir,
+        &config.permissions.effective_permission_profile(),
+        config.cwd.as_path(),
+    ) {
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!("Error adding directories: {warning}");
+            std::process::exit(1);
+        }
+    }
+
+    if !app_server_target.uses_remote_workspace() {
+        let auth_route_config = config.auth_route_config();
+        #[allow(clippy::print_stderr)]
+        if let Err(err) = enforce_login_restrictions(&AuthConfig {
+            codex_home: config.codex_home.to_path_buf(),
+            auth_credentials_store_mode: config.cli_auth_credentials_store_mode,
+            keyring_backend_kind: config.auth_keyring_backend_kind(),
+            forced_login_method: config.forced_login_method,
+            forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id.clone(),
+            managed_auth_policy: Default::default(),
+            chatgpt_base_url: Some(config.chatgpt_base_url.clone()),
+            auth_route_config,
+        })
+        .await
+        {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    }
+
     remove_legacy_tui_log_file(config.codex_home.as_path());
 
     let otel_originator = originator().value;
@@ -1055,40 +1109,6 @@ pub async fn run_main(
         .effective_config()
         .as_table()
         .is_some_and(|table| table.contains_key("log_dir"));
-
-    set_default_client_residency_requirement(config.enforce_residency.value());
-
-    if let Some(warning) = add_dir_warning_message(
-        &cli.add_dir,
-        &config.permissions.effective_permission_profile(),
-        config.cwd.as_path(),
-    ) {
-        #[allow(clippy::print_stderr)]
-        {
-            eprintln!("Error adding directories: {warning}");
-            std::process::exit(1);
-        }
-    }
-
-    if !app_server_target.uses_remote_workspace() {
-        let auth_route_config = config.auth_route_config();
-        #[allow(clippy::print_stderr)]
-        if let Err(err) = enforce_login_restrictions(&AuthConfig {
-            codex_home: config.codex_home.to_path_buf(),
-            auth_credentials_store_mode: config.cli_auth_credentials_store_mode,
-            keyring_backend_kind: config.auth_keyring_backend_kind(),
-            forced_login_method: config.forced_login_method,
-            forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id.clone(),
-            managed_auth_policy: Default::default(),
-            chatgpt_base_url: Some(config.chatgpt_base_url.clone()),
-            auth_route_config,
-        })
-        .await
-        {
-            eprintln!("{err}");
-            std::process::exit(1);
-        }
-    }
 
     let (tui_file_layer, _tui_file_log_guard) = if config_toml_log_dir_configured {
         let log_dir = config.log_dir.clone();
@@ -1215,7 +1235,6 @@ async fn run_ratatui_app(
     let mut tui = Tui::new(
         initialized_terminal.terminal,
         initialized_terminal.enhanced_keys_supported,
-        initialized_terminal.stderr_guard,
     );
     let mut terminal_restore_guard = TerminalRestoreGuard::new();
 
@@ -2305,6 +2324,29 @@ mod tests {
             &LoaderOverrides::default(),
             &target,
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_remote_target_does_not_create_a_legacy_environment() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let target = AppServerTarget::Remote {
+            endpoint: RemoteAppServerEndpoint::UnixSocket {
+                socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
+            },
+        };
+        let runtime_paths = ExecServerRuntimePaths::new(std::env::current_exe()?)?;
+
+        let environment_manager = create_environment_manager_for_target(
+            codex_home.path(),
+            runtime_paths,
+            &LoaderOverrides::default(),
+            &target,
+        )
+        .await?;
+
+        assert_eq!(environment_manager.default_environment_id(), None);
+        assert!(environment_manager.default_environment_ids().is_empty());
         Ok(())
     }
 

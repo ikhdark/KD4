@@ -14,6 +14,12 @@ pub struct AcceptedLineFingerprintSummary {
     pub line_fingerprints: Vec<AcceptedLineFingerprint>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AcceptedLineCounts {
+    pub(crate) accepted_added_lines: u64,
+    pub(crate) accepted_deleted_lines: u64,
+}
+
 pub(crate) struct AcceptedLineFingerprintEventInput {
     pub(crate) event_type: &'static str,
     pub(crate) turn_id: String,
@@ -24,7 +30,29 @@ pub(crate) struct AcceptedLineFingerprintEventInput {
     pub(crate) repo_hash: Option<String>,
     pub(crate) accepted_added_lines: u64,
     pub(crate) accepted_deleted_lines: u64,
-    pub(crate) line_fingerprints: Vec<AcceptedLineFingerprint>,
+}
+
+pub(crate) fn accepted_line_counts_from_unified_diff(unified_diff: &str) -> AcceptedLineCounts {
+    let mut in_hunk = false;
+    let mut accepted_added_lines = 0;
+    let mut accepted_deleted_lines = 0;
+
+    for line in unified_diff.lines() {
+        if line.starts_with("diff --git ") {
+            in_hunk = false;
+        } else if line.starts_with("@@ ") {
+            in_hunk = true;
+        } else if in_hunk && line.starts_with('+') {
+            accepted_added_lines += 1;
+        } else if in_hunk && line.starts_with('-') {
+            accepted_deleted_lines += 1;
+        }
+    }
+
+    AcceptedLineCounts {
+        accepted_added_lines,
+        accepted_deleted_lines,
+    }
 }
 
 pub fn accepted_line_fingerprints_from_unified_diff(
@@ -104,7 +132,6 @@ pub(crate) fn accepted_line_fingerprint_event_requests(
         repo_hash,
         accepted_added_lines,
         accepted_deleted_lines,
-        line_fingerprints: _line_fingerprints,
     } = input;
 
     vec![TrackEventRequest::AcceptedLineFingerprints(Box::new(
@@ -120,8 +147,6 @@ pub(crate) fn accepted_line_fingerprint_event_requests(
                 repo_hash,
                 accepted_added_lines,
                 accepted_deleted_lines,
-                // Keep computing local fingerprints for parsing tests and future attribution,
-                // but do not upload path/line hashes in the analytics event payload.
                 line_fingerprints: Vec::new(),
             },
         },
@@ -204,6 +229,28 @@ index 1111111..2222222
                         line_hash: fingerprint_hash("line", "return user.id;"),
                     },
                 ],
+            }
+        );
+    }
+
+    #[test]
+    fn counts_only_parser_ignores_headers_and_counts_hunk_changes() {
+        let diff = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,3 @@
+-old
++new
++another
+ context
+";
+
+        assert_eq!(
+            accepted_line_counts_from_unified_diff(diff),
+            AcceptedLineCounts {
+                accepted_added_lines: 2,
+                accepted_deleted_lines: 1,
             }
         );
     }

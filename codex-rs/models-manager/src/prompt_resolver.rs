@@ -67,8 +67,8 @@ pub(crate) fn resolve_prompt<'a>(
     ResolvedPrompt {
         id: PromptId::ProtocolDefault,
         source: PromptSource::ProtocolDefault,
-        normalization: PromptNormalization::Preserve,
-        content: codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT,
+        normalization: PromptNormalization::Trim,
+        content: codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim(),
         clears_instruction_template: false,
     }
 }
@@ -132,15 +132,15 @@ mod tests {
     }
 
     #[test]
-    fn resolver_uses_untrimmed_protocol_default_for_fallback() {
+    fn resolver_trims_protocol_default_for_fallback() {
         let resolved = resolve_prompt("unknown-model", None);
 
         assert_eq!(resolved.id, PromptId::ProtocolDefault);
         assert_eq!(resolved.source, PromptSource::ProtocolDefault);
-        assert_eq!(resolved.normalization, PromptNormalization::Preserve);
+        assert_eq!(resolved.normalization, PromptNormalization::Trim);
         assert_eq!(
             resolved.content,
-            codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT
+            codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
         );
     }
 

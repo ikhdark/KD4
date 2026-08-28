@@ -287,6 +287,40 @@ fn ignores_rg_metadata_modes_and_option_values_as_search_paths() {
 }
 
 #[test]
+fn confirmed_performance_non_rg_commands_skip_search_path_normalization() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    crate::tools::handlers::command_search::reset_search_path_normalization_count();
+
+    assert_eq!(
+        classify_rg_search_narrowing(&strings(&["git", "status", "--short"]), None, root, root,),
+        Ok(None)
+    );
+    assert_eq!(
+        crate::tools::handlers::command_search::search_path_normalization_count(),
+        0
+    );
+
+    let repository_root = root
+        .parent()
+        .and_then(Path::parent)
+        .expect("codex-core is nested under the repository root");
+    crate::tools::handlers::command_search::reset_search_path_normalization_count();
+    classify_rg_search_narrowing(
+        &strings(&["rg", "needle", "codex-rs/core/src/tools"]),
+        None,
+        repository_root,
+        repository_root,
+    )
+    .expect("search classification")
+    .expect("rg search");
+    assert_eq!(
+        crate::tools::handlers::command_search::search_path_normalization_count(),
+        2,
+        "the repository root and target should each be normalized once"
+    );
+}
+
+#[test]
 fn repairs_direct_argv_git_status_to_disable_optional_locks() {
     let invocation = CommandInvocation::Argv {
         program: "git".to_string(),
@@ -597,6 +631,19 @@ fn rejects_powershell_shape_in_posix_script() {
 }
 
 #[test]
+fn powershell_shell_mismatch_help_is_windows_only() {
+    let issue = preflight_command_issue(
+        &strings(&["pwsh", "-NoProfile", "-Command", "export CODEX_ENV=windows"]),
+        Some(ShellType::PowerShell),
+    )
+    .expect_err("POSIX syntax in PowerShell should be rejected");
+
+    let rendered = issue.render_for_model();
+    assert!(rendered.contains("rewrite the command for PowerShell"));
+    assert!(!rendered.contains("select a POSIX shell"), "{rendered}");
+}
+
+#[test]
 fn rejects_unbalanced_quotes_in_shell_script() {
     let issue = preflight_command_issue(
         &strings(&["/bin/bash", "-lc", "rg 'TODO src"]),
@@ -665,7 +712,7 @@ fn rejects_powershell_cmdlets_under_cmd() {
 }
 
 #[test]
-fn literal_path_lint_matches_path_parameter_colon_form() {
+fn literal_path_lint_windows_only_help_matches_path_parameter_colon_form() {
     let issue = lint_windows_path_shape(
         r"Get-ChildItem -Path:C:\repo\[name]",
         Some(ShellType::PowerShell),
@@ -677,7 +724,10 @@ fn literal_path_lint_matches_path_parameter_colon_form() {
         issue.code,
         CommandPreflightIssueCode::WindowsLiteralPathRequired
     );
-    assert!(issue.render_for_model().contains("-LiteralPath"));
+    let rendered = issue.render_for_model();
+    assert!(rendered.contains("-LiteralPath"));
+    assert!(rendered.contains("cmd quoting example"));
+    assert!(!rendered.contains("POSIX"), "{rendered}");
 }
 
 #[test]
@@ -705,7 +755,6 @@ fn renders_shell_path_literals() {
         ]
     );
     assert_eq!(cmd_quoted_path(path), r#""C:\A B\[x]\it's.txt""#);
-    assert_eq!(posix_single_quoted(path), r#"'C:\A B\[x]\it'"'"'s.txt'"#);
 }
 
 #[test]
@@ -724,4 +773,46 @@ fn render_truncates_rejected_command_on_char_boundary() {
 
     assert!(rendered.contains("..."));
     assert!(rendered.contains("test detail"));
+}
+
+#[test]
+fn preflight_preserves_each_plain_pipeline_stage_for_validation() {
+    let script = "cargo test | Select-Object -First 1";
+    let invocation = CommandInvocation::PowerShellScript(script.to_string());
+    let outcome = preflight_invocation_with_equivalent_repair(
+        &invocation,
+        &strings(&["pwsh", "-NoProfile", "-Command", script]),
+        Some(ShellType::PowerShell),
+    )
+    .expect("the deterministic pipeline should pass preflight");
+
+    assert_eq!(
+        outcome.validation_invocations,
+        vec![
+            CommandInvocation::Argv {
+                program: "cargo".to_string(),
+                args: vec!["test".to_string()],
+            },
+            CommandInvocation::Argv {
+                program: "Select-Object".to_string(),
+                args: vec!["-First".to_string(), "1".to_string()],
+            },
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_command_analysis_does_not_stall_the_async_runtime() {
+    let analysis = crate::tools::run_blocking_command_analysis(|| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        42
+    });
+    tokio::pin!(analysis);
+
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        result = &mut analysis => panic!("blocking analysis completed on the runtime thread: {result:?}"),
+    }
+
+    assert_eq!(analysis.await.expect("blocking worker"), 42);
 }

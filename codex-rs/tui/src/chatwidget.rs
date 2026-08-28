@@ -97,6 +97,7 @@ use codex_app_server_protocol::McpServerStatusDetail;
 use codex_app_server_protocol::ModelVerification as AppServerModelVerification;
 use codex_app_server_protocol::RateLimitReachedType;
 use codex_app_server_protocol::RateLimitSnapshot;
+use codex_app_server_protocol::ReasoningPolicySnapshot;
 use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
@@ -151,7 +152,6 @@ use codex_protocol::plan_tool::StepStatus as UpdatePlanItemStatus;
 use codex_protocol::request_permissions::RequestPermissionsEvent;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
-use codex_terminal_detection::Multiplexer;
 use codex_terminal_detection::TerminalInfo;
 use codex_terminal_detection::TerminalName;
 use codex_terminal_detection::terminal_info;
@@ -202,33 +202,17 @@ const TUI_STUB_MESSAGE: &str = "Not available in TUI yet.";
 
 /// Choose the keybinding used to edit the most-recently queued message.
 ///
-/// Apple Terminal, Warp, and VSCode integrated terminals intercept or silently
-/// swallow Alt+Up, and tmux does not reliably pass that chord through. We fall
-/// back to Shift+Left for those environments while keeping the more discoverable
-/// Alt+Up everywhere else.
+/// Warp and VSCode integrated terminals intercept or silently swallow Alt+Up. We
+/// fall back to Shift+Left for those environments while keeping the more
+/// discoverable Alt+Up everywhere else.
 ///
 /// The match is exhaustive so that adding a new `TerminalName` variant forces
 /// an explicit decision about which binding that terminal should use.
 fn queued_message_edit_binding_for_terminal(terminal_info: TerminalInfo) -> KeyBinding {
-    if matches!(
-        terminal_info.multiplexer.as_ref(),
-        Some(Multiplexer::Tmux { .. })
-    ) {
-        return key_hint::shift(KeyCode::Left);
-    }
-
     match terminal_info.name {
-        TerminalName::AppleTerminal | TerminalName::WarpTerminal | TerminalName::VsCode => {
-            key_hint::shift(KeyCode::Left)
-        }
-        TerminalName::Ghostty
-        | TerminalName::Iterm2
-        | TerminalName::WezTerm
-        | TerminalName::Kitty
+        TerminalName::WarpTerminal | TerminalName::VsCode => key_hint::shift(KeyCode::Left),
+        TerminalName::WezTerm
         | TerminalName::Alacritty
-        | TerminalName::Konsole
-        | TerminalName::GnomeTerminal
-        | TerminalName::Vte
         | TerminalName::WindowsTerminal
         | TerminalName::Dumb
         | TerminalName::Unknown => key_hint::alt(KeyCode::Up),
@@ -450,7 +434,7 @@ use strum::IntoEnumIterator;
 use unicode_segmentation::UnicodeSegmentation;
 
 const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
-const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
+const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !Get-ChildItem";
 const ASK_FOR_APPROVAL_LABEL: &str = "Ask for approval";
 const APPROVE_FOR_ME_LABEL: &str = "Approve for me";
 const AUTO_REVIEW_DESCRIPTION: &str = "Only ask for actions detected as potentially unsafe.";
@@ -603,6 +587,9 @@ pub(crate) struct ChatWidget {
     interrupts: InterruptManager,
     // Accumulates the current reasoning block text to extract a header
     reasoning_buffer: String,
+    // Latest live policy phase for the active turn, used as the status fallback
+    // before a reasoning summary supplies a more specific header.
+    active_reasoning_policy: Option<ReasoningPolicySnapshot>,
     // Preserves reasoning-summary part boundaries for transcript-only recording.
     reasoning_summary_parts: Vec<String>,
     status_state: StatusState,
@@ -655,6 +642,8 @@ pub(crate) struct ChatWidget {
     pending_notification: Option<Notification>,
     // Runtime metrics accumulated across delta snapshots for the active turn.
     turn_runtime_metrics: RuntimeMetricsSummary,
+    // Last periodic snapshot, used to keep collection independent of render tick cadence.
+    last_runtime_metrics_refresh: Option<Instant>,
     last_rendered_width: std::cell::Cell<Option<usize>>,
     // Feedback sink for /feedback
     feedback: codex_feedback::CodexFeedback,
@@ -869,14 +858,16 @@ fn patch_approval_request_from_params(
 fn request_permissions_from_params(
     params: codex_app_server_protocol::PermissionsRequestApprovalParams,
 ) -> std::io::Result<RequestPermissionsEvent> {
+    let cwd_uri = params.cwd_uri;
     Ok(RequestPermissionsEvent {
         turn_id: params.turn_id,
         call_id: params.item_id,
         environment_id: params.environment_id,
         started_at_ms: params.started_at_ms,
         reason: params.reason,
-        permissions: params.permissions.try_into()?,
+        permissions: params.permissions.into_core_with_cwd(&cwd_uri)?,
         cwd: Some(params.cwd),
+        cwd_uri: Some(cwd_uri),
     })
 }
 
@@ -1138,6 +1129,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn pre_draw_tick(&mut self) {
+        self.flush_streaming_render_for_frame();
         self.update_due_hook_visibility();
         self.schedule_hook_timer_if_needed();
         self.bottom_pane.pre_draw_tick();
@@ -1170,7 +1162,8 @@ impl ChatWidget {
     }
 
     fn add_boxed_history(&mut self, cell: Box<dyn HistoryCell>) {
-        if self.turn_lifecycle.agent_turn_running && !cell.display_lines(u16::MAX).is_empty() {
+        let cell_is_visible = !cell.display_lines(u16::MAX).is_empty();
+        if self.turn_lifecycle.agent_turn_running && cell_is_visible {
             self.record_visible_turn_activity();
         }
         // Keep the placeholder session header as the active cell until real session info arrives,
@@ -1182,7 +1175,7 @@ impl ChatWidget {
                 .as_ref()
                 .is_some_and(|c| c.as_any().is::<history_cell::SessionHeaderHistoryCell>());
 
-        if !keep_placeholder_header_active && !cell.display_lines(u16::MAX).is_empty() {
+        if !keep_placeholder_header_active && cell_is_visible {
             // Only break exec grouping if the cell renders visible lines.
             if !self.has_active_stream_tail() {
                 self.flush_active_cell();

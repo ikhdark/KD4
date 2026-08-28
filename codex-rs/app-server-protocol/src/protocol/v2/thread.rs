@@ -21,6 +21,7 @@ pub use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 pub use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 pub use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 pub use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::ThreadGoalStatus as CoreThreadGoalStatus;
@@ -104,7 +105,14 @@ pub struct ThreadStartParams {
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     #[ts(optional = nullable)]
     pub sandbox: Option<SandboxMode>,
-    /// Named profile id for this thread. Cannot be combined with `sandbox`.
+    /// Exact permission profile for this thread. When both this and the legacy
+    /// `sandbox` projection are present, this field is authoritative.
+    #[experimental("thread/start.permissionProfile")]
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub permission_profile: Option<PermissionProfile>,
+    /// Named profile id for this thread. Cannot be combined with `sandbox` or
+    /// `permissionProfile`.
     #[experimental("thread/start.permissions")]
     #[ts(optional = nullable)]
     pub permissions: Option<String>,
@@ -187,6 +195,12 @@ pub struct ThreadStartResponse {
     pub model_provider: String,
     pub service_tier: Option<String>,
     pub cwd: AbsolutePathBuf,
+    /// Authoritative primary environment selected for tool execution. Legacy
+    /// host-native fields remain populated for older clients.
+    #[experimental("thread/start.selectedEnvironment")]
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub selected_environment: Option<ThreadSelectedEnvironment>,
     /// Thread-scoped runtime workspace roots used to materialize
     /// `:workspace_roots`.
     #[experimental("thread/start.runtimeWorkspaceRoots")]
@@ -200,8 +214,14 @@ pub struct ThreadStartResponse {
     /// Reviewer currently used for approval requests on this thread.
     pub approvals_reviewer: ApprovalsReviewer,
     /// Legacy sandbox policy retained for compatibility. Experimental clients
-    /// should prefer `activePermissionProfile` for profile provenance.
+    /// should prefer `permissionProfile` for exact permissions and
+    /// `activePermissionProfile` for profile provenance.
     pub sandbox: SandboxPolicy,
+    /// Exact permission profile enforced for this thread.
+    #[experimental("thread/start.permissionProfile")]
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub permission_profile: Option<PermissionProfile>,
     /// Named or implicit built-in profile that produced the active
     /// permissions, when known.
     #[experimental("thread/start.activePermissionProfile")]
@@ -237,8 +257,15 @@ pub struct ThreadSettingsUpdateParams {
     /// Override the sandbox policy for subsequent turns.
     #[ts(optional = nullable)]
     pub sandbox_policy: Option<SandboxPolicy>,
+    /// Exact permission profile for subsequent turns. When both this and the
+    /// legacy `sandboxPolicy` projection are present, this field is
+    /// authoritative.
+    #[experimental("thread/settings/update.permissionProfile")]
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub permission_profile: Option<PermissionProfile>,
     /// Select a named permissions profile id for subsequent turns. Cannot be
-    /// combined with `sandboxPolicy`.
+    /// combined with `sandboxPolicy` or `permissionProfile`.
     #[experimental("thread/settings/update.permissions")]
     #[ts(optional = nullable)]
     pub permissions: Option<String>,
@@ -286,6 +313,11 @@ pub struct ThreadSettings {
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub sandbox_policy: SandboxPolicy,
+    /// Exact permission profile enforced for this thread.
+    #[experimental("thread/settings/update.permissionProfile")]
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub permission_profile: Option<PermissionProfile>,
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub model: String,
     pub model_provider: String,
@@ -373,8 +405,14 @@ pub struct ThreadResumeParams {
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     #[ts(optional = nullable)]
     pub sandbox: Option<SandboxMode>,
+    /// Exact permission profile for the resumed thread. When both this and the
+    /// legacy `sandbox` projection are present, this field is authoritative.
+    #[experimental("thread/resume.permissionProfile")]
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub permission_profile: Option<PermissionProfile>,
     /// Named profile id for the resumed thread. Cannot be combined with
-    /// `sandbox`.
+    /// `sandbox` or `permissionProfile`.
     #[experimental("thread/resume.permissions")]
     #[ts(optional = nullable)]
     pub permissions: Option<String>,
@@ -408,6 +446,12 @@ pub struct ThreadResumeResponse {
     pub model_provider: String,
     pub service_tier: Option<String>,
     pub cwd: AbsolutePathBuf,
+    /// Authoritative primary environment selected for tool execution. Legacy
+    /// host-native fields remain populated for older clients.
+    #[experimental("thread/resume.selectedEnvironment")]
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub selected_environment: Option<ThreadSelectedEnvironment>,
     /// Thread-scoped runtime workspace roots used to materialize
     /// `:workspace_roots`.
     #[experimental("thread/resume.runtimeWorkspaceRoots")]
@@ -421,8 +465,14 @@ pub struct ThreadResumeResponse {
     /// Reviewer currently used for approval requests on this thread.
     pub approvals_reviewer: ApprovalsReviewer,
     /// Legacy sandbox policy retained for compatibility. Experimental clients
-    /// should prefer `activePermissionProfile` for profile provenance.
+    /// should prefer `permissionProfile` for exact permissions and
+    /// `activePermissionProfile` for profile provenance.
     pub sandbox: SandboxPolicy,
+    /// Exact permission profile enforced for this thread.
+    #[experimental("thread/resume.permissionProfile")]
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub permission_profile: Option<PermissionProfile>,
     /// Named or implicit built-in profile that produced the active
     /// permissions, when known.
     #[experimental("thread/resume.activePermissionProfile")]
@@ -537,8 +587,14 @@ pub struct ThreadForkParams {
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     #[ts(optional = nullable)]
     pub sandbox: Option<SandboxMode>,
+    /// Exact permission profile for the forked thread. When both this and the
+    /// legacy `sandbox` projection are present, this field is authoritative.
+    #[experimental("thread/fork.permissionProfile")]
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub permission_profile: Option<PermissionProfile>,
     /// Named profile id for the forked thread. Cannot be combined with
-    /// `sandbox`.
+    /// `sandbox` or `permissionProfile`.
     #[experimental("thread/fork.permissions")]
     #[ts(optional = nullable)]
     pub permissions: Option<String>,
@@ -570,6 +626,12 @@ pub struct ThreadForkResponse {
     pub model_provider: String,
     pub service_tier: Option<String>,
     pub cwd: AbsolutePathBuf,
+    /// Authoritative primary environment selected for tool execution. Legacy
+    /// host-native fields remain populated for older clients.
+    #[experimental("thread/fork.selectedEnvironment")]
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub selected_environment: Option<ThreadSelectedEnvironment>,
     /// Thread-scoped runtime workspace roots used to materialize
     /// `:workspace_roots`.
     #[experimental("thread/fork.runtimeWorkspaceRoots")]
@@ -583,8 +645,14 @@ pub struct ThreadForkResponse {
     /// Reviewer currently used for approval requests on this thread.
     pub approvals_reviewer: ApprovalsReviewer,
     /// Legacy sandbox policy retained for compatibility. Experimental clients
-    /// should prefer `activePermissionProfile` for profile provenance.
+    /// should prefer `permissionProfile` for exact permissions and
+    /// `activePermissionProfile` for profile provenance.
     pub sandbox: SandboxPolicy,
+    /// Exact permission profile enforced for this thread.
+    #[experimental("thread/fork.permissionProfile")]
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub permission_profile: Option<PermissionProfile>,
     /// Named or implicit built-in profile that produced the active
     /// permissions, when known.
     #[experimental("thread/fork.activePermissionProfile")]
@@ -999,10 +1067,24 @@ pub struct ThreadBackgroundTerminal {
     pub item_id: String,
     pub process_id: String,
     pub command: String,
-    pub cwd: AbsolutePathBuf,
+    /// Legacy host-native cwd, present when the terminal cwd can be represented
+    /// on the app-server host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cwd: Option<AbsolutePathBuf>,
+    /// Authoritative environment-native cwd for the terminal.
+    pub cwd_uri: PathUri,
     pub os_pid: Option<u32>,
     pub cpu_percent: Option<f64>,
     pub rss_kb: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSelectedEnvironment {
+    pub environment_id: String,
+    pub cwd: PathUri,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

@@ -259,12 +259,10 @@ impl ExternalAgentSessionImporter {
             source: source.clone(),
             thread_source: None,
             originator: codex_login::default_client::originator().value,
-            base_instructions: BaseInstructions {
-                text: config
-                    .base_instructions
-                    .clone()
-                    .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
-            },
+            base_instructions: imported_base_instructions(
+                config.base_instructions.as_deref(),
+                &model_info.base_instructions,
+            ),
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: Some(MultiAgentVersion::V1),
@@ -430,6 +428,17 @@ struct SessionImportFailure {
     stage: &'static str,
 }
 
+fn imported_base_instructions(
+    configured_base_instructions: Option<&str>,
+    model_base_instructions: &str,
+) -> BaseInstructions {
+    BaseInstructions {
+        text: configured_base_instructions
+            .unwrap_or(model_base_instructions)
+            .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +448,18 @@ mod tests {
     use codex_thread_store::LocalThreadStore;
     use codex_thread_store::LocalThreadStoreConfig;
     use tempfile::TempDir;
+
+    #[test]
+    fn imported_session_persists_neutral_model_base_unless_configured() {
+        assert_eq!(
+            imported_base_instructions(None, "neutral model base").text,
+            "neutral model base"
+        );
+        assert_eq!(
+            imported_base_instructions(Some("configured base"), "neutral model base").text,
+            "configured base"
+        );
+    }
 
     #[tokio::test]
     async fn rollback_removes_imported_thread_state() {

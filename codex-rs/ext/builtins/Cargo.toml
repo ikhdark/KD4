@@ -1,0 +1,32 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-builtin-extensions"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "codex_builtin_extensions"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-analytics = { workspace = true }
+codex-core = { workspace = true }
+codex-exec-server = { workspace = true }
+codex-extension-api = { workspace = true }
+codex-features = { workspace = true }
+codex-goal-extension = { workspace = true }
+codex-image-generation-extension = { workspace = true }
+codex-login = { workspace = true }
+codex-memories-extension = { workspace = true }
+codex-mcp-extension = { workspace = true }
+codex-otel = { workspace = true }
+codex-protocol = { workspace = true }
+codex-skills-extension = { workspace = true }
+codex-web-search-extension = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

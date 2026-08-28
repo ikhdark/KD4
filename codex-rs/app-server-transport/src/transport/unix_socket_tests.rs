@@ -14,6 +14,8 @@ use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use std::io::Result as IoResult;
 use std::path::Path;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio::time::timeout;
@@ -138,6 +140,47 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
 
     shutdown_token.cancel();
     accept_handle.await.expect("acceptor should join");
+    assert_socket_path_removed(socket_path.as_path());
+}
+
+#[tokio::test]
+async fn control_socket_shutdown_closes_incomplete_websocket_handshakes() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let socket_path = test_socket_path(temp_dir.path());
+    let (transport_event_tx, _transport_event_rx) =
+        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+    let shutdown_token = CancellationToken::new();
+    let accept_handle = start_control_socket_acceptor(
+        socket_path.clone(),
+        transport_event_tx,
+        shutdown_token.clone(),
+    )
+    .await
+    .expect("control socket acceptor should start");
+
+    let mut stream = connect_to_socket(socket_path.as_path())
+        .await
+        .expect("raw client should connect");
+    stream
+        .write_all(b"GET /rpc HTTP/1.1\r\n")
+        .await
+        .expect("partial websocket handshake should send");
+    let mut byte = [0_u8; 1];
+    assert!(
+        timeout(Duration::from_millis(100), stream.read(&mut byte))
+            .await
+            .is_err(),
+        "incomplete websocket handshake should remain open before shutdown"
+    );
+
+    shutdown_token.cancel();
+    timeout(Duration::from_secs(1), accept_handle)
+        .await
+        .expect("acceptor should drain connection tasks")
+        .expect("acceptor should join");
+    let _ = timeout(Duration::from_secs(1), stream.read(&mut byte))
+        .await
+        .expect("shutdown should close the accepted raw socket");
     assert_socket_path_removed(socket_path.as_path());
 }
 

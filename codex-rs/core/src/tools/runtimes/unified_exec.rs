@@ -18,10 +18,9 @@ use crate::tools::flat_tool_name;
 use crate::tools::known_delta_store::KnownDeltaHit;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
-use crate::tools::runtimes::RuntimePathPrepends;
-use crate::tools::runtimes::disable_powershell_profile_for_elevated_windows_sandbox;
+use crate::tools::runtimes::ShellCommandPreparation;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
-use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot_file;
+use crate::tools::runtimes::prepare_shell_command;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ApprovalCtx;
@@ -46,11 +45,9 @@ use codex_network_proxy::NetworkProxy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxablePreference;
-use codex_shell_command::powershell::prefix_powershell_script_with_utf8;
-
-use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
 use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
@@ -58,7 +55,6 @@ use std::io;
 use std::sync::Arc;
 use tokio::sync::OwnedRwLockReadGuard;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
 
 #[cfg(test)]
 pub(crate) mod test_observation {
@@ -125,11 +121,10 @@ pub struct UnifiedExecRequest {
     pub tty: bool,
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
+    pub additional_permissions_uri: Option<UriAdditionalPermissionProfile>,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
     pub validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
-    pub validation_observation:
-        Arc<std::sync::Mutex<Option<crate::validation_admission::ValidationObservationToken>>>,
     pub(crate) known_delta_hit: Option<KnownDeltaHit>,
 }
 
@@ -144,7 +139,6 @@ struct ValidationSpawnLifecycle {
     inner: SpawnLifecycleHandle,
     authorization_guard:
         Option<OwnedRwLockReadGuard<crate::validation_admission::ValidationAuthorization>>,
-    observation: Option<crate::validation_admission::ValidationObservationToken>,
 }
 
 impl SpawnLifecycle for ValidationSpawnLifecycle {
@@ -154,9 +148,6 @@ impl SpawnLifecycle for ValidationSpawnLifecycle {
 
     fn after_spawn(&mut self) {
         self.inner.after_spawn();
-        if let Some(observation) = self.observation.take() {
-            observation.arm();
-        }
         self.authorization_guard.take();
     }
 }
@@ -172,34 +163,12 @@ async fn validation_spawn_lifecycle(
     let guard = Arc::clone(&ctx.turn.validation_authorization)
         .read_owned()
         .await;
-    if guard.revision != launch.authorization_revision
-        && !crate::validation_admission::admission_still_authorized(&guard, &launch.invocation)
-    {
-        let Some(skipped) =
-            crate::validation_admission::prohibited_skip_for(&guard, &launch.invocation)
-        else {
-            return Err(ToolError::Rejected(
-                "validation launch plan did not contain a validation command".to_string(),
-            ));
-        };
+    if let Some(skipped) = crate::validation_admission::recheck_validation_launch(&guard, launch) {
         return Err(ToolError::ValidationSkipped(skipped));
-    }
-    let observation = match (
-        launch.observation.clone(),
-        ctx.session.services.state_db.clone(),
-    ) {
-        (Some(plan), Some(state)) => {
-            Some(crate::validation_admission::ValidationObservationToken::new(plan, state))
-        }
-        _ => None,
-    };
-    if let Ok(mut slot) = req.validation_observation.lock() {
-        *slot = observation.clone();
     }
     Ok(Box::new(ValidationSpawnLifecycle {
         inner,
         authorization_guard: Some(guard),
-        observation,
     }))
 }
 
@@ -208,6 +177,7 @@ async fn validation_spawn_lifecycle(
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct UnifiedExecApprovalKey {
     pub environment_id: String,
+    pub approval_scope_id: String,
     pub command: Vec<String>,
     pub cwd: PathUri,
     pub tty: bool,
@@ -223,9 +193,10 @@ pub struct UnifiedExecRuntime<'a> {
 }
 
 fn unified_exec_options(
+    timeout_ms: Option<u64>,
     network_denial_cancellation_token: Option<CancellationToken>,
 ) -> ExecOptions {
-    let mut expiration = ExecExpiration::DefaultTimeout;
+    let mut expiration = timeout_ms.map_or(ExecExpiration::DefaultTimeout, ExecExpiration::from);
     if let Some(cancellation) = network_denial_cancellation_token {
         expiration = expiration.with_cancellation(cancellation);
     }
@@ -289,6 +260,11 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
     fn approval_keys(&self, req: &UnifiedExecRequest) -> Vec<Self::ApprovalKey> {
         vec![UnifiedExecApprovalKey {
             environment_id: req.turn_environment.environment_id.clone(),
+            approval_scope_id: req
+                .turn_environment
+                .environment
+                .approval_scope_id()
+                .to_string(),
             command: canonicalize_command_for_approval(&req.command_for_approval),
             cwd: req.cwd.clone(),
             tty: req.tty,
@@ -313,15 +289,6 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
             .clone()
             .or_else(|| req.justification.clone());
         Box::pin(async move {
-            let native_cwd = match req.cwd.to_abs_path() {
-                Ok(c) => c,
-                Err(e) => {
-                    // TODO(anp) make sandboxing work for foreign OSes, in the meantime this should
-                    // be impossible for single-OS app-servers
-                    error!(cwd = %req.cwd, ?e, "got non-native path in start_approval_async");
-                    return ReviewDecision::Abort;
-                }
-            };
             with_cached_approval(&session.services, "unified_exec", keys, || async move {
                 let available_decisions = None;
                 session
@@ -331,7 +298,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
                         /*approval_id*/ None,
                         environment_id,
                         command,
-                        native_cwd,
+                        req.cwd.clone(),
                         reason,
                         ctx.network_approval_context.clone(),
                         req.exec_approval_requirement
@@ -419,6 +386,11 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
             },
             command: req.hook_command.clone(),
             environment_id: req.turn_environment.environment_id.clone(),
+            approval_scope_id: req
+                .turn_environment
+                .environment
+                .approval_scope_id()
+                .to_string(),
         })
     }
 
@@ -486,40 +458,22 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
             }
             None => (env, None),
         };
-        let explicit_env_overrides = req.explicit_env_overrides.clone();
-        let runtime_path_prepends = RuntimePathPrepends;
-        let command = maybe_wrap_shell_lc_with_snapshot_file(
-            base_command,
+        let command = prepare_shell_command(ShellCommandPreparation {
+            command: base_command,
+            command_for_approval: &req.command_for_approval,
             shell,
-            shell_snapshot_location.as_deref(),
-            &explicit_env_overrides,
-            &mut env,
-            &runtime_path_prepends,
-        );
-        let command = disable_powershell_profile_for_elevated_windows_sandbox(
-            &command,
-            Some(&req.shell_type),
-            attempt.sandbox,
-            attempt.windows_sandbox_level,
-        );
-        let command = if matches!(req.shell_type, ShellType::PowerShell) {
-            {
-                let direct_command =
-                    req.approved_powershell_direct_argv
-                        .as_ref()
-                        .and_then(|approved| {
-                            let cwd = req.normalization_cwd.as_ref()?;
-                            let proof = prove_noprofile_powershell_command_as_direct_argv(
-                                &command, cwd, &env,
-                            )?;
-                            let direct = proof.into_command_for_state(&command, cwd, &env)?;
-                            (direct == *approved).then_some(direct)
-                        });
-                direct_command.unwrap_or_else(|| prefix_powershell_script_with_utf8(&command))
-            }
-        } else {
-            command
-        };
+            shell_snapshot: shell_snapshot_location.as_deref(),
+            explicit_env_overrides: &req.explicit_env_overrides,
+            env: &mut env,
+            shell_type: &req.shell_type,
+            sandbox_shell_type: Some(&req.shell_type),
+            sandbox: attempt.sandbox,
+            windows_sandbox_level: attempt.windows_sandbox_level,
+            enforce_managed_network: attempt.enforce_managed_network,
+            approved_powershell_direct_argv: req.approved_powershell_direct_argv.as_ref(),
+            proof_cwd: req.normalization_cwd.as_deref(),
+        })
+        .await;
 
         let command = build_unified_exec_sandbox_command(
             &command,
@@ -536,7 +490,18 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
             | ToolError::Codex(_)
             | ToolError::ValidationSkipped(_)) => error,
         })?;
-        let options = unified_exec_options(attempt.network_denial_cancellation_token.clone());
+        let validation_timeout_ms = req
+            .validation_launch
+            .as_ref()
+            .and_then(|launch| launch.structured_route.as_ref())
+            .and_then(|route| match route.leaves.as_slice() {
+                [leaf] => Some(leaf.timeout_ms),
+                _ => None,
+            });
+        let options = unified_exec_options(
+            validation_timeout_ms,
+            attempt.network_denial_cancellation_token.clone(),
+        );
         let spawn_lifecycle =
             validation_spawn_lifecycle(req, ctx, Box::new(NoopSpawnLifecycle)).await?;
         self.manager
@@ -544,6 +509,8 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
                 req.process_id,
                 command,
                 options,
+                validation_timeout_ms,
+                req.additional_permissions_uri.as_ref(),
                 attempt,
                 managed_network,
                 /*environment_id*/ Some(&req.turn_environment.environment_id),
@@ -584,7 +551,7 @@ mod tests {
     #[test]
     fn unified_exec_options_combines_default_timeout_with_network_denial_cancellation() {
         let cancellation = CancellationToken::new();
-        let options = unified_exec_options(Some(cancellation.clone()));
+        let options = unified_exec_options(None, Some(cancellation.clone()));
 
         assert_eq!(options.capture_policy, ExecCapturePolicy::ShellTool);
         match options.expiration {
@@ -603,8 +570,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unified_exec_options_honors_validation_timeout() {
+        let options = unified_exec_options(Some(300_000), None);
+
+        assert_eq!(options.capture_policy, ExecCapturePolicy::ShellTool);
+        assert!(matches!(
+            options.expiration,
+            ExecExpiration::Timeout(timeout) if timeout == Duration::from_millis(300_000)
+        ));
+    }
+
     #[tokio::test]
-    async fn approval_key_includes_environment_id() {
+    async fn approval_key_includes_environment_id_and_approval_scope() {
         let manager = UnifiedExecProcessManager::default();
         let runtime = UnifiedExecRuntime::new(&manager);
         let mut request = test_request(
@@ -616,10 +594,14 @@ mod tests {
         );
         request.turn_environment.environment_id = "remote".to_string();
         let original_key = runtime.approval_keys(&request);
+        request.turn_environment.environment = Arc::new(Environment::default_for_tests());
+        let replacement_key = runtime.approval_keys(&request);
+        assert_ne!(original_key, replacement_key);
+
         request.turn_environment.environment_id = "other".to_string();
         let other_key = runtime.approval_keys(&request);
 
-        assert_ne!(original_key, other_key);
+        assert_ne!(replacement_key, other_key);
     }
 
     #[tokio::test]
@@ -692,13 +674,13 @@ mod tests {
             tty: false,
             sandbox_permissions: SandboxPermissions::UseDefault,
             additional_permissions: None,
+            additional_permissions_uri: None,
             justification: None,
             exec_approval_requirement: ExecApprovalRequirement::Skip {
                 bypass_sandbox: false,
                 proposed_execpolicy_amendment: None,
             },
             validation_launch: None,
-            validation_observation: Arc::new(std::sync::Mutex::new(None)),
             known_delta_hit: None,
         };
 
@@ -800,10 +782,10 @@ mod tests {
             tty: false,
             sandbox_permissions,
             additional_permissions: None,
+            additional_permissions_uri: None,
             justification: None,
             exec_approval_requirement,
             validation_launch: None,
-            validation_observation: Arc::new(std::sync::Mutex::new(None)),
             known_delta_hit: None,
         }
     }

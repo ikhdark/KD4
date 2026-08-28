@@ -14,7 +14,6 @@ use codex_utils_pty::TerminalSize;
 use codex_utils_pty::WindowsTtyInputNormalizer;
 use codex_utils_pty::spawn_from_driver;
 use std::fs::File;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -79,8 +78,8 @@ pub(crate) fn start_runner_stdin_writer(
 
 pub(crate) fn start_runner_stdout_reader(
     mut pipe_read: File,
-    stdout_tx: broadcast::Sender<Vec<u8>>,
-    stderr_tx: Option<broadcast::Sender<Vec<u8>>>,
+    stdout_tx: mpsc::Sender<Vec<u8>>,
+    stderr_tx: Option<mpsc::Sender<Vec<u8>>>,
     exit_tx: oneshot::Sender<i32>,
 ) {
     std::thread::spawn(move || {
@@ -123,13 +122,13 @@ pub(crate) fn start_runner_stdout_reader(
                     };
                     match payload.stream {
                         OutputStream::Stdout => {
-                            let _ = stdout_tx.send(data);
+                            let _ = stdout_tx.blocking_send(data);
                         }
                         OutputStream::Stderr => {
                             if let Some(stderr_tx) = stderr_tx.as_ref() {
-                                let _ = stderr_tx.send(data);
+                                let _ = stderr_tx.blocking_send(data);
                             } else {
-                                let _ = stdout_tx.send(data);
+                                let _ = stdout_tx.blocking_send(data);
                             }
                         }
                     }
@@ -177,14 +176,14 @@ pub(crate) fn make_runner_resizer(
 
 fn send_runner_error(
     message: &str,
-    stdout_tx: &broadcast::Sender<Vec<u8>>,
-    stderr_tx: Option<&broadcast::Sender<Vec<u8>>>,
+    stdout_tx: &mpsc::Sender<Vec<u8>>,
+    stderr_tx: Option<&mpsc::Sender<Vec<u8>>>,
 ) {
     let formatted = format!("runner error: {message}\n").into_bytes();
     if let Some(stderr_tx) = stderr_tx {
-        let _ = stderr_tx.send(formatted);
+        let _ = stderr_tx.blocking_send(formatted);
     } else {
-        let _ = stdout_tx.send(formatted);
+        let _ = stdout_tx.blocking_send(formatted);
     }
 }
 
@@ -199,7 +198,7 @@ mod tests {
     use crate::ipc_framed::write_frame;
     use std::io::Seek;
     use std::time::Duration;
-    use tokio::sync::broadcast;
+    use tokio::sync::mpsc;
     use tokio::sync::oneshot;
 
     #[tokio::test]
@@ -219,7 +218,7 @@ mod tests {
         )?;
         pipe_read.rewind()?;
 
-        let (stdout_tx, mut stdout_rx) = broadcast::channel(1);
+        let (stdout_tx, mut stdout_rx) = mpsc::channel(1);
         let (exit_tx, exit_rx) = oneshot::channel();
         start_runner_stdout_reader(pipe_read, stdout_tx, None, exit_tx);
 
@@ -227,7 +226,7 @@ mod tests {
             .await
             .expect("runner stdout reader must finish")?;
         assert_eq!(exit_code, -1);
-        let error = stdout_rx.recv().await?;
+        let error = stdout_rx.recv().await.expect("runner error output");
         assert!(
             String::from_utf8_lossy(&error).contains("runner sent invalid output payload"),
             "unexpected runner error: {}",

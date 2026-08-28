@@ -54,6 +54,39 @@ const OUTPUT_DELIVERY_MAX_QUEUED_BYTES: usize = 256 * 1024;
 const OUTPUT_DELIVERY_QUEUE_ITEMS: usize = 256;
 const OUTPUT_DELIVERY_EVENT_OVERHEAD_BYTES: usize = 1024;
 
+pub(crate) struct OutputByteCap {
+    limit: Option<usize>,
+    retained: usize,
+    truncated: bool,
+}
+
+impl OutputByteCap {
+    pub(crate) fn new(limit: Option<usize>) -> Self {
+        Self {
+            limit,
+            retained: 0,
+            truncated: false,
+        }
+    }
+
+    pub(crate) fn accept<'a>(&mut self, chunk: &'a [u8]) -> (&'a [u8], bool) {
+        let Some(limit) = self.limit else {
+            self.retained = self.retained.saturating_add(chunk.len());
+            return (chunk, false);
+        };
+        let retained_len = limit.saturating_sub(self.retained).min(chunk.len());
+        self.retained = self.retained.saturating_add(retained_len);
+        let observed_excess = retained_len < chunk.len();
+        let newly_truncated = observed_excess && !self.truncated;
+        self.truncated |= observed_excess;
+        (&chunk[..retained_len], newly_truncated)
+    }
+
+    pub(crate) fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
 /// Validate command argv at an app-server request boundary.
 ///
 /// Execution managers only accept requests produced by those boundaries and
@@ -283,15 +316,25 @@ impl CommandExecManager {
                             let (tx_event, rx_event) =
                                 async_channel::bounded::<codex_protocol::protocol::Event>(1);
                             let handle = tokio::spawn(async move {
+                                let mut stdout_cap = OutputByteCap::new(output_bytes_cap);
+                                let mut stderr_cap = OutputByteCap::new(output_bytes_cap);
                                 while let Ok(event) = rx_event.recv().await {
                                     let EventMsg::ExecCommandOutputDelta(delta) = event.msg else {
                                         continue;
                                     };
-                                    let stream = match delta.stream {
-                                        ExecOutputStream::Stdout => CommandExecOutputStream::Stdout,
-                                        ExecOutputStream::Stderr => CommandExecOutputStream::Stderr,
+                                    let (stream, cap) = match delta.stream {
+                                        ExecOutputStream::Stdout => {
+                                            (CommandExecOutputStream::Stdout, &mut stdout_cap)
+                                        }
+                                        ExecOutputStream::Stderr => {
+                                            (CommandExecOutputStream::Stderr, &mut stderr_cap)
+                                        }
                                     };
-                                    let delta_base64 = STANDARD.encode(delta.chunk);
+                                    let (capped_chunk, cap_reached) = cap.accept(&delta.chunk);
+                                    if capped_chunk.is_empty() && !cap_reached {
+                                        continue;
+                                    }
+                                    let delta_base64 = STANDARD.encode(capped_chunk);
                                     let accounted_payload_bytes =
                                         accounted_output_delivery_bytes(&delta_base64, &process_id);
                                     if delivery_relay
@@ -301,7 +344,7 @@ impl CommandExecManager {
                                                     process_id: process_id.clone(),
                                                     stream,
                                                     delta_base64,
-                                                    cap_reached: false,
+                                                    cap_reached,
                                                 },
                                             ),
                                             accounted_payload_bytes,
@@ -340,8 +383,14 @@ impl CommandExecManager {
                                 request_id,
                                 CommandExecResponse {
                                     exit_code: output.exit_code,
-                                    stdout: output.stdout.text,
-                                    stderr: output.stderr.text,
+                                    stdout: final_response_output(
+                                        stream_stdout_stderr,
+                                        output.stdout.text,
+                                    ),
+                                    stderr: final_response_output(
+                                        stream_stdout_stderr,
+                                        output.stderr.text,
+                                    ),
                                 },
                             )
                             .await;
@@ -685,10 +734,9 @@ async fn run_command(params: RunCommandParams) {
                             CommandControl::Resize { size } => {
                                 handle_process_resize(&session, size)
                             }
-                            CommandControl::Terminate => {
-                                session.request_terminate();
-                                Ok(())
-                            }
+                            CommandControl::Terminate => session
+                                .request_terminate()
+                                .map_err(|error| internal_error(error.to_string())),
                         };
                         if let Some(response_tx) = response_tx {
                             let _ = response_tx.send(result);
@@ -696,13 +744,13 @@ async fn run_command(params: RunCommandParams) {
                     },
                     None => {
                         control_open = false;
-                        session.request_terminate();
+                        let _ = session.request_terminate();
                     }
                 }
             }
             outcome = &mut expiration, if expiration_outcome.is_none() => {
                 expiration_outcome = Some(outcome);
-                session.request_terminate();
+                let _ = session.request_terminate();
             }
             exit = &mut exit_rx => {
                 if matches!(expiration_outcome, Some(ExecExpirationOutcome::TimedOut)) {
@@ -802,6 +850,10 @@ fn accounted_output_delivery_bytes(delta_base64: &str, process_id: &str) -> usiz
         .saturating_add(OUTPUT_DELIVERY_EVENT_OVERHEAD_BYTES)
 }
 
+fn final_response_output(streamed: bool, output: String) -> String {
+    if streamed { String::new() } else { output }
+}
+
 fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHandle<String> {
     let SpawnProcessOutputParams {
         process_id,
@@ -809,12 +861,12 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
         mut stdio_timeout_rx,
         mut delivery_relay,
         stream,
-        stream_output,
+        mut stream_output,
         output_bytes_cap,
     } = params;
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
-        let mut observed_num_bytes = 0usize;
+        let mut cap = OutputByteCap::new(output_bytes_cap);
         loop {
             let mut chunk = tokio::select! {
                 chunk = output_rx.recv() => match chunk {
@@ -829,18 +881,11 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
             {
                 chunk.extend_from_slice(&next_chunk);
             }
-            let capped_chunk = match output_bytes_cap {
-                Some(output_bytes_cap) => {
-                    let capped_chunk_len = output_bytes_cap
-                        .saturating_sub(observed_num_bytes)
-                        .min(chunk.len());
-                    observed_num_bytes += capped_chunk_len;
-                    &chunk[0..capped_chunk_len]
-                }
-                None => chunk.as_slice(),
-            };
-            let cap_reached = Some(observed_num_bytes) == output_bytes_cap;
+            let (capped_chunk, cap_reached) = cap.accept(&chunk);
             if let (true, Some(process_id)) = (stream_output, process_id.as_ref()) {
+                if capped_chunk.is_empty() && !cap_reached {
+                    continue;
+                }
                 let delta_base64 = STANDARD.encode(capped_chunk);
                 let accounted_payload_bytes =
                     accounted_output_delivery_bytes(&delta_base64, process_id);
@@ -861,12 +906,11 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
                         .is_err()
                 {
                     delivery_relay = None;
+                    stream_output = false;
+                    buffer.extend_from_slice(capped_chunk);
                 }
             } else if !stream_output {
                 buffer.extend_from_slice(capped_chunk);
-            }
-            if cap_reached {
-                break;
             }
         }
         bytes_to_string_smart(&buffer)
@@ -974,6 +1018,29 @@ mod tests {
     use codex_utils_pty::ProcessDriver;
     use codex_utils_pty::spawn_from_driver;
 
+    #[test]
+    fn output_byte_cap_requires_observed_excess() {
+        let mut cap = OutputByteCap::new(Some(3));
+        assert_eq!(cap.accept(b"abc"), (&b"abc"[..], false));
+        assert!(!cap.truncated());
+
+        assert_eq!(cap.accept(b"d"), (&b""[..], true));
+        assert!(cap.truncated());
+        assert_eq!(cap.accept(b"e"), (&b""[..], false));
+    }
+
+    #[test]
+    fn streamed_windows_output_is_not_repeated_in_final_response() {
+        assert_eq!(
+            final_response_output(true, "already streamed".to_string()),
+            ""
+        );
+        assert_eq!(
+            final_response_output(false, "not streamed".to_string()),
+            "not streamed"
+        );
+    }
+
     #[tokio::test]
     async fn output_delivery_relay_finishes_without_writer_ack_and_preserves_fifo() {
         let connection_id = ConnectionId(31);
@@ -1038,6 +1105,7 @@ mod tests {
                 "exit".to_string(),
                 "0".to_string(),
             ],
+            cwd.clone(),
             cwd.clone(),
             HashMap::new(),
             /*network*/ None,
@@ -1157,11 +1225,12 @@ mod tests {
         let terminator_flag = Arc::clone(&terminated);
         let spawned = spawn_from_driver(ProcessDriver {
             writer_tx,
-            stdout_rx,
-            stderr_rx: Some(stderr_rx),
+            stdout_rx: stdout_rx.into(),
+            stderr_rx: Some(stderr_rx.into()),
             exit_rx,
             terminator: Some(Box::new(move || {
                 terminator_flag.store(true, Ordering::SeqCst);
+                Ok(())
             })),
             writer_handle: None,
             resizer: None,

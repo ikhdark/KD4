@@ -18,6 +18,7 @@ use uuid::Uuid;
 use super::ARCHIVED_SESSIONS_SUBDIR;
 use super::SESSIONS_SUBDIR;
 use super::compression;
+use crate::metadata::RolloutMetadataAccumulator;
 use crate::protocol::EventMsg;
 use crate::state_integration;
 use codex_file_search as file_search;
@@ -223,6 +224,7 @@ struct FilesByCreatedAtVisitor<'a> {
     allowed_sources: &'a [SessionSource],
     provider_matcher: Option<&'a ProviderMatcher<'a>>,
     cwd_filters: Option<&'a [PathBuf]>,
+    default_provider: &'a str,
 }
 
 impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
@@ -254,6 +256,7 @@ impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
             self.provider_matcher,
             self.cwd_filters,
             updated_at,
+            self.default_provider,
         )
         .await
         {
@@ -416,6 +419,7 @@ pub async fn get_threads_in_root(
                 config.allowed_sources,
                 provider_matcher.as_ref(),
                 config.cwd_filters,
+                config.default_provider,
             )
             .await?
         }
@@ -428,6 +432,7 @@ pub async fn get_threads_in_root(
                 config.allowed_sources,
                 provider_matcher.as_ref(),
                 config.cwd_filters,
+                config.default_provider,
             )
             .await?
         }
@@ -476,6 +481,7 @@ pub async fn get_threads_in_root_ascending(
             provider_matcher.as_ref(),
             config.cwd_filters,
             updated_at,
+            config.default_provider,
         )
         .await
         else {
@@ -526,6 +532,7 @@ async fn traverse_directories_for_paths(
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
+    default_provider: &str,
 ) -> io::Result<ThreadsPage> {
     match sort_key {
         ThreadSortKey::CreatedAt => {
@@ -536,6 +543,7 @@ async fn traverse_directories_for_paths(
                 allowed_sources,
                 provider_matcher,
                 cwd_filters,
+                default_provider,
             )
             .await
         }
@@ -547,6 +555,7 @@ async fn traverse_directories_for_paths(
                 allowed_sources,
                 provider_matcher,
                 cwd_filters,
+                default_provider,
             )
             .await
         }
@@ -561,6 +570,7 @@ async fn traverse_flat_paths(
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
+    default_provider: &str,
 ) -> io::Result<ThreadsPage> {
     match sort_key {
         ThreadSortKey::CreatedAt => {
@@ -571,6 +581,7 @@ async fn traverse_flat_paths(
                 allowed_sources,
                 provider_matcher,
                 cwd_filters,
+                default_provider,
             )
             .await
         }
@@ -582,6 +593,7 @@ async fn traverse_flat_paths(
                 allowed_sources,
                 provider_matcher,
                 cwd_filters,
+                default_provider,
             )
             .await
         }
@@ -601,6 +613,7 @@ async fn traverse_directories_for_paths_created(
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
+    default_provider: &str,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -613,6 +626,7 @@ async fn traverse_directories_for_paths_created(
         allowed_sources,
         provider_matcher,
         cwd_filters,
+        default_provider,
     };
     walk_rollout_files(&root, &mut scanned_files, &mut visitor).await?;
     more_matches_available = visitor.more_matches_available;
@@ -650,6 +664,7 @@ async fn traverse_directories_for_paths_updated(
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
+    default_provider: &str,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -679,6 +694,7 @@ async fn traverse_directories_for_paths_updated(
             provider_matcher,
             cwd_filters,
             updated_at_fallback,
+            default_provider,
         )
         .await
         {
@@ -711,6 +727,7 @@ async fn traverse_flat_paths_created(
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
+    default_provider: &str,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -736,6 +753,7 @@ async fn traverse_flat_paths_created(
             provider_matcher,
             cwd_filters,
             updated_at,
+            default_provider,
         )
         .await
         {
@@ -768,6 +786,7 @@ async fn traverse_flat_paths_updated(
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
+    default_provider: &str,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -797,6 +816,7 @@ async fn traverse_flat_paths_updated(
             provider_matcher,
             cwd_filters,
             updated_at_fallback,
+            default_provider,
         )
         .await
         {
@@ -893,10 +913,11 @@ async fn build_thread_item(
     provider_matcher: Option<&ProviderMatcher<'_>>,
     cwd_filters: Option<&[PathBuf]>,
     updated_at: Option<String>,
+    default_provider: &str,
 ) -> Option<ThreadItem> {
     // Read head and detect preview-bearing events; goal previews can appear before
     // the first normal user message.
-    let summary = read_head_summary(&path, HEAD_RECORD_LIMIT)
+    let summary = read_head_summary(&path, HEAD_RECORD_LIMIT, default_provider)
         .await
         .unwrap_or_default();
     if !allowed_sources.is_empty()
@@ -983,6 +1004,7 @@ pub async fn read_thread_item_from_rollout(path: PathBuf) -> Option<ThreadItem> 
         /*provider_matcher*/ None,
         /*cwd_filters*/ None,
         /*updated_at*/ None,
+        /*default_provider*/ "",
     )
     .await
 }
@@ -1228,112 +1250,100 @@ impl<'a> ProviderMatcher<'a> {
     }
 }
 
-async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTailSummary> {
-    let mut lines = compression::open_rollout_line_reader(path).await?;
+async fn read_head_summary(
+    path: &Path,
+    head_limit: usize,
+    default_provider: &str,
+) -> io::Result<HeadTailSummary> {
     let mut summary = HeadTailSummary::default();
     let mut settings_reducer = PersistedThreadSettingsReducer::default();
-    let mut lines_scanned = 0usize;
+    let mut metadata_accumulator = RolloutMetadataAccumulator::default();
+    let extraction_cache_guard =
+        crate::metadata::extraction_cache_guard(path, default_provider).await;
 
-    while let Some(line) = lines.next_line().await? {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        lines_scanned += 1;
-
-        let parsed: Result<RolloutLine, _> = serde_json::from_str(trimmed);
-        let rollout_line = match parsed {
-            Ok(rollout_line) => rollout_line,
-            Err(_) => {
-                if !summary.saw_session_meta
-                    && let Ok(value) = serde_json::from_str::<Value>(trimmed)
+    let (_thread_id, parse_errors) =
+        crate::recorder::RolloutRecorder::for_each_rollout_item_with_record_number(
+            path,
+            |item, record_number| {
+                settings_reducer.apply_item(&item);
+                if let Some(recency_at) =
+                    codex_state::latest_rollout_recency_at(std::slice::from_ref(&item))
                 {
-                    // The first SessionMeta belongs to this rollout. Later SessionMeta lines can
-                    // be copied from fork history, so only an unknown mode before the first parsed
-                    // SessionMeta should make this thread unreadable.
-                    crate::recorder::reject_unknown_thread_history_mode(&value)?;
+                    summary.recency_at =
+                        Some(recency_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
                 }
-                continue;
-            }
-        };
-        settings_reducer.apply_item(&rollout_line.item);
-        if let Some(recency_at) =
-            codex_state::latest_rollout_recency_at(std::slice::from_ref(&rollout_line.item))
-        {
-            summary.recency_at =
-                Some(recency_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-        }
-        let may_collect_preview = lines_scanned <= head_limit
-            || (summary.saw_session_meta
-                && (summary.preview.is_none() || summary.first_user_message.is_none())
-                && lines_scanned <= head_limit + USER_EVENT_SCAN_LIMIT);
+                let may_collect_preview = record_number <= head_limit
+                    || (summary.saw_session_meta
+                        && (summary.preview.is_none() || summary.first_user_message.is_none())
+                        && record_number <= head_limit + USER_EVENT_SCAN_LIMIT);
 
-        match rollout_line.item {
-            RolloutItem::SessionMeta(session_meta_line) => {
-                if !summary.saw_session_meta {
-                    summary.source = Some(session_meta_line.meta.source.clone());
-                    summary.history_mode = session_meta_line.meta.history_mode;
-                    summary.parent_thread_id = session_meta_line.meta.parent_thread_id;
-                    summary.agent_nickname = session_meta_line.meta.agent_nickname.clone();
-                    summary.agent_role = session_meta_line.meta.agent_role.clone();
-                    summary.model_provider = session_meta_line.meta.model_provider.clone();
-                    summary.thread_id = Some(session_meta_line.meta.id);
-                    summary.cwd = Some(session_meta_line.meta.cwd.clone());
-                    summary.git_branch = session_meta_line
-                        .git
-                        .as_ref()
-                        .and_then(|git| git.branch.clone());
-                    summary.git_sha = session_meta_line
-                        .git
-                        .as_ref()
-                        .and_then(|git| git.commit_hash.as_ref().map(|sha| sha.0.clone()));
-                    summary.git_origin_url = session_meta_line
-                        .git
-                        .as_ref()
-                        .and_then(|git| git.repository_url.clone());
-                    summary.cli_version = Some(session_meta_line.meta.cli_version);
-                    summary.created_at = Some(session_meta_line.meta.timestamp.clone());
-                    summary.saw_session_meta = true;
-                }
-            }
-            RolloutItem::ToolManifest(_) => {}
-            RolloutItem::SamplingBoundary(_) => {}
-            RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
-                summary
-                    .created_at
-                    .get_or_insert_with(|| rollout_line.timestamp.clone());
-            }
-            RolloutItem::InterAgentCommunicationMetadata { .. } => {}
-            RolloutItem::TurnContext(_) => {
-                // Not included in `head`; skip.
-            }
-            RolloutItem::WorldState(_) => {
-                // Not included in `head`; skip.
-            }
-            RolloutItem::Compacted(_) => {
-                // Not included in `head`; skip.
-            }
-            RolloutItem::EventMsg(ev) => {
-                if may_collect_preview && let Some(preview) = event_msg_preview(&ev) {
-                    // Legacy rollouts persist UserMessage while paginated rollouts persist
-                    // ItemCompleted(UserMessage), so summaries must recognize both formats.
-                    let is_user_message = match &ev {
-                        EventMsg::UserMessage(_) => true,
-                        EventMsg::ItemCompleted(event) => {
-                            matches!(event.item, TurnItem::UserMessage(_))
+                match &item {
+                    RolloutItem::SessionMeta(session_meta_line) => {
+                        if !summary.saw_session_meta {
+                            summary.source = Some(session_meta_line.meta.source.clone());
+                            summary.history_mode = session_meta_line.meta.history_mode;
+                            summary.parent_thread_id = session_meta_line.meta.parent_thread_id;
+                            summary.agent_nickname = session_meta_line.meta.agent_nickname.clone();
+                            summary.agent_role = session_meta_line.meta.agent_role.clone();
+                            summary.model_provider = session_meta_line.meta.model_provider.clone();
+                            summary.thread_id = Some(session_meta_line.meta.id);
+                            summary.cwd = Some(session_meta_line.meta.cwd.clone());
+                            summary.git_branch = session_meta_line
+                                .git
+                                .as_ref()
+                                .and_then(|git| git.branch.clone());
+                            summary.git_sha = session_meta_line
+                                .git
+                                .as_ref()
+                                .and_then(|git| git.commit_hash.as_ref().map(|sha| sha.0.clone()));
+                            summary.git_origin_url = session_meta_line
+                                .git
+                                .as_ref()
+                                .and_then(|git| git.repository_url.clone());
+                            summary.cli_version = Some(session_meta_line.meta.cli_version.clone());
+                            summary.created_at = Some(session_meta_line.meta.timestamp.clone());
+                            summary.saw_session_meta = true;
                         }
-                        _ => false,
-                    };
-                    if summary.preview.is_none() {
-                        summary.preview = Some(preview.clone());
                     }
-                    if is_user_message && summary.first_user_message.is_none() {
-                        summary.first_user_message = Some(preview);
+                    RolloutItem::ToolManifest(_) => {}
+                    RolloutItem::SamplingBoundary(_) => {}
+                    RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
+                        // A listing requires SessionMeta, which supplies the canonical created_at.
+                    }
+                    RolloutItem::InterAgentCommunicationMetadata { .. } => {}
+                    RolloutItem::TurnContext(_) => {
+                        // Not included in `head`; skip.
+                    }
+                    RolloutItem::WorldState(_) => {
+                        // Not included in `head`; skip.
+                    }
+                    RolloutItem::Compacted(_) => {
+                        // Not included in `head`; skip.
+                    }
+                    RolloutItem::EventMsg(ev) => {
+                        if may_collect_preview && let Some(preview) = event_msg_preview(ev) {
+                            // Legacy rollouts persist UserMessage while paginated rollouts persist
+                            // ItemCompleted(UserMessage), so summaries must recognize both formats.
+                            let is_user_message = match ev {
+                                EventMsg::UserMessage(_) => true,
+                                EventMsg::ItemCompleted(event) => {
+                                    matches!(&event.item, TurnItem::UserMessage(_))
+                                }
+                                _ => false,
+                            };
+                            if summary.preview.is_none() {
+                                summary.preview = Some(preview.clone());
+                            }
+                            if is_user_message && summary.first_user_message.is_none() {
+                                summary.first_user_message = Some(preview);
+                            }
+                        }
                     }
                 }
-            }
-        }
-    }
+                metadata_accumulator.push(item, path, default_provider);
+            },
+        )
+        .await?;
 
     let settings = settings_reducer.into_settings();
     if let Some(model_provider) = settings.model_provider_id {
@@ -1342,6 +1352,12 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
     if let Some(environments) = settings.environments {
         summary.cwd = Some(environments.legacy_fallback_cwd.into_path_buf());
     }
+
+    let outcome = metadata_accumulator
+        .finish(path, default_provider, parse_errors)
+        .await
+        .map_err(io::Error::other)?;
+    crate::metadata::cache_extraction_outcome(extraction_cache_guard, outcome).await;
 
     Ok(summary)
 }

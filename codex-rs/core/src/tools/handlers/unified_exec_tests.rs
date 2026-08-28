@@ -1,4 +1,6 @@
+use super::super::shell::validation_repository_root;
 use super::exec_command::attach_powershell_failure_advisory;
+use super::exec_command::finalize_sandbox_denial_artifact;
 use super::exec_command::validate_and_consume_remote_shell;
 use super::*;
 use crate::shell::ShellType;
@@ -26,6 +28,219 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 use tokio::sync::Mutex;
 
 const TEST_TRUNCATION_POLICY: TruncationPolicy = TruncationPolicy::Tokens(10_000);
+
+#[tokio::test]
+async fn sandbox_denial_preserves_the_process_raw_output_artifact() {
+    let temp = tempfile::tempdir().expect("temporary codex home");
+    let pending = crate::tools::command_output_artifact::RawOutputArtifact::pending(
+        temp.path(),
+        "sandbox-denial",
+    );
+    let preserved = crate::tools::command_output_artifact::RawOutputArtifact::unavailable(
+        "preserved process artifact",
+    );
+
+    let finalized = finalize_sandbox_denial_artifact(
+        &pending,
+        Some(preserved.clone()),
+        b"bounded model projection",
+    )
+    .await;
+
+    assert_eq!(finalized, preserved);
+}
+
+fn create_validation_cwd_alias(target: &std::path::Path, alias: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(alias)
+            .arg(target)
+            .output()
+            .expect("junction command starts");
+        assert!(
+            output.status.success(),
+            "junction is created: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, alias).expect("directory symlink is created");
+}
+
+fn remove_validation_cwd_alias(alias: &std::path::Path) {
+    #[cfg(windows)]
+    std::fs::remove_dir(alias).expect("junction removes without touching its target");
+    #[cfg(unix)]
+    std::fs::remove_file(alias).expect("directory symlink removes without touching its target");
+}
+
+#[test]
+fn direct_validation_repository_discovery_rejects_non_repo_cwd() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("outside directory");
+    assert_eq!(validation_repository_root(&outside, &outside), None);
+
+    let repository = temp.path().join("repository");
+    let nested = repository.join("nested");
+    std::fs::create_dir_all(repository.join(".git")).expect("git marker");
+    std::fs::create_dir_all(&nested).expect("nested repository directory");
+    assert_eq!(
+        validation_repository_root(&nested, &repository),
+        Some(std::fs::canonicalize(repository).expect("repository canonicalizes"))
+    );
+}
+
+#[tokio::test]
+async fn token_efficiency_unified_validation_without_metadata_executes_as_non_proof() {
+    let (session, turn) = make_session_and_context().await;
+    {
+        let mut authorization = turn.validation_authorization.write().await;
+        *authorization = crate::validation_admission::ValidationAuthorization::enabled();
+    }
+    let turn = Arc::new(turn);
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "cargo",
+            "args": ["test", "--help"]
+        })
+        .to_string(),
+    };
+    super::super::shell::reset_validation_repository_discovery_count();
+    crate::tools::handlers::reset_repository_root_resolution_count();
+
+    let result = ExecCommandHandler::default()
+        .handle(ToolInvocation {
+            session: session.into(),
+            step_context: StepContext::for_test(turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "unified-validation-missing-metadata".to_string(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        })
+        .await;
+    let response = result
+        .expect("recognized validation without metadata should execute")
+        .to_response_item("unified-validation-missing-metadata", &payload);
+    let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
+    else {
+        panic!("expected function output");
+    };
+    let message = output.body.to_text().expect("text output");
+
+    assert!(
+        message.contains("treated as an ordinary command"),
+        "{message}"
+    );
+    assert!(
+        message.contains("cannot be recorded as direct validation proof"),
+        "{message}"
+    );
+    assert_eq!(
+        super::super::shell::validation_repository_discovery_count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn unified_pipeline_validation_is_denied_before_process_launch() {
+    let (session, turn) = make_session_and_context().await;
+    {
+        let mut authorization = turn.validation_authorization.write().await;
+        *authorization = crate::validation_admission::ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input("do not run tests"));
+    }
+    let turn = Arc::new(turn);
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "script",
+            "cmd": "cargo test | cargo --version"
+        })
+        .to_string(),
+    };
+
+    let (output, launches) =
+        crate::tools::runtimes::unified_exec::test_observation::observe(async {
+            ExecCommandHandler::default()
+                .handle(ToolInvocation {
+                    session: session.into(),
+                    step_context: StepContext::for_test(turn),
+                    cancellation_token: tokio_util::sync::CancellationToken::new(),
+                    tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                    call_id: "unified-pipeline-validation-denied".to_string(),
+                    tool_name: codex_tools::ToolName::plain("exec_command"),
+                    source: ToolCallSource::Direct,
+                    payload: payload.clone(),
+                })
+                .await
+        })
+        .await;
+    let output = output.expect("the denied pipeline should return a structured skip");
+    let structured = output
+        .post_tool_use_response("unified-pipeline-validation-denied", &payload)
+        .expect("the validation skip should retain its structured result");
+
+    assert_eq!(structured["reason"], "user_prohibited_validation");
+    assert_eq!(structured["operation"], "test");
+    assert_eq!(structured["command_was_executed"], false);
+    assert_eq!(launches.process_launches, 0);
+}
+
+#[tokio::test]
+async fn late_unified_validation_denial_records_suppressed_timing() {
+    let (_session, turn) = make_session_and_context().await;
+    let invocation = CommandInvocation::Argv {
+        program: "cargo".to_string(),
+        args: vec!["test".to_string()],
+    };
+    let skipped = {
+        let mut authorization = turn.validation_authorization.write().await;
+        assert!(authorization.update_from_user_input("do not run tests"));
+        crate::validation_admission::prohibited_skip_for(&authorization, &invocation, true)
+            .expect("test denial suppresses the validation")
+    };
+
+    super::exec_command::record_late_validation_skip(&turn, &skipped);
+
+    assert_eq!(
+        turn.turn_timing_state
+            .complete_snapshot()
+            .protocol_timing()
+            .counters
+            .suppressed_validation_output_count,
+        1,
+    );
+}
+
+#[test]
+fn direct_validation_repository_discovery_resolves_cwd_alias_containment() {
+    let temp = tempfile::tempdir().expect("temporary workspace");
+    let repository = temp.path().join("repository");
+    let nested = repository.join("nested");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(repository.join(".git")).expect("git marker");
+    std::fs::create_dir_all(&nested).expect("nested repository directory");
+    std::fs::create_dir_all(&outside).expect("outside directory");
+
+    let inside_alias = repository.join("inside-alias");
+    let escape_alias = repository.join("escape-alias");
+    create_validation_cwd_alias(&nested, &inside_alias);
+    create_validation_cwd_alias(&outside, &escape_alias);
+
+    assert_eq!(
+        validation_repository_root(&inside_alias, &repository),
+        std::fs::canonicalize(&repository).ok()
+    );
+    assert_eq!(validation_repository_root(&escape_alias, &repository), None);
+
+    remove_validation_cwd_alias(&inside_alias);
+    remove_validation_cwd_alias(&escape_alias);
+}
 
 async fn run_exec_command_for_test(
     session: &Arc<crate::session::session::Session>,
@@ -333,6 +548,69 @@ async fn repeated_rg_miss_uses_workspace_identity_across_epoch_advance() {
     let message = second_error.to_string();
     assert!(message.contains("equivalent search already produced a negative result"));
     assert!(message.contains("execution was suppressed"));
+}
+
+#[tokio::test]
+async fn identical_tagged_validation_rg_misses_both_launch() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let workspace_cwd = turn
+        .environments
+        .single_local_environment_cwd()
+        .expect("test turn has one local environment");
+    let repo_root =
+        get_git_repo_root(workspace_cwd.as_path()).expect("test cwd is in a git repository");
+    let search_target = repo_root.join("codex-rs/core/src/tools/command_execution.rs");
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "rg",
+            "args": [
+                "-n",
+                "__codex_validation_unmatched_probe__",
+                search_target,
+            ],
+            "validation": {
+                "covered_paths": ["codex-rs/core/src/tools/command_execution.rs"],
+            },
+            "yield_time_ms": 10_000,
+        })
+        .to_string(),
+    };
+
+    let ((first, second), launches) =
+        crate::tools::runtimes::unified_exec::test_observation::observe(async {
+            let first = run_exec_command_for_test(
+                &session,
+                &turn,
+                "validation-first-miss",
+                payload.clone(),
+            )
+            .await;
+            let second = run_exec_command_for_test(
+                &session,
+                &turn,
+                "validation-second-miss",
+                payload.clone(),
+            )
+            .await;
+            (first, second)
+        })
+        .await;
+
+    assert_eq!(launches.process_launches, 2);
+    assert_eq!(first.code_mode_result(&payload)["exit_code"], 1);
+    assert_eq!(second.code_mode_result(&payload)["exit_code"], 1);
+    assert_eq!(
+        turn.turn_timing_state
+            .complete_snapshot()
+            .protocol_timing()
+            .counters
+            .executed_validation_count,
+        2,
+        "every launched validation must publish exactly one result",
+    );
 }
 
 #[tokio::test]
@@ -1235,34 +1513,6 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
     let model_output = code_mode["output"].as_str().expect("model output");
     assert!(model_output.len() < segment_bytes);
     assert!(!model_output.contains("MIDDLE_MARKER"));
-}
-
-#[test]
-#[cfg(not(windows))]
-fn test_get_command_respects_explicit_bash_shell() -> anyhow::Result<()> {
-    let json = r#"{"cmd": "echo hello", "shell": "/bin/bash"}"#;
-
-    let args: ExecCommandArgs = parse_arguments(json)?;
-
-    assert_eq!(args.shell.as_deref(), Some("/bin/bash"));
-
-    let resolved = get_command(
-        &args,
-        Arc::new(default_user_shell()),
-        /*allow_login_shell*/ true,
-        /*environment_is_remote*/ false,
-    )
-    .map_err(anyhow::Error::msg)?;
-    let command = resolved.command;
-
-    assert_eq!(command.last(), Some(&"echo hello".to_string()));
-    if command
-        .iter()
-        .any(|arg| arg.eq_ignore_ascii_case("-Command"))
-    {
-        assert!(command.contains(&"-NoProfile".to_string()));
-    }
-    Ok(())
 }
 
 #[test]

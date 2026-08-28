@@ -8,7 +8,7 @@ use crate::store::error_context_sub_error_type;
 use crate::store::validate_plugin_version_segment;
 use codex_http_client::HttpError;
 use codex_http_client::HttpResponse;
-use codex_login::default_client::create_client_without_request_logging;
+use codex_http_client::RouteAwareClientPool;
 use codex_plugin::PluginId;
 use codex_plugin::PluginIdError;
 use codex_plugin::find_plugin_manifest_path;
@@ -91,7 +91,7 @@ pub enum RemotePluginBundleInstallError {
     DownloadRequest {
         url: String,
         #[source]
-        source: HttpError,
+        source: codex_http_client::RouteAwareRequestError,
     },
 
     #[error("remote plugin bundle download from {url} failed with status {status}: {body}")]
@@ -254,10 +254,12 @@ fn is_loopback_url(url: &Url) -> bool {
 pub async fn download_and_install_remote_plugin_bundle(
     codex_home: PathBuf,
     bundle: ValidatedRemotePluginBundle,
+    http_clients: &RouteAwareClientPool,
 ) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
     let bundle_bytes = download_remote_plugin_bundle_with_limit(
         &bundle.bundle_download_url,
         /*max_bytes*/ REMOTE_PLUGIN_BUNDLE_MAX_DOWNLOAD_BYTES,
+        http_clients,
     )
     .await?;
     tokio::task::spawn_blocking(move || {
@@ -274,10 +276,12 @@ pub async fn download_and_install_remote_plugin_bundle(
 pub(crate) async fn download_and_extract_remote_plugin_bundle_to_path(
     bundle: ValidatedRemotePluginBundle,
     destination: AbsolutePathBuf,
+    http_clients: &RouteAwareClientPool,
 ) -> Result<AbsolutePathBuf, RemotePluginBundleInstallError> {
     let bundle_bytes = download_remote_plugin_bundle_with_limit(
         &bundle.bundle_download_url,
         /*max_bytes*/ REMOTE_PLUGIN_BUNDLE_MAX_DOWNLOAD_BYTES,
+        http_clients,
     )
     .await?;
     tokio::task::spawn_blocking(move || {
@@ -294,9 +298,9 @@ pub(crate) async fn download_and_extract_remote_plugin_bundle_to_path(
 async fn download_remote_plugin_bundle_with_limit(
     bundle_download_url: &str,
     max_bytes: u64,
+    http_clients: &RouteAwareClientPool,
 ) -> Result<Vec<u8>, RemotePluginBundleInstallError> {
-    let client = create_client_without_request_logging()?;
-    let response = client
+    let response = http_clients
         .get(bundle_download_url)
         .timeout(REMOTE_PLUGIN_BUNDLE_DOWNLOAD_TIMEOUT)
         .send()
@@ -307,8 +311,8 @@ async fn download_remote_plugin_bundle_with_limit(
         })?;
 
     let final_url = response.url().clone();
-    // The shared client may already have followed redirects here. For backend-issued bundle URLs,
-    // keep the shared client policy and fail unsupported final schemes before caching.
+    // The route-aware pool follows redirects one hop at a time, re-resolving the route before each
+    // request. Reject unsupported final schemes before caching the response body.
     if !is_allowed_bundle_download_url(&final_url, allow_test_loopback_http_bundle_downloads()) {
         return Err(
             RemotePluginBundleInstallError::UnsupportedBundleDownloadFinalUrl {

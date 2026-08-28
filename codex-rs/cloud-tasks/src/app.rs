@@ -116,6 +116,48 @@ impl App {
             self.selected -= 1;
         }
     }
+
+    pub(crate) fn begin_task_list_refresh(&mut self) -> u64 {
+        self.refresh_inflight = true;
+        self.list_generation = self.list_generation.saturating_add(1);
+        self.list_generation
+    }
+
+    pub(crate) fn apply_tasks_loaded(
+        &mut self,
+        generation: u64,
+        env: Option<&str>,
+        result: anyhow::Result<Vec<TaskSummary>>,
+    ) -> TasksLoadedOutcome {
+        if generation != self.list_generation || env != self.env_filter.as_deref() {
+            return TasksLoadedOutcome::Stale;
+        }
+
+        self.refresh_inflight = false;
+        match result {
+            Ok(tasks) => {
+                let count = tasks.len();
+                self.tasks = tasks;
+                if self.selected >= self.tasks.len() {
+                    self.selected = self.tasks.len().saturating_sub(1);
+                }
+                self.status = "Loaded tasks".to_string();
+                TasksLoadedOutcome::Loaded { count }
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.status = format!("Failed to load tasks: {error}");
+                TasksLoadedOutcome::Failed { error }
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TasksLoadedOutcome {
+    Stale,
+    Loaded { count: usize },
+    Failed { error: String },
 }
 
 pub async fn load_tasks(
@@ -299,6 +341,7 @@ pub enum DetailView {
 #[derive(Debug)]
 pub enum AppEvent {
     TasksLoaded {
+        generation: u64,
         env: Option<String>,
         result: anyhow::Result<Vec<TaskSummary>>,
     },
@@ -530,5 +573,43 @@ mod tests {
         let b = load_tasks(&backend, Some("env-B")).await.unwrap();
         assert_eq!(b.len(), 3);
         assert_eq!(b[2].title, "B-3");
+    }
+
+    #[test]
+    fn stale_same_environment_task_generation_cannot_overwrite_newer_result() {
+        fn task(title: &str) -> TaskSummary {
+            TaskSummary {
+                id: TaskId(title.to_string()),
+                title: title.to_string(),
+                status: codex_cloud_tasks_client::TaskStatus::Ready,
+                updated_at: Utc::now(),
+                environment_id: Some("env-A".to_string()),
+                environment_label: None,
+                summary: codex_cloud_tasks_client::DiffSummary::default(),
+                is_review: false,
+                attempt_total: Some(1),
+            }
+        }
+
+        let mut app = App::new();
+        app.env_filter = Some("env-A".to_string());
+        let older_generation = app.begin_task_list_refresh();
+        let newer_generation = app.begin_task_list_refresh();
+
+        assert_eq!(
+            app.apply_tasks_loaded(newer_generation, Some("env-A"), Ok(vec![task("newer")]),),
+            TasksLoadedOutcome::Loaded { count: 1 }
+        );
+        assert_eq!(app.tasks[0].title, "newer");
+        assert_eq!(app.status, "Loaded tasks");
+        assert!(!app.refresh_inflight);
+
+        assert_eq!(
+            app.apply_tasks_loaded(older_generation, Some("env-A"), Ok(vec![task("older")]),),
+            TasksLoadedOutcome::Stale
+        );
+        assert_eq!(app.tasks[0].title, "newer");
+        assert_eq!(app.status, "Loaded tasks");
+        assert!(!app.refresh_inflight);
     }
 }

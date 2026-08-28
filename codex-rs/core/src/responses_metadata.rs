@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
@@ -158,6 +159,7 @@ pub struct CodexResponsesMetadata {
     pub(crate) workspaces: BTreeMap<String, GitWorkspaceMetadata>,
     pub(crate) turn_started_at_unix_ms: Option<i64>,
     pub(crate) extra: BTreeMap<String, String>,
+    pub(crate) turn_metadata_json_cache: OnceLock<Option<String>>,
 }
 
 impl CodexResponsesMetadata {
@@ -183,6 +185,7 @@ impl CodexResponsesMetadata {
             workspaces: BTreeMap::new(),
             turn_started_at_unix_ms: None,
             extra: BTreeMap::new(),
+            turn_metadata_json_cache: OnceLock::new(),
         }
     }
 
@@ -190,8 +193,10 @@ impl CodexResponsesMetadata {
         self.request_kind.is_some()
     }
 
-    pub(crate) fn turn_metadata_json(&self) -> Option<String> {
-        to_ascii_json_string(&self.turn_metadata_payload()).ok()
+    pub(crate) fn turn_metadata_json(&self) -> Option<&str> {
+        self.turn_metadata_json_cache
+            .get_or_init(|| to_ascii_json_string(&self.turn_metadata_payload()).ok())
+            .as_deref()
     }
 
     pub(crate) fn turn_metadata_value(&self) -> Option<Value> {
@@ -226,7 +231,10 @@ impl CodexResponsesMetadata {
         if self.has_turn_metadata()
             && let Some(turn_metadata_json) = self.turn_metadata_json()
         {
-            client_metadata.insert(X_CODEX_TURN_METADATA_HEADER.to_string(), turn_metadata_json);
+            client_metadata.insert(
+                X_CODEX_TURN_METADATA_HEADER.to_string(),
+                turn_metadata_json.to_string(),
+            );
         }
         client_metadata
     }
@@ -242,7 +250,7 @@ impl CodexResponsesMetadata {
             insert_header(
                 &mut headers,
                 X_CODEX_TURN_METADATA_HEADER,
-                &turn_metadata_json,
+                turn_metadata_json,
             );
         }
         if let Some(parent_thread_id) = self.parent_thread_id {

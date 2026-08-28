@@ -5,6 +5,49 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 #[test]
+fn orchestration_audit_tool_dispatch_state_has_one_terminal_transition_owner() {
+    let completed = ToolDispatchState::new();
+    assert!(completed.try_admit());
+    assert!(completed.try_complete());
+    assert_eq!(completed.try_abort(), ToolDispatchAbort::AlreadyTerminal);
+    assert!(completed.is_terminal());
+    assert!(!completed.is_aborted());
+
+    let cancelled_before_admission = ToolDispatchState::new();
+    assert_eq!(
+        cancelled_before_admission.try_abort(),
+        ToolDispatchAbort::BeforeAdmission
+    );
+    assert!(!cancelled_before_admission.try_admit());
+    assert!(!cancelled_before_admission.try_complete());
+    assert!(cancelled_before_admission.is_aborted());
+
+    let cancelled_after_admission = ToolDispatchState::new();
+    assert!(cancelled_after_admission.try_admit());
+    assert_eq!(
+        cancelled_after_admission.try_abort(),
+        ToolDispatchAbort::AfterAdmission
+    );
+    assert!(!cancelled_after_admission.try_complete());
+    assert!(cancelled_after_admission.is_aborted());
+}
+
+fn mcp_tool_output(
+    result: CallToolResult,
+    wall_time: std::time::Duration,
+    original_image_detail_supported: bool,
+    truncation_policy: TruncationPolicy,
+) -> McpToolOutput {
+    McpToolOutput::new(
+        result,
+        json!({}),
+        wall_time,
+        original_image_detail_supported,
+        truncation_policy,
+    )
+}
+
+#[test]
 fn custom_tool_calls_should_roundtrip_as_custom_outputs() {
     let payload = ToolPayload::Custom {
         input: "patch".to_string(),
@@ -145,13 +188,12 @@ fn assert_mcp_wrapper_preserves_projection_metadata(
     expected_diagnostic_class: ToolOutputDiagnosticClass,
 ) {
     let native = ToolOutput::projection_metadata(&result).expect("native MCP metadata");
-    let wrapped = McpToolOutput {
+    let wrapped = mcp_tool_output(
         result,
-        tool_input: json!({}),
-        wall_time: std::time::Duration::from_millis(25),
-        original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Bytes(1024),
-    }
+        std::time::Duration::from_millis(25),
+        false,
+        TruncationPolicy::Bytes(1024),
+    )
     .projection_metadata()
     .expect("wrapped MCP metadata");
 
@@ -240,8 +282,8 @@ fn mcp_wrapper_preserves_native_high_signal_projection_metadata() {
 
 #[test]
 fn mcp_tool_output_response_item_includes_wall_time() {
-    let output = McpToolOutput {
-        result: CallToolResult {
+    let output = mcp_tool_output(
+        CallToolResult {
             content: vec![serde_json::json!({
                 "type": "text",
                 "text": "done",
@@ -250,11 +292,10 @@ fn mcp_tool_output_response_item_includes_wall_time() {
             is_error: Some(false),
             meta: None,
         },
-        tool_input: json!({}),
-        wall_time: std::time::Duration::from_millis(1250),
-        original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Bytes(1024),
-    };
+        std::time::Duration::from_millis(1250),
+        false,
+        TruncationPolicy::Bytes(1024),
+    );
 
     let response = output.to_response_item(
         "mcp-call-1",
@@ -296,12 +337,13 @@ fn mcp_sampling_identity_excludes_wall_time() {
         is_error: Some(false),
         meta: None,
     };
-    let output = |wall_time| McpToolOutput {
-        result: result.clone(),
-        tool_input: json!({}),
-        wall_time,
-        original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Bytes(1024),
+    let output = |wall_time| {
+        mcp_tool_output(
+            result.clone(),
+            wall_time,
+            false,
+            TruncationPolicy::Bytes(1024),
+        )
     };
 
     assert_eq!(
@@ -311,9 +353,42 @@ fn mcp_sampling_identity_excludes_wall_time() {
 }
 
 #[test]
+fn confirmed_performance_mcp_output_reuses_raw_and_provider_projections() {
+    let output = mcp_tool_output(
+        CallToolResult {
+            content: vec![json!({ "type": "text", "text": "done" })],
+            structured_content: Some(json!({ "value": 42 })),
+            is_error: Some(false),
+            meta: None,
+        },
+        std::time::Duration::from_millis(25),
+        false,
+        TruncationPolicy::Bytes(1024),
+    );
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+
+    assert_eq!(output.projection_cache_state(), (false, false));
+    let expected_raw = output.code_mode_result(&payload);
+    assert_eq!(output.sampling_request_signal().is_some(), true);
+    assert_eq!(
+        output.post_tool_use_response("call", &payload),
+        Some(expected_raw)
+    );
+    assert_eq!(output.projection_cache_state(), (true, false));
+
+    let cloned = output.clone();
+    let _ = output.log_preview();
+    let _ = output.to_response_item("call", &payload);
+    assert_eq!(output.projection_cache_state(), (true, true));
+    assert_eq!(cloned.projection_cache_state(), (true, true));
+}
+
+#[test]
 fn mcp_tool_output_response_item_truncates_large_structured_content() {
-    let output = McpToolOutput {
-        result: CallToolResult {
+    let output = mcp_tool_output(
+        CallToolResult {
             content: vec![serde_json::json!({
                 "type": "text",
                 "text": "ignored when structured content is present",
@@ -324,11 +399,10 @@ fn mcp_tool_output_response_item_truncates_large_structured_content() {
             is_error: Some(false),
             meta: None,
         },
-        tool_input: json!({}),
-        wall_time: std::time::Duration::from_millis(1250),
-        original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Bytes(128),
-    };
+        std::time::Duration::from_millis(1250),
+        false,
+        TruncationPolicy::Bytes(128),
+    );
 
     let response = output.to_response_item(
         "mcp-call-large",
@@ -356,8 +430,8 @@ fn mcp_tool_output_response_item_truncates_large_structured_content() {
 #[test]
 fn mcp_tool_output_response_item_preserves_content_items() {
     let image_url = "data:image/png;base64,AAA";
-    let output = McpToolOutput {
-        result: CallToolResult {
+    let output = mcp_tool_output(
+        CallToolResult {
             content: vec![serde_json::json!({
                 "type": "image",
                 "mimeType": "image/png",
@@ -367,11 +441,10 @@ fn mcp_tool_output_response_item_preserves_content_items() {
             is_error: Some(false),
             meta: None,
         },
-        tool_input: json!({}),
-        wall_time: std::time::Duration::from_millis(500),
-        original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Bytes(1024),
-    };
+        std::time::Duration::from_millis(500),
+        false,
+        TruncationPolicy::Bytes(1024),
+    );
 
     let response = output.to_response_item(
         "mcp-call-2",
@@ -409,8 +482,8 @@ fn mcp_tool_output_response_item_preserves_content_items() {
 #[test]
 fn mcp_tool_output_code_mode_result_stays_raw_call_tool_result() {
     let large_content = "large structured value ".repeat(1_000);
-    let output = McpToolOutput {
-        result: CallToolResult {
+    let output = mcp_tool_output(
+        CallToolResult {
             content: vec![serde_json::json!({
                 "type": "text",
                 "text": "ignored",
@@ -421,11 +494,10 @@ fn mcp_tool_output_code_mode_result_stays_raw_call_tool_result() {
             is_error: Some(false),
             meta: None,
         },
-        tool_input: json!({}),
-        wall_time: std::time::Duration::from_millis(1250),
-        original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Bytes(64),
-    };
+        std::time::Duration::from_millis(1250),
+        false,
+        TruncationPolicy::Bytes(64),
+    );
 
     let result = output.code_mode_result(&ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -522,6 +594,23 @@ fn function_output_with_image_uses_complete_json_canonical_result() {
 }
 
 #[test]
+fn confirmed_performance_single_text_function_output_uses_direct_canonical_text() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let output = FunctionToolOutput::from_text("exact text".to_string(), Some(true));
+    FunctionToolOutput::reset_projection_metadata_call_count();
+
+    let canonical = output
+        .canonical_result(&payload)
+        .expect("canonical function output");
+
+    assert_eq!(canonical.bytes, b"exact text".to_vec());
+    assert!(canonical.complete);
+    assert_eq!(FunctionToolOutput::projection_metadata_call_count(), 0);
+}
+
+#[test]
 fn tool_search_payloads_roundtrip_as_tool_search_outputs() {
     let payload = ToolPayload::ToolSearch {
         arguments: SearchToolCallParams {
@@ -530,17 +619,16 @@ fn tool_search_payloads_roundtrip_as_tool_search_outputs() {
         },
     };
     let output = ToolSearchOutput {
-        tools: vec![LoadableToolSpec::Function(codex_tools::ResponsesApiTool {
-            name: "create_event".to_string(),
-            description: String::new(),
-            strict: false,
-            defer_loading: Some(true),
-            parameters: codex_tools::JsonSchema::object(
-                /*properties*/ Default::default(),
-                /*required*/ None,
-                /*additional_properties*/ None,
-            ),
-            output_schema: None,
+        tools: vec![json!({
+            "type": "function",
+            "name": "create_event",
+            "description": "",
+            "strict": false,
+            "defer_loading": true,
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
         })],
         omitted_result_count: 0,
     };
@@ -835,7 +923,7 @@ fn command_failure_signature_preserves_exit_status() {
 }
 
 #[test]
-fn exec_command_tool_output_formats_truncated_response() {
+fn token_efficiency_exec_output_omits_redundant_headers() {
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
     };
@@ -863,7 +951,9 @@ fn exec_command_tool_output_formats_truncated_response() {
                 .body
                 .to_text()
                 .expect("exec output should serialize as text");
-            assert!(text.starts_with("Chunk ID: abc123"));
+            assert!(text.starts_with("Process exited with code 0; wall time: 1.2500 seconds"));
+            assert!(!text.contains("Chunk ID:"));
+            assert!(!text.contains("Original token count:"));
             assert!(codex_utils_string::approx_token_count(&text) <= 20);
             assert_ne!(
                 text,
@@ -872,6 +962,34 @@ fn exec_command_tool_output_formats_truncated_response() {
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
     }
+}
+
+#[test]
+fn retained_exec_command_process_is_yielded_not_timed_out() {
+    let output = ExecCommandToolOutput {
+        event_call_id: "retained-call".to_string(),
+        chunk_id: "retained-chunk".to_string(),
+        wall_time: std::time::Duration::from_millis(250),
+        raw_output: b"process still running".to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: Some(1_000),
+        process_id: Some(4242),
+        exit_code: None,
+        original_token_count: Some(3),
+        hook_command: None,
+        raw_output_artifact: None,
+        repair_notice: None,
+    };
+
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Yielded);
+    assert!(!output.success_for_logging());
+    assert_eq!(
+        output
+            .projection_metadata()
+            .expect("retained output should have projection metadata")
+            .outcome,
+        ToolOutputOutcome::Yielded
+    );
 }
 
 #[test]
@@ -919,7 +1037,7 @@ fn exec_command_projection_metadata_preserves_authoritative_first_output() {
 }
 
 #[test]
-fn exec_command_projection_applies_hard_limit_and_reports_reduction() {
+fn token_efficiency_exec_projection_reports_truncation_once() {
     let output = ExecCommandToolOutput {
         event_call_id: "call-hard-limit".to_string(),
         chunk_id: "chunk-hard-limit".to_string(),
@@ -937,8 +1055,11 @@ fn exec_command_projection_applies_hard_limit_and_reports_reduction() {
 
     let projected = output.projected_model_output();
     assert!(projected.reduced);
-    assert!(projected.text.contains("Warning: truncated output"));
-    assert!(projected.text.contains("95 tokens truncated"));
+    assert_eq!(
+        projected.text.matches("Warning: truncated output").count(),
+        1
+    );
+    assert!(!projected.text.contains("tokens truncated"));
 }
 
 #[test]
@@ -1021,7 +1142,7 @@ fn predetermined_validation_ranges_are_absent_when_not_needed() {
 }
 
 #[test]
-fn exec_command_tool_output_preserves_live_process_state_for_large_output() {
+fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() {
     let raw_output = (0..900)
         .map(|index| format!("live-process-output-{index:04}-{}", "x".repeat(72)))
         .collect::<Vec<_>>()
@@ -1046,7 +1167,7 @@ fn exec_command_tool_output_preserves_live_process_state_for_large_output() {
     assert!(!response.contains("Process exited with code"));
     assert!(!response.contains("exit_code: 0"));
     assert!(!response.contains("timed_out: true"));
-    assert!(response.contains("tokens truncated"));
+    assert_eq!(response.matches("Warning: truncated output").count(), 1);
     assert!(response.len() < raw_output.len());
 }
 
@@ -1222,19 +1343,17 @@ fn exec_code_mode_makes_empty_completion_explicit() {
 }
 
 #[test]
-fn artifact_recovery_notice_appears_when_model_output_is_reduced() {
+fn token_efficiency_artifact_recovery_notice_does_not_repeat_id() {
     let raw_output = "word ".repeat(200);
     let (output, artifact_id, _, _retained_root) =
         artifact_backed_exec_output(raw_output.as_bytes(), Some(100));
 
     let response = output.response_text();
 
-    assert!(response.contains(&format!(
-        "[command output reduced; full retained output is available as artifact {artifact_id}."
-    )));
-    assert!(response.contains(&format!(
-        "Use the advertised read_tool_output schema with artifact {artifact_id}; search once or batch exact ranges in one call. Do not rerun the producer merely to recover omitted output.]"
-    )));
+    assert!(response.contains("[command output reduced; recover the full retained output"));
+    assert!(response.contains("using the raw output artifact above"));
+    assert!(response.contains("do not rerun the producer.]"));
+    assert_eq!(response.matches(&artifact_id.to_string()).count(), 1);
 }
 
 #[test]

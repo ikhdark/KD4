@@ -8,6 +8,7 @@ use super::TERMINAL_MUTATION_FINALIZATION_TIMEOUT;
 use super::TERMINALIZATION_DEADLINE;
 use super::TerminalDeadline;
 use super::TerminalPublicationDecision;
+use super::TerminalRepairContinuation;
 use super::TerminalRepairFailure;
 use super::TerminalRepairRetry;
 use super::TerminalSchedule;
@@ -27,8 +28,11 @@ use super::protocol_terminalization_receipt;
 use super::select_terminal_authority;
 use super::terminal_publication_decision;
 use super::terminal_rollout_structure_ready;
+use super::wait_for_terminal_tool_closure;
 use super::within_final_proof_candidate_capture_budget;
 use crate::session::TurnInput;
+use crate::session::tests::attach_thread_persistence;
+use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
@@ -45,14 +49,22 @@ use crate::task_evidence::TerminalClaimResult;
 use crate::task_evidence::TerminalDecisionClaim;
 use crate::task_evidence::TerminalDeliveryState as DurableDeliveryState;
 use crate::task_evidence::TerminalRecoveryState;
+use crate::task_evidence::TerminalToolClosureAttestationV1;
 use crate::task_evidence::TerminalizationReceiptSnapshot;
+use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
+use crate::turn_timing::ToolCallTimingLineage;
+use crate::turn_timing::TurnTimingState;
+use codex_features::Feature;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::SessionTelemetry;
 use codex_otel::TURN_MEMORY_METRIC;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
+use codex_otel::TURN_TOKEN_USAGE_METRIC;
+use codex_otel::TURN_TOOL_CALL_METRIC;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
@@ -60,10 +72,13 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TerminalizationRecoveryState;
+use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::ToolExecutionId;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnTiming;
 use codex_protocol::protocol::TurnTimingTerminalization;
+use codex_protocol::protocol::TurnTimingToolCallSource;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use opentelemetry_sdk::metrics::data::AggregatedMetrics;
@@ -74,7 +89,9 @@ use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Barrier;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -105,6 +122,174 @@ impl SessionTask for FenceBlockingTask {
     }
 }
 
+struct IncompleteClosureTask {
+    accepted: Arc<tokio::sync::Notify>,
+}
+
+impl SessionTask for IncompleteClosureTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.incomplete_tool_closure"
+    }
+
+    fn run(
+        self: Arc<Self>,
+        session: Arc<crate::session::session::Session>,
+        ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async move {
+            session
+                .record_conversation_items(
+                    &ctx,
+                    &[ResponseItem::FunctionCall {
+                        id: None,
+                        name: "unresolved_tool".to_string(),
+                        namespace: None,
+                        arguments: "{}".to_string(),
+                        call_id: "unresolved-call".to_string(),
+                        internal_chat_message_metadata_passthrough: None,
+                    }],
+                )
+                .await;
+            assert!(ctx.tool_call_acceptance.try_accept(|| {
+                ctx.turn_timing_state.try_record_accepted_tool_call(
+                    "unresolved-call",
+                    &ToolExecutionId("unresolved-execution".to_string()),
+                    TurnTimingToolCallSource::Direct,
+                    None,
+                )
+            }));
+            self.accepted.notify_one();
+            Ok(super::TurnTaskResult::default())
+        })
+    }
+}
+
+struct QueuedToolResultTask {
+    queued: Arc<tokio::sync::Notify>,
+    release: CancellationToken,
+}
+
+impl SessionTask for QueuedToolResultTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.queued_tool_result"
+    }
+
+    fn run(
+        self: Arc<Self>,
+        session: Arc<crate::session::session::Session>,
+        ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async move {
+            let call_id = "queued-flush-failure-call";
+            let execution_id = ToolExecutionId("queued-flush-failure-execution".to_string());
+            assert!(ctx.tool_call_acceptance.try_accept(|| {
+                ctx.turn_timing_state.try_record_accepted_tool_call(
+                    call_id,
+                    &execution_id,
+                    TurnTimingToolCallSource::Direct,
+                    None,
+                )
+            }));
+            ctx.turn_timing_state.record_tool_dispatch_timing(
+                call_id,
+                "exec_command",
+                TurnTimingToolCallSource::Direct,
+                ToolCallTimingLineage::default(),
+                ToolDispatchTimingSnapshot {
+                    execution_id,
+                    outcome: Some("success"),
+                    ..ToolDispatchTimingSnapshot::default()
+                },
+            );
+            session
+                .record_conversation_items_ordered(
+                    &ctx,
+                    &[ResponseItem::FunctionCallOutput {
+                        id: None,
+                        call_id: call_id.to_string(),
+                        output: FunctionCallOutputPayload::from_text("queued output".to_string()),
+                        internal_chat_message_metadata_passthrough: None,
+                    }],
+                )
+                .await
+                .expect("ordered output should be accepted before the injected flush failure");
+            self.queued.notify_one();
+            tokio::select! {
+                _ = self.release.cancelled() => {}
+                _ = cancellation_token.cancelled() => {}
+            }
+            Ok(super::TurnTaskResult::default())
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PanickingTask;
+
+impl SessionTask for PanickingTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.panicking"
+    }
+
+    fn run(
+        self: Arc<Self>,
+        _session: Arc<crate::session::session::Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async move { panic!("injected worker panic") })
+    }
+}
+
+struct CountingBlockingTask {
+    started: Arc<AtomicUsize>,
+    release: CancellationToken,
+}
+
+impl SessionTask for CountingBlockingTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.counting_blocking"
+    }
+
+    fn run(
+        self: Arc<Self>,
+        _session: Arc<crate::session::session::Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async move {
+            self.started.fetch_add(1, Ordering::AcqRel);
+            tokio::select! {
+                _ = self.release.cancelled() => {}
+                _ = cancellation_token.cancelled() => {}
+            }
+            Ok(super::TurnTaskResult::default())
+        })
+    }
+}
+
 #[test]
 fn session_task_is_the_object_safe_runtime_boundary() {
     let task: Arc<dyn SessionTask> = Arc::new(FenceBlockingTask);
@@ -129,13 +314,21 @@ fn implemented_below_ignored_above_successful_side_effect_retries_only_receipt()
 }
 
 #[test]
-fn implemented_below_ignored_above_missing_output_repair_defers_terminal_publication() {
+fn terminal_publication_requires_tool_closure_before_publish_or_rollout_repair() {
     assert_eq!(
-        terminal_publication_decision(false),
+        terminal_publication_decision(false, false),
+        TerminalPublicationDecision::RefuseForToolClosure
+    );
+    assert_eq!(
+        terminal_publication_decision(true, false),
+        TerminalPublicationDecision::RefuseForToolClosure
+    );
+    assert_eq!(
+        terminal_publication_decision(false, true),
         TerminalPublicationDecision::DeferForRolloutRepair
     );
     assert_eq!(
-        terminal_publication_decision(true),
+        terminal_publication_decision(true, true),
         TerminalPublicationDecision::Publish
     );
 }
@@ -187,6 +380,34 @@ fn terminal_repair_classifies_permanent_io_failures_without_retrying() {
     assert_eq!(
         classify_terminal_repair_io_error(&interrupted),
         TerminalRepairFailure::Transient
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn orchestration_audit_terminal_repair_wait_policy_distinguishes_shutdown_from_exhaustion() {
+    let shutting_down = AtomicBool::new(false);
+    let mut retry = TerminalRepairRetry::default();
+    assert_eq!(
+        retry
+            .wait_for_next_attempt(&shutting_down, TerminalRepairFailure::Transient)
+            .await,
+        TerminalRepairContinuation::Retry
+    );
+
+    shutting_down.store(true, Ordering::Release);
+    assert_eq!(
+        retry
+            .wait_for_next_attempt(&shutting_down, TerminalRepairFailure::Transient)
+            .await,
+        TerminalRepairContinuation::ShuttingDown
+    );
+
+    let mut permanent = TerminalRepairRetry::default();
+    assert_eq!(
+        permanent
+            .wait_for_next_attempt(&AtomicBool::new(false), TerminalRepairFailure::Permanent)
+            .await,
+        TerminalRepairContinuation::Exhausted
     );
 }
 
@@ -314,6 +535,23 @@ fn metric_point(resource_metrics: &ResourceMetrics, name: &str) -> (BTreeMap<Str
     }
 }
 
+fn histogram_attribute_maps(
+    resource_metrics: &ResourceMetrics,
+    name: &str,
+) -> Vec<BTreeMap<String, String>> {
+    let metric = find_metric(resource_metrics, name);
+    match metric.data() {
+        AggregatedMetrics::F64(data) => match data {
+            MetricData::Histogram(histogram) => histogram
+                .data_points()
+                .map(|point| attributes_to_map(point.attributes()))
+                .collect(),
+            _ => panic!("unexpected histogram aggregation"),
+        },
+        _ => panic!("unexpected histogram data type"),
+    }
+}
+
 #[test]
 fn completion_review_partial_status_never_overrides_concrete_blockers() {
     for (initial, expected) in [
@@ -399,6 +637,70 @@ async fn final_proof_candidate_seal_can_outlive_generic_mutation_timeout() {
     assert_eq!(sealed, Ok("sealed"));
 }
 
+#[tokio::test(start_paused = true)]
+async fn terminal_tool_closure_wait_is_bounded_and_returns_live_snapshot() {
+    let (_session, turn_context, _events) = make_session_and_context_with_rx().await;
+    turn_context.turn_timing_state.mark_turn_started();
+    assert!(turn_context.tool_call_acceptance.try_accept(|| {
+        turn_context
+            .turn_timing_state
+            .try_record_accepted_tool_call(
+                "unresolved-call",
+                &ToolExecutionId("unresolved-execution".to_string()),
+                TurnTimingToolCallSource::Direct,
+                None,
+            )
+    }));
+    let coordinator = TurnTerminalCoordinator::new_with_tool_call_acceptance(
+        turn_context.sub_id.clone(),
+        Arc::clone(&turn_context.tool_call_acceptance),
+    );
+    coordinator.seal_tool_call_acceptance(&turn_context.turn_timing_state);
+    let deadline = TerminalDeadline::start();
+
+    let closure = wait_for_terminal_tool_closure(&deadline, turn_context.as_ref()).await;
+
+    assert_eq!(closure.accepted_count, 1);
+    assert_eq!(closure.unresolved_calls.len(), 1);
+    assert!(!closure.complete);
+    assert_eq!(
+        deadline.phase_timings_ns()["tool_closure"],
+        TERMINAL_MUTATION_FINALIZATION_TIMEOUT.as_nanos() as u64
+    );
+}
+
+#[test]
+fn orchestration_audit_terminal_coordinator_is_the_tool_acceptance_seal_owner() {
+    let acceptance = Arc::new(crate::state::ToolCallAcceptanceGate::default());
+    let timing = TurnTimingState::default();
+    timing.mark_turn_started();
+    assert!(
+        acceptance.try_accept(|| timing.try_record_accepted_tool_call(
+            "accepted-before-terminal",
+            &ToolExecutionId("accepted-execution".to_string()),
+            TurnTimingToolCallSource::Direct,
+            None,
+        ))
+    );
+
+    let coordinator = TurnTerminalCoordinator::new_with_tool_call_acceptance(
+        "acceptance-owner".to_string(),
+        Arc::clone(&acceptance),
+    );
+    coordinator.seal_tool_call_acceptance(&timing);
+
+    assert!(acceptance.is_sealed());
+    assert!(
+        !acceptance.try_accept(|| timing.try_record_accepted_tool_call(
+            "rejected-after-terminal",
+            &ToolExecutionId("rejected-execution".to_string()),
+            TurnTimingToolCallSource::Direct,
+            None,
+        ))
+    );
+    assert_eq!(timing.tool_closure_snapshot().accepted_count, 1);
+}
+
 #[test]
 fn terminalization_recovery_states_project_to_public_receipts() {
     assert_eq!(
@@ -468,6 +770,58 @@ async fn terminalization_recovery_notification_claim_is_one_shot() {
     );
 }
 
+#[tokio::test]
+async fn durably_acknowledged_delivery_is_pruned_after_redelivery_stops() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    let identity = format!("{}:turn", session.thread_id);
+    let fingerprint = "terminal-fingerprint";
+    assert!(
+        session
+            .register_authoritative_terminal_delivery(identity.clone(), fingerprint.to_string(),)
+            .await
+    );
+    session
+        .terminal_delivery_cache
+        .lock()
+        .await
+        .by_identity
+        .get_mut(&identity)
+        .expect("registered delivery")
+        .redelivery_scheduled = true;
+
+    session
+        .prune_durably_acknowledged_terminal_delivery(&identity, fingerprint)
+        .await;
+    assert!(
+        session
+            .terminal_delivery_cache
+            .lock()
+            .await
+            .by_identity
+            .contains_key(&identity)
+    );
+
+    session
+        .terminal_delivery_cache
+        .lock()
+        .await
+        .by_identity
+        .get_mut(&identity)
+        .expect("registered delivery")
+        .redelivery_scheduled = false;
+    session
+        .prune_durably_acknowledged_terminal_delivery(&identity, fingerprint)
+        .await;
+    assert!(
+        !session
+            .terminal_delivery_cache
+            .lock()
+            .await
+            .by_identity
+            .contains_key(&identity)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn permanent_rollout_repair_failure_stops_live_retry_and_recovers_after_restart() {
     let retry_started = tokio::time::Instant::now();
@@ -509,6 +863,10 @@ async fn permanent_rollout_repair_failure_stops_live_retry_and_recovers_after_re
 
     let turn_id = turn_context.sub_id.clone();
     let terminal_identity = format!("{}:{turn_id}", session.thread_id);
+    let terminal_timing = TurnTiming {
+        schema_version: crate::turn_timing::TOOL_CLOSURE_SEAL_SCHEMA_VERSION,
+        ..TurnTiming::default()
+    };
     let terminal_event = EventMsg::TurnComplete(TurnCompleteEvent {
         turn_id: turn_id.clone(),
         last_agent_message: Some("durably completed before restart".to_string()),
@@ -518,7 +876,7 @@ async fn permanent_rollout_repair_failure_stops_live_retry_and_recovers_after_re
         completed_at: None,
         duration_ms: None,
         time_to_first_token_ms: None,
-        timing: None,
+        timing: Some(terminal_timing),
     });
     let terminal_fingerprint =
         crate::terminal_event_fingerprint(&terminal_event).expect("terminal event fingerprint");
@@ -539,6 +897,9 @@ async fn permanent_rollout_repair_failure_stops_live_retry_and_recovers_after_re
         event: terminal_event.clone(),
         semantic_outcome: "passed".to_string(),
         final_proof_identity: None,
+        tool_closure_attestation: TerminalToolClosureAttestationV1::from_terminal_event(
+            &terminal_event,
+        ),
         rollout_repair: super::TerminalRolloutRepairV1 {
             items: vec![repair_item.clone()],
             repair_missing_call_outputs: true,
@@ -671,9 +1032,40 @@ async fn taskless_placeholder_cleanup_is_pointer_identity_guarded() {
     let first = ActiveTurn::default();
     let first_state = Arc::clone(&first.turn_state);
     *session.active_turn.lock().await = Some(first);
+    let pending_item = TurnInput::ResponseItem(ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "preserve placeholder input".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    });
+    session
+        .input_queue
+        .extend_pending_input_for_turn_state(
+            first_state.as_ref(),
+            std::slice::from_ref(&pending_item),
+        )
+        .await
+        .expect("pending input should fit");
 
     session.clear_taskless_placeholder(&first_state).await;
     assert!(session.active_turn.lock().await.is_none());
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await,
+        vec![pending_item]
+    );
+    assert!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+            .is_empty()
+    );
 
     let replacement = ActiveTurn::default();
     let replacement_state = Arc::clone(&replacement.turn_state);
@@ -686,6 +1078,287 @@ async fn taskless_placeholder_cleanup_is_pointer_identity_guarded() {
             Arc::ptr_eq(&active_turn.turn_state, &replacement_state)
         })
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn persisted_missing_output_repairs_tool_timing_and_publishes_terminal() {
+    let (session, turn_context, _events) = make_session_and_context_with_rx().await;
+    let accepted = Arc::new(tokio::sync::Notify::new());
+    session
+        .start_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            IncompleteClosureTask {
+                accepted: Arc::clone(&accepted),
+            },
+        )
+        .await;
+    let coordinator = session
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|active_turn| active_turn.terminal.as_ref().cloned())
+        .expect("terminal coordinator is installed before the worker starts");
+
+    accepted.notified().await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        coordinator.wait_cleanup_completed(),
+    )
+    .await
+    .expect("repaired terminal publication must finish cleanup");
+
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(!session.terminal_interaction_pending.load(Ordering::Acquire));
+    assert!(coordinator.interaction_released());
+    assert_eq!(
+        coordinator.delivery_state(),
+        TerminalDeliveryState::Delivered
+    );
+    let closure = turn_context.turn_timing_state.tool_closure_snapshot();
+    assert_eq!(closure.accepted_count, 1);
+    assert_eq!(closure.timing_paired_count, 1);
+    assert_eq!(closure.terminal_count, 1);
+    assert_eq!(closure.persisted_count, 1);
+    assert!(closure.complete);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_terminal_rollout_flush_releases_fence_without_persistence_attestation() {
+    let (mut session, turn_context, _events) = make_session_and_context_with_rx().await;
+    attach_thread_persistence(
+        Arc::get_mut(&mut session).expect("test session should be uniquely owned"),
+    )
+    .await;
+    let queued = Arc::new(tokio::sync::Notify::new());
+    let release = CancellationToken::new();
+    session
+        .start_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            QueuedToolResultTask {
+                queued: Arc::clone(&queued),
+                release: release.clone(),
+            },
+        )
+        .await;
+    let coordinator = session
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|active_turn| active_turn.terminal.as_ref().cloned())
+        .expect("terminal coordinator is installed before the worker starts");
+
+    queued.notified().await;
+    assert_eq!(
+        turn_context
+            .turn_timing_state
+            .tool_closure_snapshot()
+            .persisted_count,
+        0
+    );
+    session
+        .live_thread()
+        .expect("test session should have live persistence")
+        .shutdown()
+        .await
+        .expect("test thread store should shut down");
+    release.cancel();
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        coordinator.wait_cleanup_completed(),
+    )
+    .await
+    .expect("flush failure must not leave terminal cleanup active");
+
+    let closure = turn_context.turn_timing_state.tool_closure_snapshot();
+    assert_eq!(closure.accepted_count, 1);
+    assert_eq!(closure.timing_paired_count, 1);
+    assert_eq!(closure.terminal_count, 1);
+    assert_eq!(closure.persisted_count, 0);
+    assert_eq!(closure.unresolved_calls.len(), 1);
+    assert!(!closure.complete);
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(!session.terminal_interaction_pending.load(Ordering::Acquire));
+    assert!(coordinator.interaction_released());
+    assert_eq!(
+        coordinator.delivery_state(),
+        TerminalDeliveryState::NotAttempted
+    );
+}
+
+#[tokio::test]
+async fn panicked_worker_emits_error_before_internal_error_abort() {
+    let (session, turn_context, events) = make_session_and_context_with_rx().await;
+    session
+        .start_task(Arc::clone(&turn_context), Vec::new(), PanickingTask)
+        .await;
+
+    let mut worker_error_seen = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("worker failure event channel remains open");
+            match event.msg {
+                EventMsg::Error(error) if error.message.contains("turn worker panicked") => {
+                    worker_error_seen = true;
+                }
+                EventMsg::TurnAborted(aborted)
+                    if aborted.turn_id.as_deref() == Some(turn_context.sub_id.as_str()) =>
+                {
+                    assert!(
+                        worker_error_seen,
+                        "worker error must precede terminal abort"
+                    );
+                    assert_eq!(aborted.reason, TurnAbortReason::InternalError);
+                    break;
+                }
+                EventMsg::TurnComplete(completed) if completed.turn_id == turn_context.sub_id => {
+                    panic!("panicked worker must not publish TurnComplete");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("panicked worker must publish a bounded terminal outcome");
+}
+
+#[tokio::test]
+async fn concurrent_start_task_calls_install_exactly_one_worker() {
+    let (session, first_context, _events) = make_session_and_context_with_rx().await;
+    let second_context = session
+        .new_default_turn_with_sub_id(format!("{}-second", first_context.sub_id))
+        .await;
+    let started = Arc::new(AtomicUsize::new(0));
+    let release = CancellationToken::new();
+
+    tokio::join!(
+        session.start_task(
+            Arc::clone(&first_context),
+            Vec::new(),
+            CountingBlockingTask {
+                started: Arc::clone(&started),
+                release: release.clone(),
+            },
+        ),
+        session.start_task(
+            Arc::clone(&second_context),
+            Vec::new(),
+            CountingBlockingTask {
+                started: Arc::clone(&started),
+                release: release.clone(),
+            },
+        ),
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while started.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the installed worker starts");
+    tokio::task::yield_now().await;
+
+    assert_eq!(started.load(Ordering::Acquire), 1);
+    let installed_turn_id = session
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|active_turn| active_turn.task.as_ref())
+        .map(|task| task.turn_context.sub_id.clone())
+        .expect("one running task remains installed");
+    assert!(
+        installed_turn_id == first_context.sub_id || installed_turn_id == second_context.sub_id
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        session.abort_all_tasks(TurnAbortReason::Interrupted),
+    )
+    .await
+    .expect("installed worker terminates");
+    release.cancel();
+}
+
+#[tokio::test]
+async fn shutdown_latch_is_linearized_with_task_start_admission() {
+    let (session, turn_context, _events) = make_session_and_context_with_rx().await;
+    let task_start_guard = session
+        .task_start_gate
+        .acquire()
+        .await
+        .unwrap_or_else(|_| unreachable!("session-owned task-start semaphore is never closed"));
+    let shutdown_session = Arc::clone(&session);
+    let shutdown = tokio::spawn(async move {
+        shutdown_session.begin_shutdown().await;
+    });
+    tokio::task::yield_now().await;
+
+    assert!(!session.shutting_down.load(Ordering::Acquire));
+    drop(task_start_guard);
+    shutdown.await.expect("shutdown latch task joins");
+    assert!(session.shutting_down.load(Ordering::Acquire));
+
+    let started = Arc::new(AtomicUsize::new(0));
+    session
+        .start_task(
+            turn_context,
+            Vec::new(),
+            CountingBlockingTask {
+                started: Arc::clone(&started),
+                release: CancellationToken::new(),
+            },
+        )
+        .await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(started.load(Ordering::Acquire), 0);
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminalization_aborts_and_joins_turn_auxiliary_tasks() {
+    struct Dropped(Arc<AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    let (session, turn_context, _events) = make_session_and_context_with_rx().await;
+    session
+        .start_task(Arc::clone(&turn_context), Vec::new(), FenceBlockingTask)
+        .await;
+    let auxiliary_started = Arc::new(tokio::sync::Notify::new());
+    let auxiliary_dropped = Arc::new(AtomicBool::new(false));
+    let started = Arc::clone(&auxiliary_started);
+    let dropped = Arc::clone(&auxiliary_dropped);
+    assert!(
+        session
+            .spawn_active_turn_auxiliary(move |_turn_context, _cancellation_token| async move {
+                let _dropped = Dropped(dropped);
+                started.notify_one();
+                std::future::pending::<()>().await;
+            })
+            .await
+    );
+    auxiliary_started.notified().await;
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    assert!(
+        auxiliary_dropped.load(Ordering::Acquire),
+        "terminal cleanup must join even an auxiliary task that ignores cancellation"
+    );
+    assert!(session.active_turn.lock().await.is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -889,6 +1562,109 @@ async fn interrupt_pending_fences_sampling_without_terminalizing() {
 }
 
 #[tokio::test]
+async fn orchestration_audit_interrupt_durability_resolution_is_a_first_writer_wins_state_transition()
+ {
+    let coordinator = TurnTerminalCoordinator::new("turn-interrupt-resolution".to_string());
+    assert!(coordinator.mark_interrupt_pending().await);
+    let generation = coordinator.wake_generation_id();
+
+    assert_eq!(
+        coordinator.mark_interrupt_output_durable(&generation),
+        TerminalWakeResult::Applied
+    );
+    assert_eq!(
+        coordinator.mark_interrupt_persistence_failed(&generation),
+        TerminalWakeResult::Applied
+    );
+    assert!(
+        !coordinator.interrupt_persistence_failed(),
+        "a late failure report must not replace an established durability result"
+    );
+    assert_eq!(coordinator.sampling_admission(), SamplingAdmission::Fenced);
+
+    coordinator
+        .try_claim()
+        .expect("durability resolution opens terminal admission")
+        .complete_cleanup();
+    assert_eq!(coordinator.sampling_admission(), SamplingAdmission::Allowed);
+}
+
+#[test]
+fn terminal_claim_and_interrupt_fence_have_one_atomic_winner() {
+    const ROUNDS: usize = 10_000;
+
+    let coordinators = Arc::new(
+        (0..ROUNDS)
+            .map(|index| TurnTerminalCoordinator::new(format!("race-{index}")))
+            .collect::<Vec<_>>(),
+    );
+    let claim_wins = Arc::new(
+        (0..ROUNDS)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>(),
+    );
+    let interrupt_wins = Arc::new(
+        (0..ROUNDS)
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>(),
+    );
+    let start = Arc::new(Barrier::new(3));
+    let finish = Arc::new(Barrier::new(3));
+
+    let claim_thread = std::thread::spawn({
+        let coordinators = Arc::clone(&coordinators);
+        let claim_wins = Arc::clone(&claim_wins);
+        let start = Arc::clone(&start);
+        let finish = Arc::clone(&finish);
+        move || {
+            for index in 0..ROUNDS {
+                start.wait();
+                if let Some(permit) = coordinators[index].try_claim() {
+                    assert!(permit.mark_delivery_claimed());
+                    claim_wins[index].store(true, Ordering::Release);
+                }
+                finish.wait();
+            }
+        }
+    });
+    let interrupt_thread = std::thread::spawn({
+        let coordinators = Arc::clone(&coordinators);
+        let interrupt_wins = Arc::clone(&interrupt_wins);
+        let start = Arc::clone(&start);
+        let finish = Arc::clone(&finish);
+        move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build interrupt race runtime");
+            for index in 0..ROUNDS {
+                start.wait();
+                let won = runtime.block_on(coordinators[index].mark_interrupt_pending());
+                interrupt_wins[index].store(won, Ordering::Release);
+                finish.wait();
+            }
+        }
+    });
+
+    for index in 0..ROUNDS {
+        start.wait();
+        finish.wait();
+        let claimed = claim_wins[index].load(Ordering::Acquire);
+        let interrupted = interrupt_wins[index].load(Ordering::Acquire);
+        assert_ne!(
+            claimed, interrupted,
+            "round {index} must have exactly one terminal-decision winner"
+        );
+        assert_eq!(coordinators[index].interrupt_pending(), interrupted);
+    }
+
+    claim_thread.join().expect("terminal claim thread joins");
+    interrupt_thread
+        .join()
+        .expect("interrupt fence thread joins");
+}
+
+#[tokio::test]
 async fn terminal_wakeups_are_generation_aware_and_waiter_counts_are_cancellation_safe() {
     let coordinator = TurnTerminalCoordinator::new("turn-generation".to_string());
     let stale_generation = coordinator.wake_generation_id();
@@ -1085,6 +1861,64 @@ fn emit_turn_memory_metric_records_config_disabled_without_citations() {
             ("has_citations".to_string(), "false".to_string()),
             ("read_allowed".to_string(), "false".to_string()),
         ])
+    );
+}
+
+#[tokio::test]
+async fn live_runtime_memory_feature_labels_use_refreshed_turn_state() {
+    let (mut session, _initial_turn) = make_session_and_context().await;
+    assert!(
+        !session.enabled(Feature::MemoryTool),
+        "the fixture must begin with the session-invariant feature disabled"
+    );
+    session.services.session_telemetry = test_session_telemetry();
+    let mut refreshed_config = session.get_config().await.as_ref().clone();
+    refreshed_config
+        .features
+        .enable(Feature::MemoryTool)
+        .expect("memory feature should be enabled in refreshed config");
+    session
+        .refresh_runtime_config_features(refreshed_config, &[Feature::MemoryTool])
+        .await;
+    let turn_context = session.new_default_turn().await;
+    assert!(turn_context.config.features.enabled(Feature::MemoryTool));
+    assert!(!session.enabled(Feature::MemoryTool));
+
+    session
+        .emit_post_terminal_metrics(
+            &turn_context,
+            /*turn_had_memory_citation*/ false,
+            /*turn_tool_calls*/ 1,
+            &TokenUsage::default(),
+        )
+        .await;
+
+    let snapshot = session
+        .services
+        .session_telemetry
+        .snapshot_metrics()
+        .expect("runtime metrics snapshot");
+    let (network_attrs, _) = metric_point(&snapshot, TURN_NETWORK_PROXY_METRIC);
+    assert_eq!(
+        network_attrs.get("tmp_mem_enabled").map(String::as_str),
+        Some("true")
+    );
+    for metric_name in [TURN_TOOL_CALL_METRIC, TURN_TOKEN_USAGE_METRIC] {
+        let attribute_maps = histogram_attribute_maps(&snapshot, metric_name);
+        assert!(
+            !attribute_maps.is_empty(),
+            "{metric_name} should have samples"
+        );
+        assert!(
+            attribute_maps
+                .iter()
+                .all(|attrs| { attrs.get("tmp_mem_enabled").map(String::as_str) == Some("true") })
+        );
+    }
+    let (memory_attrs, _) = metric_point(&snapshot, TURN_MEMORY_METRIC);
+    assert_eq!(
+        memory_attrs.get("feature_enabled").map(String::as_str),
+        Some("true")
     );
 }
 

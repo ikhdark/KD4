@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::Path;
 
 use pretty_assertions::assert_eq;
@@ -7,6 +8,8 @@ use crate::ProcessDriver;
 use crate::SpawnedProcess;
 use crate::TerminalSize;
 use crate::combine_output_receivers;
+use crate::configure_windows_command_args;
+use crate::windows_cmd_payload_index;
 
 use crate::spawn_from_driver;
 use crate::spawn_pipe_process;
@@ -15,6 +18,48 @@ use crate::spawn_pty_process;
 
 #[path = "windows_tests.rs"]
 mod windows_tests;
+
+#[test]
+fn identifies_only_a_final_cmd_payload() {
+    assert_eq!(
+        windows_cmd_payload_index(
+            OsStr::new(r#"C:\Windows\System32\cmd.exe"#),
+            &["/d", "/c", r#"echo "two words""#]
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        windows_cmd_payload_index(
+            OsStr::new("powershell.exe"),
+            &["-Command", r#"echo "two words""#]
+        ),
+        None
+    );
+    assert_eq!(
+        windows_cmd_payload_index(OsStr::new("cmd.exe"), &["/c", "echo ok", "extra"]),
+        None
+    );
+}
+
+#[test]
+fn cmd_receives_inner_quotes_without_msvcrt_backslash_escaping() {
+    let args = [
+        "/d",
+        "/v:on",
+        "/c",
+        r#"set "CODEX_CMD_QUOTE=two words" & echo [!CODEX_CMD_QUOTE!]"#,
+    ];
+    let mut command = std::process::Command::new("cmd.exe");
+    configure_windows_command_args(&mut command, OsStr::new("cmd.exe"), &args);
+
+    let output = command.output().expect("execute cmd payload");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "[two words]"
+    );
+}
 
 fn find_python() -> Option<String> {
     for candidate in ["python3", "python"] {
@@ -380,8 +425,8 @@ async fn driver_backed_process_can_expose_split_stdout_and_stderr() -> anyhow::R
 
     let spawned = spawn_from_driver(ProcessDriver {
         writer_tx,
-        stdout_rx: stdout_driver_rx,
-        stderr_rx: Some(stderr_driver_rx),
+        stdout_rx: stdout_driver_rx.into(),
+        stderr_rx: Some(stderr_driver_rx.into()),
         exit_rx,
         terminator: None,
         writer_handle: None,
@@ -432,7 +477,7 @@ async fn driver_backed_process_can_resize_via_resizer_hook() -> anyhow::Result<(
     let size_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(size_tx)));
     let spawned = spawn_from_driver(ProcessDriver {
         writer_tx,
-        stdout_rx: stdout_driver_rx,
+        stdout_rx: stdout_driver_rx.into(),
         stderr_rx: None,
         exit_rx,
         terminator: None,
@@ -477,7 +522,7 @@ async fn driver_backed_process_drains_output_that_arrives_after_exit_signal() ->
 
     let spawned = spawn_from_driver(ProcessDriver {
         writer_tx,
-        stdout_rx: stdout_driver_rx,
+        stdout_rx: stdout_driver_rx.into(),
         stderr_rx: None,
         exit_rx,
         terminator: None,

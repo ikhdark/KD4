@@ -34,12 +34,6 @@ pub enum StoreError {
     ReceiptAlreadySealed(AttemptId),
     #[error("dependency validation failed: {blockers:?}")]
     DependencyBlocked { blockers: Vec<DependencyBlocker> },
-    #[error("validation evidence was superseded by workspace changes: {call_ids:?}")]
-    EvidenceSuperseded { call_ids: Vec<String> },
-    #[error(
-        "stale-evidence recovery is exhausted for attempt {0}; root reconciliation is required"
-    )]
-    StaleRecoveryExhausted(AttemptId),
     #[error("isolated handoff from assignment {0} changed after it was versioned")]
     IsolationHandoffSuperseded(AssignmentId),
     #[error("only one immutable correction amendment is allowed for assignment {0}")]
@@ -64,6 +58,8 @@ pub enum StoreError {
     ValidationCallImmutable(String),
     #[error("receipt references validation calls with incompatible status: {call_ids:?}")]
     ValidationCallStatusInvalid { call_ids: Vec<String> },
+    #[error("validation evidence was superseded by workspace changes: {call_ids:?}")]
+    EvidenceSuperseded { call_ids: Vec<String> },
     #[error("completed receipt is missing required evidence: {obligations:?}")]
     RequiredEvidenceMissing {
         obligations: Vec<MissingEvidenceObligation>,

@@ -172,6 +172,15 @@ fn write_explicit_stop_hook(home: &Path) {
         fs::write(
             &script_path,
             r#"[Console]::In.ReadToEnd() | Out-Null
+$result = 'missing-review'
+foreach ($receipt in Get-ChildItem -Path (Join-Path $PSScriptRoot 'task-evidence\*.json') -ErrorAction SilentlyContinue) {
+    $content = Get-Content -LiteralPath $receipt.FullName -Raw
+    if ($content -match '"attempt_kind"\s*:\s*"initial_review"') {
+        $result = 'reviewed'
+        break
+    }
+}
+Set-Content -LiteralPath (Join-Path $PSScriptRoot 'stop-order.txt') -Value $result
 Write-Output '{"continue":false,"stopReason":"explicit stop"}'
 "#,
         )
@@ -247,6 +256,39 @@ if (Test-Path -LiteralPath $state) {{
     .expect("write continuation stop hook config");
 }
 
+fn write_counting_passthrough_stop_hook(home: &Path) {
+    let script_path = home.join("completion-review-stop-count.ps1");
+    fs::write(
+        &script_path,
+        r#"[Console]::In.ReadToEnd() | Out-Null
+$countPath = Join-Path $PSScriptRoot 'completion-review-stop-count.txt'
+$count = 0
+if (Test-Path -LiteralPath $countPath) { $count = [int](Get-Content -LiteralPath $countPath -Raw) }
+Set-Content -LiteralPath $countPath -Value ($count + 1)
+Write-Output '{}'
+"#,
+    )
+    .expect("write counting Stop hook");
+    fs::write(
+        home.join("hooks.json"),
+        json!({
+            "hooks": {
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!(
+                            "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+                            script_path.display()
+                        )
+                    }]
+                }]
+            }
+        })
+        .to_string(),
+    )
+    .expect("write counting Stop hook config");
+}
+
 fn completion_review_builder_with_after_agent_probe() -> TestCodexBuilder {
     completion_review_builder().with_config(|config| {
         let marker = config.codex_home.join("after-agent-order.txt");
@@ -311,6 +353,29 @@ Set-Content -LiteralPath (Join-Path $Workspace 'finalizer.txt') -Value 'finalize
     })
 }
 
+fn completion_review_builder_with_legacy_workspace_mutation() -> TestCodexBuilder {
+    completion_review_builder().with_config(|config| {
+        let workspace = config.cwd.display().to_string();
+        let script = config.codex_home.join("legacy-after-agent-mutation.ps1");
+        fs::write(
+            &script,
+            r#"param([string]$Workspace, [string]$Payload)
+Set-Content -LiteralPath (Join-Path $Workspace 'legacy-after-agent.txt') -Value 'mutated'
+"#,
+        )
+        .expect("write legacy AfterAgent mutation hook");
+        config.notify = Some(vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            script.display().to_string(),
+            workspace,
+        ]);
+    })
+}
+
 fn plan_response(response_id: &str, call_id: &str, status: &str) -> String {
     if status == "passed" {
         let implemented = plan_response(
@@ -343,9 +408,7 @@ fn plan_response(response_id: &str, call_id: &str, status: &str) -> String {
                         "--",
                         "--exact"
                     ],
-                    "uncertainty": "the requested file behavior remains present",
                     "covered_paths": ["src/lib.rs"],
-                    "covered_contracts": ["The requested file behavior is present"],
                     "timeout_ms": 120000
                 }]
             }
@@ -373,9 +436,7 @@ fn validation_response(response_id: &str, call_id: &str) -> String {
         ],
         "yield_time_ms": 60_000,
         "validation": {
-            "uncertainty": "the requested file behavior remains present",
-            "covered_paths": ["src/lib.rs"],
-            "covered_contracts": ["The requested file behavior is present"]
+            "covered_paths": ["src/lib.rs"]
         }
     })
     .to_string();
@@ -1472,7 +1533,7 @@ async fn supplemental_reviewer_spawn_failure_does_not_worsen_completion() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_stop_exits_before_reviewer_without_a_false_pass() -> Result<()> {
+async fn explicit_stop_runs_after_completion_admission_without_a_false_pass() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(
@@ -1505,11 +1566,15 @@ async fn explicit_stop_exits_before_reviewer_without_a_false_pass() -> Result<()
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 5);
     assert_eq!(reviewer_request_count(&requests), 0);
+    assert_eq!(
+        fs::read_to_string(test.home.path().join("stop-order.txt"))?.trim(),
+        "reviewed"
+    );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stop_hook_continuation_runs_before_the_single_reviewer() -> Result<()> {
+async fn stop_hook_continuation_reopens_completion_review() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let continuation = "complete the stop-hook-requested follow-up";
@@ -1547,21 +1612,22 @@ async fn stop_hook_continuation_runs_before_the_single_reviewer() -> Result<()> 
     let classification_requests = probe.classification_requests.load(Ordering::SeqCst);
     assert_eq!(
         probe.total_requests.load(Ordering::SeqCst),
-        7 + classification_requests + probe.local_classification_requests.load(Ordering::SeqCst)
+        8 + classification_requests + probe.local_classification_requests.load(Ordering::SeqCst)
     );
     assert!(
         (1..=2).contains(&classification_requests),
         "classification requests must remain bounded: {classification_requests}"
     );
-    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
+    let request_payloads = probe.request_payloads.lock().expect("request payloads");
     assert!(
-        probe
-            .request_payloads
-            .lock()
-            .expect("request payloads")
+        request_payloads
             .iter()
             .any(|payload| payload.contains(continuation))
     );
+    assert!(request_payloads.iter().any(|payload| {
+        payload.contains(REVIEW_REQUEST_MARKER) && payload.contains("follow-up complete")
+    }));
     Ok(())
 }
 
@@ -1608,6 +1674,55 @@ async fn reviewer_finishes_before_legacy_after_agent_hook() -> Result<()> {
         sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(fs::read_to_string(marker)?.trim(), "reviewed");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_after_agent_mutation_is_rereviewed_without_a_second_stop() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let probe = mount_completion_review_sequence(
+        &server,
+        vec![
+            plan_response("plan-start", "plan-start-call", "in_progress"),
+            patch_response(
+                "initial-patch",
+                "initial-patch-call",
+                "*** Begin Patch\n*** Add File: completed.txt\n+done\n*** End Patch",
+            ),
+            plan_response("plan-pass", "plan-pass-call", "passed"),
+            message_response("candidate", "candidate-message", "implementation complete"),
+        ],
+        ReviewScenario::Clean,
+    )
+    .await;
+    let mut builder = completion_review_builder_with_legacy_workspace_mutation()
+        .with_pre_build_hook(write_counting_passthrough_stop_hook)
+        .with_config(trust_discovered_hooks);
+    let test = builder.build(&server).await?;
+
+    let completion =
+        submit_turn_and_capture_completion(&test, "Implement the requested behavior").await?;
+
+    assert_eq!(
+        completion.completion.as_ref().map(|gate| gate.status),
+        Some(TaskCompletionStatus::Passed)
+    );
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read_to_string(test.home.path().join("completion-review-stop-count.txt"))?.trim(),
+        "1"
+    );
+    assert!(test.workspace_path("legacy-after-agent.txt").is_file());
+    assert!(
+        probe
+            .request_payloads
+            .lock()
+            .expect("request payloads")
+            .iter()
+            .rfind(|payload| payload.contains(REVIEW_REQUEST_MARKER))
+            .is_some_and(|payload| payload.contains("legacy-after-agent.txt"))
+    );
     Ok(())
 }
 
@@ -1707,6 +1822,16 @@ async fn mutating_finalizer_does_not_rerun_during_review_repair() -> Result<()> 
         fs::read_to_string(test.home.path().join("mutating-finalizer-count.txt"))?.trim(),
         "1"
     );
+    let review_payloads = probe
+        .request_payloads
+        .lock()
+        .expect("request payloads")
+        .iter()
+        .filter(|payload| payload.contains(REVIEW_REQUEST_MARKER))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(review_payloads.len(), 2);
+    assert!(review_payloads[1].contains("done after repair"));
     Ok(())
 }
 
@@ -1736,6 +1861,10 @@ async fn mutating_finalizer_abort_is_returned_after_reviewing_its_mutation() -> 
         submit_turn_and_capture_completion(&test, "Implement the requested behavior").await?;
     let gate = completion.completion.as_ref().expect("completion gate");
     assert_eq!(gate.status, TaskCompletionStatus::Partial);
+    assert_eq!(
+        completion.last_agent_message.as_deref(),
+        Some("implementation complete")
+    );
     assert!(
         gate.reasons
             .iter()

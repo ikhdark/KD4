@@ -14,12 +14,14 @@ use codex_analytics::TurnDeliveryFact;
 use codex_analytics::TurnDeliveryStatus;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_app_server_protocol::ServerResponse;
+use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
 use codex_otel::span_w3c_trace_context;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::W3cTraceContext;
@@ -61,6 +63,8 @@ const ALL_AUTHORIZED_CONNECTIONS_DISCONNECTED_ERROR: &str =
     "client request canceled because all authorized connections disconnected";
 const ALL_AUTHORIZED_CONNECTION_SENDS_FAILED_ERROR: &str =
     "client request canceled because delivery failed for all authorized connections";
+const LEGACY_EXEC_COMMAND_APPROVAL_EMISSION_ERROR: &str =
+    "legacy execCommandApproval is decode-only; use item/commandExecution/requestApproval";
 
 /// Stable identifier for a client request scoped to a transport connection.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -126,6 +130,7 @@ pub(crate) struct OutgoingMessageSender {
     /// We keep them here because this is where responses, errors, and
     /// disconnect cleanup all get handled.
     request_contexts: Mutex<HashMap<ConnectionRequestId, RequestContext>>,
+    component_notification_cache: Mutex<ComponentNotificationCache>,
     analytics_events_client: AnalyticsEventsClient,
     delivery_tasks: TaskTracker,
     delivery_shutdown: CancellationToken,
@@ -138,6 +143,57 @@ pub(crate) struct ThreadScopedOutgoingMessageSender {
     connection_ids: Arc<Vec<ConnectionId>>,
     experimental_api_connection_ids: Arc<Vec<ConnectionId>>,
     thread_id: ThreadId,
+}
+
+#[derive(Default)]
+struct ComponentNotificationCache {
+    token_usage: HashMap<(ConnectionId, String, String), ThreadTokenUsageUpdatedNotification>,
+    rate_limits: HashMap<ConnectionId, RateLimitSnapshot>,
+}
+
+impl ComponentNotificationCache {
+    fn changed_targets(
+        &mut self,
+        connection_ids: &[ConnectionId],
+        notification: &ServerNotification,
+        force: bool,
+    ) -> Vec<ConnectionId> {
+        connection_ids
+            .iter()
+            .copied()
+            .filter(|connection_id| match notification {
+                ServerNotification::ThreadTokenUsageUpdated(notification) => {
+                    let key = (
+                        *connection_id,
+                        notification.thread_id.clone(),
+                        notification.turn_id.clone(),
+                    );
+                    if !force && self.token_usage.get(&key) == Some(notification) {
+                        return false;
+                    }
+                    self.token_usage.insert(key, notification.clone());
+                    true
+                }
+                ServerNotification::AccountRateLimitsUpdated(notification) => {
+                    if !force
+                        && self.rate_limits.get(connection_id) == Some(&notification.rate_limits)
+                    {
+                        return false;
+                    }
+                    self.rate_limits
+                        .insert(*connection_id, notification.rate_limits.clone());
+                    true
+                }
+                _ => true,
+            })
+            .collect()
+    }
+
+    fn remove_connection(&mut self, connection_id: ConnectionId) {
+        self.token_usage
+            .retain(|(cached_connection_id, _, _), _| *cached_connection_id != connection_id);
+        self.rate_limits.remove(&connection_id);
+    }
 }
 
 struct PendingCallbackEntry {
@@ -217,7 +273,7 @@ impl ThreadScopedOutgoingMessageSender {
     ) -> TerminalNotificationDispatch {
         self.outgoing
             .analytics_events_client
-            .track_notification(notification.clone());
+            .track_notification(&notification);
 
         let ServerNotification::TurnCompleted(completed) = &notification else {
             if !self.connection_ids.is_empty() {
@@ -266,7 +322,7 @@ impl ThreadScopedOutgoingMessageSender {
     ) -> TerminalNotificationDispatch {
         self.outgoing
             .analytics_events_client
-            .track_notification(notification.clone());
+            .track_notification(&notification);
         let ServerNotification::TurnCompleted(completed) = &notification else {
             return TerminalNotificationDispatch::default();
         };
@@ -355,12 +411,35 @@ impl ThreadScopedOutgoingMessageSender {
     pub(crate) async fn send_server_notification(&self, notification: ServerNotification) {
         self.outgoing
             .analytics_events_client
-            .track_notification(notification.clone());
+            .track_notification(&notification);
         if self.connection_ids.is_empty() {
             return;
         }
         self.outgoing
             .send_server_notification_to_connections(self.connection_ids.as_slice(), notification)
+            .await;
+    }
+
+    pub(crate) async fn send_component_notification_if_changed(
+        &self,
+        notification: ServerNotification,
+    ) {
+        let targets = self
+            .outgoing
+            .changed_component_notification_targets(
+                self.connection_ids.as_slice(),
+                &notification,
+                false,
+            )
+            .await;
+        if targets.is_empty() {
+            return;
+        }
+        self.outgoing
+            .analytics_events_client
+            .track_notification(&notification);
+        self.outgoing
+            .send_server_notification_to_connections(&targets, notification)
             .await;
     }
 
@@ -412,6 +491,7 @@ impl OutgoingMessageSender {
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             request_id_to_callback: Arc::new(Mutex::new(HashMap::new())),
             request_contexts: Mutex::new(HashMap::new()),
+            component_notification_cache: Mutex::new(ComponentNotificationCache::default()),
             analytics_events_client,
             delivery_tasks: TaskTracker::new(),
             delivery_shutdown: CancellationToken::new(),
@@ -434,6 +514,10 @@ impl OutgoingMessageSender {
         connection_id: ConnectionId,
         initialized: Arc<AtomicBool>,
     ) {
+        self.component_notification_cache
+            .lock()
+            .await
+            .remove_connection(connection_id);
         self.active_connections
             .lock()
             .await
@@ -465,6 +549,10 @@ impl OutgoingMessageSender {
             let mut request_contexts = self.request_contexts.lock().await;
             request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
         }
+        self.component_notification_cache
+            .lock()
+            .await
+            .remove_connection(connection_id);
         for entry in orphaned_entries {
             let request_id = entry.request.id().clone();
             self.analytics_events_client
@@ -475,6 +563,30 @@ impl OutgoingMessageSender {
                 warn!("could not notify callback for {request_id:?} due to: {err:?}");
             }
         }
+    }
+
+    async fn changed_component_notification_targets(
+        &self,
+        connection_ids: &[ConnectionId],
+        notification: &ServerNotification,
+        force: bool,
+    ) -> Vec<ConnectionId> {
+        self.component_notification_cache
+            .lock()
+            .await
+            .changed_targets(connection_ids, notification, force)
+    }
+
+    pub(crate) async fn send_initial_component_notification_to_connection(
+        &self,
+        connection_id: ConnectionId,
+        notification: ServerNotification,
+    ) {
+        let targets = self
+            .changed_component_notification_targets(&[connection_id], &notification, true)
+            .await;
+        self.send_server_notification_to_connections(&targets, notification)
+            .await;
     }
 
     pub(crate) async fn request_trace_context(
@@ -538,6 +650,13 @@ impl OutgoingMessageSender {
     ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
         let id = self.next_request_id();
         let outgoing_message_id = id.clone();
+        if matches!(&request, ServerRequestPayload::ExecCommandApproval(_)) {
+            let (tx_approve, rx_approve) = oneshot::channel();
+            let _ = tx_approve.send(Err(internal_error(
+                LEGACY_EXEC_COMMAND_APPROVAL_EMISSION_ERROR,
+            )));
+            return (outgoing_message_id, rx_approve);
+        }
         let request = request.request_with_id(outgoing_message_id.clone());
         let explicit_recipients = connection_ids.is_some();
         // Keep the active-connection snapshot locked through callback registration.
@@ -599,6 +718,7 @@ impl OutgoingMessageSender {
         let outgoing_message = OutgoingMessage::Request(request.clone());
         let mut send_error = None;
         let mut sent_connection_ids = HashSet::new();
+        let mut analytics_connection_id = None;
         for connection_id in target_connection_ids {
             if let Err(err) = self
                 .sender
@@ -613,9 +733,12 @@ impl OutgoingMessageSender {
                 break;
             } else {
                 sent_connection_ids.insert(connection_id);
-                self.analytics_events_client
-                    .track_server_request(connection_id.0, request.clone());
+                analytics_connection_id.get_or_insert(connection_id);
             }
+        }
+        if let Some(connection_id) = analytics_connection_id {
+            self.analytics_events_client
+                .track_server_request(connection_id.0, &request);
         }
         let send_result = match send_error {
             Some(err) => Err(err),
@@ -1504,6 +1627,7 @@ mod tests {
     use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
     use codex_app_server_protocol::ConfigWarningNotification;
     use codex_app_server_protocol::DynamicToolCallParams;
+    use codex_app_server_protocol::ExecCommandApprovalParams;
     use codex_app_server_protocol::FileChangeRequestApprovalParams;
     use codex_app_server_protocol::GuardianWarningNotification;
     use codex_app_server_protocol::ModelRerouteReason;
@@ -2362,6 +2486,38 @@ mod tests {
             rx.try_recv().is_err(),
             "request without recipients must not be enqueued",
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_exec_approval_emission_is_rejected() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
+        let outgoing =
+            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+        outgoing
+            .connection_opened(ConnectionId(1), Arc::new(AtomicBool::new(true)))
+            .await;
+
+        let (_request_id, wait_for_result) = outgoing
+            .send_request(ServerRequestPayload::ExecCommandApproval(
+                ExecCommandApprovalParams {
+                    conversation_id: ThreadId::new(),
+                    call_id: "call-id".to_string(),
+                    approval_id: None,
+                    command: vec!["echo".to_string(), "hello".to_string()],
+                    cwd: std::path::PathBuf::from("."),
+                    reason: None,
+                    parsed_cmd: Vec::new(),
+                },
+            ))
+            .await;
+
+        let error = wait_for_result
+            .await
+            .expect("legacy request should resolve explicitly")
+            .expect_err("legacy request emission must be rejected");
+        assert_eq!(error.message, LEGACY_EXEC_COMMAND_APPROVAL_EMISSION_ERROR);
+        assert!(rx.try_recv().is_err(), "no legacy request may be emitted");
+        assert_eq!(outgoing.pending_callback_count().await, 0);
     }
 
     #[tokio::test]

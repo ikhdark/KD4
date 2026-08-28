@@ -1,9 +1,9 @@
 use super::AnalyticsEventsClient;
 use super::AnalyticsEventsDestination;
 use super::AnalyticsEventsQueue;
+use super::analytics_failure_log_metadata;
 #[cfg(debug_assertions)]
 use super::capture_track_events_request;
-#[cfg(debug_assertions)]
 use super::send_track_events_request;
 use super::track_event_request_batches;
 use crate::events::CodexAcceptedLineFingerprintsEventParams;
@@ -13,12 +13,14 @@ use crate::events::SkillInvocationEventRequest;
 use crate::events::TrackEventRequest;
 use crate::facts::AnalyticsFact;
 use crate::facts::InvocationType;
+use codex_app_server_protocol::AccountUpdatedNotification;
 use codex_app_server_protocol::ApprovalsReviewer as AppServerApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval as AppServerAskForApproval;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy as AppServerSandboxPolicy;
+use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SessionSource as AppServerSessionSource;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchiveParams;
@@ -33,6 +35,12 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
+use codex_http_client::cache_system_proxy_route_for_test;
+use codex_login::CodexAuth;
+use codex_login::default_client::create_client_pool;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
 use std::collections::HashSet;
@@ -46,6 +54,19 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+
+#[test]
+fn logging_contract_analytics_failure_metadata_omits_body() {
+    let metadata = analytics_failure_log_metadata(500, "response body secret".len());
+
+    assert_eq!(metadata.status, 500);
+    assert_eq!(metadata.body_bytes, 20);
+    assert!(!format!("{metadata:?}").contains("response body secret"));
+}
 
 fn sample_accepted_line_fingerprint_event(thread_id: &str) -> TrackEventRequest {
     TrackEventRequest::AcceptedLineFingerprints(Box::new(
@@ -83,6 +104,13 @@ fn sample_regular_track_event(thread_id: &str) -> TrackEventRequest {
             model_slug: Some("gpt-5.1-codex".to_string()),
         },
     })
+}
+
+fn test_http_clients() -> codex_http_client::RouteAwareClientPool {
+    create_client_pool(
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        ClientRouteClass::Api,
+    )
 }
 
 #[cfg(debug_assertions)]
@@ -171,8 +199,9 @@ async fn capture_file_writes_exact_serialized_request() {
     let event = sample_regular_track_event("thread-1");
     let expected_event = serde_json::to_value(&event).expect("serialize expected event");
     let auth = codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let http_clients = test_http_clients();
 
-    send_track_events_request(&auth, &destination, vec![event]).await;
+    send_track_events_request(&auth, &destination, &http_clients, vec![event]).await;
 
     let contents = fs::read_to_string(&capture_path).expect("read capture file");
     let lines = contents.lines().collect::<Vec<_>>();
@@ -197,9 +226,9 @@ async fn capture_file_writes_final_batches_as_separate_lines() {
         sample_accepted_line_fingerprint_event("thread-2"),
         sample_regular_track_event("thread-3"),
     ];
-
+    let http_clients = test_http_clients();
     for batch in track_event_request_batches(events) {
-        send_track_events_request(&auth, &destination, batch).await;
+        send_track_events_request(&auth, &destination, &http_clients, batch).await;
     }
 
     let contents = fs::read_to_string(&capture_path).expect("read capture file");
@@ -300,11 +329,13 @@ fn sample_thread_start_response() -> ClientResponsePayload {
         model_provider: "openai".to_string(),
         service_tier: None,
         cwd: test_path_buf("/tmp").abs(),
+        selected_environment: None,
         runtime_workspace_roots: Vec::new(),
         instruction_sources: Vec::new(),
         approval_policy: AppServerAskForApproval::OnRequest,
         approvals_reviewer: AppServerApprovalsReviewer::User,
         sandbox: AppServerSandboxPolicy::DangerFullAccess,
+        permission_profile: None,
         active_permission_profile: None,
         reasoning_effort: None,
     })
@@ -317,11 +348,13 @@ fn sample_thread_resume_response() -> ClientResponsePayload {
         model_provider: "openai".to_string(),
         service_tier: None,
         cwd: test_path_buf("/tmp").abs(),
+        selected_environment: None,
         runtime_workspace_roots: Vec::new(),
         instruction_sources: Vec::new(),
         approval_policy: AppServerAskForApproval::OnRequest,
         approvals_reviewer: AppServerApprovalsReviewer::User,
         sandbox: AppServerSandboxPolicy::DangerFullAccess,
+        permission_profile: None,
         active_permission_profile: None,
         reasoning_effort: None,
         initial_turns_page: None,
@@ -335,11 +368,13 @@ fn sample_thread_fork_response() -> ClientResponsePayload {
         model_provider: "openai".to_string(),
         service_tier: None,
         cwd: test_path_buf("/tmp").abs(),
+        selected_environment: None,
         runtime_workspace_roots: Vec::new(),
         instruction_sources: Vec::new(),
         approval_policy: AppServerAskForApproval::OnRequest,
         approvals_reviewer: AppServerApprovalsReviewer::User,
         sandbox: AppServerSandboxPolicy::DangerFullAccess,
+        permission_profile: None,
         active_permission_profile: None,
         reasoning_effort: None,
     })
@@ -418,6 +453,53 @@ fn track_response_only_enqueues_analytics_relevant_responses() {
         ClientResponsePayload::ThreadArchive(ThreadArchiveResponse {}),
     );
     assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[test]
+fn ignored_notifications_are_filtered_before_cloning() {
+    let (client, mut receiver) = client_with_receiver();
+    let notification = ServerNotification::AccountUpdated(AccountUpdatedNotification {
+        auth_mode: None,
+        plan_type: None,
+    });
+
+    client.track_notification(&notification);
+    client.track_notification(&notification);
+
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[tokio::test]
+async fn analytics_request_uses_effective_proxy_route() {
+    let proxy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&proxy)
+        .await;
+    let url = "http://analytics-events.test/codex/analytics-events/events".to_string();
+    cache_system_proxy_route_for_test(&url, proxy.uri());
+    let http_clients = create_client_pool(
+        HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+        ClientRouteClass::Api,
+    );
+    let destination = AnalyticsEventsDestination::Http { url };
+
+    send_track_events_request(
+        &CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        &destination,
+        &http_clients,
+        vec![sample_regular_track_event("thread-proxy")],
+    )
+    .await;
+
+    assert_eq!(
+        proxy
+            .received_requests()
+            .await
+            .expect("proxy requests")
+            .len(),
+        1
+    );
 }
 
 #[test]

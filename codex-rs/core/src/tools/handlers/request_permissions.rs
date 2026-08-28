@@ -1,5 +1,5 @@
 use codex_protocol::request_permissions::RequestPermissionsArgs;
-use codex_sandboxing::policy_transforms::normalize_additional_permissions;
+use codex_sandboxing::policy_transforms::normalize_uri_additional_permissions;
 use std::sync::Arc;
 
 use crate::FunctionCallError;
@@ -8,7 +8,6 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
-use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::shell_spec::create_request_permissions_tool;
 use crate::tools::handlers::shell_spec::request_permissions_tool_description;
@@ -19,6 +18,7 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
+use serde_json::Value;
 
 pub struct RequestPermissionsHandler;
 
@@ -77,7 +77,7 @@ impl RequestPermissionsHandler {
             ));
         };
         let mut args = parse_request_permissions_args(&arguments, turn_environment.cwd())?;
-        args.permissions = normalize_additional_permissions(args.permissions.into())
+        args.permissions = normalize_uri_additional_permissions(args.permissions.into())
             .map(codex_protocol::request_permissions::RequestPermissionProfile::from)
             .map_err(FunctionCallError::RespondToModel)?;
         if args.permissions.is_empty() {
@@ -118,23 +118,66 @@ fn parse_request_permissions_args(
     arguments: &str,
     environment_cwd: &PathUri,
 ) -> Result<RequestPermissionsArgs, FunctionCallError> {
-    match environment_cwd.to_abs_path() {
-        Ok(native_cwd) => parse_arguments_with_base_path(arguments, &native_cwd),
-        Err(err) => {
-            let args: RequestPermissionsArgs = parse_arguments(arguments)?;
-            if args.permissions.file_system.is_some() {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "request_permissions file-system grants require a cwd native to the Codex host; `{environment_cwd}` is foreign: {err}"
-                )));
+    let mut value: Value = parse_arguments(arguments)?;
+    let file_system = value
+        .get_mut("permissions")
+        .and_then(|permissions| permissions.get_mut("file_system"));
+    if let Some(file_system) = file_system {
+        for field in ["read", "write"] {
+            if let Some(paths) = file_system.get_mut(field).and_then(Value::as_array_mut) {
+                for path in paths {
+                    resolve_path_value(path, environment_cwd)?;
+                }
             }
-            Ok(args)
+        }
+        if let Some(entries) = file_system.get_mut("entries").and_then(Value::as_array_mut) {
+            for entry in entries {
+                if entry
+                    .get("path")
+                    .and_then(|path| path.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("path")
+                    && let Some(path) = entry.get_mut("path").and_then(|path| path.get_mut("path"))
+                {
+                    resolve_path_value(path, environment_cwd)?;
+                }
+            }
         }
     }
+    serde_json::from_value(value).map_err(|err| {
+        FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
+    })
+}
+
+fn resolve_path_value(
+    value: &mut Value,
+    environment_cwd: &PathUri,
+) -> Result<(), FunctionCallError> {
+    let Some(path) = value.as_str() else {
+        return Err(FunctionCallError::RespondToModel(
+            "request_permissions filesystem paths must be strings".to_string(),
+        ));
+    };
+    let resolved = PathUri::parse(path).or_else(|_| environment_cwd.join(path));
+    *value = Value::String(
+        resolved
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to resolve permission path `{path}` against `{environment_cwd}`: {err}"
+                ))
+            })?
+            .to_string(),
+    );
+    Ok(())
 }
 
 impl CoreToolRuntime for RequestPermissionsHandler {
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         ToolExecutionTiming::Interactive
+    }
+
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
     }
 }
 
@@ -142,6 +185,13 @@ impl CoreToolRuntime for RequestPermissionsHandler {
 mod tests {
     use super::*;
     use codex_protocol::models::NetworkPermissions;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+
+    #[test]
+    fn permission_requests_wait_for_runtime_cancellation_cleanup() {
+        assert!(RequestPermissionsHandler.waits_for_runtime_cancellation());
+    }
 
     #[test]
     fn foreign_environment_accepts_network_only_permission_request() {
@@ -160,5 +210,25 @@ mod tests {
             })
         );
         assert!(args.permissions.file_system.is_none());
+    }
+
+    #[test]
+    fn foreign_environment_resolves_file_system_permission_paths_as_uris() {
+        let cwd = PathUri::parse("file:///home/remote/project").expect("foreign POSIX cwd");
+
+        let args = parse_request_permissions_args(
+            r#"{"permissions":{"file_system":{"entries":[{"path":{"type":"path","path":"generated/output.txt"},"access":"write"}]}}}"#,
+            &cwd,
+        )
+        .expect("foreign filesystem request should retain URI paths");
+
+        let file_system = args.permissions.file_system.expect("filesystem profile");
+        assert!(matches!(
+            file_system.entries.as_slice(),
+            [codex_protocol::permissions::FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path },
+                access: FileSystemAccessMode::Write,
+            }] if path == &PathUri::parse("file:///home/remote/project/generated/output.txt").expect("expected URI")
+        ));
     }
 }

@@ -2,14 +2,6 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
-fn review_prompt_template_renders_base_branch_backup_variant() {
-    assert_eq!(
-        render_review_prompt(&BASE_BRANCH_PROMPT_BACKUP_TEMPLATE, [("branch", "main")]),
-        "Review the code changes against the base branch 'main'. Start by finding the merge diff between the current branch and main's upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"main@{upstream}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the main branch. Provide prioritized, actionable findings."
-    );
-}
-
-#[test]
 fn review_prompt_template_renders_base_branch_variant() {
     assert_eq!(
         render_review_prompt(

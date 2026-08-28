@@ -174,7 +174,7 @@ contains = "CommandKind::Legacy | CommandKind::Script"
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/handlers/shell_spec.rs"
-contains = "json!(\"legacy\")"
+contains = "LEGACY_SHELL_SCRIPT_DESCRIPTION"
 
 [[features.evidence]]
 kind = "registration"
@@ -210,12 +210,12 @@ contains = "pub(crate) fn preflight_invocation_with_equivalent_repair("
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/handlers/shell/shell_command.rs"
-contains = "preflight_invocation_with_equivalent_repair("
+contains = "preflight_invocation_with_equivalent_repair_async("
 
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs"
-contains = "preflight_invocation_with_equivalent_repair("
+contains = "preflight_invocation_with_equivalent_repair_async("
 
 [[features.evidence]]
 kind = "test"
@@ -524,7 +524,7 @@ summary = "Persisted versioned task evidence, including explicit plan acknowledg
 upstream_equivalent = "none"
 config_keys = []
 runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/task_evidence_tests.rs", symbol = "current_schema_reload_removes_stale_skipped_step_requirements", command = ["cargo", "test", "-p", "codex-core", "current_schema_reload_removes_stale_skipped_step_requirements"] }
-contract_schema_version = 13
+contract_schema_version = 14
 contract_schema_source = "codex-rs/core/src/task_evidence.rs"
 contract_schema_symbol = "TASK_EVIDENCE_SCHEMA_VERSION"
 source_owner = "task-evidence-runtime"
@@ -592,7 +592,7 @@ owner = "codex-rs/agent-task-store"
 summary = "Nonblocking workspace revision and path-event tracking, advisory claims, best-effort mutation evidence, validation singleflight, lifecycle quiescence, and versioned isolated-worktree handoffs."
 upstream_equivalent = "none"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/agent-task-store/src/tests.rs", symbol = "focused_validation_dependency_receipt_freshness_is_scoped", command = ["cargo", "test", "-p", "codex-agent-task-store", "focused_validation_dependency_receipt_freshness_is_scoped"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/agent-task-store/src/tests.rs", symbol = "completed_receipt_rejects_workspace_change_after_validation", command = ["cargo", "test", "-p", "codex-agent-task-store", "completed_receipt_rejects_workspace_change_after_validation"] }
 
 [[features.evidence]]
 kind = "module"
@@ -637,7 +637,7 @@ contains = '"advisories": []'
 [[features.evidence]]
 kind = "test"
 path = "codex-rs/agent-task-store/src/tests.rs"
-contains = "focused_validation_dependency_receipt_freshness_is_scoped"
+contains = "completed_receipt_rejects_workspace_change_after_validation"
 
 [[features.evidence]]
 kind = "test"

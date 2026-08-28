@@ -33,12 +33,14 @@ struct SleepArgs {
 }
 
 fn create_sleep_tool() -> ToolSpec {
-    let properties = BTreeMap::from([(
-        "duration_ms".to_string(),
-        JsonSchema::number(Some(format!(
+    let duration_ms = JsonSchema {
+        minimum: Some(serde_json::Number::from(1_u64)),
+        maximum: Some(serde_json::Number::from(MAX_SLEEP_DURATION_MS)),
+        ..JsonSchema::integer(Some(format!(
             "How long to sleep in milliseconds. Must be between 1 and {MAX_SLEEP_DURATION_MS}."
-        ))),
-    )]);
+        )))
+    };
+    let properties = BTreeMap::from([("duration_ms".to_string(), duration_ms)]);
 
     ToolSpec::Namespace(ResponsesApiNamespace {
         name: NAMESPACE.to_string(),
@@ -157,3 +159,26 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
 }
 
 impl CoreToolRuntime for SleepHandler {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sleep_schema_enforces_runtime_integer_range() {
+        let ToolSpec::Namespace(namespace) = create_sleep_tool() else {
+            panic!("sleep must remain a namespace tool");
+        };
+        let ResponsesApiNamespaceTool::Function(tool) = &namespace.tools[0];
+        let schema = serde_json::to_value(&tool.parameters).expect("serialize sleep schema");
+        let validator = jsonschema::validator_for(&schema).expect("compile sleep schema");
+
+        assert!(validator.is_valid(&serde_json::json!({ "duration_ms": 1 })));
+        assert!(validator.is_valid(&serde_json::json!({ "duration_ms": MAX_SLEEP_DURATION_MS })));
+        assert!(!validator.is_valid(&serde_json::json!({ "duration_ms": 0 })));
+        assert!(
+            !validator.is_valid(&serde_json::json!({ "duration_ms": MAX_SLEEP_DURATION_MS + 1 }))
+        );
+        assert!(!validator.is_valid(&serde_json::json!({ "duration_ms": 1.5 })));
+    }
+}

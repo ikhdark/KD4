@@ -46,6 +46,9 @@ const MAX_TOOL_SEARCH_QUERY_BYTES: usize = 4 * 1024;
 const MAX_TOOL_SEARCH_LIMIT: usize = 64;
 const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
 
+#[cfg(test)]
+static LOADABLE_TOOL_SERIALIZATION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Debug, Default)]
 struct ToolSearchTokenizer;
 
@@ -293,6 +296,7 @@ struct ToolSearchCacheEntry {
 #[derive(Clone, Debug, PartialEq)]
 struct ToolSearchResult {
     tools: Vec<LoadableToolSpec>,
+    serialized_tools: Vec<serde_json::Value>,
     omitted_result_count: usize,
     encoded_tools_len: usize,
 }
@@ -301,6 +305,7 @@ impl Default for ToolSearchResult {
     fn default() -> Self {
         Self {
             tools: Vec::new(),
+            serialized_tools: Vec::new(),
             omitted_result_count: 0,
             encoded_tools_len: 2,
         }
@@ -545,6 +550,15 @@ impl ToolSearchHandlerCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn search_infos_for_test(&self) -> Vec<ToolSearchInfo> {
+        self.state()
+            .cached
+            .back()
+            .map(|handler| handler.search_infos.to_vec())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
     fn fingerprint_compute_count(&self) -> usize {
         self.fingerprint_compute_count.load(Ordering::Relaxed)
     }
@@ -733,10 +747,23 @@ impl ToolSearchHandler {
         turn.activate_deferred_tools(result.tools.iter().flat_map(loadable_tool_names));
 
         Ok(boxed_tool_output(ToolSearchOutput {
-            tools: result.tools.clone(),
+            tools: result.serialized_tools.clone(),
             omitted_result_count: result.omitted_result_count,
         }))
     }
+}
+
+fn serialize_loadable_tools(tools: &[LoadableToolSpec]) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            #[cfg(test)]
+            LOADABLE_TOOL_SERIALIZATION_COUNT.fetch_add(1, Ordering::Relaxed);
+            serde_json::to_value(tool).unwrap_or_else(|err| {
+                serde_json::Value::String(format!("failed to serialize tool_search output: {err}"))
+            })
+        })
+        .collect()
 }
 
 fn loadable_tool_names(spec: &LoadableToolSpec) -> Vec<ToolName> {
@@ -848,8 +875,10 @@ impl ToolSearchHandler {
             }
         }
         let (tools, encoded_tools_len) = retained.finish();
+        let serialized_tools = serialize_loadable_tools(&tools);
         Ok(ToolSearchResult {
             tools,
+            serialized_tools,
             omitted_result_count,
             encoded_tools_len,
         })
@@ -1224,6 +1253,38 @@ mod tests {
             ToolSearchTokenizer.tokenize("Launch CALENDAR-events for José"),
             vec!["launch", "calendar", "events", "for", "josé"]
         );
+    }
+
+    #[test]
+    fn cached_results_reuse_serialized_tool_specs() {
+        let handler = ToolSearchHandler::new(vec![search_info(
+            "calendar",
+            None,
+            "calendar",
+            "create_event",
+        )]);
+        LOADABLE_TOOL_SERIALIZATION_COUNT.store(0, Ordering::Relaxed);
+
+        let first = handler.search("calendar", 10).expect("first search");
+        let second = handler.search("calendar", 10).expect("cached search");
+        assert!(Arc::ptr_eq(&first, &second));
+        let output = ToolSearchOutput {
+            tools: second.serialized_tools.clone(),
+            omitted_result_count: 0,
+        };
+        let payload = ToolPayload::ToolSearch {
+            arguments: codex_protocol::models::SearchToolCallParams {
+                query: "calendar".to_string(),
+                limit: None,
+            },
+        };
+        let _ = crate::tools::context::ToolOutput::to_response_item(&output, "call-1", &payload);
+        let _ = crate::tools::context::ToolOutput::code_mode_result(&output, &payload);
+
+        assert_eq!(second.serialized_tools.len(), 1);
+        assert_eq!(second.serialized_tools[0]["type"], "namespace");
+        assert_eq!(second.serialized_tools[0]["name"], "mcp__calendar");
+        assert_eq!(LOADABLE_TOOL_SERIALIZATION_COUNT.load(Ordering::Relaxed), 1);
     }
 
     #[test]

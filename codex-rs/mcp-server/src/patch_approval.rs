@@ -89,7 +89,8 @@ pub(crate) async fn handle_patch_approval_request(
 
     let on_response = outgoing
         .send_request("elicitation/create", Some(params_json))
-        .await;
+        .await
+        .receiver;
 
     // Listen for the response on a separate task so we don't block the main agent loop.
     {

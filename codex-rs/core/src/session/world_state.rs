@@ -89,6 +89,7 @@ impl Session {
             .iter()
             .map(|root| root.selected_root().clone())
             .collect::<Vec<_>>();
+        let previous_world_state = self.state.lock().await.history.world_state_baseline();
         // World-state contributors are independent. Poll them concurrently while preserving
         // registration order, and do not let an optional contributor block the model request.
         let deadline = tokio::time::Instant::now() + EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
@@ -100,6 +101,7 @@ impl Session {
             .iter()
             .enumerate()
         {
+            let owned_section_ids = contributor.world_state_section_ids();
             let input = WorldStateContributionInput {
                 thread_id: self.thread_id(),
                 turn_id: turn_context.sub_id.as_str(),
@@ -115,23 +117,36 @@ impl Session {
                 contributor.contribute_world_state(input)
             };
             pending.push_back(async move {
-                match tokio::time::timeout_at(deadline, contribution).await {
-                    Ok(sections) => sections,
-                    Err(_) => {
-                        tracing::warn!(
-                            contributor_index,
-                            scope = "world_state",
-                            timeout = ?EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT,
-                            "extension context contributor timed out; omitting its sections"
-                        );
-                        Vec::new()
-                    }
-                }
+                (
+                    contributor_index,
+                    owned_section_ids,
+                    tokio::time::timeout_at(deadline, contribution).await,
+                )
             });
         }
-        while let Some(sections) = pending.next().await {
-            for section in sections {
-                world_state.add_extension_section(section);
+        while let Some((contributor_index, owned_section_ids, result)) = pending.next().await {
+            match result {
+                Ok(sections) => {
+                    for section in sections {
+                        world_state.add_extension_section(section);
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        contributor_index,
+                        scope = "world_state",
+                        timeout = ?EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT,
+                        "extension context contributor timed out; preserving its last accepted sections"
+                    );
+                    for id in owned_section_ids {
+                        if let Some(snapshot) = previous_world_state
+                            .as_ref()
+                            .and_then(|previous| previous.section(id))
+                        {
+                            world_state.add_preserved_extension_section(id, snapshot.clone());
+                        }
+                    }
+                }
             }
         }
         world_state

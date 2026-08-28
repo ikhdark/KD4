@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
+use std::sync::Arc;
+use std::sync::Weak;
 use std::time::Duration;
 
 use codex_utils_absolute_path::normalize_for_path_comparison;
@@ -16,8 +18,6 @@ use sha2::Sha256;
 use codex_apply_patch::AppliedPatchChange;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::AppliedPatchFileChange;
-
-use crate::git_workspace::WorkspaceEvidenceIdentity;
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const DEV_NULL: &str = "/dev/null";
@@ -126,47 +126,6 @@ struct DiffCacheKey {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ValidationFreshnessStatus {
-    None,
-    StaleAfterLastMutation,
-    FormatOnly,
-    AdvisoryBroadFilter,
-    ScopedValidationIncomplete,
-    PassedAfterLastMutation,
-    FailedAfterLastMutation,
-    TimedOut,
-}
-
-impl ValidationFreshnessStatus {
-    pub(crate) fn final_warning_message(&self) -> Option<&'static str> {
-        match self {
-            Self::PassedAfterLastMutation => None,
-            Self::None => Some(
-                "Changed files have not been followed by post-change correctness validation. Wiring evidence is separate from tests, builds, and lint; final answers should state what passed, failed, or was skipped.",
-            ),
-            Self::StaleAfterLastMutation => Some(
-                "Changed files were modified after the last successful correctness validation, so that evidence is stale.",
-            ),
-            Self::FormatOnly => Some(
-                "Changed files have only been followed by formatting. Formatting does not prove correctness or runtime reachability.",
-            ),
-            Self::AdvisoryBroadFilter => Some(
-                "Changed files have only been followed by a broad validation filter. Broad filters are advisory and do not prove focused correctness by themselves.",
-            ),
-            Self::ScopedValidationIncomplete => Some(
-                "Successful validation covered only part of the changed-file scope; remaining changed files still need correctness validation.",
-            ),
-            Self::FailedAfterLastMutation => {
-                Some("Changed files were followed by correctness validation that failed.")
-            }
-            Self::TimedOut => {
-                Some("Changed files were followed by correctness validation that timed out.")
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CommandMutation {
     ReadOnly,
     KnownMutation { paths: Option<BTreeSet<PathBuf>> },
@@ -208,13 +167,9 @@ pub struct TurnDiffTracker {
     mutation_revision: u64,
     rendered_diffs: HashMap<DiffCacheKey, Option<String>>,
     unified_diff: Option<String>,
-    unvalidated_paths: HashSet<TrackedPath>,
-    unvalidated_unknown_mutation: bool,
-    has_successful_validation: bool,
-    last_successful_validation_revision: Option<u64>,
-    last_successful_validation_identity: Option<String>,
-    last_validated_workspace_identity: Option<WorkspaceEvidenceIdentity>,
-    last_post_mutation_validation_status: ValidationFreshnessStatus,
+    last_emitted_unified_diff: Option<String>,
+    workspace_evidence_generation_batch:
+        Option<Weak<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>>,
     #[cfg(test)]
     post_edit_inspection_bundle: Option<PostEditInspectionBundle>,
     #[cfg(test)]
@@ -233,13 +188,8 @@ impl Default for TurnDiffTracker {
             mutation_revision: 0,
             rendered_diffs: HashMap::new(),
             unified_diff: None,
-            unvalidated_paths: HashSet::new(),
-            unvalidated_unknown_mutation: false,
-            has_successful_validation: false,
-            last_successful_validation_revision: None,
-            last_successful_validation_identity: None,
-            last_validated_workspace_identity: None,
-            last_post_mutation_validation_status: ValidationFreshnessStatus::None,
+            last_emitted_unified_diff: None,
+            workspace_evidence_generation_batch: None,
             #[cfg(test)]
             post_edit_inspection_bundle: None,
             #[cfg(test)]
@@ -251,6 +201,37 @@ impl Default for TurnDiffTracker {
 impl TurnDiffTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn activate_workspace_evidence_generation_batch(
+        &mut self,
+        batch: &Arc<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>,
+    ) {
+        self.workspace_evidence_generation_batch = Some(Arc::downgrade(batch));
+    }
+
+    pub(crate) fn workspace_evidence_generation_batch_for_call(
+        &self,
+        call_id: &str,
+    ) -> Option<Arc<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>> {
+        self.workspace_evidence_generation_batch
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .filter(|batch| batch.accepts_call(call_id))
+    }
+
+    pub(crate) fn clear_workspace_evidence_generation_batch(
+        &mut self,
+        batch: &Arc<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>,
+    ) {
+        let active_is_batch = self
+            .workspace_evidence_generation_batch
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|active| Arc::ptr_eq(&active, batch));
+        if active_is_batch {
+            self.workspace_evidence_generation_batch = None;
+        }
     }
 
     pub fn with_environment_display_roots(
@@ -266,7 +247,7 @@ impl TurnDiffTracker {
 
     pub fn track_delta(&mut self, environment_id: &str, delta: &AppliedPatchDelta) {
         if !delta.is_empty() {
-            self.record_mutation(paths_touched_by_delta(environment_id, delta));
+            self.record_mutation();
         }
 
         if !self.valid {
@@ -291,7 +272,7 @@ impl TurnDiffTracker {
     }
 
     pub(crate) fn record_unknown_mutation(&mut self) {
-        self.record_mutation(HashSet::new());
+        self.record_mutation();
         self.invalidate();
     }
 
@@ -317,29 +298,19 @@ impl TurnDiffTracker {
 
     pub(crate) fn record_exec_command_end_with_mutation_at(
         &mut self,
-        command: &[String],
-        exit_code: i32,
-        timed_out: bool,
-        environment_id: &str,
-        cwd: Option<&Path>,
+        _command: &[String],
+        _exit_code: i32,
+        _timed_out: bool,
+        _environment_id: &str,
+        _cwd: Option<&Path>,
         mutation: CommandMutation,
     ) {
-        let was_post_mutation = self.has_unvalidated_mutation();
-        let is_validation = is_validation_command(command);
-        let format_only = is_format_only_command(command);
-        let broad_filter = is_broad_validation_filter_command(command);
-        let possible_mutation = mutation.may_have_mutated();
-
-        // A command can write before failing or timing out, so known mutators
-        // always invalidate exact diff/freshness state.
+        // A command can write before failing or timing out, so every observed
+        // mutation advances the generic turn revision and invalidates exact
+        // diff state. Validation currency is owned by task-evidence receipts.
         match mutation {
-            CommandMutation::KnownMutation { paths: Some(paths) } => {
-                self.record_mutation(
-                    paths
-                        .iter()
-                        .map(|path| TrackedPath::new(environment_id, path))
-                        .collect(),
-                );
+            CommandMutation::KnownMutation { paths: Some(_) } => {
+                self.record_mutation();
                 self.invalidate();
             }
             CommandMutation::KnownMutation { paths: None } | CommandMutation::Uncertain => {
@@ -347,106 +318,10 @@ impl TurnDiffTracker {
             }
             CommandMutation::ReadOnly => {}
         }
-
-        let is_post_mutation = was_post_mutation || self.has_unvalidated_mutation();
-
-        if is_post_mutation {
-            self.last_post_mutation_validation_status = if format_only {
-                ValidationFreshnessStatus::FormatOnly
-            } else if timed_out && is_validation {
-                ValidationFreshnessStatus::TimedOut
-            } else if is_validation && exit_code == 0 && broad_filter {
-                ValidationFreshnessStatus::AdvisoryBroadFilter
-            } else if is_validation && exit_code == 0 && possible_mutation {
-                ValidationFreshnessStatus::StaleAfterLastMutation
-            } else if is_validation {
-                ValidationFreshnessStatus::FailedAfterLastMutation
-            } else {
-                self.last_post_mutation_validation_status.clone()
-            };
-        }
-
-        if is_validation && exit_code == 0 && !timed_out && !broad_filter && !possible_mutation {
-            self.has_successful_validation = true;
-            match validation_coverage(command, cwd) {
-                ValidationCoverage::All => {
-                    self.clear_environment_paths(environment_id);
-                    if self.can_clear_unknown_for_environment(environment_id) {
-                        self.unvalidated_unknown_mutation = false;
-                    }
-                }
-                ValidationCoverage::Paths(paths) => {
-                    self.clear_covered_paths(environment_id, &paths);
-                }
-                ValidationCoverage::ScopedUnknown => {}
-            }
-            self.last_post_mutation_validation_status = if self.has_unvalidated_mutation() {
-                ValidationFreshnessStatus::ScopedValidationIncomplete
-            } else {
-                ValidationFreshnessStatus::PassedAfterLastMutation
-            };
-            if self.last_post_mutation_validation_status
-                == ValidationFreshnessStatus::PassedAfterLastMutation
-            {
-                self.last_successful_validation_revision = Some(self.mutation_revision);
-            }
-        }
-    }
-
-    pub(crate) fn has_unvalidated_mutation(&self) -> bool {
-        self.unvalidated_unknown_mutation || !self.unvalidated_paths.is_empty()
     }
 
     pub(crate) fn current_mutation_revision(&self) -> u64 {
         self.mutation_revision
-    }
-
-    pub(crate) fn validation_freshness_status(&self) -> ValidationFreshnessStatus {
-        if self.has_unvalidated_mutation() {
-            self.last_post_mutation_validation_status.clone()
-        } else if self.has_successful_validation {
-            ValidationFreshnessStatus::PassedAfterLastMutation
-        } else {
-            ValidationFreshnessStatus::None
-        }
-    }
-
-    pub(crate) fn last_successful_validation_revision(&self) -> Option<u64> {
-        self.last_successful_validation_revision
-    }
-
-    pub(crate) fn record_workspace_freshness_observation(
-        &mut self,
-        successful_validation_identity: Option<String>,
-        workspace_identity: Option<WorkspaceEvidenceIdentity>,
-    ) {
-        if let Some(validation_identity) = successful_validation_identity {
-            if self.last_post_mutation_validation_status
-                != ValidationFreshnessStatus::PassedAfterLastMutation
-                || self.has_unvalidated_mutation()
-            {
-                return;
-            }
-            self.last_successful_validation_identity = Some(validation_identity);
-            self.last_validated_workspace_identity = workspace_identity;
-            return;
-        }
-        let Some(workspace_identity) = workspace_identity else {
-            return;
-        };
-        if self.last_validated_workspace_identity.as_ref() != Some(&workspace_identity) {
-            return;
-        }
-        self.unvalidated_paths.clear();
-        self.unvalidated_unknown_mutation = false;
-        self.last_successful_validation_revision = Some(self.mutation_revision);
-        self.last_post_mutation_validation_status =
-            ValidationFreshnessStatus::PassedAfterLastMutation;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn last_successful_validation_identity(&self) -> Option<&str> {
-        self.last_successful_validation_identity.as_deref()
     }
 
     #[cfg(test)]
@@ -548,60 +423,24 @@ impl TurnDiffTracker {
         true
     }
 
-    fn clear_covered_paths(&mut self, environment_id: &str, covered_paths: &[PathBuf]) {
-        let covered_paths = covered_paths
-            .iter()
-            .map(|path| normalize_tracked_path(path))
-            .collect::<Vec<_>>();
-        self.unvalidated_paths.retain(|tracked| {
-            tracked.environment_id != environment_id
-                || !covered_paths
-                    .iter()
-                    .any(|covered| tracked.path == *covered || tracked.path.starts_with(covered))
-        });
-    }
-
-    fn clear_environment_paths(&mut self, environment_id: &str) {
-        self.unvalidated_paths
-            .retain(|tracked| tracked.environment_id != environment_id);
-    }
-
-    fn can_clear_unknown_for_environment(&self, environment_id: &str) -> bool {
-        let mut known_environments = self
-            .display_roots_by_environment
-            .keys()
-            .map(String::as_str)
-            .chain(
-                self.unvalidated_paths
-                    .iter()
-                    .map(|tracked| tracked.environment_id.as_str()),
-            )
-            .collect::<HashSet<_>>();
-        known_environments.retain(|known| !known.is_empty());
-        known_environments.is_empty()
-            || (known_environments.len() == 1 && known_environments.contains(environment_id))
-    }
-
     pub fn get_unified_diff(&self) -> Option<String> {
         self.unified_diff.clone()
     }
 
-    pub(crate) fn has_unified_diff(&self) -> bool {
-        self.unified_diff.is_some()
+    /// Returns the latest aggregate only when it differs from the last value
+    /// returned by this method. An empty string represents a previously
+    /// published diff being cleared.
+    pub fn take_unified_diff_if_changed(&mut self) -> Option<String> {
+        if self.unified_diff == self.last_emitted_unified_diff {
+            return None;
+        }
+        self.last_emitted_unified_diff
+            .clone_from(&self.unified_diff);
+        Some(self.unified_diff.clone().unwrap_or_default())
     }
 
-    fn record_mutation(&mut self, paths: HashSet<TrackedPath>) {
+    fn record_mutation(&mut self) {
         self.mutation_revision = self.mutation_revision.saturating_add(1);
-        self.last_post_mutation_validation_status = if self.has_successful_validation {
-            ValidationFreshnessStatus::StaleAfterLastMutation
-        } else {
-            ValidationFreshnessStatus::None
-        };
-        if paths.is_empty() {
-            self.unvalidated_unknown_mutation = true;
-        } else {
-            self.unvalidated_paths.extend(paths);
-        }
     }
 
     fn refresh_unified_diff(&mut self) {
@@ -1000,132 +839,6 @@ fn lexically_normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn paths_touched_by_delta(environment_id: &str, delta: &AppliedPatchDelta) -> HashSet<TrackedPath> {
-    let mut paths = HashSet::new();
-    for change in delta.changes() {
-        paths.insert(TrackedPath::new(environment_id, change.path.as_path()));
-        if let AppliedPatchFileChange::Update {
-            move_path: Some(move_path),
-            ..
-        } = &change.change
-        {
-            paths.insert(TrackedPath::new(environment_id, move_path));
-        }
-    }
-    paths
-}
-
-fn is_validation_command(command: &[String]) -> bool {
-    let tokens = normalized_command_tokens(command);
-    is_validation_tokens(&tokens)
-        || known_powershell_validation_tokens(command)
-            .as_deref()
-            .is_some_and(is_validation_tokens)
-}
-
-fn is_validation_tokens(tokens: &[String]) -> bool {
-    let Some(first) = tokens.first().map(|token| command_basename(token)) else {
-        return false;
-    };
-    if matches!(first, "echo" | "printf" | "write-output" | "#" | "rem") {
-        return false;
-    }
-    if matches!(
-        first,
-        "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe" | "cmd" | "cmd.exe"
-    ) && let Some(position) = tokens
-        .iter()
-        .position(|token| matches!(token.as_str(), "-command" | "-c" | "/c"))
-    {
-        return is_validation_tokens(&tokens[position.saturating_add(1)..]);
-    }
-
-    match first {
-        "just" => matches!(
-            tokens.get(1).map(String::as_str),
-            Some(
-                "test"
-                    | "test-fast"
-                    | "test-lane"
-                    | "test-lane-fast"
-                    | "check"
-                    | "check-lane"
-                    | "fix"
-            )
-        ),
-        "cargo" => matches!(
-            tokens.get(1).map(String::as_str),
-            Some("test" | "nextest" | "check" | "shear" | "audit" | "deny" | "clippy" | "build")
-        ),
-        "nextest" => tokens.get(1).is_some_and(|token| token == "run"),
-        "pytest" | "vitest" | "jest" | "mypy" | "tsc" | "eslint" => true,
-        "python" => {
-            tokens.get(1).is_some_and(|token| token == "-m")
-                && tokens.get(2).is_some_and(|token| token == "pytest")
-        }
-        "uv" => {
-            tokens.get(1).is_some_and(|token| token == "run") && is_validation_tokens(&tokens[2..])
-        }
-        "ruff" => tokens.get(1).is_some_and(|token| token == "check"),
-        "playwright" => tokens.get(1).is_some_and(|token| token == "test"),
-        "go" | "mvn" | "gradle" => tokens.get(1).is_some_and(|token| token == "test"),
-        "dotnet" => tokens
-            .get(1)
-            .is_some_and(|token| matches!(token.as_str(), "test" | "build")),
-        "npm" | "pnpm" | "yarn" => tokens.iter().skip(1).take(2).any(|token| {
-            token.contains("test")
-                || token.contains("lint")
-                || token.contains("typecheck")
-                || token.contains("build")
-        }),
-        _ => false,
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum ValidationCoverage {
-    All,
-    Paths(Vec<PathBuf>),
-    ScopedUnknown,
-}
-
-fn validation_coverage(command: &[String], cwd: Option<&Path>) -> ValidationCoverage {
-    let tokens = normalized_command_tokens(command);
-    let tokens = unwrap_command_tokens(&tokens);
-    let Some(first) = tokens.first().map(|token| command_basename(token)) else {
-        return ValidationCoverage::ScopedUnknown;
-    };
-
-    match first {
-        "uv" if tokens.get(1).is_some_and(|token| token == "run") => {
-            validation_coverage_for_tokens(&tokens[2..], cwd)
-        }
-        _ => validation_coverage_for_tokens(tokens, cwd),
-    }
-}
-
-fn validation_coverage_for_tokens(tokens: &[String], cwd: Option<&Path>) -> ValidationCoverage {
-    let Some(first) = tokens.first().map(|token| command_basename(token)) else {
-        return ValidationCoverage::ScopedUnknown;
-    };
-    match first {
-        "cargo" => cargo_validation_coverage(tokens, cwd),
-        "just" => just_validation_coverage(tokens, cwd),
-        "pytest" => pytest_validation_coverage(tokens, cwd),
-        "python"
-            if tokens.get(1).is_some_and(|token| token == "-m")
-                && tokens.get(2).is_some_and(|token| token == "pytest") =>
-        {
-            pytest_validation_coverage(&tokens[2..], cwd)
-        }
-        "eslint" | "mypy" | "playwright" | "vitest" | "jest" | "ruff" => {
-            path_validation_coverage(tokens, cwd, &[])
-        }
-        "tsc" => project_flag_coverage(tokens, cwd),
-        _ => ValidationCoverage::ScopedUnknown,
-    }
-}
-
 fn unwrap_command_tokens(tokens: &[String]) -> &[String] {
     let Some(first) = tokens.first().map(|token| command_basename(token)) else {
         return tokens;
@@ -1147,341 +860,6 @@ fn unwrap_command_tokens(tokens: &[String]) -> &[String] {
         return &tokens[position.saturating_add(1)..];
     }
     tokens
-}
-
-fn cargo_validation_coverage(tokens: &[String], cwd: Option<&Path>) -> ValidationCoverage {
-    if tokens
-        .get(1)
-        .is_some_and(|subcommand| matches!(subcommand.as_str(), "audit" | "deny" | "shear"))
-    {
-        return ValidationCoverage::ScopedUnknown;
-    }
-    if let Some(path) = flag_value(tokens, &["--manifest-path"]) {
-        let manifest = resolve_scope_path(path, cwd);
-        return ValidationCoverage::Paths(vec![
-            manifest
-                .parent()
-                .unwrap_or(manifest.as_path())
-                .to_path_buf(),
-        ]);
-    }
-    if let Some(package) = flag_value(tokens, &["-p", "--package"]) {
-        return package_validation_coverage(package, cwd);
-    }
-    if [
-        "--test",
-        "--tests",
-        "--bin",
-        "--bins",
-        "--example",
-        "--examples",
-        "--lib",
-        "--bench",
-        "--benches",
-        "--doc",
-        "--exclude",
-        "--no-run",
-        "--exact",
-        "--ignored",
-        "--skip",
-        "--filter-expr",
-        "--run-ignored",
-        "--partition",
-    ]
-    .iter()
-    .any(|flag| has_flag(tokens, flag))
-        || has_short_attached_value(tokens, "-E")
-    {
-        return ValidationCoverage::ScopedUnknown;
-    }
-
-    let subcommand_index = if tokens.get(1).is_some_and(|token| token == "nextest") {
-        2
-    } else {
-        1
-    };
-    if tokens
-        .iter()
-        .skip(subcommand_index + 1)
-        .any(|token| !token.starts_with('-') && token != "--")
-    {
-        ValidationCoverage::ScopedUnknown
-    } else {
-        ValidationCoverage::All
-    }
-}
-
-fn just_validation_coverage(tokens: &[String], cwd: Option<&Path>) -> ValidationCoverage {
-    let Some(recipe) = tokens.get(1).map(String::as_str) else {
-        return ValidationCoverage::ScopedUnknown;
-    };
-    if let Some(package) = flag_value(tokens, &["-p", "--package"]) {
-        return package_validation_coverage(package, cwd);
-    }
-    if matches!(recipe, "test-lane-package" | "check-lane" | "fix-lane") {
-        if let Some(package) = tokens.iter().skip(2).find(|token| !token.starts_with('-')) {
-            return package_validation_coverage(package, cwd);
-        }
-        return ValidationCoverage::ScopedUnknown;
-    }
-    if matches!(recipe, "test-lane" | "test-lane-fast") {
-        return ValidationCoverage::ScopedUnknown;
-    }
-    if tokens
-        .iter()
-        .any(|token| matches!(token.as_str(), "-e" | "--filter-expr"))
-    {
-        return ValidationCoverage::ScopedUnknown;
-    }
-    if matches!(recipe, "test" | "test-fast" | "check") && tokens.len() == 2 {
-        ValidationCoverage::All
-    } else {
-        ValidationCoverage::ScopedUnknown
-    }
-}
-
-fn package_validation_coverage(package: &str, cwd: Option<&Path>) -> ValidationCoverage {
-    let Some(cwd) = cwd else {
-        return ValidationCoverage::ScopedUnknown;
-    };
-    find_package_directory(package, cwd)
-        .map(|path| ValidationCoverage::Paths(vec![path]))
-        .unwrap_or(ValidationCoverage::ScopedUnknown)
-}
-
-fn find_package_directory(package: &str, cwd: &Path) -> Option<PathBuf> {
-    crate::tool_history::find_cargo_package_directory(package, cwd)
-        .map(|path| normalize_tracked_path(&path))
-}
-
-#[cfg(test)]
-fn find_package_directory_with_manifest_reader(
-    package: &str,
-    cwd: &Path,
-    read_manifest: impl FnMut(&Path) -> Option<String>,
-) -> Option<PathBuf> {
-    crate::tool_history::find_cargo_package_directory_with_manifest_reader(
-        package,
-        cwd,
-        read_manifest,
-    )
-    .map(|path| normalize_tracked_path(&path))
-}
-
-fn path_validation_coverage(
-    tokens: &[String],
-    cwd: Option<&Path>,
-    scoped_flags: &[&str],
-) -> ValidationCoverage {
-    if tokens
-        .iter()
-        .any(|token| scoped_flags.iter().any(|flag| token == flag))
-    {
-        return ValidationCoverage::ScopedUnknown;
-    }
-    let positional = tokens
-        .iter()
-        .skip(1)
-        .filter(|token| !token.starts_with('-'))
-        .collect::<Vec<_>>();
-    let paths = positional
-        .iter()
-        .filter(|token| looks_like_scope_path(token))
-        .map(|path| resolve_scope_path(path, cwd))
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
-        if positional.is_empty() {
-            ValidationCoverage::All
-        } else {
-            ValidationCoverage::ScopedUnknown
-        }
-    } else {
-        ValidationCoverage::Paths(paths)
-    }
-}
-
-fn pytest_validation_coverage(tokens: &[String], cwd: Option<&Path>) -> ValidationCoverage {
-    if ["-k", "-m", "--lf"]
-        .iter()
-        .any(|flag| has_flag(tokens, flag))
-        || ["--ignore", "--ignore-glob", "--deselect"]
-            .iter()
-            .any(|flag| has_flag(tokens, flag))
-    {
-        return ValidationCoverage::ScopedUnknown;
-    }
-
-    let mut positional = Vec::new();
-    let mut skip_next = false;
-    for token in tokens.iter().skip(1) {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if token.starts_with('-') {
-            if !token.contains('=')
-                && matches!(
-                    token.as_str(),
-                    "-c" | "-o"
-                        | "--basetemp"
-                        | "--confcutdir"
-                        | "--rootdir"
-                        | "--junitxml"
-                        | "--override-ini"
-                )
-            {
-                skip_next = true;
-            }
-            continue;
-        }
-        positional.push(token);
-    }
-    let paths = positional
-        .iter()
-        .filter(|token| looks_like_scope_path(token))
-        .map(|path| resolve_scope_path(path, cwd))
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
-        if positional.is_empty() {
-            ValidationCoverage::All
-        } else {
-            ValidationCoverage::ScopedUnknown
-        }
-    } else {
-        ValidationCoverage::Paths(paths)
-    }
-}
-
-fn project_flag_coverage(tokens: &[String], cwd: Option<&Path>) -> ValidationCoverage {
-    flag_value(tokens, &["-p", "--project"]).map_or(ValidationCoverage::All, |path| {
-        ValidationCoverage::Paths(vec![resolve_scope_path(path, cwd)])
-    })
-}
-
-fn flag_value<'a>(tokens: &'a [String], flags: &[&str]) -> Option<&'a str> {
-    if let Some(value) = tokens.iter().find_map(|token| {
-        flags.iter().find_map(|flag| {
-            token
-                .strip_prefix(flag)
-                .and_then(|suffix| suffix.strip_prefix('='))
-        })
-    }) {
-        return Some(value);
-    }
-    if let Some(value) = tokens.iter().find_map(|token| {
-        flags
-            .iter()
-            .filter(|flag| flag.len() == 2)
-            .find_map(|flag| {
-                token
-                    .strip_prefix(flag)
-                    .filter(|suffix| !suffix.is_empty() && !suffix.starts_with('='))
-            })
-    }) {
-        return Some(value);
-    }
-    tokens.windows(2).find_map(|window| match window {
-        [flag, value] if flags.iter().any(|candidate| flag == candidate) => Some(value.as_str()),
-        _ => None,
-    })
-}
-
-fn has_flag(tokens: &[String], flag: &str) -> bool {
-    tokens
-        .iter()
-        .any(|token| token == flag || token.starts_with(&format!("{flag}=")))
-}
-
-fn has_short_attached_value(tokens: &[String], flag: &str) -> bool {
-    tokens.iter().any(|token| {
-        token
-            .get(..flag.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(flag))
-            && token
-                .get(flag.len()..)
-                .is_some_and(|suffix| !suffix.is_empty() && !suffix.starts_with('='))
-    })
-}
-
-fn resolve_scope_path(path: &str, cwd: Option<&Path>) -> PathBuf {
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        path
-    } else {
-        cwd.map_or(path.clone(), |cwd| cwd.join(path))
-    }
-}
-
-fn looks_like_scope_path(token: &str) -> bool {
-    token.contains('/')
-        || token.contains('\\')
-        || Path::new(token).extension().is_some()
-        || matches!(token, "." | "..")
-}
-
-fn is_broad_validation_filter_command(command: &[String]) -> bool {
-    if !is_validation_command(command) {
-        return false;
-    }
-    let expression = command
-        .windows(2)
-        .find_map(|window| match window {
-            [flag, expression]
-                if flag.eq_ignore_ascii_case("-e")
-                    || flag.eq_ignore_ascii_case("--filter-expr") =>
-            {
-                Some(expression.clone())
-            }
-            _ => None,
-        })
-        .or_else(|| {
-            command
-                .iter()
-                .find_map(|token| attached_filter_expression(token))
-        })
-        .or_else(|| {
-            let tokens = shell_filter_tokens(&command.join(" "));
-            tokens
-                .windows(2)
-                .find_map(|window| match window {
-                    [flag, expression]
-                        if flag.eq_ignore_ascii_case("-e")
-                            || flag.eq_ignore_ascii_case("--filter-expr") =>
-                    {
-                        Some(expression.clone())
-                    }
-                    _ => None,
-                })
-                .or_else(|| {
-                    tokens
-                        .iter()
-                        .find_map(|token| attached_filter_expression(token))
-                })
-        });
-    let Some(expression) = expression else {
-        return false;
-    };
-    let expression = expression.to_ascii_lowercase();
-    expression.contains('|')
-        || expression.contains(" or ")
-        || expression.contains("package(")
-        || expression.contains("kind(")
-        || expression.contains("all()")
-}
-
-fn attached_filter_expression(token: &str) -> Option<String> {
-    if let Some((flag, expression)) = token.split_once('=')
-        && flag.eq_ignore_ascii_case("--filter-expr")
-        && !expression.is_empty()
-    {
-        return Some(expression.to_string());
-    }
-    token
-        .get(..2)
-        .filter(|flag| flag.eq_ignore_ascii_case("-e"))
-        .and_then(|_| token.get(2..))
-        .filter(|expression| !expression.is_empty())
-        .map(str::to_string)
 }
 
 fn is_format_only_command(command: &[String]) -> bool {
@@ -1509,9 +887,6 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
                 && matches!(second.as_str(), "fix" | "fix-lane" | "fix-workspace" | "fmt")
     );
     if mutating_format || mutating_just_recipe {
-        return true;
-    }
-    if validation_command_may_mutate(unwrapped) {
         return true;
     }
     if let Some(subcommand) = git_subcommand(unwrapped) {
@@ -1641,12 +1016,9 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
         return false;
     }
 
-    // Mutation freshness must fail closed. The command-safety classifier above
-    // proves known inspection commands read-only, and validation commands are
-    // separately recognized by their exact runners. Any remaining executable
-    // may be an arbitrary script or generator, so treating it as read-only can
-    // leave stale source evidence live after an edit.
-    !is_validation_command(command)
+    // Mutation tracking fails closed for every command that ordinary safety
+    // classification has not proven read-only.
+    true
 }
 
 fn is_direct_file_read_command(command: &[String], unwrapped: &[String]) -> bool {
@@ -1880,8 +1252,7 @@ pub(crate) fn resolve_uncertain_command_observation(
 fn is_known_mutating_command(command: &[String]) -> bool {
     let normalized = normalized_command_tokens(command);
     let unwrapped = unwrap_command_tokens(&normalized);
-    if validation_command_may_mutate(unwrapped)
-        || (is_format_only_command(command) && !unwrapped.iter().any(|token| token == "--check"))
+    if (is_format_only_command(command) && !unwrapped.iter().any(|token| token == "--check"))
         || matches!(
             unwrapped,
             [first, second, ..]
@@ -1976,48 +1347,6 @@ pub(crate) fn command_reads_repository_history(command: &[String]) -> bool {
         && !unwrapped
             .iter()
             .any(|token| matches!(token.as_str(), "-g" | "--walk-reflogs" | "--reflog"))
-}
-
-fn validation_command_may_mutate(tokens: &[String]) -> bool {
-    let tokens = if matches!(tokens, [first, second, ..] if first == "uv" && second == "run") {
-        &tokens[2..]
-    } else {
-        tokens
-    };
-    let Some(first) = tokens.first().map(|token| command_basename(token)) else {
-        return false;
-    };
-    if matches!(first, "npm" | "pnpm" | "yarn") && is_validation_tokens(tokens) {
-        // Package scripts are arbitrary programs even when their names contain
-        // `test`, `lint`, or `build`; they may update snapshots or generated files.
-        return true;
-    }
-    if first == "eslint"
-        && tokens
-            .iter()
-            .any(|token| token == "--fix" || token.starts_with("--fix="))
-    {
-        return true;
-    }
-    if first == "ruff"
-        && tokens.iter().any(|token| {
-            matches!(token.as_str(), "--fix" | "--fix-only") || token.starts_with("--fix=")
-        })
-    {
-        return true;
-    }
-    matches!(first, "jest" | "vitest" | "playwright" | "pytest")
-        && tokens.iter().any(|token| {
-            token == "-u"
-                || matches!(
-                    token.as_str(),
-                    "--update-snapshot"
-                        | "--update-snapshots"
-                        | "--updatesnapshot"
-                        | "--snapshot-update"
-                )
-                || (token.contains("snapshot") && token.contains("update"))
-        })
 }
 
 fn git_subcommand(tokens: &[String]) -> Option<&str> {
@@ -2172,28 +1501,6 @@ fn normalized_command_tokens(command: &[String]) -> Vec<String> {
 fn command_basename(token: &str) -> &str {
     let basename = token.rsplit(['/', '\\']).next().unwrap_or(token);
     basename.strip_suffix(".exe").unwrap_or(basename)
-}
-
-fn known_powershell_validation_tokens(command: &[String]) -> Option<Vec<String>> {
-    let script = command.join("\n");
-    let lower = script.to_ascii_lowercase();
-    if !(lower.contains("$lastexitcode") && lower.contains("exit $code")) {
-        return None;
-    }
-    script.lines().find_map(|line| {
-        let lower = line.trim().to_ascii_lowercase();
-        if !(lower.starts_with("$out = &") || lower.starts_with("$output = &")) {
-            return None;
-        }
-        let (_, command) = line.split_once('&')?;
-        Some(
-            shell_filter_tokens(command)
-                .into_iter()
-                .map(|token| token.to_ascii_lowercase())
-                .filter(|token| token != "2>&1" && token != "2>&")
-                .collect(),
-        )
-    })
 }
 
 fn shell_filter_tokens(command: &str) -> Vec<String> {

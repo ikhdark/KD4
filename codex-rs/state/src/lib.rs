@@ -18,7 +18,6 @@ mod migrations;
 mod model;
 mod runtime;
 mod telemetry;
-mod validation_history;
 
 pub use model::LogEntry;
 pub use model::LogQuery;
@@ -26,11 +25,6 @@ pub use model::LogRow;
 pub use model::Phase2JobClaimOutcome;
 /// Preferred entrypoint: owns configuration and metrics.
 pub use runtime::StateRuntime;
-pub use validation_history::ValidationHistoryAggregate;
-pub use validation_history::ValidationHistoryKey;
-pub use validation_history::ValidationHistoryObservation;
-pub use validation_history::ValidationHistoryScope;
-pub use validation_history::ValidationHistoryStore;
 
 pub use audit::ThreadStateAuditRow;
 pub use audit::read_thread_state_audit_rows;
@@ -40,6 +34,7 @@ pub use bugs::BugCreateParams;
 pub use bugs::BugCreateResult;
 pub use bugs::BugFailureCategory;
 pub use bugs::BugStore;
+pub use extract::ThreadMetadataRolloutReducer;
 /// Low-level storage engine: useful for focused tests.
 ///
 /// Most consumers should prefer [`StateRuntime`].
@@ -135,6 +130,8 @@ pub const DB_FALLBACK_METRIC: &str = "codex.sqlite.fallback.count";
 
 #[cfg(test)]
 mod module_consolidation_tests {
+    use std::path::Path;
+
     #[test]
     fn runtime_owns_its_file_timestamp_helper() {
         let state_lib = include_str!("lib.rs");
@@ -143,5 +140,23 @@ mod module_consolidation_tests {
 
         assert!(!state_lib.contains(&obsolete_paths_module));
         assert!(runtime.contains("async fn file_modified_time_utc"));
+    }
+
+    #[test]
+    fn validation_history_is_migration_only() {
+        let state_lib = include_str!("lib.rs");
+        let runtime = include_str!("runtime.rs");
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let obsolete_module = ["mod validation_", "history;"].concat();
+        let obsolete_store = ["ValidationHistory", "Store"].concat();
+
+        assert!(!state_lib.contains(&obsolete_module));
+        assert!(!runtime.contains(&obsolete_store));
+        assert!(!manifest_dir.join("src/validation_history.rs").exists());
+        assert!(
+            manifest_dir
+                .join("migrations/0041_validation_history.sql")
+                .is_file()
+        );
     }
 }

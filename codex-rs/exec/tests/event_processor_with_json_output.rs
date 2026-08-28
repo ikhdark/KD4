@@ -416,6 +416,64 @@ fn web_search_completion_preserves_query_and_action() {
 }
 
 #[test]
+fn web_search_completion_preserves_page_actions() {
+    let cases = [
+        (
+            ApiWebSearchAction::OpenPage {
+                url: Some("https://example.com/docs".to_string()),
+            },
+            WebSearchAction::OpenPage {
+                url: Some("https://example.com/docs".to_string()),
+            },
+        ),
+        (
+            ApiWebSearchAction::FindInPage {
+                url: Some("https://example.com/docs".to_string()),
+                pattern: Some("async fn".to_string()),
+            },
+            WebSearchAction::FindInPage {
+                url: Some("https://example.com/docs".to_string()),
+                pattern: Some("async fn".to_string()),
+            },
+        ),
+    ];
+
+    for (api_action, expected_action) in cases {
+        let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+
+        let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
+            ItemCompletedNotification {
+                item: ThreadItem::WebSearch(ApiWebSearchItem {
+                    id: "search-1".to_string(),
+                    query: "rust async await".to_string(),
+                    action: Some(api_action),
+                }),
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                completed_at_ms: 0,
+            },
+        ));
+
+        assert_eq!(
+            collected,
+            CollectedThreadEvents {
+                events: vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                    item: ExecThreadItem {
+                        id: "item_0".to_string(),
+                        details: ThreadItemDetails::WebSearch(WebSearchItem {
+                            id: "search-1".to_string(),
+                            query: "rust async await".to_string(),
+                            action: expected_action,
+                        }),
+                    },
+                })],
+                status: CodexStatus::Running,
+            }
+        );
+    }
+}
+
+#[test]
 fn web_search_start_and_completion_reuse_item_id() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
 

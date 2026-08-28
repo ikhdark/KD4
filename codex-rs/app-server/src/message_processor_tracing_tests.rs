@@ -1,6 +1,8 @@
 use super::ConnectionSessionState;
 use super::MessageProcessor;
 use super::MessageProcessorArgs;
+use super::notification_log_metadata;
+use super::serialized_request_queue_bytes;
 use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
 use crate::outgoing_message::ConnectionId;
@@ -17,6 +19,7 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::InitializeResponse;
+use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadStartParams;
@@ -51,6 +54,8 @@ use opentelemetry_sdk::trace::InMemorySpanExporter;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::trace::SpanData;
 use pretty_assertions::assert_eq;
+use serde::Serialize;
+use serde::Serializer;
 use serde_json::json;
 use serial_test::serial;
 use std::collections::BTreeMap;
@@ -60,6 +65,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tracing_subscriber::layer::SubscriberExt;
@@ -67,6 +74,46 @@ use wiremock::MockServer;
 
 const TEST_CONNECTION_ID: ConnectionId = ConnectionId(7);
 const SECOND_TEST_CONNECTION_ID: ConnectionId = ConnectionId(8);
+
+#[test]
+fn logging_contract_notification_metadata_is_bounded_and_omits_params() {
+    let notification = JSONRPCNotification {
+        method: format!("{}é", "m".repeat(127)),
+        params: Some(json!({"secret": "notification secret"})),
+    };
+
+    let metadata = notification_log_metadata(TEST_CONNECTION_ID, &notification);
+
+    assert_eq!(metadata.connection_id, TEST_CONNECTION_ID);
+    assert_eq!(metadata.method, "m".repeat(127));
+    assert!(metadata.method_truncated);
+    assert!(metadata.params_present);
+    assert!(metadata.method.len() <= 128);
+    assert!(!format!("{metadata:?}").contains("notification secret"));
+}
+
+struct SerializationProbe<'a>(&'a AtomicUsize);
+
+impl Serialize for SerializationProbe<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        serializer.serialize_bool(true)
+    }
+}
+
+#[test]
+fn unqueued_request_skips_request_size_serialization() {
+    let serializations = AtomicUsize::new(0);
+    let probe = SerializationProbe(&serializations);
+
+    assert_eq!(serialized_request_queue_bytes(false, &probe), 0);
+    assert_eq!(serializations.load(Ordering::Relaxed), 0);
+    assert!(serialized_request_queue_bytes(true, &probe) > 0);
+    assert_eq!(serializations.load(Ordering::Relaxed), 1);
+}
 
 struct TestTracing {
     exporter: InMemorySpanExporter,
@@ -1021,6 +1068,7 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                     runtime_workspace_roots: None,
                     approval_policy: None,
                     sandbox_policy: None,
+                    permission_profile: None,
                     permissions: None,
                     approvals_reviewer: None,
                     model: None,

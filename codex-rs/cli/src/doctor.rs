@@ -55,7 +55,6 @@ use codex_login::load_auth_dot_json;
 use codex_model_provider::create_model_provider;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::protocol::AskForApproval;
-use codex_terminal_detection::Multiplexer;
 use codex_terminal_detection::TerminalInfo;
 use codex_terminal_detection::TerminalName;
 use codex_terminal_detection::terminal_info;
@@ -120,21 +119,9 @@ const REMOTE_TERMINAL_ENV_VARS: &[&str] = &[
     "SSH_TTY",
     "SSH_CONNECTION",
     "SSH_CLIENT",
-    "MOSH_IP",
-    "WSL_DISTRO_NAME",
-    "WSL_INTEROP",
     "VSCODE_INJECTION",
     "VSCODE_IPC_HOOK_CLI",
-    "WAYLAND_DISPLAY",
-    "DISPLAY",
     "WT_SESSION",
-];
-const TMUX_OPTION_NAMES: &[&str] = &[
-    "extended-keys",
-    "xterm-keys",
-    "allow-passthrough",
-    "set-clipboard",
-    "focus-events",
 ];
 const NARROW_TERMINAL_COLUMNS: u16 = 80;
 const NARROW_TERMINAL_ROWS: u16 = 24;
@@ -341,6 +328,9 @@ async fn build_report(
     }));
     checks.push(run_sync_check("runtime", progress.clone(), runtime_check));
     if let Some(local_target) = runtime::local_publish_target_path() {
+        let expected_codex_home = find_codex_home()
+            .ok()
+            .map(codex_utils_absolute_path::AbsolutePathBuf::into_path_buf);
         checks.push(
             run_async_check(
                 "local publish",
@@ -354,7 +344,11 @@ async fn build_report(
             run_async_check(
                 "desktop",
                 progress.clone(),
-                runtime::desktop_runtime_chain_check(local_target, !command.summary),
+                runtime::desktop_runtime_chain_check(
+                    local_target,
+                    expected_codex_home,
+                    !command.summary,
+                ),
             )
             .await,
         );
@@ -1687,7 +1681,6 @@ struct TerminalCheckInputs {
     stderr_is_terminal: bool,
     stream_supports_color: bool,
     terminal_size: Result<(u16, u16), String>,
-    tmux_details: Vec<String>,
     windows_console_details: Vec<String>,
 }
 
@@ -1697,11 +1690,6 @@ impl TerminalCheckInputs {
         let (env, present_env) = collect_env_snapshot(&names);
         let terminal_size = crossterm::terminal::size().map_err(|err| err.to_string());
         let info = terminal_info();
-        let tmux_details = if matches!(info.multiplexer, Some(Multiplexer::Tmux { .. })) {
-            tmux_diagnostic_details()
-        } else {
-            Vec::new()
-        };
         let windows_console_details = windows_console_details();
         Self {
             info,
@@ -1713,7 +1701,6 @@ impl TerminalCheckInputs {
             stderr_is_terminal: std::io::stderr().is_terminal(),
             stream_supports_color: supports_color::on(Stream::Stdout).is_some(),
             terminal_size,
-            tmux_details,
             windows_console_details,
         }
     }
@@ -1784,9 +1771,6 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
     if let Some(term) = info.term.as_deref() {
         details.push(format!("TERM: {term}"));
     }
-    if let Some(multiplexer) = info.multiplexer.as_ref() {
-        details.push(format!("multiplexer: {}", multiplexer_name(multiplexer)));
-    }
     details.push(format!("stdin is terminal: {}", inputs.stdin_is_terminal));
     details.push(format!("stdout is terminal: {}", inputs.stdout_is_terminal));
     details.push(format!("stderr is terminal: {}", inputs.stderr_is_terminal));
@@ -1803,7 +1787,6 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
         details.push(format!("effective locale: {locale}"));
     }
     push_presence_env_values(&mut details, &inputs, REMOTE_TERMINAL_ENV_VARS);
-    details.extend(inputs.tmux_details.iter().cloned());
     details.extend(inputs.windows_console_details.iter().cloned());
 
     let locale_warning = locale.as_deref().is_some_and(is_non_utf8_locale);
@@ -1865,33 +1848,13 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
 
 fn terminal_name(info: &TerminalInfo) -> &'static str {
     match info.name {
-        TerminalName::AppleTerminal => "Apple Terminal",
-        TerminalName::Ghostty => "Ghostty",
-        TerminalName::Iterm2 => "iTerm2",
         TerminalName::WarpTerminal => "Warp",
         TerminalName::VsCode => "VS Code",
         TerminalName::WezTerm => "WezTerm",
-        TerminalName::Kitty => "kitty",
         TerminalName::Alacritty => "Alacritty",
-        TerminalName::Konsole => "Konsole",
-        TerminalName::GnomeTerminal => "GNOME Terminal",
-        TerminalName::Vte => "VTE",
         TerminalName::WindowsTerminal => "Windows Terminal",
         TerminalName::Dumb => "dumb",
         TerminalName::Unknown => "unknown",
-    }
-}
-
-fn multiplexer_name(multiplexer: &Multiplexer) -> String {
-    match multiplexer {
-        Multiplexer::Tmux { version } => match version {
-            Some(version) => format!("tmux {version}"),
-            None => "tmux".to_string(),
-        },
-        Multiplexer::Zellij { version } => match version {
-            Some(version) => format!("zellij {version}"),
-            None => "zellij".to_string(),
-        },
     }
 }
 
@@ -2090,50 +2053,6 @@ fn terminal_size_issues(inputs: &TerminalCheckInputs) -> Vec<DoctorIssue> {
     }
 
     issues
-}
-
-fn tmux_diagnostic_details() -> Vec<String> {
-    let mut details = Vec::new();
-    push_tmux_display_detail(&mut details, "tmux client termtype", "#{client_termtype}");
-    push_tmux_display_detail(&mut details, "tmux client termname", "#{client_termname}");
-    for option in TMUX_OPTION_NAMES {
-        let value = tmux_option_value(option).unwrap_or_else(|| "unavailable".to_string());
-        details.push(format!("tmux {option}: {value}"));
-    }
-    details
-}
-
-fn push_tmux_display_detail(details: &mut Vec<String>, label: &str, format: &str) {
-    if let Some(value) = tmux_display_message(format) {
-        details.push(format!("{label}: {value}"));
-    }
-}
-
-fn tmux_option_value(option: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["show-options", "-gqv", option])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    non_empty_trimmed(String::from_utf8(output.stdout).ok()?)
-}
-
-fn tmux_display_message(format: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["display-message", "-p", format])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    non_empty_trimmed(String::from_utf8(output.stdout).ok()?)
-}
-
-fn non_empty_trimmed(value: String) -> Option<String> {
-    let value = value.trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
 }
 
 async fn state_check(config: &Config) -> DoctorCheck {
@@ -4044,7 +3963,6 @@ mod tests {
                 term_program: None,
                 version: None,
                 term: Some("xterm-256color".to_string()),
-                multiplexer: None,
             },
             env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
             present_env: BTreeSet::from(["TERM".to_string()]),
@@ -4054,7 +3972,6 @@ mod tests {
             stderr_is_terminal: true,
             stream_supports_color: true,
             terminal_size: Ok((120, 40)),
-            tmux_details: Vec::new(),
             windows_console_details: Vec::new(),
         }
     }
@@ -4214,17 +4131,6 @@ mod tests {
         assert!(details[1].starts_with("console output code page: "));
         assert!(details[2].starts_with("stdout console mode: "));
         assert!(details[3].starts_with("stderr console mode: "));
-    }
-
-    #[test]
-    fn terminal_check_keeps_tmux_probe_failures_non_fatal() {
-        let mut inputs = terminal_inputs();
-        inputs.info.multiplexer = Some(Multiplexer::Tmux { version: None });
-
-        let check = terminal_check_from_inputs(inputs);
-
-        assert_eq!(check.status, CheckStatus::Ok);
-        assert_eq!(check.summary, "terminal metadata was detected");
     }
 
     #[test]

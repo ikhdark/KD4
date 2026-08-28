@@ -1,9 +1,9 @@
 //! Local hard-delete support for persisted threads.
 //!
-//! Existing rollout files are deleted before this operation reports success. A rollout file that
-//! vanishes after discovery counts as already deleted. SQLite cleanup happens at the app-server
-//! layer after every associated rollout has been removed so failed deletes can be retried.
+//! Local rollout removal can be staged so callers that also own SQLite state have one logical
+//! commit point. Staged files are restored on drop until the caller commits the deletion.
 
+#[cfg(test)]
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
@@ -22,30 +22,174 @@ use crate::DeleteThreadParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
+#[derive(Debug)]
+struct StagedRolloutFile {
+    original_path: PathBuf,
+    staged_path: PathBuf,
+}
+
+/// A rollback guard for one or more local thread rollout deletions.
+///
+/// Dropping an uncommitted guard restores every staged rollout. Committing keeps the rollout paths
+/// undiscoverable, then performs compatibility-index and recorder cleanup on a best-effort basis.
+#[derive(Debug)]
+pub struct StagedThreadDelete<'a> {
+    store: &'a LocalThreadStore,
+    thread_ids: Vec<codex_protocol::ThreadId>,
+    found_thread_ids: Vec<codex_protocol::ThreadId>,
+    staged_files: Vec<StagedRolloutFile>,
+    staging_dir: Option<tempfile::TempDir>,
+    committed: bool,
+}
+
+impl StagedThreadDelete<'_> {
+    pub fn found_thread(&self, thread_id: codex_protocol::ThreadId) -> bool {
+        self.found_thread_ids.contains(&thread_id)
+    }
+
+    pub async fn commit(mut self) {
+        self.committed = true;
+        for thread_id in &self.thread_ids {
+            if let Err(err) =
+                remove_thread_name_entries(self.store.config.codex_home.as_path(), *thread_id).await
+            {
+                tracing::warn!(
+                    "failed to delete thread name index entries for {thread_id} after committing thread deletion: {err}"
+                );
+            }
+        }
+
+        {
+            let mut live_recorders = self.store.live_recorders.lock().await;
+            for thread_id in &self.thread_ids {
+                live_recorders.remove(thread_id);
+            }
+        }
+
+        let mut projections = self.store.projections.lock().await;
+        for thread_id in &self.thread_ids {
+            projections.remove(thread_id);
+        }
+    }
+
+    fn restore(&mut self) {
+        for staged in self.staged_files.iter().rev() {
+            if !staged.staged_path.exists() {
+                continue;
+            }
+            if let Err(err) = std::fs::rename(&staged.staged_path, &staged.original_path) {
+                tracing::error!(
+                    "failed to restore staged rollout `{}` to `{}`: {err}",
+                    staged.staged_path.display(),
+                    staged.original_path.display()
+                );
+            }
+        }
+    }
+}
+
+impl Drop for StagedThreadDelete<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.restore();
+        }
+    }
+}
+
 pub(super) async fn delete_thread(
     store: &LocalThreadStore,
     params: DeleteThreadParams,
 ) -> ThreadStoreResult<()> {
     let thread_id = params.thread_id;
-    let rollout_paths = rollout_paths(store, thread_id).await?;
-
-    let found_rollout_path = !rollout_paths.is_empty();
-    for rollout_path in rollout_paths {
-        delete_rollout_file(store, rollout_path.as_path(), thread_id)?;
-    }
-    remove_thread_name_entries(store.config.codex_home.as_path(), thread_id)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to delete thread name index entries for {thread_id}: {err}"),
-        })?;
-
-    if !found_rollout_path {
+    let staged = stage_thread_deletes(store, &[thread_id]).await?;
+    if !staged.found_thread(thread_id) {
         return Err(ThreadStoreError::ThreadNotFound { thread_id });
     }
-
-    store.live_recorders.lock().await.remove(&thread_id);
-
+    staged.commit().await;
     Ok(())
+}
+
+pub(super) async fn stage_thread_deletes<'a>(
+    store: &'a LocalThreadStore,
+    thread_ids: &[codex_protocol::ThreadId],
+) -> ThreadStoreResult<StagedThreadDelete<'a>> {
+    let mut found_thread_ids = Vec::new();
+    let mut original_paths = Vec::new();
+
+    for thread_id in thread_ids {
+        let paths = rollout_paths(store, *thread_id).await?;
+        if !paths.is_empty() {
+            found_thread_ids.push(*thread_id);
+        }
+        for rollout_path in paths {
+            let plain_path = codex_rollout::plain_rollout_path(&rollout_path);
+            for path in [plain_path.clone(), plain_path.with_extension("jsonl.zst")] {
+                if !path
+                    .try_exists()
+                    .map_err(|err| ThreadStoreError::Internal {
+                        message: format!(
+                            "failed to inspect rollout file `{}` before staging deletion: {err}",
+                            path.display()
+                        ),
+                    })?
+                {
+                    continue;
+                }
+                let checked_path = checked_rollout_path(store, path.as_path(), *thread_id)?;
+                if !original_paths.contains(&checked_path) {
+                    original_paths.push(checked_path);
+                }
+            }
+        }
+    }
+
+    let staging_dir = if original_paths.is_empty() {
+        None
+    } else {
+        Some(
+            tempfile::Builder::new()
+                .prefix("thread-delete-")
+                .tempdir_in(store.config.codex_home.as_path())
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!("failed to create thread deletion staging directory: {err}"),
+                })?,
+        )
+    };
+    let mut staged = StagedThreadDelete {
+        store,
+        thread_ids: thread_ids.to_vec(),
+        found_thread_ids,
+        staged_files: Vec::new(),
+        staging_dir,
+        committed: false,
+    };
+    let staging_path = staged
+        .staging_dir
+        .as_ref()
+        .map(|staging_dir| staging_dir.path().to_path_buf());
+
+    for (index, original_path) in original_paths.into_iter().enumerate() {
+        let staged_path = staging_path
+            .as_ref()
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: "thread deletion staging directory is missing".to_string(),
+            })?
+            .join(format!("rollout-{index}"));
+        std::fs::rename(&original_path, &staged_path).map_err(|err| {
+            ThreadStoreError::Internal {
+                message: format!(
+                    "failed to stage rollout file `{}` for deletion: {err}",
+                    original_path.display()
+                ),
+            }
+        })?;
+        staged.staged_files.push(StagedRolloutFile {
+            original_path,
+            staged_path,
+        });
+    }
+
+    Ok(staged)
 }
 
 pub(super) async fn preflight_delete_thread(
@@ -156,6 +300,7 @@ fn preflight_delete_access(path: &Path) -> ThreadStoreResult<()> {
         })
 }
 
+#[cfg(test)]
 fn delete_rollout_file(
     store: &LocalThreadStore,
     rollout_path: &Path,
@@ -168,6 +313,7 @@ fn delete_rollout_file(
     Ok(deleted_plain || deleted_compressed)
 }
 
+#[cfg(test)]
 fn delete_rollout_path(
     store: &LocalThreadStore,
     rollout_path: &Path,
@@ -257,6 +403,25 @@ mod tests {
             assert!(!path.exists());
         }
         assert!(!compressed_path.exists());
+    }
+
+    #[tokio::test]
+    async fn staged_thread_delete_restores_rollout_when_not_committed() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let uuid = Uuid::from_u128(307);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let path =
+            write_session_file(home.path(), "2025-01-03T12-30-00", uuid).expect("session file");
+
+        let staged = store
+            .stage_thread_deletes(&[thread_id])
+            .await
+            .expect("stage delete");
+        assert!(!path.exists());
+        drop(staged);
+
+        assert!(path.exists());
     }
 
     #[tokio::test]

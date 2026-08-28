@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::chatgpt_client::chatgpt_get_request_with_timeout;
+use crate::chatgpt_client::chatgpt_http_clients;
 
 use codex_connectors::AppInfo;
 use codex_connectors::ConnectorDirectoryCacheContext;
@@ -78,18 +79,27 @@ pub async fn list_all_connectors_with_options(
         return Ok(Vec::new());
     }
     let auth = connector_auth(config).await?;
+    let http_clients = chatgpt_http_clients(config);
+    let chatgpt_base_url = config.chatgpt_base_url.clone();
     let cache_context = connector_directory_cache_context(config, &auth);
     let connectors = codex_connectors::list_all_connectors_with_options(
         cache_context,
         auth.is_workspace_account(),
         force_refetch,
-        |path| async move {
-            chatgpt_get_request_with_timeout::<DirectoryListResponse>(
-                config,
-                path,
-                Some(DIRECTORY_CONNECTORS_TIMEOUT),
-            )
-            .await
+        move |path| {
+            let auth = auth.clone();
+            let http_clients = http_clients.clone();
+            let chatgpt_base_url = chatgpt_base_url.clone();
+            async move {
+                chatgpt_get_request_with_timeout::<DirectoryListResponse>(
+                    &chatgpt_base_url,
+                    &auth,
+                    &http_clients,
+                    path,
+                    Some(DIRECTORY_CONNECTORS_TIMEOUT),
+                )
+                .await
+            }
         },
     )
     .await?;

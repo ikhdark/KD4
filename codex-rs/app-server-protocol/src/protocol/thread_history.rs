@@ -290,6 +290,14 @@ impl ThreadHistoryBuilder {
             .or_else(|| self.turns.last().cloned())
     }
 
+    /// Returns active turn metadata without cloning its growing item list.
+    pub fn active_turn_change_snapshot(&self) -> Option<ThreadHistoryTurnChange> {
+        self.current_turn
+            .as_ref()
+            .map(ThreadHistoryTurnChange::from_pending_turn)
+            .or_else(|| self.turns.last().map(ThreadHistoryTurnChange::from_turn))
+    }
+
     /// Returns the current turn only while it is still in progress.
     ///
     /// Interrupted turns intentionally remain open briefly so late items can still be grouped
@@ -419,6 +427,11 @@ impl ThreadHistoryBuilder {
             }
             _ => {}
         }
+    }
+
+    /// Handles one live event and returns its incremental history projection.
+    pub fn handle_event_with_changes(&mut self, event: &EventMsg) -> ThreadHistoryChangeSet {
+        self.collect_changes(|builder| builder.handle_event(event))
     }
 
     pub fn handle_rollout_item(&mut self, item: &RolloutItem) {
@@ -1241,8 +1254,14 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_turn_aborted(&mut self, payload: &TurnAbortedEvent) {
+        let abort_status =
+            if payload.reason == codex_protocol::protocol::TurnAbortReason::InternalError {
+                TurnStatus::Failed
+            } else {
+                TurnStatus::Interrupted
+            };
         let apply_abort = |turn: &mut PendingTurn| {
-            turn.status = TurnStatus::Interrupted;
+            turn.status = abort_status.clone();
             turn.completed_at = payload.completed_at;
             turn.duration_ms = payload.duration_ms;
             turn.completion = None;
@@ -1259,7 +1278,7 @@ impl ThreadHistoryBuilder {
             }
 
             if let Some(turn) = self.turns.iter_mut().find(|turn| turn.id == turn_id) {
-                turn.status = TurnStatus::Interrupted;
+                turn.status = abort_status.clone();
                 turn.completed_at = payload.completed_at;
                 turn.duration_ms = payload.duration_ms;
                 turn.completion = None;
@@ -4621,6 +4640,39 @@ mod tests {
     }
 
     #[test]
+    fn persisted_internal_error_abort_materializes_failed_turn_with_error() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-failed".into(),
+                trace_id: None,
+                started_at: Some(20),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
+                message: "worker panicked".into(),
+                codex_error_info: Some(CodexErrorInfo::InternalServerError),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: Some("turn-failed".into()),
+                reason: TurnAbortReason::InternalError,
+                completed_at: Some(21),
+                duration_ms: Some(800),
+                timing: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        let turn = turns.first().expect("failed materialized turn");
+        assert_eq!(turn.status, TurnStatus::Failed);
+        assert_eq!(
+            turn.error.as_ref().map(|error| error.message.as_str()),
+            Some("worker panicked")
+        );
+        assert_eq!(turn.started_at, Some(20));
+    }
+
+    #[test]
     fn historical_terminal_outcome_does_not_flow_into_next_active_turn() {
         let surfaced_result = SurfacedToolResult {
             adapter: "code_mode_cell".to_string(),
@@ -5001,6 +5053,42 @@ mod tests {
                 }],
                 removed_turn_ids: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn active_turn_change_snapshot_returns_metadata_without_materializing_items() {
+        let mut builder = ThreadHistoryBuilder::new();
+        builder.handle_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-a".into(),
+            trace_id: None,
+            started_at: Some(10),
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+        builder.handle_event(&EventMsg::UserMessage(UserMessageEvent {
+            client_id: None,
+            message: "hello".into(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+            ..Default::default()
+        }));
+
+        assert_eq!(
+            builder.active_turn_change_snapshot(),
+            Some(ThreadHistoryTurnChange {
+                turn_id: "turn-a".into(),
+                status: TurnStatus::InProgress,
+                error: None,
+                started_at: Some(10),
+                completed_at: None,
+                duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
+                reasoning_policy_history: None,
+            })
         );
     }
 

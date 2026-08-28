@@ -1,7 +1,6 @@
 use super::AuthRequestTelemetryContext;
 use super::CanonicalPrefixHash;
 use super::CompactConversationRequestSettings;
-use super::HTTP_TRANSPORT_CACHE_CAPACITY;
 use super::LastResponse;
 use super::MODEL_ATTEMPT_RECONCILIATION_TOLERANCE_BYTES;
 use super::ModelAttemptClock;
@@ -41,6 +40,8 @@ use crate::GenerateAttestationFuture;
 use crate::context::PromptProvenanceSidecar;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::stable_context::StableContextManifest;
+use crate::stable_context::StableContextTarget;
+use crate::stable_context::project_stable_context;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
 use crate::tool_history::ToolHistorySubstitution;
@@ -149,7 +150,7 @@ fn test_model_client_with_thread_id(
 }
 
 #[tokio::test]
-async fn model_http_transport_cache_reuses_client_and_is_bounded() {
+async fn model_http_transport_pool_reuses_client_across_api_endpoints() {
     let client = test_model_client(SessionSource::Cli);
     let setup = client
         .current_client_setup()
@@ -158,25 +159,14 @@ async fn model_http_transport_cache_reuses_client_and_is_bounded() {
 
     client
         .build_api_transport(&setup.api_provider, "responses")
+        .await
         .expect("first transport should build");
     client
-        .build_api_transport(&setup.api_provider, "responses")
-        .expect("same route should reuse the cached transport");
-    for index in 0..=HTTP_TRANSPORT_CACHE_CAPACITY {
-        client
-            .build_api_transport(&setup.api_provider, &format!("route-{index}"))
-            .expect("bounded transport cache should accept another route");
-    }
+        .build_api_transport(&setup.api_provider, "responses/compact")
+        .await
+        .expect("different endpoint on the same route should reuse the client");
 
-    let cache = client
-        .state
-        .http_transport_cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (hits, misses, len) = cache.diagnostics();
-    assert!(hits >= 1, "the repeated route should be a cache hit");
-    assert_eq!(misses, HTTP_TRANSPORT_CACHE_CAPACITY as u64 + 2);
-    assert_eq!(len, HTTP_TRANSPORT_CACHE_CAPACITY);
+    assert_eq!(client.state.http_clients.cached_route_count(), 1);
 }
 
 fn websocket_test_model_client() -> ModelClient {
@@ -204,16 +194,15 @@ fn websocket_test_model_client() -> ModelClient {
 fn websocket_stream_retries_when_another_session_already_activated_http_fallback() {
     let client = websocket_test_model_client();
     let telemetry = test_session_telemetry();
-    let model_info = test_model_info();
     let mut first_session = client.new_session();
     let mut concurrent_session = client.new_session();
     first_session.last_stream_was_websocket = true;
     concurrent_session.last_stream_was_websocket = true;
 
-    assert!(first_session.try_switch_fallback_transport(&telemetry, &model_info));
-    assert!(concurrent_session.try_switch_fallback_transport(&telemetry, &model_info));
+    assert!(first_session.try_switch_fallback_transport(&telemetry));
+    assert!(concurrent_session.try_switch_fallback_transport(&telemetry));
     assert!(!concurrent_session.last_stream_was_websocket);
-    assert!(!concurrent_session.try_switch_fallback_transport(&telemetry, &model_info));
+    assert!(!concurrent_session.try_switch_fallback_transport(&telemetry));
 }
 
 #[test]
@@ -666,6 +655,44 @@ fn model_request_measurements_reconcile_and_match_serialized_wire_payload() {
 }
 
 #[test]
+fn model_request_measurements_reuse_authoritative_encoded_request_length() {
+    let request = history_test_request(vec![history_test_item("input", None)]);
+    let encoded_request_bytes = u64::try_from(
+        serde_json::to_vec(&request)
+            .expect("serialize request")
+            .len(),
+    )
+    .unwrap();
+    let measured = ModelRequestMeasurements::for_responses_request_cancellable(
+        &request,
+        &history_test_provenance(&request),
+        &request.instructions,
+        /*cancellation*/ None,
+        Some(encoded_request_bytes),
+    )
+    .expect("measure request from encoded length");
+
+    assert_eq!(measured.logical_request_bytes, encoded_request_bytes);
+}
+
+#[test]
+fn model_request_measurements_stop_when_cancelled() {
+    let request = history_test_request(vec![history_test_item("input", None)]);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+
+    let result = ModelRequestMeasurements::for_responses_request_cancellable(
+        &request,
+        &history_test_provenance(&request),
+        &request.instructions,
+        Some(&cancellation),
+        /*logical_request_bytes*/ None,
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
 fn prompt_context_hashes_track_categories_and_gate_fixed_prefix_reuse() {
     let stable_history = history_test_tool_output("call-1", "unchanged result");
     let first_request = history_test_request(vec![
@@ -860,12 +887,15 @@ fn websocket_exact_stable_prefix_inherits_existing_response_id() {
         .collect::<Vec<_>>()
         .into();
 
-    let (prepared, _) = session.prepare_websocket_request(
-        ResponseCreateWsRequest::from(&current),
-        &current,
-        [7; 32],
-        &[],
-    );
+    let (prepared, _, _) = session
+        .prepare_websocket_request(
+            ResponseCreateWsRequest::from(&current),
+            &current,
+            [7; 32],
+            &[],
+            None,
+        )
+        .expect("websocket request should prepare");
     let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
     assert_eq!(
         prepared.previous_response_id.as_deref(),
@@ -895,12 +925,15 @@ fn remote_compaction_rebase_preserves_response_lineage_for_next_tail() {
     let delta = history_test_item("next tool result", None);
     let current = history_test_request(vec![stable_prefix, compacted, delta.clone()]);
 
-    let (prepared, _) = session.prepare_websocket_request(
-        ResponseCreateWsRequest::from(&current),
-        &current,
-        [9; 32],
-        &[],
-    );
+    let (prepared, _, _) = session
+        .prepare_websocket_request(
+            ResponseCreateWsRequest::from(&current),
+            &current,
+            [9; 32],
+            &[],
+            None,
+        )
+        .expect("websocket request should prepare");
     let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
 
     assert_eq!(
@@ -958,12 +991,15 @@ fn websocket_stable_replacement_rebases_without_stale_inheritance() {
     session.websocket_session.last_response_rx = Some(receiver);
     let current = history_test_request(vec![history_test_item("new stable", None)]);
 
-    let (prepared, _) = session.prepare_websocket_request(
-        ResponseCreateWsRequest::from(&current),
-        &current,
-        [2; 32],
-        &[],
-    );
+    let (prepared, _, _) = session
+        .prepare_websocket_request(
+            ResponseCreateWsRequest::from(&current),
+            &current,
+            [2; 32],
+            &[],
+            None,
+        )
+        .expect("websocket request should prepare");
     let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
     assert!(prepared.previous_response_id.is_none());
     assert_eq!(prepared.input, current.input);
@@ -972,12 +1008,15 @@ fn websocket_stable_replacement_rebases_without_stale_inheritance() {
 
     // A failed fresh replay has not installed any new response baseline, so a
     // retry remains a complete, non-inheriting replay.
-    let (retry, _) = session.prepare_websocket_request(
-        ResponseCreateWsRequest::from(&current),
-        &current,
-        [2; 32],
-        &[],
-    );
+    let (retry, _, _) = session
+        .prepare_websocket_request(
+            ResponseCreateWsRequest::from(&current),
+            &current,
+            [2; 32],
+            &[],
+            None,
+        )
+        .expect("websocket retry should prepare");
     let ResponsesWsRequest::ResponseCreate(retry) = retry;
     assert!(retry.previous_response_id.is_none());
     assert_eq!(retry.input, current.input);
@@ -1010,6 +1049,11 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
         .expect("response receiver open");
     session.websocket_session.last_response_rx = Some(receiver);
     let current = history_test_request(vec![history_test_tool_output("call-1", receipt)]);
+    let stable = history_test_item("restored stable context", None);
+    let fail_open = history_test_request(vec![
+        stable.clone(),
+        history_test_tool_output("call-1", bounded),
+    ]);
     let substitutions = [ToolHistorySubstitution {
         item_index: 0,
         call_id: "call-1".to_string(),
@@ -1018,15 +1062,25 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
         substituted_output_sha256: crate::tool_history::sha256(receipt.as_bytes()),
     }];
 
-    let (prepared, _) = session.prepare_websocket_request(
-        ResponseCreateWsRequest::from(&current),
-        &current,
-        [7; 32],
-        &substitutions,
-    );
+    let (prepared, _, logical_override) = session
+        .prepare_websocket_request(
+            ResponseCreateWsRequest::from(&current),
+            &current,
+            [7; 32],
+            &substitutions,
+            Some(Box::new(|| Ok(fail_open.clone()))),
+        )
+        .expect("tool-history rebase should prepare");
     let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
     assert!(prepared.previous_response_id.is_none());
-    assert_eq!(prepared.input, current.input);
+    assert_eq!(prepared.input, fail_open.input);
+    assert_eq!(
+        logical_override
+            .expect("fresh replay should replace the logical request")
+            .input,
+        fail_open.input
+    );
+    assert_eq!(prepared.input.as_ref()[0], stable);
     assert!(session.websocket_session.last_request.is_none());
     assert!(session.websocket_session.last_request_history.is_none());
     assert!(
@@ -1040,16 +1094,62 @@ fn tool_history_receipt_inside_provider_prefix_forces_transactional_rebase() {
     // transport remains safe to publish because the cache stores it transport-only.
     assert!(session.websocket_cache_publication.is_some());
 
-    // A failed receipt-bearing rebase cannot resurrect the stale provider id.
-    let (retry, _) = session.prepare_websocket_request(
-        ResponseCreateWsRequest::from(&current),
-        &current,
-        [7; 32],
-        &substitutions,
-    );
+    // A failed fail-open replay cannot resurrect either the stale provider id
+    // or the receipt-bearing input on its retry.
+    let (retry, _, retry_override) = session
+        .prepare_websocket_request(
+            ResponseCreateWsRequest::from(&current),
+            &current,
+            [7; 32],
+            &substitutions,
+            Some(Box::new(|| Ok(fail_open.clone()))),
+        )
+        .expect("tool-history retry should prepare");
     let ResponsesWsRequest::ResponseCreate(retry) = retry;
     assert!(retry.previous_response_id.is_none());
-    assert_eq!(retry.input, current.input);
+    assert_eq!(retry.input, fail_open.input);
+    assert_eq!(
+        retry_override
+            .expect("retry should retain the fail-open logical request")
+            .input,
+        fail_open.input
+    );
+
+    // Once the replacement response exists, later turns may inherit it, but
+    // their logical baseline must remain the rebuilt unreplaced history. The
+    // restored stable item deliberately shifts the tool output's item index.
+    session.remember_request_history(&fail_open, [7; 32]);
+    session.websocket_session.last_request = Some(fail_open.clone());
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    sender
+        .send(LastResponse {
+            response_id: "response-rebuilt".to_string(),
+            items_added: Vec::new(),
+        })
+        .expect("response receiver open");
+    session.websocket_session.last_response_rx = Some(receiver);
+
+    let (continued, _, continued_override) = session
+        .prepare_websocket_request(
+            ResponseCreateWsRequest::from(&current),
+            &current,
+            [7; 32],
+            &substitutions,
+            Some(Box::new(|| Ok(fail_open.clone()))),
+        )
+        .expect("replacement baseline should prepare");
+    let ResponsesWsRequest::ResponseCreate(continued) = continued;
+    assert_eq!(
+        continued.previous_response_id.as_deref(),
+        Some("response-rebuilt")
+    );
+    assert!(continued.input.is_empty());
+    assert_eq!(
+        continued_override
+            .expect("replacement inheritance should retain rebuilt logical history")
+            .input,
+        fail_open.input
+    );
 }
 
 #[test]
@@ -1084,29 +1184,48 @@ fn tool_history_receipt_only_in_new_tail_keeps_proven_inheritance() {
         receipt_id: "receipt".to_string(),
         substituted_output_sha256: crate::tool_history::sha256(b"receipt tail"),
     }];
+    let fallback_builds = AtomicUsize::new(0);
 
-    let (prepared, _) = session.prepare_websocket_request(
-        ResponseCreateWsRequest::from(&current),
-        &current,
-        [7; 32],
-        &substitutions,
-    );
+    let (prepared, _, _) = session
+        .prepare_websocket_request(
+            ResponseCreateWsRequest::from(&current),
+            &current,
+            [7; 32],
+            &substitutions,
+            Some(Box::new(|| {
+                fallback_builds.fetch_add(1, Ordering::Relaxed);
+                Ok(current.clone())
+            })),
+        )
+        .expect("websocket request should prepare");
     let ResponsesWsRequest::ResponseCreate(prepared) = prepared;
     assert_eq!(
         prepared.previous_response_id.as_deref(),
         Some("response-proven")
     );
     assert_eq!(prepared.input.as_ref(), &[receipt]);
+    assert_eq!(fallback_builds.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
-async fn stable_context_fallback_request_replays_complete_input() {
+async fn stable_context_fallback_request_replays_authoritative_projected_input() {
     let client = test_model_client(SessionSource::Cli);
+    let old = history_test_item(
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>",
+        None,
+    );
+    let current = history_test_item(
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>",
+        None,
+    );
     let projected = history_test_item("projected delta", None);
-    let stable = history_test_item("stable prefix", None);
+    let projection = project_stable_context(
+        vec![old.clone(), projected.clone(), current.clone()].into(),
+        StableContextTarget::Sampling,
+    );
     let prompt = Prompt {
-        input: vec![projected.clone()].into(),
-        stable_context_fallback_input: vec![stable.clone(), projected.clone()].into(),
+        input: projection.items,
+        stable_context_fallback_input: projection.fallback_items,
         ..Prompt::default()
     };
     let model_info = test_model_info();
@@ -1147,8 +1266,12 @@ async fn stable_context_fallback_request_replays_complete_input() {
         )
         .expect("fallback request should build");
 
-    assert_eq!(normal.input.as_ref(), std::slice::from_ref(&projected));
-    assert_eq!(fallback.input.as_ref(), &[stable, projected]);
+    for request in [&normal, &fallback] {
+        assert!(!request.input.contains(&old));
+        assert!(request.input.contains(&current));
+        assert!(request.input.contains(&projected));
+    }
+    assert_eq!(fallback.input, normal.input);
 }
 
 #[tokio::test]
@@ -1156,11 +1279,12 @@ async fn tool_history_fail_open_request_uses_unreplaced_input() {
     let client = test_model_client(SessionSource::Cli);
     let receipt = history_test_tool_output("call-1", "receipt-substituted");
     let bounded = history_test_tool_output("call-1", "bounded provider-visible output");
+    let stable = history_test_item("restored stable context", None);
     let prompt = Prompt {
         input: vec![receipt].into(),
         stable_context_fallback_input: Vec::new().into(),
         tool_history_fallback_input: vec![bounded.clone()].into(),
-        stable_context_tool_history_fallback_input: vec![bounded.clone()].into(),
+        stable_context_tool_history_fallback_input: vec![stable.clone(), bounded.clone()].into(),
         ..Prompt::default()
     };
     let model_info = test_model_info();
@@ -1185,11 +1309,11 @@ async fn tool_history_fail_open_request_uses_unreplaced_input() {
             codex_protocol::config_types::ReasoningSummary::None,
             /* service_tier */ None,
             &responses_metadata,
-            /* use_stable_context_fallback */ false,
+            /* use_stable_context_fallback */ true,
             /* use_tool_history_fallback */ true,
         )
         .expect("fail-open request should build");
-    assert_eq!(request.input.as_ref(), &[bounded]);
+    assert_eq!(request.input.as_ref(), &[stable, bounded]);
 }
 
 #[test]
@@ -1221,9 +1345,26 @@ fn request_schema_serialization_cache_is_keyed_by_model_visible_schema() {
 }
 
 #[test]
-fn request_schema_cache_reuses_precomputed_tool_digest() {
+fn request_schema_cache_rejects_stale_precomputed_tool_digest() {
     let client = test_model_client(SessionSource::Cli);
-    let prompt = Prompt {
+    let ordinary_prompt = Prompt {
+        tools: Arc::new(crate::client_common::ToolSchemaArtifact::new(vec![
+            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+                name: "ordinary_probe".to_string(),
+                description: "Ordinary request schema.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            }),
+        ])),
+        digests: crate::client_common::PromptDigests {
+            tools: Some([7; 32]),
+            ..Default::default()
+        },
+        ..Prompt::default()
+    };
+    let terminal_prompt = Prompt {
         digests: crate::client_common::PromptDigests {
             tools: Some([7; 32]),
             ..Default::default()
@@ -1231,22 +1372,19 @@ fn request_schema_cache_reuses_precomputed_tool_digest() {
         ..Prompt::default()
     };
 
-    client
-        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
-        .expect("first serialization should succeed");
-    client
-        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
-        .expect("digest-identical serialization should hit");
-    let changed = Prompt {
-        digests: crate::client_common::PromptDigests {
-            tools: Some([8; 32]),
-            ..Default::default()
-        },
-        ..prompt
-    };
-    client
-        .request_schema_components(&changed, None, /*use_responses_lite*/ false)
-        .expect("changed digest should miss");
+    let ordinary = client
+        .request_schema_components(&ordinary_prompt, None, /*use_responses_lite*/ false)
+        .expect("ordinary schemas should serialize");
+    let terminal = client
+        .request_schema_components(&terminal_prompt, None, /*use_responses_lite*/ false)
+        .expect("terminal schemas should serialize independently");
+    let ordinary_again = client
+        .request_schema_components(&ordinary_prompt, None, /*use_responses_lite*/ false)
+        .expect("ordinary schemas should remain cached independently");
+
+    assert!(!ordinary.tools.is_empty());
+    assert!(terminal.tools.is_empty());
+    assert!(Arc::ptr_eq(&ordinary.tools, &ordinary_again.tools));
 
     let cache = client
         .state
@@ -1389,13 +1527,16 @@ async fn responses_lite_orders_base_and_tools_before_history() {
         )
         .expect("Responses Lite request should build");
 
-    assert!(matches!(
-        request.input.first(),
-        Some(ResponseItem::AdditionalTools { .. })
-    ));
     assert!(
-        matches!(request.input.get(1), Some(ResponseItem::Message { role, .. }) if role == "developer")
+        matches!(request.input.first(), Some(ResponseItem::Message { role, content, .. })
+            if role == "developer"
+                && matches!(content.as_slice(), [ContentItem::InputText { text }] if text == "stable base"))
     );
+    assert!(matches!(
+        request.input.get(1),
+        Some(ResponseItem::AdditionalTools { role, .. }) if role == "developer"
+    ));
+    assert!(request.instructions.is_empty());
     let mut expected_history_item = prompt.input.last().cloned().expect("history item");
     expected_history_item.clear_internal_chat_message_metadata_passthrough();
     assert_eq!(request.input.last(), Some(&expected_history_item));
@@ -1853,8 +1994,9 @@ fn build_ws_client_metadata_includes_window_lineage_and_turn_metadata() {
 }
 
 #[tokio::test]
-async fn response_stream_does_not_wait_for_pending_request_measurements() {
+async fn response_stream_does_not_wait_for_and_cancels_pending_request_measurements() {
     let measurement_gate = Arc::new(Notify::new());
+    let measurement_cancellation = tokio_util::sync::CancellationToken::new();
     let identity = new_attempt_identity(&new_sampling_request_id());
     let clock = ModelAttemptClock::new();
     let task_identity = identity.clone();
@@ -1884,7 +2026,12 @@ async fn response_stream_does_not_wait_for_pending_request_measurements() {
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
         test_model_provider(),
-        Some(ModelAttemptState::pending(identity, clock, attempt_task)),
+        Some(ModelAttemptState::pending(
+            identity,
+            clock,
+            attempt_task,
+            measurement_cancellation.clone(),
+        )),
     );
 
     let event = tokio::time::timeout(Duration::from_millis(250), stream.next())
@@ -1894,8 +2041,74 @@ async fn response_stream_does_not_wait_for_pending_request_measurements() {
         .expect("provider event should remain successful");
     assert!(matches!(event, ResponseEvent::Created));
 
-    measurement_gate.notify_one();
     drop(stream);
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        measurement_cancellation.cancelled(),
+    )
+    .await
+    .expect("dropping the response stream cancels pending diagnostics");
+}
+
+#[tokio::test]
+async fn response_completed_waits_for_pending_request_measurements() {
+    let measurement_gate = Arc::new(Notify::new());
+    let measurement_cancellation = tokio_util::sync::CancellationToken::new();
+    let identity = new_attempt_identity(&new_sampling_request_id());
+    let clock = ModelAttemptClock::new();
+    let task_identity = identity.clone();
+    let task_clock = clock.clone();
+    let task_gate = Arc::clone(&measurement_gate);
+    let attempt_task = tokio::spawn(async move {
+        task_gate.notified().await;
+        ModelAttemptGuard::new(
+            test_session_telemetry(),
+            task_identity,
+            0,
+            ModelAttemptRetryReason::None,
+            ModelAttemptRequestKind::Initial,
+            ModelAttemptTransport::ResponsesHttp,
+            None,
+            ModelRequestMeasurements::default(),
+            task_clock,
+            None,
+            None,
+        )
+    });
+    let api_stream = futures::stream::iter([Ok(ResponseEvent::Completed {
+        response_id: "response-id".to_string(),
+        token_usage: None,
+        end_turn: Some(true),
+    })]);
+    let (mut stream, _) = super::map_response_events(
+        None,
+        api_stream,
+        test_session_telemetry(),
+        InferenceTraceAttempt::disabled(),
+        test_model_provider(),
+        Some(ModelAttemptState::pending(
+            identity,
+            clock,
+            attempt_task,
+            measurement_cancellation,
+        )),
+    );
+
+    let mut completion = Box::pin(stream.next());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut completion)
+            .await
+            .is_err(),
+        "response completion must wait for pending request diagnostics"
+    );
+
+    measurement_gate.notify_one();
+    let event = tokio::time::timeout(Duration::from_millis(250), completion)
+        .await
+        .expect("completion should resume after request diagnostics")
+        .expect("mapped stream should yield completion")
+        .expect("completion should remain successful");
+    assert!(matches!(event, ResponseEvent::Completed { .. }));
 }
 
 #[tokio::test]

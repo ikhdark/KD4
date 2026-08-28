@@ -5,13 +5,13 @@ use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 
 /// The runtime launch strategy for an effective MCP server.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum McpServerLaunch {
     Configured(Box<McpServerConfig>),
 }
 
 /// MCP server after runtime additions have been applied.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EffectiveMcpServer {
     launch: McpServerLaunch,
 }

@@ -16,6 +16,9 @@ use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ToolContributor;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
@@ -34,6 +37,7 @@ struct WebSearchExtensionConfig {
     available: bool,
     provider: ModelProviderInfo,
     settings: SearchSettings,
+    http_clients: RouteAwareClientPool,
 }
 
 impl From<&Config> for WebSearchExtensionConfig {
@@ -46,8 +50,13 @@ impl From<&Config> for WebSearchExtensionConfig {
                 && web_search_mode != WebSearchMode::Disabled,
             provider: config.model_provider.clone(),
             settings: search_settings(config, web_search_mode),
+            http_clients: web_search_http_clients(config.http_client_factory()),
         }
     }
+}
+
+fn web_search_http_clients(http_client_factory: HttpClientFactory) -> RouteAwareClientPool {
+    RouteAwareClientPool::new(http_client_factory, ClientRouteClass::Api)
 }
 
 fn search_settings(config: &Config, web_search_mode: WebSearchMode) -> SearchSettings {
@@ -134,6 +143,7 @@ impl ToolContributor for WebSearchExtension {
                 Some(self.auth_manager.clone()),
             ),
             settings: config.settings.clone(),
+            http_clients: config.http_clients.clone(),
         })]
     }
 }
@@ -155,7 +165,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::AuthManager;
+    use super::ClientRouteClass;
     use super::Config;
+    use super::RouteAwareClientPool;
     use super::WebSearchExtensionConfig;
     use super::external_web_access_for_mode;
     use super::install;
@@ -163,7 +175,21 @@ mod tests {
     use crate::tool::WEB_NAMESPACE;
     use codex_api::ExternalWebAccess;
     use codex_api::ExternalWebAccessMode;
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
     use codex_protocol::config_types::WebSearchMode;
+
+    #[test]
+    fn web_search_pool_retains_the_effective_proxy_policy() {
+        let http_clients = super::web_search_http_clients(HttpClientFactory::new(
+            OutboundProxyPolicy::RespectSystemProxy,
+        ));
+
+        assert_eq!(
+            http_clients.outbound_proxy_policy(),
+            OutboundProxyPolicy::RespectSystemProxy
+        );
+    }
 
     #[test]
     fn external_web_access_preserves_legacy_values_until_indexed() {
@@ -198,6 +224,12 @@ mod tests {
             available: true,
             provider: ModelProviderInfo::create_openai_provider(/*base_url*/ None),
             settings: Default::default(),
+            http_clients: RouteAwareClientPool::new(
+                codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+                ClientRouteClass::Api,
+            ),
         });
 
         let tool_names = registry

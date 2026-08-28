@@ -3,6 +3,12 @@ use crate::session::step_context::StepContext;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
+fn admitted_tool_dispatch_state() -> Arc<ToolDispatchState> {
+    let state = Arc::new(ToolDispatchState::new());
+    assert!(state.try_admit());
+    state
+}
+
 #[test]
 fn nested_code_mode_projection_is_not_provider_visible() {
     assert!(projection_is_provider_visible(&ToolCallSource::Direct));
@@ -86,7 +92,6 @@ async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
             raw_registry_output.clone(),
             Some(true),
         )),
-        post_tool_use_payload: None,
         model_projection: None,
         source_dependencies: None,
         code_mode_feedback: Vec::new(),
@@ -96,6 +101,7 @@ async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
         &invocation,
         &result,
         /*parsed_function_arguments*/ None,
+        /*source_dependencies_override*/ None,
         /*force_inline_carrier*/ false,
         /*track_for_admission*/ true,
     )
@@ -180,7 +186,6 @@ async fn yielded_code_mode_output_keeps_its_live_handle_inline() {
             )
             .with_outcome(ToolOutputOutcome::Yielded),
         ),
-        post_tool_use_payload: None,
         model_projection: None,
         source_dependencies: None,
         code_mode_feedback: Vec::new(),
@@ -191,6 +196,7 @@ async fn yielded_code_mode_output_keeps_its_live_handle_inline() {
             &invocation,
             &result,
             /*parsed_function_arguments*/ None,
+            /*source_dependencies_override*/ None,
             /*force_inline_carrier*/ false,
             /*track_for_admission*/ true,
         )
@@ -217,9 +223,10 @@ fn typed_preflight_rejects_invalid_hook_rewritten_code_mode_arguments() {
         arguments: serde_json::json!({ "path": "src/lib.rs" }).to_string(),
     };
     let valid_arguments = ParsedFunctionArguments::from_payload(&valid_payload);
+    let preflight = CodeModeArgumentPreflight::default();
 
     assert_eq!(
-        preflight_code_mode_arguments(&name, &spec, &valid_payload, valid_arguments.as_ref(),),
+        preflight.validate(&name, &spec, &valid_payload, valid_arguments.as_ref(),),
         Ok(())
     );
     // This represents the final payload after a PreToolUse hook rewrites the
@@ -228,11 +235,43 @@ fn typed_preflight_rejects_invalid_hook_rewritten_code_mode_arguments() {
         arguments: serde_json::json!({ "path": 7, "extra": true }).to_string(),
     };
     let invalid_arguments = ParsedFunctionArguments::from_payload(&invalid_payload);
-    let error =
-        preflight_code_mode_arguments(&name, &spec, &invalid_payload, invalid_arguments.as_ref())
-            .expect_err("invalid typed arguments must be rejected before dispatch");
+    let error = preflight
+        .validate(&name, &spec, &invalid_payload, invalid_arguments.as_ref())
+        .expect_err("invalid typed arguments must be rejected before dispatch");
     assert!(error.contains("argument preflight failed"));
     assert!(error.contains("/path") || error.contains("additional"));
+    assert_eq!(preflight.compile_count.load(Ordering::Relaxed), 1);
+    assert_eq!(preflight.validation_count.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn code_mode_dispatch_without_hook_rewrite_preflights_once() -> anyhow::Result<()> {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let tool_name = ToolName::plain("typed_helper");
+    let registry = ToolRegistry::from_tools([Arc::new(TestHandler {
+        tool_name: tool_name.clone(),
+    }) as Arc<dyn CoreToolRuntime>]);
+    let mut invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "code-mode-call",
+        tool_name.clone(),
+    );
+    invocation.source = ToolCallSource::CodeMode {
+        cell_id: "cell-1".to_string(),
+        parent_call_id: Some("exec-1".to_string()),
+        runtime_tool_call_id: "runtime-call-1".to_string(),
+    };
+
+    registry
+        .dispatch_any_with_terminal_outcome(invocation, admitted_tool_dispatch_state())
+        .await?;
+
+    assert_eq!(
+        registry.code_mode_argument_preflight_counts(&tool_name),
+        Some((1, 1))
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -306,9 +345,80 @@ fn complete_projection_envelope_respects_applied_limit() {
         envelope.model_approximate_tokens,
         approx_token_count(rendered) as u64
     );
+    let (header, selected_text) = model_projection_parts(rendered);
+    assert_eq!(header["outcome"], "success");
     assert_eq!(
-        serde_json::from_str::<Value>(rendered).expect("valid JSON projection"),
-        projected.value()
+        selected_text,
+        envelope.result["selected_text"]
+            .as_str()
+            .expect("internal selected text")
+    );
+    assert_eq!(projected.value()["canonical_sha256"], "hash");
+}
+
+#[test]
+fn projection_model_render_is_compact_and_keeps_selected_text_unescaped() {
+    let envelope = ToolProjectionV1 {
+        version: 1,
+        tool: "test".to_string(),
+        outcome: "success".to_string(),
+        canonical_sha256: "diagnostic-hash".to_string(),
+        canonical_bytes: 8_000,
+        canonical_approximate_tokens: 2_000,
+        canonical_complete: true,
+        model_bytes: 0,
+        model_approximate_tokens: 0,
+        artifact_id: Some("artifact-123".to_string()),
+        sections: Vec::new(),
+        omitted_sections: vec!["omitted-1".to_string()],
+        result: serde_json::json!({
+            "essential": {"exit_code": 0},
+            "selection": {
+                "selected_ids": ["selected-1"],
+                "omitted_inline_ids": ["omitted-1"],
+                "partial_ids": [],
+                "available_fragments": 12,
+            },
+            "selected_text": "",
+            "preserved_content": [],
+            "artifact": {"complete": true},
+        }),
+    };
+    let output = "first line\nC:\\work\\file.txt\n\"quoted\"";
+
+    let projected = serialize_projection_with_limit(envelope, output, 1_000).expect("projection");
+    let rendered = projected.rendered();
+    let (header, selected_text) = model_projection_parts(rendered);
+
+    assert_eq!(selected_text, output);
+    assert!(rendered.ends_with(output));
+    assert_eq!(header["artifact_id"], "artifact-123");
+    assert_eq!(
+        header["selection"]["selected_ids"],
+        serde_json::json!(["selected-1"])
+    );
+    for internal_field in [
+        "version",
+        "tool",
+        "canonical_sha256",
+        "canonical_bytes",
+        "canonical_approximate_tokens",
+        "model_bytes",
+        "model_approximate_tokens",
+        "sections",
+    ] {
+        assert!(
+            header.get(internal_field).is_none(),
+            "leaked {internal_field}"
+        );
+    }
+    let internal = projected.envelope().expect("internal envelope");
+    assert_eq!(internal.result["selected_text"], output);
+    assert_eq!(internal.canonical_sha256, "diagnostic-hash");
+    assert_eq!(internal.model_bytes, rendered.len() as u64);
+    assert_eq!(
+        internal.model_approximate_tokens,
+        approx_token_count(rendered) as u64
     );
 }
 
@@ -350,10 +460,17 @@ fn projection_fallback_preserves_essential_inline() {
     assert_eq!(envelope.result["essential"], essential);
     assert_eq!(envelope.result["selected_text"], "");
     assert!(envelope.result.get("large_metadata").is_none());
-    assert_eq!(
-        serde_json::from_str::<Value>(&rendered).expect("valid JSON fallback"),
-        serde_json::to_value(envelope).expect("serialize typed carrier"),
-    );
+    let (header, selected_text) = model_projection_parts(&rendered);
+    assert_eq!(header["essential"], essential);
+    assert!(selected_text.is_empty());
+}
+
+fn model_projection_parts(rendered: &str) -> (Value, &str) {
+    let (header, selected_text) = rendered.split_once('\n').unwrap_or((rendered, ""));
+    (
+        serde_json::from_str(header).expect("valid compact projection header"),
+        selected_text,
+    )
 }
 
 #[tokio::test]
@@ -367,6 +484,7 @@ async fn projection_source_dependency_decision_records_reuse_and_fallback() {
     let carried = with_precomputed_projection_source_dependencies(Some(expected.clone()), async {
         resolve_projection_source_dependencies(
             &timing,
+            /*authoritative_override*/ None,
             precomputed_projection_source_dependencies(),
             || panic!("precomputed dependencies must skip fallback analysis"),
         )
@@ -378,12 +496,28 @@ async fn projection_source_dependency_decision_records_reuse_and_fallback() {
             std::path::Path::new("fallback"),
             false,
         )]);
-    let fallback =
-        resolve_projection_source_dependencies(&timing, None, || fallback_expected.clone());
+    let fallback = resolve_projection_source_dependencies(
+        &timing,
+        /*authoritative_override*/ None,
+        /*precomputed*/ None,
+        || fallback_expected.clone(),
+    );
     assert_eq!(fallback, fallback_expected);
+    let rewritten_expected =
+        std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
+            std::path::Path::new("rewritten"),
+            false,
+        )]);
+    let rewritten = resolve_projection_source_dependencies(
+        &timing,
+        Some(rewritten_expected.clone()),
+        Some(expected.clone()),
+        || panic!("final rewritten dependencies must override pre-hook analysis"),
+    );
+    assert_eq!(rewritten, rewritten_expected);
     let counters = timing.complete_snapshot().protocol_timing().counters;
     assert_eq!(counters.projection_source_dependencies_reuse_count, 1);
-    assert_eq!(counters.projection_source_dependencies_fallback_count, 1);
+    assert_eq!(counters.projection_source_dependencies_fallback_count, 2);
 
     let output = "bounded output".to_string();
     let canonical = CanonicalToolResult::text(output.clone());
@@ -435,14 +569,20 @@ async fn projection_source_dependency_decision_records_reuse_and_fallback() {
             "native output".to_string(),
             Some(true),
         )),
-        post_tool_use_payload: None,
         model_projection: None,
         source_dependencies: None,
         code_mode_feedback: Vec::new(),
     };
-    result.install_model_projection(Some(projection));
+    result.install_model_projection(Some(projection), /*source_dependencies_override*/ None);
 
     assert_eq!(result.projected_source_dependencies(), Some(&expected));
+
+    result.install_model_projection(None, Some(rewritten_expected.clone()));
+    assert_eq!(
+        result.projected_source_dependencies(),
+        Some(&rewritten_expected),
+        "a rewritten invocation must retain final dependencies even when projection is exempt",
+    );
 }
 
 #[test]
@@ -952,8 +1092,8 @@ async fn projection_owner_recovery_drains_exact_json_pointer_in_original_return(
         }
         other => panic!("unexpected response: {other:?}"),
     };
-    let envelope: ToolProjectionV1 = serde_json::from_str(&rendered).expect("projection envelope");
-    let recovery = envelope.result["preserved_content"]
+    let (header, _) = model_projection_parts(&rendered);
+    let recovery = header["preserved_content"]
         .as_array()
         .and_then(|items| items.first())
         .expect("deterministic recovery");
@@ -1148,8 +1288,8 @@ async fn three_predetermined_artifact_ranges_are_drained_in_original_return() {
         }
         other => panic!("unexpected response: {other:?}"),
     };
-    let envelope: ToolProjectionV1 = serde_json::from_str(&rendered).expect("projection envelope");
-    let recovery = envelope.result["preserved_content"]
+    let (header, _) = model_projection_parts(&rendered);
+    let recovery = header["preserved_content"]
         .as_array()
         .and_then(|items| {
             items.iter().find(|item| {
@@ -1403,7 +1543,6 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
             "native nested value".to_string(),
             Some(true),
         )),
-        post_tool_use_payload: None,
         model_projection: Some(inner_projection),
         source_dependencies: None,
         code_mode_feedback: Vec::new(),
@@ -1492,7 +1631,6 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
             "bounded outer output".to_string(),
             Some(true),
         )),
-        post_tool_use_payload: None,
         model_projection: Some(outer_projection),
         source_dependencies: None,
         code_mode_feedback: Vec::new(),
@@ -1510,19 +1648,19 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
         panic!("expected outer custom tool output");
     };
     let rendered = output.body.to_text().expect("outer projection text");
-    let envelope: ToolProjectionV1 = serde_json::from_str(&rendered).expect("outer envelope");
+    let (header, _) = model_projection_parts(&rendered);
     assert!(
-        envelope.result["preserved_content"]
+        header["preserved_content"]
             .to_string()
             .contains("exact nested evidence")
     );
     assert!(
-        envelope.result["preserved_content"]
+        header["preserved_content"]
             .to_string()
             .contains("exact pointer evidence")
     );
     assert!(
-        !envelope.result["preserved_content"]
+        !header["preserved_content"]
             .to_string()
             .contains(&"x".repeat(8_000))
     );
@@ -1725,7 +1863,6 @@ fn metadata_free_new_tool_result_has_no_owner_drained_continuation() {
             "new evidence requiring interpretation".to_string(),
             Some(true),
         )),
-        post_tool_use_payload: None,
         model_projection: None,
         source_dependencies: None,
         code_mode_feedback: Vec::new(),
@@ -2031,6 +2168,102 @@ impl ToolExecutor<ToolInvocation> for TestHandler {
 
 impl CoreToolRuntime for TestHandler {}
 
+struct PostHookGateHandler {
+    tool_name: ToolName,
+    success: bool,
+    name_calls: Arc<std::sync::atomic::AtomicUsize>,
+    payload_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ToolExecutor<ToolInvocation> for PostHookGateHandler {
+    fn tool_name(&self) -> ToolName {
+        self.tool_name.clone()
+    }
+
+    fn spec(&self) -> ToolSpec {
+        test_spec(&self.tool_name)
+    }
+
+    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        let success = self.success;
+        Box::pin(async move {
+            Ok(
+                Box::new(crate::tools::context::FunctionToolOutput::from_text(
+                    "ok".to_string(),
+                    Some(success),
+                )) as Box<dyn crate::tools::context::ToolOutput>,
+            )
+        })
+    }
+}
+
+impl CoreToolRuntime for PostHookGateHandler {
+    fn post_tool_use_hook_name(&self, _invocation: &ToolInvocation) -> Option<HookToolName> {
+        self.name_calls.fetch_add(1, Ordering::Relaxed);
+        Some(HookToolName::new(self.tool_name.to_string()))
+    }
+
+    fn post_tool_use_payload(
+        &self,
+        invocation: &ToolInvocation,
+        _result: &dyn ToolOutput,
+    ) -> Option<PostToolUsePayload> {
+        self.payload_calls.fetch_add(1, Ordering::Relaxed);
+        Some(PostToolUsePayload {
+            tool_name: HookToolName::new(self.tool_name.to_string()),
+            tool_use_id: invocation.call_id.clone(),
+            tool_input: serde_json::json!({}),
+            tool_response: serde_json::json!({ "ok": true }),
+        })
+    }
+}
+
+#[tokio::test]
+async fn confirmed_performance_post_hook_response_is_deferred_until_success_and_matcher_gates_pass()
+-> anyhow::Result<()> {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let successful_name = ToolName::plain("successful_post_hook_gate");
+    let failed_name = ToolName::plain("failed_post_hook_gate");
+    let name_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let payload_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let registry = ToolRegistry::from_tools([
+        Arc::new(PostHookGateHandler {
+            tool_name: successful_name.clone(),
+            success: true,
+            name_calls: Arc::clone(&name_calls),
+            payload_calls: Arc::clone(&payload_calls),
+        }) as Arc<dyn CoreToolRuntime>,
+        Arc::new(PostHookGateHandler {
+            tool_name: failed_name.clone(),
+            success: false,
+            name_calls: Arc::clone(&name_calls),
+            payload_calls: Arc::clone(&payload_calls),
+        }) as Arc<dyn CoreToolRuntime>,
+    ]);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    for (call_id, tool_name) in [
+        ("successful-call", successful_name),
+        ("failed-call", failed_name),
+    ] {
+        let mut invocation =
+            test_invocation(Arc::clone(&session), Arc::clone(&turn), call_id, tool_name);
+        invocation.source = ToolCallSource::CodeMode {
+            cell_id: "cell-1".to_string(),
+            parent_call_id: Some("exec-1".to_string()),
+            runtime_tool_call_id: call_id.to_string(),
+        };
+        registry
+            .dispatch_any_with_terminal_outcome(invocation, admitted_tool_dispatch_state())
+            .await?;
+    }
+
+    assert_eq!(name_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(payload_calls.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
 struct SpecCountingHandler {
     tool_name: codex_tools::ToolName,
     spec_calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -2099,7 +2332,17 @@ fn registry_caches_each_runtime_spec_once() {
     let first = registry.manifest_entries();
     let second = registry.manifest_entries();
 
-    assert_eq!(first, second);
+    assert_eq!(first.len(), second.len());
+    assert!(
+        first
+            .iter()
+            .zip(&second)
+            .all(|(left, right)| std::ptr::eq(*left, *right))
+    );
+    assert!(std::ptr::eq(
+        first[0].canonical_spec_sha256(),
+        second[0].canonical_spec_sha256()
+    ));
     assert_eq!(spec_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
@@ -2283,6 +2526,89 @@ impl LifecycleTestHandler {
 }
 
 impl CoreToolRuntime for LifecycleTestHandler {}
+
+struct BlockingProjectionOutput {
+    inner: crate::tools::context::FunctionToolOutput,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    projection_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::tools::context::ToolOutput for BlockingProjectionOutput {
+    fn log_preview(&self) -> String {
+        self.inner.log_preview()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        self.inner.success_for_logging()
+    }
+
+    fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+        self.projection_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.entered
+            .send(())
+            .expect("projection claim test receiver should remain alive");
+        self.release
+            .recv()
+            .expect("projection claim test should release materialization");
+        self.inner.projection_metadata()
+    }
+
+    fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        self.inner.canonical_result(payload)
+    }
+
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        self.inner.to_response_item(call_id, payload)
+    }
+}
+
+struct BlockingProjectionHandler {
+    tool_name: codex_tools::ToolName,
+    entered: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    projection_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ToolExecutor<ToolInvocation> for BlockingProjectionHandler {
+    fn tool_name(&self) -> codex_tools::ToolName {
+        self.tool_name.clone()
+    }
+
+    fn spec(&self) -> codex_tools::ToolSpec {
+        test_spec(&self.tool_name)
+    }
+
+    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        let entered = self
+            .entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("blocking projection handler is single-use");
+        let release = self
+            .release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("blocking projection handler is single-use");
+        let projection_calls = Arc::clone(&self.projection_calls);
+        Box::pin(async move {
+            Ok(Box::new(BlockingProjectionOutput {
+                inner: crate::tools::context::FunctionToolOutput::from_text(
+                    "ordinary result".to_string(),
+                    Some(true),
+                ),
+                entered,
+                release,
+                projection_calls,
+            }) as Box<dyn crate::tools::context::ToolOutput>)
+        })
+    }
+}
+
+impl CoreToolRuntime for BlockingProjectionHandler {}
 
 fn test_spec(tool_name: &codex_tools::ToolName) -> codex_tools::ToolSpec {
     let tool = codex_tools::ResponsesApiTool {
@@ -2552,7 +2878,6 @@ fn post_tool_feedback_survives_code_mode_projection() {
             )),
             model_visible,
         }),
-        post_tool_use_payload: None,
         model_projection: None,
         source_dependencies: None,
         code_mode_feedback: vec![FunctionCallOutputContentItem::InputText {
@@ -2589,7 +2914,6 @@ fn post_tool_feedback_survives_code_mode_projection() {
                 original: Box::new(codex_tools::JsonToolOutput::new(original.clone())),
                 model_visible,
             }),
-            post_tool_use_payload: None,
             model_projection: None,
             source_dependencies: None,
             code_mode_feedback: vec![FunctionCallOutputContentItem::InputText {
@@ -2630,7 +2954,7 @@ async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()> {
     let registry = ToolRegistry::from_tools([ok_handler, failing_handler]);
     let session = Arc::new(session);
     let turn = Arc::new(turn);
-    let ok_terminal_outcome = Arc::new(AtomicBool::new(false));
+    let ok_terminal_outcome = admitted_tool_dispatch_state();
 
     registry
         .dispatch_any_with_terminal_outcome(
@@ -2643,8 +2967,8 @@ async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()> {
             Arc::clone(&ok_terminal_outcome),
         )
         .await?;
-    assert!(ok_terminal_outcome.load(Ordering::Acquire));
-    let failing_terminal_outcome = Arc::new(AtomicBool::new(false));
+    assert!(ok_terminal_outcome.is_terminal());
+    let failing_terminal_outcome = admitted_tool_dispatch_state();
     let err = match registry
         .dispatch_any_with_terminal_outcome(
             test_invocation(
@@ -2661,7 +2985,7 @@ async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()> {
         Err(err) => err,
     };
     assert_eq!(err.to_string(), "handler failed");
-    assert!(failing_terminal_outcome.load(Ordering::Acquire));
+    assert!(failing_terminal_outcome.is_terminal());
 
     let expected = vec![
         RecordedToolLifecycle::Start {
@@ -2695,8 +3019,89 @@ async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_completion_reserves_projection_before_abort_can_claim() -> anyhow::Result<()> {
+    let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+    let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.tool_lifecycle_contributor(Arc::new(ToolLifecycleRecorder {
+        records: Arc::clone(&records),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+
+    let tool_name = codex_tools::ToolName::plain("blocking_projection_tool");
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let projection_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let registry = ToolRegistry::from_tools([Arc::new(BlockingProjectionHandler {
+        tool_name: tool_name.clone(),
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+        projection_calls: Arc::clone(&projection_calls),
+    }) as Arc<dyn CoreToolRuntime>]);
+    let terminal_outcome = admitted_tool_dispatch_state();
+    let dispatch_terminal_outcome = Arc::clone(&terminal_outcome);
+    let dispatch = tokio::spawn(async move {
+        registry
+            .dispatch_any_with_terminal_outcome(
+                test_invocation(
+                    Arc::new(session),
+                    Arc::new(turn),
+                    "projection-call",
+                    tool_name,
+                ),
+                dispatch_terminal_outcome,
+            )
+            .await
+    });
+
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(std::time::Duration::from_secs(1)))
+        .await
+        .expect("projection entry waiter should join")
+        .expect("projection should start");
+    let simulated_abort_claimed = !matches!(
+        terminal_outcome.try_abort(),
+        crate::tools::context::ToolDispatchAbort::AlreadyTerminal
+    );
+    release_tx
+        .send(())
+        .expect("projection materialization should remain in flight");
+
+    let result = dispatch.await.expect("dispatch task should join")?;
+    assert!(
+        !simulated_abort_claimed,
+        "handler completion must reserve the ordinary projection before an abort can claim it"
+    );
+    assert!(result.model_projection.is_some());
+    assert_eq!(
+        projection_calls.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the ordinary terminal transaction materializes exactly one projection"
+    );
+    assert_eq!(
+        records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        &[
+            RecordedToolLifecycle::Start {
+                call_id: "projection-call".to_string(),
+                tool_name: codex_tools::ToolName::plain("blocking_projection_tool"),
+            },
+            RecordedToolLifecycle::Finish {
+                call_id: "projection-call".to_string(),
+                tool_name: codex_tools::ToolName::plain("blocking_projection_tool"),
+                outcome: codex_extension_api::ToolCallOutcome::Completed { success: true },
+            },
+        ]
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
-async fn projection_failure_notifies_failed_lifecycle_instead_of_completed() -> anyhow::Result<()> {
+async fn projection_failure_preserves_completed_lifecycle_and_returns_bounded_notice()
+-> anyhow::Result<()> {
     let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
     let temp = tempfile::tempdir()?;
     let blocked_home = temp.path().join("not-a-directory");
@@ -2717,7 +3122,7 @@ async fn projection_failure_notifies_failed_lifecycle_instead_of_completed() -> 
         tool_name: tool_name.clone(),
         result: LifecycleTestResult::RequiredArtifact,
     }) as Arc<dyn CoreToolRuntime>]);
-    let terminal_outcome = Arc::new(AtomicBool::new(false));
+    let terminal_outcome = admitted_tool_dispatch_state();
     let result = registry
         .dispatch_any_with_terminal_outcome(
             test_invocation(
@@ -2728,14 +3133,20 @@ async fn projection_failure_notifies_failed_lifecycle_instead_of_completed() -> 
             ),
             Arc::clone(&terminal_outcome),
         )
-        .await;
-    let error = match result {
-        Ok(_) => panic!("required artifact persistence must fail"),
-        Err(error) => error,
-    };
+        .await?;
 
-    assert!(error.to_string().contains("failed to preserve and admit"));
-    assert!(terminal_outcome.load(Ordering::Acquire));
+    let response = result.response();
+    let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+        panic!("expected a function call output");
+    };
+    assert_eq!(output.success, Some(true));
+    assert_eq!(
+        output.body.to_text().as_deref(),
+        Some(
+            "Tool execution completed, but its full result could not be preserved for model delivery."
+        )
+    );
+    assert!(terminal_outcome.is_terminal());
     let actual = records
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2751,9 +3162,7 @@ async fn projection_failure_notifies_failed_lifecycle_instead_of_completed() -> 
             RecordedToolLifecycle::Finish {
                 call_id: "artifact-call".to_string(),
                 tool_name,
-                outcome: codex_extension_api::ToolCallOutcome::Failed {
-                    handler_executed: true,
-                },
+                outcome: codex_extension_api::ToolCallOutcome::Completed { success: true },
             },
         ]
     );

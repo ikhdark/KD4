@@ -294,6 +294,7 @@ fn app_server_request_permissions_preserves_file_system_permissions() {
         environment_id: Some("remote".to_string()),
         started_at_ms: 0,
         cwd: cwd.clone(),
+        cwd_uri: PathUri::from_abs_path(&cwd),
         reason: Some("Select a workspace root".to_string()),
         permissions: codex_app_server_protocol::RequestPermissionProfile {
             network: Some(AppServerAdditionalNetworkPermissions {
@@ -316,12 +317,13 @@ fn app_server_request_permissions_preserves_file_system_permissions() {
                 enabled: Some(true),
             }),
             file_system: Some(FileSystemPermissions::from_read_write_roots(
-                Some(vec![read_path]),
-                Some(vec![write_path]),
+                Some(vec![PathUri::from_abs_path(&read_path)]),
+                Some(vec![PathUri::from_abs_path(&write_path)]),
             )),
         }
     );
-    assert_eq!(request.cwd, Some(cwd));
+    assert_eq!(request.cwd, Some(cwd.clone()));
+    assert_eq!(request.cwd_uri, Some(PathUri::from_abs_path(&cwd)));
     assert_eq!(request.environment_id.as_deref(), Some("remote"));
 }
 

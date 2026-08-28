@@ -23,6 +23,20 @@ from scripts.build_tooling_test_support import powershell
 from scripts.build_tooling_test_support import ps_single_quote
 
 
+def repository_owned_paths() -> list[Path]:
+    result = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        check=True,
+    )
+    return [
+        REPO_ROOT / relative_path
+        for relative_path in result.stdout.decode("utf-8").split("\0")
+        if relative_path and (REPO_ROOT / relative_path).is_file()
+    ]
+
+
 class BuildToolingPolicyTest(unittest.TestCase):
     def run_workspace_analyzer(
         self,
@@ -84,31 +98,65 @@ class BuildToolingPolicyTest(unittest.TestCase):
         payloads = [json.loads(line) for line in output.splitlines() if line.strip()]
         return result, payloads
 
-    def test_build_info_script_uses_upstream_git_metadata_fallbacks(
-        self,
-    ) -> None:
-        text = (REPO_ROOT / "codex-rs" / "build_info.rs").read_text(encoding="utf-8")
-        self.assertIn('args(["status", "--porcelain"])', text)
-        self.assertIn("git_dirty(&workspace_root)", text)
-        self.assertIn(
-            'cargo:rerun-if-changed={}", git_dir.join("index").display()', text
-        )
-        self.assertNotIn("SystemTime::now", text)
-        self.assertIn('workspace_root.join("build_info.rs").display()', text)
+    def test_build_metadata_is_owned_by_the_compiling_utility_crate(self) -> None:
+        rust_root = REPO_ROOT / "codex-rs"
+        for retired_path in (
+            rust_root / "build_info.rs",
+            rust_root / "app-server" / "build.rs",
+            rust_root / "cli" / "build.rs",
+            rust_root / "rollout" / "build.rs",
+        ):
+            self.assertFalse(retired_path.exists(), f"retired build input: {retired_path}")
 
-    def test_build_info_scripts_emit_metadata_without_non_windows_linking(self) -> None:
-        app_server_build = (
-            REPO_ROOT / "codex-rs" / "app-server" / "build.rs"
-        ).read_text(encoding="utf-8")
-        cli_build = (REPO_ROOT / "codex-rs" / "cli" / "build.rs").read_text(
+        cli_manifest = load_toml(rust_root / "cli" / "Cargo.toml")
+        self.assertNotIn("build", cli_manifest["package"])
+
+        build_info = (rust_root / "utils" / "build-info" / "src" / "lib.rs").read_text(
             encoding="utf-8"
         )
+        publisher = (REPO_ROOT / "scripts" / "publish-local-codex.ps1").read_text(
+            encoding="utf-8"
+        )
+        for variable in (
+            "CODEX_BUILD_COMMIT",
+            "CODEX_BUILD_DIRTY",
+            "CODEX_BUILD_PROFILE",
+            "CODEX_BUILD_TIMESTAMP",
+        ):
+            self.assertIn(f'option_env!("{variable}")', build_info)
+            self.assertIn(
+                f'Set-ProcessEnvironmentVariable -Name "{variable}"', publisher
+            )
 
-        self.assertIn('#[path = "../build_info.rs"]', app_server_build)
-        self.assertIn("build_info::emit();", app_server_build)
-        self.assertIn('#[path = "../build_info.rs"]', cli_build)
-        self.assertIn("build_info::emit();", cli_build)
-        self.assertNotIn("cargo:rustc-link-arg=-ObjC", cli_build)
+    def test_confirmed_dead_rust_inputs_do_not_return(self) -> None:
+        rust_root = REPO_ROOT / "codex-rs"
+        rmcp = load_toml(rust_root / "rmcp-client" / "Cargo.toml")
+        state = load_toml(rust_root / "state" / "Cargo.toml")
+        tui = load_toml(rust_root / "tui" / "Cargo.toml")
+
+        self.assertNotIn("codex-utils-home-dir", rmcp["dependencies"])
+        self.assertNotIn("hmac", state["dependencies"])
+        self.assertNotIn("rand", state["dependencies"])
+        self.assertNotIn("core_test_support", tui["dev-dependencies"])
+
+        diff_render = (rust_root / "tui" / "src" / "diff_render.rs").read_text(
+            encoding="utf-8"
+        )
+        responses_stream = (
+            rust_root / "codex-api" / "src" / "responses_stream.rs"
+        ).read_text(encoding="utf-8")
+        self.assertNotRegex(
+            diff_render,
+            r"#\[allow\(dead_code\)\]\s*path: PathBuf",
+        )
+        self.assertNotRegex(
+            responses_stream,
+            r"#\[allow\(dead_code\)\]\s*struct ResponseCompleted",
+        )
+        self.assertRegex(
+            responses_stream,
+            r"#\[allow\(dead_code\)\]\s*struct Error",
+        )
 
     def test_skills_build_script_requires_bundled_samples(self) -> None:
         text = (REPO_ROOT / "codex-rs" / "skills" / "build.rs").read_text(
@@ -121,16 +169,14 @@ class BuildToolingPolicyTest(unittest.TestCase):
     def test_retired_repo_local_harness_skill_has_no_registration(self) -> None:
         features = load_toml(REPO_ROOT / "kd4_features.toml")["features"]
         feature_ids = {feature["id"] for feature in features}
-        workspace_policy = (REPO_ROOT / ".codex" / "AGENTS.md").read_text(
-            encoding="utf-8"
-        )
+        root_policy = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         harness_workflow = (REPO_ROOT / ".codex" / "harness" / "workflow.md").read_text(
             encoding="utf-8"
         )
 
         self.assertNotIn("kd4-harness", feature_ids)
         self.assertFalse((REPO_ROOT / ".codex" / "skills" / "kd4-harness").exists())
-        self.assertNotIn("skills/kd4-harness", workspace_policy)
+        self.assertNotIn("skills/kd4-harness", root_policy)
         self.assertNotIn("kd4-harness", harness_workflow)
 
     def test_harness_workflow_orchestrator_reference_resolves(self) -> None:
@@ -257,14 +303,15 @@ class BuildToolingPolicyTest(unittest.TestCase):
         )
         self.assertIn("do not hand-edit generated output", normalized)
 
-    def test_agents_scripts_policy_is_nested_and_discoverable(self) -> None:
+    def test_agents_scripts_policy_is_root_owned(self) -> None:
         root_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        scripts_text = (REPO_ROOT / "scripts" / "AGENTS.md").read_text(encoding="utf-8")
+        normalized = " ".join(root_text.split())
 
-        self.assertIn("`scripts/AGENTS.md`", root_text)
-        self.assertIn("# Scripts Policy", scripts_text)
-        self.assertIn("Root maintenance lint, test, and audit commands", scripts_text)
-        self.assertIn("root_maintenance.py", scripts_text)
+        self.assertFalse((REPO_ROOT / "scripts" / "AGENTS.md").exists())
+        self.assertIn(
+            "For a script edit, follow the validation route named in `SOURCEMAP.md`",
+            normalized,
+        )
 
     def test_windows_installer_requires_standalone_metadata(self) -> None:
         powershell_installer = (
@@ -690,20 +737,16 @@ class BuildToolingPolicyTest(unittest.TestCase):
             ],
         )
 
-    def test_python_sdk_gate_and_publish_routing_match_policy(self) -> None:
+    def test_python_sdk_gate_and_publish_routing_match_source_map(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         sdk_recipe = justfile.split("\nsdk-python-check:\n", 1)[1].split("\n\n", 1)[0]
-        scripts_policy = (REPO_ROOT / "scripts" / "AGENTS.md").read_text(
-            encoding="utf-8"
-        )
+        source_map = (REPO_ROOT / "SOURCEMAP.md").read_text(encoding="utf-8")
 
         self.assertIn("--group dev ruff check .", sdk_recipe)
         self.assertIn("--group dev pytest", sdk_recipe)
-        self.assertIn(
-            "python\n  scripts/root_maintenance.py test-python --changed\n  "
-            "scripts/publish-local-codex.ps1",
-            scripts_policy,
-        )
+        self.assertIn("| Windows local publish |", source_map)
+        self.assertIn("`scripts/publish-local-codex.ps1`", source_map)
+        self.assertIn("`just publish-local-codex-final`", source_map)
 
     def test_root_maintenance_script_audit_plan_covers_every_script_type(self) -> None:
         root_maintenance = load_root_maintenance_module()
@@ -874,6 +917,28 @@ class BuildToolingPolicyTest(unittest.TestCase):
         deny_config = (REPO_ROOT / "codex-rs" / "deny.toml").read_text(encoding="utf-8")
         self.assertNotIn('"webrtc-sys-build"', deny_config)
 
+        repository_paths = repository_owned_paths()
+        posix_launchers = sorted(
+            str(path.relative_to(REPO_ROOT))
+            for path in repository_paths
+            if path.suffix.lower() in {".bash", ".sh", ".zsh"}
+        )
+        self.assertEqual(posix_launchers, [])
+
+        retired_asset_pattern = re.compile(
+            r"(?:^|/)(?:docker|linux|macos|darwin|mosh|tmux|wsl|wine|zellij)"
+            r"(?:[-_.]|/)|(?:apple-darwin|pc-linux|unknown-linux)",
+            re.IGNORECASE,
+        )
+        retired_assets = sorted(
+            relative_path
+            for path in repository_paths
+            if retired_asset_pattern.search(
+                relative_path := path.relative_to(REPO_ROOT).as_posix()
+            )
+        )
+        self.assertEqual(retired_assets, [])
+
     def test_windows_only_rust_policy_has_no_host_platform_branches(self) -> None:
         cargo = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
         self.assertEqual(cargo["workspace"]["dependencies"]["arboard"], "3")
@@ -925,6 +990,96 @@ class BuildToolingPolicyTest(unittest.TestCase):
         for retired_platform in ("macos-", "linux-", "apple-darwin", "unknown-linux"):
             with self.subTest(dotslash_platform=retired_platform):
                 self.assertNotIn(retired_platform, dotslash_manifest)
+
+        repository_paths = repository_owned_paths()
+        rust_paths = [path for path in repository_paths if path.suffix == ".rs"]
+        host_cfg_pattern = re.compile(
+            r"(?:#\s*\[\s*cfg(?:_attr)?|cfg!)\s*\([^)]{0,500}"
+            r"\b(?:target_family|target_os|unix|windows)\b"
+        )
+        host_cfg_branches: list[str] = []
+        unix_imports: list[str] = []
+        retired_platform_test_residue: list[str] = []
+        retired_platform_test_pattern = re.compile(
+            r"(?m)\b(?:async\s+)?fn\s+(?:linux|macos)_[A-Za-z0-9_]+\s*\(|"
+            r"\b_unix_script\b|\bconst\s+IS_(?:MACOS|WINDOWS)\s*:|"
+            r"#\[ignore\s*=\s*[\"'][^\"']*(?:linux|macos|unix|windows)[^\"']*[\"']\]"
+        )
+        for path in rust_paths:
+            relative_path = path.relative_to(REPO_ROOT).as_posix()
+            source = path.read_text(encoding="utf-8")
+            if host_cfg_pattern.search(source):
+                host_cfg_branches.append(relative_path)
+            if "std::os::unix" in source:
+                unix_imports.append(relative_path)
+            if retired_platform_test_pattern.search(source):
+                retired_platform_test_residue.append(relative_path)
+        self.assertEqual(sorted(host_cfg_branches), [])
+        self.assertEqual(sorted(unix_imports), [])
+        self.assertEqual(sorted(retired_platform_test_residue), [])
+
+        source_suffixes = {".js", ".md", ".ps1", ".py", ".rs", ".toml", ".ts"}
+        policy_path = Path(__file__).resolve()
+        retired_harness_pattern = re.compile(
+            r"\b(?:DOCKER_CERT_PATH|DOCKER_HOST|DOCKER_TLS_VERIFY|WINEDEBUG|"
+            r"WINEPREFIX|WSL_DISTRO_NAME|WSLENV|CODEX_[A-Z0-9_]*(?:DOCKER|WINE|WSL)"
+            r"[A-Z0-9_]*)\b"
+        )
+        retired_harness_variables: list[str] = []
+        for path in repository_paths:
+            if path.resolve() == policy_path or path.suffix.lower() not in source_suffixes:
+                continue
+            source = path.read_text(encoding="utf-8")
+            if retired_harness_pattern.search(source):
+                retired_harness_variables.append(
+                    path.relative_to(REPO_ROOT).as_posix()
+                )
+        self.assertEqual(sorted(retired_harness_variables), [])
+
+        compatibility_parser_roots = (
+            (REPO_ROOT / "codex-rs" / "apply-patch").resolve(),
+            (REPO_ROOT / "codex-rs" / "shell-command").resolve(),
+        )
+        posix_runtime_launcher_pattern = re.compile(
+            r"(?m)^\s*#!\s*/(?:usr/bin/env\s+)?(?:ba|z|)sh\b|"
+            r"Command::new\s*\(\s*[\"'](?:bash|zsh|sh|/bin/(?:bash|zsh|sh))[\"']|"
+            r"(?:exec|execFile|spawn)\s*\(\s*[\"']"
+            r"(?:bash|zsh|sh|/bin/(?:bash|zsh|sh))[\"']|"
+            r"Start-Process\s+(?:-FilePath\s+)?[\"']?(?:bash|zsh|sh)\b|"
+            r"subprocess\.(?:Popen|call|check_call|check_output|run)\s*\(\s*"
+            r"[\[(]?\s*[\"'](?:bash|zsh|sh|/bin/(?:bash|zsh|sh))[\"']"
+        )
+        posix_runtime_launchers: list[str] = []
+        for path in repository_paths:
+            resolved_path = path.resolve()
+            if resolved_path == policy_path or path.suffix.lower() not in source_suffixes:
+                continue
+            if any(
+                resolved_path == root or root in resolved_path.parents
+                for root in compatibility_parser_roots
+            ):
+                continue
+            source = path.read_text(encoding="utf-8")
+            if posix_runtime_launcher_pattern.search(source):
+                posix_runtime_launchers.append(
+                    path.relative_to(REPO_ROOT).as_posix()
+                )
+        self.assertEqual(sorted(posix_runtime_launchers), [])
+
+        runtime_docs = "\n".join(
+            (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            for relative_path in (
+                "codex-rs/app-server/README.md",
+                "codex-rs/exec-server/README.md",
+            )
+        )
+        for retired_runtime_example in (
+            "/Users/",
+            "/usr/bin:/bin",
+            "file:///tmp",
+        ):
+            with self.subTest(runtime_example=retired_runtime_example):
+                self.assertNotIn(retired_runtime_example, runtime_docs)
 
     def test_ignore_rules_have_single_owners_for_generated_artifacts(self) -> None:
         root_ignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")

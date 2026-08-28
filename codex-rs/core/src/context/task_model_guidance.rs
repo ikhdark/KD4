@@ -2,6 +2,12 @@ use super::ContextualUserFragment;
 
 pub(crate) const TASK_MODEL_GUIDANCE_OPEN_TAG: &str = "<task_model_guidance>";
 pub(crate) const TASK_MODEL_GUIDANCE_CLOSE_TAG: &str = "</task_model_guidance>";
+pub(crate) const TASK_MODEL_GUIDANCE_BASE_POLICY_MARKER: &str =
+    "<task_model_guidance_policy version=\"1\" />";
+
+pub(crate) fn base_instructions_own_task_model_guidance(base_instructions: &str) -> bool {
+    base_instructions.contains(TASK_MODEL_GUIDANCE_BASE_POLICY_MARKER)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TaskModelGuidance;
@@ -31,7 +37,10 @@ impl ContextualUserFragment for TaskModelGuidance {
             "relationships as hypotheses, and test results as proof only for the exact exercised ",
             "contract. Reuse current exact values and enumerations already returned by tools ",
             "instead of rediscovering them. Batch independent read-only checks in one tool ",
-            "generation when their tool contracts allow it. After an observational or wait ",
+            "generation when their tool contracts allow it. For actionable coding tasks, begin ",
+            "with the responsible owner, implementation, and direct test when available; expand ",
+            "the inspection as evidence requires, and pause only when genuinely blocked. After ",
+            "an observational or wait ",
             "result leaves the relevant state unchanged, do not repeat that observation unless ",
             "you can name a pending state transition; otherwise synthesize the evidence, take a ",
             "state-changing action, or report the blocker. Before final synthesis, compare every ",
@@ -82,5 +91,27 @@ mod tests {
         assert!(rendered.contains("never substitute a remembered value"));
         assert!(rendered.contains("Never fill an unknown"));
         assert!(rendered.ends_with(TASK_MODEL_GUIDANCE_CLOSE_TAG));
+    }
+
+    #[test]
+    fn renders_action_first_contract_for_actionable_coding_tasks() {
+        let rendered = TaskModelGuidance.render();
+
+        assert!(rendered.contains(
+            "For actionable coding tasks, begin with the responsible owner, implementation, and \
+             direct test when available; expand the inspection as evidence requires, and pause \
+             only when genuinely blocked."
+        ));
+    }
+
+    #[test]
+    fn bundled_prompt_uses_the_full_runtime_guidance_fragment() {
+        let bundled = include_str!("../../../protocol/src/prompts/base_instructions/default.md");
+
+        assert!(!base_instructions_own_task_model_guidance(bundled));
+        assert!(!base_instructions_own_task_model_guidance(
+            "catalog supplied instructions"
+        ));
+        assert!(TaskModelGuidance.render().contains("direct_file_read"));
     }
 }

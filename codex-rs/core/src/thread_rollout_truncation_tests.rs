@@ -293,6 +293,34 @@ fn truncates_rollout_from_start_applies_thread_rollback_markers() {
 }
 
 #[test]
+fn initial_history_ignores_user_turns_removed_by_rollback() {
+    let history = InitialHistory::Forked(vec![
+        RolloutItem::ResponseItem(user_msg("rolled back")),
+        RolloutItem::ResponseItem(assistant_msg("answer")),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        })),
+    ]);
+
+    assert!(!initial_history_has_prior_user_turns(&history));
+}
+
+#[test]
+fn initial_history_keeps_user_turns_before_rollback_suffix() {
+    let history = InitialHistory::Forked(vec![
+        RolloutItem::ResponseItem(user_msg("retained")),
+        RolloutItem::ResponseItem(assistant_msg("answer")),
+        RolloutItem::ResponseItem(user_msg("rolled back")),
+        RolloutItem::ResponseItem(assistant_msg("answer")),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        })),
+    ]);
+
+    assert!(initial_history_has_prior_user_turns(&history));
+}
+
+#[test]
 fn truncates_rollout_from_start_preserves_users_before_rolled_back_inter_agent_turn() {
     let rollout_items = vec![
         RolloutItem::ResponseItem(user_msg("u1")),

@@ -8,6 +8,7 @@ use codex_login::CodexAuth;
 use serde::Deserialize;
 
 use crate::chatgpt_client::chatgpt_get_request_with_timeout;
+use crate::chatgpt_client::chatgpt_http_clients;
 
 const WORKSPACE_SETTINGS_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKSPACE_SETTINGS_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -111,8 +112,11 @@ pub async fn codex_plugins_enabled_for_workspace(
     }
 
     let encoded_account_id = encode_path_segment(&account_id);
+    let http_clients = chatgpt_http_clients(config);
     let settings: WorkspaceSettingsResponse = chatgpt_get_request_with_timeout(
-        config,
+        &config.chatgpt_base_url,
+        auth,
+        &http_clients,
         format!("/accounts/{encoded_account_id}/settings"),
         Some(WORKSPACE_SETTINGS_TIMEOUT),
     )

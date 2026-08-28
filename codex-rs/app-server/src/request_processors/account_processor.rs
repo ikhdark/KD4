@@ -69,6 +69,7 @@ pub(crate) struct AccountRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config: Arc<Config>,
     config_manager: ConfigManager,
+    backend_client: BackendClient,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
 }
 
@@ -80,14 +81,23 @@ impl AccountRequestProcessor {
         config: Arc<Config>,
         config_manager: ConfigManager,
     ) -> Self {
+        let backend_client = BackendClient::new(
+            config.chatgpt_base_url.clone(),
+            config.http_client_factory(),
+        );
         Self {
             auth_manager,
             thread_manager,
             outgoing,
             config,
             config_manager,
+            backend_client,
             active_login: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn backend_client_for_auth(&self, auth: &CodexAuth) -> BackendClient {
+        self.backend_client.clone().with_auth(auth)
     }
 
     pub(crate) async fn login_account(
@@ -174,9 +184,14 @@ impl AccountRequestProcessor {
 
     pub(crate) fn clear_external_auth(&self) {
         self.auth_manager.clear_external_auth();
-        self.thread_manager
-            .plugins_manager()
-            .set_auth_mode(self.auth_manager.get_api_auth_mode());
+        let plugins_manager = self.thread_manager.plugins_manager();
+        plugins_manager.set_auth_mode(self.auth_manager.get_api_auth_mode());
+        if plugins_manager.invalidate_account_scoped_remote_plugin_caches() {
+            Self::spawn_effective_plugins_changed_task(
+                Arc::clone(&self.thread_manager),
+                self.config_manager.clone(),
+            );
+        }
     }
 
     fn current_account_updated_notification(&self) -> AccountUpdatedNotification {
@@ -195,12 +210,14 @@ impl AccountRequestProcessor {
         thread_manager: &Arc<ThreadManager>,
         auth: Option<CodexAuth>,
     ) {
-        thread_manager
-            .plugins_manager()
-            .set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
-        thread_manager
-            .plugins_manager()
-            .clear_recommended_plugins_cache();
+        let plugins_manager = thread_manager.plugins_manager();
+        plugins_manager.set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
+        if plugins_manager.invalidate_account_scoped_remote_plugin_caches() {
+            Self::spawn_effective_plugins_changed_task(
+                Arc::clone(thread_manager),
+                config_manager.clone(),
+            );
+        }
 
         match config_manager
             .load_latest_config(/*fallback_cwd*/ None)
@@ -209,18 +226,16 @@ impl AccountRequestProcessor {
             Ok(config) => {
                 let refresh_thread_manager = Arc::clone(thread_manager);
                 let refresh_config_manager = config_manager.clone();
-                thread_manager
-                    .plugins_manager()
-                    .maybe_start_remote_plugin_caches_refresh(
-                        &config.plugins_config_input(),
-                        auth,
-                        Some(Arc::new(move || {
-                            Self::spawn_effective_plugins_changed_task(
-                                Arc::clone(&refresh_thread_manager),
-                                refresh_config_manager.clone(),
-                            );
-                        })),
-                    );
+                plugins_manager.maybe_start_remote_plugin_caches_refresh(
+                    &config.plugins_config_input(),
+                    auth,
+                    Some(Arc::new(move || {
+                        Self::spawn_effective_plugins_changed_task(
+                            Arc::clone(&refresh_thread_manager),
+                            refresh_config_manager.clone(),
+                        );
+                    })),
+                );
             }
             Err(err) => {
                 warn!(
@@ -423,16 +438,23 @@ impl AccountRequestProcessor {
         codex_streamlined_login: bool,
         login_success_page: LoginSuccessPage,
     ) {
+        let (response_enqueued_tx, response_enqueued_rx) = oneshot::channel();
         let result = self
-            .login_chatgpt_response(codex_streamlined_login, login_success_page)
+            .login_chatgpt_response(
+                codex_streamlined_login,
+                login_success_page,
+                response_enqueued_rx,
+            )
             .await;
         self.outgoing.send_result(request_id, result).await;
+        let _ = response_enqueued_tx.send(());
     }
 
     async fn login_chatgpt_response(
         &self,
         codex_streamlined_login: bool,
         login_success_page: LoginSuccessPage,
+        response_enqueued: oneshot::Receiver<()>,
     ) -> Result<LoginAccountResponse, JSONRPCErrorError> {
         let opts = self
             .login_chatgpt_common(codex_streamlined_login, login_success_page)
@@ -462,6 +484,7 @@ impl AccountRequestProcessor {
         let active_login = self.active_login.clone();
         let auth_url = server.auth_url.clone();
         tokio::spawn(async move {
+            let _ = response_enqueued.await;
             let (success, error_msg) = match tokio::time::timeout(
                 LOGIN_CHATGPT_TIMEOUT,
                 server.block_until_done(),
@@ -502,12 +525,17 @@ impl AccountRequestProcessor {
     }
 
     async fn login_chatgpt_device_code_v2(&self, request_id: ConnectionRequestId) {
-        let result = self.login_chatgpt_device_code_response().await;
+        let (response_enqueued_tx, response_enqueued_rx) = oneshot::channel();
+        let result = self
+            .login_chatgpt_device_code_response(response_enqueued_rx)
+            .await;
         self.outgoing.send_result(request_id, result).await;
+        let _ = response_enqueued_tx.send(());
     }
 
     async fn login_chatgpt_device_code_response(
         &self,
+        response_enqueued: oneshot::Receiver<()>,
     ) -> Result<LoginAccountResponse, JSONRPCErrorError> {
         let opts = self
             .login_chatgpt_common(
@@ -542,6 +570,7 @@ impl AccountRequestProcessor {
         let http_client_factory = self.config.http_client_factory();
         let active_login = self.active_login.clone();
         tokio::spawn(async move {
+            let _ = response_enqueued.await;
             let (success, error_msg) = tokio::select! {
                 _ = cancel.cancelled() => {
                     (false, Some("Login was not completed".to_string()))
@@ -944,11 +973,7 @@ impl AccountRequestProcessor {
             ));
         }
 
-        let client = BackendClient::from_auth(
-            self.config.chatgpt_base_url.clone(),
-            &auth,
-            self.config.http_client_factory(),
-        );
+        let client = self.backend_client_for_auth(&auth);
 
         let (response, detailed_rate_limit_reset_credits) = tokio::join!(
             client.get_rate_limits_with_reset_credits(),
@@ -1017,11 +1042,7 @@ impl AccountRequestProcessor {
             ));
         }
 
-        let client = BackendClient::from_auth(
-            self.config.chatgpt_base_url.clone(),
-            &auth,
-            self.config.http_client_factory(),
-        );
+        let client = self.backend_client_for_auth(&auth);
         let profile = tokio::time::timeout(
             ACCOUNT_TOKEN_USAGE_FETCH_TIMEOUT,
             client.get_token_usage_profile(),
@@ -1047,11 +1068,7 @@ impl AccountRequestProcessor {
             ));
         }
 
-        let client = BackendClient::from_auth(
-            self.config.chatgpt_base_url.clone(),
-            &auth,
-            self.config.http_client_factory(),
-        );
+        let client = self.backend_client_for_auth(&auth);
         let messages = tokio::time::timeout(
             ACCOUNT_WORKSPACE_MESSAGES_FETCH_TIMEOUT,
             client.list_workspace_messages(),
@@ -1138,11 +1155,7 @@ impl AccountRequestProcessor {
             ));
         }
 
-        let client = BackendClient::from_auth(
-            self.config.chatgpt_base_url.clone(),
-            &auth,
-            self.config.http_client_factory(),
-        );
+        let client = self.backend_client_for_auth(&auth);
 
         match client
             .send_add_credits_nudge_email(Self::backend_credit_type(params.credit_type))

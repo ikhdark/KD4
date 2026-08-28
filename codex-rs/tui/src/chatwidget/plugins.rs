@@ -294,9 +294,7 @@ impl ChatWidget {
                 if source.is_empty() {
                     return;
                 }
-                tx.send(AppEvent::OpenMarketplaceAddLoading {
-                    source: source.clone(),
-                });
+                tx.send(AppEvent::OpenMarketplaceAddLoading);
                 tx.send(AppEvent::FetchMarketplaceAdd {
                     cwd: cwd.clone(),
                     source,
@@ -306,7 +304,7 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
-    pub(crate) fn open_marketplace_add_loading_popup(&mut self, _source: &str) {
+    pub(crate) fn open_marketplace_add_loading_popup(&mut self) {
         self.plugins_active_tab_id = Some(ADD_MARKETPLACE_TAB_ID.to_string());
         let params = self.marketplace_add_loading_popup_params();
         if !self
@@ -506,7 +504,6 @@ impl ChatWidget {
     pub(crate) fn on_marketplace_add_loaded(
         &mut self,
         cwd: PathBuf,
-        _source: String,
         result: Result<MarketplaceAddResponse, String>,
     ) {
         if self.config.cwd.as_path() != cwd.as_path() {

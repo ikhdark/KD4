@@ -12,12 +12,14 @@ use codex_network_proxy::NetworkProxyConfig;
 use codex_network_proxy::NetworkProxyConstraints;
 use codex_network_proxy::NetworkProxyHandle;
 use codex_network_proxy::NetworkProxyState;
-use codex_network_proxy::build_config_state;
+use codex_network_proxy::build_config_state_with_codex_home;
 use codex_network_proxy::host_and_port_from_network_addr;
 use codex_network_proxy::normalize_host;
 use codex_network_proxy::validate_policy_against_constraints;
 use codex_protocol::models::PermissionProfile;
 use std::collections::HashSet;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,13 +33,16 @@ pub struct NetworkProxySpec {
 
 pub struct StartedNetworkProxy {
     proxy: NetworkProxy,
+    #[cfg_attr(not(test), allow(dead_code))]
+    codex_home: PathBuf,
     _handle: NetworkProxyHandle,
 }
 
 impl StartedNetworkProxy {
-    fn new(proxy: NetworkProxy, handle: NetworkProxyHandle) -> Self {
+    fn new(proxy: NetworkProxy, handle: NetworkProxyHandle, codex_home: PathBuf) -> Self {
         Self {
             proxy,
+            codex_home,
             _handle: handle,
         }
     }
@@ -121,14 +126,20 @@ impl NetworkProxySpec {
 
     pub async fn start_proxy(
         &self,
+        codex_home: &Path,
         permission_profile: &PermissionProfile,
         policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
         blocked_request_observer: Option<Arc<dyn BlockedRequestObserver>>,
         enable_network_approval_flow: bool,
         audit_metadata: NetworkProxyAuditMetadata,
     ) -> std::io::Result<StartedNetworkProxy> {
-        let state = self.build_state_with_audit_metadata(audit_metadata)?;
-        let mut builder = NetworkProxy::builder().state(Arc::new(state));
+        let state = self.build_state_with_audit_metadata(codex_home, audit_metadata)?;
+        let absolute_codex_home =
+            codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(codex_home)
+                .map_err(std::io::Error::other)?;
+        let mut builder = NetworkProxy::builder()
+            .state(Arc::new(state))
+            .codex_home(absolute_codex_home);
         if enable_network_approval_flow && !self.hard_deny_allowlist_misses {
             if let Some(policy_decider) = policy_decider {
                 builder = builder.policy_decider_arc(policy_decider);
@@ -147,7 +158,11 @@ impl NetworkProxySpec {
             .run()
             .await
             .map_err(|err| std::io::Error::other(format!("failed to run network proxy: {err}")))?;
-        Ok(StartedNetworkProxy::new(proxy, handle))
+        Ok(StartedNetworkProxy::new(
+            proxy,
+            handle,
+            codex_home.to_path_buf(),
+        ))
     }
 
     pub(crate) fn recompute_for_permission_profile(
@@ -181,7 +196,7 @@ impl NetworkProxySpec {
         &self,
         started_proxy: &StartedNetworkProxy,
     ) -> std::io::Result<()> {
-        let state = self.build_config_state_for_spec()?;
+        let state = self.build_config_state_for_spec(&started_proxy.codex_home)?;
         started_proxy
             .proxy()
             .replace_config_state(state)
@@ -193,9 +208,10 @@ impl NetworkProxySpec {
 
     fn build_state_with_audit_metadata(
         &self,
+        codex_home: &Path,
         audit_metadata: NetworkProxyAuditMetadata,
     ) -> std::io::Result<NetworkProxyState> {
-        let state = self.build_config_state_for_spec()?;
+        let state = self.build_config_state_for_spec(codex_home)?;
         let reloader = Arc::new(StaticNetworkProxyReloader::new(state.clone()));
         Ok(NetworkProxyState::with_reloader_and_audit_metadata(
             state,
@@ -204,10 +220,13 @@ impl NetworkProxySpec {
         ))
     }
 
-    fn build_config_state_for_spec(&self) -> std::io::Result<ConfigState> {
-        build_config_state(self.config.clone(), self.constraints.clone()).map_err(|err| {
-            std::io::Error::other(format!("failed to build network proxy state: {err}"))
-        })
+    fn build_config_state_for_spec(&self, codex_home: &Path) -> std::io::Result<ConfigState> {
+        build_config_state_with_codex_home(
+            self.config.clone(),
+            self.constraints.clone(),
+            codex_home,
+        )
+        .map_err(|err| std::io::Error::other(format!("failed to build network proxy state: {err}")))
     }
 
     fn apply_requirements(

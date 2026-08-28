@@ -21,6 +21,8 @@ use codex_protocol::ThreadId;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::sqlite::SqlitePoolOptions;
 use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -260,6 +262,82 @@ async fn thread_delete_failure_preserves_loaded_thread() -> Result<()> {
 
     send_turn_and_wait(&mut mcp, &thread.id, "still loaded").await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_delete_primary_state_failure_restores_staged_rollout() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let start_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let thread = to_response::<ThreadStartResponse>(start_response)?.thread;
+    send_turn_and_wait(&mut mcp, &thread.id, "materialize").await?;
+    let rollout_path = thread.path.expect("thread path");
+    let thread_id = ThreadId::from_string(&thread.id)?;
+
+    let state_db =
+        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".to_string()).await?;
+    assert!(state_db.get_thread(thread_id).await?.is_some());
+    let trigger_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(codex_home.path().join(codex_state::STATE_DB_FILENAME))
+                .create_if_missing(false),
+        )
+        .await?;
+    // `thread_id` has already been parsed as a UUID above, so it cannot alter the SQL shape.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        r#"
+CREATE TRIGGER fail_selected_thread_delete
+BEFORE DELETE ON threads
+WHEN OLD.id = '{thread_id}'
+BEGIN
+    SELECT RAISE(FAIL, 'forced primary thread deletion failure');
+        END
+        "#
+    )))
+    .execute(&trigger_pool)
+    .await?;
+
+    let delete_id = mcp
+        .send_thread_delete_request(ThreadDeleteParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let delete_error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(delete_id)),
+    )
+    .await??;
+
+    assert!(
+        delete_error
+            .error
+            .message
+            .contains("failed to delete app-server state")
+    );
+    assert!(rollout_path.exists());
+    assert!(state_db.get_thread(thread_id).await?.is_some());
+    trigger_pool.close().await;
     Ok(())
 }
 

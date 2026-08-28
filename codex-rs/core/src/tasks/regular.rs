@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -14,6 +15,7 @@ use tracing::trace_span;
 
 use super::SessionTask;
 use super::SessionTaskResult;
+use super::TurnTaskResult;
 
 #[derive(Default)]
 pub(crate) struct RegularTask;
@@ -57,7 +59,7 @@ impl SessionTask for RegularTask {
             sess.set_server_reasoning_included(/*included*/ false).await;
             let mut next_input = input;
             loop {
-                let last_agent_message = run_turn(
+                let turn_result = run_turn(
                     Arc::clone(&sess),
                     Arc::clone(&ctx),
                     Arc::clone(&turn_extension_data),
@@ -67,11 +69,80 @@ impl SessionTask for RegularTask {
                 )
                 .instrument(run_turn_span.clone())
                 .await?;
-                if !sess.input_queue.has_pending_input(&sess.active_turn).await {
-                    return Ok(last_agent_message);
+                if !should_reenter_regular_task(
+                    &turn_result,
+                    sess.input_queue.has_pending_input(&sess.active_turn),
+                )
+                .await
+                {
+                    return Ok(turn_result);
                 }
                 next_input = Vec::new();
             }
         })
+    }
+}
+
+async fn should_reenter_regular_task<F>(turn_result: &TurnTaskResult, has_pending_input: F) -> bool
+where
+    F: Future<Output = bool>,
+{
+    if turn_result.required_tool_terminal.is_some() || turn_result.defer_pending_input {
+        false
+    } else {
+        has_pending_input.await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::tools::context::RequiredToolTerminal;
+    use crate::tools::context::RequiredToolTerminalCause;
+
+    #[tokio::test]
+    async fn terminal_results_do_not_poll_pending_input_for_same_turn_reentry() {
+        let required_terminal = TurnTaskResult {
+            required_tool_terminal: Some(RequiredToolTerminal {
+                call_id: "required-call".to_string(),
+                cause: RequiredToolTerminalCause::Failure,
+                message: "required tool failed".to_string(),
+            }),
+            ..Default::default()
+        };
+        let deferred_terminal = TurnTaskResult {
+            defer_pending_input: true,
+            ..Default::default()
+        };
+
+        for result in [&required_terminal, &deferred_terminal] {
+            let polled = Arc::new(AtomicBool::new(false));
+            let future_polled = Arc::clone(&polled);
+            let reenter = should_reenter_regular_task(result, async move {
+                future_polled.store(true, Ordering::Release);
+                true
+            })
+            .await;
+
+            assert!(!reenter);
+            assert!(!polled.load(Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
+    async fn nonterminal_result_reenters_when_pending_input_exists() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let future_polled = Arc::clone(&polled);
+        let reenter = should_reenter_regular_task(&TurnTaskResult::default(), async move {
+            future_polled.store(true, Ordering::Release);
+            true
+        })
+        .await;
+
+        assert!(reenter);
+        assert!(polled.load(Ordering::Acquire));
     }
 }

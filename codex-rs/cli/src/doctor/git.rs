@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn warns_when_git_repo_has_no_git_executable() {
         let check = git_check_from_inputs(GitCheckInputs {
-            repo_root: Some(PathBuf::from("/repo")),
+            repo_root: Some(PathBuf::from(r"C:\repo")),
             ..GitCheckInputs::default()
         });
 
@@ -345,8 +345,8 @@ mod tests {
     #[test]
     fn warns_when_selected_git_cannot_report_version() {
         let check = git_check_from_inputs(GitCheckInputs {
-            selected_git: Some(PathBuf::from("/usr/bin/git")),
-            repo_root: Some(PathBuf::from("/repo")),
+            selected_git: Some(PathBuf::from(r"C:\Program Files\Git\cmd\git.exe")),
+            repo_root: Some(PathBuf::from(r"C:\repo")),
             ..GitCheckInputs::default()
         });
 
@@ -357,11 +357,14 @@ mod tests {
     #[test]
     fn reports_git_candidates_and_repo_metadata() {
         let check = git_check_from_inputs(GitCheckInputs {
-            selected_git: Some(PathBuf::from("/usr/bin/git")),
-            git_candidates: vec![PathBuf::from("/usr/bin/git"), PathBuf::from("/opt/bin/git")],
+            selected_git: Some(PathBuf::from(r"C:\Program Files\Git\cmd\git.exe")),
+            git_candidates: vec![
+                PathBuf::from(r"C:\Program Files\Git\cmd\git.exe"),
+                PathBuf::from(r"D:\Tools\Git\cmd\git.exe"),
+            ],
             git_version: Some("git version 2.54.0".to_string()),
-            git_exec_path: Some("/usr/libexec/git-core".to_string()),
-            repo_root: Some(PathBuf::from("/repo")),
+            git_exec_path: Some(r"C:\Program Files\Git\mingw64\libexec\git-core".to_string()),
+            repo_root: Some(PathBuf::from(r"C:\repo")),
             git_entry: Some("directory".to_string()),
             branch: Some("main".to_string()),
             core_fsmonitor: Some("false".to_string()),

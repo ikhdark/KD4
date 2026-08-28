@@ -76,6 +76,114 @@ async fn request_user_input_round_trip_emits_auto_resolution_ms() -> anyhow::Res
     request_user_input_round_trip_for_mode(ModeKind::Plan, Some(60_000)).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_turn_start_rejects_active_turn_instead_of_steering() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let call_id = "active-turn-call";
+    let request_args = json!({
+        "questions": [{
+            "id": "confirm_path",
+            "header": "Confirm",
+            "question": "Proceed?",
+            "options": [{
+                "label": "Yes (Recommended)",
+                "description": "Continue."
+            }, {
+                "label": "No",
+                "description": "Stop."
+            }]
+        }]
+    })
+    .to_string();
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-active"),
+            ev_function_call(call_id, "request_user_input", &request_args),
+            ev_completed("resp-active"),
+        ]),
+    )
+    .await;
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-active", "done"),
+            ev_completed("resp-active-follow-up"),
+        ]),
+    )
+    .await;
+
+    let test = test_codex().build(&server).await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "start the active turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    let request = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::RequestUserInput(request) => Some(request.clone()),
+        _ => None,
+    })
+    .await;
+    let reserved_turn_id = test.codex.reserve_turn_id();
+    let error = test
+        .codex
+        .submit_user_input_with_reserved_turn_id(
+            reserved_turn_id,
+            Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "this must not become steering input".into(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            },
+            None,
+            None,
+        )
+        .await
+        .expect_err("reserved turn/start must reject an active turn");
+    assert!(matches!(
+        error,
+        codex_protocol::error::CodexErr::InvalidRequest(message)
+            if message == "a turn is already active"
+    ));
+
+    let mut answers = HashMap::new();
+    answers.insert(
+        "confirm_path".to_string(),
+        RequestUserInputAnswer {
+            answers: vec!["yes".to_string()],
+        },
+    );
+    test.codex
+        .submit(Op::UserInputAnswer {
+            id: request.turn_id,
+            response: RequestUserInputResponse {
+                answers,
+                interrupted: false,
+            },
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    Ok(())
+}
+
 async fn request_user_input_round_trip_for_mode(
     mode: ModeKind,
     auto_resolution_ms: Option<u64>,

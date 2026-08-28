@@ -1833,18 +1833,17 @@ fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
             let mut expected_final_answer =
                 assistant_message("parent final answer", Some(MessagePhase::FinalAnswer));
             expected_final_answer.set_turn_id_if_missing(&turn_context.sub_id);
+            let expected_child_usage_hint =
+                crate::context_manager::updates::build_developer_update_item(
+                    crate::stable_context::multi_agent_usage_hint_sections(Some(
+                        "Child subagent guidance.",
+                    )),
+                )
+                .expect("child usage hint");
             let expected_history = [
                 expected_parent_seed,
                 expected_final_answer,
-                ResponseItem::Message {
-                    id: None,
-                    role: "developer".to_string(),
-                    content: vec![ContentItem::InputText {
-                        text: "Child subagent guidance.".to_string(),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                },
+                expected_child_usage_hint,
             ];
             assert_eq!(
                 strip_response_item_ids(history.raw_items()),

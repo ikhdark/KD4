@@ -27,6 +27,13 @@ pub fn command_might_be_dangerous(command: &[String]) -> bool {
     false
 }
 
+/// Returns whether an exact, already-tokenized argv is known dangerous without
+/// interpreting a shell-looking executable as an owned shell wrapper.
+pub fn direct_argv_might_be_dangerous(command: &[String]) -> bool {
+    windows_dangerous_commands::is_dangerous_direct_argv_windows(command)
+        || is_dangerous_to_call_with_exec(command)
+}
+
 /// Returns whether already-tokenized PowerShell words should be treated as
 /// dangerous by the Windows unmatched-command heuristics.
 pub fn is_dangerous_powershell_words(command: &[String]) -> bool {
@@ -217,6 +224,23 @@ mod tests {
     #[test]
     fn rm_rf_is_dangerous() {
         assert!(command_might_be_dangerous(&vec_str(&["rm", "-rf", "/"])));
+    }
+
+    #[test]
+    fn authorization_identity_direct_argv_dangerousness_is_opaque() {
+        assert!(direct_argv_might_be_dangerous(&vec_str(&[
+            "rm", "-rf", "/",
+        ])));
+        assert!(!direct_argv_might_be_dangerous(&vec_str(&[
+            "/workspace/bash",
+            "-lc",
+            "rm -rf /",
+        ])));
+        assert!(!direct_argv_might_be_dangerous(&vec_str(&[
+            "/workspace/pwsh.exe",
+            "-Command",
+            "Start-Process https://example.com",
+        ])));
     }
 
     #[test]

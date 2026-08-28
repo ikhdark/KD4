@@ -254,13 +254,13 @@ pub mod test_support {
     use std::path::Path;
     use std::path::PathBuf;
 
-    /// Creates a platform-absolute [`PathBuf`] from a Unix-style absolute test path.
+    /// Creates a Windows-absolute [`PathBuf`] from a slash-separated test path.
     ///
     /// On Windows, `/tmp/example` maps to `C:\tmp\example`.
-    pub fn test_path_buf(unix_path: &str) -> PathBuf {
+    pub fn test_path_buf(test_path: &str) -> PathBuf {
         let mut path = PathBuf::from(r"C:\");
         path.extend(
-            unix_path
+            test_path
                 .trim_start_matches('/')
                 .split('/')
                 .filter(|segment| !segment.is_empty()),

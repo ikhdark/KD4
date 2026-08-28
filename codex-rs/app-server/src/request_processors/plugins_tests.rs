@@ -31,13 +31,13 @@ fn remote_catalog_jsonrpc_error_preserves_typed_recovery_data() {
 }
 
 #[test]
-fn missing_error_path_remote_uninstall_cache_failure_is_not_tracked_as_success() {
+fn remote_uninstall_cache_failure_is_committed_and_schedules_reconciliation() {
     assert_eq!(
         remote_plugin_uninstall_effects(&Err(RemotePluginCatalogError::CacheRemove(
             "injected cache failure".to_string(),
         ))),
         RemotePluginUninstallEffects {
-            track_success: false,
+            track_success: true,
             refresh_caches: true,
         }
     );

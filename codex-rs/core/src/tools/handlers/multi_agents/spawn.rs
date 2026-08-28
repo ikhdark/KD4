@@ -75,8 +75,7 @@ async fn handle_spawn_agent(
             "Agent depth limit reached. Solve the task yourself.".to_string(),
         ));
     }
-    let mut config =
-        build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+    let mut config = build_agent_spawn_config(turn.as_ref())?;
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
     }

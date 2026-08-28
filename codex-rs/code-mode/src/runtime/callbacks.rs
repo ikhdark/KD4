@@ -1,8 +1,11 @@
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 
 use super::EXIT_SENTINEL;
+use super::MAX_OUTSTANDING_CALLBACKS_PER_CELL;
 use super::RuntimeEvent;
 use super::RuntimeState;
+use super::stored_value_limit_message;
+use super::stored_values_within_limits;
 use super::timers;
 use super::value::json_to_v8;
 use super::value::normalize_output_image;
@@ -47,6 +50,14 @@ pub(super) fn tool_callback(
         return;
     };
     let promise = resolver.get_promise(scope);
+
+    if scope
+        .get_slot::<RuntimeState>()
+        .is_some_and(|state| !state.can_admit_callback())
+    {
+        reject_callback_limit(scope, resolver, promise, &mut retval);
+        return;
+    }
 
     let resolver = v8::Global::new(scope, resolver);
     let (tool_name, tool_kind) = {
@@ -97,9 +108,7 @@ pub(super) fn text_callback(
         }
     };
     if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::ContentItem(
-            FunctionCallOutputContentItem::InputText { text },
-        ));
+        state.emit_output(FunctionCallOutputContentItem::InputText { text });
     }
     retval.set(v8::undefined(scope).into());
 }
@@ -132,7 +141,7 @@ pub(super) fn image_callback(
         Err(()) => return,
     };
     if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::ContentItem(image_item));
+        state.emit_output(image_item);
     }
     retval.set(v8::undefined(scope).into());
 }
@@ -159,11 +168,9 @@ pub(super) fn generated_image_callback(
         Err(()) => return,
     };
     if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::ContentItem(image_item));
+        state.emit_output(image_item);
         if let Some(text) = output_hint {
-            let _ = state.event_tx.send(RuntimeEvent::ContentItem(
-                FunctionCallOutputContentItem::InputText { text },
-            ));
+            state.emit_output(FunctionCallOutputContentItem::InputText { text });
         }
     }
     retval.set(v8::undefined(scope).into());
@@ -216,9 +223,32 @@ pub(super) fn store_callback(
             return;
         }
     };
-    if let Some(state) = scope.get_slot_mut::<RuntimeState>() {
-        state.stored_values.insert(key.clone(), serialized.clone());
-        state.stored_value_writes.insert(key, serialized);
+    let limit_error = scope.get_slot_mut::<RuntimeState>().and_then(|state| {
+        if let Some(error) = state.stored_value_limit_error.as_ref() {
+            return Some(error.clone());
+        }
+
+        let previous = state.stored_values.insert(key.clone(), serialized.clone());
+        if stored_values_within_limits(&state.stored_values) {
+            state.stored_value_writes.insert(key, serialized);
+            return None;
+        }
+
+        match previous {
+            Some(previous) => {
+                state.stored_values.insert(key, previous);
+            }
+            None => {
+                state.stored_values.remove(&key);
+            }
+        }
+        state.stored_value_writes.clear();
+        let error = stored_value_limit_message();
+        state.stored_value_limit_error = Some(error.clone());
+        Some(error)
+    });
+    if let Some(error) = limit_error {
+        throw_type_error(scope, &error);
     }
 }
 
@@ -275,6 +305,13 @@ pub(super) fn notify_callback(
         return;
     };
     let promise = resolver.get_promise(scope);
+    if scope
+        .get_slot::<RuntimeState>()
+        .is_some_and(|state| !state.can_admit_callback())
+    {
+        reject_callback_limit(scope, resolver, promise, &mut retval);
+        return;
+    }
     let resolver = v8::Global::new(scope, resolver);
     let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
         throw_type_error(scope, "runtime state unavailable");
@@ -288,6 +325,22 @@ pub(super) fn notify_callback(
         call_id: state.tool_call_id.clone(),
         text,
     });
+    retval.set(promise.into());
+}
+
+fn reject_callback_limit(
+    scope: &mut v8::PinScope<'_, '_>,
+    resolver: v8::Local<'_, v8::PromiseResolver>,
+    promise: v8::Local<'_, v8::Promise>,
+    retval: &mut v8::ReturnValue<v8::Value>,
+) {
+    let message = format!(
+        "code mode cell exceeded its limit of {MAX_OUTSTANDING_CALLBACKS_PER_CELL} outstanding tool and notification callbacks"
+    );
+    let error = v8::String::new(scope, &message)
+        .map(Into::into)
+        .unwrap_or_else(|| v8::undefined(scope).into());
+    resolver.reject(scope, error);
     retval.set(promise.into());
 }
 

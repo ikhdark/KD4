@@ -10,6 +10,7 @@ use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
@@ -61,19 +62,38 @@ fn validate_turn_interrupt_target(
     Ok(())
 }
 
-fn normalize_task_fingerprint_json(value: &mut Value) {
+fn active_turn_in_progress_error(turn_id: Option<&str>) -> JSONRPCErrorError {
+    let mut error = invalid_request(
+        "thread already has an active turn; use turn/steer to add input to that turn",
+    );
+    let mut data = serde_json::json!({ "reason": "activeTurnInProgress" });
+    if let (Some(turn_id), Value::Object(data)) = (turn_id, &mut data) {
+        data.insert("turnId".to_string(), Value::String(turn_id.to_string()));
+    }
+    error.data = Some(data);
+    error
+}
+
+fn validate_turn_start_target(
+    active_turn_id: Option<&str>,
+    is_running: bool,
+) -> Result<(), JSONRPCErrorError> {
+    if active_turn_id.is_some() || is_running {
+        return Err(active_turn_in_progress_error(active_turn_id));
+    }
+    Ok(())
+}
+
+fn canonicalize_task_fingerprint_json(value: &mut Value) {
     match value {
         Value::Array(values) => {
             for value in values {
-                normalize_task_fingerprint_json(value);
+                canonicalize_task_fingerprint_json(value);
             }
         }
         Value::Object(values) => {
-            if let Some(Value::String(text)) = values.get_mut("text") {
-                *text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            }
             for value in values.values_mut() {
-                normalize_task_fingerprint_json(value);
+                canonicalize_task_fingerprint_json(value);
             }
             let mut entries = std::mem::take(values).into_iter().collect::<Vec<_>>();
             entries.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -94,7 +114,7 @@ fn normalized_task_fingerprint(
         request.remove("clientUserMessageId");
         request.remove("runIndependently");
     }
-    normalize_task_fingerprint_json(&mut request);
+    canonicalize_task_fingerprint_json(&mut request);
     let identity = serde_json::json!({
         "request": request,
         "workspace": workspace_identity,
@@ -143,9 +163,9 @@ fn in_flight_task_capacity_error() -> JSONRPCErrorError {
     )
 }
 
-async fn claim_in_flight_task_before_connection_updates<F, Fut>(
+async fn claim_turn_start_before_connection_updates<F, Fut>(
     thread_state_manager: &ThreadStateManager,
-    task_fingerprint: Option<&String>,
+    task_fingerprint: Option<&str>,
     thread_id: ThreadId,
     turn_id: &str,
     apply_connection_updates: F,
@@ -154,31 +174,45 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(), JSONRPCErrorError>>,
 {
-    if let Some(fingerprint) = task_fingerprint {
-        match thread_state_manager
-            .claim_in_flight_task(fingerprint.clone(), thread_id, turn_id.to_string())
-            .await
-        {
-            crate::thread_state::InFlightTaskClaim::Claimed => {}
-            crate::thread_state::InFlightTaskClaim::Existing(existing) => {
-                return Err(identical_task_in_flight_error(&existing));
-            }
-            crate::thread_state::InFlightTaskClaim::CapacityExceeded => {
-                return Err(in_flight_task_capacity_error());
-            }
+    match thread_state_manager
+        .claim_turn_start(task_fingerprint, thread_id, turn_id)
+        .await
+    {
+        crate::thread_state::TurnStartClaim::Claimed => {}
+        crate::thread_state::TurnStartClaim::IdenticalTask(existing) => {
+            return Err(identical_task_in_flight_error(&existing));
+        }
+        crate::thread_state::TurnStartClaim::ActiveTurn(existing) => {
+            return Err(active_turn_in_progress_error(Some(&existing.turn_id)));
+        }
+        crate::thread_state::TurnStartClaim::CapacityExceeded => {
+            return Err(in_flight_task_capacity_error());
         }
     }
 
     if let Err(error) = apply_connection_updates().await {
-        if task_fingerprint.is_some() {
-            thread_state_manager
-                .release_in_flight_task(thread_id, turn_id)
-                .await;
-        }
+        thread_state_manager
+            .release_turn_start(thread_id, turn_id)
+            .await;
         return Err(error);
     }
 
     Ok(())
+}
+
+async fn release_turn_start_after_submission_error(
+    thread_state_manager: &ThreadStateManager,
+    thread_id: ThreadId,
+    turn_id: &str,
+    err: CodexErr,
+) -> JSONRPCErrorError {
+    thread_state_manager
+        .release_turn_start(thread_id, turn_id)
+        .await;
+    match err {
+        CodexErr::InvalidRequest(message) => invalid_request(message),
+        err => internal_error(format!("failed to start turn: {err}")),
+    }
 }
 
 fn validate_user_input_image_urls(input: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
@@ -334,6 +368,7 @@ struct ThreadSettingsBuildParams {
     approval_policy: Option<codex_app_server_protocol::AskForApproval>,
     approvals_reviewer: Option<codex_app_server_protocol::ApprovalsReviewer>,
     sandbox_policy: Option<codex_app_server_protocol::SandboxPolicy>,
+    permission_profile: Option<PermissionProfile>,
     permissions: Option<String>,
     model: Option<String>,
     service_tier: Option<Option<String>>,
@@ -631,6 +666,18 @@ impl TurnRequestProcessor {
             );
             return Err(error);
         }
+        let is_running = matches!(thread.agent_status().await, AgentStatus::Running);
+        let active_turn_id = {
+            let thread_state = self.thread_state_manager.thread_state(thread_id).await;
+            thread_state
+                .lock()
+                .await
+                .in_progress_turn_id()
+                .map(str::to_owned)
+        };
+        validate_turn_start_target(active_turn_id.as_deref(), is_running).inspect_err(|_| {
+            self.track_error_response(&request_id, /*error_type*/ None);
+        })?;
         let task_fingerprint = if params.run_independently.unwrap_or(false) {
             None
         } else {
@@ -661,6 +708,7 @@ impl TurnRequestProcessor {
                     approval_policy: params.approval_policy,
                     approvals_reviewer: params.approvals_reviewer,
                     sandbox_policy: params.sandbox_policy,
+                    permission_profile: params.permission_profile,
                     permissions: params.permissions,
                     model: params.model,
                     service_tier: params.service_tier,
@@ -685,9 +733,9 @@ impl TurnRequestProcessor {
         // Admission must precede connection capability mutations. Duplicate or overloaded turns
         // are rejected without changing shared thread or MCP state, and a failed capability update
         // releases the claim so the request can be retried.
-        claim_in_flight_task_before_connection_updates(
+        claim_turn_start_before_connection_updates(
             &self.thread_state_manager,
-            task_fingerprint.as_ref(),
+            task_fingerprint.as_deref(),
             thread_id,
             &turn_id,
             || async {
@@ -728,12 +776,13 @@ impl TurnRequestProcessor {
             )
             .await
         {
-            if task_fingerprint.is_some() {
-                self.thread_state_manager
-                    .release_in_flight_task(thread_id, &turn_id)
-                    .await;
-            }
-            let error = internal_error(format!("failed to start turn: {err}"));
+            let error = release_turn_start_after_submission_error(
+                &self.thread_state_manager,
+                thread_id,
+                &turn_id,
+                err,
+            )
+            .await;
             self.track_error_response(&request_id, /*error_type*/ None);
             return Err(error);
         }
@@ -817,6 +866,7 @@ impl TurnRequestProcessor {
             approval_policy,
             approvals_reviewer,
             sandbox_policy,
+            permission_profile: inline_permission_profile,
             permissions,
             model,
             service_tier,
@@ -826,9 +876,11 @@ impl TurnRequestProcessor {
             personality,
         } = params;
 
-        if sandbox_policy.is_some() && permissions.is_some() {
+        if permissions.is_some()
+            && (sandbox_policy.is_some() || inline_permission_profile.is_some())
+        {
             return Err(invalid_request(
-                "`permissions` cannot be combined with `sandboxPolicy`",
+                "`permissions` cannot be combined with `sandboxPolicy` or `permissionProfile`",
             ));
         }
 
@@ -850,6 +902,7 @@ impl TurnRequestProcessor {
             || approval_policy.is_some()
             || approvals_reviewer.is_some()
             || sandbox_policy.is_some()
+            || inline_permission_profile.is_some()
             || permissions.is_some()
             || model.is_some()
             || service_tier.is_some()
@@ -864,7 +917,11 @@ impl TurnRequestProcessor {
             approval_policy.map(codex_app_server_protocol::AskForApproval::to_core);
         let approvals_reviewer =
             approvals_reviewer.map(codex_app_server_protocol::ApprovalsReviewer::to_core);
-        let sandbox_policy = sandbox_policy.map(|policy| policy.to_core());
+        let sandbox_policy = if inline_permission_profile.is_some() {
+            None
+        } else {
+            sandbox_policy.map(|policy| policy.to_core())
+        };
         let (permission_profile, active_permission_profile, profile_workspace_roots) =
             if let Some(permissions) = permissions {
                 let Some(snapshot) = snapshot.as_ref() else {
@@ -908,6 +965,8 @@ impl TurnRequestProcessor {
                     config.permissions.active_permission_profile(),
                     Some(config.permissions.profile_workspace_roots().to_vec()),
                 )
+            } else if let Some(permission_profile) = inline_permission_profile {
+                (Some(permission_profile), None, Some(Vec::new()))
             } else {
                 (None, None, None)
             };
@@ -977,6 +1036,7 @@ impl TurnRequestProcessor {
                     approval_policy: params.approval_policy,
                     approvals_reviewer: params.approvals_reviewer,
                     sandbox_policy: params.sandbox_policy,
+                    permission_profile: params.permission_profile,
                     permissions: params.permissions,
                     model: params.model,
                     service_tier: params.service_tier,

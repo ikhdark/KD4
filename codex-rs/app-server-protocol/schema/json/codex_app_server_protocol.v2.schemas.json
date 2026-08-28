@@ -5577,6 +5577,17 @@
             "null"
           ]
         },
+        "consumer": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ExperimentalFeatureConsumer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which side of the app-server boundary consumes this flag. Optional for clients generated before consumer metadata existed."
+        },
         "defaultEnabled": {
           "description": "Whether this feature is enabled by default.",
           "type": "boolean"
@@ -5619,6 +5630,13 @@
         "stage"
       ],
       "type": "object"
+    },
+    "ExperimentalFeatureConsumer": {
+      "enum": [
+        "runtime",
+        "client"
+      ],
+      "type": "string"
     },
     "ExperimentalFeatureEnablementSetParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -8911,6 +8929,57 @@
       "title": "McpServerRefreshResponse",
       "type": "object"
     },
+    "McpServerStartupCompletedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "cancelled": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "failed": {
+          "items": {
+            "$ref": "#/definitions/McpServerStartupFailure"
+          },
+          "type": "array"
+        },
+        "ready": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "cancelled",
+        "failed",
+        "ready"
+      ],
+      "title": "McpServerStartupCompletedNotification",
+      "type": "object"
+    },
+    "McpServerStartupFailure": {
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "server": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "error",
+        "server"
+      ],
+      "type": "object"
+    },
     "McpServerStartupFailureReason": {
       "enum": [
         "reauthenticationRequired"
@@ -9967,6 +10036,9 @@
           "type": "object"
         }
       ]
+    },
+    "PathUri": {
+      "type": "string"
     },
     "PermissionProfileListParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -14023,6 +14095,26 @@
           "properties": {
             "method": {
               "enum": [
+                "mcpServer/startup/completed"
+              ],
+              "title": "McpServer/startup/completedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/McpServerStartupCompletedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "McpServer/startup/completedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "account/updated"
               ],
               "title": "Account/updatedNotificationMethod",
@@ -15700,7 +15792,7 @@
               "$ref": "#/definitions/SandboxPolicy"
             }
           ],
-          "description": "Legacy sandbox policy retained for compatibility. Experimental clients should prefer `activePermissionProfile` for profile provenance."
+          "description": "Legacy sandbox policy retained for compatibility. Experimental clients should prefer `permissionProfile` for exact permissions and `activePermissionProfile` for profile provenance."
         },
         "serviceTier": {
           "type": [
@@ -17191,7 +17283,7 @@
               "$ref": "#/definitions/SandboxPolicy"
             }
           ],
-          "description": "Legacy sandbox policy retained for compatibility. Experimental clients should prefer `activePermissionProfile` for profile provenance."
+          "description": "Legacy sandbox policy retained for compatibility. Experimental clients should prefer `permissionProfile` for exact permissions and `activePermissionProfile` for profile provenance."
         },
         "serviceTier": {
           "type": [
@@ -17267,6 +17359,21 @@
       "required": [
         "snippet",
         "thread"
+      ],
+      "type": "object"
+    },
+    "ThreadSelectedEnvironment": {
+      "properties": {
+        "cwd": {
+          "$ref": "#/definitions/PathUri"
+        },
+        "environmentId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cwd",
+        "environmentId"
       ],
       "type": "object"
     },
@@ -17632,7 +17739,7 @@
               "$ref": "#/definitions/SandboxPolicy"
             }
           ],
-          "description": "Legacy sandbox policy retained for compatibility. Experimental clients should prefer `activePermissionProfile` for profile provenance."
+          "description": "Legacy sandbox policy retained for compatibility. Experimental clients should prefer `permissionProfile` for exact permissions and `activePermissionProfile` for profile provenance."
         },
         "serviceTier": {
           "type": [
@@ -18892,7 +18999,6 @@
           "default": {
             "checkpointTokens": 0,
             "completionGateNs": 0,
-            "conservativeRerunCount": 0,
             "deliveryAttemptNs": 0,
             "diffRefreshCount": 0,
             "diffReuseCount": 0,
@@ -18905,7 +19011,6 @@
             "interactionReleaseNs": 0,
             "postCleanupNs": 0,
             "preparationNs": 0,
-            "proofReuseCount": 0,
             "reviewNs": 0,
             "reviewPreflightNs": 0,
             "reviewerInfrastructureMemoHitCount": 0,
@@ -18931,6 +19036,28 @@
             "$ref": "#/definitions/TurnTimingToolCall"
           },
           "type": "array"
+        },
+        "toolClosure": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnTimingToolClosure"
+            }
+          ],
+          "default": {
+            "acceptedCount": 0,
+            "complete": true,
+            "duplicateAcceptanceCount": 0,
+            "duplicateCallIdCount": 0,
+            "duplicatePersistenceCount": 0,
+            "duplicateTimingCount": 0,
+            "orphanPersistenceCount": 0,
+            "orphanTimingCount": 0,
+            "overflowCount": 0,
+            "persistedCount": 0,
+            "terminalCount": 0,
+            "timingPairedCount": 0
+          },
+          "description": "Exact accepted-call closure ledger. A terminal event is publishable only when every accepted direct and nested execution has timing, a terminal outcome, and exactly one persisted projection."
         },
         "unions": {
           "$ref": "#/definitions/TurnTimingUnions"
@@ -19029,13 +19156,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "duplicateValidationCount": {
-          "default": 0,
-          "description": "Validation requests identified as duplicates and served from the ledger.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "exactRepeatedWaitCount": {
           "default": 0,
           "format": "uint32",
@@ -19044,7 +19164,7 @@
         },
         "executedValidationCount": {
           "default": 0,
-          "description": "Validation commands that executed rather than reusing a proof.",
+          "description": "Validation commands that executed.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -19064,13 +19184,6 @@
         },
         "failureSignatureCount": {
           "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "forcedFreshValidationCount": {
-          "default": 0,
-          "description": "Executed validation requests that explicitly bypassed reusable proof state.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -19249,13 +19362,6 @@
         "residualDeterministicGenerationCount": {
           "default": 0,
           "description": "Residual deterministic generation requests proved by the reasoning governor, including requests elided before provider dispatch.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "reusedValidationCount": {
-          "default": 0,
-          "description": "Validation results served from the authoritative validation ledger.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -20544,12 +20650,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "conservativeRerunCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "deliveryAttemptNs": {
           "default": 0,
           "format": "uint64",
@@ -20619,12 +20719,6 @@
         "preparationNs": {
           "default": 0,
           "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "proofReuseCount": {
-          "default": 0,
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },
@@ -20861,7 +20955,7 @@
         },
         "outputModelVisibleAtMs": {
           "default": null,
-          "description": "The direct tool output was committed to model-visible conversation history and the best-effort rollout persistence attempt returned. This does not prove that a rollout recorder existed, that its append succeeded, or that storage was flushed. Nested code-mode calls are represented by the outer direct tool output and leave this absent.",
+          "description": "The direct tool output was committed to model-visible conversation history. Durable rollout persistence is tracked independently by the tool-closure ledger. Nested code-mode calls are represented by the outer direct tool output and leave this absent.",
           "format": "uint64",
           "minimum": 0.0,
           "type": [
@@ -21065,12 +21159,134 @@
       ],
       "type": "object"
     },
+    "TurnTimingToolCallIdentity": {
+      "description": "Payload-free identity for one accepted tool execution in the terminal closure ledger.",
+      "properties": {
+        "callId": {
+          "type": "string"
+        },
+        "executionId": {
+          "type": "string"
+        },
+        "parentCallId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "samplingGenerationId": {
+          "default": "",
+          "type": "string"
+        },
+        "source": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnTimingToolCallSource"
+            }
+          ],
+          "default": "direct"
+        }
+      },
+      "required": [
+        "callId",
+        "executionId"
+      ],
+      "type": "object"
+    },
     "TurnTimingToolCallSource": {
       "enum": [
         "direct",
         "code_mode"
       ],
       "type": "string"
+    },
+    "TurnTimingToolClosure": {
+      "description": "Reconciliation summary for all accepted tool executions in a turn.\n\n`complete` is true for a turn with no accepted calls. Otherwise it requires every accepted execution to have a timing record, terminal outcome, and exactly-once persisted projection, with no orphan or duplicate lifecycle records and no ledger overflow.",
+      "properties": {
+        "acceptedCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "complete": {
+          "default": false,
+          "type": "boolean"
+        },
+        "duplicateAcceptanceCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "duplicateCallIdCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "duplicatePersistenceCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "duplicateTimingCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "orphanCalls": {
+          "items": {
+            "$ref": "#/definitions/TurnTimingToolCallIdentity"
+          },
+          "type": "array"
+        },
+        "orphanPersistenceCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "orphanTimingCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "overflowCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "persistedCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "terminalCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "timingPairedCount": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "unresolvedCalls": {
+          "items": {
+            "$ref": "#/definitions/TurnTimingToolCallIdentity"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
     },
     "TurnTimingToolLifecycleEvent": {
       "description": "Exact event-site timestamp from the turn's single monotonic clock.",

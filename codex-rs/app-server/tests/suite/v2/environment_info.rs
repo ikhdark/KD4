@@ -31,8 +31,12 @@ async fn environment_info_returns_remote_environment_info() -> Result<()> {
         accept_exec_server_environment(
             listener,
             json!({
-                "shell": {"name": "zsh", "path": "/bin/zsh"},
-                "cwd": "file:///workspace",
+                "operatingSystem": "windows",
+                "shell": {
+                    "name": "powershell",
+                    "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+                },
+                "cwd": "file:///C:/workspace",
             }),
         )
         .await?;
@@ -68,10 +72,10 @@ async fn environment_info_returns_remote_environment_info() -> Result<()> {
         to_response::<EnvironmentInfoResponse>(response)?,
         EnvironmentInfoResponse {
             shell: EnvironmentShellInfo {
-                name: "zsh".to_string(),
-                path: "/bin/zsh".to_string(),
+                name: "powershell".to_string(),
+                path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
             },
-            cwd: Some(PathUri::parse("file:///workspace")?),
+            cwd: Some(PathUri::parse("file:///C:/workspace")?),
         }
     );
     timeout(RPC_TIMEOUT, exec_server).await???;
@@ -85,7 +89,9 @@ async fn environment_info_accepts_missing_cwd() -> Result<()> {
     let exec_server = tokio::spawn(async move {
         accept_exec_server_environment(
             listener,
-            json!({"shell": {"name": "zsh", "path": "/bin/zsh"}}),
+            json!({
+                "shell": {"name": "cmd", "path": "C:\\Windows\\System32\\cmd.exe"}
+            }),
         )
         .await?;
         Ok::<_, anyhow::Error>(())
@@ -120,8 +126,8 @@ async fn environment_info_accepts_missing_cwd() -> Result<()> {
         to_response::<EnvironmentInfoResponse>(response)?,
         EnvironmentInfoResponse {
             shell: EnvironmentShellInfo {
-                name: "zsh".to_string(),
-                path: "/bin/zsh".to_string(),
+                name: "cmd".to_string(),
+                path: r"C:\Windows\System32\cmd.exe".to_string(),
             },
             cwd: None,
         }

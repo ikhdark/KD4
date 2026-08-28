@@ -1074,34 +1074,35 @@ ON CONFLICT(id) DO UPDATE SET
 
     /// Delete a set of threads and all associated state.
     ///
-    /// Spawn edges and thread rows are deleted last so a failed delete can be retried with enough
-    /// state left to rediscover the same spawned subtree.
+    /// The primary state transaction is the commit point. Auxiliary databases are cleaned only
+    /// after that transaction commits, so a primary failure leaves the complete retry graph and
+    /// auxiliary records intact. Auxiliary cleanup is best-effort after the logical delete.
     pub async fn delete_threads_strict(&self, thread_ids: &[ThreadId]) -> anyhow::Result<u64> {
+        let (rows_affected, _) = self.delete_threads_strict_impl(thread_ids).await?;
+        Ok(rows_affected)
+    }
+
+    async fn delete_threads_strict_impl(
+        &self,
+        thread_ids: &[ThreadId],
+    ) -> anyhow::Result<(u64, usize)> {
         if thread_ids.is_empty() {
-            return Ok(0);
+            return Ok((0, 0));
         }
 
         let thread_id_strings = thread_ids
             .iter()
             .map(ThreadId::to_string)
             .collect::<Vec<_>>();
-        for (thread_id, thread_id_string) in thread_ids.iter().zip(&thread_id_strings) {
-            sqlx::query("DELETE FROM logs WHERE thread_id = ?")
-                .bind(thread_id_string)
-                .execute(self.logs_pool.as_ref())
-                .await?;
-            self.memories.delete_thread_memory(*thread_id).await?;
-            self.thread_goals.delete_thread_goal(*thread_id).await?;
-        }
-
+        let thread_ids_json = serde_json::to_string(&thread_id_strings)?;
         let now = Utc::now().timestamp();
         let mut tx = self.pool.begin().await?;
-        for thread_id_string in &thread_id_strings {
-            for parent_thread_id_string in &thread_id_strings {
-                // If both the job runner and worker are being deleted, requeueing
-                // the worker item would leave a running job with no loop to consume it.
-                sqlx::query(
-                    r#"
+        let mut primary_statement_count = 0;
+
+        // If both the job runner and worker are being deleted, requeueing the worker item would
+        // leave a running job with no loop to consume it.
+        sqlx::query(
+            r#"
 UPDATE agent_jobs
 SET status = ?, updated_at = ?, completed_at = ?, last_error = ?
 WHERE status IN (?, ?)
@@ -1109,65 +1110,79 @@ WHERE status IN (?, ?)
     SELECT item.job_id
     FROM agent_job_items AS item
     JOIN thread_spawn_edges AS edge ON edge.child_thread_id = item.assigned_thread_id
-    WHERE item.status = ? AND item.assigned_thread_id = ? AND edge.parent_thread_id = ?
+    WHERE item.status = ?
+      AND item.assigned_thread_id IN (SELECT value FROM json_each(?))
+      AND edge.parent_thread_id IN (SELECT value FROM json_each(?))
   )
-                    "#,
-                )
-                .bind(AgentJobStatus::Cancelled.as_str())
-                .bind(now)
-                .bind(now)
-                .bind("agent job runner thread was deleted")
-                .bind(AgentJobStatus::Pending.as_str())
-                .bind(AgentJobStatus::Running.as_str())
-                .bind(AgentJobItemStatus::Running.as_str())
-                .bind(thread_id_string)
-                .bind(parent_thread_id_string)
-                .execute(&mut *tx)
-                .await?;
-            }
-            sqlx::query("DELETE FROM thread_dynamic_tools WHERE thread_id = ?")
-                .bind(thread_id_string)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query(
-                r#"
+            "#,
+        )
+        .bind(AgentJobStatus::Cancelled.as_str())
+        .bind(now)
+        .bind(now)
+        .bind("agent job runner thread was deleted")
+        .bind(AgentJobStatus::Pending.as_str())
+        .bind(AgentJobStatus::Running.as_str())
+        .bind(AgentJobItemStatus::Running.as_str())
+        .bind(&thread_ids_json)
+        .bind(&thread_ids_json)
+        .execute(&mut *tx)
+        .await?;
+        primary_statement_count += 1;
+
+        sqlx::query(
+            "DELETE FROM thread_dynamic_tools WHERE thread_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(&thread_ids_json)
+        .execute(&mut *tx)
+        .await?;
+        primary_statement_count += 1;
+
+        sqlx::query(
+            r#"
 UPDATE agent_job_items
 SET
     status = ?,
     assigned_thread_id = NULL,
     updated_at = ?,
     last_error = ?
-WHERE assigned_thread_id = ? AND status = ?
+WHERE assigned_thread_id IN (SELECT value FROM json_each(?)) AND status = ?
             "#,
-            )
-            .bind(AgentJobItemStatus::Pending.as_str())
-            .bind(now)
-            .bind("assigned thread was deleted")
-            .bind(thread_id_string)
-            .bind(AgentJobItemStatus::Running.as_str())
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                r#"
+        )
+        .bind(AgentJobItemStatus::Pending.as_str())
+        .bind(now)
+        .bind("assigned thread was deleted")
+        .bind(&thread_ids_json)
+        .bind(AgentJobItemStatus::Running.as_str())
+        .execute(&mut *tx)
+        .await?;
+        primary_statement_count += 1;
+
+        sqlx::query(
+            r#"
 UPDATE agent_job_items
 SET assigned_thread_id = NULL, updated_at = ?
-WHERE assigned_thread_id = ?
+WHERE assigned_thread_id IN (SELECT value FROM json_each(?))
             "#,
-            )
-            .bind(now)
-            .bind(thread_id_string)
-            .execute(&mut *tx)
-            .await?;
-        }
-        for thread_id_string in &thread_id_strings {
-            sqlx::query(
-                "DELETE FROM thread_spawn_edges WHERE parent_thread_id = ? OR child_thread_id = ?",
-            )
-            .bind(thread_id_string)
-            .bind(thread_id_string)
-            .execute(&mut *tx)
-            .await?;
-        }
+        )
+        .bind(now)
+        .bind(&thread_ids_json)
+        .execute(&mut *tx)
+        .await?;
+        primary_statement_count += 1;
+
+        sqlx::query(
+            r#"
+DELETE FROM thread_spawn_edges
+WHERE parent_thread_id IN (SELECT value FROM json_each(?))
+   OR child_thread_id IN (SELECT value FROM json_each(?))
+            "#,
+        )
+        .bind(&thread_ids_json)
+        .bind(&thread_ids_json)
+        .execute(&mut *tx)
+        .await?;
+        primary_statement_count += 1;
+
         let mut rows_affected = 0;
         for thread_id_string in &thread_id_strings {
             rows_affected += sqlx::query("DELETE FROM threads WHERE id = ?")
@@ -1175,10 +1190,27 @@ WHERE assigned_thread_id = ?
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
+            primary_statement_count += 1;
         }
         tx.commit().await?;
 
-        Ok(rows_affected)
+        for (thread_id, thread_id_string) in thread_ids.iter().zip(&thread_id_strings) {
+            if let Err(err) = sqlx::query("DELETE FROM logs WHERE thread_id = ?")
+                .bind(thread_id_string)
+                .execute(self.logs_pool.as_ref())
+                .await
+            {
+                warn!("failed to remove logs for deleted thread {thread_id}: {err}");
+            }
+            if let Err(err) = self.memories.delete_thread_memory(*thread_id).await {
+                warn!("failed to remove memories for deleted thread {thread_id}: {err}");
+            }
+            if let Err(err) = self.thread_goals.delete_thread_goal(*thread_id).await {
+                warn!("failed to remove goal for deleted thread {thread_id}: {err}");
+            }
+        }
+
+        Ok((rows_affected, primary_statement_count))
     }
 }
 
@@ -1660,11 +1692,12 @@ mod tests {
             )
             .await?;
 
-        let rows = runtime
-            .delete_threads_strict(&[thread_id, child_thread_id])
+        let (rows, primary_statement_count) = runtime
+            .delete_threads_strict_impl(&[thread_id, child_thread_id])
             .await?;
 
         assert_eq!(rows, 1);
+        assert_eq!(primary_statement_count, 7);
         assert!(runtime.get_thread(thread_id).await?.is_none());
         let dynamic_tool_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM thread_dynamic_tools WHERE thread_id = ?")
@@ -1700,7 +1733,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_thread_keeps_retry_graph_on_cleanup_failure() -> Result<()> {
+    async fn delete_thread_keeps_retry_graph_and_auxiliary_state_on_primary_failure() -> Result<()>
+    {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string()).await?;
         let thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000405")?;
@@ -1714,17 +1748,41 @@ mod tests {
             .await?;
         seed_thread_cleanup_state(&runtime, thread_id, child_thread_id).await?;
 
-        runtime.logs_pool.close().await;
+        sqlx::query(
+            r#"
+CREATE TRIGGER fail_thread_delete
+BEFORE DELETE ON threads
+BEGIN
+    SELECT RAISE(FAIL, 'forced primary thread deletion failure');
+END
+            "#,
+        )
+        .execute(runtime.pool.as_ref())
+        .await?;
         runtime
             .delete_thread(thread_id)
             .await
-            .expect_err("closed log db should fail deletion");
+            .expect_err("primary deletion should fail");
 
         assert!(runtime.get_thread(thread_id).await?.is_some());
         assert_eq!(
             runtime.list_thread_spawn_descendants(thread_id).await?,
             vec![child_thread_id]
         );
+        let goal = runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .expect("thread goal should survive a primary deletion failure");
+        assert_eq!(goal.objective, "test goal");
+        assert_eq!(goal.status, crate::ThreadGoalStatus::Active);
+        let logs = runtime
+            .query_logs(&LogQuery {
+                thread_ids: vec![thread_id.to_string()],
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(logs.len(), 1);
         Ok(())
     }
 

@@ -10,6 +10,16 @@ pub mod powershell;
 pub use command_safety::is_dangerous_command;
 pub use command_safety::is_safe_command;
 
+/// Escapes text that will be placed between PowerShell single quotes.
+pub fn escape_powershell_single_quoted(input: &str) -> String {
+    input.replace('\'', "''")
+}
+
+/// Renders one PowerShell single-quoted string literal.
+pub fn quote_powershell_single_quoted(input: &str) -> String {
+    format!("'{}'", escape_powershell_single_quoted(input))
+}
+
 /// Quote one Windows command-line argument using the rules followed by
 /// `CommandLineToArgvW` and the Microsoft C runtime.
 ///
@@ -53,6 +63,8 @@ pub fn quote_windows_arg(arg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::escape_powershell_single_quoted;
+    use super::quote_powershell_single_quoted;
     use super::quote_windows_arg;
     use pretty_assertions::assert_eq;
 
@@ -67,5 +79,11 @@ mod tests {
         ] {
             assert_eq!(quote_windows_arg(argument), expected);
         }
+    }
+
+    #[test]
+    fn powershell_single_quote_helpers_share_one_escape_rule() {
+        assert_eq!(escape_powershell_single_quoted("it's here"), "it''s here");
+        assert_eq!(quote_powershell_single_quoted("it's here"), "'it''s here'");
     }
 }

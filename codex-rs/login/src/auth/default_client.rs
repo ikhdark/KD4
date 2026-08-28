@@ -12,6 +12,7 @@ use codex_http_client::HttpClientBuilder;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 pub use codex_http_client::RequestBuilder as CodexRequestBuilder;
+use codex_http_client::RouteAwareClientPool;
 use codex_terminal_detection::user_agent;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -52,6 +53,15 @@ pub struct Originator {
 static ORIGINATOR: LazyLock<RwLock<Option<Originator>>> = LazyLock::new(|| RwLock::new(None));
 static REQUIREMENTS_RESIDENCY: LazyLock<RwLock<Option<ResidencyRequirement>>> =
     LazyLock::new(|| RwLock::new(None));
+static PLATFORM_USER_AGENT: LazyLock<String> = LazyLock::new(|| {
+    let os_info = os_info::get();
+    format!(
+        "{} {}; {}",
+        os_info.os_type(),
+        os_info.version(),
+        os_info.architecture().unwrap_or("unknown")
+    )
+});
 static ROUTE_AWARE_CLIENT_BUILD_PERMIT: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(1);
 
@@ -159,14 +169,11 @@ pub fn is_first_party_chat_originator(originator_value: &str) -> bool {
 
 pub fn get_codex_user_agent() -> String {
     let build_version = env!("CARGO_PKG_VERSION");
-    let os_info = os_info::get();
     let originator = originator();
     let prefix = format!(
-        "{}/{build_version} ({} {}; {}) {}",
+        "{}/{build_version} ({}) {}",
         originator.value.as_str(),
-        os_info.os_type(),
-        os_info.version(),
-        os_info.architecture().unwrap_or("unknown"),
+        platform_user_agent(),
         user_agent()
     );
     let suffix = USER_AGENT_SUFFIX
@@ -181,6 +188,10 @@ pub fn get_codex_user_agent() -> String {
 
     let candidate = format!("{prefix}{suffix}");
     sanitize_user_agent(candidate, &prefix)
+}
+
+fn platform_user_agent() -> &'static str {
+    PLATFORM_USER_AGENT.as_str()
 }
 
 /// Sanitize the user agent string.
@@ -242,6 +253,30 @@ pub fn create_client_without_request_logging() -> Result<HttpClient, BuildCustom
     build_default_client(default_http_client_builder().without_request_logging())
 }
 
+/// Creates a reusable route-aware pool with the default Codex headers and ChatGPT cookie store.
+pub fn create_client_pool(
+    http_client_factory: HttpClientFactory,
+    route_class: ClientRouteClass,
+) -> RouteAwareClientPool {
+    RouteAwareClientPool::with_builder(
+        http_client_factory,
+        route_class,
+        default_http_client_builder(),
+    )
+}
+
+/// Creates the default reusable route-aware pool without request diagnostics.
+pub fn create_client_pool_without_request_logging(
+    http_client_factory: HttpClientFactory,
+    route_class: ClientRouteClass,
+) -> RouteAwareClientPool {
+    RouteAwareClientPool::with_builder(
+        http_client_factory,
+        route_class,
+        default_http_client_builder().without_request_logging(),
+    )
+}
+
 /// Builds the default Codex HTTP client for a concrete outbound route.
 ///
 /// When route-aware proxy handling is disabled, or the client is running inside the Codex
@@ -273,10 +308,20 @@ pub async fn create_client_for_route_async(
     request_url: String,
     route_class: ClientRouteClass,
 ) -> std::io::Result<HttpClient> {
-    let permit = ROUTE_AWARE_CLIENT_BUILD_PERMIT
-        .acquire()
-        .await
-        .map_err(std::io::Error::other)?;
+    let serialize_build = matches!(
+        http_client_factory.outbound_proxy_policy(),
+        OutboundProxyPolicy::RespectSystemProxy
+    ) && !is_sandboxed();
+    let permit = if serialize_build {
+        Some(
+            ROUTE_AWARE_CLIENT_BUILD_PERMIT
+                .acquire()
+                .await
+                .map_err(std::io::Error::other)?,
+        )
+    } else {
+        None
+    };
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         create_client_for_route(&http_client_factory, &request_url, route_class)

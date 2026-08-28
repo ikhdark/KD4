@@ -10,9 +10,7 @@ use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
-use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
-use crate::extensions::guardian_agent_spawner;
 use crate::extensions::thread_extensions;
 use crate::fs_watch::FsWatchManager;
 use crate::outgoing_message::ConnectionId;
@@ -67,6 +65,7 @@ use codex_app_server_protocol::OverloadReason;
 use codex_app_server_protocol::experimental_required_message;
 use codex_app_server_protocol::overloaded_error;
 use codex_arg0::Arg0DispatchPaths;
+use codex_builtin_extensions::BuiltinExtensionDependencies;
 use codex_chatgpt::workspace_settings;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
@@ -80,6 +79,7 @@ use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::StateDbHandle;
 use codex_state::log_db::LogDbLayer;
 use futures::FutureExt;
+use serde::Serialize;
 use std::panic::AssertUnwindSafe;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -88,6 +88,37 @@ use tracing::Instrument;
 use crate::models_refresh_worker::ModelsRefreshWorker;
 
 const SERIALIZED_REQUEST_QUEUE_FULL_MESSAGE: &str = "Serialized request queue is full";
+const LOGGED_NOTIFICATION_METHOD_BYTES: usize = 128;
+
+#[derive(Debug, PartialEq, Eq)]
+struct NotificationLogMetadata {
+    connection_id: ConnectionId,
+    method: String,
+    method_truncated: bool,
+    params_present: bool,
+}
+
+fn notification_log_metadata(
+    connection_id: ConnectionId,
+    notification: &JSONRPCNotification,
+) -> NotificationLogMetadata {
+    let method_truncated = notification.method.len() > LOGGED_NOTIFICATION_METHOD_BYTES;
+    let method = if method_truncated {
+        let mut end = LOGGED_NOTIFICATION_METHOD_BYTES;
+        while !notification.method.is_char_boundary(end) {
+            end -= 1;
+        }
+        notification.method[..end].to_string()
+    } else {
+        notification.method.clone()
+    };
+    NotificationLogMetadata {
+        connection_id,
+        method,
+        method_truncated,
+        params_present: notification.params.is_some(),
+    }
+}
 
 struct InitializedClientMetadata {
     app_server_client_name: Option<String>,
@@ -99,6 +130,18 @@ struct InitializedClientMetadata {
 fn deserialize_client_request(request: JSONRPCRequest) -> Result<ClientRequest, JSONRPCErrorError> {
     ClientRequest::try_from(request)
         .map_err(|err| invalid_request(format!("Invalid request: {err}")))
+}
+
+fn serialized_request_queue_bytes<T: Serialize + ?Sized>(
+    is_serialized: bool,
+    request: &T,
+) -> usize {
+    if !is_serialized {
+        return 0;
+    }
+    serde_json::to_vec(request)
+        .map(|request| request.len())
+        .unwrap_or(usize::MAX)
 }
 
 pub(crate) struct MessageProcessor {
@@ -256,35 +299,23 @@ impl MessageProcessor {
         let thread_store = codex_core::thread_store_from_config(config.as_ref(), state_db.clone());
         let environment_manager_for_requests = Arc::clone(&environment_manager);
         let environment_manager_for_extensions = Arc::clone(&environment_manager);
-        let restriction_product = session_source.restriction_product();
-        let executor_skill_provider: Arc<dyn codex_skills_extension::SkillProvider> = Arc::new(
-            codex_skills_extension::ExecutorSkillProvider::new_with_restriction_product(
-                Arc::clone(&environment_manager_for_extensions),
-                restriction_product,
-            ),
-        );
         let goal_service = Arc::new(GoalService::new());
         let thread_manager = Arc::new_cyclic(|thread_manager| {
             ThreadManager::new(
                 config.as_ref(),
                 auth_manager.clone(),
-                session_source,
+                session_source.clone(),
                 environment_manager,
                 thread_extensions(
-                    guardian_agent_spawner(thread_manager.clone()),
-                    ThreadExtensionDependencies {
-                        event_sink: app_server_extension_event_sink(
-                            outgoing.clone(),
-                            thread_state_manager.clone(),
-                        ),
+                    app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone()),
+                    BuiltinExtensionDependencies {
                         auth_manager: auth_manager.clone(),
                         state_db: state_db.clone(),
-                        analytics_events_client: analytics_events_client.clone(),
+                        analytics_events_client: Some(analytics_events_client.clone()),
                         thread_manager: thread_manager.clone(),
                         goal_service: Arc::clone(&goal_service),
                         environment_manager: Arc::clone(&environment_manager_for_extensions),
-                        executor_skill_provider: Arc::clone(&executor_skill_provider),
-                        thread_store: Arc::clone(&thread_store),
+                        session_source,
                     },
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
@@ -626,10 +657,21 @@ impl MessageProcessor {
         .await;
     }
 
-    pub(crate) async fn process_notification(&self, notification: JSONRPCNotification) {
+    pub(crate) async fn process_notification(
+        &self,
+        connection_id: ConnectionId,
+        notification: JSONRPCNotification,
+    ) {
         // Currently, we do not expect to receive any notifications from the
         // client, so we just log them.
-        tracing::info!("<- notification: {:?}", notification);
+        let metadata = notification_log_metadata(connection_id, &notification);
+        tracing::info!(
+            connection_id = ?metadata.connection_id,
+            method = metadata.method,
+            method_truncated = metadata.method_truncated,
+            params_present = metadata.params_present,
+            "<- notification"
+        );
     }
 
     /// Handles typed notifications from in-process clients.
@@ -797,9 +839,8 @@ impl MessageProcessor {
         let handler_rpc_gate = Arc::clone(&rpc_gate);
         let processor = Arc::clone(self);
         let span = request_context.span();
-        let estimated_request_bytes = serde_json::to_vec(&codex_request)
-            .map(|request| request.len())
-            .unwrap_or(usize::MAX);
+        let estimated_request_bytes =
+            serialized_request_queue_bytes(serialization_scope.is_some(), &codex_request);
         let request = QueuedInitializedRequest::new_with_estimated_bytes(
             rpc_gate,
             estimated_request_bytes,

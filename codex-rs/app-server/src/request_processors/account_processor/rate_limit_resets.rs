@@ -109,11 +109,7 @@ impl AccountRequestProcessor {
             ));
         }
 
-        Ok(BackendClient::from_auth(
-            self.config.chatgpt_base_url.clone(),
-            &auth,
-            self.config.http_client_factory(),
-        ))
+        Ok(self.backend_client_for_auth(&auth))
     }
 }
 

@@ -8,7 +8,9 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecPolicyAmendment;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -250,6 +252,134 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
     );
 
     Ok(())
+}
+
+async fn assert_direct_argv_shell_name_is_opaque(unified_exec: bool) -> Result<()> {
+    let mut builder = test_codex()
+        .with_pre_build_hook(|codex_home| {
+            let policy_path = codex_home.join("rules").join("policy.rules");
+            fs::create_dir_all(
+                policy_path
+                    .parent()
+                    .expect("policy directory must have a parent"),
+            )
+            .expect("create policy directory");
+            fs::write(
+                &policy_path,
+                r#"prefix_rule(pattern=["ls"], decision="allow")"#,
+            )
+            .expect("write policy file");
+        })
+        .with_config(move |config| {
+            let result = if unified_exec {
+                config.features.enable(Feature::UnifiedExec)
+            } else {
+                config.features.disable(Feature::UnifiedExec)
+            };
+            result.expect("test config should allow feature update");
+        });
+    let server = start_mock_server().await;
+    let test = builder.build(&server).await?;
+    let call_id = if unified_exec {
+        "unified-direct-argv-shell-name"
+    } else {
+        "legacy-direct-argv-shell-name"
+    };
+    let tool_name = if unified_exec {
+        "exec_command"
+    } else {
+        "shell_command"
+    };
+    let program = test
+        .config
+        .cwd
+        .join(if cfg!(windows) { "bash.exe" } else { "bash" })
+        .to_string_lossy()
+        .into_owned();
+    let command = vec![program.clone(), "-lc".to_string(), "ls".to_string()];
+    let args = if unified_exec {
+        json!({
+            "kind": "argv",
+            "program": program,
+            "args": ["-lc", "ls"],
+            "yield_time_ms": 1_000,
+        })
+    } else {
+        json!({
+            "kind": "argv",
+            "program": program,
+            "args": ["-lc", "ls"],
+            "timeout_ms": 1_000,
+        })
+    };
+
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-direct-argv-1"),
+            ev_function_call(call_id, tool_name, &serde_json::to_string(&args)?),
+            ev_completed("resp-direct-argv-1"),
+        ]),
+    )
+    .await;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-direct-argv-1", "done"),
+            ev_completed("resp-direct-argv-2"),
+        ]),
+    )
+    .await;
+
+    submit_user_turn(
+        &test,
+        "run a direct argv command whose executable resembles a shell",
+        AskForApproval::UnlessTrusted,
+        PermissionProfile::Disabled,
+        None,
+    )
+    .await?;
+
+    let approval_event = wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::ExecApprovalRequest(_) | EventMsg::Error(_) | EventMsg::TurnComplete(_)
+        )
+    })
+    .await;
+    let approval = match approval_event {
+        EventMsg::ExecApprovalRequest(approval) => approval,
+        other => panic!("expected approval for exact direct argv command, got {other:?}"),
+    };
+    assert_eq!(approval.command, command);
+    assert_eq!(
+        approval.proposed_execpolicy_amendment,
+        Some(ExecPolicyAmendment::new(command))
+    );
+
+    test.codex
+        .submit(Op::ExecApproval {
+            id: approval.effective_approval_id(),
+            turn_id: None,
+            decision: ReviewDecision::Denied,
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn authorization_identity_legacy_direct_argv_shell_name_is_opaque() -> Result<()> {
+    assert_direct_argv_shell_name_is_opaque(false).await
+}
+
+#[tokio::test]
+async fn authorization_identity_unified_direct_argv_shell_name_is_opaque() -> Result<()> {
+    assert_direct_argv_shell_name_is_opaque(true).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

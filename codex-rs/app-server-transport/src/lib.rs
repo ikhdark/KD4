@@ -30,3 +30,4 @@ pub use transport::start_remote_control;
 pub use transport::start_stdio_connection;
 pub use transport::start_websocket_acceptor;
 pub use transport::take_remote_control_disabled_env;
+pub use transport::validate_websocket_listener;

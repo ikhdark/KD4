@@ -58,7 +58,24 @@ fn byte_stream_output(text: impl Into<Vec<u8>>) -> StreamOutput<Vec<u8>> {
     StreamOutput {
         text: text.into(),
         truncated_after_lines: None,
+        truncated: false,
     }
+}
+
+#[test]
+fn output_capture_preserves_observed_order_and_requires_excess_for_truncation() {
+    let mut capture = OutputCapture::new(Some(6));
+    capture.append(b"a");
+    capture.append(b"BC");
+    capture.append(b"def");
+    let exact = capture.snapshot();
+    assert_eq!(exact.text, b"aBCdef");
+    assert!(!exact.truncated);
+
+    capture.append(b"g");
+    let overflowed = capture.snapshot();
+    assert_eq!(overflowed.text, b"aBCdef");
+    assert!(overflowed.truncated);
 }
 
 impl ChunkedReader {
@@ -205,6 +222,7 @@ async fn read_output_limits_retained_bytes_for_shell_capture() {
     .await
     .expect("read");
     assert_eq!(out.text.len(), EXEC_OUTPUT_MAX_BYTES);
+    assert!(out.truncated);
 }
 
 #[tokio::test]
@@ -232,6 +250,57 @@ async fn read_output_notifies_the_command_progress_watchdog() {
         observer
             .has_changed()
             .expect("progress channel remains open")
+    );
+}
+
+#[tokio::test]
+async fn read_output_drains_and_retains_pipe_when_live_event_queue_is_full() {
+    let (tx_event, rx_event) = async_channel::bounded(1);
+    let stream = StdoutStream {
+        sub_id: "sub".to_string(),
+        call_id: "call".to_string(),
+        tx_event,
+        progress: None,
+    };
+    stream
+        .tx_event
+        .try_send(output_delta_event(
+            &stream,
+            /*is_stderr*/ false,
+            b"prefill".to_vec(),
+        ))
+        .expect("prefill bounded live event queue");
+
+    let expected = vec![b'x'; READ_CHUNK_SIZE * 4];
+    let writer_expected = expected.clone();
+    let (mut writer, reader) = tokio::io::duplex(128);
+    let writer_task = tokio::spawn(async move {
+        writer
+            .write_all(&writer_expected)
+            .await
+            .expect("write all pipe output");
+    });
+
+    let output = timeout(
+        Duration::from_secs(1),
+        read_output(
+            reader,
+            Some(stream),
+            /*is_stderr*/ false,
+            /*max_bytes*/ None,
+            Arc::new(OutputDeltaLimiter::default()),
+        ),
+    )
+    .await
+    .expect("a full live event queue must not block pipe drain")
+    .expect("read output");
+    writer_task.await.expect("writer task joins");
+
+    assert_eq!(output.text, expected);
+    assert_eq!(
+        rx_event.len(),
+        1,
+        "full queue should remain best-effort only"
     );
 }
 
@@ -347,10 +416,12 @@ fn aggregate_output_prefers_stderr_on_contention() {
     let stdout = StreamOutput {
         text: vec![b'a'; EXEC_OUTPUT_MAX_BYTES],
         truncated_after_lines: None,
+        truncated: false,
     };
     let stderr = StreamOutput {
         text: vec![b'b'; EXEC_OUTPUT_MAX_BYTES],
         truncated_after_lines: None,
+        truncated: false,
     };
 
     let aggregated = aggregate_output(&stdout, &stderr, Some(EXEC_OUTPUT_MAX_BYTES));
@@ -368,10 +439,12 @@ fn aggregate_output_fills_remaining_capacity_with_stderr() {
     let stdout = StreamOutput {
         text: vec![b'a'; stdout_len],
         truncated_after_lines: None,
+        truncated: false,
     };
     let stderr = StreamOutput {
         text: vec![b'b'; EXEC_OUTPUT_MAX_BYTES],
         truncated_after_lines: None,
+        truncated: false,
     };
 
     let aggregated = aggregate_output(&stdout, &stderr, Some(EXEC_OUTPUT_MAX_BYTES));
@@ -387,10 +460,12 @@ fn aggregate_output_rebalances_when_stderr_is_small() {
     let stdout = StreamOutput {
         text: vec![b'a'; EXEC_OUTPUT_MAX_BYTES],
         truncated_after_lines: None,
+        truncated: false,
     };
     let stderr = StreamOutput {
         text: vec![b'b'; 1],
         truncated_after_lines: None,
+        truncated: false,
     };
 
     let aggregated = aggregate_output(&stdout, &stderr, Some(EXEC_OUTPUT_MAX_BYTES));
@@ -406,10 +481,12 @@ fn aggregate_output_keeps_stdout_then_stderr_when_under_cap() {
     let stdout = StreamOutput {
         text: vec![b'a'; 4],
         truncated_after_lines: None,
+        truncated: false,
     };
     let stderr = StreamOutput {
         text: vec![b'b'; 3],
         truncated_after_lines: None,
+        truncated: false,
     };
 
     let aggregated = aggregate_output(&stdout, &stderr, Some(EXEC_OUTPUT_MAX_BYTES));
@@ -449,10 +526,12 @@ fn aggregate_output_keeps_all_bytes_when_uncapped() {
     let stdout = StreamOutput {
         text: vec![b'a'; EXEC_OUTPUT_MAX_BYTES],
         truncated_after_lines: None,
+        truncated: false,
     };
     let stderr = StreamOutput {
         text: vec![b'b'; EXEC_OUTPUT_MAX_BYTES],
         truncated_after_lines: None,
+        truncated: false,
     };
 
     let aggregated = aggregate_output(&stdout, &stderr, /*max_bytes*/ None);
@@ -479,6 +558,42 @@ fn full_buffer_capture_policy_disables_caps_and_exec_expiration() {
 }
 
 #[tokio::test]
+async fn combined_exec_cancellation_waits_inline_for_every_source() {
+    let first = CancellationToken::new();
+    let second = CancellationToken::new();
+    let third = CancellationToken::new();
+    let expiration = ExecExpiration::Cancellation(first)
+        .with_cancellation(second)
+        .with_cancellation(third.clone());
+
+    let ExecExpiration::CancellationSet(cancellations) = &expiration else {
+        panic!("combined cancellation should retain its sources without a relay task");
+    };
+    assert_eq!(cancellations.len(), 3);
+
+    third.cancel();
+    assert_eq!(
+        expiration.wait_with_outcome().await,
+        ExecExpirationOutcome::Cancelled
+    );
+}
+
+#[test]
+fn direct_exec_does_not_register_a_process_wide_ctrl_c_listener() {
+    let source = include_str!("exec.rs");
+    let consume_output = source
+        .split("async fn consume_output(")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("async fn await_captured_output_until_deadline(")
+                .next()
+        })
+        .expect("consume_output source");
+
+    assert!(!consume_output.contains("tokio::signal::ctrl_c"));
+}
+
+#[tokio::test]
 async fn exec_full_buffer_capture_ignores_expiration() -> Result<()> {
     let command = vec![
         "powershell.exe".to_string(),
@@ -492,6 +607,7 @@ async fn exec_full_buffer_capture_ignores_expiration() -> Result<()> {
     let output = exec(
         ExecParams {
             command,
+            codex_home: codex_utils_absolute_path::AbsolutePathBuf::current_dir()?,
             cwd: codex_utils_absolute_path::AbsolutePathBuf::current_dir()?,
             expiration: 1.into(),
             capture_policy: ExecCapturePolicy::FullBuffer,
@@ -529,6 +645,7 @@ async fn windows_direct_exec_completes_for_trivial_command() -> Result<()> {
                     "/c".to_string(),
                     "exit 0".to_string(),
                 ],
+                codex_home: codex_utils_absolute_path::AbsolutePathBuf::current_dir()?,
                 cwd: codex_utils_absolute_path::AbsolutePathBuf::current_dir()?,
                 expiration: ExecExpiration::Timeout(Duration::from_secs(5)),
                 capture_policy: ExecCapturePolicy::FullBuffer,
@@ -551,6 +668,37 @@ async fn windows_direct_exec_completes_for_trivial_command() -> Result<()> {
 
     assert_eq!(output.exit_status.code(), Some(0));
     assert!(!output.timed_out);
+    Ok(())
+}
+
+#[tokio::test]
+async fn forced_direct_exec_termination_reaps_the_child() -> Result<()> {
+    let cwd = codex_utils_absolute_path::AbsolutePathBuf::current_dir()?;
+    let managed_root = ManagedRootProcess::reserve_with_reclaim().await?;
+    let mut child = spawn_child_async(SpawnChildRequest {
+        program: PathBuf::from("powershell.exe"),
+        args: vec![
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "Start-Sleep -Seconds 30".to_string(),
+        ],
+        arg0: None,
+        cwd,
+        network_sandbox_policy: NetworkSandboxPolicy::Enabled,
+        network: None,
+        stdio_policy: StdioPolicy::RedirectForShellTool,
+        env: std::env::vars().collect(),
+        creation_flags: 0,
+    })
+    .await?;
+    managed_root.attach_and_resume(child.id().expect("child process id"))?;
+
+    terminate_and_reap_child_process_tree(&mut child, &managed_root).await?;
+
+    assert!(
+        child.try_wait()?.is_some(),
+        "terminated child was not reaped"
+    );
     Ok(())
 }
 
@@ -616,30 +764,50 @@ async fn output_drain_readers_share_one_deadline_window() -> Result<()> {
 }
 
 #[tokio::test]
-async fn output_drain_timeout_discards_captured_prefix() -> Result<()> {
+async fn output_drain_timeout_preserves_captured_prefix_and_marks_it_truncated() -> Result<()> {
     let prefix_read = Arc::new(tokio::sync::Notify::new());
-    let stdout = tokio::spawn(read_output(
+    let stdout_capture = Arc::new(Mutex::new(OutputCapture::new(None)));
+    let stderr_capture = Arc::new(Mutex::new(OutputCapture::new(None)));
+    let aggregate_capture = Arc::new(Mutex::new(OutputCapture::new(None)));
+    let stdout = tokio::spawn(read_output_into_capture(
         PrefixThenPendingReader {
-            prefix: Some(b"discarded prefix".to_vec()),
+            prefix: Some(b"retained prefix".to_vec()),
             prefix_read: Arc::clone(&prefix_read),
         },
         None,
         false,
-        None,
+        Arc::clone(&stdout_capture),
+        Some(Arc::clone(&aggregate_capture)),
         Arc::new(OutputDeltaLimiter::default()),
     ));
     prefix_read.notified().await;
-    let stderr = tokio::spawn(async { Ok::<_, io::Error>(byte_stream_output(b"stderr")) });
+    let stderr = tokio::spawn({
+        let stderr_capture = Arc::clone(&stderr_capture);
+        let aggregate_capture = Arc::clone(&aggregate_capture);
+        async move {
+            aggregate_capture.lock().unwrap().append(b"stderr");
+            stderr_capture.lock().unwrap().append(b"stderr");
+            Ok::<_, io::Error>(())
+        }
+    });
 
-    let (stdout, stderr) = await_output_until_deadline(
+    let (stdout, stderr) = await_captured_output_until_deadline(
         stdout,
         stderr,
+        stdout_capture,
+        stderr_capture,
+        Arc::clone(&aggregate_capture),
         tokio::time::Instant::now() + Duration::from_millis(100),
     )
     .await?;
 
-    assert!(stdout.text.is_empty());
+    assert_eq!(stdout.text, b"retained prefix");
+    assert!(stdout.truncated);
     assert_eq!(stderr.text, b"stderr");
+    assert!(!stderr.truncated);
+    let aggregated = aggregate_capture.lock().unwrap().snapshot();
+    assert_eq!(aggregated.text, b"retained prefixstderr");
+    assert!(aggregated.truncated);
     Ok(())
 }
 
@@ -697,6 +865,7 @@ async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result
     let output = process_exec_tool_call(
         ExecParams {
             command,
+            codex_home: cwd.clone(),
             cwd: cwd.clone(),
             expiration: 1.into(),
             capture_policy: ExecCapturePolicy::FullBuffer,
@@ -1332,12 +1501,14 @@ fn process_exec_tool_call_uses_platform_sandbox_for_network_only_restrictions() 
 fn build_exec_request_preserves_windows_workspace_roots() -> Result<()> {
     let temp_dir = tempfile::TempDir::new()?;
     let cwd = temp_dir.path().abs();
+    let codex_home = temp_dir.path().join("configured-home").abs();
     let additional_root = temp_dir.path().join("additional").abs();
     let workspace_roots = vec![cwd.clone(), additional_root];
 
     let exec_request = build_exec_request(
         ExecParams {
             command: vec!["echo".to_string(), "ok".to_string()],
+            codex_home: codex_home.clone(),
             cwd: cwd.clone(),
             expiration: ExecExpiration::DefaultTimeout,
             capture_policy: ExecCapturePolicy::ShellTool,
@@ -1359,10 +1530,10 @@ fn build_exec_request_preserves_windows_workspace_roots() -> Result<()> {
         exec_request.windows_sandbox_workspace_roots,
         workspace_roots
     );
+    assert_eq!(exec_request.codex_home, codex_home);
     Ok(())
 }
 
-#[cfg(windows)]
 fn encode_powershell_script(script: &str) -> String {
     let utf16_le = script
         .encode_utf16()
@@ -1371,12 +1542,10 @@ fn encode_powershell_script(script: &str) -> String {
     base64::prelude::BASE64_STANDARD.encode(utf16_le)
 }
 
-#[cfg(windows)]
 fn powershell_literal_path(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\'', "''")
 }
 
-#[cfg(windows)]
 #[tokio::test]
 async fn direct_exec_cancellation_terminates_windows_descendants() -> Result<()> {
     let temp_dir = tempfile::TempDir::new()?;
@@ -1419,6 +1588,7 @@ async fn direct_exec_cancellation_terminates_windows_descendants() -> Result<()>
     });
     let params = ExecParams {
         command,
+        codex_home: cwd.clone(),
         cwd,
         expiration: ExecExpiration::Cancellation(cancellation),
         capture_policy: ExecCapturePolicy::ShellTool,
@@ -1466,6 +1636,7 @@ async fn process_exec_tool_call_respects_cancellation_token() -> Result<()> {
     let cancel_tx = cancel_token.clone();
     let params = ExecParams {
         command,
+        codex_home: cwd.clone(),
         cwd: cwd.clone(),
         expiration: ExecExpiration::Cancellation(cancel_token),
         capture_policy: ExecCapturePolicy::ShellTool,

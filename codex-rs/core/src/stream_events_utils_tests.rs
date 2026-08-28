@@ -1,4 +1,5 @@
 use super::HandleOutputCtx;
+use super::OrderedResponseItemRecorder;
 use super::TurnItemContributorPolicy;
 use super::completed_item_defers_mailbox_delivery_to_next_turn;
 use super::finalize_non_tool_response_item;
@@ -6,6 +7,7 @@ use super::handle_non_tool_response_item;
 use super::handle_output_item_done;
 use super::last_assistant_message_from_item;
 use super::response_item_may_include_external_context;
+use super::tool_call_arguments_length;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::tools::ToolRouter;
@@ -15,11 +17,13 @@ use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::router::ToolCall;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::turn_timing::ContinuationCause;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::TurnItemContributor;
 use codex_protocol::ResponseItemId;
+use codex_protocol::error::CodexErr;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::TurnItem;
 use codex_protocol::memory_citation::MemoryCitation;
@@ -31,11 +35,26 @@ use codex_protocol::models::LocalShellStatus;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
+use codex_tools::ToolName;
+use codex_tools::ToolPayload;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
+
+#[test]
+fn logging_contract_tool_call_metadata_omits_payload() {
+    let call = ToolCall {
+        tool_name: ToolName::plain("shell"),
+        call_id: "call-secret".to_string(),
+        payload: ToolPayload::Function {
+            arguments: "argument secret".to_string(),
+        },
+    };
+
+    assert_eq!(tool_call_arguments_length(&call), 15);
+}
 
 struct PersistenceProbeHandler {
     started: Arc<AtomicBool>,
@@ -179,6 +198,14 @@ fn external_context_pollution_items_exclude_local_tool_calls() {
             .iter()
             .any(response_item_may_include_external_context)
     );
+}
+
+#[tokio::test]
+async fn external_context_pollution_signal_is_claimed_once_per_turn() {
+    let (_, turn_context) = make_session_and_context().await;
+
+    assert!(turn_context.claim_memory_pollution_signal());
+    assert!(!turn_context.claim_memory_pollution_signal());
 }
 
 #[tokio::test]
@@ -345,6 +372,7 @@ async fn handle_output_item_done_returns_contributed_last_agent_message() {
         turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
         tool_runtime,
         cancellation_token: CancellationToken::new(),
+        response_item_recorder: OrderedResponseItemRecorder::default(),
     };
 
     let output = handle_output_item_done(
@@ -394,6 +422,7 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
         turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
         tool_runtime,
         cancellation_token: CancellationToken::new(),
+        response_item_recorder: OrderedResponseItemRecorder::default(),
     };
 
     let output = handle_output_item_done(
@@ -404,6 +433,7 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
 
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_none());
+    ctx.response_item_recorder.flush().await;
     let history = session.clone_history().await;
     let [
         ResponseItem::ToolSearchCall {
@@ -429,7 +459,7 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
 }
 
 #[tokio::test]
-async fn completed_tool_call_is_persisted_before_its_future_can_start() {
+async fn completed_tool_call_persistence_does_not_block_stream_and_precedes_dispatch() {
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
@@ -464,22 +494,32 @@ async fn completed_tool_call_is_persisted_before_its_future_can_start() {
         call_id: "persisted-read".to_string(),
         internal_chat_message_metadata_passthrough: None,
     };
+    let response_item_recorder = OrderedResponseItemRecorder::default();
+    let (release_persistence, persistence_blocked) = tokio::sync::oneshot::channel();
+    response_item_recorder
+        .block_persistence_for_test(persistence_blocked)
+        .await;
     let mut ctx = HandleOutputCtx {
         sess: Arc::clone(&session),
         turn_context: Arc::clone(&turn_context),
         turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
         tool_runtime,
         cancellation_token: CancellationToken::new(),
+        response_item_recorder,
     };
     let mut eager_prefix_open = true;
 
-    let output = handle_output_item_done(
-        &mut ctx,
-        item,
-        /*previously_active_item*/ None,
-        &mut eager_prefix_open,
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        handle_output_item_done(
+            &mut ctx,
+            item,
+            /*previously_active_item*/ None,
+            &mut eager_prefix_open,
+        ),
     )
     .await
+    .expect("rollout persistence must not block response stream handling")
     .expect("read-safe tool call should be accepted");
 
     assert!(!output.eager_read_eligible);
@@ -489,25 +529,113 @@ async fn completed_tool_call_is_persisted_before_its_future_can_start() {
         Some((1, 0)),
         "model emission must be counted before the deferred executor future is polled"
     );
+    assert!(session.clone_history().await.raw_items().is_empty());
+    let mut tool_future = Box::pin(
+        output
+            .tool_future
+            .expect("accepted tool call should retain its lazy future")
+            .into_future(),
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), tool_future.as_mut())
+            .await
+            .is_err(),
+        "dispatch must remain blocked behind ordered persistence"
+    );
+    assert!(!started.load(Ordering::SeqCst));
+
+    release_persistence
+        .send(())
+        .expect("persistence blocker should still be active");
+    tool_future
+        .await
+        .result
+        .expect("persistence probe handler should succeed");
     let history = session.clone_history().await;
     let [ResponseItem::FunctionCall { call_id, .. }] = history.raw_items() else {
         panic!("completed tool call must be persisted before dispatch")
     };
     assert_eq!(call_id, "persisted-read");
-
-    output
-        .tool_future
-        .expect("accepted tool call should retain its lazy future")
-        .into_future()
-        .await
-        .result
-        .expect("persistence probe handler should succeed");
     assert!(started.load(Ordering::SeqCst));
     assert_eq!(
         turn_context.turn_timing_state.model_tool_call_counts(),
         Some((1, 1)),
         "executor polling must be counted separately from model emission"
     );
+}
+
+#[tokio::test]
+async fn duplicate_same_generation_tool_call_is_rejected_before_persistence_and_dispatch() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    turn_context.turn_timing_state.mark_turn_started();
+    let sampling = turn_context.turn_timing_state.begin_sampling();
+    let mut pending = None::<ContinuationCause>;
+    turn_context
+        .turn_timing_state
+        .begin_model_generation(&mut pending, &SessionSource::Cli);
+    drop(turn_context.turn_timing_state.begin_model_request_wait());
+    drop(sampling);
+    let started = Arc::new(AtomicBool::new(false));
+    let handler = Arc::new(PersistenceProbeHandler {
+        started: Arc::clone(&started),
+    }) as Arc<dyn CoreToolRuntime>;
+    let router = Arc::new(ToolRouter::from_parts(
+        ToolRegistry::from_tools([handler]),
+        Vec::new(),
+    ));
+    let step_context =
+        StepContext::for_test(Arc::clone(&turn_context)).with_tool_router_for_test(router);
+    let tool_runtime = ToolCallRuntime::new(
+        Arc::clone(&session),
+        step_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+    );
+    let item = ResponseItem::FunctionCall {
+        id: None,
+        name: "persistence_probe".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "duplicate-call".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut ctx = HandleOutputCtx {
+        sess: Arc::clone(&session),
+        turn_context: Arc::clone(&turn_context),
+        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+        tool_runtime,
+        cancellation_token: CancellationToken::new(),
+        response_item_recorder: OrderedResponseItemRecorder::default(),
+    };
+    let mut eager_prefix_open = true;
+
+    let first = handle_output_item_done(
+        &mut ctx,
+        item.clone(),
+        /*previously_active_item*/ None,
+        &mut eager_prefix_open,
+    )
+    .await
+    .expect("first tool call should be accepted");
+    assert!(first.tool_future.is_some());
+
+    let second = handle_output_item_done(
+        &mut ctx,
+        item,
+        /*previously_active_item*/ None,
+        &mut eager_prefix_open,
+    )
+    .await;
+    assert!(matches!(second, Err(CodexErr::Fatal(message)) if message.contains("same call ID")));
+    assert!(!started.load(Ordering::SeqCst));
+
+    ctx.response_item_recorder.flush().await;
+    let history = session.clone_history().await;
+    assert_eq!(history.raw_items().len(), 1);
+    let closure = turn_context.turn_timing_state.tool_closure_snapshot();
+    assert_eq!(closure.accepted_count, 1);
+    assert_eq!(closure.duplicate_call_id_count, 1);
 }
 
 #[tokio::test]

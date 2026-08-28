@@ -214,24 +214,35 @@ impl PlanHandler {
         let use_task_evidence = self.include_task_evidence_schema
             && session.services.task_evidence.allows_kd4_completion();
         let (requested_input, requested_args) = if use_task_evidence {
-            let requested_input = parse_task_evidence_arguments(&arguments)?;
-            let repository = codex_git_utils::get_git_repo_root(turn.config.cwd.as_path())
-                .unwrap_or_else(|| turn.config.cwd.to_path_buf());
-            let routes = requested_input.validation_route.iter().chain(
-                requested_input
+            let mut requested_input = parse_task_evidence_arguments(&arguments)?;
+            let has_validation_routes = requested_input.validation_route.is_some()
+                || requested_input
                     .plan
                     .iter()
-                    .filter_map(|item| item.validation_route.as_ref()),
-            );
-            for route in routes {
-                for leaf in &route.leaves {
-                    super::shell::validate_structured_validation_leaf(leaf, &repository).map_err(
-                        |reason| {
+                    .any(|item| item.validation_route.is_some());
+            if has_validation_routes {
+                let repository = super::shell::validation_repository_root(
+                    turn.config.cwd.as_path(),
+                    turn.config.cwd.as_path(),
+                )
+                .ok_or_else(|| {
+                    FunctionCallError::RespondToModel(
+                        "structured validation routes require a repository workspace".to_string(),
+                    )
+                })?;
+                let routes = requested_input.validation_route.iter_mut().chain(
+                    requested_input
+                        .plan
+                        .iter_mut()
+                        .filter_map(|item| item.validation_route.as_mut()),
+                );
+                for route in routes {
+                    super::shell::normalize_structured_validation_route(route, &repository)
+                        .map_err(|reason| {
                             FunctionCallError::RespondToModel(format!(
                                 "structured validation route could not be bound: {reason}"
                             ))
-                        },
-                    )?;
+                        })?;
                 }
             }
             let requested_args = UpdatePlanArgs {
@@ -339,7 +350,7 @@ fn pending_validation_result(candidate: AutoValidationCandidate) -> JsonValue {
     serde_json::json!({
         "missing_proof": {
             "step_id": candidate.step_id,
-            "implementation_identity": candidate.implementation_identity,
+            "step_revision": candidate.step_revision,
         },
         "stale_epoch": serde_json::Value::Null,
         "unsupported_runner": serde_json::Value::Null,

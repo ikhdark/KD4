@@ -23,6 +23,7 @@ use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHand
 use crate::tools::handlers::multi_agents_v2::SubmitAgentReceiptHandler as SubmitAgentReceiptHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
 use codex_features::MULTI_AGENT_MIN_WAIT_TIMEOUT_MS;
@@ -39,6 +40,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -987,10 +989,6 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
             &child_source,
             validation_call_id.clone(),
             "focused validation".to_string(),
-            std::fs::canonicalize(std::env::current_exe().expect("current test executable"))
-                .expect("current test executable canonicalizes")
-                .to_string_lossy()
-                .into_owned(),
         )
         .await
         .expect("validation call should start for the bound attempt")
@@ -6227,9 +6225,9 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     }
 
     let (_session, mut turn) = make_session_and_context().await;
-    let base_instructions = BaseInstructions {
-        text: "base".to_string(),
-    };
+    turn.base_instructions = Arc::new(BaseInstructions {
+        text: "active turn base".to_string(),
+    });
     turn.developer_instructions = Some("dev".to_string());
     let mut config = (*turn.config).clone();
     config.compact_prompt = Some("compact".to_string());
@@ -6259,9 +6257,9 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .set(AskForApproval::OnRequest)
         .expect("approval policy set");
 
-    let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
+    let config = build_agent_spawn_config(&turn).expect("spawn config");
     let mut expected = (*turn.config).clone();
-    expected.base_instructions = Some(base_instructions.text);
+    expected.base_instructions = Some(turn.base_instructions.text.clone());
     expected.model = Some(turn.model_info.slug.clone());
     expected.model_provider = turn.provider.info().clone();
     expected.model_reasoning_effort = turn.reasoning_effort.clone();
@@ -6278,6 +6276,32 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .set_permission_profile(permission_profile)
         .expect("permission profile set");
     assert_eq!(config, expected);
+}
+
+#[tokio::test]
+async fn live_runtime_windows_sandbox_is_projected_into_child_config() {
+    let (_session, mut turn) = make_session_and_context().await;
+    let mut turn_config = (*turn.config).clone();
+    turn_config
+        .features
+        .enable(Feature::WindowsSandbox)
+        .expect("legacy restricted-token feature should be enabled");
+    turn_config
+        .features
+        .enable(Feature::WindowsSandboxElevated)
+        .expect("legacy elevated feature should be enabled");
+    turn.config = Arc::new(turn_config);
+    for level in [
+        WindowsSandboxLevel::Disabled,
+        WindowsSandboxLevel::RestrictedToken,
+        WindowsSandboxLevel::Elevated,
+    ] {
+        turn.windows_sandbox_level = level;
+
+        let child_config = build_agent_spawn_config(&turn).expect("spawn config");
+
+        assert_eq!(WindowsSandboxLevel::from_config(&child_config), level);
+    }
 }
 
 #[tokio::test]

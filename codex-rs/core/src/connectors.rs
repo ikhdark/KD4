@@ -247,6 +247,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         McpRuntimeContext::new(Arc::clone(&environment_manager), config.cwd.to_path_buf());
     let auth_status_entries = compute_auth_statuses(
         mcp_servers.iter(),
+        &config.codex_home,
         config.mcp_oauth_credentials_store_mode,
         config.auth_keyring_backend_kind(),
         auth.as_ref(),
@@ -286,6 +287,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         /*elicitation_reviewer*/ None,
         /*elicitation_lifecycle*/ None,
         codex_mcp::ElicitationRequestRouter::default(),
+        /*previous_manager*/ None,
     )
     .await;
 

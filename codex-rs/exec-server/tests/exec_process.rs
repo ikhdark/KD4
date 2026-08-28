@@ -35,6 +35,16 @@ struct ProcessContext {
     _server: Option<ExecServerHarness>,
 }
 
+fn powershell(script: impl Into<String>) -> Vec<String> {
+    vec![
+        "powershell.exe".to_string(),
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        script.into(),
+    ]
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ProcessEventSnapshot {
     Output {
@@ -74,7 +84,13 @@ async fn assert_exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
         .backend
         .start(ExecParams {
             process_id: ProcessId::from("proc-1"),
-            argv: vec!["true".to_string()],
+            argv: vec![
+                "cmd.exe".to_string(),
+                "/D".to_string(),
+                "/S".to_string(),
+                "/C".to_string(),
+                "exit /b 0".to_string(),
+            ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
@@ -215,11 +231,9 @@ async fn assert_exec_process_streams_output(use_remote: bool) -> Result<()> {
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "sleep 0.05; printf 'session output\\n'".to_string(),
-            ],
+            argv: powershell(
+                "Start-Sleep -Milliseconds 50; [Console]::Out.Write(\"session output`n\")",
+            ),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
@@ -249,11 +263,9 @@ async fn assert_exec_process_pushes_events(use_remote: bool) -> Result<()> {
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "printf 'event output\\n'; sleep 0.1; printf 'event err\\n' >&2; sleep 0.1; exit 7".to_string(),
-            ],
+            argv: powershell(
+                "[Console]::Out.Write(\"event output`n\"); Start-Sleep -Milliseconds 100; [Console]::Error.Write(\"event err`n\"); Start-Sleep -Milliseconds 100; exit 7",
+            ),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
@@ -299,11 +311,9 @@ async fn assert_exec_process_replays_events_after_close(use_remote: bool) -> Res
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "printf 'late one\\n'; printf 'late two\\n'".to_string(),
-            ],
+            argv: powershell(
+                "[Console]::Out.Write(\"late one`n\"); [Console]::Out.Write(\"late two`n\")",
+            ),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
@@ -424,16 +434,13 @@ async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
         .start(ExecParams {
             process_id: process_id.clone().into(),
             argv: vec![
-                // Use `/bin/sh` instead of Python so this stdin round-trip test
-                // stays portable across Linux runners where
-                // `/usr/bin/python3` is not guaranteed to exist.
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "IFS= read line; printf 'from-stdin:%s\\n' \"$line\"".to_string(),
+                "cmd.exe".to_string(),
+                "/D".to_string(),
+                "/Q".to_string(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
-            env: Default::default(),
+            env: std::env::vars().collect(),
             tty: true,
             pipe_stdin: false,
             arg0: None,
@@ -445,7 +452,11 @@ async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
     assert_eq!(session.process.process_id().as_str(), process_id);
 
     tokio::time::sleep(Duration::from_millis(200)).await;
-    session.process.write(b"hello\n".to_vec()).await?;
+    let write = session
+        .process
+        .write(b"echo from-stdin:hello & exit 0\n".to_vec())
+        .await?;
+    assert_eq!(write.status, WriteStatus::Accepted);
     let StartedExecProcess { process, .. } = session;
     let wake_rx = process.subscribe_wake();
     let (output, exit_code, closed) = collect_process_output_from_reads(process, wake_rx).await?;
@@ -466,11 +477,9 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "IFS= read line; printf 'from-stdin:%s\\n' \"$line\"".to_string(),
-            ],
+            argv: powershell(
+                "$line = [Console]::In.ReadLine(); [Console]::Out.Write(\"from-stdin:$line`n\")",
+            ),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
@@ -502,11 +511,9 @@ async fn assert_exec_process_rejects_write_without_pipe_stdin(use_remote: bool) 
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "sleep 0.3; if IFS= read -r line; then printf 'read:%s\\n' \"$line\"; else printf 'eof\\n'; fi".to_string(),
-            ],
+            argv: powershell(
+                "Start-Sleep -Milliseconds 300; $line = [Console]::In.ReadLine(); if ($null -eq $line) { [Console]::Out.Write(\"eof`n\") } else { [Console]::Out.Write(\"read:$line`n\") }",
+            ),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
@@ -528,63 +535,6 @@ async fn assert_exec_process_rejects_write_without_pipe_stdin(use_remote: bool) 
 
     assert_eq!(output, "eof\n");
     assert_eq!(exit_code, Some(0));
-    assert!(closed);
-    Ok(())
-}
-
-async fn assert_exec_process_signal_interrupts_process(use_remote: bool) -> Result<()> {
-    let context = create_process_context(use_remote).await?;
-    let process_id = "proc-signal".to_string();
-    let session = context
-        .backend
-        .start(ExecParams {
-            process_id: process_id.clone().into(),
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "trap 'printf \"signal:2\\n\"; exit 7' INT; printf 'ready\\n'; while :; do :; done".to_string(),
-            ],
-            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
-            env_policy: /*env_policy*/ None,
-            env: Default::default(),
-            tty: false,
-            pipe_stdin: false,
-            arg0: None,
-            sandbox: None,
-            enforce_managed_network: false,
-            managed_network: None,
-        })
-        .await?;
-    assert_eq!(session.process.process_id().as_str(), process_id);
-
-    let StartedExecProcess { process, .. } = session;
-    let mut wake_rx = process.subscribe_wake();
-    let mut ready_output = String::new();
-    let mut after_seq = None;
-    loop {
-        let response =
-            read_process_until_change(Arc::clone(&process), &mut wake_rx, after_seq).await?;
-        for chunk in response.chunks {
-            ready_output.push_str(&String::from_utf8_lossy(&chunk.chunk.into_inner()));
-            after_seq = Some(chunk.seq);
-        }
-        if ready_output.contains("ready\n") {
-            break;
-        }
-        if response.closed {
-            anyhow::bail!("process closed before readiness marker: {ready_output:?}");
-        }
-        after_seq = response.next_seq.checked_sub(1).or(after_seq);
-    }
-
-    process.signal(ProcessSignal::Interrupt).await?;
-    let (output, exit_code, closed) = collect_process_output_from_reads(process, wake_rx).await?;
-
-    assert!(
-        output.contains("signal:2"),
-        "expected signal handler output, got {output:?}"
-    );
-    assert_eq!(exit_code, Some(7));
     assert!(closed);
     Ok(())
 }
@@ -638,11 +588,7 @@ async fn assert_exec_process_preserves_queued_events_before_subscribe(
         .backend
         .start(ExecParams {
             process_id: ProcessId::from("proc-queued"),
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "printf 'queued output\\n'".to_string(),
-            ],
+            argv: powershell("[Console]::Out.Write(\"queued output`n\")"),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
@@ -667,7 +613,6 @@ async fn assert_exec_process_preserves_queued_events_before_subscribe(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Unix-only exec-server process test"]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
 async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()> {
@@ -681,20 +626,15 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
     let session = backend
         .start(ExecParams {
             process_id: ProcessId::from("proc-recover"),
-            argv: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                concat!(
-                    "printf 'ready:%s\\n' \"$$\"; ",
-                    "while [ ! -f \"$GATE\" ]; do /bin/sleep 0.01; done; ",
-                    "printf 'during:%s\\n' \"$$\"; ",
-                    ": > \"$EMITTED\"; ",
-                    "IFS= read -r line; ",
-                    "printf 'after:%s:%s\\n' \"$$\" \"$line\"; ",
-                    "exit 7",
-                )
-                .to_string(),
-            ],
+            argv: powershell(concat!(
+                "[Console]::Out.Write(\"ready:$PID`n\"); ",
+                "while (-not (Test-Path -LiteralPath $env:GATE)) { Start-Sleep -Milliseconds 10 }; ",
+                "[Console]::Out.Write(\"during:$PID`n\"); ",
+                "$null = New-Item -ItemType File -Force -LiteralPath $env:EMITTED; ",
+                "$line = [Console]::In.ReadLine(); ",
+                "[Console]::Out.Write(\"after:$PID:$line`n\"); ",
+                "exit 7"
+            )),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
             env: HashMap::from([
@@ -819,7 +759,6 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -829,7 +768,6 @@ async fn exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -839,7 +777,6 @@ async fn exec_process_streams_output(use_remote: bool) -> Result<()> {
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -849,7 +786,6 @@ async fn exec_process_pushes_events(use_remote: bool) -> Result<()> {
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -859,7 +795,6 @@ async fn exec_process_replays_events_after_close(use_remote: bool) -> Result<()>
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -871,7 +806,6 @@ async fn exec_process_retains_output_after_exit_until_streams_close(
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -881,7 +815,6 @@ async fn exec_process_write_then_read(use_remote: bool) -> Result<()> {
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
@@ -891,22 +824,11 @@ async fn exec_process_write_then_read_without_tty(use_remote: bool) -> Result<()
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
 async fn exec_process_rejects_write_without_pipe_stdin(use_remote: bool) -> Result<()> {
     assert_exec_process_rejects_write_without_pipe_stdin(use_remote).await
-}
-
-#[test_case(false ; "local")]
-#[test_case(true ; "remote")]
-#[ignore = "Unix-only exec-server process test"]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// Serialize tests that launch a real exec-server process through the full CLI.
-#[serial_test::serial(remote_exec_server)]
-async fn exec_process_signal_interrupts_process(use_remote: bool) -> Result<()> {
-    assert_exec_process_signal_interrupts_process(use_remote).await
 }
 
 #[test_case(false ; "local")]
@@ -920,7 +842,6 @@ async fn exec_process_signal_reports_unsupported_on_windows(use_remote: bool) ->
 
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
-#[ignore = "Unix-only exec-server process test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]

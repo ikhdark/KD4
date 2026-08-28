@@ -1060,13 +1060,6 @@ pub fn ev_shell_command_call_with_args(call_id: &str, args: &serde_json::Value) 
     ev_function_call(call_id, "shell_command", &arguments)
 }
 
-pub fn ev_apply_patch_shell_command_call_via_heredoc(call_id: &str, patch: &str) -> Value {
-    let args = serde_json::json!({ "command": format!("apply_patch <<'EOF'\n{patch}\nEOF\n") });
-    let arguments = serde_json::to_string(&args).expect("serialize apply_patch arguments");
-
-    ev_function_call(call_id, "shell_command", &arguments)
-}
-
 pub fn sse_failed(id: &str, code: &str, message: &str) -> String {
     sse(vec![serde_json::json!({
         "type": "response.failed",

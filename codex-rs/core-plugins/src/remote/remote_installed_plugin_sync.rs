@@ -250,6 +250,7 @@ pub async fn sync_remote_installed_plugin_bundles_once(
             match crate::remote_bundle::download_and_install_remote_plugin_bundle(
                 codex_home.clone(),
                 bundle,
+                &config.http_clients,
             )
             .await
             {
@@ -448,6 +449,8 @@ fn clear_remote_installed_plugin_bundle_sync_in_flight(key: &RemoteInstalledPlug
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use wiremock::Mock;
@@ -542,9 +545,10 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let config = RemotePluginServiceConfig {
-            chatgpt_base_url: format!("{}/backend-api", server.uri()),
-        };
+        let config = RemotePluginServiceConfig::new(
+            format!("{}/backend-api", server.uri()),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        );
         let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
 
         let outcome = sync_remote_installed_plugin_bundles_once(

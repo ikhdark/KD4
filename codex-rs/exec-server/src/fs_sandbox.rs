@@ -18,6 +18,7 @@ use codex_sandboxing::transform_for_direct_spawn;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
 use codex_utils_path_uri::PathUri;
+use codex_utils_pty::configure_windows_command_args;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -307,7 +308,7 @@ fn spawn_command(
     let mut command = Command::new(program);
 
     let _ = arg0;
-    command.args(args);
+    configure_windows_command_args(command.as_std_mut(), std::ffi::OsStr::new(program), args);
     // TODO(anp): Keep PathUri through the filesystem helper launch boundary.
     let cwd = cwd.to_abs_path().map_err(io_error)?;
     command.current_dir(cwd.as_path());

@@ -1421,10 +1421,26 @@
         }
       ]
     },
+    "PathUri": {
+      "type": "string"
+    },
     "PermissionsRequestApprovalParams": {
       "properties": {
         "cwd": {
-          "$ref": "#/definitions/AbsolutePathBuf"
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "description": "Legacy native working directory. For foreign selected environments this is a compatibility fallback; `cwd_uri` is authoritative."
+        },
+        "cwdUri": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PathUri"
+            }
+          ],
+          "description": "URI-preserving working directory for the selected environment."
         },
         "environmentId": {
           "default": null,
@@ -1459,6 +1475,7 @@
       },
       "required": [
         "cwd",
+        "cwdUri",
         "itemId",
         "permissions",
         "startedAtMs",
@@ -2020,7 +2037,7 @@
       "type": "object"
     },
     {
-      "description": "Request to exec a command. This request is used for Turns started via the legacy APIs (i.e. SendUserTurn, SendUserMessage).",
+      "description": "Legacy compatibility request to approve a command. The app-server retains this wire shape for decoding but does not emit it; live command approvals use `item/commandExecution/requestApproval`.",
       "properties": {
         "id": {
           "$ref": "#/definitions/RequestId"

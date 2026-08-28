@@ -21,9 +21,34 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 use toml::Value as TomlValue;
 use tracing::instrument;
 use tracing::warn;
+
+/// Coalesce the clusters of identical config reads made by one app-server RPC
+/// without turning the manager into a long-lived authority over config files.
+const CONFIG_LOAD_CACHE_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, PartialEq)]
+struct ConfigLoadCacheKey {
+    cli_overrides: Vec<(String, TomlValue)>,
+    typesafe_overrides: String,
+    fallback_cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigLoadCacheEntry {
+    key: ConfigLoadCacheKey,
+    generation: u64,
+    loaded_at: Instant,
+    config: Config,
+}
 
 /// Shared app-server entry point for loading effective Codex configuration.
 #[derive(Clone)]
@@ -36,6 +61,10 @@ pub(crate) struct ConfigManager {
     cloud_config_bundle: Arc<RwLock<CloudConfigBundleLoader>>,
     arg0_paths: Arg0DispatchPaths,
     thread_config_loader: Arc<RwLock<Arc<dyn ThreadConfigLoader>>>,
+    load_cache: Arc<RwLock<Option<ConfigLoadCacheEntry>>>,
+    load_generation: Arc<AtomicU64>,
+    #[cfg(test)]
+    config_build_count: Arc<AtomicUsize>,
 }
 
 impl ConfigManager {
@@ -57,6 +86,10 @@ impl ConfigManager {
             cloud_config_bundle: Arc::new(RwLock::new(cloud_config_bundle)),
             arg0_paths,
             thread_config_loader: Arc::new(RwLock::new(thread_config_loader)),
+            load_cache: Arc::new(RwLock::new(None)),
+            load_generation: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            config_build_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -89,6 +122,8 @@ impl ConfigManager {
         let mut runtime_feature_enablement =
             self.runtime_feature_enablement.write().map_err(|_| ())?;
         runtime_feature_enablement.extend(enablement);
+        drop(runtime_feature_enablement);
+        self.invalidate_load_cache();
         Ok(())
     }
 
@@ -106,6 +141,8 @@ impl ConfigManager {
         );
         if let Ok(mut guard) = self.cloud_config_bundle.write() {
             *guard = loader;
+            drop(guard);
+            self.invalidate_load_cache();
         } else {
             warn!("failed to update cloud config bundle loader");
         }
@@ -117,6 +154,8 @@ impl ConfigManager {
     ) {
         if let Ok(mut guard) = self.thread_config_loader.write() {
             *guard = thread_config_loader;
+            drop(guard);
+            self.invalidate_load_cache();
         } else {
             warn!("failed to update thread config loader");
         }
@@ -246,6 +285,23 @@ impl ConfigManager {
             )
             .collect::<Vec<_>>();
 
+        let cache_key = ConfigLoadCacheKey {
+            cli_overrides: merged_cli_overrides.clone(),
+            typesafe_overrides: format!("{typesafe_overrides:?}"),
+            fallback_cwd: fallback_cwd.clone(),
+        };
+        let generation = self.load_generation.load(Ordering::Acquire);
+        if let Ok(cache) = self.load_cache.read()
+            && let Some(entry) = cache.as_ref()
+            && entry.generation == generation
+            && entry.key == cache_key
+            && entry.loaded_at.elapsed() <= CONFIG_LOAD_CACHE_TTL
+        {
+            return Ok(entry.config.clone());
+        }
+
+        #[cfg(test)]
+        self.config_build_count.fetch_add(1, Ordering::Relaxed);
         let mut config = codex_core::config::ConfigBuilder::default()
             .codex_home(self.codex_home.clone())
             .cli_overrides(merged_cli_overrides)
@@ -259,6 +315,14 @@ impl ConfigManager {
             .await?;
         self.apply_runtime_feature_enablement(&mut config);
         self.apply_arg0_paths(&mut config);
+        if let Ok(mut cache) = self.load_cache.write() {
+            *cache = Some(ConfigLoadCacheEntry {
+                key: cache_key,
+                generation,
+                loaded_at: Instant::now(),
+                config: config.clone(),
+            });
+        }
         Ok(config)
     }
 
@@ -314,6 +378,18 @@ impl ConfigManager {
 
     fn apply_arg0_paths(&self, config: &mut Config) {
         config.codex_self_exe = self.arg0_paths.codex_self_exe.clone();
+    }
+
+    fn invalidate_load_cache(&self) {
+        self.load_generation.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut cache) = self.load_cache.write() {
+            *cache = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn config_build_count(&self) -> usize {
+        self.config_build_count.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -400,5 +476,25 @@ fn apply_runtime_feature_enablement_to_features(
             continue;
         };
         features.set_enabled(feature, *enabled);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn identical_config_loads_within_ttl_reuse_built_config() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let manager =
+            ConfigManager::without_managed_config_for_tests(codex_home.path().to_path_buf());
+        let fallback_cwd = Some(codex_home.path().to_path_buf());
+
+        manager.load_latest_config(fallback_cwd.clone()).await?;
+        manager.load_latest_config(fallback_cwd).await?;
+
+        assert_eq!(manager.config_build_count(), 1);
+        Ok(())
     }
 }

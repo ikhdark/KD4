@@ -4,6 +4,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::BorrowedHandle;
 use std::os::windows::io::FromRawHandle;
 use std::os::windows::io::OwnedHandle;
+use std::os::windows::process::CommandExt;
 use std::sync::Arc;
 use std::time::Duration;
 use winapi::um::processthreadsapi::OpenProcess;
@@ -61,7 +62,7 @@ async fn managed_job_terminates_child_and_grandchild() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("managed root closed stdout before reporting child pid"))?;
     let grandchild_pid = std::str::from_utf8(&output)?.trim().parse::<u32>()?;
 
-    session.terminate();
+    session.terminate().expect("terminate pipe process");
     let _ = tokio::time::timeout(Duration::from_secs(5), exit_rx).await?;
 
     let raw = unsafe {
@@ -83,8 +84,47 @@ async fn managed_job_terminates_child_and_grandchild() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn suspended_root_waits_for_job_assignment_before_running() -> anyhow::Result<()> {
+    let marker = std::env::temp_dir().join(format!(
+        "codex-suspended-root-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    let marker_literal = marker.to_string_lossy().replace('\'', "''");
+    let managed = ManagedRootProcess::reserve()?;
+    let mut command = std::process::Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("[IO.File]::WriteAllText('{marker_literal}', 'ran')"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(WINDOWS_CREATE_SUSPENDED);
+    let mut child = command.spawn()?;
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !marker.exists(),
+        "suspended child ran before Job assignment"
+    );
+
+    managed.attach_and_resume(child.id())?;
+    let status = child.wait()?;
+    assert!(status.success());
+    assert!(marker.exists(), "child did not run after it was resumed");
+    std::fs::remove_file(marker)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn windows_process_spawn_timeout_does_not_block_async_runtime() {
-    let error = run_windows_spawn_operation(Duration::from_millis(20), || {
+    let error = run_windows_process_operation(Duration::from_millis(20), || {
         std::thread::sleep(Duration::from_millis(100));
         Ok(())
     })

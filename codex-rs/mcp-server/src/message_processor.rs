@@ -1,11 +1,17 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use codex_arg0::Arg0DispatchPaths;
+use codex_builtin_extensions::BuiltinExtensionDependencies;
+use codex_builtin_extensions::GoalService;
+use codex_builtin_extensions::install_builtin_extensions;
 use codex_core::StateDbHandle;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_exec_server::EnvironmentManager;
+use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
@@ -30,7 +36,8 @@ use rmcp::model::RequestId;
 use rmcp::model::ServerCapabilities;
 use serde_json::json;
 use tokio::sync::Mutex;
-use tokio::task;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::codex_tool_config::CodexToolCallParam;
 use crate::codex_tool_config::CodexToolCallReplyParam;
@@ -44,6 +51,39 @@ pub(crate) struct MessageProcessor {
     arg0_paths: Arg0DispatchPaths,
     thread_manager: Arc<ThreadManager>,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    tool_tasks: ToolTasks,
+}
+
+#[derive(Default)]
+struct ToolTasks {
+    cancellation_token: CancellationToken,
+    tasks: TaskTracker,
+}
+
+fn mcp_extension_registry(
+    dependencies: BuiltinExtensionDependencies,
+) -> Arc<ExtensionRegistry<Config>> {
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    install_builtin_extensions(&mut extensions, dependencies);
+    Arc::new(extensions.build())
+}
+
+impl ToolTasks {
+    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let cancellation_token = self.cancellation_token.clone();
+        self.tasks.spawn(async move {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => {}
+                _ = task => {}
+            }
+        });
+    }
+
+    async fn shutdown(&self) {
+        self.cancellation_token.cancel();
+        self.tasks.close();
+        self.tasks.wait().await;
+    }
 }
 
 impl MessageProcessor {
@@ -66,33 +106,57 @@ impl MessageProcessor {
         let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
             config.codex_home.clone(),
         ));
-        let mut extensions = ExtensionRegistryBuilder::<Config>::new();
-        codex_image_generation_extension::install(
-            &mut extensions,
-            auth_manager.clone(),
-            |config: &Config| Some(config.codex_home.clone()),
-        );
-        let thread_manager = Arc::new(ThreadManager::new(
-            config.as_ref(),
-            auth_manager,
-            SessionSource::Mcp,
-            environment_manager,
-            Arc::new(extensions.build()),
-            user_instructions_provider,
-            /*analytics_events_client*/ None,
-            codex_core::thread_store_from_config(config.as_ref(), state_db.clone()),
-            codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
-            installation_id,
-            /*attestation_provider*/ None,
-            /*external_time_provider*/ None,
-        ));
+        let thread_store = codex_core::thread_store_from_config(config.as_ref(), state_db.clone());
+        let goal_service = Arc::new(GoalService::new());
+        let environment_manager_for_extensions = Arc::clone(&environment_manager);
+        let thread_manager = Arc::new_cyclic(|thread_manager| {
+            let extensions = mcp_extension_registry(BuiltinExtensionDependencies {
+                auth_manager: auth_manager.clone(),
+                state_db: state_db.clone(),
+                analytics_events_client: None,
+                thread_manager: thread_manager.clone(),
+                goal_service: Arc::clone(&goal_service),
+                environment_manager: Arc::clone(&environment_manager_for_extensions),
+                session_source: SessionSource::Mcp,
+            });
+            ThreadManager::new(
+                config.as_ref(),
+                auth_manager,
+                SessionSource::Mcp,
+                environment_manager,
+                extensions,
+                user_instructions_provider,
+                /*analytics_events_client*/ None,
+                Arc::clone(&thread_store),
+                codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
+                installation_id,
+                /*attestation_provider*/ None,
+                /*external_time_provider*/ None,
+            )
+        });
         Self {
             outgoing,
             initialized: false,
             arg0_paths,
             thread_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
+            tool_tasks: ToolTasks::default(),
         }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.tool_tasks.shutdown().await;
+        let report = self
+            .thread_manager
+            .shutdown_all_threads_bounded(Duration::from_secs(10))
+            .await;
+        for thread_id in report.submit_failed {
+            tracing::warn!(%thread_id, "failed to submit Shutdown to MCP thread");
+        }
+        for thread_id in report.timed_out {
+            tracing::warn!(%thread_id, "timed out shutting down MCP thread");
+        }
+        self.running_requests_id_to_codex_uuid.lock().await.clear();
     }
 
     pub(crate) async fn process_request(&mut self, request: JsonRpcRequest<ClientRequest>) {
@@ -406,7 +470,7 @@ impl MessageProcessor {
 
         // Spawn an async task to handle the Codex session so that we do not
         // block the synchronous message-processing loop.
-        task::spawn(async move {
+        self.tool_tasks.spawn(async move {
             // Run the Codex session and stream events back to the client.
             crate::codex_tool_runner::run_codex_tool_session(
                 id,
@@ -485,7 +549,7 @@ impl MessageProcessor {
 
         // Spawn the long-running reply handler.
         let prompt = codex_tool_call_reply_param.prompt.clone();
-        tokio::spawn({
+        self.tool_tasks.spawn({
             let outgoing = outgoing.clone();
             let running_requests_id_to_codex_uuid = running_requests_id_to_codex_uuid.clone();
 
@@ -585,5 +649,55 @@ impl MessageProcessor {
 
     fn handle_initialized_notification(&self) {
         tracing::info!("notifications/initialized");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Weak;
+
+    use codex_exec_server::EnvironmentManager;
+    use codex_login::CodexAuth;
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn mcp_host_uses_the_complete_shared_extension_profile() {
+        let registry = mcp_extension_registry(BuiltinExtensionDependencies {
+            auth_manager: AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test")),
+            state_db: None,
+            analytics_events_client: None,
+            thread_manager: Weak::new(),
+            goal_service: Arc::new(GoalService::new()),
+            environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+            session_source: SessionSource::Mcp,
+        });
+
+        assert_eq!(registry.tool_contributors().len(), 4);
+        assert_eq!(registry.context_contributors().len(), 2);
+        assert_eq!(
+            registry
+                .mcp_server_contributors()
+                .iter()
+                .map(|contributor| contributor.id())
+                .collect::<Vec<_>>(),
+            vec!["hosted_plugin_runtime", "selected_executor_plugin_mcp"]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_task_shutdown_drops_resources_held_by_in_flight_tasks() {
+        let tool_tasks = ToolTasks::default();
+        let (resource_tx, mut resource_rx) = tokio::sync::mpsc::channel::<()>(1);
+        tool_tasks.spawn(async move {
+            let _resource_tx = resource_tx;
+            std::future::pending::<()>().await;
+        });
+
+        tokio::task::yield_now().await;
+        tool_tasks.shutdown().await;
+
+        assert_eq!(resource_rx.recv().await, None);
     }
 }

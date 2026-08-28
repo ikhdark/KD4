@@ -14,6 +14,11 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
@@ -82,6 +87,60 @@ impl Default for ToolSchemaArtifact {
     }
 }
 
+/// Request-dynamic history accounting that is intentionally resolved only by
+/// post-dispatch diagnostics. Clones share the same result so unchanged
+/// transport retries do not repeat serialization or token scanning.
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredDynamicHistoryMeasurement {
+    stable_input_bytes: u64,
+    stable_input_tokens: i64,
+    measured_manifest: Arc<OnceLock<StableContextManifest>>,
+    #[cfg(test)]
+    measurement_count: Arc<AtomicUsize>,
+}
+
+impl DeferredDynamicHistoryMeasurement {
+    pub(crate) fn new(stable_input_bytes: u64, stable_input_tokens: i64) -> Self {
+        Self {
+            stable_input_bytes,
+            stable_input_tokens,
+            measured_manifest: Arc::new(OnceLock::new()),
+            #[cfg(test)]
+            measurement_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn measure(
+        &self,
+        input: &[ResponseItem],
+        manifest: &StableContextManifest,
+    ) -> StableContextManifest {
+        self.measured_manifest
+            .get_or_init(|| {
+                #[cfg(test)]
+                self.measurement_count.fetch_add(1, Ordering::Relaxed);
+                let input_bytes = serde_json::to_vec(input).unwrap_or_default();
+                let dynamic_bytes = u64::try_from(input_bytes.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(self.stable_input_bytes);
+                let dynamic_tokens =
+                    i64::try_from(codex_utils_output_truncation::approx_token_count(
+                        std::str::from_utf8(&input_bytes).unwrap_or_default(),
+                    ))
+                    .unwrap_or(i64::MAX)
+                    .saturating_sub(self.stable_input_tokens)
+                    .max(0);
+                manifest.add_dynamic_history(&input_bytes, dynamic_bytes, dynamic_tokens)
+            })
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn measurement_count(&self) -> usize {
+        self.measurement_count.load(Ordering::Relaxed)
+    }
+}
+
 /// API request payload for a single model turn
 #[derive(Debug, Clone)]
 pub struct Prompt {
@@ -110,6 +169,10 @@ pub struct Prompt {
     /// Internal-only context identity and accounting sidecar. This field is
     /// never serialized into a provider request.
     pub(crate) stable_context_manifest: StableContextManifest,
+
+    /// Deferred request-dynamic accounting resolved by post-dispatch
+    /// diagnostics. This field is never serialized into a provider request.
+    pub(crate) deferred_dynamic_history: Option<DeferredDynamicHistoryMeasurement>,
 
     /// Measurement-only response-item provenance. It is never serialized.
     pub(crate) prompt_provenance: PromptProvenanceSidecar,
@@ -144,6 +207,7 @@ impl Default for Prompt {
             tool_history_substitutions: Arc::from([]),
             stable_context_fallback_tool_history_substitutions: Arc::from([]),
             stable_context_manifest: StableContextManifest::default(),
+            deferred_dynamic_history: None,
             prompt_provenance: PromptProvenanceSidecar::default(),
             digests: PromptDigests::default(),
             tools: Arc::new(ToolSchemaArtifact::default()),
@@ -156,15 +220,25 @@ impl Default for Prompt {
 }
 
 impl Prompt {
+    pub(crate) fn measured_stable_context_manifest(&self) -> StableContextManifest {
+        self.deferred_dynamic_history.as_ref().map_or_else(
+            || self.stable_context_manifest.clone(),
+            |measurement| measurement.measure(&self.input, &self.stable_context_manifest),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dynamic_history_measurement_count(&self) -> usize {
+        self.deferred_dynamic_history
+            .as_ref()
+            .map_or(0, DeferredDynamicHistoryMeasurement::measurement_count)
+    }
+
     pub(crate) fn get_formatted_input_for_request(
         &self,
         use_responses_lite: bool,
     ) -> Arc<[ResponseItem]> {
-        let mut input = if crate::latency_switches::shared_prompt_input_enabled() {
-            Arc::clone(&self.input)
-        } else {
-            Arc::from(self.input.to_vec())
-        };
+        let mut input = Arc::clone(&self.input);
         if use_responses_lite && has_image_details(&input) {
             strip_image_details(Arc::make_mut(&mut input));
         }

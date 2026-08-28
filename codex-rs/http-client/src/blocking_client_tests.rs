@@ -9,6 +9,25 @@ use http::StatusCode;
 use pretty_assertions::assert_eq;
 
 use super::BlockingHttpClientBuilder;
+use crate::BuildCustomCaTransportError;
+use crate::custom_ca::CustomCaPolicy;
+
+#[test]
+fn exclusive_tls_roots_select_explicit_root_policy() {
+    let ca_pem = include_bytes!("../tests/fixtures/test-ca.pem");
+
+    let client = BlockingHttpClientBuilder::new()
+        .tls_certs_only_pem(ca_pem)
+        .expect("valid CA certificate")
+        .build_inner_using(/*direct*/ false, |builder, custom_ca_policy| {
+            assert_eq!(custom_ca_policy, CustomCaPolicy::ExplicitRootSet);
+            builder
+                .build()
+                .map_err(BuildCustomCaTransportError::BuildClientWithExplicitRoots)
+        });
+
+    assert!(client.is_ok());
+}
 
 #[test]
 fn blocking_client_streams_request_and_response_without_exposing_transport_types() {

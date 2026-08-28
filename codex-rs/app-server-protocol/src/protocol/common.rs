@@ -214,6 +214,26 @@ macro_rules! serialization_scope_expr {
 /// client can send to the server. Each variant has associated `params` and
 /// `response` types. Also generates a `export_client_responses()` function to
 /// export all response types to TypeScript.
+macro_rules! encode_client_request_params {
+    ($params:ident;) => {
+        serde_json::to_value($params).map(Some)
+    };
+    (
+        $params:ident;
+        #[serde(skip_serializing_if = "Option::is_none")]
+        $($remaining:tt)*
+    ) => {
+        if $params.is_none() {
+            Ok(None)
+        } else {
+            serde_json::to_value($params).map(Some)
+        }
+    };
+    ($params:ident; #[$other:meta] $($remaining:tt)*) => {
+        encode_client_request_params!($params; $($remaining)*)
+    };
+}
+
 macro_rules! client_request_definitions {
     (
         $(
@@ -221,7 +241,7 @@ macro_rules! client_request_definitions {
             $(#[doc = $variant_doc:literal])*
             $variant:ident => $wire:literal {
                 $(aliases: [$($alias:literal),* $(,)?],)?
-                params: $(#[$params_meta:meta])* $params:ty,
+                params: $(#[$($params_meta:tt)*])* $params:ty,
                 $(inspect_params: $inspect_params:tt,)?
                 serialization: $serialization:ident $( ( $($serialization_args:tt)* ) )?,
                 $(manual_payload_conversion: $manual_payload_conversion:ident,)?
@@ -243,7 +263,7 @@ macro_rules! client_request_definitions {
                 $variant {
                     #[serde(rename = "id")]
                     request_id: RequestId,
-                    $(#[$params_meta])*
+                    $(#[$($params_meta)*])*
                     params: $params,
                 },
             )*
@@ -302,6 +322,26 @@ macro_rules! client_request_definitions {
                         &method,
                         &[$($wire),*],
                     )),
+                }
+            }
+        }
+
+        impl TryFrom<ClientRequest> for JSONRPCRequest {
+            type Error = serde_json::Error;
+
+            fn try_from(value: ClientRequest) -> Result<Self, Self::Error> {
+                match value {
+                    $(
+                        ClientRequest::$variant { request_id, params } => Ok(Self {
+                            id: request_id,
+                            method: $wire.to_string(),
+                            params: encode_client_request_params!(
+                                params;
+                                $(#[$($params_meta)*])*
+                            )?,
+                            trace: None,
+                        }),
+                    )*
                 }
             }
         }
@@ -1543,6 +1583,23 @@ macro_rules! client_notification_definitions {
             )*
         }
 
+        impl TryFrom<ClientNotification> for JSONRPCNotification {
+            type Error = serde_json::Error;
+
+            fn try_from(value: ClientNotification) -> Result<Self, Self::Error> {
+                let method = value.to_string();
+                let params = match serde_json::to_value(value)? {
+                    serde_json::Value::Object(mut value) => value.remove("params"),
+                    _ => {
+                        return Err(<serde_json::Error as serde::ser::Error>::custom(
+                            "client notification must serialize as an object",
+                        ));
+                    }
+                };
+                Ok(Self { method, params })
+            }
+        }
+
         pub(crate) fn export_client_notification_schemas(
             _out_dir: &::std::path::Path,
         ) -> ::anyhow::Result<Vec<GeneratedSchema>> {
@@ -1618,8 +1675,9 @@ server_request_definitions! {
         params: v1::ApplyPatchApprovalParams,
         response: v1::ApplyPatchApprovalResponse,
     },
-    /// Request to exec a command.
-    /// This request is used for Turns started via the legacy APIs (i.e. SendUserTurn, SendUserMessage).
+    /// Legacy compatibility request to approve a command.
+    /// The app-server retains this wire shape for decoding but does not emit it; live command
+    /// approvals use `item/commandExecution/requestApproval`.
     ExecCommandApproval => "execCommandApproval" {
         params: v1::ExecCommandApprovalParams,
         response: v1::ExecCommandApprovalResponse,
@@ -1773,6 +1831,8 @@ server_notification_definitions! {
     #[delivery(required)]
     McpServerOauthLoginCompleted => "mcpServer/oauthLogin/completed" (v2::McpServerOauthLoginCompletedNotification),
     McpServerStatusUpdated => "mcpServer/startupStatus/updated" (v2::McpServerStatusUpdatedNotification),
+    #[delivery(required)]
+    McpServerStartupCompleted => "mcpServer/startup/completed" (v2::McpServerStartupCompletedNotification),
     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
     #[delivery(required)]
     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
@@ -2603,7 +2663,7 @@ mod tests {
     }
 
     #[test]
-    fn serialize_client_notification() -> Result<()> {
+    fn confirmed_performance_serialize_client_notification() -> Result<()> {
         let notification = ClientNotification::Initialized;
         // Note there is no "params" field for this notification.
         assert_eq!(
@@ -2611,6 +2671,13 @@ mod tests {
                 "method": "initialized",
             }),
             serde_json::to_value(&notification)?,
+        );
+        assert_eq!(
+            JSONRPCNotification::try_from(notification)?,
+            JSONRPCNotification {
+                method: "initialized".to_string(),
+                params: None,
+            }
         );
         Ok(())
     }
@@ -2872,7 +2939,7 @@ mod tests {
     }
 
     #[test]
-    fn serialize_get_account_rate_limits() -> Result<()> {
+    fn confirmed_performance_serialize_get_account_rate_limits() -> Result<()> {
         let request = ClientRequest::GetAccountRateLimits {
             request_id: RequestId::Integer(1),
             params: None,
@@ -2885,6 +2952,15 @@ mod tests {
                 "id": 1,
             }),
             serde_json::to_value(&request)?,
+        );
+        assert_eq!(
+            JSONRPCRequest::try_from(request)?,
+            JSONRPCRequest {
+                id: RequestId::Integer(1),
+                method: "account/rateLimits/read".to_string(),
+                params: None,
+                trace: None,
+            }
         );
         Ok(())
     }
@@ -2987,8 +3063,10 @@ mod tests {
                 approval_policy: v2::AskForApproval::OnRequest,
                 approvals_reviewer: v2::ApprovalsReviewer::User,
                 sandbox: v2::SandboxPolicy::DangerFullAccess,
+                permission_profile: Some(codex_protocol::models::PermissionProfile::Disabled),
                 active_permission_profile: None,
                 reasoning_effort: None,
+                selected_environment: None,
             },
         };
 
@@ -3856,6 +3934,7 @@ mod tests {
                     approval_policy: v2::AskForApproval::Never,
                     approvals_reviewer: v2::ApprovalsReviewer::User,
                     sandbox_policy: v2::SandboxPolicy::DangerFullAccess,
+                    permission_profile: None,
                     active_permission_profile: None,
                     model: "gpt-5.4".to_string(),
                     model_provider: "openai".to_string(),

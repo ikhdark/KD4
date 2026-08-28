@@ -89,8 +89,10 @@ pub(crate) async fn create_client_with_http_client(
     base_url: &str,
     http_client: Arc<dyn HttpClient>,
 ) -> anyhow::Result<RmcpClient> {
+    let codex_home = TempDir::new()?;
     let client = RmcpClient::new_streamable_http_client(
         "test-streamable-http",
+        codex_home.path().to_path_buf(),
         &format!("{base_url}/mcp"),
         Some("test-bearer".to_string()),
         /*http_headers*/ None,
@@ -134,8 +136,10 @@ pub(crate) async fn create_remote_client(
     base_url: &str,
     http_client: ExecServerClient,
 ) -> anyhow::Result<RmcpClient> {
+    let codex_home = TempDir::new()?;
     let client = RmcpClient::new_streamable_http_client(
         "test-streamable-http-remote",
+        codex_home.path().to_path_buf(),
         &format!("{base_url}/mcp"),
         Some("test-bearer".to_string()),
         /*http_headers*/ None,

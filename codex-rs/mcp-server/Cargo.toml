@@ -19,10 +19,10 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 codex-arg0 = { workspace = true }
+codex-builtin-extensions = { workspace = true }
 codex-config = { workspace = true }
 codex-core = { workspace = true }
 codex-home = { workspace = true }
-codex-image-generation-extension = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-login = { workspace = true }

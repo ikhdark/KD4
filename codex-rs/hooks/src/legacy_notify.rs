@@ -87,7 +87,8 @@ pub fn mutating_finalizer_hook(argv: Vec<String>) -> Hook {
                 command
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null());
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true);
 
                 match command.status().await {
                     Ok(status) if status.success() => HookResult::Success,
@@ -106,6 +107,8 @@ pub fn mutating_finalizer_hook(argv: Vec<String>) -> Hook {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use anyhow::Result;
     use codex_protocol::ThreadId;
     use codex_utils_absolute_path::test_support::PathBufExt;
@@ -116,6 +119,64 @@ mod tests {
 
     use super::*;
     use crate::HookEventAfterAgent;
+
+    fn after_agent_payload(cwd: &std::path::Path) -> HookPayload {
+        HookPayload {
+            session_id: ThreadId::new(),
+            cwd: cwd
+                .to_path_buf()
+                .try_into()
+                .expect("temporary directory should be absolute"),
+            client: None,
+            triggered_at: chrono::Utc::now(),
+            hook_event: HookEvent::AfterAgent {
+                event: HookEventAfterAgent {
+                    thread_id: ThreadId::new(),
+                    turn_id: "turn-1".to_string(),
+                    input_messages: Vec::new(),
+                    last_assistant_message: None,
+                },
+            },
+        }
+    }
+
+    fn delayed_marker_command(directory: &std::path::Path) -> Vec<String> {
+        #[cfg(windows)]
+        {
+            let script = directory.join("delayed-marker.ps1");
+            std::fs::write(
+                &script,
+                concat!(
+                    "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'started.txt') -Value started\n",
+                    "Start-Sleep -Seconds 2\n",
+                    "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'escaped.txt') -Value escaped\n",
+                ),
+            )
+            .expect("write finalizer test script");
+            vec![
+                "powershell.exe".to_string(),
+                "-NoProfile".to_string(),
+                "-File".to_string(),
+                script.to_string_lossy().into_owned(),
+            ]
+        }
+
+        #[cfg(not(windows))]
+        {
+            let script = directory.join("delayed-marker.sh");
+            std::fs::write(
+                &script,
+                concat!(
+                    "script_dir=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n",
+                    "printf started > \"$script_dir/started.txt\"\n",
+                    "sleep 2\n",
+                    "printf escaped > \"$script_dir/escaped.txt\"\n",
+                ),
+            )
+            .expect("write finalizer test script");
+            vec!["sh".to_string(), script.to_string_lossy().into_owned()]
+        }
+    }
 
     fn expected_notification_json() -> Value {
         let cwd = test_path_buf("/Users/example/project");
@@ -177,5 +238,37 @@ mod tests {
         assert_eq!(actual, expected_notification_json());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_mutating_finalizer_terminates_its_subprocess() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let started = temp_dir.path().join("started.txt");
+        let escaped = temp_dir.path().join("escaped.txt");
+        let hook = mutating_finalizer_hook(delayed_marker_command(temp_dir.path()));
+        let payload = after_agent_payload(temp_dir.path());
+
+        let hook_task = tokio::spawn(async move { hook.execute(&payload).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("finalizer subprocess should start");
+
+        hook_task.abort();
+        assert!(
+            hook_task
+                .await
+                .expect_err("aborted finalizer task should not complete")
+                .is_cancelled()
+        );
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !escaped.exists(),
+            "mutating finalizer subprocess survived cancellation"
+        );
     }
 }

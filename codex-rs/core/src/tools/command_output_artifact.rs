@@ -1356,26 +1356,6 @@ impl RawOutputArtifact {
         matches!(self, Self::Pending { .. })
     }
 
-    pub(crate) fn restore_validation(
-        codex_home: &Path,
-        thread_id: &str,
-        artifact_ref: &str,
-    ) -> Option<Self> {
-        let id = ToolOutputArtifactId::from_str(artifact_ref).ok()?;
-        let path = codex_home
-            .join("tool-output")
-            .join(thread_id)
-            .join(format!("{id}.log"));
-        let (handle, bytes) = open_regular_artifact(&path).ok()?;
-        Some(Self::Stored {
-            id,
-            path,
-            bytes,
-            truncated: false,
-            handle: Arc::new(handle),
-        })
-    }
-
     pub(crate) fn unavailable(message: impl Into<String>) -> Self {
         Self::Failed {
             id: None,
@@ -1410,6 +1390,22 @@ impl RawOutputArtifact {
         }
     }
 
+    pub(crate) fn render_for_model_with_source_truncation(
+        &self,
+        source_capture_truncated: bool,
+    ) -> String {
+        let mut rendered = self.render_for_model();
+        if source_capture_truncated {
+            if !rendered.is_empty() {
+                rendered.push_str("; ");
+            }
+            rendered.push_str(
+                "source capture truncated at execution retained-byte limit; omitted bytes unavailable",
+            );
+        }
+        rendered
+    }
+
     pub(crate) fn model_projection(
         &self,
     ) -> (Option<ToolOutputArtifactId>, Option<u64>, Option<String>) {
@@ -1426,10 +1422,7 @@ impl RawOutputArtifact {
 
     pub(crate) fn reduction_notice(&self) -> Option<String> {
         let Self::Stored {
-            id,
-            path,
-            truncated,
-            ..
+            path, truncated, ..
         } = self
         else {
             return None;
@@ -1438,12 +1431,12 @@ impl RawOutputArtifact {
             return None;
         }
         let scope = if *truncated {
-            "the retained output prefix (the artifact reached its safety limit)"
+            "the retained prefix"
         } else {
-            "full retained output"
+            "the full retained output"
         };
         Some(format!(
-            "[command output reduced; {scope} is available as artifact {id}.\nUse the advertised read_tool_output schema with artifact {id}; search once or batch exact ranges in one call. Do not rerun the producer merely to recover omitted output.]"
+            "[command output reduced; recover {scope} with read_tool_output using the raw output artifact above. Batch exact ranges when possible; do not rerun the producer.]"
         ))
     }
 
@@ -1468,15 +1461,6 @@ impl RawOutputArtifact {
     pub(crate) fn retention_limit_reason(&self) -> Option<&'static str> {
         self.retention_limit_hit()
             .then_some("per_artifact_safety_limit")
-    }
-
-    /// Reads the immutable retained bytes once to prove that a successful
-    /// validation artifact is still retrievable and uncorrupted before reuse.
-    /// This is an integrity check, not an artifact-content cache.
-    pub(crate) async fn validation_integrity(&self) -> Option<(String, String)> {
-        self.validation_integrity_with_output()
-            .await
-            .map(|(id, sha256, _)| (id, sha256))
     }
 
     pub(crate) async fn validation_integrity_with_output(
@@ -1578,7 +1562,10 @@ pub(crate) async fn create_raw_output_artifact(
             let file = file.into_std().await;
             let _ = file.unlock();
             let handle = Arc::new(file);
-            if let Err(err) = sync_parent_directory(&path) {
+            let sync_path = path.clone();
+            if let Err(err) =
+                run_blocking_artifact_io(move || sync_parent_directory(&sync_path)).await
+            {
                 return failed_with_owned_path(
                     path.clone(),
                     retained.len() as u64,
@@ -2740,9 +2727,13 @@ async fn create_evidence_output_artifact_inner(
     }
     let directory = codex_home.join("tool-output").join(thread_id);
     let retention_permit = retention_sweep_permit().await;
-    std::fs::create_dir_all(&directory)
-        .map_err(|err| format!("failed to create `{}`: {err}", directory.display()))?;
-    let _initial_retention_token = capture_retention_token(&directory);
+    let initial_directory = directory.clone();
+    let _initial_retention_token = run_blocking_artifact_io(move || {
+        std::fs::create_dir_all(&initial_directory)?;
+        Ok(capture_retention_token(&initial_directory))
+    })
+    .await
+    .map_err(|err| format!("failed to create `{}`: {err}", directory.display()))?;
     // Make room before rejecting the reservation. Expired and inactive ordinary command output
     // should not cause durable evidence creation to fail spuriously.
     enforce_retention_locked(&directory, Path::new(""), output.len() as u64, 1).await;
@@ -2757,15 +2748,24 @@ async fn create_evidence_output_artifact_inner(
     // The reservation above may have installed a replacement generation. Artifact creation starts
     // against the post-reservation state so its eventual durable record can never update the
     // generation that preceded reconciliation.
-    let retention_token = capture_retention_token(&directory);
+    let token_directory = directory.clone();
+    let retention_token = run_blocking_artifact_io(move || {
+        Ok::<_, std::io::Error>(capture_retention_token(&token_directory))
+    })
+    .await
+    .map_err(|err| format!("failed to inspect artifact retention state: {err}"))?;
 
     let id = ToolOutputArtifactId::new();
     let path = directory.join(format!("{id}.log"));
-    let file = match std::fs::OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(&path)
+    let create_path = path.clone();
+    let file = match run_blocking_artifact_io(move || {
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&create_path)
+    })
+    .await
     {
         Ok(file) => file,
         Err(err) => {
@@ -2774,8 +2774,18 @@ async fn create_evidence_output_artifact_inner(
         }
     };
     let cleanup = PendingEvidenceArtifactCleanup::new(path.clone(), retention_token.clone());
-    file.try_lock()
-        .map_err(|err| format!("failed to lock `{}` for creation: {err}", path.display()))?;
+    let lock_path = path.clone();
+    let file = run_blocking_artifact_io(move || {
+        file.try_lock()?;
+        Ok(file)
+    })
+    .await
+    .map_err(|err| {
+        format!(
+            "failed to lock `{}` for creation: {err}",
+            lock_path.display()
+        )
+    })?;
     let mut file = tokio::fs::File::from_std(file);
     file.write_all(output)
         .await
@@ -2796,9 +2806,13 @@ async fn create_evidence_output_artifact_inner(
     let _ = pre_marker_barrier;
 
     let marker = evidence_protection_path(&path);
-    create_new_evidence_protection_marker(&marker)
+    let marker_path = marker.clone();
+    run_blocking_artifact_io(move || create_new_evidence_protection_marker(&marker_path))
+        .await
         .map_err(|err| format!("failed to protect `{}` as evidence: {err}", path.display()))?;
-    sync_parent_directory(&path)
+    let sync_path = path.clone();
+    run_blocking_artifact_io(move || sync_parent_directory(&sync_path))
+        .await
         .map_err(|err| format!("failed to sync evidence directory: {err}"))?;
 
     let record = artifact_retention_record(&path)
@@ -4708,7 +4722,6 @@ fn active_tool_history_protection_path(artifact_path: &Path) -> PathBuf {
 
 fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    #[cfg(windows)]
     let result = {
         use std::os::windows::fs::OpenOptionsExt;
 
@@ -4719,8 +4732,6 @@ fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
             .open(parent)
             .and_then(|directory| directory.sync_all())
     };
-    #[cfg(not(windows))]
-    let result = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
     match result {
         Ok(()) => Ok(()),
         Err(error)
@@ -4735,6 +4746,16 @@ fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
         }
         Err(error) => Err(error),
     }
+}
+
+async fn run_blocking_artifact_io<T, F>(operation: F) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 async fn artifact_is_protected(artifact_path: &Path) -> std::io::Result<bool> {
@@ -5772,27 +5793,24 @@ fn retention_interprocess_generation() -> &'static StdMutex<Option<u64>> {
 }
 
 fn advance_retention_interprocess_generation(lock_target: &Path) -> std::io::Result<()> {
-    let previous = match std::fs::read_to_string(lock_target) {
-        Ok(value) => value.trim().parse::<u64>().map_err(|err| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid artifact retention generation: {err}"),
-            )
-        })?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+    let (previous, next, recovered) = match std::fs::read_to_string(lock_target) {
+        Ok(value) => match value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|previous| previous.checked_add(1).map(|next| (previous, next)))
+        {
+            Some((previous, next)) => (previous, next, false),
+            None => (0, 1, true),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0, 1, false),
         Err(err) => return Err(err),
     };
-    let next = previous.checked_add(1).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "artifact retention generation overflowed",
-        )
-    })?;
     write_bytes_atomically(lock_target, next.to_string().as_bytes())?;
     let mut observed = retention_interprocess_generation()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if observed.is_none_or(|observed| observed != previous) {
+    if recovered || observed.is_none_or(|observed| observed != previous) {
         retention_interprocess_index_stale().store(true, Ordering::Release);
     }
     *observed = Some(next);

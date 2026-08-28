@@ -63,13 +63,6 @@ fn typed_source(path: &str) -> SessionSource {
     })
 }
 
-fn resolved_test_executable() -> String {
-    std::fs::canonicalize(std::env::current_exe().expect("current test executable"))
-        .expect("current test executable canonicalizes")
-        .to_string_lossy()
-        .into_owned()
-}
-
 async fn initialized_coordinator() -> (AgentTaskCoordinator, TempDir, TempDir) {
     let codex_home = TempDir::new().expect("codex home tempdir");
     let repository = TempDir::new().expect("repository tempdir");
@@ -83,147 +76,6 @@ async fn initialized_coordinator() -> (AgentTaskCoordinator, TempDir, TempDir) {
         .await
         .expect("task coordinator initializes");
     (coordinator, codex_home, repository)
-}
-
-#[tokio::test]
-async fn validation_waiter_is_removed_on_cancellation() {
-    let (coordinator, _codex_home, _repository) = initialized_coordinator().await;
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
-
-    let current = coordinator
-        .wait_for_validation_call_terminal(
-            "cancelled-validation",
-            &cancellation,
-            Utc::now() + chrono::Duration::minutes(1),
-        )
-        .await
-        .expect("cancelled validation wait succeeds");
-
-    assert!(current.is_none());
-    assert!(
-        coordinator
-            .validation_waiters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty(),
-        "cancellation must release the validation waiter registration"
-    );
-}
-
-#[tokio::test]
-async fn validation_waiter_does_not_miss_terminal_transition() {
-    let (coordinator, _codex_home, _repository) = initialized_coordinator().await;
-    let (armed_tx, mut armed_rx) = tokio::sync::mpsc::unbounded_channel();
-    coordinator.set_validation_wait_armed_hook(armed_tx);
-    let cancellation = CancellationToken::new();
-    let waiter_coordinator = coordinator.clone();
-    let waiter_cancellation = cancellation.clone();
-    let waiter = tokio::spawn(async move {
-        waiter_coordinator
-            .wait_for_validation_call_terminal(
-                "armed-validation",
-                &waiter_cancellation,
-                Utc::now() + chrono::Duration::minutes(1),
-            )
-            .await
-    });
-
-    assert_eq!(
-        armed_rx.recv().await.as_deref(),
-        Some("armed-validation"),
-        "waiter must arm its notification before reading persisted state"
-    );
-    coordinator.notify_validation_call("armed-validation");
-    assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), armed_rx.recv())
-            .await
-            .expect("notification should wake the waiter before its deadline")
-            .as_deref(),
-        Some("armed-validation"),
-        "notify_waiters must be observed even when it runs before the select"
-    );
-
-    cancellation.cancel();
-    waiter
-        .await
-        .expect("validation wait task joins")
-        .expect("validation wait succeeds");
-}
-
-#[tokio::test]
-async fn cancelling_one_validation_waiter_keeps_other_waiter_registered() {
-    let (coordinator, _codex_home, _repository) = initialized_coordinator().await;
-    let first_cancellation = CancellationToken::new();
-    let second_cancellation = CancellationToken::new();
-    let first_coordinator = coordinator.clone();
-    let first_token = first_cancellation.clone();
-    let first = tokio::spawn(async move {
-        first_coordinator
-            .wait_for_validation_call_terminal(
-                "shared-validation",
-                &first_token,
-                Utc::now() + chrono::Duration::minutes(1),
-            )
-            .await
-    });
-    let second_coordinator = coordinator.clone();
-    let second_token = second_cancellation.clone();
-    let second = tokio::spawn(async move {
-        second_coordinator
-            .wait_for_validation_call_terminal(
-                "shared-validation",
-                &second_token,
-                Utc::now() + chrono::Duration::minutes(1),
-            )
-            .await
-    });
-
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let registrations = coordinator
-                .validation_waiters
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get("shared-validation")
-                .map(|entry| entry.registrations);
-            if registrations == Some(2) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("both validation waiters register");
-
-    first_cancellation.cancel();
-    first
-        .await
-        .expect("first validation wait task joins")
-        .expect("first validation wait succeeds");
-    assert_eq!(
-        coordinator
-            .validation_waiters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get("shared-validation")
-            .map(|entry| entry.registrations),
-        Some(1),
-        "one cancelled owner must not unregister the remaining waiter"
-    );
-
-    second_cancellation.cancel();
-    second
-        .await
-        .expect("second validation wait task joins")
-        .expect("second validation wait succeeds");
-    assert!(
-        coordinator
-            .validation_waiters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-    );
 }
 
 #[test]
@@ -337,7 +189,6 @@ async fn focused_validation_token_stays_pinned_across_source_rebinding() {
             &typed_source("/root/worker"),
             "validation-call".to_string(),
             "cargo test -p codex-core".to_string(),
-            resolved_test_executable(),
         )
         .await
         .expect("focused validation begins")
@@ -416,7 +267,6 @@ async fn focused_validation_finish_after_seal_and_rebind_never_retargets() {
             &typed_source("/root/worker"),
             "validation-call".to_string(),
             "cargo test -p codex-core".to_string(),
-            resolved_test_executable(),
         )
         .await
         .expect("focused validation begins")
@@ -465,6 +315,61 @@ async fn focused_validation_finish_after_seal_and_rebind_never_retargets() {
             .validation_calls
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn focused_validation_heartbeat_renews_the_running_call() {
+    let (coordinator, _codex_home, repository) = initialized_coordinator().await;
+    let (assignment, attempt) = coordinator
+        .create_assignment(repository.path(), assignment_draft())
+        .await
+        .expect("assignment is created");
+    coordinator
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: "/root/worker".to_string(),
+            task_name: "worker".to_string(),
+            thread_id: None,
+        })
+        .await
+        .expect("assignment binds");
+    let token = coordinator
+        .begin_focused_validation_for_source(
+            &typed_source("/root/worker"),
+            "validation-heartbeat".to_string(),
+            "cargo test -p codex-core focused".to_string(),
+        )
+        .await
+        .expect("focused validation begins")
+        .expect("typed source is bound");
+    let store = coordinator.required_store().expect("task store exists");
+    let initial_lease = store
+        .get_validation_call("validation-heartbeat".to_string())
+        .await
+        .expect("validation call reads")
+        .expect("validation call exists")
+        .evidence
+        .lease_expires_at
+        .expect("running validation has a lease");
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        coordinator
+            .heartbeat_focused_validation(&token)
+            .await
+            .expect("focused validation heartbeat succeeds")
+    );
+
+    let renewed_lease = store
+        .get_validation_call("validation-heartbeat".to_string())
+        .await
+        .expect("renewed validation call reads")
+        .expect("renewed validation call exists")
+        .evidence
+        .lease_expires_at
+        .expect("renewed validation has a lease");
+    assert!(renewed_lease > initial_lease);
 }
 
 #[tokio::test]

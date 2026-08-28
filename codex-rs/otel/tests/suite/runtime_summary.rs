@@ -7,7 +7,6 @@ use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
-use eventsource_stream::Event as StreamEvent;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
@@ -69,16 +68,11 @@ fn runtime_metrics_summary_collects_tool_api_and_streaming_metrics() -> Result<(
         /*connection_reused*/ false,
         /*agent_identity_telemetry*/ None,
     );
-    let sse_response: std::result::Result<
-        Option<std::result::Result<StreamEvent, eventsource_stream::EventStreamError<&str>>>,
-        tokio::time::error::Elapsed,
-    > = Ok(Some(Ok(StreamEvent {
-        event: "response.created".to_string(),
-        data: "{}".to_string(),
-        id: String::new(),
-        retry: None,
-    })));
-    manager.log_sse_event(&sse_response, Duration::from_millis(120));
+    manager.log_sse_event_result(
+        "response.created",
+        Duration::from_millis(120),
+        /*error*/ None,
+    );
     let ws_response: std::result::Result<
         Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>,
         codex_api::ApiError,

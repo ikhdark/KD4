@@ -37,29 +37,34 @@ pub(super) async fn read_thread(
                     store.config.codex_home.as_path(),
                     metadata.rollout_path.as_path(),
                 )))
-        && (!params.include_history
-            || sqlite_rollout_path_can_load_history_for_thread(
-                store,
-                &metadata.rollout_path,
-                thread_id,
-            )
-            .await)
     {
-        let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
-        if !params.include_history
-            && let Some(rollout_path) = thread.rollout_path.clone()
-            && let Ok(rollout_thread) = read_thread_from_rollout_path(store, rollout_path).await
-            && rollout_thread.thread_id == thread_id
-            && (params.include_archived || rollout_thread.archived_at.is_none())
-            && !rollout_thread.preview.is_empty()
-        {
-            // Preview extraction can be newer than the last SQLite flush, but the SQLite-backed
-            // object remains authoritative for every persisted metadata field.
-            thread.preview = rollout_thread.preview;
+        let preloaded_history = if params.include_history {
+            load_history_items_for_thread(&metadata.rollout_path, thread_id).await
+        } else {
+            None
+        };
+        if params.include_history && preloaded_history.is_none() {
+            // SQLite metadata can outlive a moved/recreated rollout path. Fall through to the
+            // canonical path resolver when the single history read does not match this thread.
+        } else {
+            let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
+            if !params.include_history
+                && let Some(rollout_path) = thread.rollout_path.clone()
+                && let Ok(rollout_thread) = read_thread_from_rollout_path(store, rollout_path).await
+                && rollout_thread.thread_id == thread_id
+                && (params.include_archived || rollout_thread.archived_at.is_none())
+                && !rollout_thread.preview.is_empty()
+            {
+                // Preview extraction can be newer than the last SQLite flush, but the SQLite-backed
+                // object remains authoritative for every persisted metadata field.
+                thread.preview = rollout_thread.preview;
+            }
+            reject_paginated_history(&thread, params.include_history)?;
+            if let Some(items) = preloaded_history {
+                thread.history = Some(StoredThreadHistory { thread_id, items });
+            }
+            return Ok(thread);
         }
-        reject_paginated_history(&thread, params.include_history)?;
-        attach_history_if_requested(&mut thread, params.include_history).await?;
-        return Ok(thread);
     }
 
     let path = resolve_rollout_path(
@@ -83,20 +88,13 @@ pub(super) async fn read_thread(
     Ok(thread)
 }
 
-async fn sqlite_rollout_path_can_load_history_for_thread(
-    store: &LocalThreadStore,
+async fn load_history_items_for_thread(
     path: &std::path::Path,
     thread_id: codex_protocol::ThreadId,
-) -> bool {
-    if codex_rollout::existing_rollout_path(path).await.is_none() {
-        return false;
-    }
-    // SQLite metadata can outlive a moved/recreated rollout path. When history is
-    // requested, verify the path still resolves to the requested thread before
-    // trusting it as the source replay.
-    read_thread_from_rollout_path(store, path.to_path_buf())
-        .await
-        .is_ok_and(|thread| thread.thread_id == thread_id)
+) -> Option<Vec<codex_protocol::protocol::RolloutItem>> {
+    codex_rollout::existing_rollout_path(path).await?;
+    let (items, loaded_thread_id, _) = RolloutRecorder::load_rollout_items(path).await.ok()?;
+    (loaded_thread_id == Some(thread_id)).then_some(items)
 }
 
 pub(super) async fn read_thread_by_rollout_path(
@@ -461,6 +459,26 @@ mod tests {
         assert_eq!(
             thread.history.expect("history should load").thread_id,
             thread_id
+        );
+    }
+
+    #[tokio::test]
+    async fn history_identity_is_validated_by_the_same_read_that_returns_items() {
+        let home = TempDir::new().expect("temp dir");
+        let uuid = Uuid::from_u128(206);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let path =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+
+        let items = load_history_items_for_thread(&path, thread_id)
+            .await
+            .expect("matching history");
+
+        assert_eq!(items.len(), 2);
+        assert!(
+            load_history_items_for_thread(&path, ThreadId::new())
+                .await
+                .is_none()
         );
     }
 

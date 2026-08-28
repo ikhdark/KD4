@@ -308,6 +308,7 @@ pub async fn read_mcp_resource(
     mcp_servers.retain(|name, _| name == server);
     let auth_statuses = compute_auth_statuses(
         mcp_servers.iter(),
+        &config.codex_home,
         config.mcp_oauth_credentials_store_mode,
         config.auth_keyring_backend_kind,
         auth,
@@ -344,6 +345,7 @@ pub async fn read_mcp_resource(
         /*elicitation_reviewer*/ None,
         /*elicitation_lifecycle*/ None,
         crate::elicitation::ElicitationRequestRouter::default(),
+        /*previous_manager*/ None,
     )
     .await;
 
@@ -372,7 +374,56 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
     codex_apps_tools_cache: CodexAppsToolsCache,
     detail: McpSnapshotDetail,
 ) -> McpServerStatusSnapshot {
-    let mcp_servers = effective_mcp_servers(config, auth);
+    collect_mcp_server_status_snapshot_impl(
+        config,
+        auth,
+        submit_id,
+        runtime_context,
+        codex_apps_tools_cache,
+        detail,
+        None,
+    )
+    .await
+}
+
+pub async fn collect_mcp_server_status_snapshot_for_servers_with_detail(
+    config: &McpConfig,
+    auth: Option<&CodexAuth>,
+    submit_id: String,
+    runtime_context: McpRuntimeContext,
+    codex_apps_tools_cache: CodexAppsToolsCache,
+    detail: McpSnapshotDetail,
+    selected_server_names: &[String],
+) -> McpServerStatusSnapshot {
+    collect_mcp_server_status_snapshot_impl(
+        config,
+        auth,
+        submit_id,
+        runtime_context,
+        codex_apps_tools_cache,
+        detail,
+        Some(selected_server_names),
+    )
+    .await
+}
+
+async fn collect_mcp_server_status_snapshot_impl(
+    config: &McpConfig,
+    auth: Option<&CodexAuth>,
+    submit_id: String,
+    runtime_context: McpRuntimeContext,
+    codex_apps_tools_cache: CodexAppsToolsCache,
+    detail: McpSnapshotDetail,
+    selected_server_names: Option<&[String]>,
+) -> McpServerStatusSnapshot {
+    let mut mcp_servers = effective_mcp_servers(config, auth);
+    if let Some(selected_server_names) = selected_server_names {
+        let selected_server_names = selected_server_names
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        mcp_servers.retain(|name, _| selected_server_names.contains(name.as_str()));
+    }
     let tool_plugin_provenance = tool_plugin_provenance(config);
     if mcp_servers.is_empty() {
         return McpServerStatusSnapshot {
@@ -387,6 +438,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
 
     let auth_status_entries = compute_auth_statuses(
         mcp_servers.iter(),
+        &config.codex_home,
         config.mcp_oauth_credentials_store_mode,
         config.auth_keyring_backend_kind,
         auth,
@@ -427,6 +479,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         /*elicitation_reviewer*/ None,
         /*elicitation_lifecycle*/ None,
         crate::elicitation::ElicitationRequestRouter::default(),
+        /*previous_manager*/ None,
     )
     .await;
 

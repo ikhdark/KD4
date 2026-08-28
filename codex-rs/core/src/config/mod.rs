@@ -340,12 +340,23 @@ pub use codex_config::CONFIG_TOML_FILE;
 const CONFIG_PROFILE_V2_SUFFIX: &str = ".config.toml";
 
 fn resolve_sqlite_home_env(resolved_cwd: &Path) -> Option<PathBuf> {
-    let raw = std::env::var(codex_state::SQLITE_HOME_ENV).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let path = PathBuf::from(trimmed);
+    resolve_sqlite_home_env_value(
+        std::env::var_os(codex_state::SQLITE_HOME_ENV)?,
+        resolved_cwd,
+    )
+}
+
+fn resolve_sqlite_home_env_value(raw: std::ffi::OsString, resolved_cwd: &Path) -> Option<PathBuf> {
+    let path = match raw.to_str() {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            PathBuf::from(trimmed)
+        }
+        None => PathBuf::from(raw),
+    };
     if path.is_absolute() {
         Some(path)
     } else {
@@ -781,6 +792,10 @@ pub struct Config {
     /// Whether to inject the `<environment_context>` user block.
     pub include_environment_context: bool,
 
+    /// Explicit KD4 workflow override. `None` preserves repository-marker
+    /// detection for compatibility.
+    pub kd4_workflow_enabled: Option<bool>,
+
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
 
@@ -885,9 +900,6 @@ pub struct Config {
     /// roots while profile-defined workspace roots remain encoded directly in
     /// the permission profile.
     pub workspace_roots: Vec<AbsolutePathBuf>,
-    /// Whether runtime workspace roots were supplied explicitly by the caller
-    /// or legacy config, rather than defaulting to `cwd`.
-    pub workspace_roots_explicit: bool,
 
     /// Preferred store for CLI auth credentials.
     /// file (default): Use a file in the Codex home directory.
@@ -1059,9 +1071,6 @@ pub struct Config {
 
     /// Configuration for the experimental code-mode tool surface.
     pub code_mode: CodeModeConfig,
-
-    /// If set to `true`, used only the experimental unified exec tool.
-    pub unified_exec_enabled: bool,
 
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
     /// Default: `60000` (1 minute).
@@ -1457,10 +1466,6 @@ impl Config {
         &mut self,
         sandbox_policy: SandboxPolicy,
     ) -> ConstraintResult<()> {
-        self.workspace_roots_explicit = matches!(
-            &sandbox_policy,
-            SandboxPolicy::WorkspaceWrite { writable_roots, .. } if !writable_roots.is_empty()
-        );
         self.permissions
             .set_legacy_sandbox_policy(sandbox_policy, self.cwd.as_path())?;
         self.workspace_roots = self.permissions.workspace_roots().to_vec();
@@ -1502,11 +1507,12 @@ impl Config {
 
     /// Build the plugin-manager input from the effective config.
     pub fn plugins_config_input(&self) -> PluginsConfigInput {
-        PluginsConfigInput::new(
+        PluginsConfigInput::new_with_http_client_factory(
             self.config_layer_stack.clone(),
             self.features.enabled(Feature::Plugins),
             self.features.enabled(Feature::RemotePlugin),
             self.chatgpt_base_url.clone(),
+            self.http_client_factory(),
         )
     }
 
@@ -3017,16 +3023,6 @@ impl Config {
                 permission_config_syntax,
                 None | Some(PermissionConfigSyntax::Legacy)
             );
-        let legacy_workspace_roots_explicit = should_seed_legacy_workspace_roots
-            && cfg
-                .sandbox_workspace_write
-                .as_ref()
-                .is_some_and(|sandbox_workspace_write| {
-                    !sandbox_workspace_write.writable_roots.is_empty()
-                });
-        let workspace_roots_explicit = workspace_roots_override.is_some()
-            || !requested_additional_writable_roots.is_empty()
-            || legacy_workspace_roots_explicit;
         let mut workspace_roots = match workspace_roots_override {
             Some(workspace_roots) => workspace_roots,
             None => {
@@ -3372,8 +3368,6 @@ impl Config {
             .unwrap_or(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
             .max(MIN_EMPTY_YIELD_TIME_MS);
 
-        let unified_exec_enabled = features.enabled(Feature::UnifiedExec);
-
         let forced_chatgpt_workspace_id = cfg
             .forced_chatgpt_workspace_id
             .clone()
@@ -3601,7 +3595,6 @@ impl Config {
             model_provider,
             cwd: resolved_cwd,
             workspace_roots: workspace_roots.clone(),
-            workspace_roots_explicit,
             startup_warnings,
             permissions: Permissions {
                 approval_policy: constrained_approval_policy.value,
@@ -3630,6 +3623,7 @@ impl Config {
             orchestrator_skills_enabled,
             orchestrator_mcp_enabled,
             include_environment_context,
+            kd4_workflow_enabled: cfg.kd4_workflow_enabled,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
             cli_auth_credentials_store_mode: resolve_cli_auth_credentials_store_mode(
@@ -3700,9 +3694,8 @@ impl Config {
             codex_self_exe,
 
             hide_agent_reasoning: cfg.hide_agent_reasoning.unwrap_or(false),
-            show_raw_agent_reasoning: cfg
-                .show_raw_agent_reasoning
-                .or(show_raw_agent_reasoning)
+            show_raw_agent_reasoning: show_raw_agent_reasoning
+                .or(cfg.show_raw_agent_reasoning)
                 .unwrap_or(false),
             guardian_policy_config,
             model_reasoning_effort: cfg.model_reasoning_effort,
@@ -3728,7 +3721,6 @@ impl Config {
             web_search_config,
             experimental_request_user_input_enabled,
             code_mode,
-            unified_exec_enabled,
             background_terminal_max_timeout,
             multi_agent_v2,
             current_time_reminder,

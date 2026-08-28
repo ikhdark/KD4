@@ -513,7 +513,14 @@ fn retryable_post_response_status(mcp_method: Option<&str>, status: u16) -> bool
     is_retryable_http_status(status)
         && matches!(
             mcp_method,
-            Some("initialize" | "notifications/initialized" | "tools/list")
+            Some(
+                "initialize"
+                    | "notifications/initialized"
+                    | "tools/list"
+                    | "resources/list"
+                    | "resources/templates/list"
+                    | "resources/read"
+            )
         )
 }
 

@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
+use std::ffi::OsString;
 
 pub const FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME: &str = "codex-connectivity-diagnostics.txt";
 const PROXY_ENV_VARS: &[&str] = &[
@@ -27,27 +28,24 @@ impl FeedbackDiagnostics {
     }
 
     pub fn collect_from_env() -> Self {
-        Self::collect_from_pairs(std::env::vars())
+        Self::collect_from_pairs(std::env::vars_os())
     }
 
     fn collect_from_pairs<I, K, V>(pairs: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<String>,
+        K: Into<OsString>,
     {
         let env = pairs
             .into_iter()
-            .map(|(key, value)| (key.into(), value.into()))
-            .collect::<HashMap<_, _>>();
+            .filter_map(|(key, _)| key.into().into_string().ok())
+            .collect::<HashSet<_>>();
         let mut diagnostics = Vec::new();
 
         let proxy_details = PROXY_ENV_VARS
             .iter()
-            .filter_map(|key| {
-                let value = env.get(*key)?;
-                Some(format!("{key} = {value}"))
-            })
+            .filter(|key| env.contains(**key))
+            .map(|key| format!("{key} is set; value redacted"))
             .collect::<Vec<_>>();
         if !proxy_details.is_empty() {
             diagnostics.push(FeedbackDiagnostic {
@@ -96,7 +94,7 @@ mod tests {
     use super::FeedbackDiagnostics;
 
     #[test]
-    fn collect_from_pairs_reports_raw_values_and_attachment() {
+    fn collect_from_pairs_redacts_values_and_attachment() {
         let diagnostics = FeedbackDiagnostics::collect_from_pairs([
             (
                 "HTTPS_PROXY",
@@ -113,10 +111,9 @@ mod tests {
                     headline: "Proxy environment variables are set and may affect connectivity."
                         .to_string(),
                     details: vec![
-                        "http_proxy = proxy.example.com:8080".to_string(),
-                        "HTTPS_PROXY = https://user:password@secure-proxy.example.com:443?secret=1"
-                            .to_string(),
-                        "all_proxy = socks5h://all-proxy.example.com:1080".to_string(),
+                        "http_proxy is set; value redacted".to_string(),
+                        "HTTPS_PROXY is set; value redacted".to_string(),
+                        "all_proxy is set; value redacted".to_string(),
                     ],
                 },],
             }
@@ -128,9 +125,9 @@ mod tests {
                 r#"Connectivity diagnostics
 
 - Proxy environment variables are set and may affect connectivity.
-  - http_proxy = proxy.example.com:8080
-  - HTTPS_PROXY = https://user:password@secure-proxy.example.com:443?secret=1
-  - all_proxy = socks5h://all-proxy.example.com:1080"#
+  - http_proxy is set; value redacted
+  - HTTPS_PROXY is set; value redacted
+  - all_proxy is set; value redacted"#
                     .to_string()
             )
         );
@@ -144,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_from_pairs_preserves_whitespace_and_empty_values() {
+    fn collect_from_pairs_redacts_whitespace_and_empty_values() {
         let diagnostics =
             FeedbackDiagnostics::collect_from_pairs([("HTTP_PROXY", "  proxy with spaces  ")]);
 
@@ -154,14 +151,14 @@ mod tests {
                 diagnostics: vec![FeedbackDiagnostic {
                     headline: "Proxy environment variables are set and may affect connectivity."
                         .to_string(),
-                    details: vec!["HTTP_PROXY =   proxy with spaces  ".to_string()],
+                    details: vec!["HTTP_PROXY is set; value redacted".to_string()],
                 },],
             }
         );
     }
 
     #[test]
-    fn collect_from_pairs_reports_values_verbatim() {
+    fn collect_from_pairs_never_reports_invalid_values() {
         let proxy_value = "not a valid proxy";
         let diagnostics = FeedbackDiagnostics::collect_from_pairs([("HTTP_PROXY", proxy_value)]);
 
@@ -171,9 +168,50 @@ mod tests {
                 diagnostics: vec![FeedbackDiagnostic {
                     headline: "Proxy environment variables are set and may affect connectivity."
                         .to_string(),
-                    details: vec!["HTTP_PROXY = not a valid proxy".to_string()],
+                    details: vec!["HTTP_PROXY is set; value redacted".to_string()],
                 },],
             }
+        );
+    }
+
+    #[test]
+    fn collect_from_pairs_does_not_inspect_values() {
+        struct PanicIfInspected;
+
+        impl From<PanicIfInspected> for String {
+            fn from(_: PanicIfInspected) -> Self {
+                panic!("proxy value was inspected");
+            }
+        }
+
+        let diagnostics =
+            FeedbackDiagnostics::collect_from_pairs([("HTTPS_PROXY", PanicIfInspected)]);
+
+        assert_eq!(
+            diagnostics.diagnostics()[0].details,
+            ["HTTPS_PROXY is set; value redacted"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_from_pairs_ignores_non_utf8_entries_without_inspecting_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let diagnostics = FeedbackDiagnostics::collect_from_pairs([
+            (
+                std::ffi::OsString::from_vec(vec![0xff]),
+                std::ffi::OsString::from("unrelated"),
+            ),
+            (
+                std::ffi::OsString::from("HTTPS_PROXY"),
+                std::ffi::OsString::from_vec(vec![0xfe]),
+            ),
+        ]);
+
+        assert_eq!(
+            diagnostics.diagnostics()[0].details,
+            ["HTTPS_PROXY is set; value redacted"]
         );
     }
 }

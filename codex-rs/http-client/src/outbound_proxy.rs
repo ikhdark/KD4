@@ -19,7 +19,8 @@ use http::HeaderValue;
 
 use crate::chatgpt_cloudflare_cookies::ChatGptCookieStore;
 use crate::custom_ca::BuildCustomCaTransportError;
-use crate::custom_ca::build_reqwest_client_with_custom_ca;
+use crate::custom_ca::CustomCaPolicy;
+use crate::custom_ca::build_reqwest_client_with_custom_ca_policy;
 use sha2::Digest;
 use sha2::Sha256;
 use thiserror::Error;
@@ -266,6 +267,23 @@ impl HttpClientFactory {
             request_url,
             route_class,
             self.outbound_proxy_policy,
+            CustomCaPolicy::HonorProcessEnvironment,
+        )
+    }
+
+    pub(crate) fn build_reqwest_client_with_custom_ca_policy(
+        &self,
+        builder: reqwest::ClientBuilder,
+        request_url: &str,
+        route_class: ClientRouteClass,
+        custom_ca_policy: CustomCaPolicy,
+    ) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
+        build_reqwest_client_for_route(
+            builder,
+            request_url,
+            route_class,
+            self.outbound_proxy_policy,
+            custom_ca_policy,
         )
     }
 
@@ -274,9 +292,10 @@ impl HttpClientFactory {
         builder: reqwest::ClientBuilder,
         route_class: ClientRouteClass,
         route: &OutboundProxyRoute,
+        custom_ca_policy: CustomCaPolicy,
     ) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
         let builder = configure_builder_for_resolved_route(builder, route_class, route)?;
-        build_reqwest_client_with_custom_ca(builder).map_err(Into::into)
+        build_reqwest_client_with_custom_ca_policy(builder, custom_ca_policy).map_err(Into::into)
     }
 }
 
@@ -406,6 +425,7 @@ fn build_reqwest_client_for_route(
     request_url: &str,
     route_class: ClientRouteClass,
     outbound_proxy_policy: OutboundProxyPolicy,
+    custom_ca_policy: CustomCaPolicy,
 ) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
     let builder = configure_proxy_for_route(
         &ProcessEnv,
@@ -415,7 +435,7 @@ fn build_reqwest_client_for_route(
         outbound_proxy_policy,
         resolve_system_proxy,
     )?;
-    build_reqwest_client_with_custom_ca(builder).map_err(Into::into)
+    build_reqwest_client_with_custom_ca_policy(builder, custom_ca_policy).map_err(Into::into)
 }
 
 fn configure_proxy_for_route(

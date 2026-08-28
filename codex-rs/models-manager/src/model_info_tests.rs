@@ -103,3 +103,14 @@ fn model_context_window_uses_model_value_without_override() {
 
     assert_eq!(updated, model);
 }
+
+#[test]
+fn local_personality_template_contains_the_base_prompt_once() {
+    let model = model_info_from_slug("gpt-5.2-codex");
+
+    let rendered =
+        model.get_model_instructions(Some(codex_protocol::config_types::Personality::Friendly));
+
+    assert_eq!(rendered.matches(BASE_INSTRUCTIONS).count(), 1);
+    assert!(rendered.contains(LOCAL_FRIENDLY_TEMPLATE));
+}

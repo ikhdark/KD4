@@ -19,18 +19,30 @@ pub(crate) struct CommandOutput {
     pub(crate) exit_code: i32,
     /// The finalized, interleaved stderr and stdout used by the compact preview.
     pub(crate) aggregated_output: String,
-    /// The finalized output of the command, as seen by the model.
-    pub(crate) formatted_output: String,
+    /// The finalized output of the command, as seen by the model, when it differs from the
+    /// aggregated preview output. `None` reuses `aggregated_output` for the transcript.
+    pub(crate) formatted_output: Option<String>,
     /// The bounded preview while command-output deltas are still arriving.
     live_output: Option<LiveCommandOutput>,
 }
 
 impl CommandOutput {
     pub(crate) fn new(exit_code: i32, aggregated_output: String, formatted_output: String) -> Self {
+        let formatted_output = (formatted_output != aggregated_output).then_some(formatted_output);
         Self {
             exit_code,
             aggregated_output,
             formatted_output,
+            live_output: None,
+        }
+    }
+
+    /// Creates finalized output whose compact preview and transcript use the same allocation.
+    pub(crate) fn from_shared_output(exit_code: i32, output: String) -> Self {
+        Self {
+            exit_code,
+            aggregated_output: output,
+            formatted_output: None,
             live_output: None,
         }
     }
@@ -58,7 +70,13 @@ impl CommandOutput {
     pub(super) fn transcript_lines(&self) -> impl Iterator<Item = Cow<'_, str>> {
         match self.live_output.as_ref() {
             Some(output) => Either::Left(output.transcript_lines()),
-            None => Either::Right(self.formatted_output.lines().map(Cow::Borrowed)),
+            None => Either::Right(
+                self.formatted_output
+                    .as_deref()
+                    .unwrap_or(&self.aggregated_output)
+                    .lines()
+                    .map(Cow::Borrowed),
+            ),
         }
     }
 }
@@ -72,7 +90,6 @@ pub(crate) struct ExecCall {
     pub(crate) source: ExecCommandSource,
     pub(crate) start_time: Option<Instant>,
     pub(crate) duration: Option<Duration>,
-    pub(crate) interaction_input: Option<String>,
 }
 
 #[derive(Debug)]
@@ -95,7 +112,6 @@ impl ExecCell {
         command: Vec<String>,
         parsed: Vec<ParsedCommand>,
         source: ExecCommandSource,
-        interaction_input: Option<String>,
     ) -> Option<Self> {
         let call = ExecCall {
             call_id,
@@ -105,7 +121,6 @@ impl ExecCell {
             source,
             start_time: Some(Instant::now()),
             duration: None,
-            interaction_input,
         };
         if self.is_exploring_cell() && Self::is_exploring_call(&call) {
             Some(Self {

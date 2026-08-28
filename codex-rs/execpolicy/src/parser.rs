@@ -392,7 +392,7 @@ fn policy_builtins(builder: &mut GlobalsBuilder) {
                     },
                     decision,
                     justification: justification.clone(),
-                }) as RuleRef
+                })
             })
             .collect();
 

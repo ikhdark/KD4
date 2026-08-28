@@ -13,7 +13,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionMetaLine;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::io::AsyncBufReadExt;
 
 const SESSION_INDEX_FILE: &str = "session_index.jsonl";
 const SESSION_INDEX_LOCK_FILE: &str = "session_index.jsonl.lock";
@@ -160,31 +159,14 @@ pub async fn find_thread_names_by_ids(
     codex_home: &Path,
     thread_ids: &HashSet<ThreadId>,
 ) -> std::io::Result<HashMap<ThreadId, String>> {
-    let path = session_index_path(codex_home);
-    if thread_ids.is_empty() || !path.exists() {
+    if thread_ids.is_empty() {
         return Ok(HashMap::new());
     }
-
-    let file = tokio::fs::File::open(&path).await?;
-    let reader = tokio::io::BufReader::new(file);
-    let mut lines = reader.lines();
-    let mut names = HashMap::with_capacity(thread_ids.len());
-
-    while let Some(line) = lines.next_line().await? {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(trimmed) else {
-            continue;
-        };
-        let name = entry.thread_name.trim();
-        if !name.is_empty() && thread_ids.contains(&entry.id) {
-            names.insert(entry.id, name.to_string());
-        }
-    }
-
-    Ok(names)
+    let path = session_index_path(codex_home);
+    let thread_ids = thread_ids.clone();
+    tokio::task::spawn_blocking(move || scan_index_from_end_by_ids(&path, &thread_ids))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 /// Locate a recorded thread rollout and read its session metadata by thread name.
@@ -240,6 +222,29 @@ fn scan_index_from_end_by_id(
     scan_index_from_end(path, |entry| entry.id == *thread_id)
 }
 
+fn scan_index_from_end_by_ids(
+    path: &Path,
+    thread_ids: &HashSet<ThreadId>,
+) -> std::io::Result<HashMap<ThreadId, String>> {
+    let mut pending = thread_ids.clone();
+    let mut names = HashMap::with_capacity(thread_ids.len());
+    match scan_index_from_end_for_each(path, |entry| {
+        let name = entry.thread_name.trim();
+        if pending.contains(&entry.id) && !name.is_empty() {
+            names.insert(entry.id, name.to_string());
+            pending.remove(&entry.id);
+            if pending.is_empty() {
+                return Ok(Some(entry.clone()));
+            }
+        }
+        Ok(None)
+    }) {
+        Ok(_) => Ok(names),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(error) => Err(error),
+    }
+}
+
 fn stream_thread_ids_from_end_by_name(
     path: &Path,
     name: &str,
@@ -288,6 +293,8 @@ where
     while remaining > 0 {
         let read_size = usize::try_from(remaining.min(READ_CHUNK_SIZE as u64))
             .map_err(std::io::Error::other)?;
+        #[cfg(test)]
+        SESSION_INDEX_REVERSE_BYTES_READ.with(|bytes| bytes.set(bytes.get() + read_size));
         remaining -= read_size as u64;
         file.seek(SeekFrom::Start(remaining))?;
         file.read_exact(&mut buf[..read_size])?;
@@ -308,6 +315,21 @@ where
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+thread_local! {
+    static SESSION_INDEX_REVERSE_BYTES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_session_index_reverse_bytes_read() {
+    SESSION_INDEX_REVERSE_BYTES_READ.with(|bytes| bytes.set(0));
+}
+
+#[cfg(test)]
+fn session_index_reverse_bytes_read() -> usize {
+    SESSION_INDEX_REVERSE_BYTES_READ.with(std::cell::Cell::get)
 }
 
 fn parse_line_from_rev<F>(

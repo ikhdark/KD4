@@ -12,6 +12,7 @@ use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::McpServerStartupCompletedNotification;
 use codex_app_server_protocol::McpServerStartupState;
 use codex_app_server_protocol::McpServerStatusUpdatedNotification;
 use codex_app_server_protocol::RequestId;
@@ -37,7 +38,10 @@ use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::TrustLevel;
+use codex_protocol::models::ManagedFileSystemPermissions;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -470,6 +474,40 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_start_preserves_canonical_permission_profile() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let permission_profile = PermissionProfile::Managed {
+        file_system: ManagedFileSystemPermissions::Unrestricted,
+        network: NetworkSandboxPolicy::Restricted,
+    };
+    let request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            sandbox: Some(SandboxMode::WorkspaceWrite),
+            permission_profile: Some(permission_profile.clone()),
+            ephemeral: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let response: ThreadStartResponse = to_response(response)?;
+
+    assert_eq!(response.permission_profile, Some(permission_profile));
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_start_history_mode_accepts_legacy_and_rejects_paginated() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -674,7 +712,7 @@ async fn thread_start_rejects_relative_environment_cwd_as_invalid_request() -> R
     assert_eq!(
         error.error.message,
         format!(
-            "invalid cwd for environment `{environment_id}`: path `relative` does not use absolute POSIX or Windows path syntax"
+            "invalid cwd for environment `{environment_id}`: path `relative` does not use absolute Windows drive or UNC path syntax"
         )
     );
 
@@ -1145,7 +1183,7 @@ async fn thread_start_fails_when_required_mcp_server_fails_to_initialize() -> Re
 }
 
 #[tokio::test]
-async fn thread_start_emits_mcp_server_status_updated_notifications() -> Result<()> {
+async fn thread_start_emits_mcp_server_startup_notifications() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
     let codex_home = TempDir::new()?;
@@ -1232,7 +1270,7 @@ async fn thread_start_emits_mcp_server_status_updated_notifications() -> Result<
     let ServerNotification::McpServerStatusUpdated(failed) = failed else {
         anyhow::bail!("unexpected notification variant");
     };
-    assert_eq!(failed.thread_id, Some(start_response.thread.id));
+    assert_eq!(failed.thread_id, Some(start_response.thread.id.clone()));
     assert_eq!(failed.name, "optional_broken");
     assert_eq!(failed.status, McpServerStartupState::Failed);
     assert_eq!(failed.failure_reason, None);
@@ -1244,6 +1282,31 @@ async fn thread_start_emits_mcp_server_status_updated_notifications() -> Result<
         "unexpected MCP startup error: {:?}",
         failed.error
     );
+
+    let completed = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "mcpServer/startup/completed",
+            |notification| notification.method == "mcpServer/startup/completed",
+        ),
+    )
+    .await??;
+    let completed: ServerNotification = completed.try_into()?;
+    let ServerNotification::McpServerStartupCompleted(completed) = completed else {
+        anyhow::bail!("unexpected notification variant");
+    };
+    let McpServerStartupCompletedNotification {
+        thread_id,
+        ready,
+        failed,
+        cancelled,
+    } = completed;
+    assert_eq!(thread_id, Some(start_response.thread.id));
+    assert!(ready.is_empty());
+    assert!(cancelled.is_empty());
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].server, "optional_broken");
+    assert!(failed[0].error.contains("failed to start"));
 
     Ok(())
 }

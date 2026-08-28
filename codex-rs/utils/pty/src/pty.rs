@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::WINDOWS_PROCESS_OPERATION_TIMEOUT;
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
 use crate::process::ProcessSignal;
@@ -23,6 +24,7 @@ use crate::process::PtyHandles;
 use crate::process::PtyMasterHandle;
 use crate::process::SpawnedProcess;
 use crate::process::TerminalSize;
+use crate::run_windows_process_operation;
 
 /// Returns true when ConPTY support is available (Windows only).
 pub fn conpty_supported() -> bool {
@@ -91,6 +93,7 @@ async fn spawn_process_portable(
 ) -> Result<SpawnedProcess> {
     let pty_system = platform_native_pty_system();
     let pair = pty_system.openpty(size.into())?;
+    let portable_pty::PtyPair { master, slave } = pair;
 
     let mut command_builder = CommandBuilder::new(arg0.as_ref().unwrap_or(&program.to_string()));
     command_builder.cwd(cwd);
@@ -102,14 +105,21 @@ async fn spawn_process_portable(
         command_builder.env(key, value);
     }
 
-    let mut child = pair.slave.spawn_command(command_builder)?;
+    let (slave, mut child) =
+        run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
+            let child = slave
+                .spawn_command(command_builder)
+                .map_err(std::io::Error::other)?;
+            Ok((slave, child))
+        })
+        .await?;
 
     let killer = child.clone_killer();
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
-    let mut reader = pair.master.try_clone_reader()?;
+    let mut reader = master.try_clone_reader()?;
     let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8_192];
         loop {
@@ -128,7 +138,7 @@ async fn spawn_process_portable(
         }
     });
 
-    let writer = pair.master.take_writer()?;
+    let writer = master.take_writer()?;
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let writer_handle: JoinHandle<()> = tokio::spawn({
         let writer = Arc::clone(&writer);
@@ -162,8 +172,8 @@ async fn spawn_process_portable(
     });
 
     let handles = PtyHandles {
-        _slave: Some(pair.slave),
-        _master: PtyMasterHandle::Resizable(pair.master),
+        _slave: Some(slave),
+        _master: PtyMasterHandle::Resizable(master),
     };
 
     let handle = ProcessHandle::new(

@@ -48,7 +48,7 @@ pub async fn forward_sandbox_session_stdio(spawned: SpawnedProcess) -> i32 {
         res = &mut exit_rx => res.unwrap_or(-1),
         res = tokio::signal::ctrl_c() => {
             if let Ok(()) = res {
-                session.request_terminate();
+                let _ = session.request_terminate();
             }
             exit_rx.await.unwrap_or(-1)
         }

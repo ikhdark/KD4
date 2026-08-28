@@ -20,12 +20,14 @@ use tracing::warn;
 use crate::rmcp_client::Elicitation;
 use crate::rmcp_client::SendElicitation;
 use crate::rmcp_client::SendProgress;
+use crate::rmcp_client::SendToolListChanged;
 
 #[derive(Clone)]
 pub(crate) struct LoggingClientHandler {
     client_info: ClientInfo,
     send_elicitation: Arc<SendElicitation>,
     send_progress: Arc<SendProgress>,
+    send_tool_list_changed: Arc<SendToolListChanged>,
 }
 
 impl LoggingClientHandler {
@@ -33,11 +35,13 @@ impl LoggingClientHandler {
         client_info: ClientInfo,
         send_elicitation: SendElicitation,
         send_progress: SendProgress,
+        send_tool_list_changed: SendToolListChanged,
     ) -> Self {
         Self {
             client_info,
             send_elicitation: Arc::new(send_elicitation),
             send_progress: Arc::new(send_progress),
+            send_tool_list_changed: Arc::new(send_tool_list_changed),
         }
     }
 
@@ -47,6 +51,11 @@ impl LoggingClientHandler {
             params.progress_token, params.progress, params.total, params.message
         );
         (self.send_progress)(params).await;
+    }
+
+    async fn handle_tool_list_changed_notification(&self) {
+        info!("MCP server tool list changed");
+        (self.send_tool_list_changed)().await;
     }
 }
 
@@ -94,7 +103,7 @@ impl ClientHandler for LoggingClientHandler {
     }
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        info!("MCP server tool list changed");
+        self.handle_tool_list_changed_notification().await;
     }
 
     async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
@@ -168,6 +177,7 @@ mod tests {
                     seen.lock().expect("progress callback lock").push(params);
                 })
             }),
+            Box::new(|| Box::pin(async {})),
         );
         let params = ProgressNotificationParam {
             progress_token: ProgressToken(NumberOrString::String("item-1".into())),
@@ -181,6 +191,30 @@ mod tests {
         assert_eq!(
             seen.lock().expect("progress callback lock").as_slice(),
             &[params]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_list_changed_notifications_are_forwarded_to_runtime_callback() {
+        let notification_count = Arc::new(Mutex::new(0));
+        let notification_count_by_callback = Arc::clone(&notification_count);
+        let handler = LoggingClientHandler::new(
+            ClientInfo::default(),
+            Box::new(|_, _| Box::pin(async move { unreachable!() })),
+            Box::new(|_| Box::pin(async {})),
+            Box::new(move || {
+                let notification_count = Arc::clone(&notification_count_by_callback);
+                Box::pin(async move {
+                    *notification_count.lock().expect("tool-list callback lock") += 1;
+                })
+            }),
+        );
+
+        handler.handle_tool_list_changed_notification().await;
+
+        assert_eq!(
+            *notification_count.lock().expect("tool-list callback lock"),
+            1
         );
     }
 }

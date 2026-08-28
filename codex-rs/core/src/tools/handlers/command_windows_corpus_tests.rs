@@ -22,7 +22,9 @@ fn run(
     shell: &Shell,
     cwd: &Path,
 ) -> std::io::Result<std::process::Output> {
-    let command = invocation.to_exec_args(shell, /*use_login_shell*/ false);
+    let command = invocation
+        .to_exec_args(shell, /*use_login_shell*/ false)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     Command::new(&command[0])
         .args(&command[1..])
         .current_dir(cwd)
@@ -115,7 +117,9 @@ async fn windows_command_corpus_measures_phase2_exit_gate() {
         long_argument_length = long_argument.len(),
     );
     let powershell_invocation = CommandInvocation::PowerShellScript(script.clone());
-    let encoded_args = powershell_invocation.to_exec_args(&powershell, false);
+    let encoded_args = powershell_invocation
+        .to_exec_args(&powershell, false)
+        .expect("PowerShell args");
     assert!(encoded_args.iter().any(|arg| arg == "-EncodedCommand"));
     assert!(!encoded_args.iter().any(|arg| arg == &script));
     let powershell_output = run(&powershell_invocation, &powershell, temp.path())

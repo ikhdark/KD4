@@ -17,7 +17,7 @@ use codex_extension_api::parse_tool_input_schema_without_compaction;
 use codex_extension_items::ExtensionItem;
 use codex_extension_items::web_search::WebSearchAction;
 use codex_extension_items::web_search::WebSearchItem;
-use codex_login::default_client::create_client;
+use codex_http_client::RouteAwareClientPool;
 use codex_model_provider::SharedModelProvider;
 use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
 use codex_protocol::protocol::EventMsg;
@@ -43,6 +43,7 @@ pub(crate) struct WebSearchTool {
     pub(crate) session_id: String,
     pub(crate) provider: SharedModelProvider,
     pub(crate) settings: SearchSettings,
+    pub(crate) http_clients: RouteAwareClientPool,
 }
 
 impl ToolExecutor<ToolCall> for WebSearchTool {
@@ -105,10 +106,14 @@ impl WebSearchTool {
                     .api_auth()
                     .await
                     .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+                let endpoint = provider.url_for_path("alpha/search");
+                let client = self
+                    .http_clients
+                    .client_for_url(&endpoint)
+                    .await
+                    .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
                 Ok::<_, FunctionCallError>(SearchClient::new(
-                    ReqwestTransport::from_http_client(
-                        create_client().map_err(|err| FunctionCallError::Fatal(err.to_string()))?,
-                    ),
+                    ReqwestTransport::from_http_client(client),
                     provider,
                     auth,
                 ))
@@ -265,7 +270,16 @@ mod tests {
     use codex_extension_items::web_search::WebSearchAction;
     use pretty_assertions::assert_eq;
 
+    use super::WEB_RUN_DESCRIPTION;
     use super::command_action;
+
+    #[test]
+    fn description_defers_to_higher_priority_instructions() {
+        assert!(WEB_RUN_DESCRIPTION.contains(
+            "Follow these special cases unless a higher-priority instruction conflicts."
+        ));
+        assert!(!WEB_RUN_DESCRIPTION.contains("conflict with any other instructions"));
+    }
 
     #[test]
     fn command_action_reports_queries_and_navigation_detail() {

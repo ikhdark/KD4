@@ -2,11 +2,16 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadHistoryBuilder;
+use codex_app_server_protocol::ThreadHistoryChangeSet;
+use codex_app_server_protocol::ThreadHistoryTurnChange;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError;
+use codex_app_server_protocol::TurnItemsView;
+use codex_app_server_protocol::TurnStatus;
 use codex_core::CodexThread;
 use codex_core::OutOfBandElicitationLeaseId;
 use codex_core::ThreadConfigSnapshot;
@@ -40,9 +45,10 @@ pub(crate) struct InFlightTaskReference {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum InFlightTaskClaim {
+pub(crate) enum TurnStartClaim {
     Claimed,
-    Existing(InFlightTaskReference),
+    IdenticalTask(InFlightTaskReference),
+    ActiveTurn(InFlightTaskReference),
     CapacityExceeded,
 }
 
@@ -119,7 +125,8 @@ impl Drop for TurnOriginReservation {
 
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
-    pub(crate) history_items: Vec<RolloutItem>,
+    pub(crate) history_items: Option<Vec<RolloutItem>>,
+    pub(crate) listener_generation: u64,
     pub(crate) config_snapshot: ThreadConfigSnapshot,
     pub(crate) instruction_sources: Vec<LegacyAppPathString>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
@@ -128,6 +135,7 @@ pub(crate) struct PendingThreadResumeRequest {
     pub(crate) include_turns: bool,
     pub(crate) initial_turns_page:
         Option<codex_app_server_protocol::ThreadResumeInitialTurnsPageParams>,
+    pub(crate) prepared_initial_turns_page: Option<codex_app_server_protocol::TurnsPage>,
     pub(crate) redact_resume_payloads: bool,
 }
 
@@ -197,6 +205,7 @@ pub(crate) enum TerminalEventDisposition {
     ProjectNotification { fingerprint: String },
     RetryNotification(Box<TerminalNotificationReplay>),
     Acknowledge { fingerprint: String },
+    SuppressAcknowledged,
     RejectConflict,
     RejectStale,
 }
@@ -205,11 +214,339 @@ pub(crate) enum TerminalEventDisposition {
 struct TerminalLedgerEntry {
     fingerprint: String,
     state_reduced: bool,
+    retained_turn_summary: Option<TurnSummary>,
     notification: Option<ServerNotification>,
     origin_connection_id: Option<ConnectionId>,
     accepted_connection_ids: HashSet<ConnectionId>,
     notification_accepted: bool,
     acknowledged_queued: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct IndexedTurnPage {
+    pub(crate) turns: Vec<Turn>,
+    pub(crate) more_turns_available: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct IndexedItemPage {
+    pub(crate) items: Vec<IndexedThreadItem>,
+    pub(crate) more_items_available: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct IndexedThreadItem {
+    pub(crate) turn_id: String,
+    pub(crate) item: codex_app_server_protocol::ThreadItem,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct IndexedItemKey {
+    turn_id: String,
+    item_id: String,
+}
+
+#[derive(Default)]
+struct ThreadTurnIndex {
+    initialized: bool,
+    order: Vec<String>,
+    turn_positions: HashMap<String, usize>,
+    turns: HashMap<String, Turn>,
+    item_order: Vec<IndexedItemKey>,
+    item_positions: HashMap<IndexedItemKey, usize>,
+    item_offsets: HashMap<IndexedItemKey, usize>,
+}
+
+impl ThreadTurnIndex {
+    fn apply_changes(&mut self, changes: ThreadHistoryChangeSet) {
+        for turn_id in changes.removed_turn_ids {
+            self.turns.remove(&turn_id);
+            self.order.retain(|candidate| candidate != &turn_id);
+            self.rebuild_positions();
+        }
+
+        for change in changes.changed_turns {
+            self.apply_turn_change(change);
+        }
+        for change in changes.changed_items {
+            let key = IndexedItemKey {
+                turn_id: change.turn_id.clone(),
+                item_id: change.item.id().to_string(),
+            };
+            let existing_offset = self.item_offsets.get(&key).copied();
+            if let Some(index) = existing_offset {
+                self.turn_mut(&change.turn_id).items[index] = change.item;
+            } else {
+                let offset = {
+                    let turn = self.turn_mut(&change.turn_id);
+                    let offset = turn.items.len();
+                    turn.items.push(change.item);
+                    offset
+                };
+                self.item_offsets.insert(key.clone(), offset);
+                self.insert_item_key(key);
+            }
+        }
+    }
+
+    fn insert_item_key(&mut self, key: IndexedItemKey) {
+        let turn_position = self.turn_positions[&key.turn_id];
+        let append = self
+            .item_order
+            .last()
+            .is_none_or(|last| self.turn_positions[&last.turn_id] <= turn_position);
+        if append {
+            self.item_positions
+                .insert(key.clone(), self.item_order.len());
+            self.item_order.push(key);
+            return;
+        }
+
+        let insertion_index = self
+            .item_order
+            .iter()
+            .position(|existing| self.turn_positions[&existing.turn_id] > turn_position)
+            .unwrap_or(self.item_order.len());
+        self.item_order.insert(insertion_index, key);
+        for (position, key) in self.item_order.iter().enumerate().skip(insertion_index) {
+            self.item_positions.insert(key.clone(), position);
+        }
+    }
+
+    fn apply_turn_change(&mut self, change: ThreadHistoryTurnChange) {
+        let turn = self.turn_mut(&change.turn_id);
+        turn.status = change.status;
+        turn.error = change.error;
+        turn.started_at = change.started_at;
+        turn.completed_at = change.completed_at;
+        turn.duration_ms = change.duration_ms;
+        turn.completion = change.completion;
+        turn.timing = change.timing;
+        turn.surfaced_result = change.surfaced_result;
+        turn.reasoning_policy_history = change.reasoning_policy_history;
+    }
+
+    fn overlay_turn(&mut self, turn: Turn) {
+        if !self.turns.contains_key(&turn.id) {
+            self.turn_positions
+                .insert(turn.id.clone(), self.order.len());
+            self.order.push(turn.id.clone());
+        }
+        self.turns.insert(turn.id.clone(), turn);
+        self.rebuild_positions();
+    }
+
+    fn turn_mut(&mut self, turn_id: &str) -> &mut Turn {
+        if !self.turns.contains_key(turn_id) {
+            self.turn_positions
+                .insert(turn_id.to_string(), self.order.len());
+            self.order.push(turn_id.to_string());
+        }
+        self.turns
+            .entry(turn_id.to_string())
+            .or_insert_with(|| Turn {
+                id: turn_id.to_string(),
+                items: Vec::new(),
+                items_view: TurnItemsView::Full,
+                status: TurnStatus::InProgress,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                completion: None,
+                timing: None,
+                surfaced_result: None,
+                reasoning_policy_history: None,
+            })
+    }
+
+    fn page(
+        &self,
+        anchor: Option<(&str, bool)>,
+        page_size: usize,
+        sort_direction: SortDirection,
+    ) -> Result<Option<IndexedTurnPage>, ()> {
+        if !self.initialized {
+            return Ok(None);
+        }
+        let anchor_index =
+            anchor.and_then(|(turn_id, _)| self.turn_positions.get(turn_id).copied());
+        if anchor.is_some() && anchor_index.is_none() {
+            return Err(());
+        }
+
+        let (start, end) = page_bounds(
+            self.order.len(),
+            anchor_index,
+            anchor.map(|(_, include)| include),
+            sort_direction,
+        );
+        let indexes = ordered_indexes(start, end, sort_direction);
+        let mut turns = indexes
+            .take(page_size.saturating_add(1))
+            .filter_map(|index| self.turns.get(&self.order[index]).cloned())
+            .collect::<Vec<_>>();
+        let more_turns_available = turns.len() > page_size;
+        turns.truncate(page_size);
+        Ok(Some(IndexedTurnPage {
+            turns,
+            more_turns_available,
+        }))
+    }
+
+    fn items_page(
+        &self,
+        turn_id_filter: Option<&str>,
+        anchor: Option<(&str, &str, bool)>,
+        page_size: usize,
+        sort_direction: SortDirection,
+    ) -> Result<Option<IndexedItemPage>, ()> {
+        if !self.initialized {
+            return Ok(None);
+        }
+        if let Some(turn_id) = turn_id_filter {
+            let turn = self.turns.get(turn_id);
+            let anchor_index = anchor.and_then(|(anchor_turn_id, item_id, _)| {
+                (anchor_turn_id == turn_id)
+                    .then(|| {
+                        self.item_offsets
+                            .get(&IndexedItemKey {
+                                turn_id: turn_id.to_string(),
+                                item_id: item_id.to_string(),
+                            })
+                            .copied()
+                    })
+                    .flatten()
+            });
+            if anchor.is_some() && anchor_index.is_none() {
+                return Err(());
+            }
+
+            let (start, end) = page_bounds(
+                turn.map_or(0, |turn| turn.items.len()),
+                anchor_index,
+                anchor.map(|(_, _, include)| include),
+                sort_direction,
+            );
+            let mut items = turn
+                .into_iter()
+                .flat_map(|turn| {
+                    ordered_indexes(start, end, sort_direction).filter_map(move |index| {
+                        turn.items
+                            .get(index)
+                            .cloned()
+                            .map(|item| IndexedThreadItem {
+                                turn_id: turn_id.to_string(),
+                                item,
+                            })
+                    })
+                })
+                .take(page_size.saturating_add(1))
+                .collect::<Vec<_>>();
+            let more_items_available = items.len() > page_size;
+            items.truncate(page_size);
+            return Ok(Some(IndexedItemPage {
+                items,
+                more_items_available,
+            }));
+        }
+
+        let anchor_index = anchor.and_then(|(turn_id, item_id, _)| {
+            let key = IndexedItemKey {
+                turn_id: turn_id.to_string(),
+                item_id: item_id.to_string(),
+            };
+            self.item_positions.get(&key).copied()
+        });
+        if anchor.is_some() && anchor_index.is_none() {
+            return Err(());
+        }
+
+        let (start, end) = page_bounds(
+            self.item_order.len(),
+            anchor_index,
+            anchor.map(|(_, _, include)| include),
+            sort_direction,
+        );
+        let mut items = Vec::with_capacity(page_size.saturating_add(1));
+        for index in ordered_indexes(start, end, sort_direction) {
+            let key = &self.item_order[index];
+            let Some(offset) = self.item_offsets.get(key).copied() else {
+                continue;
+            };
+            let Some(item) = self
+                .turns
+                .get(&key.turn_id)
+                .and_then(|turn| turn.items.get(offset))
+                .cloned()
+            else {
+                continue;
+            };
+            items.push(IndexedThreadItem {
+                turn_id: key.turn_id.clone(),
+                item,
+            });
+            if items.len() > page_size {
+                break;
+            }
+        }
+        let more_items_available = items.len() > page_size;
+        items.truncate(page_size);
+        Ok(Some(IndexedItemPage {
+            items,
+            more_items_available,
+        }))
+    }
+
+    fn rebuild_positions(&mut self) {
+        self.turn_positions.clear();
+        self.item_order.clear();
+        self.item_positions.clear();
+        self.item_offsets.clear();
+        for (turn_position, turn_id) in self.order.iter().enumerate() {
+            self.turn_positions.insert(turn_id.clone(), turn_position);
+            let Some(turn) = self.turns.get(turn_id) else {
+                continue;
+            };
+            for (offset, item) in turn.items.iter().enumerate() {
+                let key = IndexedItemKey {
+                    turn_id: turn_id.clone(),
+                    item_id: item.id().to_string(),
+                };
+                self.item_offsets.insert(key.clone(), offset);
+                self.item_positions
+                    .insert(key.clone(), self.item_order.len());
+                self.item_order.push(key);
+            }
+        }
+    }
+}
+
+fn page_bounds(
+    len: usize,
+    anchor_index: Option<usize>,
+    include_anchor: Option<bool>,
+    sort_direction: SortDirection,
+) -> (usize, usize) {
+    match (sort_direction, anchor_index, include_anchor) {
+        (SortDirection::Asc, Some(anchor), Some(true)) => (anchor, len),
+        (SortDirection::Asc, Some(anchor), _) => (anchor.saturating_add(1), len),
+        (SortDirection::Asc, None, _) => (0, len),
+        (SortDirection::Desc, Some(anchor), Some(true)) => (0, anchor.saturating_add(1)),
+        (SortDirection::Desc, Some(anchor), _) => (0, anchor),
+        (SortDirection::Desc, None, _) => (0, len),
+    }
+}
+
+fn ordered_indexes(
+    start: usize,
+    end: usize,
+    sort_direction: SortDirection,
+) -> Box<dyn Iterator<Item = usize>> {
+    match sort_direction {
+        SortDirection::Asc => Box::new(start..end),
+        SortDirection::Desc => Box::new((start..end).rev()),
+    }
 }
 
 #[derive(Default)]
@@ -221,46 +558,20 @@ pub(crate) struct ThreadState {
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
+    resume_history_seeded_generation: Option<u64>,
     last_thread_settings: Option<ThreadSettings>,
     listener_command_tx: Option<mpsc::Sender<ThreadListenerCommand>>,
-    unresolved_server_request_resolutions: Vec<ResolveServerRequestError>,
     current_turn_history: ThreadHistoryBuilder,
+    turn_index: ThreadTurnIndex,
     turn_origin_tracker: TurnOriginTracker,
     listener_thread: Option<Weak<CodexThread>>,
     watch_registration: WatchRegistration,
 }
 
 impl ThreadState {
-    fn mark_server_request_resolution_unresolved(
-        &mut self,
-        request_id: RequestId,
-        failure: ResolveServerRequestFailure,
-    ) -> ResolveServerRequestError {
-        self.unresolved_server_request_resolutions
-            .retain(|unresolved| unresolved.request_id != request_id);
-        let error = ResolveServerRequestError {
-            request_id,
-            failure,
-        };
-        self.unresolved_server_request_resolutions
-            .push(error.clone());
-        error
-    }
-
-    fn clear_unresolved_server_request_resolution(&mut self, request_id: &RequestId) {
-        self.unresolved_server_request_resolutions
-            .retain(|unresolved| &unresolved.request_id != request_id);
-    }
-
     #[cfg(test)]
-    fn unresolved_server_request_resolution(
-        &self,
-        request_id: &RequestId,
-    ) -> Option<ResolveServerRequestFailure> {
-        self.unresolved_server_request_resolutions
-            .iter()
-            .find(|unresolved| &unresolved.request_id == request_id)
-            .map(|unresolved| unresolved.failure)
+    fn retained_server_request_resolution_count(&self) -> usize {
+        0
     }
 
     pub(crate) fn listener_matches(&self, conversation: &Arc<CodexThread>) -> bool {
@@ -303,12 +614,61 @@ impl ThreadState {
         self.listener_command_tx.clone()
     }
 
+    pub(crate) fn resume_history_is_seeded_for_current_listener(&self) -> bool {
+        self.listener_command_tx.is_some()
+            && self.resume_history_seeded_generation == Some(self.listener_generation)
+    }
+
     pub(crate) fn active_turn_snapshot(&self) -> Option<Turn> {
         self.current_turn_history.active_turn_snapshot()
     }
 
+    pub(crate) fn indexed_turns_page(
+        &self,
+        anchor: Option<(&str, bool)>,
+        page_size: usize,
+        sort_direction: SortDirection,
+    ) -> Result<Option<IndexedTurnPage>, ()> {
+        self.turn_index.page(anchor, page_size, sort_direction)
+    }
+
+    pub(crate) fn indexed_items_page(
+        &self,
+        turn_id_filter: Option<&str>,
+        anchor: Option<(&str, &str, bool)>,
+        page_size: usize,
+        sort_direction: SortDirection,
+    ) -> Result<Option<IndexedItemPage>, ()> {
+        self.turn_index
+            .items_page(turn_id_filter, anchor, page_size, sort_direction)
+    }
+
+    /// Seeds the pagination index once from persisted history while preserving
+    /// live events that arrived before the initial history load completed.
+    pub(crate) fn seed_turn_index_from_history(&mut self, items: &[RolloutItem]) {
+        let live_index = std::mem::take(&mut self.turn_index);
+        let mut builder = ThreadHistoryBuilder::new();
+        for item in items {
+            let changes = builder.handle_rollout_item_with_changes(item);
+            self.turn_index.apply_changes(changes);
+        }
+        for turn_id in live_index.order {
+            if let Some(turn) = live_index.turns.get(&turn_id).cloned() {
+                self.turn_index.overlay_turn(turn);
+            }
+        }
+        self.turn_index.initialized = true;
+    }
+
     pub(crate) fn in_progress_turn_id(&self) -> Option<&str> {
         self.current_turn_history.in_progress_turn_id()
+    }
+
+    pub(crate) fn open_turn_id(&self) -> Option<&str> {
+        self.current_turn_history
+            .has_active_turn()
+            .then(|| self.current_turn_history.active_turn_id())
+            .flatten()
     }
 
     pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
@@ -316,7 +676,8 @@ impl ThreadState {
             self.turn_summary.started_at = payload.started_at;
             self.turn_summary.origin_connection_id = self.turn_origin_tracker.take(event_turn_id);
         }
-        self.current_turn_history.handle_event(event);
+        let changes = self.current_turn_history.handle_event_with_changes(event);
+        self.turn_index.apply_changes(changes);
         if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_))
             && !self.current_turn_history.has_active_turn()
         {
@@ -324,17 +685,40 @@ impl ThreadState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn classify_terminal_event(
         &mut self,
         event_turn_id: &str,
         event: &EventMsg,
         current_connection_ids: &[ConnectionId],
     ) -> TerminalEventDisposition {
+        self.classify_terminal_event_with_durable_acknowledgement(
+            event_turn_id,
+            event,
+            current_connection_ids,
+            None,
+        )
+    }
+
+    pub(crate) fn classify_terminal_event_with_durable_acknowledgement(
+        &mut self,
+        event_turn_id: &str,
+        event: &EventMsg,
+        current_connection_ids: &[ConnectionId],
+        durably_acknowledged_fingerprint: Option<&str>,
+    ) -> TerminalEventDisposition {
         let Some(fingerprint) = terminal_event_fingerprint(event) else {
             return TerminalEventDisposition::NotTerminal;
         };
         if terminal_turn_id(event) != Some(event_turn_id) {
             return TerminalEventDisposition::RejectConflict;
+        }
+        if let Some(acknowledged_fingerprint) = durably_acknowledged_fingerprint {
+            if acknowledged_fingerprint != fingerprint.as_str() {
+                return TerminalEventDisposition::RejectConflict;
+            }
+            self.terminal_ledger.remove(event_turn_id);
+            return TerminalEventDisposition::SuppressAcknowledged;
         }
         if let Some(entry) = self.terminal_ledger.get_mut(event_turn_id) {
             if entry.fingerprint != fingerprint {
@@ -380,6 +764,7 @@ impl ThreadState {
             TerminalLedgerEntry {
                 fingerprint: fingerprint.clone(),
                 state_reduced: false,
+                retained_turn_summary: None,
                 notification: None,
                 origin_connection_id: None,
                 accepted_connection_ids: HashSet::new(),
@@ -393,10 +778,30 @@ impl ThreadState {
     /// Reconstructs exactly-once terminal state application from retained rollout history.
     /// Notification acceptance is intentionally not inferred: core must replay the exact event
     /// so the notification can be handed to the current outbound owner.
+    #[cfg(test)]
     pub(crate) fn seed_terminal_ledger_from_history(&mut self, items: &[RolloutItem]) {
+        self.seed_terminal_ledger_from_history_for_replay(items, None);
+    }
+
+    fn seed_terminal_ledger_from_history_for_replay(
+        &mut self,
+        items: &[RolloutItem],
+        replay_fingerprints: Option<&HashMap<String, String>>,
+    ) {
         self.current_turn_history.reset();
+        let mut retained_turn_summaries = HashMap::new();
         for item in items {
             self.current_turn_history.handle_rollout_item(item);
+            if let Some(turn) = self.current_turn_history.active_turn_change_snapshot() {
+                retained_turn_summaries.insert(
+                    turn.turn_id.clone(),
+                    TurnSummary {
+                        started_at: turn.started_at,
+                        last_error: turn.error,
+                        ..Default::default()
+                    },
+                );
+            }
             let RolloutItem::EventMsg(event) = item else {
                 continue;
             };
@@ -405,11 +810,17 @@ impl ThreadState {
             else {
                 continue;
             };
+            if replay_fingerprints.is_some_and(|replay_fingerprints| {
+                replay_fingerprints.get(turn_id) != Some(&fingerprint)
+            }) {
+                continue;
+            }
             self.terminal_ledger
                 .entry(turn_id.to_string())
                 .or_insert(TerminalLedgerEntry {
                     fingerprint,
                     state_reduced: true,
+                    retained_turn_summary: retained_turn_summaries.get(turn_id).cloned(),
                     notification: None,
                     origin_connection_id: None,
                     accepted_connection_ids: HashSet::new(),
@@ -417,6 +828,31 @@ impl ThreadState {
                     acknowledged_queued: false,
                 });
         }
+    }
+
+    pub(crate) fn seed_resume_history_for_listener(
+        &mut self,
+        items: &[RolloutItem],
+        listener_generation: u64,
+        replay_fingerprints: Option<&HashMap<String, String>>,
+    ) -> bool {
+        if self.listener_generation != listener_generation || self.listener_command_tx.is_none() {
+            return false;
+        }
+        self.seed_terminal_ledger_from_history_for_replay(items, replay_fingerprints);
+        self.resume_history_seeded_generation = Some(listener_generation);
+        true
+    }
+
+    pub(crate) fn retained_terminal_turn_summary(
+        &self,
+        turn_id: &str,
+        fingerprint: &str,
+    ) -> Option<TurnSummary> {
+        self.terminal_ledger
+            .get(turn_id)
+            .filter(|entry| entry.state_reduced && entry.fingerprint == fingerprint)
+            .and_then(|entry| entry.retained_turn_summary.clone())
     }
 
     pub(crate) fn mark_terminal_state_reduced(&mut self, turn_id: &str, fingerprint: &str) {
@@ -480,10 +916,21 @@ impl ThreadState {
             && entry.fingerprint == fingerprint
         {
             entry.notification_accepted = true;
+            entry.retained_turn_summary = None;
             entry.notification = None;
             entry.origin_connection_id = None;
             entry.accepted_connection_ids.clear();
             self.queue_acknowledged_terminal_tombstone(turn_id);
+        }
+    }
+
+    pub(crate) fn mark_terminal_durably_acknowledged(&mut self, turn_id: &str, fingerprint: &str) {
+        if self
+            .terminal_ledger
+            .get(turn_id)
+            .is_some_and(|entry| entry.fingerprint == fingerprint)
+        {
+            self.terminal_ledger.remove(turn_id);
         }
     }
 
@@ -520,19 +967,42 @@ fn terminal_turn_id(event: &EventMsg) -> Option<&str> {
     }
 }
 
+pub(crate) async fn acknowledge_terminal_notification(
+    conversation: &CodexThread,
+    thread_state: &Arc<Mutex<ThreadState>>,
+    turn_id: &str,
+    fingerprint: &str,
+) -> bool {
+    if !conversation
+        .acknowledge_terminal_event(turn_id, fingerprint)
+        .await
+    {
+        return false;
+    }
+    let durable_fingerprint = conversation
+        .durably_acknowledged_terminal_fingerprint(turn_id)
+        .await;
+    let mut state = thread_state.lock().await;
+    if durable_fingerprint.as_deref() == Some(fingerprint) {
+        state.mark_terminal_durably_acknowledged(turn_id, fingerprint);
+    } else {
+        state.mark_terminal_acknowledged(turn_id, fingerprint);
+    }
+    true
+}
+
 pub(crate) async fn resolve_server_request_on_thread_listener(
     thread_state: &Arc<Mutex<ThreadState>>,
     request_id: RequestId,
 ) -> Result<(), ResolveServerRequestError> {
-    async fn unresolved(
-        thread_state: &Arc<Mutex<ThreadState>>,
+    fn unresolved(
         request_id: RequestId,
         failure: ResolveServerRequestFailure,
     ) -> ResolveServerRequestError {
-        thread_state
-            .lock()
-            .await
-            .mark_server_request_resolution_unresolved(request_id, failure)
+        ResolveServerRequestError {
+            request_id,
+            failure,
+        }
     }
 
     let (completion_tx, completion_rx) = oneshot::channel();
@@ -542,11 +1012,9 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
     };
     let Some(listener_command_tx) = listener_command_tx else {
         return Err(unresolved(
-            thread_state,
             request_id,
             ResolveServerRequestFailure::ListenerNotRunning,
-        )
-        .await);
+        ));
     };
 
     let unresolved_request_id = request_id.clone();
@@ -559,26 +1027,17 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
         .is_err()
     {
         return Err(unresolved(
-            thread_state,
             unresolved_request_id,
             ResolveServerRequestFailure::ListenerClosed,
-        )
-        .await);
+        ));
     }
 
     if completion_rx.await.is_err() {
         return Err(unresolved(
-            thread_state,
             unresolved_request_id,
             ResolveServerRequestFailure::CompletionDropped,
-        )
-        .await);
+        ));
     }
-
-    thread_state
-        .lock()
-        .await
-        .clear_unresolved_server_request_resolution(&unresolved_request_id);
     Ok(())
 }
 
@@ -714,8 +1173,8 @@ mod tests {
             state
                 .lock()
                 .await
-                .unresolved_server_request_resolution(&request_id),
-            Some(ResolveServerRequestFailure::ListenerNotRunning)
+                .retained_server_request_resolution_count(),
+            0
         );
     }
 
@@ -738,8 +1197,8 @@ mod tests {
             state
                 .lock()
                 .await
-                .unresolved_server_request_resolution(&request_id),
-            Some(ResolveServerRequestFailure::ListenerClosed)
+                .retained_server_request_resolution_count(),
+            0
         );
     }
 
@@ -770,52 +1229,49 @@ mod tests {
             state
                 .lock()
                 .await
-                .unresolved_server_request_resolution(&request_id),
-            Some(ResolveServerRequestFailure::CompletionDropped)
+                .retained_server_request_resolution_count(),
+            0
         );
     }
 
     #[tokio::test]
-    async fn in_flight_task_coalescing_claims_and_releases() {
+    async fn turn_start_claims_coalesce_tasks_and_serialize_each_thread() {
         let manager = ThreadStateManager::new();
         let first_thread = ThreadId::new();
         let second_thread = ThreadId::new();
 
         assert_eq!(
             manager
-                .claim_in_flight_task(
-                    "fingerprint".to_string(),
-                    first_thread,
-                    "turn-1".to_string(),
-                )
+                .claim_turn_start(Some("fingerprint"), first_thread, "turn-1")
                 .await,
-            InFlightTaskClaim::Claimed
+            TurnStartClaim::Claimed
         );
         assert_eq!(
             manager
-                .claim_in_flight_task(
-                    "fingerprint".to_string(),
-                    second_thread,
-                    "turn-2".to_string(),
-                )
+                .claim_turn_start(Some("fingerprint"), second_thread, "turn-2")
                 .await,
-            InFlightTaskClaim::Existing(InFlightTaskReference {
+            TurnStartClaim::IdenticalTask(InFlightTaskReference {
+                thread_id: first_thread,
+                turn_id: "turn-1".to_string(),
+            })
+        );
+        assert_eq!(
+            manager
+                .claim_turn_start(Some("different-task"), first_thread, "turn-2")
+                .await,
+            TurnStartClaim::ActiveTurn(InFlightTaskReference {
                 thread_id: first_thread,
                 turn_id: "turn-1".to_string(),
             })
         );
 
-        manager.release_in_flight_task(first_thread, "turn-1").await;
+        manager.release_turn_start(first_thread, "turn-1").await;
         assert!(manager.state.lock().await.in_flight_tasks.is_empty());
         assert_eq!(
             manager
-                .claim_in_flight_task(
-                    "fingerprint".to_string(),
-                    second_thread,
-                    "turn-2".to_string(),
-                )
+                .claim_turn_start(Some("fingerprint"), second_thread, "turn-2")
                 .await,
-            InFlightTaskClaim::Claimed
+            TurnStartClaim::Claimed
         );
     }
 
@@ -825,37 +1281,34 @@ mod tests {
         let original_thread = ThreadId::new();
 
         for index in 0..MAX_TRACKED_IN_FLIGHT_TASKS {
+            let thread_id = if index == 0 {
+                original_thread
+            } else {
+                ThreadId::new()
+            };
             assert_eq!(
                 manager
-                    .claim_in_flight_task(
-                        format!("fingerprint-{index}"),
-                        original_thread,
-                        format!("turn-{index}"),
+                    .claim_turn_start(
+                        Some(&format!("fingerprint-{index}")),
+                        thread_id,
+                        &format!("turn-{index}"),
                     )
                     .await,
-                InFlightTaskClaim::Claimed
+                TurnStartClaim::Claimed
             );
         }
 
         assert_eq!(
             manager
-                .claim_in_flight_task(
-                    "overflow".to_string(),
-                    ThreadId::new(),
-                    "overflow-turn".to_string(),
-                )
+                .claim_turn_start(Some("overflow"), ThreadId::new(), "overflow-turn")
                 .await,
-            InFlightTaskClaim::CapacityExceeded
+            TurnStartClaim::CapacityExceeded
         );
         assert_eq!(
             manager
-                .claim_in_flight_task(
-                    "fingerprint-0".to_string(),
-                    ThreadId::new(),
-                    "duplicate-turn".to_string(),
-                )
+                .claim_turn_start(Some("fingerprint-0"), ThreadId::new(), "duplicate-turn")
                 .await,
-            InFlightTaskClaim::Existing(InFlightTaskReference {
+            TurnStartClaim::IdenticalTask(InFlightTaskReference {
                 thread_id: original_thread,
                 turn_id: "turn-0".to_string(),
             })
@@ -937,88 +1390,37 @@ mod tests {
     }
 
     #[test]
-    fn terminal_ledger_retains_acknowledged_tombstones_for_exactly_once_replay() {
+    fn durable_terminal_acknowledgement_evicts_tombstone_and_suppresses_replay() {
         let mut state = ThreadState::default();
-
-        let unreduced_event = terminal_event("unreduced", "done");
-        let unreduced_fingerprint =
-            terminal_event_fingerprint(&unreduced_event).expect("terminal fingerprint");
+        let event = terminal_event("turn-1", "done");
+        let fingerprint = terminal_event_fingerprint(&event).expect("terminal fingerprint");
         assert!(matches!(
-            state.classify_terminal_event("unreduced", &unreduced_event, &[]),
+            state.classify_terminal_event("turn-1", &event, &[]),
             TerminalEventDisposition::Apply { .. }
         ));
-        state.mark_terminal_acknowledged("unreduced", &unreduced_fingerprint);
+        state.mark_terminal_state_reduced("turn-1", &fingerprint);
+        state.mark_terminal_durably_acknowledged("turn-1", &fingerprint);
+        assert!(state.terminal_ledger.is_empty());
 
-        let pending_event = terminal_event("pending", "done");
-        let pending_fingerprint =
-            terminal_event_fingerprint(&pending_event).expect("terminal fingerprint");
         assert!(matches!(
-            state.classify_terminal_event("pending", &pending_event, &[ConnectionId(7)]),
-            TerminalEventDisposition::Apply { .. }
+            state.classify_terminal_event_with_durable_acknowledgement(
+                "turn-1",
+                &event,
+                &[],
+                Some(&fingerprint),
+            ),
+            TerminalEventDisposition::SuppressAcknowledged
         ));
-        state.mark_terminal_state_reduced("pending", &pending_fingerprint);
-        assert!(!state.record_terminal_notification_attempt(
-            "pending",
-            &pending_fingerprint,
-            cached_notification(),
-            Some(ConnectionId(7)),
-            &[ConnectionId(7)],
-            &[],
+        assert!(state.terminal_ledger.is_empty());
+        assert!(matches!(
+            state.classify_terminal_event_with_durable_acknowledgement(
+                "turn-1",
+                &terminal_event("turn-1", "conflict"),
+                &[],
+                Some(&fingerprint),
+            ),
+            TerminalEventDisposition::RejectConflict
         ));
-
-        const TOMBSTONES_BEYOND_FORMER_CAP: usize = 1_025;
-        for index in 0..TOMBSTONES_BEYOND_FORMER_CAP {
-            let turn_id = format!("acknowledged-{index}");
-            let event = terminal_event(&turn_id, "done");
-            let fingerprint = terminal_event_fingerprint(&event).expect("terminal fingerprint");
-            assert!(matches!(
-                state.classify_terminal_event(&turn_id, &event, &[]),
-                TerminalEventDisposition::Apply { .. }
-            ));
-            state.mark_terminal_state_reduced(&turn_id, &fingerprint);
-            state.mark_terminal_acknowledged(&turn_id, &fingerprint);
-        }
-
-        let newest_turn_id = format!("acknowledged-{}", TOMBSTONES_BEYOND_FORMER_CAP - 1);
-        let newest_fingerprint = state
-            .terminal_ledger
-            .get(&newest_turn_id)
-            .expect("newest acknowledged tombstone")
-            .fingerprint
-            .clone();
-        state.mark_terminal_acknowledged(&newest_turn_id, &newest_fingerprint);
-
-        assert!(state.terminal_ledger.contains_key("acknowledged-0"));
-        assert!(state.terminal_ledger.contains_key(&newest_turn_id));
-        assert_eq!(
-            state.terminal_ledger.len(),
-            TOMBSTONES_BEYOND_FORMER_CAP + 2
-        );
-
-        let unreduced = state
-            .terminal_ledger
-            .get("unreduced")
-            .expect("unreduced entry must remain");
-        assert!(!unreduced.state_reduced);
-        assert!(!unreduced.acknowledged_queued);
-
-        state.mark_terminal_state_reduced("unreduced", &unreduced_fingerprint);
-        let reduced_tombstone = state
-            .terminal_ledger
-            .get("unreduced")
-            .expect("newest acknowledged tombstone must remain");
-        assert!(reduced_tombstone.state_reduced);
-        assert!(reduced_tombstone.acknowledged_queued);
-        assert!(state.terminal_ledger.contains_key("acknowledged-1"));
-
-        let pending = state
-            .terminal_ledger
-            .get("pending")
-            .expect("notification-pending entry must remain");
-        assert!(pending.state_reduced);
-        assert!(!pending.notification_accepted);
-        assert!(pending.notification.is_some());
-        assert!(!pending.acknowledged_queued);
     }
 
     #[test]
@@ -1084,6 +1486,130 @@ mod tests {
     }
 
     #[test]
+    fn seeded_turn_index_pages_without_replaying_full_history() {
+        let mut items = Vec::new();
+        for (turn_id, message) in [("turn-1", "first"), ("turn-2", "second")] {
+            items.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: turn_id.to_string(),
+                    trace_id: None,
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: ModeKind::Default,
+                },
+            )));
+            items.push(RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    client_id: None,
+                    message: message.to_string(),
+                    images: None,
+                    local_images: Vec::new(),
+                    text_elements: Vec::new(),
+                    ..Default::default()
+                },
+            )));
+            items.push(RolloutItem::EventMsg(terminal_event(turn_id, message)));
+        }
+
+        let mut state = ThreadState::default();
+        state.seed_turn_index_from_history(&items);
+
+        let newest = state
+            .indexed_turns_page(None, 1, SortDirection::Desc)
+            .expect("valid page")
+            .expect("initialized index");
+        assert_eq!(newest.turns[0].id, "turn-2");
+        assert!(newest.more_turns_available);
+
+        let older = state
+            .indexed_turns_page(
+                Some(("turn-2", /*include_anchor*/ false)),
+                1,
+                SortDirection::Desc,
+            )
+            .expect("valid page")
+            .expect("initialized index");
+        assert_eq!(older.turns[0].id, "turn-1");
+        assert!(!older.more_turns_available);
+    }
+
+    #[test]
+    fn seeded_item_index_pages_without_replaying_full_history() {
+        let mut items = Vec::new();
+        for (turn_id, message) in [("turn-1", "first"), ("turn-2", "second")] {
+            items.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: turn_id.to_string(),
+                    trace_id: None,
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: ModeKind::Default,
+                },
+            )));
+            items.push(RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    client_id: None,
+                    message: message.to_string(),
+                    images: None,
+                    local_images: Vec::new(),
+                    text_elements: Vec::new(),
+                    ..Default::default()
+                },
+            )));
+            items.push(RolloutItem::EventMsg(terminal_event(turn_id, message)));
+        }
+
+        let mut state = ThreadState::default();
+        state.seed_turn_index_from_history(&items);
+
+        let first = state
+            .indexed_items_page(None, None, 2, SortDirection::Asc)
+            .expect("valid page")
+            .expect("initialized index");
+        assert_eq!(first.items.len(), 2);
+        assert!(first.more_items_available);
+        let anchor = first.items.last().expect("page anchor");
+
+        let second = state
+            .indexed_items_page(
+                None,
+                Some((anchor.turn_id.as_str(), anchor.item.id(), false)),
+                2,
+                SortDirection::Asc,
+            )
+            .expect("valid page")
+            .expect("initialized index");
+        assert_eq!(second.items.len(), 2);
+        assert!(!second.more_items_available);
+        assert!(second.items.iter().all(|entry| entry.turn_id == "turn-2"));
+    }
+
+    #[test]
+    fn late_indexed_items_remain_grouped_by_turn_order() {
+        let mut index = ThreadTurnIndex::default();
+        index.turn_mut("turn-1");
+        index.turn_mut("turn-2");
+        let turn_2_item = IndexedItemKey {
+            turn_id: "turn-2".to_string(),
+            item_id: "item-2".to_string(),
+        };
+        let turn_1_item = IndexedItemKey {
+            turn_id: "turn-1".to_string(),
+            item_id: "item-1".to_string(),
+        };
+
+        index.insert_item_key(turn_2_item.clone());
+        index.insert_item_key(turn_1_item.clone());
+
+        assert_eq!(
+            index.item_order,
+            vec![turn_1_item.clone(), turn_2_item.clone()]
+        );
+        assert_eq!(index.item_positions[&turn_1_item], 0);
+        assert_eq!(index.item_positions[&turn_2_item], 1);
+    }
+
+    #[test]
     fn retained_terminal_history_requires_notification_projection_after_restart() {
         let event = terminal_event("turn-1", "done");
         let mut state = ThreadState::default();
@@ -1095,6 +1621,53 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn resume_history_seed_is_scoped_to_listener_generation() {
+        let event = terminal_event("turn-1", "done");
+        let mut state = ThreadState::default();
+        let (listener_command_tx, _listener_command_rx) = thread_listener_command_channel();
+        state.listener_command_tx = Some(listener_command_tx);
+        state.listener_generation = 7;
+        let listener_generation = state.listener_generation;
+
+        assert!(!state.resume_history_is_seeded_for_current_listener());
+        assert!(state.seed_resume_history_for_listener(
+            &[RolloutItem::EventMsg(event)],
+            listener_generation,
+            None,
+        ));
+        assert!(state.resume_history_is_seeded_for_current_listener());
+
+        state.listener_generation += 1;
+        assert!(!state.resume_history_is_seeded_for_current_listener());
+        assert!(!state.seed_resume_history_for_listener(&[], 7, None));
+    }
+
+    #[test]
+    fn resume_history_only_retains_terminals_that_still_require_replay() {
+        let mut state = ThreadState::default();
+        let (listener_command_tx, _listener_command_rx) = thread_listener_command_channel();
+        state.listener_command_tx = Some(listener_command_tx);
+        state.listener_generation = 3;
+        let acknowledged = terminal_event("acknowledged", "done");
+        let pending = terminal_event("pending", "done");
+        let pending_fingerprint =
+            terminal_event_fingerprint(&pending).expect("terminal fingerprint");
+        let replay_fingerprints = HashMap::from([("pending".to_string(), pending_fingerprint)]);
+
+        assert!(state.seed_resume_history_for_listener(
+            &[
+                RolloutItem::EventMsg(acknowledged),
+                RolloutItem::EventMsg(pending),
+            ],
+            3,
+            Some(&replay_fingerprints),
+        ));
+
+        assert!(!state.terminal_ledger.contains_key("acknowledged"));
+        assert!(state.terminal_ledger.contains_key("pending"));
+    }
+
     fn thread_settings(model: &str) -> ThreadSettings {
         ThreadSettings {
             cwd: AbsolutePathBuf::from_absolute_path("/tmp").expect("absolute path"),
@@ -1103,6 +1676,7 @@ mod tests {
             sandbox_policy: SandboxPolicy::ReadOnly {
                 network_access: false,
             },
+            permission_profile: None,
             active_permission_profile: None,
             model: model.to_string(),
             model_provider: "mock_provider".to_string(),
@@ -1156,6 +1730,7 @@ struct ThreadStateManagerInner {
     out_of_band_elicitation_leases:
         HashMap<ThreadId, HashMap<OutOfBandElicitationLeaseKey, Weak<CodexThread>>>,
     in_flight_tasks: HashMap<String, InFlightTaskReference>,
+    in_flight_turn_starts: HashMap<ThreadId, String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1246,38 +1821,56 @@ impl ThreadStateManager {
         Self::default()
     }
 
-    pub(crate) async fn claim_in_flight_task(
+    pub(crate) async fn claim_turn_start(
         &self,
-        fingerprint: String,
+        fingerprint: Option<&str>,
         thread_id: ThreadId,
-        turn_id: String,
-    ) -> InFlightTaskClaim {
+        turn_id: &str,
+    ) -> TurnStartClaim {
         let mut state = self.state.lock().await;
-        if let Some(existing) = state.in_flight_tasks.get(&fingerprint) {
-            return InFlightTaskClaim::Existing(existing.clone());
+        if let Some(existing) = fingerprint.and_then(|key| state.in_flight_tasks.get(key)) {
+            return TurnStartClaim::IdenticalTask(existing.clone());
+        }
+        if let Some(existing_turn_id) = state.in_flight_turn_starts.get(&thread_id) {
+            return TurnStartClaim::ActiveTurn(InFlightTaskReference {
+                thread_id,
+                turn_id: existing_turn_id.clone(),
+            });
         }
 
         // This map is live correctness state. Evicting an active fingerprint
         // would admit the same task again while its original execution runs.
-        if state.in_flight_tasks.len() >= MAX_TRACKED_IN_FLIGHT_TASKS {
-            return InFlightTaskClaim::CapacityExceeded;
+        if fingerprint.is_some() && state.in_flight_tasks.len() >= MAX_TRACKED_IN_FLIGHT_TASKS {
+            return TurnStartClaim::CapacityExceeded;
         }
 
-        state.in_flight_tasks.insert(
-            fingerprint.clone(),
-            InFlightTaskReference {
-                thread_id,
-                turn_id: turn_id.clone(),
-            },
-        );
-        InFlightTaskClaim::Claimed
+        state
+            .in_flight_turn_starts
+            .insert(thread_id, turn_id.to_string());
+        if let Some(fingerprint) = fingerprint {
+            state.in_flight_tasks.insert(
+                fingerprint.to_string(),
+                InFlightTaskReference {
+                    thread_id,
+                    turn_id: turn_id.to_string(),
+                },
+            );
+        }
+        TurnStartClaim::Claimed
     }
 
-    pub(crate) async fn release_in_flight_task(&self, thread_id: ThreadId, turn_id: &str) {
+    pub(crate) async fn release_turn_start(&self, thread_id: ThreadId, turn_id: &str) {
         let mut state = self.state.lock().await;
         state
             .in_flight_tasks
             .retain(|_, entry| entry.thread_id != thread_id || entry.turn_id.as_str() != turn_id);
+        if state
+            .in_flight_turn_starts
+            .get(&thread_id)
+            .is_some_and(|active_turn_id| active_turn_id == turn_id)
+        {
+            state.in_flight_turn_starts.remove(&thread_id);
+        }
     }
 
     pub(crate) async fn connection_initialized(
@@ -1510,6 +2103,10 @@ impl ThreadStateManager {
             if let Some(leases) = state.out_of_band_elicitation_leases.remove(&thread_id) {
                 release_out_of_band_elicitation_leases(leases);
             }
+            state.in_flight_turn_starts.remove(&thread_id);
+            state
+                .in_flight_tasks
+                .retain(|_, entry| entry.thread_id != thread_id);
             thread_state
         };
         self.unregister_listener_command_tx(thread_id);

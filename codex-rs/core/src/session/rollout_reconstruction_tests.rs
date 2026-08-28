@@ -5,6 +5,7 @@ use super::tests::make_session_and_context;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AcceptedAttemptProvenance;
 use codex_protocol::protocol::CompactedItem;
@@ -83,7 +84,7 @@ fn inter_agent_assistant_message(text: &str) -> ResponseItem {
 }
 
 #[tokio::test]
-async fn reconstruct_history_keeps_tool_manifest_dictionary_model_invisible() {
+async fn reconstruct_history_ignores_tool_manifest_records() {
     let (session, turn_context) = make_session_and_context().await;
     let first = json!({
         "model_visible": [{"type": "function", "name": "shell"}],
@@ -115,13 +116,18 @@ async fn reconstruct_history_keeps_tool_manifest_dictionary_model_invisible() {
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
         .await;
 
-    assert_eq!(reconstructed.history, vec![user]);
-    assert_eq!(reconstructed.tool_manifests.manifest("first"), Some(&first));
-    assert_eq!(
-        reconstructed.tool_manifests.manifest("second"),
-        Some(&second)
-    );
-    assert_eq!(reconstructed.tool_manifests.current_hash(), Some("second"));
+    let super::rollout_reconstruction::RolloutReconstruction {
+        history,
+        previous_turn_settings: _,
+        reference_context_item: _,
+        world_state_baseline: _,
+        window_number: _,
+        first_window_id: _,
+        previous_window_id: _,
+        window_id: _,
+        last_passed_root_completion_turn_id: _,
+    } = reconstructed;
+    assert_eq!(history, vec![user]);
 }
 
 fn completed_user_turn_rollout(
@@ -223,6 +229,76 @@ async fn resume_rollout(session: &Session, rollout_items: Vec<RolloutItem>) {
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
         .await;
+}
+
+#[tokio::test]
+async fn durability_regression_resume_invalidates_unified_exec_session() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let original_output =
+        "Chunk ID: 123\nProcess running with session ID 1000\nLive output\n".to_string();
+    let rollout_items = vec![
+        RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            id: None,
+            name: "exec_command".to_string(),
+            namespace: None,
+            arguments: r#"{"cmd":"long-running"}"#.to_string(),
+            call_id: "exec-call".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        }),
+        RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "exec-call".to_string(),
+            output: FunctionCallOutputPayload::from_text(original_output.clone()),
+            internal_chat_message_metadata_passthrough: None,
+        }),
+        RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            id: None,
+            name: "write_stdin".to_string(),
+            namespace: None,
+            arguments: r#"{"session_id":1000,"chars":""}"#.to_string(),
+            call_id: "write-call".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        }),
+        RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "write-call".to_string(),
+            output: FunctionCallOutputPayload::from_text(
+                "Process running with session ID 1000\nMore output\n".to_string(),
+            ),
+            internal_chat_message_metadata_passthrough: None,
+        }),
+    ];
+
+    resume_rollout(&session, rollout_items).await;
+
+    let history = session.clone_history().await;
+    assert!(history.raw_items().iter().any(|item| {
+        matches!(
+            item,
+            ResponseItem::FunctionCallOutput { output, .. }
+                if output.text_content() == Some(original_output.as_str())
+        )
+    }));
+    let invalidations = history
+        .raw_items()
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
+                content.iter().find_map(|content| match content {
+                    ContentItem::InputText { text }
+                        if text.starts_with("<unified_exec_resume_invalidated>") =>
+                    {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(invalidations.len(), 1);
+    assert!(invalidations[0].contains("- 1000"));
+    assert!(invalidations[0].contains("Do not call write_stdin"));
 }
 
 #[tokio::test]

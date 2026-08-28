@@ -49,6 +49,12 @@ pub fn is_known_safe_command(command: &[String]) -> bool {
     false
 }
 
+/// Returns whether an exact, already-tokenized argv is known safe without
+/// interpreting a shell-looking executable as an owned shell wrapper.
+pub fn is_known_safe_direct_argv(command: &[String]) -> bool {
+    is_safe_to_call_with_exec(command)
+}
+
 /// Returns whether already-tokenized PowerShell words are read-only enough to
 /// be auto-approved by the Windows safelist.
 pub fn is_safe_powershell_words(command: &[String]) -> bool {
@@ -532,6 +538,22 @@ mod tests {
     #[test]
     fn zsh_lc_safe_command_sequence() {
         assert!(is_known_safe_command(&vec_str(&["zsh", "-lc", "ls"])));
+    }
+
+    #[test]
+    fn authorization_identity_direct_argv_safety_is_opaque() {
+        assert!(is_known_safe_direct_argv(&vec_str(&["ls"])));
+        assert!(!is_known_safe_direct_argv(&vec_str(&[
+            "/workspace/bash",
+            "-lc",
+            "ls",
+        ])));
+        assert!(!is_known_safe_direct_argv(&vec_str(&[
+            "/workspace/pwsh.exe",
+            "-NoProfile",
+            "-Command",
+            "Get-ChildItem",
+        ])));
     }
 
     #[test]

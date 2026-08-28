@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -32,9 +33,6 @@ use tracing::warn;
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::config::Config;
 use crate::context::ContextualUserFragment;
-use crate::hook_runtime::inspect_pending_input;
-use crate::hook_runtime::record_additional_contexts;
-use crate::hook_runtime::record_pending_input;
 use crate::hook_runtime::run_turn_interrupt_hooks;
 use crate::session::TurnInput;
 use crate::session::session::Session;
@@ -57,8 +55,10 @@ use crate::task_evidence::TerminalDeliveryState as DurableDeliveryState;
 use crate::task_evidence::TerminalInteractionUpdate;
 use crate::task_evidence::TerminalRecoveryState;
 use crate::task_evidence::TerminalRolloutRepairV1;
+use crate::task_evidence::TerminalToolClosureAttestationV1;
 use crate::task_evidence::TerminalizationReceiptSnapshot;
 use crate::terminal_event_fingerprint;
+use crate::tools::context::RequiredToolTerminal;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
 use codex_otel::SessionTelemetry;
@@ -74,7 +74,6 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TerminalizationDeliveryState;
@@ -87,6 +86,7 @@ use codex_protocol::protocol::TurnTerminalizationCompleteEvent;
 use codex_protocol::protocol::TurnTerminalizationReceipt;
 use codex_protocol::protocol::TurnTiming;
 use codex_protocol::protocol::TurnTimingTerminalization;
+use codex_protocol::protocol::TurnTimingToolClosure;
 
 use codex_features::Feature;
 use codex_protocol::error::CodexErr;
@@ -133,6 +133,13 @@ enum TerminalRepairFailure {
     Permanent,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TerminalRepairContinuation {
+    Retry,
+    ShuttingDown,
+    Exhausted,
+}
+
 impl TerminalRepairRetry {
     fn retry_delay_after_failure(&mut self, failure: TerminalRepairFailure) -> Option<Duration> {
         if failure == TerminalRepairFailure::Permanent {
@@ -148,6 +155,25 @@ impl TerminalRepairRetry {
                 .saturating_mul(1_u32.checked_shl(shift).unwrap_or(u32::MAX))
                 .min(TERMINAL_REPAIR_MAX_BACKOFF),
         )
+    }
+
+    async fn wait_for_next_attempt(
+        &mut self,
+        shutting_down: &AtomicBool,
+        failure: TerminalRepairFailure,
+    ) -> TerminalRepairContinuation {
+        if shutting_down.load(Ordering::Acquire) {
+            return TerminalRepairContinuation::ShuttingDown;
+        }
+        let Some(delay) = self.retry_delay_after_failure(failure) else {
+            return TerminalRepairContinuation::Exhausted;
+        };
+        tokio::time::sleep(delay).await;
+        if shutting_down.load(Ordering::Acquire) {
+            TerminalRepairContinuation::ShuttingDown
+        } else {
+            TerminalRepairContinuation::Retry
+        }
     }
 }
 
@@ -199,6 +225,10 @@ fn protocol_terminalization_receipt(
 pub(crate) struct TurnTaskResult {
     pub(crate) last_agent_message: Option<String>,
     pub(crate) surfaced_result: Option<codex_protocol::protocol::SurfacedToolResult>,
+    pub(crate) required_tool_terminal: Option<RequiredToolTerminal>,
+    /// Preserve already-accepted pending input for a fresh turn instead of folding it into a
+    /// terminal turn that no longer has a model-generation budget.
+    pub(crate) defer_pending_input: bool,
 }
 
 pub(crate) type SessionTaskResult = CodexResult<TurnTaskResult>;
@@ -340,6 +370,32 @@ impl TerminalDeadline {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+}
+
+async fn wait_for_terminal_tool_closure(
+    deadline: &TerminalDeadline,
+    turn_context: &TurnContext,
+) -> TurnTimingToolClosure {
+    match deadline
+        .run(
+            "tool_closure",
+            TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+            turn_context
+                .turn_timing_state
+                .wait_for_tool_closure_after_seal(),
+        )
+        .await
+    {
+        Ok(tool_closure) => tool_closure,
+        Err(error) => {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                ?error,
+                "exact tool closure did not complete before the terminal deadline"
+            );
+            turn_context.turn_timing_state.tool_closure_snapshot()
+        }
     }
 }
 
@@ -564,6 +620,7 @@ impl TurnTerminalOutcome {
         match self {
             Self::Aborted(reason) => Some(reason.clone()),
             Self::ReturnedError(CodexErr::TurnAborted) => Some(TurnAbortReason::Interrupted),
+            Self::WorkerJoinFailed(_) => Some(TurnAbortReason::InternalError),
             _ => None,
         }
     }
@@ -604,6 +661,7 @@ struct TerminalFinalization {
     deadline: TerminalDeadline,
     mutation_quiescent: bool,
     pending_turn_profile: Option<TurnProfileFact>,
+    worker_failure_reported: bool,
 }
 
 struct TerminalInteractionMilestone {
@@ -616,6 +674,7 @@ struct TerminalInteractionOutcome {
     durable_outcome: String,
     durable_success_established: bool,
     rollout_structure_ready: bool,
+    tool_closure_complete: bool,
     rollout_repair_items: Vec<ResponseItem>,
 }
 
@@ -643,10 +702,16 @@ fn durable_side_effect_step(
 enum TerminalPublicationDecision {
     Publish,
     DeferForRolloutRepair,
+    RefuseForToolClosure,
 }
 
-fn terminal_publication_decision(rollout_structure_ready: bool) -> TerminalPublicationDecision {
-    if rollout_structure_ready {
+fn terminal_publication_decision(
+    rollout_structure_ready: bool,
+    tool_closure_complete: bool,
+) -> TerminalPublicationDecision {
+    if !tool_closure_complete {
+        TerminalPublicationDecision::RefuseForToolClosure
+    } else if rollout_structure_ready {
         TerminalPublicationDecision::Publish
     } else {
         TerminalPublicationDecision::DeferForRolloutRepair
@@ -868,12 +933,50 @@ fn final_proof_hash(label: &str, value: &impl serde::Serialize) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-struct WorkerDoneNotifier(Arc<Notify>);
+struct WorkerDoneNotifier {
+    notify: Arc<Notify>,
+    worker_done: Arc<AtomicBool>,
+}
 
 impl Drop for WorkerDoneNotifier {
     fn drop(&mut self) {
-        // `notify_one` retains a permit when the abort finalizer has not started waiting yet.
-        self.0.notify_one();
+        self.worker_done.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+        self.notify.notify_one();
+    }
+}
+
+async fn wait_for_worker_done(task: &RunningTask) {
+    loop {
+        let notified = task.done.notified();
+        if task.worker_done.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+async fn drain_auxiliary_tasks(tasks: &mut tokio::task::JoinSet<()>) {
+    while let Some(result) = tasks.join_next().await {
+        if let Err(err) = result
+            && !err.is_cancelled()
+        {
+            warn!(%err, "turn auxiliary task failed while terminalizing");
+        }
+    }
+}
+
+async fn quiesce_turn_auxiliary_tasks(task: &mut RunningTask) {
+    task.auxiliary_cancellation_token.cancel();
+    if tokio::time::timeout(
+        GRACEFUL_INTERRUPTION_TIMEOUT,
+        drain_auxiliary_tasks(&mut task.auxiliary_tasks),
+    )
+    .await
+    .is_err()
+    {
+        task.auxiliary_tasks.abort_all();
+        drain_auxiliary_tasks(&mut task.auxiliary_tasks).await;
     }
 }
 
@@ -922,33 +1025,69 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        let Ok(_task_start_permit) = self.task_start_gate.acquire().await else {
+            unreachable!("session-owned task-start semaphore is never closed");
+        };
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        self.start_task(turn_context, input, task).await;
+        let _ = self.start_task_locked(turn_context, input, task).await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
     ) {
-        let taskless_placeholder = {
-            let active_turn = self.active_turn.lock().await;
-            active_turn.as_ref().and_then(|active_turn| {
-                (active_turn.task.is_none() && active_turn.terminal.is_none())
-                    .then(|| Arc::clone(&active_turn.turn_state))
-            })
+        let Ok(_task_start_permit) = self.task_start_gate.acquire().await else {
+            unreachable!("session-owned task-start semaphore is never closed");
         };
+        let _ = self.start_task_locked(turn_context, input, task).await;
+    }
+
+    pub(crate) async fn start_task_with_admission<T: SessionTask>(
+        self: &Arc<Self>,
+        _task_start_permit: &tokio::sync::SemaphorePermit<'_>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+    ) -> CodexResult<()> {
+        self.start_task_locked(turn_context, input, task).await
+    }
+
+    async fn start_task_locked<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+    ) -> CodexResult<()> {
+        let turn_state = {
+            let mut active_turn = self.active_turn.lock().await;
+            match active_turn.as_ref() {
+                Some(active_turn)
+                    if active_turn.task.is_some() || active_turn.terminal.is_some() =>
+                {
+                    return Err(CodexErr::InvalidRequest(
+                        "a turn is already active".to_string(),
+                    ));
+                }
+                Some(active_turn) => Arc::clone(&active_turn.turn_state),
+                None => Arc::clone(&active_turn.insert(ActiveTurn::default()).turn_state),
+            }
+        };
+        let mut startup_guard = TasklessTurnStartupGuard::new(self, Arc::clone(&turn_state));
         if self.terminal_interaction_pending.load(Ordering::Acquire)
             || self
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
         {
-            if let Some(taskless_placeholder) = taskless_placeholder.as_ref() {
-                self.clear_taskless_placeholder(taskless_placeholder).await;
-            }
-            return;
+            self.recover_cancelled_taskless_placeholder(&turn_state)
+                .await;
+            startup_guard.disarm();
+            return Err(CodexErr::InvalidRequest(
+                "the thread is shutting down".to_string(),
+            ));
         }
         let agent_execution_guard = match self.services.agent_control.execution_guard_for_task(
             self.thread_id,
@@ -958,15 +1097,15 @@ impl Session {
         ) {
             Ok(guard) => guard,
             Err(err) => {
-                if let Some(taskless_placeholder) = taskless_placeholder.as_ref() {
-                    self.clear_taskless_placeholder(taskless_placeholder).await;
-                }
+                self.recover_cancelled_taskless_placeholder(&turn_state)
+                    .await;
+                startup_guard.disarm();
                 self.send_event(
                     turn_context.as_ref(),
                     EventMsg::Error(err.to_error_event(None)),
                 )
                 .await;
-                return;
+                return Err(err);
             }
         };
         let task: Arc<dyn SessionTask> = Arc::new(task);
@@ -979,8 +1118,13 @@ impl Session {
         let token_usage_at_turn_start = self.total_token_usage().await.unwrap_or_default();
 
         let cancellation_token = CancellationToken::new();
+        let auxiliary_cancellation_token = cancellation_token.child_token();
         let done = Arc::new(Notify::new());
-        let terminal = TurnTerminalCoordinator::new(turn_context.sub_id.clone());
+        let worker_done = Arc::new(AtomicBool::new(false));
+        let terminal = TurnTerminalCoordinator::new_with_tool_call_acceptance(
+            turn_context.sub_id.clone(),
+            Arc::clone(&turn_context.tool_call_acceptance),
+        );
 
         self.services
             .guardian_rejection_circuit_breaker
@@ -988,120 +1132,168 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        let turn_state = {
+        let reservation_is_current = {
             let mut active = self.active_turn.lock().await;
-            let turn = active.get_or_insert_with(ActiveTurn::default);
-            debug_assert!(turn.task.is_none());
-            turn.reasoning_policy_recorder = Arc::new(
-                crate::session::reasoning_governor::ReasoningPolicyRecorder::new(
-                    turn_context.config.reasoning_phase_efforts.is_some(),
-                ),
-            );
-            Arc::clone(&turn.turn_state)
+            active.as_mut().is_some_and(|turn| {
+                turn.task.is_none()
+                    && turn.terminal.is_none()
+                    && Arc::ptr_eq(&turn.turn_state, &turn_state)
+            })
         };
-        let mut startup_guard = TasklessTurnStartupGuard::new(self, Arc::clone(&turn_state));
+        if !reservation_is_current {
+            self.recover_cancelled_taskless_placeholder(&turn_state)
+                .await;
+            startup_guard.disarm();
+            return Err(CodexErr::Fatal(
+                "turn start reservation was lost before task installation".to_string(),
+            ));
+        }
         let pending_items = self.input_queue.get_pending_input(&self.active_turn).await;
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
         self.input_queue
             .restore_transferred_input_for_turn_state(turn_state.as_ref(), pending_items)
             .await;
-        self.emit_turn_start_lifecycle(turn_context.as_ref(), &token_usage_at_turn_start)
-            .await;
 
-        let mut active = self.active_turn.lock().await;
-        let turn = active.get_or_insert_with(ActiveTurn::default);
-        debug_assert!(turn.task.is_none());
-        let done_clone = Arc::clone(&done);
-        let session = Arc::clone(self);
-        let ctx = Arc::clone(&turn_context);
-        let task_for_run = Arc::clone(&task);
-        let task_input = input;
-        let task_cancellation_token = cancellation_token.child_token();
-        let (start_tx, start_rx) = oneshot::channel::<()>();
-        // Task-owned turn spans keep a core-owned span open for the
-        // full task lifecycle after the submission dispatch span ends.
-        let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
-        let task_span = info_span!(
-            "turn",
-            otel.name = span_name,
-            thread.id = %self.thread_id,
-            turn.id = %turn_context.sub_id,
-            model = %turn_context.model_info.slug,
-            codex.turn.reasoning_effort = %reasoning_effort,
-            codex.turn.token_usage.input_tokens = field::Empty,
-            codex.turn.token_usage.cached_input_tokens = field::Empty,
-            codex.turn.token_usage.non_cached_input_tokens = field::Empty,
-            codex.turn.token_usage.output_tokens = field::Empty,
-            codex.turn.token_usage.reasoning_output_tokens = field::Empty,
-            codex.turn.token_usage.total_tokens = field::Empty,
-        );
-        let worker_handle = tokio::spawn(
-            async move {
-                let _done_notifier = WorkerDoneNotifier(done_clone);
-                // Do not let a fast worker finish before its RunningTask and terminal
-                // coordinator are visible under the active-turn lock.
-                let _ = start_rx.await;
-                task_for_run
-                    .run(
-                        session,
-                        ctx,
-                        task_input,
-                        task_cancellation_token.child_token(),
-                    )
-                    .instrument(trace_span!("session_task.run"))
-                    .await
+        let start_tx = {
+            let mut active = self.active_turn.lock().await;
+            let reservation_is_current = active.as_ref().is_some_and(|turn| {
+                turn.task.is_none()
+                    && turn.terminal.is_none()
+                    && Arc::ptr_eq(&turn.turn_state, &turn_state)
+                    && !self.terminal_interaction_pending.load(Ordering::Acquire)
+                    && !self
+                        .shutting_down
+                        .load(std::sync::atomic::Ordering::Acquire)
+            });
+            if !reservation_is_current {
+                None
+            } else {
+                let Some(turn) = active.as_mut() else {
+                    unreachable!("validated taskless turn reservation must remain present");
+                };
+                turn.reasoning_policy_recorder = Arc::new(
+                    crate::session::reasoning_governor::ReasoningPolicyRecorder::new(
+                        turn_context.config.reasoning_phase_efforts.is_some(),
+                    ),
+                );
+                let done_clone = Arc::clone(&done);
+                let worker_done_clone = Arc::clone(&worker_done);
+                let session = Arc::clone(self);
+                let ctx = Arc::clone(&turn_context);
+                let task_for_run = Arc::clone(&task);
+                let task_input = input;
+                let task_cancellation_token = cancellation_token.child_token();
+                let lifecycle_token_usage = token_usage_at_turn_start.clone();
+                let (start_tx, start_rx) = oneshot::channel::<()>();
+                // Task-owned turn spans keep a core-owned span open for the
+                // full task lifecycle after the submission dispatch span ends.
+                let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
+                let task_span = info_span!(
+                    "turn",
+                    otel.name = span_name,
+                    thread.id = %self.thread_id,
+                    turn.id = %turn_context.sub_id,
+                    model = %turn_context.model_info.slug,
+                    codex.turn.reasoning_effort = %reasoning_effort,
+                    codex.turn.token_usage.input_tokens = field::Empty,
+                    codex.turn.token_usage.cached_input_tokens = field::Empty,
+                    codex.turn.token_usage.non_cached_input_tokens = field::Empty,
+                    codex.turn.token_usage.output_tokens = field::Empty,
+                    codex.turn.token_usage.reasoning_output_tokens = field::Empty,
+                    codex.turn.token_usage.total_tokens = field::Empty,
+                );
+                let worker_handle = tokio::spawn(
+                    async move {
+                        let _done_notifier = WorkerDoneNotifier {
+                            notify: done_clone,
+                            worker_done: worker_done_clone,
+                        };
+                        // Do not let a fast worker finish before its RunningTask and terminal
+                        // coordinator are visible under the active-turn lock.
+                        let _ = start_rx.await;
+                        session
+                            .emit_turn_start_lifecycle(ctx.as_ref(), &lifecycle_token_usage)
+                            .await;
+                        task_for_run
+                            .run(
+                                session,
+                                ctx,
+                                task_input,
+                                task_cancellation_token.child_token(),
+                            )
+                            .instrument(trace_span!("session_task.run"))
+                            .await
+                    }
+                    .instrument(task_span.clone()),
+                );
+                let worker_abort_handle = worker_handle.abort_handle();
+                let supervisor_session = Arc::clone(self);
+                let supervisor_turn_id = turn_context.sub_id.clone();
+                let supervisor_handle = tokio::spawn(
+                    async move {
+                        supervisor_session
+                            .on_task_finished(&supervisor_turn_id, worker_handle.await)
+                            .await;
+                    }
+                    .instrument(task_span.clone()),
+                );
+                let running_task = RunningTask {
+                    done,
+                    worker_done,
+                    kind: task_kind,
+                    task,
+                    cancellation_token,
+                    auxiliary_cancellation_token,
+                    auxiliary_tasks: tokio::task::JoinSet::new(),
+                    worker_abort_handle,
+                    _supervisor_handle: supervisor_handle,
+                    task_span,
+                    turn_context: Arc::clone(&turn_context),
+                    _agent_execution_guard: agent_execution_guard,
+                };
+                turn.task = Some(running_task);
+                turn.terminal = Some(terminal);
+                Some(start_tx)
             }
-            .instrument(task_span.clone()),
-        );
-        let worker_abort_handle = worker_handle.abort_handle();
-        let supervisor_session = Arc::clone(self);
-        let supervisor_turn_id = turn_context.sub_id.clone();
-        let supervisor_handle = tokio::spawn(
-            async move {
-                supervisor_session
-                    .on_task_finished(&supervisor_turn_id, worker_handle.await)
-                    .await;
-            }
-            .instrument(task_span.clone()),
-        );
-        let running_task = RunningTask {
-            done,
-            kind: task_kind,
-            task,
-            cancellation_token,
-            worker_abort_handle,
-            _supervisor_handle: supervisor_handle,
-            task_span,
-            turn_context: Arc::clone(&turn_context),
-            _agent_execution_guard: agent_execution_guard,
         };
-        turn.task = Some(running_task);
-        turn.terminal = Some(terminal);
-        drop(active);
+        let Some(start_tx) = start_tx else {
+            self.recover_cancelled_taskless_placeholder(&turn_state)
+                .await;
+            startup_guard.disarm();
+            return Err(CodexErr::Fatal(
+                "turn start reservation was lost before task installation".to_string(),
+            ));
+        };
         startup_guard.disarm();
         let _ = start_tx.send(());
+        Ok(())
+    }
+
+    pub(crate) async fn spawn_active_turn_auxiliary<F, Fut>(&self, start: F) -> bool
+    where
+        F: FnOnce(Arc<TurnContext>, CancellationToken) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut active_turn = self.active_turn.lock().await;
+        let Some(task) = active_turn
+            .as_mut()
+            .and_then(|active_turn| active_turn.task.as_mut())
+        else {
+            return false;
+        };
+        let turn_context = Arc::clone(&task.turn_context);
+        let cancellation_token = task.auxiliary_cancellation_token.child_token();
+        task.auxiliary_tasks
+            .spawn(start(turn_context, cancellation_token));
+        true
     }
 
     pub(crate) async fn clear_taskless_placeholder(
         &self,
         expected_turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
     ) {
-        let cleared = {
-            let mut active_turn = self.active_turn.lock().await;
-            if active_turn.as_ref().is_some_and(|active_turn| {
-                active_turn.task.is_none()
-                    && active_turn.terminal.is_none()
-                    && Arc::ptr_eq(&active_turn.turn_state, expected_turn_state)
-            }) {
-                *active_turn = None;
-                true
-            } else {
-                false
-            }
-        };
-        if cleared {
-            self.emit_thread_idle_lifecycle_if_idle().await;
-        }
+        self.recover_cancelled_taskless_placeholder(expected_turn_state)
+            .await;
     }
 
     #[expect(
@@ -1125,8 +1317,16 @@ impl Session {
                     .await;
                 *active_turn = None;
                 Some(recovered_input)
-            } else {
+            } else if active_turn.as_ref().is_some_and(|active_turn| {
+                Arc::ptr_eq(&active_turn.turn_state, expected_turn_state)
+            }) {
                 None
+            } else {
+                Some(
+                    self.input_queue
+                        .take_pending_input_for_turn_state(expected_turn_state.as_ref())
+                        .await,
+                )
             }
         };
         let Some(recovered_input) = recovered_input else {
@@ -1184,7 +1384,22 @@ impl Session {
         {
             return;
         }
-        if !self.input_queue.has_trigger_turn_mailbox_items().await {
+        if !self.input_queue.has_pending_turn_start_work().await {
+            return;
+        }
+
+        // All turn-start paths reserve the active slot while holding the same
+        // admission guard. This keeps the pending-work path from publishing a
+        // taskless placeholder ahead of an already admitted client start.
+        let Ok(task_start_permit) = self.task_start_gate.acquire().await else {
+            unreachable!("session-owned task-start semaphore is never closed");
+        };
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.terminal_interaction_pending.load(Ordering::Acquire)
+            || !self.input_queue.has_pending_turn_start_work().await
+        {
             return;
         }
 
@@ -1206,7 +1421,13 @@ impl Session {
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
+        let _ = self
+            .start_task_with_admission(
+                &task_start_permit,
+                turn_context,
+                Vec::new(),
+                RegularTask::new(),
+            )
             .await;
         startup_guard.disarm();
     }
@@ -1242,39 +1463,50 @@ impl Session {
     ) -> BoxFuture<'a, TerminalSchedule> {
         Box::pin(async move {
             let terminal_fence_started = tokio::time::Instant::now();
-            let (task, turn_state, reasoning_policy_recorder, permit, coordinator) = {
+            let scheduling = {
                 let mut active = self.active_turn.lock().await;
                 let Some(active_turn) = active.as_mut() else {
                     return TerminalSchedule::NotFound;
                 };
-                let Some(coordinator) = active_turn.terminal.as_ref().cloned() else {
-                    if expected_turn_id.is_none() && active_turn.task.is_none() {
-                        *active = None;
+                if let Some(coordinator) = active_turn.terminal.as_ref().cloned() {
+                    if expected_turn_id.is_some_and(|turn_id| coordinator.turn_id() != turn_id) {
+                        return TerminalSchedule::NotFound;
                     }
-                    return TerminalSchedule::NotFound;
-                };
-                if expected_turn_id.is_some_and(|turn_id| coordinator.turn_id() != turn_id) {
-                    return TerminalSchedule::NotFound;
+                    if active_turn.task.is_none() {
+                        return TerminalSchedule::AlreadyRunning(coordinator);
+                    }
+                    let Some(permit) = coordinator.try_claim() else {
+                        return TerminalSchedule::AlreadyRunning(coordinator);
+                    };
+                    let Some(task) = active_turn.task.take() else {
+                        return TerminalSchedule::AlreadyRunning(coordinator);
+                    };
+                    coordinator.seal_tool_call_acceptance(&task.turn_context.turn_timing_state);
+                    self.terminal_interaction_pending
+                        .store(true, Ordering::Release);
+                    Ok((
+                        task,
+                        Arc::clone(&active_turn.turn_state),
+                        active_turn.reasoning_policy_recorder.clone(),
+                        permit,
+                        coordinator,
+                    ))
+                } else {
+                    Err((expected_turn_id.is_none() && active_turn.task.is_none())
+                        .then(|| Arc::clone(&active_turn.turn_state)))
                 }
-                if active_turn.task.is_none() {
-                    return TerminalSchedule::AlreadyRunning(coordinator);
-                }
-                let Some(permit) = coordinator.try_claim() else {
-                    return TerminalSchedule::AlreadyRunning(coordinator);
-                };
-                let Some(task) = active_turn.task.take() else {
-                    return TerminalSchedule::AlreadyRunning(coordinator);
-                };
-                self.terminal_interaction_pending
-                    .store(true, Ordering::Release);
-                (
-                    task,
-                    Arc::clone(&active_turn.turn_state),
-                    active_turn.reasoning_policy_recorder.clone(),
-                    permit,
-                    coordinator,
-                )
             };
+            let (task, turn_state, reasoning_policy_recorder, permit, coordinator) =
+                match scheduling {
+                    Ok(scheduling) => scheduling,
+                    Err(taskless_turn_state) => {
+                        if let Some(taskless_turn_state) = taskless_turn_state {
+                            self.recover_cancelled_taskless_placeholder(&taskless_turn_state)
+                                .await;
+                        }
+                        return TerminalSchedule::NotFound;
+                    }
+                };
 
             // From this point to `TaskTracker::spawn` there is no await: the permit moves
             // directly from the caller into a session-owned, non-cancellable supervisor task.
@@ -1299,6 +1531,7 @@ impl Session {
                     deadline: terminal_deadline,
                     mutation_quiescent: true,
                     pending_turn_profile: None,
+                    worker_failure_reported: false,
                 };
                 let result = AssertUnwindSafe(
                     session.finalize_turn_terminal(&mut finalization),
@@ -1422,10 +1655,32 @@ impl Session {
             durable_outcome,
             durable_success_established,
             rollout_structure_ready,
+            tool_closure_complete,
             rollout_repair_items,
         } = outcome;
+        if terminal_publication_decision(rollout_structure_ready, tool_closure_complete)
+            == TerminalPublicationDecision::RefuseForToolClosure
+        {
+            warn!(turn_id = %turn_context.sub_id, "refusing terminal publication before exact tool closure");
+            return TerminalInteractionMilestone {
+                live_attempted: false,
+                live_delivered: false,
+                cleared_active_turn: false,
+            };
+        }
         let terminal_identity = format!("{}:{}", self.thread_id, turn_context.sub_id);
         apply_terminal_phase_timings(event, &finalization.deadline.phase_timings_ns());
+        let Some(tool_closure_attestation) =
+            TerminalToolClosureAttestationV1::from_terminal_event(event)
+                .filter(TerminalToolClosureAttestationV1::is_complete)
+        else {
+            warn!(turn_id = %turn_context.sub_id, "refusing terminal publication without schema-attested exact tool closure");
+            return TerminalInteractionMilestone {
+                live_attempted: false,
+                live_delivered: false,
+                cleared_active_turn: false,
+            };
+        };
         let Some(candidate_fingerprint) = terminal_event_fingerprint(event) else {
             warn!(turn_id = %turn_context.sub_id, "refusing to publish a non-terminal event through terminalization");
             let cleared_active_turn = self.detach_terminal_turn(finalization).await;
@@ -1440,7 +1695,7 @@ impl Session {
             .task_evidence
             .current_finalization_memo_identity()
             .await;
-        if terminal_publication_decision(rollout_structure_ready)
+        if terminal_publication_decision(rollout_structure_ready, tool_closure_complete)
             == TerminalPublicationDecision::DeferForRolloutRepair
         {
             let candidate_authority = AuthoritativeTerminalEventV1 {
@@ -1451,6 +1706,7 @@ impl Session {
                 fingerprint: candidate_fingerprint.clone(),
                 semantic_outcome: durable_outcome.clone(),
                 final_proof_identity: final_proof_identity.clone(),
+                tool_closure_attestation: Some(tool_closure_attestation.clone()),
                 rollout_repair: TerminalRolloutRepairV1 {
                     items: rollout_repair_items,
                     repair_missing_call_outputs: true,
@@ -1522,6 +1778,7 @@ impl Session {
             fingerprint: candidate_fingerprint.clone(),
             semantic_outcome: durable_outcome,
             final_proof_identity,
+            tool_closure_attestation: Some(tool_closure_attestation),
             rollout_repair: TerminalRolloutRepairV1::default(),
         };
         let claim = TerminalDecisionClaim {
@@ -1706,7 +1963,7 @@ impl Session {
         let update = TerminalInteractionUpdate {
             terminal_identity,
             delivery_state,
-            app_server_acknowledged: false,
+            app_server_acknowledged: !requires_app_server_ack && live_delivered,
             runtime_status_converged: true,
             rollout_mirrored,
             parent_notification_completed: false,
@@ -1726,6 +1983,8 @@ impl Session {
         .await
         {
             Ok(true) => {
+                self.prune_terminal_delivery_if_durably_acknowledged(&authority.terminal_identity)
+                    .await;
                 if let Some((authority, require_app_server_ack)) = redelivery {
                     self.schedule_terminal_redelivery(authority, require_app_server_ack);
                 }
@@ -1750,48 +2009,43 @@ impl Session {
         }
     }
 
-    /// Re-reads rollout storage after an ambiguous append failure. The first exact-turn terminal
-    /// event in durable history wins, even when it conflicts with the in-memory candidate.
+    /// Reconciles against the first terminal event persisted for this turn. The live-thread index
+    /// handles the ordinary path without I/O and falls back to durable history only after an
+    /// ambiguous append failure.
     async fn reconcile_terminal_authority_from_rollout(
         &self,
         candidate: &AuthoritativeTerminalEventV1,
     ) -> Option<AuthoritativeTerminalEventV1> {
-        let history = self
+        let event = self
             .live_thread()?
-            .load_history(/*include_archived*/ true)
+            .terminal_event(&candidate.turn_id, /*include_archived*/ true)
             .await
-            .ok()?;
-        history.items.into_iter().find_map(|item| {
-            let RolloutItem::EventMsg(event) = item else {
-                return None;
-            };
-            let event_turn_id = match &event {
-                EventMsg::TurnComplete(event) => Some(event.turn_id.as_str()),
-                EventMsg::TurnAborted(event) => event.turn_id.as_deref(),
-                _ => return None,
-            };
-            if event_turn_id != Some(candidate.turn_id.as_str()) {
-                return None;
-            }
-            let fingerprint = terminal_event_fingerprint(&event)?;
-            if fingerprint != candidate.fingerprint {
-                warn!(
-                    turn_id = %candidate.turn_id,
-                    authoritative_fingerprint = %fingerprint,
-                    candidate_fingerprint = %candidate.fingerprint,
-                    "rollout reconciliation preserved an earlier conflicting terminal event"
-                );
-            }
-            Some(AuthoritativeTerminalEventV1 {
-                version: 1,
-                terminal_identity: candidate.terminal_identity.clone(),
-                turn_id: candidate.turn_id.clone(),
-                semantic_outcome: semantic_terminal_outcome(&event),
-                event,
-                fingerprint,
-                final_proof_identity: candidate.final_proof_identity.clone(),
-                rollout_repair: TerminalRolloutRepairV1::default(),
-            })
+            .ok()??;
+        let fingerprint = terminal_event_fingerprint(&event)?;
+        let tool_closure_attestation = if fingerprint == candidate.fingerprint {
+            candidate.tool_closure_attestation.clone()
+        } else {
+            TerminalToolClosureAttestationV1::from_terminal_event(&event)
+        }
+        .filter(TerminalToolClosureAttestationV1::is_complete)?;
+        if fingerprint != candidate.fingerprint {
+            warn!(
+                turn_id = %candidate.turn_id,
+                authoritative_fingerprint = %fingerprint,
+                candidate_fingerprint = %candidate.fingerprint,
+                "rollout reconciliation preserved an earlier conflicting terminal event"
+            );
+        }
+        Some(AuthoritativeTerminalEventV1 {
+            version: 1,
+            terminal_identity: candidate.terminal_identity.clone(),
+            turn_id: candidate.turn_id.clone(),
+            semantic_outcome: semantic_terminal_outcome(&event),
+            event,
+            fingerprint,
+            final_proof_identity: candidate.final_proof_identity.clone(),
+            tool_closure_attestation: Some(tool_closure_attestation),
+            rollout_repair: TerminalRolloutRepairV1::default(),
         })
     }
 
@@ -1799,6 +2053,10 @@ impl Session {
         &self,
         authority: &AuthoritativeTerminalEventV1,
     ) -> bool {
+        if !authority.is_self_consistent() {
+            warn!(turn_id = %authority.turn_id, "refusing to mirror terminal authority without exact tool closure");
+            return false;
+        }
         match self
             .reconcile_terminal_authority_from_rollout(authority)
             .await
@@ -1843,18 +2101,27 @@ impl Session {
                             &update.terminal_identity,
                         )
                         .await;
+                    session
+                        .prune_terminal_delivery_if_durably_acknowledged(
+                            &update.terminal_identity,
+                        )
+                        .await;
                     if let Some((authority, require_app_server_ack)) = redelivery {
                         session.schedule_terminal_redelivery(authority, require_app_server_ack);
                     }
                     return;
                 }
-                let Some(delay) =
-                    retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
-                else {
-                    warn!(turn_id = %turn_context.sub_id, "terminal receipt persistence retry budget exhausted");
-                    return;
-                };
-                tokio::time::sleep(delay).await;
+                match retry
+                    .wait_for_next_attempt(&session.shutting_down, TerminalRepairFailure::Transient)
+                    .await
+                {
+                    TerminalRepairContinuation::Retry => {}
+                    TerminalRepairContinuation::ShuttingDown => return,
+                    TerminalRepairContinuation::Exhausted => {
+                        warn!(turn_id = %turn_context.sub_id, "terminal receipt persistence retry budget exhausted");
+                        return;
+                    }
+                }
             }
         });
     }
@@ -1882,12 +2149,17 @@ impl Session {
                 ) {
                     return;
                 }
-                let Some(delay) = retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
-                else {
-                    warn!(%reason, "completion invalidation persistence retry budget exhausted");
-                    return;
-                };
-                tokio::time::sleep(delay).await;
+                match retry
+                    .wait_for_next_attempt(&session.shutting_down, TerminalRepairFailure::Transient)
+                    .await
+                {
+                    TerminalRepairContinuation::Retry => {}
+                    TerminalRepairContinuation::ShuttingDown => return,
+                    TerminalRepairContinuation::Exhausted => {
+                        warn!(%reason, "completion invalidation persistence retry budget exhausted");
+                        return;
+                    }
+                }
             }
         });
     }
@@ -1915,12 +2187,17 @@ impl Session {
                 ) {
                     return;
                 }
-                let Some(delay) = retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
-                else {
-                    warn!("provisional completion-review supersession retry budget exhausted");
-                    return;
-                };
-                tokio::time::sleep(delay).await;
+                match retry
+                    .wait_for_next_attempt(&session.shutting_down, TerminalRepairFailure::Transient)
+                    .await
+                {
+                    TerminalRepairContinuation::Retry => {}
+                    TerminalRepairContinuation::ShuttingDown => return,
+                    TerminalRepairContinuation::Exhausted => {
+                        warn!("provisional completion-review supersession retry budget exhausted");
+                        return;
+                    }
+                }
             }
         });
     }
@@ -1985,13 +2262,17 @@ impl Session {
                         .await;
                     return;
                 }
-                let Some(delay) =
-                    retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
-                else {
-                    warn!(turn_id = %candidate.turn_id, "terminal claim retry budget exhausted; retaining the active turn because no durable candidate exists");
-                    return;
-                };
-                tokio::time::sleep(delay).await;
+                match retry
+                    .wait_for_next_attempt(&session.shutting_down, TerminalRepairFailure::Transient)
+                    .await
+                {
+                    TerminalRepairContinuation::Retry => {}
+                    TerminalRepairContinuation::ShuttingDown => return,
+                    TerminalRepairContinuation::Exhausted => {
+                        warn!(turn_id = %candidate.turn_id, "terminal claim retry budget exhausted; retaining the active turn because no durable candidate exists");
+                        return;
+                    }
+                }
             }
         });
     }
@@ -2001,10 +2282,14 @@ impl Session {
         authority: AuthoritativeTerminalEventV1,
         require_app_server_ack: bool,
     ) {
+        if !authority.is_self_consistent() {
+            warn!(turn_id = %authority.turn_id, "refusing terminal redelivery without exact tool closure");
+            return;
+        }
         let session = Arc::clone(self);
         self.terminal_tasks.spawn(async move {
             {
-                let mut registry = session.terminal_delivery_registry.lock().await;
+                let mut registry = session.terminal_delivery_cache.lock().await;
                 let Some(entry) = registry.by_identity.get_mut(&authority.terminal_identity) else {
                     return;
                 };
@@ -2044,7 +2329,7 @@ impl Session {
                             pending_update = Some(TerminalInteractionUpdate {
                                 terminal_identity: authority.terminal_identity.clone(),
                                 delivery_state: DurableDeliveryState::Delivered,
-                                app_server_acknowledged: false,
+                                app_server_acknowledged: !require_app_server_ack,
                                 runtime_status_converged: true,
                                 rollout_mirrored: false,
                                 parent_notification_completed: false,
@@ -2087,22 +2372,43 @@ impl Session {
                         pending_update = None;
                     }
                 }
-                let Some(delay) =
-                    retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
-                else {
-                    retry_budget_exhausted = true;
-                    break;
-                };
-                tokio::time::sleep(delay).await;
+                match retry
+                    .wait_for_next_attempt(&session.shutting_down, TerminalRepairFailure::Transient)
+                    .await
+                {
+                    TerminalRepairContinuation::Retry => {}
+                    TerminalRepairContinuation::ShuttingDown => break,
+                    TerminalRepairContinuation::Exhausted => {
+                        retry_budget_exhausted = true;
+                        break;
+                    }
+                }
             }
-            if let Some(entry) = session
-                .terminal_delivery_registry
-                .lock()
-                .await
-                .by_identity
-                .get_mut(&authority.terminal_identity)
             {
-                entry.redelivery_scheduled = false;
+                if let Some(entry) = session
+                    .terminal_delivery_cache
+                    .lock()
+                    .await
+                    .by_identity
+                    .get_mut(&authority.terminal_identity)
+                {
+                    entry.redelivery_scheduled = false;
+                }
+            }
+            if session
+                .services
+                .task_evidence
+                .acknowledged_terminal_fingerprint(&authority.terminal_identity)
+                .await
+                .as_deref()
+                == Some(authority.fingerprint.as_str())
+            {
+                session
+                    .prune_durably_acknowledged_terminal_delivery(
+                        &authority.terminal_identity,
+                        &authority.fingerprint,
+                    )
+                    .await;
             }
             if retry_budget_exhausted {
                 warn!(
@@ -2170,13 +2476,17 @@ impl Session {
                 if claim_matches && rollout_mirrored {
                     return;
                 }
-                let Some(delay) =
-                    retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
-                else {
-                    warn!(turn_id = %authority.turn_id, "terminal authority persistence retry budget exhausted");
-                    return;
-                };
-                tokio::time::sleep(delay).await;
+                match retry
+                    .wait_for_next_attempt(&session.shutting_down, TerminalRepairFailure::Transient)
+                    .await
+                {
+                    TerminalRepairContinuation::Retry => {}
+                    TerminalRepairContinuation::ShuttingDown => return,
+                    TerminalRepairContinuation::Exhausted => {
+                        warn!(turn_id = %authority.turn_id, "terminal authority persistence retry budget exhausted");
+                        return;
+                    }
+                }
             }
         });
     }
@@ -2241,16 +2551,20 @@ impl Session {
                         return;
                     }
                 }
-                let Some(delay) =
-                    retry.retry_delay_after_failure(TerminalRepairFailure::Transient)
-                else {
-                    warn!(
-                        turn_id = %turn_context.sub_id,
-                        "parent terminal notification retry budget exhausted; durable notification remains pending for restart"
-                    );
-                    return;
-                };
-                tokio::time::sleep(delay).await;
+                match retry
+                    .wait_for_next_attempt(&session.shutting_down, TerminalRepairFailure::Transient)
+                    .await
+                {
+                    TerminalRepairContinuation::Retry => {}
+                    TerminalRepairContinuation::ShuttingDown => return,
+                    TerminalRepairContinuation::Exhausted => {
+                        warn!(
+                            turn_id = %turn_context.sub_id,
+                            "parent terminal notification retry budget exhausted; durable notification remains pending for restart"
+                        );
+                        return;
+                    }
+                }
             }
         });
     }
@@ -2296,6 +2610,10 @@ impl Session {
         authority: AuthoritativeTerminalEventV1,
         require_app_server_ack: bool,
     ) {
+        if !authority.is_self_consistent() {
+            warn!(turn_id = %authority.turn_id, "refusing recovered terminal delivery without exact tool-closure attestation");
+            return;
+        }
         let turn_context = self
             .new_default_turn_with_sub_id(authority.turn_id.clone())
             .await;
@@ -2352,7 +2670,7 @@ impl Session {
             },
             // A non-app-server client accepts the live channel handoff directly; there is no
             // later protocol acknowledgement to wait for before restart recovery is complete.
-            app_server_acknowledged: !require_app_server_ack,
+            app_server_acknowledged: !require_app_server_ack && live_delivered,
             runtime_status_converged: true,
             rollout_mirrored,
             parent_notification_completed,
@@ -2376,6 +2694,8 @@ impl Session {
             .await;
         if updated {
             self.emit_terminalization_receipt(turn_context.as_ref(), &authority.terminal_identity)
+                .await;
+            self.prune_terminal_delivery_if_durably_acknowledged(&authority.terminal_identity)
                 .await;
             if let Some((authority, require_app_server_ack)) = redelivery {
                 self.schedule_terminal_redelivery(authority, require_app_server_ack);
@@ -2452,15 +2772,22 @@ impl Session {
             if repair_items.is_empty() && missing_outputs_repaired {
                 return true;
             }
-            let Some(delay) = retry.retry_delay_after_failure(failure) else {
-                return false;
-            };
-            tokio::time::sleep(delay).await;
+            match retry
+                .wait_for_next_attempt(&self.shutting_down, failure)
+                .await
+            {
+                TerminalRepairContinuation::Retry => {}
+                TerminalRepairContinuation::ShuttingDown
+                | TerminalRepairContinuation::Exhausted => return false,
+            }
         }
     }
 
-    pub(crate) async fn adopt_rollout_terminal_authority(&self, items: &[RolloutItem]) {
-        let Some(authority) = last_terminal_authority_from_rollout(self.thread_id, items) else {
+    pub(crate) async fn adopt_terminal_authority(
+        &self,
+        authority: Option<AuthoritativeTerminalEventV1>,
+    ) {
+        let Some(authority) = authority else {
             return;
         };
         if self
@@ -2519,6 +2846,7 @@ impl Session {
         let mut failure_reasons = Vec::new();
 
         self.services.command_execution.finish_turn(&turn_id).await;
+        self.services.code_mode_service.finish_turn(&turn_id);
         let inputs = completion_review::refresh_authoritative_review_inputs(self).await;
         failure_reasons.extend(inputs.partial_reasons.iter().cloned());
         if !inputs.typed_quiescent {
@@ -2545,17 +2873,14 @@ impl Session {
             )
             .await
             {
-                Some(FinalProofSealResultV1::Memoized { gate, .. })
+                Some(FinalProofSealResultV1::Sealed { gate, .. })
                     if gate.status == TaskCompletionStatus::Passed =>
                 {
                     completion_gate = Some(gate);
                 }
-                Some(FinalProofSealResultV1::Memoized { gate, .. }) => {
+                Some(FinalProofSealResultV1::Sealed { gate, .. }) => {
                     failure_reasons.extend(gate.reasons);
                 }
-                Some(FinalProofSealResultV1::Sealed { .. }) => failure_reasons.push(
-                    "restart recovery identities no longer match the sealed memo".to_string(),
-                ),
                 Some(FinalProofSealResultV1::PreflightFailed(gate)) => {
                     failure_reasons.extend(gate.reasons);
                 }
@@ -2666,6 +2991,12 @@ impl Session {
         let Some(fingerprint) = terminal_event_fingerprint(&event) else {
             return;
         };
+        let Some(tool_closure_attestation) =
+            TerminalToolClosureAttestationV1::from_terminal_event(&event)
+        else {
+            warn!(turn_id = %turn_context.sub_id, "refusing recovered terminal candidate without exact tool-closure attestation");
+            return;
+        };
         let terminal_identity = format!("{}:{}", self.thread_id, turn_context.sub_id);
         let candidate = AuthoritativeTerminalEventV1 {
             version: 1,
@@ -2679,6 +3010,7 @@ impl Session {
                 .task_evidence
                 .current_finalization_memo_identity()
                 .await,
+            tool_closure_attestation: Some(tool_closure_attestation),
             rollout_repair: TerminalRolloutRepairV1::default(),
         };
         let claim = self
@@ -2759,7 +3091,7 @@ impl Session {
             } else {
                 DurableDeliveryState::DeliveryFailed
             },
-            app_server_acknowledged: false,
+            app_server_acknowledged: !requires_app_server_ack && live_delivered,
             runtime_status_converged: true,
             rollout_mirrored,
             parent_notification_completed,
@@ -2777,6 +3109,8 @@ impl Session {
             .await;
         if updated {
             self.emit_terminalization_receipt(turn_context.as_ref(), &authority.terminal_identity)
+                .await;
+            self.prune_terminal_delivery_if_durably_acknowledged(&authority.terminal_identity)
                 .await;
             if let Some((authority, require_app_server_ack)) = redelivery {
                 self.schedule_terminal_redelivery(authority, require_app_server_ack);
@@ -2827,9 +3161,10 @@ impl Session {
         turn_tool_calls: u64,
         token_usage_at_turn_start: &TokenUsage,
     ) {
+        let memory_feature_enabled = turn_context.config.features.enabled(Feature::MemoryTool);
         let tmp_mem = (
             "tmp_mem_enabled",
-            if self.enabled(Feature::MemoryTool) {
+            if memory_feature_enabled {
                 "true"
             } else {
                 "false"
@@ -2923,10 +3258,48 @@ impl Session {
         }
         emit_turn_memory_metric(
             &self.services.session_telemetry,
-            turn_context.config.features.enabled(Feature::MemoryTool),
+            memory_feature_enabled,
             turn_context.config.memories.use_memories,
             turn_had_memory_citation,
         );
+    }
+
+    async fn emit_worker_join_failure_before_terminal(
+        &self,
+        finalization: &mut TerminalFinalization,
+        turn_context: &TurnContext,
+    ) {
+        if finalization.worker_failure_reported {
+            return;
+        }
+        let TurnTerminalOutcome::WorkerJoinFailed(failure) = &finalization.outcome else {
+            return;
+        };
+        let failure_kind = match failure {
+            WorkerJoinFailure::Cancelled => "cancelled",
+            WorkerJoinFailure::Panicked => "panicked",
+        };
+        let emission = finalization
+            .deadline
+            .run(
+                "preparation",
+                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                self.send_event(
+                    turn_context,
+                    EventMsg::Error(ErrorEvent {
+                        message: format!(
+                            "The turn worker {failure_kind} before terminal bookkeeping completed."
+                        ),
+                        codex_error_info: Some(CodexErrorInfo::InternalServerError),
+                    }),
+                ),
+            )
+            .await;
+        if emission.is_err() {
+            warn!(turn_id = %turn_context.sub_id, "timed out emitting worker failure before terminal dispatch");
+        } else {
+            finalization.worker_failure_reported = true;
+        }
     }
 
     async fn finalize_turn_terminal(self: &Arc<Self>, finalization: &mut TerminalFinalization) {
@@ -2952,22 +3325,31 @@ impl Session {
             finalization.task.cancellation_token.cancel();
         }
 
+        quiesce_turn_auxiliary_tasks(&mut finalization.task).await;
+
         self.services
             .command_execution
             .finish_turn(&turn_context.sub_id)
             .await;
         if requires_abort_cleanup {
-            tokio::select! {
-                _ = finalization.task.done.notified() => {},
-                _ = tokio::time::sleep(GRACEFUL_INTERRUPTION_TIMEOUT) => {
-                    warn!(
-                        "task {} didn't complete gracefully after {}ms",
-                        turn_context.sub_id,
-                        GRACEFUL_INTERRUPTION_TIMEOUT.as_millis()
-                    );
-                }
+            if tokio::time::timeout(
+                GRACEFUL_INTERRUPTION_TIMEOUT,
+                wait_for_worker_done(&finalization.task),
+            )
+            .await
+            .is_err()
+            {
+                warn!(
+                    "task {} didn't complete gracefully after {}ms",
+                    turn_context.sub_id,
+                    GRACEFUL_INTERRUPTION_TIMEOUT.as_millis()
+                );
+                finalization.task.worker_abort_handle.abort();
             }
-            finalization.task.worker_abort_handle.abort();
+            // A terminal snapshot must not race the drop of an accepted but
+            // unpolled tool future. The level-triggered latch remains valid if
+            // a prior finalizer already observed the worker exit.
+            wait_for_worker_done(&finalization.task).await;
 
             let session_task = Arc::clone(&finalization.task.task);
             if finalization
@@ -2983,6 +3365,9 @@ impl Session {
                 warn!(turn_id = %turn_context.sub_id, "timed out running task-specific abort cleanup");
             }
         }
+        self.services
+            .code_mode_service
+            .finish_turn(&turn_context.sub_id);
 
         let missing_call_output_repair_failure = match finalization
             .deadline
@@ -3019,6 +3404,8 @@ impl Session {
         turn_context.turn_timing_state.begin_finalization();
 
         let abort_reason = finalization.outcome.abort_reason();
+        self.emit_worker_join_failure_before_terminal(finalization, turn_context.as_ref())
+            .await;
         let mut interrupted_marker_repair = Vec::new();
         if abort_reason == Some(TurnAbortReason::Interrupted)
             && let Some(marker) = interrupted_turn_history_marker(
@@ -3052,19 +3439,30 @@ impl Session {
             }
         }
 
-        let (mut last_agent_message, surfaced_result) = match &finalization.outcome {
-            TurnTerminalOutcome::Completed { result } => (
-                result.last_agent_message.clone(),
-                result.surfaced_result.clone(),
-            ),
-            TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => (None, None),
-            TurnTerminalOutcome::ReturnedError(err) => {
-                warn!(%err, "session task returned an unexpected error");
-                (None, None)
-            }
-            TurnTerminalOutcome::Aborted(_) => (None, None),
-            TurnTerminalOutcome::WorkerJoinFailed(_) => (None, None),
-        };
+        let (mut last_agent_message, surfaced_result, required_tool_terminal, defer_pending_input) =
+            match &finalization.outcome {
+                TurnTerminalOutcome::Completed { result } => (
+                    result.last_agent_message.clone(),
+                    result.surfaced_result.clone(),
+                    result.required_tool_terminal.clone(),
+                    result.defer_pending_input,
+                ),
+                TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => {
+                    (None, None, None, false)
+                }
+                TurnTerminalOutcome::ReturnedError(err) => {
+                    warn!(%err, "session task returned an unexpected error");
+                    (None, None, None, false)
+                }
+                TurnTerminalOutcome::Aborted(_) => (None, None, None, false),
+                TurnTerminalOutcome::WorkerJoinFailed(_) => (None, None, None, false),
+            };
+        let completion_scope = completion_review::CompletionScope::terminal(
+            turn_context.as_ref(),
+            self.services.task_evidence.allows_kd4_completion(),
+            abort_reason.is_some(),
+            required_tool_terminal.is_some(),
+        );
 
         let pending_input_result = finalization
             .deadline
@@ -3078,39 +3476,20 @@ impl Session {
                         self.input_queue
                             .clear_pending_for_turn_state(finalization.turn_state.as_ref())
                             .await;
+                        false
                     } else {
                         let pending_input = self
                             .input_queue
                             .take_pending_input_for_turn_state(finalization.turn_state.as_ref())
                             .await;
-                        for pending_input_item in pending_input {
-                            let hook_outcome =
-                                inspect_pending_input(self, &turn_context, &pending_input_item)
-                                    .await;
-                            if hook_outcome.should_stop {
-                                crate::hook_runtime::emit_hook_stop_reason(
-                                    self,
-                                    &turn_context,
-                                    "UserPromptSubmit",
-                                    hook_outcome.stop_reason.as_deref(),
-                                )
-                                .await;
-                                record_additional_contexts(
-                                    self,
-                                    &turn_context,
-                                    hook_outcome.additional_contexts,
-                                )
-                                .await;
-                            } else {
-                                record_pending_input(
-                                    self,
-                                    &turn_context,
-                                    pending_input_item,
-                                    hook_outcome.additional_contexts,
-                                )
-                                .await;
-                            }
-                        }
+                        let restart_for_pending_input = !pending_input.is_empty();
+                        // Input accepted after the final sampling boundary belongs to a
+                        // fresh turn. Recording it in the closing turn would make it
+                        // durable without ever letting the model sample it.
+                        self.input_queue
+                            .restore_transferred_startup_input(pending_input)
+                            .await;
+                        restart_for_pending_input
                     }
                 },
             )
@@ -3118,6 +3497,7 @@ impl Session {
         if pending_input_result.is_err() {
             warn!(turn_id = %turn_context.sub_id, "pending-input terminal hooks did not quiesce before the deadline");
         }
+        let restart_for_pending_input = pending_input_result.unwrap_or(false);
 
         let interrupt_hook_result = if abort_reason == Some(TurnAbortReason::Interrupted) {
             finalization
@@ -3203,11 +3583,7 @@ impl Session {
         }
         let mut atomically_persisted_completion = None;
         let mut terminal_authoritative_inputs = None;
-        if abort_reason.is_none()
-            && turn_context
-                .config
-                .features
-                .enabled(Feature::TaskCompletionReviewer)
+        if completion_scope.terminal_review_gate_in_scope()
             && completion_review_partial_reasons.is_empty()
         {
             let completion_review_result = finalization
@@ -3448,32 +3824,42 @@ impl Session {
         }
         let completion_was_review_finalized = atomically_persisted_completion.is_some();
         let mut completion = if abort_reason.is_none() {
-            match atomically_persisted_completion {
-                Some(gate) => Some(gate),
-                None => match finalization
-                    .deadline
-                    .run(
-                        "gate",
-                        TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                        self.services.task_evidence.completion_gate(),
-                    )
-                    .await
-                {
-                    Ok(gate) => gate,
-                    Err(_) => {
-                        completion_review_partial_reasons
-                            .push("timed out loading persisted completion evidence".to_string());
-                        None
-                    }
-                },
+            if let Some(required_tool_terminal) = required_tool_terminal.as_ref() {
+                Some(TaskCompletionGate {
+                    status: if required_tool_terminal.is_blocked() {
+                        TaskCompletionStatus::Blocked
+                    } else {
+                        TaskCompletionStatus::Partial
+                    },
+                    reasons: vec![required_tool_terminal.message.clone()],
+                    evidence_path: None,
+                })
+            } else {
+                match atomically_persisted_completion {
+                    Some(gate) => Some(gate),
+                    None => match finalization
+                        .deadline
+                        .run(
+                            "gate",
+                            TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
+                            self.services.task_evidence.completion_gate(),
+                        )
+                        .await
+                    {
+                        Ok(gate) => gate,
+                        Err(_) => {
+                            completion_review_partial_reasons.push(
+                                "timed out loading persisted completion evidence".to_string(),
+                            );
+                            None
+                        }
+                    },
+                }
             }
         } else {
             None
         };
-        if abort_reason.is_none()
-            && !turn_context.session_source.is_non_root_agent()
-            && !completion_was_review_finalized
-        {
+        if completion_scope.typed_quiescence_in_scope() && !completion_was_review_finalized {
             let coordinator = self.services.agent_control.task_coordinator();
             let quiescence_result = finalization
                 .deadline
@@ -3549,7 +3935,9 @@ impl Session {
             if let Some(reason) = quiescence_reason {
                 match completion.as_mut() {
                     Some(gate) => {
-                        gate.status = TaskCompletionStatus::Blocked;
+                        if required_tool_terminal.is_none() {
+                            gate.status = TaskCompletionStatus::Blocked;
+                        }
                         gate.reasons.push(reason);
                     }
                     None => {
@@ -3562,10 +3950,7 @@ impl Session {
                 }
             }
         }
-        if abort_reason.is_none()
-            && !turn_context.session_source.is_non_root_agent()
-            && self.services.task_evidence.allows_kd4_completion()
-        {
+        if completion_scope.final_proof_in_scope() {
             let mut final_proof_child_gate_state = completion_review_partial_reasons.clone();
             if let Some(gate) = completion
                 .as_ref()
@@ -3594,13 +3979,6 @@ impl Session {
                 .await;
             match sealed {
                 Ok(Some(result)) => {
-                    let freshness_diagnostics = self.services.task_evidence.freshness_diagnostics();
-                    let proof_reuse_count =
-                        u32::try_from(freshness_diagnostics.strong_hashes_reused)
-                            .unwrap_or(u32::MAX);
-                    let conservative_rerun_count =
-                        u32::try_from(freshness_diagnostics.conservative_reruns)
-                            .unwrap_or(u32::MAX);
                     let mut gate = match result {
                         FinalProofSealResultV1::Sealed {
                             checkpoint,
@@ -3614,26 +3992,7 @@ impl Session {
                                 telemetry.validation_process_ns,
                                 telemetry.validation_aggregate_ns,
                                 1,
-                                proof_reuse_count,
-                                conservative_rerun_count,
                                 0,
-                            );
-                            gate
-                        }
-                        FinalProofSealResultV1::Memoized {
-                            gate,
-                            checkpoint_tokens,
-                            telemetry,
-                        } => {
-                            turn_context.turn_timing_state.record_final_proof_telemetry(
-                                checkpoint_tokens,
-                                telemetry.validation_launch_count,
-                                telemetry.validation_process_ns,
-                                telemetry.validation_aggregate_ns,
-                                1,
-                                proof_reuse_count,
-                                conservative_rerun_count,
-                                1,
                             );
                             gate
                         }
@@ -3763,22 +4122,12 @@ impl Session {
         if abort_reason.is_none() {
             merge_completion_review_partial(&mut completion, completion_review_partial_reasons);
         }
-        let worker_join_failure_kind =
-            if let TurnTerminalOutcome::WorkerJoinFailed(failure) = &finalization.outcome {
-                Some(match failure {
-                    WorkerJoinFailure::Cancelled => "cancelled",
-                    WorkerJoinFailure::Panicked => "panicked",
-                })
-            } else {
-                None
-            };
-
         let pre_terminal_flush_failure = match finalization
             .deadline
             .run(
                 "durable_commit",
                 TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                self.flush_rollout(),
+                self.flush_rollout_after_ordered_commits(turn_context.as_ref()),
             )
             .await
         {
@@ -3789,12 +4138,29 @@ impl Session {
             Err(_) => Some("rollout flush timed out before terminal dispatch".to_string()),
         };
         if let Some(reason) = pre_terminal_flush_failure {
+            turn_context
+                .turn_timing_state
+                .record_tool_result_persistence_barrier_failed();
             warn!(turn_id = %turn_context.sub_id, %reason);
             if abort_reason.is_none() && completion.is_some() {
                 merge_completion_review_partial(&mut completion, vec![reason]);
             }
         }
 
+        let repaired_tool_timings = turn_context
+            .turn_timing_state
+            .repair_terminal_tool_timing_after_durable_projection();
+        if repaired_tool_timings > 0 {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                repaired_tool_timings,
+                "repaired terminal tool timing pairs from durable output projections"
+            );
+        }
+
+        let tool_closure =
+            wait_for_terminal_tool_closure(&finalization.deadline, turn_context.as_ref()).await;
+        let tool_closure_complete = tool_closure.complete;
         let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
         if let Some(duration) = timing_snapshot.inclusive_duration() {
             turn_context
@@ -3809,8 +4175,7 @@ impl Session {
                 profile: timing_snapshot.legacy_profile.clone(),
                 timing: Some(timing.clone()),
             });
-        if abort_reason.is_none()
-            && !turn_context.session_source.is_non_root_agent()
+        if completion_scope.passed_root_completion_in_scope()
             && completion_was_review_finalized
             && completion
                 .as_ref()
@@ -3887,8 +4252,7 @@ impl Session {
             )
             .await
             .unwrap_or(None);
-        let mut passed_root_completion = abort_reason.is_none()
-            && !turn_context.session_source.is_non_root_agent()
+        let mut passed_root_completion = completion_scope.passed_root_completion_in_scope()
             && completion
                 .as_ref()
                 .is_some_and(|gate| gate.status == TaskCompletionStatus::Passed);
@@ -3954,6 +4318,7 @@ impl Session {
                     durable_outcome,
                     durable_success_established: passed_root_completion,
                     rollout_structure_ready,
+                    tool_closure_complete,
                     rollout_repair_items: interrupted_marker_repair,
                 },
             )
@@ -3972,7 +4337,12 @@ impl Session {
             )
             .await;
         }
-        if cleared_active_turn && abort_reason == Some(TurnAbortReason::Interrupted) {
+        if cleared_active_turn
+            && (abort_reason == Some(TurnAbortReason::Interrupted)
+                || required_tool_terminal.is_some()
+                || defer_pending_input
+                || restart_for_pending_input)
+        {
             self.maybe_start_turn_for_pending_work().await;
         }
 
@@ -4027,24 +4397,6 @@ impl Session {
             .is_err()
         {
             warn!(turn_id = %turn_context.sub_id, "timed out emitting reasoning policy summary after terminal dispatch");
-        }
-        if let Some(failure_kind) = worker_join_failure_kind
-            && tokio::time::timeout(
-                TERMINAL_MUTATION_FINALIZATION_TIMEOUT,
-                self.send_event(
-                    turn_context.as_ref(),
-                    EventMsg::Error(ErrorEvent {
-                        message: format!(
-                            "The turn worker {failure_kind} before terminal bookkeeping completed."
-                        ),
-                        codex_error_info: Some(CodexErrorInfo::InternalServerError),
-                    }),
-                ),
-            )
-            .await
-            .is_err()
-        {
-            warn!(turn_id = %turn_context.sub_id, "timed out emitting worker failure after terminal dispatch");
         }
         if passed_root_completion {
             let _ = tokio::time::timeout(
@@ -4151,7 +4503,10 @@ impl Session {
         self.terminal_tasks.spawn(task);
     }
 
-    pub(crate) fn begin_shutdown(&self) {
+    pub(crate) async fn begin_shutdown(&self) {
+        let Ok(_task_start_permit) = self.task_start_gate.acquire().await else {
+            unreachable!("session-owned task-start semaphore is never closed");
+        };
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -4186,6 +4541,10 @@ impl Session {
         finalization.mutation_quiescent = true;
         finalization.task.cancellation_token.cancel();
         finalization.task.worker_abort_handle.abort();
+        wait_for_worker_done(&finalization.task).await;
+        self.services
+            .code_mode_service
+            .finish_turn(&turn_context.sub_id);
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
@@ -4203,6 +4562,8 @@ impl Session {
         );
 
         let abort_reason = finalization.outcome.abort_reason();
+        self.emit_worker_join_failure_before_terminal(finalization, turn_context.as_ref())
+            .await;
         let mut interrupted_marker_repair = Vec::new();
         if abort_reason == Some(TurnAbortReason::Interrupted)
             && let Some(marker) = interrupted_turn_history_marker(
@@ -4228,6 +4589,18 @@ impl Session {
         {
             interrupted_marker_repair.push(marker);
         }
+        let repaired_tool_timings = turn_context
+            .turn_timing_state
+            .repair_terminal_tool_timing_after_durable_projection();
+        if repaired_tool_timings > 0 {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                repaired_tool_timings,
+                "repaired terminal tool timing pairs from durable output projections"
+            );
+        }
+        let tool_closure =
+            wait_for_terminal_tool_closure(&finalization.deadline, turn_context.as_ref()).await;
         let rollout_structure_ready = terminal_rollout_structure_ready(
             missing_call_output_repair_succeeded,
             interrupted_marker_repair.is_empty(),
@@ -4292,6 +4665,7 @@ impl Session {
                         durable_outcome: "fail_safe".to_string(),
                         durable_success_established: false,
                         rollout_structure_ready,
+                        tool_closure_complete: tool_closure.complete,
                         rollout_repair_items: interrupted_marker_repair,
                     },
                 )
@@ -4498,55 +4872,28 @@ fn semantic_terminal_outcome(event: &EventMsg) -> String {
     }
 }
 
-fn last_terminal_authority_from_rollout(
+pub(crate) fn terminal_authority_from_event(
     thread_id: ThreadId,
-    items: &[RolloutItem],
+    event: &EventMsg,
 ) -> Option<AuthoritativeTerminalEventV1> {
-    items.iter().rev().find_map(|item| {
-        let RolloutItem::EventMsg(event) = item else {
-            return None;
-        };
-        let turn_id = match event {
-            EventMsg::TurnComplete(event) => event.turn_id.clone(),
-            EventMsg::TurnAborted(event) => event.turn_id.clone()?,
-            _ => return None,
-        };
-        let fingerprint = terminal_event_fingerprint(event)?;
-        Some(AuthoritativeTerminalEventV1 {
-            version: 1,
-            terminal_identity: format!("{thread_id}:{turn_id}"),
-            turn_id,
-            event: event.clone(),
-            fingerprint,
-            semantic_outcome: semantic_terminal_outcome(event),
-            final_proof_identity: None,
-            rollout_repair: TerminalRolloutRepairV1::default(),
-        })
+    let turn_id = match event {
+        EventMsg::TurnComplete(event) => event.turn_id.clone(),
+        EventMsg::TurnAborted(event) => event.turn_id.clone()?,
+        _ => return None,
+    };
+    let fingerprint = terminal_event_fingerprint(event)?;
+    let tool_closure_attestation = TerminalToolClosureAttestationV1::from_terminal_event(event)?;
+    Some(AuthoritativeTerminalEventV1 {
+        version: 1,
+        terminal_identity: format!("{thread_id}:{turn_id}"),
+        turn_id,
+        event: event.clone(),
+        fingerprint,
+        semantic_outcome: semantic_terminal_outcome(event),
+        final_proof_identity: None,
+        tool_closure_attestation: Some(tool_closure_attestation),
+        rollout_repair: TerminalRolloutRepairV1::default(),
     })
-}
-
-pub(crate) fn open_turn_id_for_terminal_recovery(items: &[RolloutItem]) -> Option<String> {
-    let mut open_turn_id = None;
-    for item in items {
-        let RolloutItem::EventMsg(event) = item else {
-            continue;
-        };
-        match event {
-            EventMsg::TurnStarted(started) => open_turn_id = Some(started.turn_id.clone()),
-            EventMsg::TurnComplete(completed)
-                if open_turn_id.as_deref() == Some(completed.turn_id.as_str()) =>
-            {
-                open_turn_id = None;
-            }
-            EventMsg::TurnAborted(aborted)
-                if aborted.turn_id.as_deref() == open_turn_id.as_deref() =>
-            {
-                open_turn_id = None;
-            }
-            _ => {}
-        }
-    }
-    open_turn_id
 }
 
 #[cfg(test)]

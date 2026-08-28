@@ -842,7 +842,9 @@ fn sample_thread_start_response() -> ThreadStartResponse {
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
         },
+        permission_profile: None,
         active_permission_profile: None,
         reasoning_effort: None,
+        selected_environment: None,
     }
 }

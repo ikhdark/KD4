@@ -120,11 +120,13 @@ receipt after its assignment is terminal.
 
 Use [`templates/ORCHESTRATOR.md`](templates/ORCHESTRATOR.md) when multi-agent
 work is active. Give each agent a bounded task, durable identity, claim set, and
-evidence target. Name one owner for each complete behavioral contract and one
-owner for final validation; overlaps remain visible as risk metadata. Before
-root completion, linked assignments, validations, and gates must be terminal.
-Root completion rechecks sealed receipt evidence so later relevant drift remains
-a blocker; unrelated task roots only warn and do not join this barrier.
+evidence target. Every subagent stays within its assigned scope and does not
+broaden the task or make unrelated edits. Name one owner for each complete
+behavioral contract and one owner for final validation; overlaps remain visible
+as risk metadata. Before root completion, linked assignments, validations, and
+gates must be terminal. Root completion rechecks sealed receipt evidence so
+later relevant drift remains a blocker; unrelated task roots only warn and do
+not join this barrier.
 
 Investigation agents remain read-only, load root and nearest scoped
 instructions, inspect the smallest owner/caller/test/contract surface, separate
@@ -133,6 +135,37 @@ a stop condition. Implementation agents reinspect their focused diff before
 editing, preserve unrelated work, stop on competing ownership or unfinished
 dependencies, and report changed paths, validation, runtime wiring, and risk.
 Subagents do not mutate shared harness state or stage, commit, push, or publish.
+
+### Bounded Subagent Review
+
+When bounded subagent review is active:
+
+- Subagents are read-only. They never edit code, run fixers, or initiate
+  additional agents.
+- Run exactly one initial review pass. Each reviewer may report at most 25
+  findings from that pass.
+- The main agent independently verifies the findings and performs at most one
+  remediation batch.
+- After remediation, run exactly one verification pass with the same reviewers.
+- Limit the verification pass to determining whether each previously reported
+  finding is resolved and identifying regressions directly introduced by the
+  remediation hunks.
+- Reviewers do not reopen the original implementation, broaden scope, introduce
+  new design preferences, or perform another exhaustive review during
+  verification.
+- Allow a new verification-pass finding only when it is a concrete correctness
+  or safety regression caused by the remediation diff. It must cite the
+  responsible remediation hunk.
+- The main agent may fix verification-pass regressions locally but does not
+  start another review cycle.
+- After the verification reports return, all subagent work terminates regardless
+  of whether findings remain.
+- Report unresolved findings to the user; they do not trigger another agent pass
+  automatically.
+- The required verification assignment is the only permitted reviewer
+  follow-up. After it returns, do not resume, follow up with, or replace a
+  reviewer unless the user explicitly requests another review.
+- Both `no findings` and `findings remain` are terminal reviewer outcomes.
 
 ### Architect-Driven Implementation Lane
 

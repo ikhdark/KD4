@@ -1,7 +1,6 @@
 use crate::remote::RemotePluginServiceConfig;
-use codex_http_client::HttpError;
+use codex_http_client::RouteAwareRequestError;
 use codex_login::CodexAuth;
-use codex_login::default_client::create_client_without_request_logging;
 use codex_protocol::protocol::Product;
 use std::time::Duration;
 
@@ -16,7 +15,7 @@ pub enum RemotePluginFetchError {
     Request {
         url: String,
         #[source]
-        source: HttpError,
+        source: RouteAwareRequestError,
     },
 
     #[error("remote featured plugin request to {url} failed with status {status}: {body}")]
@@ -43,8 +42,8 @@ pub async fn fetch_remote_featured_plugin_ids(
         "{}/plugins/featured",
         config.chatgpt_base_url.trim_end_matches('/')
     );
-    let client = create_client_without_request_logging()?;
-    let mut request = client
+    let mut request = config
+        .http_clients()
         .get(&url)
         .query(&[(
             "platform",
@@ -74,4 +73,41 @@ pub async fn fetch_remote_featured_plugin_ids(
         url: url.clone(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
+    use codex_http_client::cache_system_proxy_route_for_test;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+
+    #[tokio::test]
+    async fn featured_plugin_fetch_uses_configured_proxy_route() {
+        let proxy = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"["plugin-a"]"#))
+            .mount(&proxy)
+            .await;
+        let base_url = "http://featured-plugins.test";
+        let request_url = format!(
+            "{base_url}/plugins/featured?platform={}",
+            Product::Codex.to_app_platform()
+        );
+        cache_system_proxy_route_for_test(&request_url, proxy.uri());
+        let config = RemotePluginServiceConfig::new(
+            base_url.to_string(),
+            HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+        );
+
+        let featured = fetch_remote_featured_plugin_ids(&config, None, None)
+            .await
+            .expect("featured plugins should use the configured proxy route");
+
+        assert_eq!(featured, vec!["plugin-a"]);
+    }
 }

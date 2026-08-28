@@ -23,6 +23,8 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::sync::RwLock;
 use tokio::sync::TryLockError;
+use tokio::sync::watch;
+use tokio::time::Instant;
 use tracing::Instrument as _;
 use tracing::error;
 use tracing::info;
@@ -111,8 +113,79 @@ type SharedModelsEndpointClient = Arc<dyn ModelsEndpointClient>;
 /// workspace switch cannot keep using the identity captured at construction.
 pub type ModelsCacheIdentity = Arc<dyn Fn() -> String + Send + Sync>;
 
+/// Shared demand signal and first-refresh gate for model catalog consumers.
+#[derive(Debug)]
+pub struct ModelCatalogActivity {
+    activated: watch::Sender<bool>,
+    initial_refresh_deadline: Mutex<Option<Instant>>,
+    initial_refresh_ready: watch::Sender<bool>,
+}
+
+impl ModelCatalogActivity {
+    fn new() -> Self {
+        Self {
+            activated: watch::channel(false).0,
+            initial_refresh_deadline: Mutex::new(None),
+            initial_refresh_ready: watch::channel(true).0,
+        }
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<bool> {
+        self.activated.subscribe()
+    }
+
+    pub fn arm_initial_refresh(&self, deadline: Instant) {
+        self.initial_refresh_ready.send_replace(false);
+        *self
+            .initial_refresh_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(deadline);
+    }
+
+    pub fn finish_initial_refresh(&self) {
+        *self
+            .initial_refresh_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.initial_refresh_ready.send_replace(true);
+    }
+
+    async fn note_activity(&self) {
+        self.activated.send_replace(true);
+        let should_wait = self
+            .initial_refresh_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if !should_wait {
+            return;
+        }
+        let mut ready = self.initial_refresh_ready.subscribe();
+        loop {
+            let initial_refresh_is_ready = *ready.borrow_and_update();
+            if initial_refresh_is_ready || ready.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn note_activity_without_waiting(&self) {
+        self.activated.send_replace(true);
+    }
+}
+
 /// Coordinates model discovery plus cached metadata on disk.
 pub trait ModelsManager: fmt::Debug + Send + Sync {
+    /// Return the shared demand signal used by background catalog refresh.
+    fn model_catalog_activity(&self) -> Arc<ModelCatalogActivity>;
+
+    /// Force the online refresh used by the periodic background worker without
+    /// recursively entering the consumer activity gate.
+    fn refresh_models_for_background(
+        &self,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, CoreResult<()>>;
+
     /// List all available models, refreshing according to the specified strategy.
     ///
     /// Returns model presets sorted by priority and filtered by auth mode and visibility.
@@ -319,6 +392,7 @@ pub struct OpenAiModelsManager {
     // `etag_refresh` across an await point.
     etag_refresh: Mutex<EtagRefreshState>,
     etag_refresh_idle: Notify,
+    model_catalog_activity: Arc<ModelCatalogActivity>,
 }
 
 #[derive(Debug)]
@@ -419,6 +493,7 @@ pub struct StaticModelsManager {
     remote_models: Vec<ModelInfo>,
     available_models: AvailableModelPresets,
     auth_manager: Option<Arc<AuthManager>>,
+    model_catalog_activity: Arc<ModelCatalogActivity>,
     #[cfg(test)]
     list_models_calls: std::sync::atomic::AtomicUsize,
 }
@@ -443,6 +518,7 @@ impl OpenAiModelsManager {
             auth_manager,
             etag_refresh: Mutex::new(EtagRefreshState::default()),
             etag_refresh_idle: Notify::new(),
+            model_catalog_activity: Arc::new(ModelCatalogActivity::new()),
         }
     }
 }
@@ -455,6 +531,7 @@ impl StaticModelsManager {
             remote_models: model_catalog.models,
             available_models,
             auth_manager,
+            model_catalog_activity: Arc::new(ModelCatalogActivity::new()),
             #[cfg(test)]
             list_models_calls: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -468,6 +545,20 @@ impl StaticModelsManager {
 }
 
 impl ModelsManager for OpenAiModelsManager {
+    fn model_catalog_activity(&self) -> Arc<ModelCatalogActivity> {
+        Arc::clone(&self.model_catalog_activity)
+    }
+
+    fn refresh_models_for_background(
+        &self,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, CoreResult<()>> {
+        Box::pin(async move {
+            self.refresh_available_models(RefreshStrategy::Online, &http_client_factory)
+                .await
+        })
+    }
+
     fn list_models(
         &self,
         refresh_strategy: RefreshStrategy,
@@ -487,6 +578,7 @@ impl ModelsManager for OpenAiModelsManager {
         http_client_factory: HttpClientFactory,
     ) -> ModelsManagerFuture<'_, CoreResult<Arc<Vec<ModelPreset>>>> {
         Box::pin(async move {
+            self.model_catalog_activity.note_activity().await;
             self.refresh_available_models(refresh_strategy, &http_client_factory)
                 .await?;
             self.ensure_current_cache_identity().await;
@@ -507,26 +599,29 @@ impl ModelsManager for OpenAiModelsManager {
         refresh_strategy: RefreshStrategy,
         http_client_factory: HttpClientFactory,
     ) -> ModelsManagerFuture<'_, CoreResult<ModelsResponse>> {
-        Box::pin(OpenAiModelsManager::raw_model_catalog(
-            self,
-            refresh_strategy,
-            http_client_factory,
-        ))
+        Box::pin(async move {
+            self.model_catalog_activity.note_activity().await;
+            OpenAiModelsManager::raw_model_catalog(self, refresh_strategy, http_client_factory)
+                .await
+        })
     }
 
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
         Box::pin(async move {
+            self.model_catalog_activity.note_activity().await;
             self.ensure_current_cache_identity().await;
             self.state.read().await.remote_models.clone()
         })
     }
 
     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
+        self.model_catalog_activity.note_activity_without_waiting();
         self.try_ensure_current_cache_identity()?;
         Ok(self.state.try_read()?.remote_models.clone())
     }
 
     fn try_list_models_shared(&self) -> Result<Arc<Vec<ModelPreset>>, TryLockError> {
+        self.model_catalog_activity.note_activity_without_waiting();
         self.try_ensure_current_cache_identity()?;
         let uses_codex_backend = self
             .auth_manager()
@@ -545,6 +640,7 @@ impl ModelsManager for OpenAiModelsManager {
     ) -> ModelsManagerFuture<'a, ModelInfo> {
         Box::pin(
             async move {
+                self.model_catalog_activity.note_activity().await;
                 self.ensure_current_cache_identity().await;
                 let state = self.state.read().await;
                 construct_model_info_from_candidates(model, &state.remote_models, config)
@@ -1044,12 +1140,24 @@ impl OpenAiModelsManager {
 }
 
 impl ModelsManager for StaticModelsManager {
+    fn model_catalog_activity(&self) -> Arc<ModelCatalogActivity> {
+        Arc::clone(&self.model_catalog_activity)
+    }
+
+    fn refresh_models_for_background(
+        &self,
+        _http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, CoreResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn list_models(
         &self,
         _refresh_strategy: RefreshStrategy,
         _http_client_factory: HttpClientFactory,
     ) -> ModelsManagerFuture<'_, CoreResult<Vec<ModelPreset>>> {
         Box::pin(async move {
+            self.model_catalog_activity.note_activity().await;
             #[cfg(test)]
             self.list_models_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1070,6 +1178,7 @@ impl ModelsManager for StaticModelsManager {
         _http_client_factory: HttpClientFactory,
     ) -> ModelsManagerFuture<'_, CoreResult<Arc<Vec<ModelPreset>>>> {
         Box::pin(async move {
+            self.model_catalog_activity.note_activity().await;
             let uses_codex_backend = self
                 .auth_manager()
                 .is_some_and(AuthManager::current_auth_uses_codex_backend);
@@ -1121,6 +1230,7 @@ impl ModelsManager for StaticModelsManager {
         _http_client_factory: HttpClientFactory,
     ) -> ModelsManagerFuture<'_, CoreResult<ModelsResponse>> {
         Box::pin(async move {
+            self.model_catalog_activity.note_activity().await;
             Ok(ModelsResponse {
                 models: self.get_remote_models().await,
             })
@@ -1128,14 +1238,19 @@ impl ModelsManager for StaticModelsManager {
     }
 
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
-        Box::pin(async { self.remote_models.clone() })
+        Box::pin(async {
+            self.model_catalog_activity.note_activity().await;
+            self.remote_models.clone()
+        })
     }
 
     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
+        self.model_catalog_activity.note_activity_without_waiting();
         Ok(self.remote_models.clone())
     }
 
     fn try_list_models_shared(&self) -> Result<Arc<Vec<ModelPreset>>, TryLockError> {
+        self.model_catalog_activity.note_activity_without_waiting();
         let uses_codex_backend = self
             .auth_manager()
             .is_some_and(AuthManager::current_auth_uses_codex_backend);
@@ -1148,8 +1263,11 @@ impl ModelsManager for StaticModelsManager {
         config: &'a ModelsManagerConfig,
     ) -> ModelsManagerFuture<'a, ModelInfo> {
         Box::pin(
-            async move { construct_model_info_from_candidates(model, &self.remote_models, config) }
-                .instrument(tracing::info_span!("get_model_info", model = model)),
+            async move {
+                self.model_catalog_activity.note_activity().await;
+                construct_model_info_from_candidates(model, &self.remote_models, config)
+            }
+            .instrument(tracing::info_span!("get_model_info", model = model)),
         )
     }
 
@@ -1264,7 +1382,7 @@ pub(crate) fn construct_model_info_from_candidates(
     // retry for namespaced slugs like `custom/gpt-5.3-codex`.
     let remote = find_model_by_longest_prefix(model, candidates)
         .or_else(|| find_model_by_namespaced_suffix(model, candidates));
-    let model_info = if let Some(remote) = remote {
+    let mut model_info = if let Some(remote) = remote {
         ModelInfo {
             slug: model.to_string(),
             used_fallback_model_metadata: false,
@@ -1273,6 +1391,7 @@ pub(crate) fn construct_model_info_from_candidates(
     } else {
         model_info::model_info_from_slug(model)
     };
+    model_info::apply_local_personality_messages(&mut model_info, model);
     model_info::with_config_overrides(model_info, config)
 }
 

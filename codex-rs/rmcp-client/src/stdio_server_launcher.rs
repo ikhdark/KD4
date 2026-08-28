@@ -34,6 +34,9 @@ use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::ManagedRootProcess;
+use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
+use codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT;
+use codex_utils_pty::run_windows_process_operation;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -45,6 +48,7 @@ use rmcp::transport::child_process::TokioChildProcess;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tracing::info;
 use tracing::warn;
 
@@ -203,6 +207,7 @@ struct StdioServerProcessHandleInner {
     program_name: String,
     kind: StdioServerProcessKind,
     terminated: AtomicBool,
+    termination_gate: Arc<Semaphore>,
 }
 
 enum StdioServerProcessKind {
@@ -242,18 +247,23 @@ impl LocalStdioServerLauncher {
             .current_dir(cwd)
             .env_clear()
             .envs(envs)
-            .args(args);
+            .args(args)
+            .creation_flags(WINDOWS_CREATE_SUSPENDED);
 
         let managed = Arc::new(ManagedRootProcess::reserve_with_reclaim().await?);
 
-        let (transport, stderr) = TokioChildProcess::builder(command)
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let (transport, stderr) =
+            run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
+                TokioChildProcess::builder(command)
+                    .stderr(Stdio::piped())
+                    .spawn()
+            })
+            .await?;
         let process_id = transport
             .id()
             .ok_or_else(|| io::Error::other("spawned MCP server has no process id"))?;
 
-        managed.attach(process_id)?;
+        managed.attach_and_resume(process_id)?;
         let process = StdioServerProcessHandle::local(
             program_name.clone(),
             Some(LocalProcessTerminator::new(process_id, managed)),
@@ -294,16 +304,17 @@ impl LocalProcessTerminator {
         }
     }
 
-    fn terminate(&self) {
-        let Some(managed) = self.take_managed() else {
-            return;
+    fn terminate(&self) -> io::Result<()> {
+        let mut managed = self
+            .managed
+            .lock()
+            .map_err(|_| io::Error::other("failed to lock MCP process terminator"))?;
+        let Some(root) = managed.as_ref() else {
+            return Ok(());
         };
-        if let Err(error) = managed.terminate() {
-            warn!(
-                "Failed to terminate Windows MCP process tree lifecycle_id={}: {error}",
-                managed.id()
-            );
-        }
+        root.terminate()?;
+        managed.take();
+        Ok(())
     }
 
     fn reaped(&self) {
@@ -322,6 +333,7 @@ impl StdioServerProcessHandle {
                 program_name,
                 kind: StdioServerProcessKind::Local(terminator),
                 terminated: AtomicBool::new(false),
+                termination_gate: Arc::new(Semaphore::new(1)),
             }),
         }
     }
@@ -332,29 +344,40 @@ impl StdioServerProcessHandle {
                 program_name,
                 kind: StdioServerProcessKind::Executor(process),
                 terminated: AtomicBool::new(false),
+                termination_gate: Arc::new(Semaphore::new(1)),
             }),
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn unconfirmed_for_test() -> Self {
+        Self::local("test-server".to_string(), None)
+    }
+
     pub(crate) async fn terminate(&self) -> io::Result<()> {
-        if self.inner.terminated.swap(true, Ordering::AcqRel) {
+        let _termination_permit = Arc::clone(&self.inner.termination_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::other("MCP process termination gate was closed"))?;
+        if self.inner.terminated.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        match &self.inner.kind {
-            StdioServerProcessKind::Local(Some(terminator)) => {
-                terminator.terminate();
-                Ok(())
-            }
+        let result = match &self.inner.kind {
+            StdioServerProcessKind::Local(Some(terminator)) => terminator.terminate(),
             StdioServerProcessKind::Local(None) => Ok(()),
-            StdioServerProcessKind::Executor(process) => match process.terminate().await {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    self.inner.terminated.store(false, Ordering::Release);
-                    Err(io::Error::other(error))
-                }
-            },
+            StdioServerProcessKind::Executor(process) => {
+                process.terminate().await.map_err(io::Error::other)
+            }
+        };
+        if result.is_ok() {
+            self.inner.terminated.store(true, Ordering::Release);
         }
+        result
+    }
+
+    pub(crate) fn termination_confirmed(&self) -> bool {
+        self.inner.terminated.load(Ordering::Acquire)
     }
 
     pub(crate) fn reaped(&self) {
@@ -373,7 +396,12 @@ impl Drop for StdioServerProcessHandleInner {
 
         match &self.kind {
             StdioServerProcessKind::Local(Some(terminator)) => {
-                terminator.terminate();
+                if let Err(error) = terminator.terminate() {
+                    warn!(
+                        "Failed to terminate local MCP server process on drop ({}): {error}",
+                        self.program_name
+                    );
+                }
             }
             StdioServerProcessKind::Local(None) => {}
             StdioServerProcessKind::Executor(process) => {
@@ -556,9 +584,110 @@ impl ExecutorStdioServerLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_exec_server::ExecProcessEventReceiver;
+    use codex_exec_server::ExecProcessFuture;
+    use codex_exec_server::ExecServerError;
+    use codex_exec_server::ProcessId;
+    use codex_exec_server::ProcessSignal;
+    use codex_exec_server::ReadResponse;
+    use codex_exec_server::WriteResponse;
     use codex_protocol::config_types::EnvironmentVariablePattern;
     use codex_protocol::config_types::ShellEnvironmentPolicy;
     use codex_protocol::shell_environment;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
+    use tokio::sync::watch;
+
+    struct BlockingExecProcess {
+        process_id: ProcessId,
+        terminate_calls: AtomicUsize,
+        terminate_started: Notify,
+        terminate_allowed: watch::Sender<bool>,
+        wake_tx: watch::Sender<u64>,
+    }
+
+    impl BlockingExecProcess {
+        fn new() -> Self {
+            let (terminate_allowed, _terminate_allowed_rx) = watch::channel(false);
+            let (wake_tx, _wake_rx) = watch::channel(0);
+            Self {
+                process_id: ProcessId::from("cancelled-mcp-termination"),
+                terminate_calls: AtomicUsize::new(0),
+                terminate_started: Notify::new(),
+                terminate_allowed,
+                wake_tx,
+            }
+        }
+
+        async fn terminate(&self) -> Result<(), ExecServerError> {
+            self.terminate_calls.fetch_add(1, Ordering::AcqRel);
+            let mut allowed = self.terminate_allowed.subscribe();
+            self.terminate_started.notify_one();
+            allowed
+                .wait_for(|allowed| *allowed)
+                .await
+                .map_err(|_| ExecServerError::Protocol("termination control closed".to_string()))?;
+            Ok(())
+        }
+    }
+
+    impl ExecProcess for BlockingExecProcess {
+        fn process_id(&self) -> &ProcessId {
+            &self.process_id
+        }
+
+        fn subscribe_wake(&self) -> watch::Receiver<u64> {
+            self.wake_tx.subscribe()
+        }
+
+        fn subscribe_events(&self) -> ExecProcessEventReceiver {
+            ExecProcessEventReceiver::empty()
+        }
+
+        fn read(
+            &self,
+            _after_seq: Option<u64>,
+            _max_bytes: Option<usize>,
+            _wait_ms: Option<u64>,
+        ) -> ExecProcessFuture<'_, ReadResponse> {
+            Box::pin(std::future::pending())
+        }
+
+        fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
+            Box::pin(std::future::pending())
+        }
+
+        fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
+            Box::pin(std::future::pending())
+        }
+
+        fn terminate(&self) -> ExecProcessFuture<'_, ()> {
+            Box::pin(BlockingExecProcess::terminate(self))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_executor_termination_remains_retryable() {
+        let process = Arc::new(BlockingExecProcess::new());
+        let process_trait: Arc<dyn ExecProcess> = process.clone();
+        let handle =
+            StdioServerProcessHandle::executor("blocking-test-server".to_string(), process_trait);
+        let first_handle = handle.clone();
+        let first_termination = tokio::spawn(async move { first_handle.terminate().await });
+
+        process.terminate_started.notified().await;
+        first_termination.abort();
+        let _ = first_termination.await;
+        assert!(!handle.termination_confirmed());
+
+        process.terminate_allowed.send_replace(true);
+        handle
+            .terminate()
+            .await
+            .expect("termination should be retried after cancellation");
+        assert!(handle.termination_confirmed());
+        assert_eq!(process.terminate_calls.load(Ordering::Acquire), 2);
+    }
 
     #[test]
     fn remote_env_policy_uses_core_env_without_remote_source_vars() {

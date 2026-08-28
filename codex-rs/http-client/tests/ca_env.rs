@@ -39,6 +39,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 const CODEX_CA_CERT_ENV: &str = "CODEX_CA_CERTIFICATE";
+const PROBE_EXCLUSIVE_CA_ENV: &str = "CODEX_CUSTOM_CA_PROBE_EXCLUSIVE_CA";
 const PROBE_PROXY_ENV: &str = "CODEX_CUSTOM_CA_PROBE_PROXY";
 const PROBE_TLS13_ENV: &str = "CODEX_CUSTOM_CA_PROBE_TLS13";
 const PROBE_URL_ENV: &str = "CODEX_CUSTOM_CA_PROBE_URL";
@@ -94,6 +95,7 @@ fn probe_command() -> Command {
     // `Command` inherits the parent environment by default, so scrub CA-related variables first or
     // these tests can accidentally pass/fail based on the developer shell or CI runner.
     cmd.env_remove(CODEX_CA_CERT_ENV);
+    cmd.env_remove(PROBE_EXCLUSIVE_CA_ENV);
     cmd.env_remove(PROBE_PROXY_ENV);
     cmd.env_remove(PROBE_TLS13_ENV);
     cmd.env_remove(PROBE_URL_ENV);
@@ -118,6 +120,20 @@ fn run_probe_posting_to_tls13_server(envs: &[(&str, &Path)], url: &str) -> std::
         cmd.env(key, value);
     }
     cmd.env(PROBE_TLS13_ENV, "1");
+    cmd.env(PROBE_URL_ENV, url);
+    cmd.output().expect("custom_ca_probe should run")
+}
+
+fn run_probe_posting_with_exclusive_roots(
+    envs: &[(&str, &Path)],
+    explicit_ca_path: &Path,
+    url: &str,
+) -> std::process::Output {
+    let mut cmd = probe_command();
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.env(PROBE_EXCLUSIVE_CA_ENV, explicit_ca_path);
     cmd.env(PROBE_URL_ENV, url);
     cmd.output().expect("custom_ca_probe should run")
 }
@@ -452,6 +468,33 @@ fn posts_to_tls13_server_using_custom_ca_bundle() {
         .expect("TLS test server should report a request")
         .expect("TLS test server should accept the probe request");
     assert_token_exchange_request(&request);
+}
+
+#[test]
+fn exclusive_tls_roots_do_not_trust_process_custom_ca_bundle() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let server = spawn_tls13_test_server();
+    let process_ca_path = write_cert_file(&temp_dir, "process-ca.pem", &server.ca_cert_pem);
+    let explicit_ca_path = write_cert_file(&temp_dir, "explicit-ca.pem", TEST_CERT_1);
+
+    let output = run_probe_posting_with_exclusive_roots(
+        &[(CODEX_CA_CERT_ENV, process_ca_path.as_path())],
+        &explicit_ca_path,
+        &server.url,
+    );
+    let server_result = server.request_rx.recv_timeout(Duration::from_secs(5));
+
+    assert!(
+        !output.status.success(),
+        "exclusive roots unexpectedly trusted the process CA\nstdout:\n{}\nstderr:\n{}\nserver:\n{server_result:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("probe request failed"),
+        "unexpected probe failure:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

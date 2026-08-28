@@ -268,7 +268,7 @@ mod tests {
         let config = test_config(&codex_home, &cwd).await;
         let native_source = PathUri::from_abs_path(&config.cwd.join("AGENTS.md"));
         let foreign_source = PathUri::parse("file:///remote%20workspace/AGENTS.md")
-            .expect("POSIX instruction source");
+            .expect("legacy foreign instruction source");
 
         let summary = compose_agents_summary(&config, &[native_source, foreign_source]);
         insta::assert_snapshot!(summary, @r"AGENTS.md, /remote workspace/AGENTS.md");

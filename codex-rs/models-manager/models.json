@@ -33,6 +33,10 @@
       "default_reasoning_level": "high",
       "supported_reasoning_levels": [
         {
+          "effort": "none",
+          "description": "Fastest responses with reasoning disabled"
+        },
+        {
           "effort": "low",
           "description": "Fast responses with lighter reasoning"
         },
@@ -146,6 +150,10 @@
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
         {
+          "effort": "none",
+          "description": "Fastest responses with reasoning disabled"
+        },
+        {
           "effort": "low",
           "description": "Fast responses with lighter reasoning"
         },
@@ -257,6 +265,10 @@
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
         {
+          "effort": "none",
+          "description": "Fastest responses with reasoning disabled"
+        },
+        {
           "effort": "low",
           "description": "Fast responses with lighter reasoning"
         },
@@ -364,6 +376,10 @@
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
         {
+          "effort": "none",
+          "description": "Fastest responses with reasoning disabled"
+        },
+        {
           "effort": "low",
           "description": "Fast responses with lighter reasoning"
         },
@@ -470,6 +486,10 @@
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
         {
+          "effort": "none",
+          "description": "Fastest responses with reasoning disabled"
+        },
+        {
           "effort": "low",
           "description": "Fast responses with lighter reasoning"
         },
@@ -571,6 +591,10 @@
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
         {
+          "effort": "none",
+          "description": "Fastest responses with reasoning disabled"
+        },
+        {
           "effort": "low",
           "description": "Fast responses with lighter reasoning"
         },
@@ -666,6 +690,10 @@
       "description": "Optimized for professional work and long-running agents.",
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
+        {
+          "effort": "none",
+          "description": "Fastest responses with reasoning disabled"
+        },
         {
           "effort": "low",
           "description": "Balances speed with some reasoning; useful for straightforward queries and short explanations"

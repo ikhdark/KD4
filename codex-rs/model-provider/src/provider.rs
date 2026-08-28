@@ -59,6 +59,13 @@ pub struct ProviderAccountState {
     pub requires_openai_auth: bool,
 }
 
+/// Provider configuration and credentials resolved from one request-time auth view.
+pub struct ResolvedModelProviderClientSetup {
+    pub auth: Option<CodexAuth>,
+    pub api_provider: Provider,
+    pub resolved_auth: ResolvedProviderAuth,
+}
+
 /// Error returned when a provider cannot construct its app-visible account state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderAccountError {
@@ -195,6 +202,24 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
             let auth = self.auth().await;
             resolve_provider_auth_for_scope(self.auth_manager(), auth.as_ref(), self.info(), scope)
                 .await
+        })
+    }
+
+    /// Resolves all request setup that must agree on the same provider auth state.
+    fn resolve_client_setup(
+        &self,
+        scope: ProviderAuthScope,
+    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<ResolvedModelProviderClientSetup>>
+    {
+        Box::pin(async move {
+            let auth = self.auth().await;
+            let api_provider = self.api_provider().await?;
+            let resolved_auth = self.api_auth_for_scope(scope).await?;
+            Ok(ResolvedModelProviderClientSetup {
+                auth,
+                api_provider,
+                resolved_auth,
+            })
         })
     }
 
@@ -419,6 +444,35 @@ impl ModelProvider for ConfiguredModelProvider {
         })
     }
 
+    fn resolve_client_setup(
+        &self,
+        scope: ProviderAuthScope,
+    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<ResolvedModelProviderClientSetup>>
+    {
+        Box::pin(async move {
+            let auth = self.auth().await;
+            let api_provider = self
+                .info
+                .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
+            let resolved_auth = if provider_uses_first_party_auth_path(&self.info) {
+                resolve_provider_auth_for_scope(
+                    self.auth_manager(),
+                    auth.as_ref(),
+                    &self.info,
+                    scope,
+                )
+                .await?
+            } else {
+                ResolvedProviderAuth::new(resolve_provider_auth(auth.as_ref(), &self.info)?)
+            };
+            Ok(ResolvedModelProviderClientSetup {
+                auth,
+                api_provider,
+                resolved_auth,
+            })
+        })
+    }
+
     fn account_state(&self) -> ProviderAccountResult {
         let account = if self.info.requires_openai_auth {
             self.auth_manager
@@ -502,9 +556,14 @@ impl ModelProvider for ConfiguredModelProvider {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use codex_http_client::HttpClientFactory;
     use codex_http_client::OutboundProxyPolicy;
+    use codex_login::ExternalAuth;
+    use codex_login::ExternalAuthFuture;
+    use codex_login::ExternalAuthRefreshContext;
     use codex_login::auth::AgentIdentityAuthPolicy;
     use codex_login::auth::BedrockApiKeyAuth;
     use codex_model_provider_info::ModelProviderAwsAuthInfo;
@@ -721,6 +780,57 @@ mod tests {
             api_key: "bedrock-api-key-test".to_string(),
             region: "us-east-1".to_string(),
         })
+    }
+
+    struct CountingExternalAuth {
+        auth: CodexAuth,
+        resolves: Arc<AtomicUsize>,
+    }
+
+    impl ExternalAuth for CountingExternalAuth {
+        fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            let auth = self.auth.clone();
+            Box::pin(async move { Ok(auth) })
+        }
+
+        fn refresh(
+            &self,
+            _context: ExternalAuthRefreshContext,
+        ) -> ExternalAuthFuture<'_, CodexAuth> {
+            let auth = self.auth.clone();
+            Box::pin(async move { Ok(auth) })
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_client_setup_resolves_external_auth_once() {
+        let auth = CodexAuth::from_api_key("sk-external");
+        let auth_manager = AuthManager::from_auth_for_testing(auth.clone());
+        let resolves = Arc::new(AtomicUsize::new(0));
+        auth_manager
+            .set_external_auth(Arc::new(CountingExternalAuth {
+                auth,
+                resolves: Arc::clone(&resolves),
+            }))
+            .await
+            .expect("external auth should install");
+        let baseline = resolves.load(Ordering::SeqCst);
+        let provider = create_model_provider(
+            ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+            Some(auth_manager),
+        );
+
+        provider
+            .resolve_client_setup(ProviderAuthScope {
+                agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
+                session_source: SessionSource::Cli,
+                agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
+            })
+            .await
+            .expect("client setup should resolve");
+
+        assert_eq!(resolves.load(Ordering::SeqCst), baseline + 1);
     }
 
     #[tokio::test]

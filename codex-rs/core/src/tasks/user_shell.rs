@@ -162,7 +162,13 @@ pub(crate) async fn execute_user_shell_command(
     // allows commands that use shell features (pipes, &&, redirects, etc.).
     // We do not source rc files or otherwise reformat the script.
     let use_login_shell = true;
-    let display_command = environment_shell.derive_exec_args(&command, use_login_shell);
+    let display_command = match environment_shell.derive_exec_args(&command, use_login_shell) {
+        Ok(display_command) => display_command,
+        Err(error) => {
+            send_user_shell_error(&session, turn_context.as_ref(), &error.to_string()).await;
+            return;
+        }
+    };
     let cwd = turn_environment.cwd().clone();
 
     let call_id = Uuid::new_v4().to_string();
@@ -386,6 +392,7 @@ async fn execute_local_user_shell_command(
     let permission_profile = PermissionProfile::Disabled;
     let exec_env = ExecRequest {
         command: exec_command,
+        codex_home: turn_context.config.codex_home.clone(),
         cwd: cwd.clone().into(),
         env: exec_env_map,
         exec_server_env_config: None,
@@ -632,9 +639,9 @@ fn prepare_user_shell_exec_command(
             shell_snapshot,
             shell_environment_set,
             exec_env_map,
-            // On non-Unix targets, arg0 has already prepended the package path
-            // to the process PATH before create_env() builds exec_env_map.
-            // RuntimePathPrepends is only needed for Unix shell snapshot replay.
+            // On Windows, arg0 has already prepended the package path to the
+            // process PATH before create_env() builds exec_env_map. Shell
+            // snapshot replay does not need additional runtime path entries.
             &RuntimePathPrepends,
         )
     }

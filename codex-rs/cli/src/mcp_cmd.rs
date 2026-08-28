@@ -211,6 +211,7 @@ impl McpCli {
 /// retry the login flow once without scopes.
 #[allow(clippy::too_many_arguments)]
 async fn perform_oauth_login_retry_without_scopes(
+    codex_home: &std::path::Path,
     name: &str,
     url: &str,
     store_mode: codex_config::types::OAuthCredentialsStoreMode,
@@ -224,6 +225,7 @@ async fn perform_oauth_login_retry_without_scopes(
     callback_url: Option<&str>,
 ) -> Result<()> {
     match perform_oauth_login(
+        codex_home,
         name,
         url,
         store_mode,
@@ -242,6 +244,7 @@ async fn perform_oauth_login_retry_without_scopes(
         Err(err) if should_retry_without_scopes(resolved_scopes, &err) => {
             println!("OAuth provider rejected discovered scopes. Retrying without scopes…");
             perform_oauth_login(
+                codex_home,
                 name,
                 url,
                 store_mode,
@@ -388,6 +391,7 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
                 oauth_config.discovered_scopes.clone(),
             );
             perform_oauth_login_retry_without_scopes(
+                &config.codex_home,
                 &name,
                 &oauth_config.url,
                 config.mcp_oauth_credentials_store_mode,
@@ -483,6 +487,7 @@ async fn run_login(config_overrides: &CliConfigOverrides, login_args: LoginArgs)
         resolve_oauth_scopes(explicit_scopes, server.scopes.clone(), discovered_scopes);
 
     perform_oauth_login_retry_without_scopes(
+        &config.codex_home,
         &name,
         &url,
         config.mcp_oauth_credentials_store_mode,
@@ -524,6 +529,7 @@ async fn run_logout(config_overrides: &CliConfigOverrides, logout_args: LogoutAr
     };
 
     match delete_oauth_tokens(
+        &config.codex_home,
         &name,
         &url,
         config.mcp_oauth_credentials_store_mode,
@@ -557,6 +563,7 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
     entries.sort_by_key(|(name, _)| *name);
     let auth_statuses = compute_auth_statuses(
         effective_mcp_servers.iter(),
+        &config.codex_home,
         config.mcp_oauth_credentials_store_mode,
         config.auth_keyring_backend_kind(),
         auth.as_ref(),

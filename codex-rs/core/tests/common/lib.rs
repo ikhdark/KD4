@@ -24,6 +24,7 @@ use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 pub use codex_utils_absolute_path::test_support::PathBufExt;
 pub use codex_utils_absolute_path::test_support::PathExt;
+use codex_utils_path_uri::PathUri;
 use regex_lite::Regex;
 use std::path::Path;
 use std::path::PathBuf;
@@ -36,18 +37,7 @@ pub mod responses;
 pub mod streaming_sse;
 pub mod test_codex;
 pub mod test_codex_exec;
-mod test_environment;
 pub mod tracing;
-
-pub(crate) use test_environment::TestEnvironment;
-pub use test_environment::TestTargetOs;
-pub use test_environment::is_remote_test_environment;
-#[doc(hidden)]
-pub use test_environment::is_wine_exec_test_environment;
-#[doc(hidden)]
-pub use test_environment::test_docker_container_name;
-pub(crate) use test_environment::test_environment;
-pub use test_environment::test_target_os;
 
 static TEST_ARG0_PATH_ENTRY: OnceLock<Option<Arg0PathEntryGuard>> = OnceLock::new();
 
@@ -91,21 +81,17 @@ pub fn assert_regex_match<'s>(pattern: &str, actual: &'s str) -> regex_lite::Cap
 }
 
 pub fn test_path_buf_with_windows(unix_path: &str, windows_path: Option<&str>) -> PathBuf {
-    if cfg!(target_os = "windows") {
-        if let Some(windows) = windows_path {
-            return PathBuf::from(windows);
-        }
-        let mut path = PathBuf::from(r"C:\");
-        path.extend(
-            unix_path
-                .trim_start_matches('/')
-                .split('/')
-                .filter(|segment| !segment.is_empty()),
-        );
-        return path;
+    if let Some(windows) = windows_path {
+        return PathBuf::from(windows);
     }
-
-    PathBuf::from(unix_path)
+    let mut path = PathBuf::from(r"C:\");
+    path.extend(
+        unix_path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty()),
+    );
+    path
 }
 
 pub fn test_path_buf(unix_path: &str) -> PathBuf {
@@ -162,9 +148,9 @@ pub fn requested_directory_write_permissions(path: &Path) -> RequestPermissionPr
     RequestPermissionProfile {
         file_system: Some(FileSystemPermissions::from_read_write_roots(
             Some(vec![]),
-            Some(vec![
-                AbsolutePathBuf::try_from(path).expect("absolute path"),
-            ]),
+            Some(vec![PathUri::from_abs_path(
+                &AbsolutePathBuf::try_from(path).expect("absolute path"),
+            )]),
         )),
         ..RequestPermissionProfile::default()
     }
@@ -176,7 +162,9 @@ pub fn normalized_directory_write_permissions(
     Ok(RequestPermissionProfile {
         file_system: Some(FileSystemPermissions::from_read_write_roots(
             Some(vec![]),
-            Some(vec![AbsolutePathBuf::try_from(path.canonicalize()?)?]),
+            Some(vec![PathUri::from_abs_path(&AbsolutePathBuf::try_from(
+                path.canonicalize()?,
+            )?)]),
         )),
         ..RequestPermissionProfile::default()
     })
@@ -389,7 +377,9 @@ pub fn sandbox_network_env_var() -> &'static str {
 }
 
 pub fn format_with_current_shell(command: &str) -> Vec<String> {
-    codex_core::shell::default_user_shell().derive_exec_args(command, /*use_login_shell*/ true)
+    codex_core::shell::default_user_shell()
+        .derive_exec_args(command, /*use_login_shell*/ true)
+        .expect("default Windows shell must be executable")
 }
 
 pub fn format_with_current_shell_display(command: &str) -> String {
@@ -400,6 +390,7 @@ pub fn format_with_current_shell_display(command: &str) -> String {
 pub fn format_with_current_shell_non_login(command: &str) -> Vec<String> {
     codex_core::shell::default_user_shell()
         .derive_exec_args(command, /*use_login_shell*/ false)
+        .expect("default Windows shell must be executable")
 }
 
 pub fn format_with_current_shell_display_non_login(command: &str) -> String {
@@ -592,60 +583,6 @@ macro_rules! skip_if_test_condition {
     }};
 }
 
-#[macro_export]
-macro_rules! skip_if_remote {
-    ($reason:expr $(,)?) => {{
-        $crate::skip_if_test_condition!(
-            $crate::is_remote_test_environment(),
-            "a remote test environment",
-            $reason,
-        );
-    }};
-    ($return_value:expr, $reason:expr $(,)?) => {{
-        $crate::skip_if_test_condition!(
-            $return_value,
-            $crate::is_remote_test_environment(),
-            "a remote test environment",
-            $reason,
-        );
-    }};
-}
-
-#[macro_export]
-macro_rules! skip_if_no_remote_env {
-    () => {{
-        if !$crate::is_remote_test_environment() {
-            eprintln!("Skipping test because it requires a remote test environment.");
-            return;
-        }
-    }};
-    ($return_value:expr $(,)?) => {{
-        if !$crate::is_remote_test_environment() {
-            eprintln!("Skipping test because it requires a remote test environment.");
-            return $return_value;
-        }
-    }};
-}
-
-#[macro_export]
-macro_rules! skip_if_wine_exec {
-    ($reason:expr $(,)?) => {{
-        $crate::skip_if_test_condition!(
-            $crate::is_wine_exec_test_environment(),
-            "the Wine-exec test environment",
-            $reason,
-        );
-    }};
-    ($return_value:expr, $reason:expr $(,)?) => {{
-        $crate::skip_if_test_condition!(
-            $return_value,
-            $crate::is_wine_exec_test_environment(),
-            "the Wine-exec test environment",
-            $reason,
-        );
-    }};
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,11 +593,7 @@ mod tests {
     fn host_path_fixture_uses_host_convention() {
         let path = test_path_buf_with_windows("/tmp/kd4-test", Some(r"C:\tmp\kd4-test"));
 
-        if cfg!(target_os = "windows") {
-            assert_eq!(path, PathBuf::from(r"C:\tmp\kd4-test"));
-        } else {
-            assert_eq!(path, PathBuf::from("/tmp/kd4-test"));
-        }
+        assert_eq!(path, PathBuf::from(r"C:\tmp\kd4-test"));
     }
 
     #[tokio::test]

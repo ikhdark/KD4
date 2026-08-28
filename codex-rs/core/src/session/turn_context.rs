@@ -79,7 +79,7 @@ pub(crate) struct DeferredToolActivation {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DeferredToolActivationState {
     revision: u64,
-    capability_revisions: HashMap<codex_tools::ToolName, String>,
+    capability_revisions: Arc<HashMap<codex_tools::ToolName, String>>,
     activations: HashMap<codex_tools::ToolName, DeferredToolActivation>,
 }
 
@@ -152,12 +152,20 @@ impl std::fmt::Debug for TurnEnvironment {
     }
 }
 
+#[derive(Debug, Default)]
+struct PendingPostToolContexts {
+    by_call_id: Mutex<HashMap<String, Vec<ResponseItem>>>,
+}
+
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
 pub struct TurnContext {
     pub(crate) sub_id: String,
     pub(crate) trace_id: Option<String>,
     pub config: Arc<Config>,
+    /// Fully resolved instructions for this turn. Keeping the rendered text on
+    /// the turn avoids rebuilding it during token-estimate and retry paths.
+    pub(crate) base_instructions: Arc<BaseInstructions>,
     pub(crate) auth_manager: Option<Arc<AuthManager>>,
     pub(crate) model_info: ModelInfo,
     pub(crate) session_telemetry: SessionTelemetry,
@@ -189,15 +197,21 @@ pub struct TurnContext {
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
     /// Deferred tools selected during this root task, bound to exact capability revisions.
     pub(crate) deferred_tool_activations: Arc<std::sync::RwLock<DeferredToolActivationState>>,
+    pub(crate) kd4_workflow_enabled: bool,
     pub(crate) validation_authorization: crate::validation_admission::SharedValidationAuthorization,
-    pub(crate) validation_singleflight: crate::validation_admission::SharedValidationSingleflight,
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
     pub(crate) turn_skills: TurnSkillsContext,
     pub(crate) turn_timing_state: Arc<TurnTimingState>,
+    pub(crate) tool_call_acceptance: Arc<crate::state::ToolCallAcceptanceGate>,
+    /// Remembers completed ordered-history commit retry keys for this turn only.
+    pub(crate) durable_history_completed_commits: Arc<Mutex<HashSet<String>>>,
     pub(crate) terminal_error: Arc<Mutex<Option<ErrorEvent>>>,
     pub(crate) server_model_warning_emitted: AtomicBool,
     pub(crate) model_verification_emitted: AtomicBool,
+    /// Ensures external-context producers signal memory pollution at most once
+    /// during this turn, even when the same result has multiple projections.
+    pub(crate) memory_pollution_signal_claimed: AtomicBool,
 }
 
 enum TurnMultiAgentRuntime {
@@ -206,6 +220,44 @@ enum TurnMultiAgentRuntime {
 }
 
 impl TurnContext {
+    pub(crate) async fn queue_post_tool_contexts(
+        &self,
+        call_id: &str,
+        contexts: Vec<ResponseItem>,
+    ) {
+        if contexts.is_empty() {
+            return;
+        }
+        let pending = self
+            .extension_data
+            .get_or_init(PendingPostToolContexts::default);
+        pending
+            .by_call_id
+            .lock()
+            .await
+            .entry(call_id.to_string())
+            .or_default()
+            .extend(contexts);
+    }
+
+    pub(crate) async fn take_post_tool_contexts(&self, call_id: &str) -> Vec<ResponseItem> {
+        let Some(pending) = self.extension_data.get::<PendingPostToolContexts>() else {
+            return Vec::new();
+        };
+        pending
+            .by_call_id
+            .lock()
+            .await
+            .remove(call_id)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn claim_memory_pollution_signal(&self) -> bool {
+        self.memory_pollution_signal_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     /// Returns the host-native cwd resolved for this turn.
     ///
     /// Per-turn config construction derives this value from the primary selected
@@ -347,16 +399,17 @@ impl TurnContext {
 
     pub(crate) fn refresh_deferred_tool_capabilities(
         &self,
-        capability_revisions: HashMap<codex_tools::ToolName, String>,
+        capability_revisions: Arc<HashMap<codex_tools::ToolName, String>>,
     ) {
         let mut state = self
             .deferred_tool_activations
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let capability_changed = state.capability_revisions != capability_revisions;
+        let capability_changed =
+            state.capability_revisions.as_ref() != capability_revisions.as_ref();
         state.capability_revisions = capability_revisions;
         let current_epoch = self.sub_id.as_str();
-        let current_revisions = state.capability_revisions.clone();
+        let current_revisions = Arc::clone(&state.capability_revisions);
         let before = state.activations.len();
         state.activations.retain(|tool_name, activation| {
             activation.root_task_epoch == current_epoch
@@ -473,6 +526,9 @@ impl TurnContext {
             sub_id: self.sub_id.clone(),
             trace_id: self.trace_id.clone(),
             config: Arc::new(config),
+            base_instructions: Arc::new(BaseInstructions {
+                text: model_info.base_instructions.clone(),
+            }),
             auth_manager: self.auth_manager.clone(),
             model_info: model_info.clone(),
             session_telemetry: self
@@ -506,18 +562,23 @@ impl TurnContext {
             final_output_json_schema: self.final_output_json_schema.clone(),
             dynamic_tools: self.dynamic_tools.clone(),
             deferred_tool_activations: Arc::clone(&self.deferred_tool_activations),
+            kd4_workflow_enabled: self.kd4_workflow_enabled,
             validation_authorization: Arc::clone(&self.validation_authorization),
-            validation_singleflight: Arc::clone(&self.validation_singleflight),
             turn_metadata_state: self.turn_metadata_state.clone(),
             extension_data: Arc::clone(&self.extension_data),
             turn_skills: self.turn_skills.clone(),
             turn_timing_state: Arc::clone(&self.turn_timing_state),
+            tool_call_acceptance: Arc::clone(&self.tool_call_acceptance),
+            durable_history_completed_commits: Arc::clone(&self.durable_history_completed_commits),
             terminal_error: Arc::clone(&self.terminal_error),
             server_model_warning_emitted: AtomicBool::new(
                 self.server_model_warning_emitted.load(Ordering::Relaxed),
             ),
             model_verification_emitted: AtomicBool::new(
                 self.model_verification_emitted.load(Ordering::Relaxed),
+            ),
+            memory_pollution_signal_claimed: AtomicBool::new(
+                self.memory_pollution_signal_claimed.load(Ordering::Relaxed),
             ),
         }
     }
@@ -638,11 +699,12 @@ impl Session {
     pub(crate) fn build_per_turn_config(
         session_configuration: &SessionConfiguration,
         cwd: AbsolutePathBuf,
-    ) -> Config {
+    ) -> Arc<Config> {
         // todo(aibrahim): store this state somewhere else so we don't need to mut config
         let config = session_configuration.original_config_do_not_use.clone();
         let mut per_turn_config = (*config).clone();
         per_turn_config.cwd = cwd;
+        per_turn_config.model = Some(session_configuration.collaboration_mode.model().to_string());
         per_turn_config.workspace_roots = session_configuration.workspace_roots.clone();
         per_turn_config
             .permissions
@@ -671,15 +733,21 @@ impl Session {
             );
         }
         per_turn_config.features = config.features.clone();
-        per_turn_config
+        if per_turn_config == *config {
+            config
+        } else {
+            Arc::new(per_turn_config)
+        }
     }
 
     pub(crate) fn build_effective_session_config(
         session_configuration: &SessionConfiguration,
     ) -> Config {
-        let mut config =
-            Self::build_per_turn_config(session_configuration, session_configuration.cwd().clone());
-        config.model = Some(session_configuration.collaboration_mode.model().to_string());
+        let mut config = (*Self::build_per_turn_config(
+            session_configuration,
+            session_configuration.cwd().clone(),
+        ))
+        .clone();
         config.permissions.approval_policy = session_configuration.approval_policy.clone();
         config.workspace_roots = session_configuration.workspace_roots.clone();
         config
@@ -697,12 +765,13 @@ impl Session {
         provider: ModelProviderInfo,
         session_configuration: &SessionConfiguration,
         multi_agent_version: MultiAgentVersion,
-        per_turn_config: Config,
+        per_turn_config: Arc<Config>,
         model_info: ModelInfo,
-        models_manager: &SharedModelsManager,
+        available_models: Arc<Vec<ModelPreset>>,
         network: Option<NetworkProxy>,
         environments: TurnEnvironmentSnapshot,
         git_metadata_source: Option<GitWorkspaceMetadataSource>,
+        kd4_workflow_enabled: bool,
         sub_id: String,
         skills_snapshot: HostSkillsSnapshot,
     ) -> TurnContext {
@@ -720,17 +789,15 @@ impl Session {
         let auth_manager_for_context = auth_manager.clone();
         let provider_for_context = create_model_provider(provider, auth_manager);
         let session_telemetry_for_context = session_telemetry;
-        let available_models = models_manager.try_list_models_shared().unwrap_or_default();
-
-        let mut per_turn_config = per_turn_config;
-        per_turn_config.service_tier = get_service_tier(
-            per_turn_config.service_tier,
+        let resolved_service_tier = get_service_tier(
+            per_turn_config.service_tier.clone(),
             per_turn_config.features.enabled(Feature::FastMode),
             &model_info,
         );
-        let kd4_workflow_enabled =
-            crate::task_evidence::is_kd4_repository(per_turn_config.cwd.as_path());
-        let per_turn_config = Arc::new(per_turn_config);
+        let mut per_turn_config = per_turn_config;
+        if per_turn_config.service_tier != resolved_service_tier {
+            Arc::make_mut(&mut per_turn_config).service_tier = resolved_service_tier;
+        }
         let turn_metadata_state = Arc::new(TurnMetadataState::new_with_git_metadata_source(
             session_id.to_string(),
             thread_id.to_string(),
@@ -747,10 +814,14 @@ impl Session {
         let (current_date, timezone) = local_time_context();
         let extension_data = Arc::new(codex_extension_api::ExtensionData::new(sub_id.clone()));
         extension_data.insert(skills_snapshot.clone());
+        let base_instructions = Arc::new(BaseInstructions {
+            text: model_info.base_instructions.clone(),
+        });
         TurnContext {
             sub_id,
             trace_id: current_span_trace_id(),
             config: per_turn_config,
+            base_instructions,
             auth_manager: auth_manager_for_context,
             model_info,
             session_telemetry: session_telemetry_for_context,
@@ -781,21 +852,22 @@ impl Session {
             deferred_tool_activations: Arc::new(std::sync::RwLock::new(
                 DeferredToolActivationState::default(),
             )),
+            kd4_workflow_enabled,
             validation_authorization: Arc::new(tokio::sync::RwLock::new(if kd4_workflow_enabled {
                 crate::validation_admission::ValidationAuthorization::enabled()
             } else {
                 crate::validation_admission::ValidationAuthorization::default()
             })),
-            validation_singleflight: crate::validation_admission::new_validation_singleflight(
-                kd4_workflow_enabled,
-            ),
             turn_metadata_state,
             extension_data,
             turn_skills: TurnSkillsContext::new(skills_snapshot),
             turn_timing_state: Arc::new(TurnTimingState::default()),
+            tool_call_acceptance: Arc::new(crate::state::ToolCallAcceptanceGate::default()),
+            durable_history_completed_commits: Arc::new(Mutex::new(HashSet::new())),
             terminal_error: Arc::new(Mutex::new(None)),
             server_model_warning_emitted: AtomicBool::new(false),
             model_verification_emitted: AtomicBool::new(false),
+            memory_pollution_signal_claimed: AtomicBool::new(false),
         }
     }
 
@@ -1010,6 +1082,47 @@ impl Session {
             .skills_service
             .snapshot_for_config(&skills_input, fs)
             .await;
+        let available_models = self
+            .services
+            .models_manager
+            .list_models_shared(
+                RefreshStrategy::Offline,
+                per_turn_config.http_client_factory(),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "failed to load the current turn model catalog");
+                Arc::new(Vec::new())
+            });
+        let resolved_service_tier = get_service_tier(
+            per_turn_config.service_tier.clone(),
+            per_turn_config.features.enabled(Feature::FastMode),
+            &model_info,
+        );
+        let mut per_turn_config = per_turn_config;
+        if per_turn_config.service_tier != resolved_service_tier {
+            Arc::make_mut(&mut per_turn_config).service_tier = resolved_service_tier;
+        }
+        let per_turn_config = {
+            let mut cached = self
+                .turn_config_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match cached.as_ref() {
+                Some(previous) if previous.as_ref() == per_turn_config.as_ref() => {
+                    Arc::clone(previous)
+                }
+                _ => {
+                    *cached = Some(Arc::clone(&per_turn_config));
+                    per_turn_config
+                }
+            }
+        };
+        let kd4_workflow_enabled = resolve_kd4_workflow_enabled(
+            per_turn_config.kd4_workflow_enabled,
+            self.services
+                .kd4_workflow_enabled_for(per_turn_config.cwd.as_path()),
+        );
         let mut turn_context: TurnContext = Self::make_turn_context(
             self.thread_id(),
             self.session_id(),
@@ -1020,7 +1133,7 @@ impl Session {
             multi_agent_version,
             per_turn_config,
             model_info,
-            &self.services.models_manager,
+            available_models,
             self.services
                 .network_proxy
                 .load_full()
@@ -1033,6 +1146,7 @@ impl Session {
                 }),
             turn_environments,
             git_metadata_source,
+            kd4_workflow_enabled,
             sub_id,
             skills_snapshot,
         );
@@ -1099,5 +1213,22 @@ impl Session {
     async fn default_turn_configuration(&self) -> SessionConfiguration {
         let state = self.state.lock().await;
         state.session_configuration.clone()
+    }
+}
+
+fn resolve_kd4_workflow_enabled(configured: Option<bool>, detected: bool) -> bool {
+    configured.unwrap_or(detected)
+}
+
+#[cfg(test)]
+mod kd4_workflow_tests {
+    use super::resolve_kd4_workflow_enabled;
+
+    #[test]
+    fn explicit_kd4_workflow_setting_overrides_marker_detection() {
+        assert!(!resolve_kd4_workflow_enabled(Some(false), true));
+        assert!(resolve_kd4_workflow_enabled(Some(true), false));
+        assert!(resolve_kd4_workflow_enabled(None, true));
+        assert!(!resolve_kd4_workflow_enabled(None, false));
     }
 }

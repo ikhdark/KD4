@@ -78,4 +78,5 @@ pub use state::NetworkProxyConstraintError;
 pub use state::NetworkProxyConstraints;
 pub use state::PartialNetworkProxyConfig;
 pub use state::build_config_state;
+pub use state::build_config_state_with_codex_home;
 pub use state::validate_policy_against_constraints;

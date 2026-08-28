@@ -1,9 +1,15 @@
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
+use codex_protocol::protocol::ENVIRONMENT_SKILLS_INSTRUCTIONS_CLOSE_TAG;
+use codex_protocol::protocol::ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG;
+use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_utils_output_truncation::approx_token_count;
 use sha2::Digest;
@@ -22,7 +28,7 @@ std::thread_local! {
     static CLASSIFY_STABLE_TEXT_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
-const STABLE_CONTEXT_CONTRACT_VERSION: u16 = 1;
+const STABLE_CONTEXT_CONTRACT_VERSION: u16 = 2;
 const STABLE_CONTEXT_HASH_DOMAIN: &[u8] = b"codex.stable-context.component.v1";
 const STABLE_CONTEXT_MANIFEST_HASH_DOMAIN: &[u8] = b"codex.stable-context.manifest.v1";
 const SKILLS_USAGE_OPEN_TAG: &str = "<skills_usage_instructions>";
@@ -34,6 +40,41 @@ const REPOSITORY_REMOVAL_NOTICE: &str =
 const COLLABORATION_RESET_NOTICE: &str = "No collaboration-mode-specific instructions are currently active. Any previously provided collaboration-mode instructions no longer apply.";
 const ROOT_COORDINATOR_PREFIX: &str =
     "You are `/root`, the primary agent in a team of agents collaborating";
+const ROOT_ORCHESTRATION_OPEN_TAG: &str = "<root_orchestration_instructions>";
+const ROOT_ORCHESTRATION_CLOSE_TAG: &str = "</root_orchestration_instructions>";
+const DEVELOPER_INSTRUCTIONS_PRESENT_MARKER: &str =
+    "<configured_developer_instructions state=\"present\" />";
+const DEVELOPER_INSTRUCTIONS_REMOVED_MARKER: &str =
+    "<configured_developer_instructions state=\"removed\" />";
+const MULTI_AGENT_USAGE_HINT_PRESENT_MARKER: &str = "<multi_agent_usage_hint state=\"present\" />";
+const MULTI_AGENT_USAGE_HINT_REMOVED_MARKER: &str = "<multi_agent_usage_hint state=\"removed\" />";
+const TRUSTED_STABLE_CONTEXT_ITEM_ID_BASE: &str = "msg_sctx";
+const TRUSTED_STABLE_CONTEXT_ITEM_ID_PREFIX: &str = "msg_sctx_";
+
+/// Marks a message as stable context emitted by a trusted core producer.
+///
+/// The marker uses the existing durable response-item ID field so it survives
+/// rollout persistence and compaction without extending strongly typed
+/// Responses metadata. Ordinary user messages receive `msg_<item-id>` IDs at
+/// ingestion and therefore cannot acquire this core-owned prefix from text.
+pub(crate) fn mark_trusted_stable_context_item(item: &mut ResponseItem) {
+    let ResponseItem::Message { id, .. } = item else {
+        return;
+    };
+    if id.as_ref().is_some_and(is_trusted_stable_context_id) {
+        return;
+    }
+    *id = Some(ResponseItemId::new(TRUSTED_STABLE_CONTEXT_ITEM_ID_BASE));
+}
+
+fn is_trusted_stable_context_id(id: &ResponseItemId) -> bool {
+    id.as_str()
+        .starts_with(TRUSTED_STABLE_CONTEXT_ITEM_ID_PREFIX)
+}
+
+fn is_trusted_stable_context_item(item: &ResponseItem) -> bool {
+    item.id().is_some_and(is_trusted_stable_context_id)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum StableContextKind {
@@ -52,8 +93,10 @@ pub(crate) enum StableContextKind {
     Memory,
     ModelSwitch,
     Personality,
+    DeveloperInstructions,
     RootCoordinator,
     MultiAgent,
+    MultiAgentUsageHint,
     TaskModelGuidance,
     TaskEvidence,
     ToolSchemas,
@@ -80,8 +123,10 @@ impl StableContextKind {
             Self::Memory => "memory",
             Self::ModelSwitch => "model_switch",
             Self::Personality => "personality",
+            Self::DeveloperInstructions => "developer_instructions",
             Self::RootCoordinator => "root_coordinator",
             Self::MultiAgent => "multi_agent",
+            Self::MultiAgentUsageHint => "multi_agent_usage_hint",
             Self::TaskModelGuidance => "task_model_guidance",
             Self::TaskEvidence => "task_evidence",
             Self::ToolSchemas => "tool_schemas",
@@ -272,6 +317,42 @@ impl StableContextManifest {
         Self::from_components(components, self.projection_enabled, self.fail_open)
     }
 
+    /// Appends the request-dynamic history measurement without rebuilding the
+    /// immutable stable-prefix identity. `DynamicHistory` is deliberately
+    /// excluded from [`manifest_fingerprint`], and is the final sorted kind,
+    /// so retaining the already-computed fingerprint is equivalent to
+    /// `add_measured_component` while avoiding another stable-manifest hash.
+    pub(crate) fn add_dynamic_history(
+        &self,
+        identity_bytes: &[u8],
+        serialized_bytes: u64,
+        approx_tokens: i64,
+    ) -> Self {
+        debug_assert!(
+            self.components
+                .iter()
+                .all(|component| component.kind != StableContextKind::DynamicHistory),
+            "request scaffold must not contain dynamic history"
+        );
+        let mut component = component_from_bytes(
+            StableContextKind::DynamicHistory,
+            "dynamic_history",
+            identity_bytes,
+            true,
+            StableContextDisposition::Unchanged,
+        );
+        component.identity.serialized_bytes = serialized_bytes;
+        component.identity.approx_tokens = approx_tokens;
+        let mut components = self.components.to_vec();
+        components.push(component);
+        Self {
+            components: components.into(),
+            fingerprint: self.fingerprint,
+            projection_enabled: self.projection_enabled,
+            fail_open: self.fail_open,
+        }
+    }
+
     fn from_components(
         mut components: Vec<StableContextComponent>,
         projection_enabled: bool,
@@ -307,6 +388,8 @@ enum StableContextSlot {
     Collaboration,
     SkillUsage,
     SkillCatalog,
+    ExtensionSkillCatalog,
+    EnvironmentSkillCatalog,
     SelectedSkill,
     Apps,
     AppContext,
@@ -319,7 +402,9 @@ enum StableContextSlot {
     Memory,
     ModelSwitch,
     Personality,
+    DeveloperInstructions,
     MultiAgent,
+    MultiAgentUsageHint,
     RootCoordinator,
 }
 
@@ -329,7 +414,9 @@ impl StableContextSlot {
             Self::Repository => StableContextKind::Repository,
             Self::Collaboration => StableContextKind::Collaboration,
             Self::SkillUsage => StableContextKind::SkillUsage,
-            Self::SkillCatalog => StableContextKind::SkillCatalog,
+            Self::SkillCatalog | Self::ExtensionSkillCatalog | Self::EnvironmentSkillCatalog => {
+                StableContextKind::SkillCatalog
+            }
             Self::SelectedSkill => StableContextKind::SelectedSkill,
             Self::Apps => StableContextKind::DesktopApp,
             Self::AppContext => StableContextKind::AppContext,
@@ -342,7 +429,9 @@ impl StableContextSlot {
             Self::Memory => StableContextKind::Memory,
             Self::ModelSwitch => StableContextKind::ModelSwitch,
             Self::Personality => StableContextKind::Personality,
+            Self::DeveloperInstructions => StableContextKind::DeveloperInstructions,
             Self::MultiAgent => StableContextKind::MultiAgent,
+            Self::MultiAgentUsageHint => StableContextKind::MultiAgentUsageHint,
             Self::RootCoordinator => StableContextKind::RootCoordinator,
         }
     }
@@ -353,6 +442,8 @@ impl StableContextSlot {
             Self::Collaboration => "collaboration",
             Self::SkillUsage => "skill_usage",
             Self::SkillCatalog => "skill_catalog",
+            Self::ExtensionSkillCatalog => "extension_skill_catalog",
+            Self::EnvironmentSkillCatalog => "environment_skill_catalog",
             Self::SelectedSkill => "selected_skill",
             Self::Apps => "apps",
             Self::AppContext => "app_context",
@@ -365,7 +456,9 @@ impl StableContextSlot {
             Self::Memory => "memory",
             Self::ModelSwitch => "model_switch",
             Self::Personality => "personality",
+            Self::DeveloperInstructions => "developer_instructions",
             Self::MultiAgent => "multi_agent",
+            Self::MultiAgentUsageHint => "multi_agent_usage_hint",
             Self::RootCoordinator => "root_coordinator",
         }
     }
@@ -376,23 +469,27 @@ impl StableContextSlot {
     fn canonical_order(self) -> u8 {
         match self {
             Self::Repository => 0,
-            Self::Collaboration => 1,
-            Self::RootCoordinator => 2,
-            Self::MultiAgent => 3,
-            Self::TaskModelGuidance => 4,
-            Self::TaskEvidence => 5,
-            Self::Permissions => 6,
-            Self::Memory => 7,
-            Self::SkillUsage => 8,
-            Self::SkillCatalog => 9,
-            Self::Apps => 10,
-            Self::Plugins => 11,
-            Self::Personality => 12,
-            Self::SelectedSkill => 13,
-            Self::AppContext => 14,
-            Self::ModelSwitch => 15,
-            Self::Environment => 16,
-            Self::RecommendedPlugins => 17,
+            Self::DeveloperInstructions => 1,
+            Self::Collaboration => 2,
+            Self::RootCoordinator => 3,
+            Self::MultiAgent => 4,
+            Self::MultiAgentUsageHint => 5,
+            Self::TaskModelGuidance => 6,
+            Self::TaskEvidence => 7,
+            Self::Permissions => 8,
+            Self::Memory => 9,
+            Self::SkillUsage => 10,
+            Self::SkillCatalog => 11,
+            Self::ExtensionSkillCatalog => 12,
+            Self::EnvironmentSkillCatalog => 13,
+            Self::Apps => 14,
+            Self::Plugins => 15,
+            Self::Personality => 16,
+            Self::SelectedSkill => 17,
+            Self::AppContext => 18,
+            Self::ModelSwitch => 19,
+            Self::Environment => 20,
+            Self::RecommendedPlugins => 21,
         }
     }
 
@@ -407,7 +504,15 @@ impl StableContextSlot {
                 | Self::AppContext
                 | Self::ModelSwitch
                 | Self::Environment
+                | Self::TaskEvidence
                 | Self::RecommendedPlugins
+        )
+    }
+
+    fn is_skill_catalog(self) -> bool {
+        matches!(
+            self,
+            Self::SkillCatalog | Self::ExtensionSkillCatalog | Self::EnvironmentSkillCatalog
         )
     }
 }
@@ -416,7 +521,9 @@ impl StableContextSlot {
 struct Occurrence {
     item_index: usize,
     content_index: usize,
+    payload_content_index: Option<usize>,
     slot: StableContextSlot,
+    explicitly_removed: bool,
 }
 
 impl Occurrence {
@@ -424,7 +531,8 @@ impl Occurrence {
         let ResponseItem::Message { content, .. } = &items[self.item_index] else {
             unreachable!("stable context occurrences only reference messages");
         };
-        let ContentItem::InputText { text } = &content[self.content_index] else {
+        let content_index = self.payload_content_index.unwrap_or(self.content_index);
+        let ContentItem::InputText { text } = &content[content_index] else {
             unreachable!("stable context occurrences only reference input text");
         };
         text
@@ -433,6 +541,81 @@ impl Occurrence {
     fn turn_id<'a>(&self, items: &'a [ResponseItem]) -> Option<&'a str> {
         items[self.item_index].turn_id()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StableItemSignatureEntry {
+    slot: StableContextSlot,
+    role: String,
+    payload: String,
+}
+
+fn stable_item_signature(item: &ResponseItem) -> Option<Vec<StableItemSignatureEntry>> {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return None;
+    };
+    if !is_trusted_stable_context_item(item) {
+        return None;
+    }
+    let mut signature = Vec::new();
+    let mut content_index = 0;
+    while let Some(content_item) = content.get(content_index) {
+        let ContentItem::InputText { text } = content_item else {
+            return None;
+        };
+        let classification = classify_stable_text(role, text)?;
+        let (payload, consumed) = match classification.payload {
+            StablePayload::Inline | StablePayload::Removed => (text.clone(), 1),
+            StablePayload::FollowingText => {
+                let Some(ContentItem::InputText { text }) = content.get(content_index + 1) else {
+                    return None;
+                };
+                (text.clone(), 2)
+            }
+        };
+        signature.push(StableItemSignatureEntry {
+            slot: classification.slot,
+            role: role.clone(),
+            payload,
+        });
+        content_index += consumed;
+    }
+    (!signature.is_empty()).then_some(signature)
+}
+
+/// Removes an unchanged non-volatile stable injection that is already the
+/// latest value in history. Volatile or ambiguous items remain turn-scoped.
+pub(crate) fn filter_unchanged_stable_context_items(
+    history: &[ResponseItem],
+    candidates: Vec<ResponseItem>,
+) -> Vec<ResponseItem> {
+    let mut latest = HashMap::<StableContextSlot, StableItemSignatureEntry>::new();
+    for item in history {
+        if let Some(signature) = stable_item_signature(item) {
+            for entry in signature {
+                latest.insert(entry.slot, entry);
+            }
+        }
+    }
+
+    let mut retained = Vec::with_capacity(candidates.len());
+    for item in candidates {
+        let Some(signature) = stable_item_signature(&item) else {
+            retained.push(item);
+            continue;
+        };
+        let unchanged = signature
+            .iter()
+            .all(|entry| !entry.slot.is_volatile() && latest.get(&entry.slot) == Some(entry));
+        if unchanged {
+            continue;
+        }
+        for entry in signature {
+            latest.insert(entry.slot, entry);
+        }
+        retained.push(item);
+    }
+    retained
 }
 
 pub(crate) fn project_stable_context(
@@ -455,27 +638,49 @@ pub(crate) fn project_stable_context(
         else {
             continue;
         };
+        let trusted_stable_context = is_trusted_stable_context_item(item);
         let mut contains_stable = false;
         let mut contains_ordinary_user_content = false;
         let mut contains_unprojectable = false;
-        for (content_index, content_item) in content.iter().enumerate() {
+        let mut content_index = 0;
+        while let Some(content_item) = content.get(content_index) {
             let ContentItem::InputText { text } = content_item else {
                 contains_unprojectable = true;
                 contains_ordinary_user_content = true;
+                content_index += 1;
                 continue;
             };
-            if let Some(slot) = classify_stable_text(role, text) {
+            if trusted_stable_context && let Some(classification) = classify_stable_text(role, text)
+            {
                 contains_stable = true;
+                let payload_content_index = match classification.payload {
+                    StablePayload::Inline | StablePayload::Removed => None,
+                    StablePayload::FollowingText => {
+                        let Some(ContentItem::InputText { .. }) = content.get(content_index + 1)
+                        else {
+                            ambiguous = true;
+                            contains_ordinary_user_content = true;
+                            content_index += 1;
+                            continue;
+                        };
+                        Some(content_index + 1)
+                    }
+                };
                 occurrences.push(Occurrence {
                     item_index,
                     content_index,
-                    slot,
+                    payload_content_index,
+                    slot: classification.slot,
+                    explicitly_removed: classification.payload == StablePayload::Removed,
                 });
-            } else if contains_known_open_marker(text) {
+                content_index += 1 + usize::from(payload_content_index.is_some());
+            } else if trusted_stable_context && contains_known_open_marker(text) {
                 ambiguous = true;
                 contains_ordinary_user_content = true;
+                content_index += 1;
             } else {
                 contains_ordinary_user_content = true;
+                content_index += 1;
             }
         }
         // Splitting a registered fragment away from images or output text
@@ -508,8 +713,14 @@ pub(crate) fn project_stable_context(
             analyze_unprojected(&items, &occurrences, fail_open),
         )
     };
+    let projected: Arc<[ResponseItem]> = projected.into();
+    let fallback_items = if enabled {
+        Arc::clone(&projected)
+    } else {
+        fallback_items
+    };
     StableContextProjection {
-        items: projected.into(),
+        items: projected,
         fallback_items,
         manifest: StableContextManifest::from_components(components, enabled, fail_open),
     }
@@ -539,6 +750,14 @@ fn project_items(
         .get(&StableContextSlot::Repository)
         .and_then(|index| occurrences.get(*index))
         .is_some_and(|occurrence| occurrence.text(items).contains(REPOSITORY_REMOVAL_NOTICE));
+    let developer_instructions_removed = latest_by_slot
+        .get(&StableContextSlot::DeveloperInstructions)
+        .and_then(|index| occurrences.get(*index))
+        .is_some_and(|occurrence| occurrence.explicitly_removed);
+    let multi_agent_usage_hint_removed = latest_by_slot
+        .get(&StableContextSlot::MultiAgentUsageHint)
+        .and_then(|index| occurrences.get(*index))
+        .is_some_and(|occurrence| occurrence.explicitly_removed);
     let recommended_plugins_current = latest_by_slot
         .get(&StableContextSlot::RecommendedPlugins)
         .and_then(|index| occurrences.get(*index))
@@ -547,17 +766,27 @@ fn project_items(
                 || occurrence_matches_latest_user_turn(items, occurrence, latest_real_user)
         });
 
-    let compact_catalog = if selected_skills_active {
-        latest_by_slot
-            .get(&StableContextSlot::SkillCatalog)
-            .map(|occurrence_index| {
-                (
-                    *occurrence_index,
-                    compact_skill_catalog_reference(occurrences[*occurrence_index].text(items)),
-                )
-            })
+    let compact_catalogs = if selected_skills_active {
+        [
+            StableContextSlot::SkillCatalog,
+            StableContextSlot::ExtensionSkillCatalog,
+            StableContextSlot::EnvironmentSkillCatalog,
+        ]
+        .into_iter()
+        .filter_map(|slot| {
+            latest_by_slot
+                .get(&slot)
+                .map(|occurrence_index| (slot, occurrence_index))
+        })
+        .map(|(slot, occurrence_index)| {
+            (
+                *occurrence_index,
+                compact_skill_catalog_reference(slot, occurrences[*occurrence_index].text(items)),
+            )
+        })
+        .collect::<HashMap<_, _>>()
     } else {
-        None
+        HashMap::new()
     };
 
     let mut keep = HashSet::<(usize, usize)>::new();
@@ -566,8 +795,10 @@ fn project_items(
         let should_keep = match slot {
             StableContextSlot::Repository => !repository_removed,
             StableContextSlot::Collaboration => !collaboration_removed,
+            StableContextSlot::DeveloperInstructions => !developer_instructions_removed,
+            StableContextSlot::MultiAgentUsageHint => !multi_agent_usage_hint_removed,
             StableContextSlot::SkillUsage => !selected_skills_active,
-            StableContextSlot::SkillCatalog => true,
+            slot if slot.is_skill_catalog() => true,
             StableContextSlot::RecommendedPlugins => recommended_plugins_current,
             _ => true,
         };
@@ -580,15 +811,16 @@ fn project_items(
         keep.insert((occurrence.item_index, occurrence.content_index));
     }
 
-    let occurrence_lookup = occurrences
+    let occurrence_content = occurrences
         .iter()
-        .map(|occurrence| {
-            (
-                (occurrence.item_index, occurrence.content_index),
-                occurrence,
+        .flat_map(|occurrence| {
+            std::iter::once((occurrence.item_index, occurrence.content_index)).chain(
+                occurrence
+                    .payload_content_index
+                    .map(|content_index| (occurrence.item_index, content_index)),
             )
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<HashSet<_>>();
     let mut reusable = Vec::<(StableContextSlot, usize, ResponseItem)>::new();
     let mut volatile = Vec::<(StableContextSlot, usize, ResponseItem)>::new();
     for (occurrence_index, occurrence) in occurrences.iter().enumerate() {
@@ -599,13 +831,9 @@ fn project_items(
         let Some(item) = items.get(occurrence.item_index) else {
             continue;
         };
-        let text = compact_catalog
-            .as_ref()
-            .filter(|(compact_index, _)| *compact_index == occurrence_index)
-            .map_or_else(
-                || occurrence.text(items).to_string(),
-                |(_, replacement)| replacement.clone(),
-            );
+        let text = compact_catalogs
+            .get(&occurrence_index)
+            .map_or_else(|| occurrence.text(items).to_string(), Clone::clone);
         let Some(projected_item) =
             projected_message(item, false, vec![ContentItem::InputText { text }])
         else {
@@ -634,7 +862,7 @@ fn project_items(
         let mut next_content = Vec::with_capacity(content.len());
         for (content_index, content_item) in content.iter().enumerate() {
             let key = (item_index, content_index);
-            if occurrence_lookup.contains_key(&key) {
+            if occurrence_content.contains(&key) {
                 continue;
             }
             next_content.push(content_item.clone());
@@ -683,13 +911,14 @@ fn project_items(
         let (prior_count, replaced) =
             prior_occurrence_summary(items, occurrences, latest_index, slot);
         let removed = (slot == StableContextSlot::Repository && repository_removed)
-            || (slot == StableContextSlot::Collaboration && collaboration_removed);
+            || (slot == StableContextSlot::Collaboration && collaboration_removed)
+            || (slot == StableContextSlot::DeveloperInstructions && developer_instructions_removed)
+            || (slot == StableContextSlot::MultiAgentUsageHint && multi_agent_usage_hint_removed);
         let gated = (matches!(slot, StableContextSlot::SkillUsage) && selected_skills_active)
             || (slot == StableContextSlot::RecommendedPlugins && !recommended_plugins_current);
-        let text = compact_catalog
-            .as_ref()
-            .filter(|(compact_index, _)| *compact_index == latest_index)
-            .map(|(_, replacement)| replacement.as_str())
+        let text = compact_catalogs
+            .get(&latest_index)
+            .map(String::as_str)
             .unwrap_or_else(|| occurrence.text(items));
         let mut component = component_from_text(
             slot.kind(),
@@ -698,7 +927,7 @@ fn project_items(
             !removed && !gated,
             if removed {
                 StableContextDisposition::Removed
-            } else if gated || (slot == StableContextSlot::SkillCatalog && selected_skills_active) {
+            } else if gated || (slot.is_skill_catalog() && selected_skills_active) {
                 StableContextDisposition::Gated
             } else if replaced || prior_count > 1 {
                 StableContextDisposition::Replaced
@@ -853,35 +1082,101 @@ fn analyze_unprojected(
         .collect()
 }
 
-fn classify_stable_text(role: &str, text: &str) -> Option<StableContextSlot> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StablePayload {
+    Inline,
+    FollowingText,
+    Removed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StableTextClassification {
+    slot: StableContextSlot,
+    payload: StablePayload,
+}
+
+impl StableTextClassification {
+    const fn inline(slot: StableContextSlot) -> Self {
+        Self {
+            slot,
+            payload: StablePayload::Inline,
+        }
+    }
+}
+
+fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassification> {
     #[cfg(test)]
     CLASSIFY_STABLE_TEXT_CALLS.with(|calls| calls.set(calls.get() + 1));
 
     if role == "user" && marked(text, REPOSITORY_OPEN_TAG, REPOSITORY_CLOSE_TAG) {
-        return Some(StableContextSlot::Repository);
+        return Some(StableTextClassification::inline(
+            StableContextSlot::Repository,
+        ));
     }
-    if role == "user" && marked(text, SKILL_OPEN_TAG, "</skill>") {
-        return Some(StableContextSlot::SelectedSkill);
+    if matches!(role, "system" | "developer" | "user") && marked(text, SKILL_OPEN_TAG, "</skill>") {
+        return Some(StableTextClassification::inline(
+            StableContextSlot::SelectedSkill,
+        ));
     }
     if role == "user" && marked(text, "<environment_context>", "</environment_context>") {
-        return Some(StableContextSlot::Environment);
+        return Some(StableTextClassification::inline(
+            StableContextSlot::Environment,
+        ));
     }
     if role == "user" && marked(text, "<task_model_guidance>", "</task_model_guidance>") {
-        return Some(StableContextSlot::TaskModelGuidance);
+        return Some(StableTextClassification::inline(
+            StableContextSlot::TaskModelGuidance,
+        ));
     }
     if role == "user" && marked(text, "<kd4_task_state_v1>", "</kd4_task_state_v1>") {
-        return Some(StableContextSlot::TaskEvidence);
+        return Some(StableTextClassification::inline(
+            StableContextSlot::TaskEvidence,
+        ));
     }
     if role == "user" && marked(text, "<recommended_plugins>", "</recommended_plugins>") {
-        return Some(StableContextSlot::RecommendedPlugins);
+        return Some(StableTextClassification::inline(
+            StableContextSlot::RecommendedPlugins,
+        ));
     }
     if role != "developer" {
         return None;
     }
+    let trimmed = text.trim();
+    if trimmed == DEVELOPER_INSTRUCTIONS_PRESENT_MARKER {
+        return Some(StableTextClassification {
+            slot: StableContextSlot::DeveloperInstructions,
+            payload: StablePayload::FollowingText,
+        });
+    }
+    if trimmed == DEVELOPER_INSTRUCTIONS_REMOVED_MARKER {
+        return Some(StableTextClassification {
+            slot: StableContextSlot::DeveloperInstructions,
+            payload: StablePayload::Removed,
+        });
+    }
+    if trimmed == MULTI_AGENT_USAGE_HINT_PRESENT_MARKER {
+        return Some(StableTextClassification {
+            slot: StableContextSlot::MultiAgentUsageHint,
+            payload: StablePayload::FollowingText,
+        });
+    }
+    if trimmed == MULTI_AGENT_USAGE_HINT_REMOVED_MARKER {
+        return Some(StableTextClassification {
+            slot: StableContextSlot::MultiAgentUsageHint,
+            payload: StablePayload::Removed,
+        });
+    }
     if text.trim_start().starts_with(ROOT_COORDINATOR_PREFIX) {
-        return Some(StableContextSlot::RootCoordinator);
+        return Some(StableTextClassification::inline(
+            StableContextSlot::RootCoordinator,
+        ));
     }
     [
+        (
+            ROOT_ORCHESTRATION_OPEN_TAG,
+            ROOT_ORCHESTRATION_CLOSE_TAG,
+            StableContextSlot::RootCoordinator,
+        ),
         (
             COLLABORATION_MODE_OPEN_TAG,
             "</collaboration_mode>",
@@ -896,6 +1191,16 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableContextSlot> {
             SKILLS_INSTRUCTIONS_OPEN_TAG,
             "</skills_instructions>",
             StableContextSlot::SkillCatalog,
+        ),
+        (
+            EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG,
+            EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG,
+            StableContextSlot::ExtensionSkillCatalog,
+        ),
+        (
+            ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG,
+            ENVIRONMENT_SKILLS_INSTRUCTIONS_CLOSE_TAG,
+            StableContextSlot::EnvironmentSkillCatalog,
         ),
         (
             APPS_INSTRUCTIONS_OPEN_TAG,
@@ -939,15 +1244,20 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableContextSlot> {
         ),
     ]
     .into_iter()
-    .find_map(|(open, close, slot)| marked(text, open, close).then_some(slot))
+    .find_map(|(open, close, slot)| {
+        marked(text, open, close).then_some(StableTextClassification::inline(slot))
+    })
 }
 
 fn contains_known_open_marker(text: &str) -> bool {
     [
         REPOSITORY_OPEN_TAG,
+        ROOT_ORCHESTRATION_OPEN_TAG,
         COLLABORATION_MODE_OPEN_TAG,
         SKILLS_USAGE_OPEN_TAG,
         SKILLS_INSTRUCTIONS_OPEN_TAG,
+        EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG,
+        ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG,
         SKILL_OPEN_TAG,
         "<environment_context>",
         "<task_model_guidance>",
@@ -959,6 +1269,8 @@ fn contains_known_open_marker(text: &str) -> bool {
         "<permissions instructions>",
         "<memory_context>",
         MULTI_AGENT_MODE_OPEN_TAG,
+        "<configured_developer_instructions",
+        "<multi_agent_usage_hint",
         "<model_switch>",
         "<personality_spec>",
     ]
@@ -966,18 +1278,94 @@ fn contains_known_open_marker(text: &str) -> bool {
     .any(|marker| text.trim_start().starts_with(marker))
 }
 
+fn stable_identity_sections(
+    text: Option<&str>,
+    present_marker: &str,
+    removed_marker: &str,
+) -> Vec<String> {
+    match text.filter(|text| !text.is_empty()) {
+        Some(text) => vec![present_marker.to_string(), text.to_string()],
+        None => vec![removed_marker.to_string()],
+    }
+}
+
+pub(crate) fn configured_developer_instructions_sections(text: Option<&str>) -> Vec<String> {
+    stable_identity_sections(
+        text,
+        DEVELOPER_INSTRUCTIONS_PRESENT_MARKER,
+        DEVELOPER_INSTRUCTIONS_REMOVED_MARKER,
+    )
+}
+
+pub(crate) fn multi_agent_usage_hint_sections(text: Option<&str>) -> Vec<String> {
+    stable_identity_sections(
+        text.map(|text| {
+            format!(
+                "{text}\n\nTool availability does not authorize spawning agents. The active <multi_agent_mode> and its applicable instructions govern whether delegation is allowed."
+            )
+        })
+        .as_deref(),
+        MULTI_AGENT_USAGE_HINT_PRESENT_MARKER,
+        MULTI_AGENT_USAGE_HINT_REMOVED_MARKER,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn multi_agent_usage_hint_payload(item: &ResponseItem) -> Option<&str> {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return None;
+    };
+    let [
+        ContentItem::InputText { text: marker },
+        ContentItem::InputText { text },
+    ] = content.as_slice()
+    else {
+        return None;
+    };
+    (role == "developer" && marker.trim() == MULTI_AGENT_USAGE_HINT_PRESENT_MARKER)
+        .then_some(text.as_str())
+}
+
+pub(crate) fn is_multi_agent_usage_hint_item(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    let Some(ContentItem::InputText { text }) = content.first() else {
+        return false;
+    };
+    role == "developer"
+        && matches!(
+            text.trim(),
+            MULTI_AGENT_USAGE_HINT_PRESENT_MARKER | MULTI_AGENT_USAGE_HINT_REMOVED_MARKER
+        )
+}
+
 fn marked(text: &str, open: &str, close: &str) -> bool {
     let text = text.trim();
     text.starts_with(open) && text.ends_with(close)
 }
 
-fn compact_skill_catalog_reference(catalog: &str) -> String {
+fn compact_skill_catalog_reference(slot: StableContextSlot, catalog: &str) -> String {
     #[cfg(test)]
     COMPACT_CATALOG_CALLS.with(|calls| calls.set(calls.get() + 1));
 
     let digest: [u8; 32] = Sha256::digest(catalog.as_bytes()).into();
+    let (open_tag, close_tag) = match slot {
+        StableContextSlot::SkillCatalog => {
+            (SKILLS_INSTRUCTIONS_OPEN_TAG, SKILLS_INSTRUCTIONS_CLOSE_TAG)
+        }
+        StableContextSlot::ExtensionSkillCatalog => (
+            EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG,
+            EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG,
+        ),
+        StableContextSlot::EnvironmentSkillCatalog => (
+            ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG,
+            ENVIRONMENT_SKILLS_INSTRUCTIONS_CLOSE_TAG,
+        ),
+        _ => unreachable!("only skill catalog slots can be compacted"),
+    };
     format!(
-        "<skills_instructions>\n<active_catalog version=\"v1\" sha256=\"{}\" state=\"selected\" />\nThe full catalog is inactive while explicitly selected skill instructions are active. It will be restored for a later capability-selection turn.\n</skills_instructions>",
+        "{open_tag}\n<active_catalog version=\"v1\" sha256=\"{}\" state=\"selected\" />\nThe full catalog is inactive while explicitly selected skill instructions are active. It will be restored for a later capability-selection turn.\n{close_tag}",
         short_hash(&digest)
     )
 }
@@ -1083,7 +1471,7 @@ mod tests_optimization {
     use codex_protocol::models::MessagePhase;
 
     fn text_message(role: &str, text: &str) -> ResponseItem {
-        ResponseItem::Message {
+        let mut item = ResponseItem::Message {
             id: None,
             role: role.to_string(),
             content: vec![ContentItem::InputText {
@@ -1091,7 +1479,9 @@ mod tests_optimization {
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
-        }
+        };
+        mark_trusted_stable_context_item(&mut item);
+        item
     }
 
     fn text_message_for_turn(role: &str, text: &str, turn_id: &str) -> ResponseItem {
@@ -1109,6 +1499,72 @@ mod tests_optimization {
             ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text),
             _ => None,
         }
+    }
+
+    #[test]
+    fn unchanged_nonvolatile_injection_is_reused_without_history_growth() {
+        let guidance = text_message(
+            "user",
+            "<task_model_guidance>\nkeep the task focused\n</task_model_guidance>",
+        );
+
+        let retained = filter_unchanged_stable_context_items(
+            std::slice::from_ref(&guidance),
+            vec![guidance.clone()],
+        );
+
+        assert!(retained.is_empty());
+    }
+
+    #[test]
+    fn wrapped_root_orchestration_is_classified_and_reused() {
+        let old = text_message(
+            "developer",
+            "<root_orchestration_instructions>old orchestration</root_orchestration_instructions>",
+        );
+        let current = text_message(
+            "developer",
+            "<root_orchestration_instructions>current orchestration</root_orchestration_instructions>",
+        );
+
+        let projected = project_stable_context(
+            vec![old, current.clone()].into(),
+            StableContextTarget::Sampling,
+        );
+        let root_items = projected
+            .manifest
+            .components
+            .iter()
+            .filter(|component| component.kind == StableContextKind::RootCoordinator)
+            .count();
+
+        assert_eq!(root_items, 1);
+        assert_eq!(projected.items.as_ref(), &[current]);
+    }
+
+    #[test]
+    fn changed_and_volatile_injections_remain_turn_scoped() {
+        let old_guidance = text_message(
+            "user",
+            "<task_model_guidance>\nold guidance\n</task_model_guidance>",
+        );
+        let new_guidance = text_message(
+            "user",
+            "<task_model_guidance>\nnew guidance\n</task_model_guidance>",
+        );
+        let selected_skill = text_message("user", &skill("one"));
+
+        assert_eq!(
+            filter_unchanged_stable_context_items(&[old_guidance], vec![new_guidance.clone()]),
+            vec![new_guidance]
+        );
+        assert_eq!(
+            filter_unchanged_stable_context_items(
+                std::slice::from_ref(&selected_skill),
+                vec![selected_skill.clone()]
+            ),
+            vec![selected_skill]
+        );
     }
 
     #[test]
@@ -1313,17 +1769,23 @@ mod tests_optimization {
             Occurrence {
                 item_index: 0,
                 content_index: 0,
+                payload_content_index: None,
                 slot: StableContextSlot::Repository,
+                explicitly_removed: false,
             },
             Occurrence {
                 item_index: 1,
                 content_index: 0,
+                payload_content_index: None,
                 slot: StableContextSlot::Repository,
+                explicitly_removed: false,
             },
             Occurrence {
                 item_index: 2,
                 content_index: 0,
+                payload_content_index: None,
                 slot: StableContextSlot::Repository,
+                explicitly_removed: false,
             },
         ];
 

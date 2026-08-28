@@ -37,6 +37,8 @@ use crate::cell_actor::CellHost;
 use crate::cell_actor::CellState;
 use crate::cell_actor::CellToolCall;
 use crate::cell_actor::CompletionCommit;
+use crate::runtime::stored_value_limit_message;
+use crate::runtime::stored_values_with_writes_within_limits;
 
 type RuntimeEventFuture = Pin<Box<dyn Future<Output = Result<CellEvent, Error>> + Send + 'static>>;
 const TERMINAL_CELL_CACHE_CAPACITY: usize = 256;
@@ -329,8 +331,17 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             }
             stored_values = self.inner.stored_values.lock() => stored_values,
         };
+        let writes_fit =
+            stored_values_with_writes_within_limits(&stored_values, &stored_value_writes);
+        let event = if writes_fit {
+            event
+        } else {
+            storage_rejected_event(event)
+        };
         cell_state.commit_completion(event, pending_initial_yield_items, || {
-            stored_values.extend(stored_value_writes);
+            if writes_fit {
+                stored_values.extend(stored_value_writes);
+            }
         })
     }
 
@@ -351,6 +362,26 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         }
         self.cell_permit.lock().await.take();
         self.inner.delegate.cell_closed(&self.cell_id);
+    }
+}
+
+fn storage_rejected_event(event: CellEvent) -> CellEvent {
+    match event {
+        CellEvent::Completed {
+            content_items,
+            error_text,
+        } => {
+            let limit_error = stored_value_limit_message();
+            let error_text = Some(match error_text {
+                Some(error) => format!("{error}\n{limit_error}"),
+                None => limit_error,
+            });
+            CellEvent::Completed {
+                content_items,
+                error_text,
+            }
+        }
+        event => event,
     }
 }
 

@@ -43,11 +43,15 @@ pub(crate) mod view_image_spec;
 mod wait_for_environment;
 
 use codex_git_utils::get_git_repo_root;
+use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
+#[cfg(test)]
 use codex_sandboxing::policy_transforms::intersect_permission_profiles;
-use codex_sandboxing::policy_transforms::merge_permission_profiles;
+use codex_sandboxing::policy_transforms::intersect_uri_permission_profiles;
+use codex_sandboxing::policy_transforms::merge_uri_permission_profiles;
 use codex_sandboxing::policy_transforms::normalize_additional_permissions;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
+use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
@@ -193,7 +197,19 @@ where
 }
 
 pub(crate) fn resolve_repository_root(cwd: &Path) -> PathBuf {
+    #[cfg(test)]
+    REPOSITORY_ROOT_RESOLUTION_COUNT.with(|count| count.set(count.get() + 1));
     resolve_repository_root_with(cwd, get_git_repo_root)
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPOSITORY_ROOT_RESOLUTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_repository_root_resolution_count() {
+    REPOSITORY_ROOT_RESOLUTION_COUNT.with(|count| count.set(0));
 }
 
 fn resolve_repository_root_with(
@@ -376,6 +392,7 @@ pub(crate) fn normalize_and_validate_additional_permissions(
 pub(super) struct EffectiveAdditionalPermissions {
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
+    pub additional_permissions_uri: Option<UriAdditionalPermissionProfile>,
     pub permissions_preapproved: bool,
 }
 
@@ -398,8 +415,28 @@ pub(super) fn implicit_granted_permissions(
 
 pub(super) async fn apply_granted_turn_permissions(
     session: &Session,
-    environment_id: &str,
+    approval_scope_id: &str,
     cwd: &Path,
+    sandbox_permissions: SandboxPermissions,
+    additional_permissions: Option<AdditionalPermissionProfile>,
+) -> EffectiveAdditionalPermissions {
+    let Ok(cwd) = AbsolutePathBuf::from_absolute_path(cwd) else {
+        unreachable!("permission matching cwd must be absolute");
+    };
+    apply_granted_turn_permissions_uri(
+        session,
+        approval_scope_id,
+        &PathUri::from_abs_path(&cwd),
+        sandbox_permissions,
+        additional_permissions,
+    )
+    .await
+}
+
+pub(super) async fn apply_granted_turn_permissions_uri(
+    session: &Session,
+    approval_scope_id: &str,
+    cwd: &PathUri,
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<AdditionalPermissionProfile>,
 ) -> EffectiveAdditionalPermissions {
@@ -407,41 +444,59 @@ pub(super) async fn apply_granted_turn_permissions(
         return EffectiveAdditionalPermissions {
             sandbox_permissions,
             additional_permissions,
+            additional_permissions_uri: None,
             permissions_preapproved: false,
         };
     }
 
-    let granted_session_permissions = session.granted_session_permissions(environment_id).await;
-    let granted_turn_permissions = session.granted_turn_permissions(environment_id).await;
-    let granted_permissions = merge_permission_profiles(
+    let granted_session_permissions = session.granted_session_permissions(approval_scope_id).await;
+    let granted_turn_permissions = session.granted_turn_permissions(approval_scope_id).await;
+    let granted_permissions = merge_uri_permission_profiles(
         granted_session_permissions.as_ref(),
         granted_turn_permissions.as_ref(),
     );
-    let effective_permissions = merge_permission_profiles(
-        additional_permissions.as_ref(),
+    let requested_permissions_uri = additional_permissions.clone().map(Into::into);
+    let effective_permissions_uri = merge_uri_permission_profiles(
+        requested_permissions_uri.as_ref(),
         granted_permissions.as_ref(),
     );
-    let permissions_preapproved = match (effective_permissions.as_ref(), granted_permissions) {
+    let permissions_preapproved = match (effective_permissions_uri.as_ref(), granted_permissions) {
         (Some(effective_permissions), Some(granted_permissions)) => {
-            permissions_are_preapproved(effective_permissions, granted_permissions, cwd)
+            uri_permissions_are_preapproved(effective_permissions, granted_permissions, cwd)
         }
         _ => false,
     };
 
-    let sandbox_permissions =
-        if effective_permissions.is_some() && !sandbox_permissions.uses_additional_permissions() {
-            SandboxPermissions::WithAdditionalPermissions
-        } else {
-            sandbox_permissions
-        };
+    let effective_permissions = effective_permissions_uri
+        .clone()
+        .and_then(|permissions| AdditionalPermissionProfile::try_from(permissions).ok());
+
+    let sandbox_permissions = if effective_permissions_uri.is_some()
+        && !sandbox_permissions.uses_additional_permissions()
+    {
+        SandboxPermissions::WithAdditionalPermissions
+    } else {
+        sandbox_permissions
+    };
 
     EffectiveAdditionalPermissions {
         sandbox_permissions,
         additional_permissions: effective_permissions,
+        additional_permissions_uri: effective_permissions_uri,
         permissions_preapproved,
     }
 }
 
+fn uri_permissions_are_preapproved(
+    effective_permissions: &UriAdditionalPermissionProfile,
+    granted_permissions: UriAdditionalPermissionProfile,
+    cwd: &PathUri,
+) -> bool {
+    intersect_uri_permission_profiles(effective_permissions.clone(), granted_permissions, cwd)
+        == *effective_permissions
+}
+
+#[cfg(test)]
 fn permissions_are_preapproved(
     effective_permissions: &AdditionalPermissionProfile,
     granted_permissions: AdditionalPermissionProfile,
@@ -570,6 +625,7 @@ mod tests {
             &EffectiveAdditionalPermissions {
                 sandbox_permissions: SandboxPermissions::WithAdditionalPermissions,
                 additional_permissions: Some(granted_permissions.clone()),
+                additional_permissions_uri: None,
                 permissions_preapproved: false,
             },
         );
@@ -587,6 +643,7 @@ mod tests {
             &EffectiveAdditionalPermissions {
                 sandbox_permissions: SandboxPermissions::WithAdditionalPermissions,
                 additional_permissions: Some(requested_permissions.clone()),
+                additional_permissions_uri: None,
                 permissions_preapproved: false,
             },
         );

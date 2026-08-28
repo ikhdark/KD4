@@ -12,7 +12,19 @@ impl ChatWidget {
             self.set_status_header(header);
         } else if self.bottom_pane.is_task_running() {
             self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Working;
-            self.set_status_header(String::from("Working"));
+            let header = self
+                .active_reasoning_policy
+                .as_ref()
+                .map(|snapshot| match snapshot.phase {
+                    codex_protocol::protocol::ReasoningPolicyPhase::Orient => "Orienting",
+                    codex_protocol::protocol::ReasoningPolicyPhase::Inspect => "Inspecting",
+                    codex_protocol::protocol::ReasoningPolicyPhase::Implement => "Implementing",
+                    codex_protocol::protocol::ReasoningPolicyPhase::Verify => "Verifying",
+                    codex_protocol::protocol::ReasoningPolicyPhase::Diagnose => "Diagnosing",
+                    codex_protocol::protocol::ReasoningPolicyPhase::Finalize => "Finalizing",
+                })
+                .unwrap_or("Working");
+            self.set_status_header(header.to_string());
         }
     }
 
@@ -361,7 +373,7 @@ impl ChatWidget {
         }
 
         if self.turn_lifecycle.agent_turn_running {
-            self.refresh_runtime_metrics();
+            self.refresh_runtime_metrics(now);
         }
     }
 
@@ -446,8 +458,40 @@ impl ChatWidget {
             && self.active_cell_is_stream_tail()
     }
 
+    /// Render all source committed since the previous display frame in one pass.
+    pub(super) fn flush_streaming_render_for_frame(&mut self) {
+        let answer_enqueued = self
+            .stream_controller
+            .as_mut()
+            .is_some_and(StreamController::flush_render_for_frame);
+        let plan_enqueued = self
+            .plan_stream_controller
+            .as_mut()
+            .is_some_and(PlanStreamController::flush_render_for_frame);
+        if answer_enqueued || plan_enqueued {
+            self.app_event_tx.send(AppEvent::StartCommitAnimation);
+            self.run_catch_up_commit_tick();
+        }
+        self.sync_active_stream_tail();
+    }
+
     pub(super) fn sync_active_stream_tail(&mut self) {
         if let Some(controller) = self.stream_controller.as_ref() {
+            let (revision, tail_starts_stream) = controller.tail_sync_key();
+            let sync_key = transcript::ActiveStreamTailSyncKey::Agent {
+                revision,
+                tail_starts_stream,
+            };
+            if self.transcript.active_stream_tail_sync
+                == Some((sync_key, self.transcript.active_cell_revision))
+                && self
+                    .transcript
+                    .active_cell
+                    .as_ref()
+                    .is_some_and(|cell| cell.as_any().is::<history_cell::StreamingAgentTailCell>())
+            {
+                return;
+            }
             let tail_lines = controller.current_tail_lines();
             if tail_lines.is_empty() {
                 self.clear_active_stream_tail();
@@ -455,16 +499,34 @@ impl ChatWidget {
             }
 
             self.bottom_pane.hide_status_indicator();
-            self.transcript.active_cell =
-                Some(Box::new(history_cell::StreamingAgentTailCell::new(
-                    tail_lines,
-                    controller.tail_starts_stream(),
-                )));
+            self.transcript.active_cell = Some(Box::new(
+                history_cell::StreamingAgentTailCell::new(tail_lines, tail_starts_stream),
+            ));
             self.bump_active_cell_revision();
+            self.transcript.active_stream_tail_sync =
+                Some((sync_key, self.transcript.active_cell_revision));
             return;
         }
 
         if let Some(controller) = self.plan_stream_controller.as_ref() {
+            let (revision, header_emitted, top_padding_emitted, tail_starts_stream) =
+                controller.tail_sync_key();
+            let sync_key = transcript::ActiveStreamTailSyncKey::Plan {
+                revision,
+                header_emitted,
+                top_padding_emitted,
+                tail_starts_stream,
+            };
+            if self.transcript.active_stream_tail_sync
+                == Some((sync_key, self.transcript.active_cell_revision))
+                && self
+                    .transcript
+                    .active_cell
+                    .as_ref()
+                    .is_some_and(|cell| cell.as_any().is::<history_cell::StreamingPlanTailCell>())
+            {
+                return;
+            }
             let tail_lines = controller.current_tail_display_lines();
             if tail_lines.is_empty() {
                 self.clear_active_stream_tail();
@@ -474,9 +536,11 @@ impl ChatWidget {
             self.bottom_pane.hide_status_indicator();
             self.transcript.active_cell = Some(Box::new(history_cell::StreamingPlanTailCell::new(
                 tail_lines,
-                !controller.tail_starts_stream(),
+                !tail_starts_stream,
             )));
             self.bump_active_cell_revision();
+            self.transcript.active_stream_tail_sync =
+                Some((sync_key, self.transcript.active_cell_revision));
             return;
         }
 
@@ -484,6 +548,7 @@ impl ChatWidget {
     }
 
     pub(super) fn clear_active_stream_tail(&mut self) {
+        self.transcript.active_stream_tail_sync = None;
         if self.active_cell_is_stream_tail() {
             self.transcript.active_cell = None;
             self.bump_active_cell_revision();

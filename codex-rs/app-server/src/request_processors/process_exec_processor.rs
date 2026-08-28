@@ -35,6 +35,7 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::command_exec::OutputByteCap;
 use crate::command_exec::StdinWriteRequest;
 use crate::command_exec::spawn_stdin_writer;
 use crate::command_exec::terminal_size_from_protocol;
@@ -49,6 +50,47 @@ use crate::outgoing_message::OutgoingMessageSender;
 
 const EXEC_TIMEOUT_EXIT_CODE: i32 = 124;
 const OUTPUT_CHUNK_SIZE_HINT: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessSpawnLogMetadata {
+    argv_count: usize,
+    env_key_count: usize,
+    tty: bool,
+    stream_stdin: bool,
+    stream_stdout_stderr: bool,
+    output_cap_present: bool,
+    timeout_present: bool,
+    size_present: bool,
+}
+
+fn process_spawn_log_metadata(params: &ProcessSpawnParams) -> ProcessSpawnLogMetadata {
+    ProcessSpawnLogMetadata {
+        argv_count: params.command.len(),
+        env_key_count: params.env.as_ref().map_or(0, HashMap::len),
+        tty: params.tty,
+        stream_stdin: params.stream_stdin,
+        stream_stdout_stderr: params.stream_stdout_stderr,
+        output_cap_present: params.output_bytes_cap.is_some(),
+        timeout_present: params.timeout_ms.is_some(),
+        size_present: params.size.is_some(),
+    }
+}
+
+fn log_process_spawn_request(params: &ProcessSpawnParams) {
+    let metadata = process_spawn_log_metadata(params);
+    tracing::debug!(
+        rpc.method = "process/spawn",
+        argv_count = metadata.argv_count,
+        env_key_count = metadata.env_key_count,
+        tty = metadata.tty,
+        stream_stdin = metadata.stream_stdin,
+        stream_stdout_stderr = metadata.stream_stdout_stderr,
+        output_cap_present = metadata.output_cap_present,
+        timeout_present = metadata.timeout_present,
+        size_present = metadata.size_present,
+        "command request"
+    );
+}
 
 #[derive(Clone)]
 pub(crate) struct ProcessExecRequestProcessor {
@@ -76,6 +118,7 @@ impl ProcessExecRequestProcessor {
         rpc_gate: &ConnectionRpcGate,
     ) -> Result<(), JSONRPCErrorError> {
         self.require_local_environment()?;
+        log_process_spawn_request(&params);
         let ProcessSpawnParams {
             command,
             process_handle,
@@ -89,7 +132,6 @@ impl ProcessExecRequestProcessor {
             size,
         } = params;
         let method_name = "process/spawn";
-        tracing::debug!("{method_name} command: {command:?}");
         validate_command_argv(&command)?;
         if process_handle.is_empty() {
             return Err(invalid_request("processHandle must not be empty"));
@@ -352,7 +394,9 @@ impl ProcessExecRequestProcessor {
         let sessions = Arc::clone(&self.sessions);
         let response_outgoing = Arc::clone(&outgoing);
         let response_request_id = request_id.clone();
+        let (response_enqueued_tx, response_enqueued_rx) = oneshot::channel();
         tokio::spawn(async move {
+            let _ = response_enqueued_rx.await;
             run_process(RunProcessParams {
                 outgoing,
                 request_id,
@@ -376,6 +420,7 @@ impl ProcessExecRequestProcessor {
         response_outgoing
             .send_response(response_request_id, ProcessSpawnResponse {})
             .await;
+        let _ = response_enqueued_tx.send(());
 
         Ok(())
     }
@@ -584,10 +629,9 @@ async fn run_process(params: RunProcessParams) {
                             ProcessControl::Resize { size } => {
                                 handle_process_resize(&session, size)
                             }
-                            ProcessControl::Kill => {
-                                session.request_terminate();
-                                Ok(())
-                            }
+                            ProcessControl::Kill => session
+                                .request_terminate()
+                                .map_err(|error| internal_error(error.to_string())),
                         };
                         if let Some(response_tx) = response_tx
                             && response_tx.send(result).is_err()
@@ -600,13 +644,13 @@ async fn run_process(params: RunProcessParams) {
                     },
                     None => {
                         control_open = false;
-                        session.request_terminate();
+                        let _ = session.request_terminate();
                     }
                 }
             }
             outcome = &mut expiration, if expiration_outcome.is_none() => {
                 expiration_outcome = Some(outcome);
-                session.request_terminate();
+                let _ = session.request_terminate();
             }
             exit = &mut exit_rx => {
                 if matches!(expiration_outcome, Some(ExecExpirationOutcome::TimedOut)) {
@@ -666,8 +710,7 @@ fn collect_spawn_process_output(
     } = params;
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
-        let mut observed_num_bytes = 0usize;
-        let mut cap_reached = false;
+        let mut cap = OutputByteCap::new(output_bytes_cap);
         loop {
             let mut chunk = tokio::select! {
                 chunk = output_rx.recv() => match chunk {
@@ -681,18 +724,11 @@ fn collect_spawn_process_output(
             {
                 chunk.extend_from_slice(&next_chunk);
             }
-            let capped_chunk = match output_bytes_cap {
-                Some(output_bytes_cap) => {
-                    let capped_chunk_len = output_bytes_cap
-                        .saturating_sub(observed_num_bytes)
-                        .min(chunk.len());
-                    observed_num_bytes += capped_chunk_len;
-                    &chunk[0..capped_chunk_len]
-                }
-                None => chunk.as_slice(),
-            };
-            cap_reached = Some(observed_num_bytes) == output_bytes_cap;
+            let (capped_chunk, cap_reached) = cap.accept(&chunk);
             if stream_output {
+                if capped_chunk.is_empty() && !cap_reached {
+                    continue;
+                }
                 if !outgoing
                     .send_server_notification_to_connection_bounded(
                         connection_id,
@@ -712,13 +748,10 @@ fn collect_spawn_process_output(
             } else {
                 buffer.extend_from_slice(capped_chunk);
             }
-            if cap_reached {
-                break;
-            }
         }
         ProcessOutputCapture {
             text: bytes_to_string_smart(&buffer),
-            cap_reached,
+            cap_reached: cap.truncated(),
         }
     })
 }
@@ -755,6 +788,42 @@ mod tests {
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
 
+    #[test]
+    fn logging_contract_process_spawn_metadata_omits_argv_and_env_values() {
+        let params = ProcessSpawnParams {
+            command: vec![
+                "powershell".to_string(),
+                "-Command".to_string(),
+                "command secret".to_string(),
+            ],
+            process_handle: "process secret".to_string(),
+            cwd: AbsolutePathBuf::from_absolute_path(std::env::temp_dir())
+                .expect("absolute temp dir"),
+            tty: true,
+            stream_stdin: true,
+            stream_stdout_stderr: true,
+            output_bytes_cap: Some(Some(1024)),
+            timeout_ms: Some(Some(1000)),
+            env: Some(HashMap::from([(
+                "SECRET_KEY".to_string(),
+                Some("secret value".to_string()),
+            )])),
+            size: None,
+        };
+
+        let metadata = process_spawn_log_metadata(&params);
+
+        assert_eq!(metadata.argv_count, 3);
+        assert_eq!(metadata.env_key_count, 1);
+        assert!(metadata.tty);
+        assert!(metadata.output_cap_present);
+        assert!(metadata.timeout_present);
+        let rendered = format!("{metadata:?}");
+        assert!(!rendered.contains("command secret"));
+        assert!(!rendered.contains("secret value"));
+        assert!(!rendered.contains("process secret"));
+    }
+
     #[tokio::test]
     async fn backpressured_stdin_does_not_block_kill_control() {
         let (writer_tx, mut writer_rx) = mpsc::channel(1);
@@ -770,11 +839,12 @@ mod tests {
         let terminator_flag = Arc::clone(&terminated);
         let spawned = spawn_from_driver(ProcessDriver {
             writer_tx,
-            stdout_rx,
-            stderr_rx: Some(stderr_rx),
+            stdout_rx: stdout_rx.into(),
+            stderr_rx: Some(stderr_rx.into()),
             exit_rx,
             terminator: Some(Box::new(move || {
                 terminator_flag.store(true, Ordering::SeqCst);
+                Ok(())
             })),
             writer_handle: None,
             resizer: None,

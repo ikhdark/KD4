@@ -20,6 +20,8 @@ pub use model::SkillMetadata;
 pub use model::SkillPolicy;
 pub use model::filter_skill_load_outcome_for_product;
 pub use model::skill_catalog_id;
+pub use model::skill_instruction_role;
+pub use model::skill_scope_label;
 pub use render::AvailableSkills;
 pub use render::SKILLS_HOW_TO_USE;
 pub use render::SKILLS_INTRO_WITH_ABSOLUTE_PATHS;

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -22,6 +23,7 @@ use crate::guardian::GuardianRejectionCircuitBreaker;
 use crate::mcp::McpManager;
 use crate::plan_store::PlanStore;
 use crate::session::McpRuntimeSnapshot;
+use crate::task_evidence::Kd4RepositoryContext;
 use crate::task_evidence::TaskEvidenceLedger;
 use crate::tools::code_mode::CodeModeService;
 use crate::tools::command_execution::CommandExecutionLedger;
@@ -67,6 +69,7 @@ pub(crate) struct SessionServices {
     pub(crate) command_execution: CommandExecutionLedger,
     pub(crate) plan_store: PlanStore,
     pub(crate) task_evidence: TaskEvidenceLedger,
+    pub(crate) kd4_repository_context: std::sync::RwLock<Kd4RepositoryContext>,
     pub(crate) elicitations: ElicitationService,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) hooks: ArcSwap<Hooks>,
@@ -112,6 +115,21 @@ pub(crate) struct SessionServices {
 }
 
 impl SessionServices {
+    pub(crate) fn kd4_workflow_enabled_for(&self, cwd: &Path) -> bool {
+        self.kd4_repository_context
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(cwd)
+    }
+
+    pub(crate) fn set_kd4_repository_context(&self, repository_root: Option<std::path::PathBuf>) {
+        *self
+            .kd4_repository_context
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Kd4RepositoryContext::from_repository_root(repository_root);
+    }
+
     /// Installs the manager before validating required servers so startup-time elicitation can
     /// resolve through the session's manager while validation waits.
     pub(crate) async fn install_mcp_connection_manager(
@@ -160,16 +178,21 @@ impl SessionServices {
         plugins_available: bool,
         runtime_context: McpRuntimeContext,
         available_environment_ids: Vec<String>,
-        manager: Arc<McpConnectionManager>,
+        existing_runtime: &McpRuntimeSnapshot,
     ) -> Arc<McpRuntimeSnapshot> {
-        self.publish_mcp_runtime_update(
-            state_owner,
+        let next_generation = self.planning_generation().saturating_add(1);
+        let runtime = self.publish_mcp_runtime_with_generation_and_lifecycle(
+            next_generation,
             config,
             plugins_available,
             runtime_context,
             available_environment_ids,
-            manager,
-        )
+            existing_runtime.manager_arc(),
+            existing_runtime.manager_lifecycle_arc(),
+        );
+        let published_generation = self.advance_planning_generation(state_owner);
+        debug_assert_eq!(published_generation, next_generation);
+        runtime
     }
 
     fn publish_mcp_runtime_update(
@@ -228,6 +251,31 @@ impl SessionServices {
             config,
             plugins_available,
             manager,
+            runtime_context,
+            available_environment_ids,
+        ));
+        self.mcp_runtime.store(Some(Arc::clone(&runtime)));
+        runtime
+    }
+
+    // Publishing is one atomic runtime generation transition with its full context.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_mcp_runtime_with_generation_and_lifecycle(
+        &self,
+        generation: u64,
+        config: Arc<McpConfig>,
+        plugins_available: bool,
+        runtime_context: McpRuntimeContext,
+        available_environment_ids: Vec<String>,
+        manager: Arc<McpConnectionManager>,
+        manager_lifecycle: Arc<crate::session::McpManagerLifecycle>,
+    ) -> Arc<McpRuntimeSnapshot> {
+        let runtime = Arc::new(McpRuntimeSnapshot::new_with_manager_lifecycle(
+            generation,
+            config,
+            plugins_available,
+            manager,
+            manager_lifecycle,
             runtime_context,
             available_environment_ids,
         ));

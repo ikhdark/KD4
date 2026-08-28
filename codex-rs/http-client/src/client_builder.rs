@@ -16,7 +16,8 @@ use crate::HttpClientFactory;
 use crate::OutboundProxyRoute;
 use crate::chatgpt_cloudflare_cookies::ChatGptCookieStore;
 use crate::client::RequestLogging;
-use crate::custom_ca::build_reqwest_client_with_custom_ca;
+use crate::custom_ca::CustomCaPolicy;
+use crate::custom_ca::build_reqwest_client_with_custom_ca_policy;
 use crate::with_chatgpt_cloudflare_cookie_store;
 
 /// Configures an [`HttpClient`] without exposing the underlying HTTP implementation.
@@ -105,6 +106,8 @@ impl HttpClientBuilder {
     }
 
     /// Replaces the transport root set with the certificate encoded by `pem`.
+    ///
+    /// Process custom CA environment variables are not added to this exclusive root set.
     pub fn tls_certs_only_pem(mut self, pem: &[u8]) -> Result<Self, crate::HttpError> {
         let certificate = reqwest::Certificate::from_pem(pem)?;
         self.tls_certs_only = Some(vec![certificate]);
@@ -152,8 +155,13 @@ impl HttpClientBuilder {
         route_class: ClientRouteClass,
     ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
         self.chatgpt_cookie_store = http_client_factory.chatgpt_cookie_store();
-        let (builder, request_logging) = self.into_reqwest_parts();
-        let inner = http_client_factory.build_reqwest_client(builder, request_url, route_class)?;
+        let (builder, request_logging, custom_ca_policy) = self.into_reqwest_parts();
+        let inner = http_client_factory.build_reqwest_client_with_custom_ca_policy(
+            builder,
+            request_url,
+            route_class,
+            custom_ca_policy,
+        )?;
         Ok(HttpClient::from_parts(inner, request_logging))
     }
 
@@ -165,11 +173,12 @@ impl HttpClientBuilder {
         route: &OutboundProxyRoute,
     ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
         self.chatgpt_cookie_store = http_client_factory.chatgpt_cookie_store();
-        let (builder, request_logging) = self.into_reqwest_parts();
+        let (builder, request_logging, custom_ca_policy) = self.into_reqwest_parts();
         let inner = http_client_factory.build_reqwest_client_for_resolved_route(
             builder,
             route_class,
             route,
+            custom_ca_policy,
         )?;
         Ok(HttpClient::from_parts(inner, request_logging))
     }
@@ -184,8 +193,8 @@ impl HttpClientBuilder {
     /// traffic must use [`Self::build_respecting_outbound_proxy_policy`] or
     /// [`HttpClientFactory::build_client`].
     pub fn build_direct(self) -> Result<HttpClient, BuildCustomCaTransportError> {
-        let (builder, request_logging) = self.into_reqwest_parts();
-        build_reqwest_client_with_custom_ca(builder.no_proxy())
+        let (builder, request_logging, custom_ca_policy) = self.into_reqwest_parts();
+        build_reqwest_client_with_custom_ca_policy(builder.no_proxy(), custom_ca_policy)
             .map(|inner| HttpClient::from_parts(inner, request_logging))
     }
 
@@ -199,24 +208,39 @@ impl HttpClientBuilder {
     pub fn build_with_transport_default_proxy(
         self,
     ) -> Result<HttpClient, BuildCustomCaTransportError> {
-        self.build_with_transport_default_proxy_using(build_reqwest_client_with_custom_ca)
+        self.build_with_transport_default_proxy_using(build_reqwest_client_with_custom_ca_policy)
     }
 
     fn build_with_transport_default_proxy_using(
         self,
         build_with_custom_ca: impl FnOnce(
             reqwest::ClientBuilder,
+            CustomCaPolicy,
         )
             -> Result<reqwest::Client, BuildCustomCaTransportError>,
     ) -> Result<HttpClient, BuildCustomCaTransportError> {
         let request_logging = self.request_logging;
-        build_with_custom_ca(self.base_reqwest_builder())
+        let custom_ca_policy = self.custom_ca_policy();
+        build_with_custom_ca(self.base_reqwest_builder(), custom_ca_policy)
             .map(|inner| HttpClient::from_parts(inner, request_logging))
     }
 
-    fn into_reqwest_parts(self) -> (reqwest::ClientBuilder, RequestLogging) {
+    fn into_reqwest_parts(self) -> (reqwest::ClientBuilder, RequestLogging, CustomCaPolicy) {
         let request_logging = self.request_logging;
-        (self.base_reqwest_builder(), request_logging)
+        let custom_ca_policy = self.custom_ca_policy();
+        (
+            self.base_reqwest_builder(),
+            request_logging,
+            custom_ca_policy,
+        )
+    }
+
+    fn custom_ca_policy(&self) -> CustomCaPolicy {
+        if self.tls_certs_only.is_some() {
+            CustomCaPolicy::ExplicitRootSet
+        } else {
+            CustomCaPolicy::HonorProcessEnvironment
+        }
     }
 
     fn base_reqwest_builder(self) -> reqwest::ClientBuilder {

@@ -17,7 +17,6 @@ use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::ValidationCall;
 use codex_agent_task_store::ValidationCallStatus;
 use codex_agent_task_store::ValidationEvidence;
-use codex_agent_task_store::ValidationProofKind;
 use codex_agent_task_store::WorkspaceStrategy;
 use codex_agent_task_store::WorkspaceTaskStatus;
 
@@ -156,7 +155,6 @@ fn completed_task_with_validation(
             next_action: None,
             architecture_contract: None,
             evidence_epoch: 0,
-            evidence_manifest_hash: String::new(),
             sealed_at: now,
         }),
         validation_calls: validation_calls
@@ -165,17 +163,18 @@ fn completed_task_with_validation(
                 call_id: (*call_id).to_string(),
                 attempt_id,
                 command_summary: "focused validation".to_string(),
-                resolved_executable: Some(
-                    std::fs::canonicalize(
-                        std::env::current_exe().expect("current test executable"),
-                    )
-                    .expect("current test executable canonicalizes")
-                    .to_string_lossy()
-                    .into_owned(),
-                ),
-                proof_kind: ValidationProofKind::Focused,
                 evidence: ValidationEvidence {
                     end_epoch: Some(0),
+                    validation_result: status.is_success().then(|| {
+                        serde_json::json!({
+                            "argv": ["cargo", "test"],
+                            "coveredPaths": ["."],
+                            "callId": call_id,
+                            "processId": null,
+                            "status": "succeeded",
+                            "durationMs": 1,
+                        })
+                    }),
                     ..ValidationEvidence::default()
                 },
                 status: *status,
@@ -207,12 +206,12 @@ fn completed_receipt_with_succeeded_validation_is_first_pass_success() {
 }
 
 #[test]
-fn legacy_unclassified_success_is_not_first_pass_validation() {
+fn succeeded_status_without_current_result_is_not_first_pass_validation() {
     let mut task = completed_task_with_validation(
         &["validation-1"],
         &[("validation-1", ValidationCallStatus::Succeeded)],
     );
-    task.validation_calls[0].proof_kind = ValidationProofKind::LegacyUnclassified;
+    task.validation_calls[0].evidence.validation_result = None;
 
     assert!(!super::terminal_input(&task).first_pass_validation_succeeded);
 }

@@ -2,19 +2,22 @@ use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionReason;
 use codex_otel::SessionTelemetry;
 use codex_protocol::error::CodexErr;
+use http::StatusCode;
 use tracing::warn;
 
 pub(crate) fn should_retry_with_current_model(error: &CodexErr) -> bool {
-    matches!(
-        error,
-        CodexErr::InvalidRequest(_)
-            | CodexErr::UnexpectedStatus(_)
-            | CodexErr::ContextWindowExceeded
-            | CodexErr::UsageLimitReached(_)
-            | CodexErr::ServerOverloaded
-            | CodexErr::InternalServerError
-            | CodexErr::RetryLimit(_)
-    )
+    match error {
+        CodexErr::UnexpectedStatus(error) => error.status != StatusCode::UNAUTHORIZED,
+        _ => matches!(
+            error,
+            CodexErr::InvalidRequest(_)
+                | CodexErr::ContextWindowExceeded
+                | CodexErr::UsageLimitReached(_)
+                | CodexErr::ServerOverloaded
+                | CodexErr::InternalServerError
+                | CodexErr::RetryLimit(_)
+        ),
+    }
 }
 
 pub(crate) fn record_model_fallback(

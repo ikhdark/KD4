@@ -6,7 +6,6 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 #[cfg(test)]
@@ -15,8 +14,6 @@ use std::time::Duration;
 use codex_agent_task_store::AttemptId;
 use codex_protocol::plan_tool::ValidationRoute;
 use codex_protocol::protocol::ToolExecutionId;
-use codex_protocol::validation::ValidationFreshness;
-use codex_protocol::validation::ValidationProofKey;
 use codex_protocol::validation::ValidationResult;
 use codex_protocol::validation::ValidationTerminalStatus;
 use serde::Deserialize;
@@ -32,7 +29,6 @@ use crate::tools::handlers::command_search::RgSearchNarrowing;
 use crate::validation_admission::ValidationLaunchPlan;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
-const MAX_COMPLETED_VALIDATION_PROOFS: usize = 128;
 const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 2;
 const COMMAND_FINGERPRINT_VERSION: &str = "v2";
 static NEXT_COMMAND_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -366,46 +362,9 @@ struct CommandCompletionReceipt {
 }
 
 #[derive(Debug, Clone)]
-struct CompletedValidationProof {
-    result: Arc<ValidationResult>,
-    artifact: RawOutputArtifact,
-}
-
-impl RunningCommand {
-    pub(crate) fn completed_validation_skip_disposition(
-        &self,
-        output: &[u8],
-        exit_code: i32,
-    ) -> Option<codex_tools::ToolOutputSkipDisposition> {
-        self.validation_launch
-            .as_ref()
-            .and_then(|launch| launch.structured_route.as_ref())
-            .and_then(|route| completed_validation_skip_disposition(route, output, exit_code))
-    }
-}
-
-#[derive(Debug, Clone)]
 struct CommandExecutionPersistence {
     cache_path: PathBuf,
-    shared_validation_cache_path: PathBuf,
-    codex_home: PathBuf,
-    thread_id: String,
     cwd: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedValidationProof {
-    result: ValidationResult,
-    #[serde(default)]
-    artifact_thread_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedValidationCacheDocument {
-    schema_version: u32,
-    completed_validations: Vec<PersistedValidationProof>,
-    #[serde(default)]
-    invalidated_validations: Vec<ValidationProofKey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +386,7 @@ struct CommandProcessState {
 #[derive(Default)]
 struct CommandRepositoryState {
     epoch: u64,
+    workspace_identity_observation_epoch: Option<u64>,
     observed_workspace_identity: Option<(u64, crate::git_workspace::WorkspaceEvidenceIdentity)>,
     observed_workspace_identity_hash: Option<(u64, String)>,
     observed_turn_mutation_revisions: HashMap<String, u64>,
@@ -464,27 +424,25 @@ struct CommandSearchState {
 }
 
 #[derive(Default)]
-struct CommandValidationState {
-    completed: HashMap<ValidationProofKey, CompletedValidationProof>,
-    completed_order: VecDeque<ValidationProofKey>,
-    invalidated: HashSet<ValidationProofKey>,
-    invalidated_order: VecDeque<ValidationProofKey>,
-    results_by_call: HashMap<String, Arc<ValidationResult>>,
-    bound_plan_steps_by_call: HashMap<String, (String, u64)>,
-    result_call_order: VecDeque<String>,
-}
-
-#[derive(Default)]
 struct CommandExecutionState {
     retry: CommandRetryState,
     process: CommandProcessState,
     repository: CommandRepositoryState,
-    validation: CommandValidationState,
     search: CommandSearchState,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompletedValidation {
+    pub(crate) result: ValidationResult,
+    pub(crate) bound_plan_step: Option<(String, u64)>,
+    pub(crate) bound_work_unit: Option<(String, u64)>,
+    pub(crate) focused_validation_token:
+        Option<crate::agent::task_coordinator::FocusedValidationToken>,
 }
 
 pub(crate) struct CommandExecutionLedger {
     state: Mutex<CommandExecutionState>,
+    workspace_identity_refresh: tokio::sync::Semaphore,
     persistence: Option<CommandExecutionPersistence>,
 }
 
@@ -492,6 +450,7 @@ impl Default for CommandExecutionLedger {
     fn default() -> Self {
         Self {
             state: Mutex::new(CommandExecutionState::default()),
+            workspace_identity_refresh: tokio::sync::Semaphore::new(/*permits*/ 1),
             persistence: None,
         }
     }
@@ -503,59 +462,17 @@ impl CommandExecutionLedger {
     }
 
     pub(crate) async fn load_or_new(codex_home: PathBuf, thread_id: String, cwd: &Path) -> Self {
-        let Some(workspace_identity) =
-            crate::git_workspace::capture_workspace_evidence_identity(cwd).await
-        else {
-            return Self::default();
-        };
         let persistence = CommandExecutionPersistence {
             cache_path: codex_home
                 .join("command-execution-cache")
                 .join(format!("{thread_id}.json")),
-            shared_validation_cache_path: shared_validation_cache_path(
-                &codex_home,
-                &workspace_identity,
-                cwd,
-            ),
-            codex_home,
-            thread_id,
             cwd: cwd.to_path_buf(),
         };
-        let workspace_identity_hash = workspace_identity_hash(&workspace_identity);
-        let ledger = Self {
-            state: Mutex::new(CommandExecutionState {
-                repository: CommandRepositoryState {
-                    observed_workspace_identity: Some((0, workspace_identity.clone())),
-                    observed_workspace_identity_hash: Some((0, workspace_identity_hash.clone())),
-                    ..CommandRepositoryState::default()
-                },
-                ..CommandExecutionState::default()
-            }),
-            persistence: Some(persistence.clone()),
-        };
-        if let Ok(bytes) = tokio::fs::read(&persistence.cache_path).await
-            && let Ok(document) = serde_json::from_slice::<CommandExecutionCacheDocument>(&bytes)
-            && document.schema_version == COMMAND_EXECUTION_CACHE_SCHEMA_VERSION
-            && document.workspace_identity == workspace_identity
-        {
-            let mut state = ledger.state.lock().await;
-            state.repository.epoch = document.repository_epoch;
-            state.repository.observed_workspace_identity =
-                Some((document.repository_epoch, workspace_identity));
-            state.repository.observed_workspace_identity_hash =
-                Some((document.repository_epoch, workspace_identity_hash));
-            for search_miss in document
-                .search_misses
-                .into_iter()
-                .take(MAX_TRACKED_COMMANDS)
-            {
-                if state.search.misses.insert(search_miss.clone()) {
-                    state.search.miss_order.push_back(search_miss);
-                }
-            }
+        Self {
+            state: Mutex::new(CommandExecutionState::default()),
+            workspace_identity_refresh: tokio::sync::Semaphore::new(/*permits*/ 1),
+            persistence: Some(persistence),
         }
-        ledger.refresh_shared_validation_cache().await;
-        ledger
     }
 
     pub(crate) async fn admit_search_narrowing(
@@ -575,21 +492,19 @@ impl CommandExecutionLedger {
             query_identity: search.query_identity.clone(),
             scope_identity: search.scope_identity.clone(),
         };
-        if self
+        let preceded_by_narrow_miss = self
             .state
             .lock()
             .await
             .search
             .allowed_expansions
-            .contains(&scope)
-        {
-            return Ok(());
-        }
-
-        Err(
-            "repository-wide `rg` search rejected: first search a narrower scope for the same query, then expand only after that search returns no matches"
-                .to_string(),
-        )
+            .contains(&scope);
+        tracing::debug!(
+            preceded_by_narrow_miss,
+            query_identity = %search.query_identity,
+            "admitting broad rg search"
+        );
+        Ok(())
     }
 
     pub(crate) async fn record_uncertain_command_baseline(
@@ -667,168 +582,6 @@ impl CommandExecutionLedger {
             .map(|pending| pending.baseline)
     }
 
-    pub(crate) async fn reusable_validation(
-        &self,
-        key: &ValidationProofKey,
-    ) -> Option<ValidationResult> {
-        let (mut proof, superseded_keys) = {
-            let mut state = self.state.lock().await;
-            let superseded_keys =
-                supersede_validation_proofs_for_new_implementation(&mut state, key);
-            (
-                state.validation.completed.get(key).cloned(),
-                superseded_keys,
-            )
-        };
-        for superseded_key in superseded_keys {
-            if let Err(error) = self.remove_shared_validation(&superseded_key).await {
-                tracing::warn!(
-                    %error,
-                    "failed to persist superseded validation proof invalidation"
-                );
-            }
-        }
-        if proof.is_none() {
-            self.refresh_shared_validation_cache().await;
-            let (refreshed_proof, superseded_keys) = {
-                let mut state = self.state.lock().await;
-                let superseded_keys =
-                    supersede_validation_proofs_for_new_implementation(&mut state, key);
-                (
-                    state.validation.completed.get(key).cloned(),
-                    superseded_keys,
-                )
-            };
-            proof = refreshed_proof;
-            for superseded_key in superseded_keys {
-                if let Err(error) = self.remove_shared_validation(&superseded_key).await {
-                    tracing::warn!(
-                        %error,
-                        "failed to persist superseded validation proof invalidation"
-                    );
-                }
-            }
-        }
-        let proof = proof?;
-        let Some((artifact_ref, artifact_sha256)) = proof.artifact.validation_integrity().await
-        else {
-            self.invalidate_validation_proof(key).await;
-            return None;
-        };
-        if proof.result.raw_artifact_ref.as_deref() != Some(artifact_ref.as_str())
-            || proof.result.raw_artifact_sha256.as_deref() != Some(artifact_sha256.as_str())
-        {
-            self.invalidate_validation_proof(key).await;
-            return None;
-        }
-        let mut result = proof.result.as_ref().clone();
-        result.freshness = ValidationFreshness::Reused;
-        Some(result)
-    }
-
-    async fn invalidate_validation_proof(&self, key: &ValidationProofKey) {
-        {
-            let mut state = self.state.lock().await;
-            state.validation.completed.remove(key);
-            state
-                .validation
-                .completed_order
-                .retain(|entry| entry != key);
-            mark_validation_invalidated(&mut state.validation, key.clone());
-        }
-        if let Err(error) = self.remove_shared_validation(key).await {
-            tracing::warn!(
-                %error,
-                "failed to persist invalid validation proof tombstone"
-            );
-        }
-    }
-
-    async fn refresh_shared_validation_cache(&self) {
-        let Some(persistence) = self.persistence.as_ref() else {
-            return;
-        };
-        let Ok(bytes) = tokio::fs::read(&persistence.shared_validation_cache_path).await else {
-            return;
-        };
-        let Ok(document) = serde_json::from_slice::<PersistedValidationCacheDocument>(&bytes)
-        else {
-            return;
-        };
-        if document.schema_version != COMMAND_EXECUTION_CACHE_SCHEMA_VERSION {
-            return;
-        }
-        let mut state = self.state.lock().await;
-        for invalidated in document.invalidated_validations {
-            state.validation.completed.remove(&invalidated);
-            state
-                .validation
-                .completed_order
-                .retain(|entry| entry != &invalidated);
-            mark_validation_invalidated(&mut state.validation, invalidated);
-        }
-        restore_persisted_validations(
-            &mut state,
-            &persistence.codex_home,
-            &persistence.thread_id,
-            document.completed_validations,
-        );
-    }
-
-    async fn persist_shared_validation(&self, proof: PersistedValidationProof) -> io::Result<()> {
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(());
-        };
-        update_shared_validation_cache(
-            persistence.shared_validation_cache_path.clone(),
-            SharedValidationCacheUpdate::Persist(Box::new(proof)),
-        )
-        .await
-    }
-
-    async fn remove_shared_validation(&self, key: &ValidationProofKey) -> io::Result<()> {
-        let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(());
-        };
-        update_shared_validation_cache(
-            persistence.shared_validation_cache_path.clone(),
-            SharedValidationCacheUpdate::Invalidate(key.clone()),
-        )
-        .await
-    }
-
-    pub(crate) async fn validation_result_for_call(
-        &self,
-        call_id: &str,
-    ) -> Option<ValidationResult> {
-        self.state
-            .lock()
-            .await
-            .validation
-            .results_by_call
-            .get(call_id)
-            .map(|result| result.as_ref().clone())
-    }
-
-    pub(crate) async fn validation_result_with_plan_step_for_call(
-        &self,
-        call_id: &str,
-    ) -> Option<(ValidationResult, Option<(String, u64)>)> {
-        let state = self.state.lock().await;
-        let result = state
-            .validation
-            .results_by_call
-            .get(call_id)?
-            .as_ref()
-            .clone();
-        let bound_plan_step = state
-            .validation
-            .bound_plan_steps_by_call
-            .get(call_id)
-            .cloned();
-        Some((result, bound_plan_step))
-    }
-
     pub(crate) async fn observe_repository_revision(
         &self,
         turn_id: &str,
@@ -844,7 +597,7 @@ impl CommandExecutionLedger {
         mutation_revision: u64,
         observed_workspace_identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
     ) -> u64 {
-        let (repository_epoch, refresh_workspace_identity, expected_repository_root) = {
+        let requested_repository_epoch = {
             let mut state = self.state.lock().await;
             let delta = {
                 let observed_revision = state
@@ -857,62 +610,112 @@ impl CommandExecutionLedger {
                 delta
             };
             state.repository.epoch = state.repository.epoch.saturating_add(delta);
+            state.repository.epoch
+        };
+
+        let Ok(_refresh_permit) = self.workspace_identity_refresh.acquire().await else {
+            unreachable!("command-execution workspace refresh semaphore is never closed");
+        };
+        let (repository_epoch, expected_repository_root) = {
+            let mut state = self.state.lock().await;
             let repository_epoch = state.repository.epoch;
-            let refresh_workspace_identity = delta > 0
-                || state
-                    .repository
-                    .observed_workspace_identity
-                    .as_ref()
-                    .is_none_or(|(epoch, _)| *epoch != repository_epoch);
+            if state
+                .repository
+                .observed_workspace_identity
+                .as_ref()
+                .is_some_and(|(epoch, _)| *epoch == repository_epoch)
+                || state.repository.workspace_identity_observation_epoch == Some(repository_epoch)
+            {
+                return repository_epoch;
+            }
             let expected_repository_root = state
                 .repository
                 .observed_workspace_identity
                 .as_ref()
                 .and_then(|(_, identity)| identity.repository_root.clone());
-            if refresh_workspace_identity {
-                state.repository.observed_workspace_identity = None;
-                state.repository.observed_workspace_identity_hash = None;
-            }
-            (
-                repository_epoch,
-                refresh_workspace_identity,
-                expected_repository_root,
-            )
+            state.repository.observed_workspace_identity = None;
+            state.repository.observed_workspace_identity_hash = None;
+            (repository_epoch, expected_repository_root)
         };
-
-        if !refresh_workspace_identity {
-            return repository_epoch;
-        }
         let observed_workspace_identity = observed_workspace_identity.filter(|identity| {
             identity.repository_root.is_some()
-                && identity.repository_root == expected_repository_root
+                && requested_repository_epoch == repository_epoch
+                && expected_repository_root
+                    .as_ref()
+                    .is_none_or(|root| identity.repository_root.as_ref() == Some(root))
         });
         let workspace_identity = match observed_workspace_identity {
             Some(workspace_identity) => workspace_identity,
             None => {
                 let Some(persistence) = self.persistence.as_ref() else {
+                    self.finish_workspace_identity_observation_without_identity(repository_epoch)
+                        .await;
                     return repository_epoch;
                 };
                 let Some(workspace_identity) =
                     crate::git_workspace::capture_workspace_evidence_identity(&persistence.cwd)
                         .await
                 else {
+                    self.finish_workspace_identity_observation_without_identity(repository_epoch)
+                        .await;
                     return repository_epoch;
                 };
                 workspace_identity
             }
+        };
+        let cached_document = if repository_epoch == 0 {
+            match self.persistence.as_ref() {
+                Some(persistence) => tokio::fs::read(&persistence.cache_path)
+                    .await
+                    .ok()
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<CommandExecutionCacheDocument>(&bytes).ok()
+                    })
+                    .filter(|document| {
+                        document.schema_version == COMMAND_EXECUTION_CACHE_SCHEMA_VERSION
+                            && document.workspace_identity == workspace_identity
+                    }),
+                None => None,
+            }
+        } else {
+            None
         };
         let workspace_identity_hash = workspace_identity_hash(&workspace_identity);
         let mut state = self.state.lock().await;
         if state.repository.epoch == repository_epoch
             && state.repository.observed_workspace_identity.is_none()
         {
+            let observed_epoch = cached_document
+                .as_ref()
+                .map_or(repository_epoch, |document| document.repository_epoch);
+            state.repository.epoch = observed_epoch;
+            state.repository.workspace_identity_observation_epoch = Some(observed_epoch);
             state.repository.observed_workspace_identity =
-                Some((repository_epoch, workspace_identity));
+                Some((observed_epoch, workspace_identity));
             state.repository.observed_workspace_identity_hash =
-                Some((repository_epoch, workspace_identity_hash));
+                Some((observed_epoch, workspace_identity_hash));
+            if let Some(document) = cached_document {
+                for search_miss in document
+                    .search_misses
+                    .into_iter()
+                    .take(MAX_TRACKED_COMMANDS)
+                {
+                    if state.search.misses.insert(search_miss.clone()) {
+                        state.search.miss_order.push_back(search_miss);
+                    }
+                }
+            }
         }
         state.repository.epoch
+    }
+
+    async fn finish_workspace_identity_observation_without_identity(&self, repository_epoch: u64) {
+        let mut state = self.state.lock().await;
+        if state.repository.epoch == repository_epoch
+            && state.repository.observed_workspace_identity.is_none()
+        {
+            state.repository.workspace_identity_observation_epoch = Some(repository_epoch);
+        }
     }
 
     pub(crate) async fn current_workspace_identity_hash(
@@ -1149,17 +952,9 @@ impl CommandExecutionLedger {
         if observed_epoch != repository_epoch {
             return;
         }
-        let Some(workspace_identity) =
-            crate::git_workspace::capture_workspace_evidence_identity(&persistence.cwd).await
-        else {
-            return;
-        };
-        if workspace_identity != observed_workspace_identity {
-            return;
-        }
         let document = CommandExecutionCacheDocument {
             schema_version: COMMAND_EXECUTION_CACHE_SCHEMA_VERSION,
-            workspace_identity,
+            workspace_identity: observed_workspace_identity,
             repository_epoch,
             search_misses,
         };
@@ -1209,7 +1004,6 @@ impl CommandExecutionLedger {
             }
             debug_assert_command_execution_invariants(&state);
         }
-        self.publish_completed_validation_if_ready(process_id).await;
     }
 
     #[cfg(test)]
@@ -1322,7 +1116,6 @@ impl CommandExecutionLedger {
             );
             debug_assert_command_execution_invariants(&state);
         }
-        self.publish_completed_validation_if_ready(process_id).await;
         CompletionApplyResult::Applied
     }
 
@@ -1361,152 +1154,170 @@ impl CommandExecutionLedger {
         CompletionApplyResult::Applied
     }
 
-    async fn publish_completed_validation_if_ready(&self, process_id: u32) {
-        let candidate = {
-            let state = self.state.lock().await;
-            let running = state.process.running.get(&process_id).or_else(|| {
-                state
+    pub(crate) async fn complete_running_validation(
+        &self,
+        process_id: u32,
+        timed_out: bool,
+    ) -> Option<CompletedValidation> {
+        let (launch, artifact, started_at, exit_code) = {
+            let mut state = self.state.lock().await;
+            let running = if let Some(running) = state.process.running.get_mut(&process_id) {
+                running
+            } else {
+                &mut state
                     .process
                     .pending_by_execution_id
-                    .values()
-                    .find(|pending| pending.process_id == process_id)
-                    .map(|pending| &pending.command)
-            });
-            let Some(running) = running else {
-                return;
+                    .values_mut()
+                    .find(|pending| pending.process_id == process_id)?
+                    .command
             };
-            let Some(exit_code) = running.completed_exit_code else {
-                return;
-            };
-            let Some(launch) = running.validation_launch.as_ref() else {
-                return;
-            };
-            let (Some(proof_key), Some(route), Some(call_id)) = (
-                launch.proof_key.clone(),
-                launch.structured_route.clone(),
-                launch.validation_call_id.clone(),
-            ) else {
-                return;
-            };
+            let exit_code = running.completed_exit_code?;
+            let launch = running.validation_launch.take()?;
             (
-                proof_key,
-                route,
-                call_id,
-                launch.bound_plan_step.clone(),
+                launch,
                 running.artifact.clone(),
                 running.started_at,
                 exit_code,
-                launch.turn_timing_state.clone(),
-                launch.force_fresh,
             )
         };
-        let (
-            proof_key,
-            route,
-            call_id,
-            bound_plan_step,
-            artifact,
+        self.complete_validation_from_launch(
+            &launch,
+            Some(artifact),
             started_at,
-            exit_code,
-            turn_timing_state,
-            force_fresh,
-        ) = candidate;
-        self.publish_completed_validation_with_context(
-            proof_key,
-            route,
-            call_id,
-            bound_plan_step,
-            artifact,
-            started_at,
-            exit_code,
+            Some(exit_code),
+            timed_out,
             Some(process_id.to_string()),
-            turn_timing_state,
-            force_fresh,
         )
-        .await;
+        .await
     }
 
-    pub(crate) async fn publish_inline_validation(
+    pub(crate) async fn complete_timed_out_running_validation(
+        &self,
+        process_id: u32,
+    ) -> Option<CompletedValidation> {
+        let (launch, artifact, started_at) = {
+            let mut state = self.state.lock().await;
+            let running = if let Some(running) = state.process.running.get_mut(&process_id) {
+                running
+            } else {
+                &mut state
+                    .process
+                    .pending_by_execution_id
+                    .values_mut()
+                    .find(|pending| pending.process_id == process_id)?
+                    .command
+            };
+            let launch = running.validation_launch.take()?;
+            (launch, running.artifact.clone(), running.started_at)
+        };
+        self.complete_validation_from_launch(
+            &launch,
+            Some(artifact),
+            started_at,
+            /*exit_code*/ None,
+            /*timed_out*/ true,
+            Some(process_id.to_string()),
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_inline_validation(
         &self,
         launch: &ValidationLaunchPlan,
-        artifact: RawOutputArtifact,
+        artifact: Option<RawOutputArtifact>,
         started_at: Instant,
-        exit_code: i32,
-    ) -> bool {
-        let (Some(proof_key), Some(route), Some(call_id)) = (
-            launch.proof_key.clone(),
+        exit_code: Option<i32>,
+        timed_out: bool,
+        process_id: Option<String>,
+    ) -> Option<CompletedValidation> {
+        self.complete_validation_from_launch(
+            launch, artifact, started_at, exit_code, timed_out, process_id,
+        )
+        .await
+    }
+
+    async fn complete_validation_from_launch(
+        &self,
+        launch: &ValidationLaunchPlan,
+        artifact: Option<RawOutputArtifact>,
+        started_at: Instant,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        process_id: Option<String>,
+    ) -> Option<CompletedValidation> {
+        let (Some(route), Some(call_id)) = (
             launch.structured_route.clone(),
             launch.validation_call_id.clone(),
         ) else {
-            return false;
+            return None;
         };
-        self.publish_completed_validation_with_context(
-            proof_key,
+        self.complete_validation(
             route,
             call_id,
             launch.bound_plan_step.clone(),
+            launch.bound_work_unit.clone(),
             artifact,
             started_at,
             exit_code,
-            None,
+            timed_out,
+            process_id,
             launch.turn_timing_state.clone(),
-            launch.force_fresh,
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    async fn publish_completed_validation(
-        &self,
-        proof_key: ValidationProofKey,
-        route: ValidationRoute,
-        call_id: String,
-        artifact: RawOutputArtifact,
-        started_at: Instant,
-        exit_code: i32,
-        process_id: Option<String>,
-    ) -> bool {
-        self.publish_completed_validation_with_context(
-            proof_key, route, call_id, None, artifact, started_at, exit_code, process_id, None,
-            false,
+            launch.focused_validation_token.clone(),
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn publish_completed_validation_with_context(
+    async fn complete_validation(
         &self,
-        proof_key: ValidationProofKey,
         route: ValidationRoute,
         call_id: String,
         bound_plan_step: Option<(String, u64)>,
-        artifact: RawOutputArtifact,
+        bound_work_unit: Option<(String, u64)>,
+        artifact: Option<RawOutputArtifact>,
         started_at: Instant,
-        exit_code: i32,
+        exit_code: Option<i32>,
+        timed_out: bool,
         process_id: Option<String>,
         turn_timing_state: Option<std::sync::Arc<crate::turn_timing::TurnTimingState>>,
-        force_fresh: bool,
-    ) -> bool {
-        let Some((artifact_ref, artifact_sha256, retained_output)) =
-            artifact.validation_integrity_with_output().await
-        else {
-            return false;
+        focused_validation_token: Option<crate::agent::task_coordinator::FocusedValidationToken>,
+    ) -> Option<CompletedValidation> {
+        let [leaf] = route.leaves.as_slice() else {
+            return None;
         };
-        let selected_test_evidence = selected_test_evidence(&route, &retained_output);
+        let (raw_artifact_ref, raw_artifact_sha256, retained_output) = match artifact.as_ref() {
+            Some(artifact) => artifact
+                .validation_integrity_with_output()
+                .await
+                .map_or((None, None, None), |(reference, sha256, output)| {
+                    (Some(reference), Some(sha256), Some(output))
+                }),
+            None => (None, None, None),
+        };
+        let selected_test_evidence = retained_output.as_deref().map_or_else(
+            || {
+                if validation_route_is_test(&route) {
+                    SelectedTestEvidence::Missing
+                } else {
+                    SelectedTestEvidence::NotATest
+                }
+            },
+            |output| selected_test_evidence(&route, output),
+        );
         let selected_test_count = match selected_test_evidence {
             SelectedTestEvidence::Exact(count) => Some(count),
             SelectedTestEvidence::NotATest
             | SelectedTestEvidence::Missing
             | SelectedTestEvidence::Ambiguous => None,
         };
-        let missing_selected_tests =
-            completed_validation_skip_disposition(&route, &retained_output, exit_code)
-                == Some(codex_tools::ToolOutputSkipDisposition::NotApplicable);
-        let mut succeeded = exit_code == 0 && !missing_selected_tests;
-        let mut result = ValidationResult {
-            proof_key: proof_key.clone(),
-            route,
+        let missing_selected_tests = exit_code == Some(0)
+            && !timed_out
+            && validation_route_is_test(&route)
+            && !matches!(selected_test_evidence, SelectedTestEvidence::Exact(1..));
+        let succeeded = exit_code == Some(0) && !timed_out && !missing_selected_tests;
+        let result = ValidationResult {
+            argv: leaf.argv.clone(),
+            covered_paths: leaf.covered_paths.clone(),
             call_id: call_id.clone(),
             process_id,
             status: if succeeded {
@@ -1521,116 +1332,58 @@ impl CommandExecutionLedger {
             )
             .unwrap_or(u64::MAX),
             summary: Some(if missing_selected_tests {
-                "focused validation did not prove a nonzero selected-test count".to_string()
-            } else if succeeded {
-                selected_test_count.map_or_else(
-                    || "focused validation succeeded".to_string(),
-                    |count| format!("focused validation succeeded with {count} selected tests"),
-                )
+                "validation did not prove a nonzero selected-test count".to_string()
             } else {
-                format!("focused validation exited with code {exit_code}")
+                match (timed_out, exit_code, selected_test_count) {
+                    (true, _, _) => "validation timed out".to_string(),
+                    (false, Some(0), Some(count)) => {
+                        format!("validation succeeded with {count} selected tests")
+                    }
+                    (false, Some(0), None) => "validation succeeded".to_string(),
+                    (false, Some(exit_code), _) => {
+                        format!("validation exited with code {exit_code}")
+                    }
+                    (false, None, _) => {
+                        "validation terminated without an exit code".to_string()
+                    }
+                }
             }),
             failure_excerpt: (!succeeded).then(|| {
                 if missing_selected_tests {
                     "test validation exited successfully without a positive selected-test count; exact output is retained in the immutable artifact"
                         .to_string()
                 } else {
-                    format!(
-                        "validation exited with code {exit_code}; exact output is retained in the immutable artifact"
-                    )
+                    match (timed_out, exit_code) {
+                        (true, _) => "validation timed out".to_string(),
+                        (false, Some(exit_code)) => {
+                            format!("validation exited with code {exit_code}")
+                        }
+                        (false, None) => {
+                            "validation terminated without an exit code".to_string()
+                        }
+                    }
                 }
             }),
-            raw_artifact_ref: Some(artifact_ref),
-            raw_artifact_sha256: Some(artifact_sha256),
-            freshness: ValidationFreshness::Executed,
+            raw_artifact_ref,
+            raw_artifact_sha256,
         };
         let duration_ms = result.duration_ms;
-        let artifact_thread_id = self
-            .persistence
-            .as_ref()
-            .map(|persistence| persistence.thread_id.clone())
-            .unwrap_or_default();
-        if succeeded
-            && let Err(error) = self
-                .persist_shared_validation(PersistedValidationProof {
-                    result: result.clone(),
-                    artifact_thread_id,
-                })
-                .await
-        {
-            succeeded = false;
-            result.status = ValidationTerminalStatus::Failed;
-            result.summary = Some("focused validation cache persistence failed".to_string());
-            result.failure_excerpt = Some(format!(
-                "validation completed but its reusable proof could not be durably persisted: {error}"
-            ));
-        }
-        let result = Arc::new(result);
-        {
-            let mut state = self.state.lock().await;
-            if state.validation.results_by_call.contains_key(&call_id) {
-                return true;
-            }
-            while state.validation.results_by_call.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
-                let Some(oldest) = state.validation.result_call_order.pop_front() else {
-                    break;
-                };
-                state.validation.results_by_call.remove(&oldest);
-                state.validation.bound_plan_steps_by_call.remove(&oldest);
-            }
-            state
-                .validation
-                .result_call_order
-                .push_back(call_id.clone());
-            state
-                .validation
-                .results_by_call
-                .insert(call_id.clone(), Arc::clone(&result));
-            if let Some(bound_plan_step) = bound_plan_step {
-                state
-                    .validation
-                    .bound_plan_steps_by_call
-                    .insert(call_id.clone(), bound_plan_step);
-            }
-            if succeeded && !state.validation.completed.contains_key(&proof_key) {
-                state.validation.invalidated.remove(&proof_key);
-                state
-                    .validation
-                    .invalidated_order
-                    .retain(|entry| entry != &proof_key);
-                while state.validation.completed.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
-                    let Some(oldest) = state.validation.completed_order.pop_front() else {
-                        break;
-                    };
-                    state.validation.completed.remove(&oldest);
-                }
-                state
-                    .validation
-                    .completed_order
-                    .push_back(proof_key.clone());
-                state.validation.completed.insert(
-                    proof_key.clone(),
-                    CompletedValidationProof {
-                        result: Arc::clone(&result),
-                        artifact,
-                    },
-                );
-            }
-        }
         if let Some(turn_timing_state) = turn_timing_state {
-            turn_timing_state.record_executed_validation(duration_ms, force_fresh);
+            turn_timing_state.record_executed_validation(duration_ms);
         }
         tracing::info!(
             disposition = "executed",
             validation_call_id = %call_id,
             duration_ms,
-            force_fresh,
-            coverage_identity = %proof_key.coverage_identity,
-            implementation_identity = %proof_key.implementation_identity,
             succeeded,
             "validation process completed"
         );
-        true
+        Some(CompletedValidation {
+            result,
+            bound_plan_step,
+            bound_work_unit,
+            focused_validation_token,
+        })
     }
 
     #[cfg(test)]
@@ -1831,6 +1584,9 @@ fn record_running_exit_locked(
     running: &RunningCommand,
     exit_code: i32,
 ) {
+    if running.validation_launch.is_some() {
+        return;
+    }
     record_search_result_locked(state, &running.key, exit_code);
     record_exit_locked(state, &running.key, exit_code);
 }
@@ -1989,302 +1745,6 @@ fn test_intent_token(argument: &str) -> bool {
         || normalized.starts_with("--test")
 }
 
-pub(crate) fn completed_validation_skip_disposition(
-    route: &ValidationRoute,
-    output: &[u8],
-    exit_code: i32,
-) -> Option<codex_tools::ToolOutputSkipDisposition> {
-    (exit_code == 0
-        && validation_route_is_test(route)
-        && !matches!(
-            selected_test_evidence(route, output),
-            SelectedTestEvidence::Exact(1..)
-        ))
-    .then_some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
-}
-
-fn shared_validation_cache_path(
-    codex_home: &Path,
-    workspace_identity: &crate::git_workspace::WorkspaceEvidenceIdentity,
-    cwd: &Path,
-) -> PathBuf {
-    let repository = workspace_identity
-        .repository_root
-        .as_deref()
-        .map(str::to_owned)
-        .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
-    let repository = repository.replace('\\', "/").to_ascii_lowercase();
-    let identity = format!("{:x}", Sha256::digest(repository.as_bytes()));
-    codex_home
-        .join("command-execution-cache")
-        .join(format!("validation-{identity}.json"))
-}
-
-fn restore_persisted_validations(
-    state: &mut CommandExecutionState,
-    codex_home: &Path,
-    fallback_thread_id: &str,
-    persisted_validations: Vec<PersistedValidationProof>,
-) {
-    let skip = persisted_validations
-        .len()
-        .saturating_sub(MAX_COMPLETED_VALIDATION_PROOFS);
-    for persisted in persisted_validations.into_iter().skip(skip) {
-        let result = Arc::new(persisted.result);
-        if result.status != ValidationTerminalStatus::Succeeded
-            || state.validation.invalidated.contains(&result.proof_key)
-            || state.validation.completed.contains_key(&result.proof_key)
-        {
-            continue;
-        }
-        let Some(artifact_ref) = result.raw_artifact_ref.as_deref() else {
-            continue;
-        };
-        let artifact_thread_id = if persisted.artifact_thread_id.is_empty() {
-            fallback_thread_id.to_string()
-        } else {
-            persisted.artifact_thread_id
-        };
-        let Some(artifact) =
-            RawOutputArtifact::restore_validation(codex_home, &artifact_thread_id, artifact_ref)
-        else {
-            continue;
-        };
-        while state.validation.completed.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
-            let Some(oldest) = state.validation.completed_order.pop_front() else {
-                break;
-            };
-            state.validation.completed.remove(&oldest);
-        }
-        let proof_key = result.proof_key.clone();
-        state
-            .validation
-            .completed_order
-            .push_back(proof_key.clone());
-        state.validation.completed.insert(
-            proof_key,
-            CompletedValidationProof {
-                result: Arc::clone(&result),
-                artifact,
-            },
-        );
-        if !state
-            .validation
-            .results_by_call
-            .contains_key(&result.call_id)
-        {
-            while state.validation.results_by_call.len() >= MAX_COMPLETED_VALIDATION_PROOFS {
-                let Some(oldest) = state.validation.result_call_order.pop_front() else {
-                    break;
-                };
-                state.validation.results_by_call.remove(&oldest);
-                state.validation.bound_plan_steps_by_call.remove(&oldest);
-            }
-            state
-                .validation
-                .result_call_order
-                .push_back(result.call_id.clone());
-            state
-                .validation
-                .results_by_call
-                .insert(result.call_id.clone(), Arc::clone(&result));
-        }
-    }
-}
-
-enum SharedValidationCacheUpdate {
-    Persist(Box<PersistedValidationProof>),
-    Invalidate(ValidationProofKey),
-}
-
-async fn update_shared_validation_cache(
-    cache_path: PathBuf,
-    update: SharedValidationCacheUpdate,
-) -> io::Result<()> {
-    tokio::task::spawn_blocking(move || {
-        let Some(parent) = cache_path.parent() else {
-            return Err(io::Error::other("validation cache path has no parent"));
-        };
-        std::fs::create_dir_all(parent)?;
-        let lock_path = cache_path.with_extension("lock");
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(lock_path)?;
-        lock_file.lock()?;
-
-        let mut document = match std::fs::read(&cache_path) {
-            Ok(bytes) => serde_json::from_slice::<PersistedValidationCacheDocument>(&bytes)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                PersistedValidationCacheDocument {
-                    schema_version: COMMAND_EXECUTION_CACHE_SCHEMA_VERSION,
-                    completed_validations: Vec::new(),
-                    invalidated_validations: Vec::new(),
-                }
-            }
-            Err(error) => return Err(error),
-        };
-        if document.schema_version != COMMAND_EXECUTION_CACHE_SCHEMA_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported validation cache schema version {}",
-                    document.schema_version
-                ),
-            ));
-        }
-
-        match update {
-            SharedValidationCacheUpdate::Persist(proof) => {
-                let proof = *proof;
-                document.completed_validations.retain(|candidate| {
-                    candidate.result.status == ValidationTerminalStatus::Succeeded
-                        && candidate.result.proof_key != proof.result.proof_key
-                });
-                document
-                    .invalidated_validations
-                    .retain(|key| key != &proof.result.proof_key);
-                document.completed_validations.push(proof);
-                let excess = document
-                    .completed_validations
-                    .len()
-                    .saturating_sub(MAX_COMPLETED_VALIDATION_PROOFS);
-                document.completed_validations.drain(..excess);
-            }
-            SharedValidationCacheUpdate::Invalidate(key) => {
-                document
-                    .completed_validations
-                    .retain(|proof| proof.result.proof_key != key);
-                document
-                    .invalidated_validations
-                    .retain(|candidate| candidate != &key);
-                document.invalidated_validations.push(key);
-                let excess = document
-                    .invalidated_validations
-                    .len()
-                    .saturating_sub(MAX_COMPLETED_VALIDATION_PROOFS);
-                document.invalidated_validations.drain(..excess);
-            }
-        }
-
-        let bytes = serde_json::to_vec_pretty(&document)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let _commit = write_cache_document_blocking(&cache_path, &bytes)?;
-        lock_file.unlock()?;
-        Ok(())
-    })
-    .await
-    .map_err(|error| io::Error::other(format!("validation cache task failed: {error}")))?
-}
-
-async fn write_cache_document(cache_path: PathBuf, bytes: Vec<u8>) -> io::Result<()> {
-    let _commit =
-        tokio::task::spawn_blocking(move || write_cache_document_blocking(&cache_path, &bytes))
-            .await
-            .map_err(|error| io::Error::other(format!("command cache task failed: {error}")))??;
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DurableCacheCommit;
-
-fn write_cache_document_blocking(
-    cache_path: &Path,
-    bytes: &[u8],
-) -> io::Result<DurableCacheCommit> {
-    let Some(parent) = cache_path.parent() else {
-        return Err(io::Error::other("command cache path has no parent"));
-    };
-    std::fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(cache_path).map_err(|error| error.error)?;
-    sync_cache_parent(parent)?;
-    Ok(DurableCacheCommit)
-}
-
-#[cfg(windows)]
-fn sync_cache_parent(parent: &Path) -> io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(parent)?
-        .sync_all()
-}
-
-#[cfg(not(windows))]
-fn sync_cache_parent(parent: &Path) -> io::Result<()> {
-    std::fs::File::open(parent)?.sync_all()
-}
-
-fn supersede_validation_proofs_for_new_implementation(
-    state: &mut CommandExecutionState,
-    requested: &ValidationProofKey,
-) -> Vec<ValidationProofKey> {
-    let superseded_keys = state
-        .validation
-        .completed
-        .keys()
-        .filter(|candidate| {
-            candidate.repository == requested.repository
-                && candidate.cwd == requested.cwd
-                && candidate.canonical_route_hash == requested.canonical_route_hash
-                && candidate.coverage_identity == requested.coverage_identity
-                && candidate.environment_identity == requested.environment_identity
-                && candidate.toolchain_identity == requested.toolchain_identity
-                && candidate.configuration_identity == requested.configuration_identity
-                && candidate.validation_contract_version == requested.validation_contract_version
-                && candidate.implementation_identity != requested.implementation_identity
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    for superseded_key in &superseded_keys {
-        let Some(proof) = state.validation.completed.remove(superseded_key) else {
-            continue;
-        };
-        state
-            .validation
-            .completed_order
-            .retain(|entry| entry != superseded_key);
-        mark_validation_invalidated(&mut state.validation, superseded_key.clone());
-        let Some(result) = state
-            .validation
-            .results_by_call
-            .get_mut(&proof.result.call_id)
-        else {
-            continue;
-        };
-        let result = Arc::make_mut(result);
-        result.status = ValidationTerminalStatus::Superseded;
-        result.freshness = ValidationFreshness::Superseded;
-        result.summary = Some(format!(
-            "focused validation was superseded by implementation identity {}",
-            requested.implementation_identity
-        ));
-    }
-    superseded_keys
-}
-
-fn mark_validation_invalidated(validation: &mut CommandValidationState, key: ValidationProofKey) {
-    if validation.invalidated.insert(key.clone()) {
-        validation.invalidated_order.push_back(key);
-    }
-    while validation.invalidated.len() > MAX_COMPLETED_VALIDATION_PROOFS {
-        let Some(oldest) = validation.invalidated_order.pop_front() else {
-            break;
-        };
-        validation.invalidated.remove(&oldest);
-    }
-}
-
 fn selected_test_evidence(route: &ValidationRoute, output: &[u8]) -> SelectedTestEvidence {
     let Some(runner) = validation_test_runner(route) else {
         return SelectedTestEvidence::NotATest;
@@ -2383,6 +1843,44 @@ fn nextest_selected_test_count(output: &[u8]) -> Option<u64> {
     }
 }
 
+async fn write_cache_document(cache_path: PathBuf, bytes: Vec<u8>) -> io::Result<()> {
+    let _commit =
+        tokio::task::spawn_blocking(move || write_cache_document_blocking(&cache_path, &bytes))
+            .await
+            .map_err(|error| io::Error::other(format!("command cache task failed: {error}")))??;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DurableCacheCommit;
+
+fn write_cache_document_blocking(
+    cache_path: &Path,
+    bytes: &[u8],
+) -> io::Result<DurableCacheCommit> {
+    let Some(parent) = cache_path.parent() else {
+        return Err(io::Error::other("command cache path has no parent"));
+    };
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(cache_path).map_err(|error| error.error)?;
+    sync_cache_parent(parent)?;
+    Ok(DurableCacheCommit)
+}
+
+fn sync_cache_parent(parent: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)?
+        .sync_all()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2404,20 +1902,41 @@ mod tests {
         CommandAttemptKey::new("exec_command", "local", "C:/repo", &[command.to_string()])
     }
 
+    fn initialize_git_repository(path: &Path) {
+        std::fs::create_dir_all(path).expect("create repository");
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(path)
+            .status()
+            .expect("launch git init");
+        assert!(status.success(), "git init failed");
+    }
+
     fn validation_launch() -> ValidationLaunchPlan {
         ValidationLaunchPlan {
-            invocation: crate::tools::handlers::command_shape::CommandInvocation::Argv {
-                program: "cargo".to_string(),
-                args: vec!["test".to_string()],
-            },
+            classification: crate::validation_admission::classify_validation(
+                &crate::tools::handlers::command_shape::CommandInvocation::Argv {
+                    program: "cargo".to_string(),
+                    args: vec!["test".to_string()],
+                },
+            ),
             authorization_revision: 1,
-            observation: None,
-            proof_key: None,
+            explicitly_tagged: false,
             structured_route: None,
             bound_plan_step: None,
+            bound_work_unit: None,
             validation_call_id: None,
             turn_timing_state: None,
-            force_fresh: false,
+            focused_validation_token: None,
+        }
+    }
+
+    fn receipt_validation_launch(call_id: &str) -> ValidationLaunchPlan {
+        ValidationLaunchPlan {
+            structured_route: Some(focused_cargo_route()),
+            bound_plan_step: Some(("implementation-step".to_string(), 7)),
+            validation_call_id: Some(call_id.to_string()),
+            ..validation_launch()
         }
     }
 
@@ -2431,909 +1950,125 @@ mod tests {
                     "codex-core".to_string(),
                     "focused_case".to_string(),
                 ],
-                uncertainty: "the focused case still passes".to_string(),
                 covered_paths: vec!["core/src/tools/command_execution.rs".to_string()],
-                covered_contracts: vec!["nonempty-cargo-proof".to_string()],
                 timeout_ms: 30_000,
-                semantic_timeout: false,
             }],
             ordering: Default::default(),
         }
     }
-
-    fn validation_proof_key(identity: &str) -> ValidationProofKey {
-        ValidationProofKey {
-            repository: "C:/repo".to_string(),
-            cwd: "C:/repo".to_string(),
-            canonical_route_hash: format!("route-{identity}"),
-            implementation_identity: identity.to_string(),
-            coverage_identity: "focused-coverage".to_string(),
-            environment_identity: "test-environment".to_string(),
-            toolchain_identity: "test-toolchain".to_string(),
-            configuration_identity: "test-configuration".to_string(),
-            validation_contract_version: codex_protocol::validation::VALIDATION_CONTRACT_VERSION,
-        }
-    }
-
-    fn initialize_git_repository(path: &Path) {
-        std::fs::create_dir_all(path).expect("create repository");
-        let status = Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(path)
-            .status()
-            .expect("launch git init");
-        assert!(status.success(), "git init failed");
-    }
-
-    fn validation_route_with_argv(argv: &[&str]) -> ValidationRoute {
-        let mut route = focused_cargo_route();
-        route.leaves[0].argv = argv
-            .iter()
-            .map(|argument| (*argument).to_string())
-            .collect();
-        route
-    }
-
-    const AUDIT_CARGO_SUCCESS: &[u8] = b"running 1 test\n\
-test focused_case ... ok\n\
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
-
-    #[test]
-    fn audit_validation_execution_rejects_mixed_runner_count_evidence() {
-        let route = validation_route_with_argv(&["just", "test-fast"]);
-        let output = b"running 2 tests\n\
-test first ... ok\n\
-test second ... ok\n\
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
-Summary [ 0.10s] 7 tests run: 7 passed, 0 skipped\n";
-
-        assert_eq!(
-            selected_test_evidence(&route, output),
-            SelectedTestEvidence::Ambiguous
-        );
-        assert_eq!(
-            completed_validation_skip_disposition(&route, output, 0),
-            Some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
-        );
-    }
-
-    #[test]
-    fn audit_validation_execution_sums_disjoint_cargo_suites() {
-        let output = b"running 1 test\n\
-test first ... ok\n\
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
-running 2 tests\n\
-test second ... ok\n\
-test third ... ok\n\
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
-
-        assert_eq!(
-            selected_test_evidence(&focused_cargo_route(), output),
-            SelectedTestEvidence::Exact(3)
-        );
-    }
-
-    #[test]
-    fn audit_validation_execution_normalizes_windows_runner_paths() {
-        for program in ["cargo.exe", r"C:\\Rust\\bin\\cargo.exe"] {
-            let route = validation_route_with_argv(&[program, "test", "focused_case"]);
-            assert_eq!(
-                selected_test_evidence(&route, AUDIT_CARGO_SUCCESS),
-                SelectedTestEvidence::Exact(1)
-            );
-        }
-        let just_route = validation_route_with_argv(&["C:/tools/just.exe", "test-fast"]);
-        assert_eq!(
-            selected_test_evidence(&just_route, AUDIT_CARGO_SUCCESS),
-            SelectedTestEvidence::Exact(1)
-        );
-    }
-
-    #[test]
-    fn audit_validation_execution_rejects_free_form_count_phrases() {
-        let output = b"application log: starting\nrunning 12 tests\napplication log: complete\n";
-
-        assert_eq!(
-            selected_test_evidence(&focused_cargo_route(), output),
-            SelectedTestEvidence::Missing
-        );
-        assert_eq!(
-            completed_validation_skip_disposition(&focused_cargo_route(), output, 0),
-            Some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
-        );
-    }
-
-    #[test]
-    fn audit_validation_execution_unverified_test_runner_cannot_succeed() {
-        let route = validation_route_with_argv(&["custom-test-runner", "focused_case"]);
-
-        assert!(validation_route_is_test(&route));
-        assert_eq!(
-            selected_test_evidence(&route, b"all checks passed\n"),
-            SelectedTestEvidence::Missing
-        );
-        assert_eq!(
-            completed_validation_skip_disposition(&route, b"all checks passed\n", 0),
-            Some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
-        );
-    }
-
     #[tokio::test]
-    async fn audit_validation_execution_shared_cache_uses_os_file_lock() {
-        let temp = tempfile::tempdir().expect("cache fixture");
-        let cache_path = temp.path().join("cache").join("validation.json");
-        std::fs::create_dir_all(cache_path.parent().expect("cache parent"))
-            .expect("create cache parent");
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(cache_path.with_extension("lock"))
-            .expect("open validation cache lock");
-        lock_file.lock().expect("hold validation cache lock");
-
-        let key = validation_proof_key("locked-update");
-        let update = tokio::spawn(update_shared_validation_cache(
-            cache_path.clone(),
-            SharedValidationCacheUpdate::Invalidate(key.clone()),
-        ));
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert!(
-            !update.is_finished(),
-            "cache update must wait for a lock held outside its task"
-        );
-        lock_file.unlock().expect("release validation cache lock");
-        update
-            .await
-            .expect("join cache update")
-            .expect("cache update");
-
-        let document: PersistedValidationCacheDocument =
-            serde_json::from_slice(&std::fs::read(cache_path).expect("read validation cache"))
-                .expect("parse validation cache");
-        assert_eq!(document.invalidated_validations, vec![key]);
-    }
-
-    #[tokio::test]
-    async fn audit_validation_execution_tombstone_blocks_stale_reimport() {
-        let temp = tempfile::tempdir().expect("cache fixture");
-        let repository = temp.path().join("repo");
-        let codex_home = temp.path().join("codex-home");
-        initialize_git_repository(&repository);
-        let ledger = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            "tombstone-producer".to_string(),
-            &repository,
-        )
-        .await;
-        let old_key = validation_proof_key("tombstoned-old");
-        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            &codex_home,
-            "tombstone-producer",
-            AUDIT_CARGO_SUCCESS,
-        )
-        .await;
-        assert!(
-            ledger
-                .publish_completed_validation(
-                    old_key.clone(),
-                    focused_cargo_route(),
-                    "tombstone-call".to_string(),
-                    artifact,
-                    Instant::now(),
-                    0,
-                    None,
-                )
-                .await
-        );
-        let cache_path = ledger
-            .persistence
-            .as_ref()
-            .expect("persistent ledger")
-            .shared_validation_cache_path
-            .clone();
-        let original: PersistedValidationCacheDocument = serde_json::from_slice(
-            &std::fs::read(&cache_path).expect("read original validation cache"),
-        )
-        .expect("parse original validation cache");
-        let stale_proof = original.completed_validations[0].clone();
-
-        let mut current_key = old_key.clone();
-        current_key.implementation_identity = "tombstoned-current".to_string();
-        assert!(ledger.reusable_validation(&current_key).await.is_none());
-        let mut tombstoned: PersistedValidationCacheDocument = serde_json::from_slice(
-            &std::fs::read(&cache_path).expect("read tombstoned validation cache"),
-        )
-        .expect("parse tombstoned validation cache");
-        assert_eq!(tombstoned.invalidated_validations, vec![old_key.clone()]);
-        tombstoned.completed_validations.push(stale_proof);
-        let bytes = serde_json::to_vec_pretty(&tombstoned).expect("serialize stale cache state");
-        write_cache_document_blocking(&cache_path, &bytes).expect("inject stale cache record");
-        drop(ledger);
-
-        let reopened = CommandExecutionLedger::load_or_new(
-            codex_home,
-            "tombstone-consumer".to_string(),
-            &repository,
-        )
-        .await;
-        assert!(reopened.reusable_validation(&old_key).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn audit_validation_execution_cache_write_failure_is_reported() {
-        let temp = tempfile::tempdir().expect("cache fixture");
-        let repository = temp.path().join("repo");
-        let codex_home = temp.path().join("codex-home");
-        initialize_git_repository(&repository);
-        let ledger = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            "persistence-failure".to_string(),
-            &repository,
-        )
-        .await;
-        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            &codex_home,
-            "persistence-failure",
-            AUDIT_CARGO_SUCCESS,
-        )
-        .await;
-        let cache_parent = ledger
-            .persistence
-            .as_ref()
-            .expect("persistent ledger")
-            .shared_validation_cache_path
-            .parent()
-            .expect("cache parent")
-            .to_path_buf();
-        if cache_parent.exists() {
-            std::fs::remove_dir_all(&cache_parent).expect("remove cache directory fixture");
-        }
-        std::fs::write(&cache_parent, b"not a directory").expect("block cache directory creation");
-
-        let proof_key = validation_proof_key("persistence-failure");
-        assert!(
-            ledger
-                .publish_completed_validation(
-                    proof_key.clone(),
-                    focused_cargo_route(),
-                    "persistence-failure-call".to_string(),
-                    artifact,
-                    Instant::now(),
-                    0,
-                    None,
-                )
-                .await
-        );
-        let result = ledger
-            .validation_result_for_call("persistence-failure-call")
-            .await
-            .expect("failed validation result");
-        assert_eq!(result.status, ValidationTerminalStatus::Failed);
-        assert!(
-            result
-                .summary
-                .as_deref()
-                .is_some_and(|summary| summary.contains("persistence failed"))
-        );
-        assert!(ledger.reusable_validation(&proof_key).await.is_none());
-    }
-
-    #[test]
-    fn audit_validation_execution_cache_commit_syncs_parent() {
-        let temp = tempfile::tempdir().expect("cache fixture");
-        let cache_path = temp.path().join("cache").join("document.json");
-
-        let commit = write_cache_document_blocking(&cache_path, b"durable")
-            .expect("write and sync cache document");
-
-        assert_eq!(commit, DurableCacheCommit);
-        assert_eq!(std::fs::read(cache_path).expect("read cache"), b"durable");
-    }
-
-    #[tokio::test]
-    async fn workspace_identity_is_available_only_for_captured_local_cwd() {
-        let temp = tempfile::tempdir().expect("workspace identity fixture");
-        let repository = temp.path().join("repo");
-        let alternate_repository = temp.path().join("alternate-repo");
-        let codex_home = temp.path().join("codex-home");
-        initialize_git_repository(&repository);
-        initialize_git_repository(&alternate_repository);
-        let ledger = CommandExecutionLedger::load_or_new(
-            codex_home,
-            "workspace-scope".to_string(),
-            &repository,
-        )
-        .await;
-
-        assert!(
-            ledger
-                .current_workspace_identity_hash(
-                    codex_exec_server::LOCAL_ENVIRONMENT_ID,
-                    &repository,
-                )
-                .await
-                .is_some()
-        );
-        assert!(
-            ledger
-                .current_workspace_identity_hash(
-                    codex_exec_server::LOCAL_ENVIRONMENT_ID,
-                    &alternate_repository,
-                )
-                .await
-                .is_none()
-        );
-        assert!(
-            ledger
-                .current_workspace_identity_hash("remote-environment", &repository)
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn supplied_workspace_identity_must_match_persisted_repository() {
-        let temp = tempfile::tempdir().expect("workspace identity fixture");
-        let repository = temp.path().join("repo");
-        let other_repository = temp.path().join("other-repo");
-        initialize_git_repository(&repository);
-        initialize_git_repository(&other_repository);
-        let ledger = CommandExecutionLedger::load_or_new(
-            temp.path().join("codex-home"),
-            "workspace-scope".to_string(),
-            &repository,
-        )
-        .await;
-        tokio::fs::write(repository.join("changed.txt"), b"changed")
-            .await
-            .expect("mutate persisted repository");
-        let expected_identity =
-            crate::git_workspace::capture_workspace_evidence_identity(&repository)
-                .await
-                .expect("expected repository identity");
-        let other_identity =
-            crate::git_workspace::capture_workspace_evidence_identity(&other_repository)
-                .await
-                .expect("other repository identity");
-
-        ledger
-            .observe_repository_revision_with_identity("turn-a", 1, Some(other_identity.clone()))
-            .await;
-
-        let expected_hash = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&expected_identity).expect("serialize identity"))
-        );
-        let other_hash = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&other_identity).expect("serialize identity"))
-        );
-        let observed_hash = ledger
-            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
-            .await
-            .expect("observed repository identity");
-        assert_eq!(observed_hash, expected_hash);
-        assert_ne!(observed_hash, other_hash);
-    }
-
-    #[tokio::test]
-    async fn scoped_validation_reuse_survives_unrelated_workspace_change() {
-        let temp = tempfile::tempdir().expect("cache fixture");
-        let repository = temp.path().join("repo");
-        let codex_home = temp.path().join("codex-home");
-        initialize_git_repository(&repository);
-        let thread_id = "persisted-command-state";
-        let ledger = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            thread_id.to_string(),
-            &repository,
-        )
-        .await;
-        assert_eq!(ledger.observe_repository_revision("turn-a", 1).await, 1);
-        let search = RgSearchNarrowing {
-            breadth: RgSearchBreadth::Narrow,
-            query_identity: "missing".to_string(),
-            search_identity: "missing:src".to_string(),
-            scope_identity: "repo/src".to_string(),
-            parent_scope_identity: Some("repo".to_string()),
-            can_record_miss: true,
-        };
-        let missed = key("rg missing src")
-            .with_repository_epoch(1)
-            .with_search_narrowing("turn-a", "repo", Some(search.clone()));
-        ledger.record_exit(&missed, 1).await;
-
-        let proof_key = validation_proof_key("persisted");
-        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            &codex_home,
-            thread_id,
-            b"running 1 test\ntest persisted_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
-        )
-        .await;
-        assert!(
-            ledger
-                .publish_completed_validation(
-                    proof_key.clone(),
-                    focused_cargo_route(),
-                    "persisted-call".to_string(),
-                    artifact,
-                    Instant::now(),
-                    0,
-                    None,
-                )
-                .await
-        );
-        ledger.finish_turn("turn-a").await;
-
-        let reopened = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            thread_id.to_string(),
-            &repository,
-        )
-        .await;
-        let equivalent = key("rg missing ./src")
-            .with_repository_epoch(1)
-            .with_search_narrowing("turn-b", "repo", Some(search));
-        assert!(
-            reopened
-                .begin_attempt_with_freshness(&equivalent, false, false)
-                .await
-                .is_err()
-        );
-        let reused = reopened
-            .reusable_validation(&proof_key)
-            .await
-            .expect("persisted validation proof");
-        assert_eq!(reused.freshness, ValidationFreshness::Reused);
-
-        std::fs::write(repository.join("external-change.txt"), "changed")
-            .expect("mutate repository");
-        let changed_workspace =
-            CommandExecutionLedger::load_or_new(codex_home, thread_id.to_string(), &repository)
-                .await;
-        assert!(
-            changed_workspace
-                .reusable_validation(&proof_key)
-                .await
-                .is_some(),
-            "an unrelated workspace mutation must not invalidate a scoped proof"
-        );
-        assert!(
-            changed_workspace
-                .begin_attempt_with_freshness(&equivalent, false, false)
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn scoped_validation_reuse_is_immediately_available_to_later_thread() {
-        let temp = tempfile::tempdir().expect("cache fixture");
-        let repository = temp.path().join("repo");
-        let codex_home = temp.path().join("codex-home");
-        initialize_git_repository(&repository);
-        let producer = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            "producer-thread".to_string(),
-            &repository,
-        )
-        .await;
-        let consumer = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            "consumer-thread".to_string(),
-            &repository,
-        )
-        .await;
-        let proof_key = validation_proof_key("cross-thread");
-        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            &codex_home,
-            "producer-thread",
-            b"running 1 test\ntest cross_thread_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
-        )
-        .await;
-        assert!(
-            producer
-                .publish_completed_validation(
-                    proof_key.clone(),
-                    focused_cargo_route(),
-                    "producer-call".to_string(),
-                    artifact,
-                    Instant::now(),
-                    0,
-                    None,
-                )
-                .await
-        );
-
-        std::fs::write(repository.join("unrelated.txt"), "changed")
-            .expect("mutate an unrelated path");
-        let reused = consumer
-            .reusable_validation(&proof_key)
-            .await
-            .expect("later thread reuses the producer's completed validation");
-        assert_eq!(reused.call_id, "producer-call");
-        assert_eq!(reused.freshness, ValidationFreshness::Reused);
-    }
-
-    #[tokio::test]
-    async fn scoped_validation_reuse_never_persists_failures() {
-        let temp = tempfile::tempdir().expect("cache fixture");
-        let repository = temp.path().join("repo");
-        let codex_home = temp.path().join("codex-home");
-        initialize_git_repository(&repository);
-        let producer = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            "failed-producer".to_string(),
-            &repository,
-        )
-        .await;
-        let proof_key = validation_proof_key("failed-cross-thread");
-        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            &codex_home,
-            "failed-producer",
-            b"running 1 test\ntest focused_case ... FAILED\n",
-        )
-        .await;
-        assert!(
-            producer
-                .publish_completed_validation(
-                    proof_key.clone(),
-                    focused_cargo_route(),
-                    "failed-call".to_string(),
-                    artifact,
-                    Instant::now(),
-                    1,
-                    None,
-                )
-                .await
-        );
-
-        let consumer = CommandExecutionLedger::load_or_new(
-            codex_home,
-            "failed-consumer".to_string(),
-            &repository,
-        )
-        .await;
-        assert!(consumer.reusable_validation(&proof_key).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn scoped_validation_reuse_rejects_cross_thread_artifact_tampering() {
-        let temp = tempfile::tempdir().expect("cache fixture");
-        let repository = temp.path().join("repo");
-        let codex_home = temp.path().join("codex-home");
-        initialize_git_repository(&repository);
-        let producer_thread = "tamper-producer";
-        let producer = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            producer_thread.to_string(),
-            &repository,
-        )
-        .await;
-        let proof_key = validation_proof_key("tampered-cross-thread");
-        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            &codex_home,
-            producer_thread,
-            b"running 1 test\ntest focused_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
-        )
-        .await;
-        assert!(
-            producer
-                .publish_completed_validation(
-                    proof_key.clone(),
-                    focused_cargo_route(),
-                    "tamper-call".to_string(),
-                    artifact,
-                    Instant::now(),
-                    0,
-                    None,
-                )
-                .await
-        );
-        let artifact_ref = producer
-            .validation_result_for_call("tamper-call")
-            .await
-            .and_then(|result| result.raw_artifact_ref)
-            .expect("retained artifact reference");
-        let shared_validation_cache_path = producer
-            .persistence
-            .as_ref()
-            .expect("persistent producer")
-            .shared_validation_cache_path
-            .clone();
-        drop(producer);
-        std::fs::write(
-            codex_home
-                .join("tool-output")
-                .join(producer_thread)
-                .join(format!("{artifact_ref}.log")),
-            "tampered output",
-        )
-        .expect("tamper retained artifact");
-
-        let consumer = CommandExecutionLedger::load_or_new(
-            codex_home,
-            "tamper-consumer".to_string(),
-            &repository,
-        )
-        .await;
-        assert!(consumer.reusable_validation(&proof_key).await.is_none());
-        let persisted: PersistedValidationCacheDocument = serde_json::from_slice(
-            &std::fs::read(shared_validation_cache_path).expect("read shared validation cache"),
-        )
-        .expect("parse shared validation cache");
-        assert!(persisted.completed_validations.is_empty());
-    }
-
-    #[tokio::test]
-    async fn superseded_validation_freshness_marks_outdated_implementation_proof() {
-        let temp = tempfile::tempdir().expect("artifact directory");
-        let ledger = CommandExecutionLedger::default();
-        let old_key = validation_proof_key("old-implementation");
-        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            temp.path(),
-            "superseded-validation",
-            b"running 1 test\ntest focused_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
-        )
-        .await;
-        assert!(
-            ledger
-                .publish_completed_validation(
-                    old_key.clone(),
-                    focused_cargo_route(),
-                    "superseded-call".to_string(),
-                    artifact,
-                    Instant::now(),
-                    0,
-                    None,
-                )
-                .await
-        );
-
-        let mut current_key = old_key.clone();
-        current_key.implementation_identity = "current-implementation".to_string();
-        assert!(ledger.reusable_validation(&current_key).await.is_none());
-
-        let superseded = ledger
-            .validation_result_for_call("superseded-call")
-            .await
-            .expect("superseded result remains addressable by its production call id");
-        assert_eq!(superseded.status, ValidationTerminalStatus::Superseded);
-        assert_eq!(superseded.freshness, ValidationFreshness::Superseded);
-        assert!(
-            superseded
-                .summary
-                .as_deref()
-                .is_some_and(|summary| summary.contains("current-implementation"))
-        );
-        assert!(ledger.reusable_validation(&old_key).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn scoped_validation_reuse_persists_before_finish_turn() {
-        let temp = tempfile::tempdir().expect("cache fixture");
-        let repository = temp.path().join("repo");
-        let codex_home = temp.path().join("codex-home");
-        initialize_git_repository(&repository);
-        let thread_id = "mutation-before-persist";
-        let ledger = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            thread_id.to_string(),
-            &repository,
-        )
-        .await;
-        assert_eq!(ledger.observe_repository_revision("turn-a", 1).await, 1);
-        let search = RgSearchNarrowing {
-            breadth: RgSearchBreadth::Narrow,
-            query_identity: "missing".to_string(),
-            search_identity: "missing:src".to_string(),
-            scope_identity: "repo/src".to_string(),
-            parent_scope_identity: Some("repo".to_string()),
-            can_record_miss: true,
-        };
-        let missed = key("rg missing src")
-            .with_repository_epoch(1)
-            .with_search_narrowing("turn-a", "repo", Some(search.clone()));
-        ledger.record_exit(&missed, 1).await;
-
-        let proof_key = validation_proof_key("mutation-before-persist");
-        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            &codex_home,
-            thread_id,
-            b"running 1 test\ntest persisted_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
-        )
-        .await;
-        assert!(
-            ledger
-                .publish_completed_validation(
-                    proof_key.clone(),
-                    focused_cargo_route(),
-                    "persisted-call".to_string(),
-                    artifact,
-                    Instant::now(),
-                    0,
-                    None,
-                )
-                .await
-        );
-        let per_thread_cache_path = ledger
-            .persistence
-            .as_ref()
-            .expect("persistent ledger")
-            .cache_path
-            .clone();
-
-        std::fs::write(repository.join("external-change.txt"), "changed")
-            .expect("mutate repository before persistence");
-        ledger.finish_turn("turn-a").await;
-        if let Ok(bytes) = std::fs::read(per_thread_cache_path) {
-            let per_thread_cache: serde_json::Value =
-                serde_json::from_slice(&bytes).expect("parse per-thread command cache");
-            assert!(per_thread_cache.get("completed_validations").is_none());
-        }
-
-        let reopened =
-            CommandExecutionLedger::load_or_new(codex_home, thread_id.to_string(), &repository)
-                .await;
-        let equivalent = key("rg missing ./src")
-            .with_repository_epoch(1)
-            .with_search_narrowing("turn-b", "repo", Some(search));
-        assert!(
-            reopened
-                .begin_attempt_with_freshness(&equivalent, false, false)
-                .await
-                .is_ok()
-        );
-        assert!(reopened.reusable_validation(&proof_key).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn zero_test_cargo_success_is_failed_and_not_reusable() {
-        let temp = tempfile::tempdir().expect("artifact directory");
-        let ledger = CommandExecutionLedger::default();
-        let route = focused_cargo_route();
-        let zero_key = validation_proof_key("zero");
-        let zero_artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            temp.path(),
-            "zero-test",
-            b"running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n",
-        )
-        .await;
-        assert_eq!(
-            completed_validation_skip_disposition(
-                &route,
-                b"running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n",
-                0,
-            ),
-            Some(codex_tools::ToolOutputSkipDisposition::NotApplicable)
-        );
-        assert!(
-            ledger
-                .publish_completed_validation(
-                    zero_key.clone(),
-                    route.clone(),
-                    "zero-call".to_string(),
-                    zero_artifact,
-                    Instant::now(),
-                    0,
-                    None,
-                )
-                .await
-        );
-        let zero_result = ledger
-            .validation_result_for_call("zero-call")
-            .await
-            .expect("zero-test result");
-        assert_eq!(zero_result.status, ValidationTerminalStatus::Failed);
-        assert!(ledger.reusable_validation(&zero_key).await.is_none());
-
-        let selected_key = validation_proof_key("selected");
-        let selected_artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            temp.path(),
-            "selected-test",
-            b"running 1 test\ntest focused_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
-        )
-        .await;
-        assert!(
-            ledger
-                .publish_completed_validation(
-                    selected_key.clone(),
-                    route,
-                    "selected-call".to_string(),
-                    selected_artifact,
-                    Instant::now(),
-                    0,
-                    None,
-                )
-                .await
-        );
-        let selected_result = ledger
-            .validation_result_for_call("selected-call")
-            .await
-            .expect("selected-test result");
-        assert_eq!(selected_result.status, ValidationTerminalStatus::Succeeded);
-        assert!(ledger.reusable_validation(&selected_key).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn validation_execution_telemetry_records_cost_and_force_fresh() {
-        let temp = tempfile::tempdir().expect("artifact directory");
-        let ledger = CommandExecutionLedger::default();
-        let timing = std::sync::Arc::new(crate::turn_timing::TurnTimingState::default());
-        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            temp.path(),
-            "telemetry-test",
-            b"running 1 test\ntest focused_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
-        )
-        .await;
-        assert!(
-            ledger
-                .publish_completed_validation_with_context(
-                    validation_proof_key("telemetry"),
-                    focused_cargo_route(),
-                    "telemetry-call".to_string(),
-                    None,
-                    artifact,
-                    Instant::now() - Duration::from_millis(25),
-                    0,
-                    None,
-                    Some(std::sync::Arc::clone(&timing)),
-                    true,
-                )
-                .await
-        );
-
-        let counters = timing.complete_snapshot().protocol_timing().counters;
-        assert_eq!(counters.executed_validation_count, 1);
-        assert_eq!(counters.forced_fresh_validation_count, 1);
-        assert!(counters.executed_validation_duration_ns >= 25_000_000);
-        assert_eq!(counters.reused_validation_count, 0);
-        assert_eq!(counters.duplicate_validation_count, 0);
-    }
-
-    #[tokio::test]
-    async fn completed_validation_preserves_launch_bound_plan_step() {
+    async fn zero_test_validation_fails_without_losing_launch_binding() {
         let temp = tempfile::tempdir().expect("artifact directory");
         let ledger = CommandExecutionLedger::default();
         let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
             temp.path(),
             "bound-plan-step-test",
-            b"running 1 test\ntest focused_case ... ok\ntest result: ok. 1 passed; 0 failed\n",
+            b"running 0 tests\ntest result: ok. 0 passed; 0 failed\n",
         )
         .await;
 
-        assert!(
-            ledger
-                .publish_completed_validation_with_context(
-                    validation_proof_key("bound-plan-step"),
-                    focused_cargo_route(),
-                    "bound-plan-step-call".to_string(),
-                    Some(("implementation-step".to_string(), 7)),
-                    artifact,
-                    Instant::now(),
-                    0,
-                    None,
-                    None,
-                    false,
-                )
-                .await
-        );
-
-        let (result, bound_plan_step) = ledger
-            .validation_result_with_plan_step_for_call("bound-plan-step-call")
+        let completed = ledger
+            .complete_validation(
+                focused_cargo_route(),
+                "bound-plan-step-call".to_string(),
+                Some(("implementation-step".to_string(), 7)),
+                None,
+                Some(artifact),
+                Instant::now(),
+                Some(0),
+                false,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("completed validation result");
-        assert_eq!(result.status, ValidationTerminalStatus::Succeeded);
+        assert_eq!(completed.result.status, ValidationTerminalStatus::Failed);
         assert_eq!(
-            bound_plan_step,
+            completed.result.summary.as_deref(),
+            Some("validation did not prove a nonzero selected-test count")
+        );
+        assert_eq!(
+            completed.result.failure_excerpt.as_deref(),
+            Some(
+                "test validation exited successfully without a positive selected-test count; exact output is retained in the immutable artifact"
+            )
+        );
+        assert_eq!(
+            completed.bound_plan_step,
             Some(("implementation-step".to_string(), 7))
         );
+        assert_eq!(completed.bound_work_unit, None);
     }
 
     #[tokio::test]
-    async fn broad_rg_requires_a_same_turn_narrow_search_miss() {
+    async fn validation_result_uses_exit_status_without_parsing_output() {
+        let temp = tempfile::tempdir().expect("artifact directory");
+        let ledger = CommandExecutionLedger::default();
+        let misleading_artifact =
+            crate::tools::command_output_artifact::create_raw_output_artifact(
+                temp.path(),
+                "exit-status-oracle-test",
+                b"running 1 test\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured\n",
+            )
+            .await;
+
+        let succeeded = ledger
+            .complete_validation(
+                focused_cargo_route(),
+                "exit-zero-call".to_string(),
+                None,
+                None,
+                Some(misleading_artifact),
+                Instant::now(),
+                Some(0),
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("exit-zero result");
+        let failed = ledger
+            .complete_validation(
+                focused_cargo_route(),
+                "nonzero-call".to_string(),
+                None,
+                None,
+                None,
+                Instant::now(),
+                Some(7),
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("nonzero result");
+        let timed_out = ledger
+            .complete_validation(
+                focused_cargo_route(),
+                "timeout-call".to_string(),
+                None,
+                None,
+                None,
+                Instant::now(),
+                Some(0),
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("timeout result");
+
+        assert_eq!(succeeded.result.status, ValidationTerminalStatus::Succeeded);
+        assert_eq!(failed.result.status, ValidationTerminalStatus::Failed);
+        assert_eq!(timed_out.result.status, ValidationTerminalStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn token_efficiency_broad_rg_is_admitted_with_or_without_narrow_miss() {
         let ledger = CommandExecutionLedger::default();
         let narrow = key("rg needle src").with_search_narrowing(
             "turn-a",
@@ -3360,11 +2095,10 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
             }),
         );
 
-        let blocked = ledger
+        ledger
             .admit_search_narrowing(&broad)
             .await
-            .expect_err("broad search must start blocked");
-        assert!(blocked.contains("first search a narrower scope"));
+            .expect("a justified broad search is advisory, not rejected");
         ledger
             .admit_search_narrowing(&narrow)
             .await
@@ -3379,11 +2113,11 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
         ledger
             .admit_search_narrowing(&broad)
             .await
-            .expect_err("expansion authorization must expire with the turn");
+            .expect("admission remains advisory after narrow-miss state expires");
     }
 
     #[tokio::test]
-    async fn broad_rg_requires_a_miss_for_the_same_query() {
+    async fn token_efficiency_different_query_miss_does_not_block_broad_rg() {
         let ledger = CommandExecutionLedger::default();
         let narrow = key("rg other src").with_search_narrowing(
             "turn-a",
@@ -3415,7 +2149,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
         ledger
             .admit_search_narrowing(&broad)
             .await
-            .expect_err("a miss for a different query must not authorize broad search");
+            .expect("broad search guidance is not a runtime rejection gate");
     }
 
     #[tokio::test]
@@ -3915,7 +2649,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
     }
 
     #[tokio::test]
-    async fn tracked_validation_watcher_completion_records_once_and_refreshes_evidence() {
+    async fn tracked_validation_watcher_completion_records_once_without_retry_state() {
         let ledger = CommandExecutionLedger::default();
         let command_key = key("cargo test --test focused");
         let finalized_artifact = RawOutputArtifact::unavailable("finalized watcher artifact");
@@ -3928,7 +2662,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
                 42,
                 command_key.clone(),
                 RawOutputArtifact::unavailable("initial watcher artifact"),
-                Some(validation_launch()),
+                Some(receipt_validation_launch("watcher-validation-call")),
                 Instant::now() - Duration::from_millis(25),
             )
             .await
@@ -3949,19 +2683,33 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
         ledger
             .update_running_artifact(42, finalized_artifact.clone())
             .await;
+        let completed = ledger
+            .complete_running_validation(42, false)
+            .await
+            .expect("watcher validation result");
+        assert_eq!(completed.result.call_id, "watcher-validation-call");
+        assert_eq!(completed.result.process_id.as_deref(), Some("42"));
+        assert_eq!(completed.result.status, ValidationTerminalStatus::Failed);
+        assert!(
+            ledger
+                .complete_running_validation(42, false)
+                .await
+                .is_none()
+        );
         assert!(ledger.finish_running_process(42, Some(7)).await.accepted());
 
         let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
-        assert_eq!(snapshot.consecutive_failures, 1);
+        assert_eq!(snapshot.consecutive_failures, 0);
+        assert_eq!(snapshot.last_exit_code, None);
         assert_eq!(snapshot.deterministic_failure, None);
         ledger
             .begin_attempt(&command_key, false)
             .await
-            .expect("a nonzero validation without typed proof remains retryable");
+            .expect("validation results do not enter the generic retry cache");
     }
 
     #[tokio::test]
-    async fn tracked_validation_handler_completion_records_once() {
+    async fn tracked_validation_handler_completion_does_not_enter_retry_state() {
         let ledger = CommandExecutionLedger::default();
         let command_key = key("cargo test --test direct");
         let finalized_artifact = RawOutputArtifact::unavailable("finalized handler artifact");
@@ -3987,12 +2735,13 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
         assert!(!ledger.finish_running_process(43, Some(9)).await.accepted());
 
         let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
-        assert_eq!(snapshot.consecutive_failures, 1);
+        assert_eq!(snapshot.consecutive_failures, 0);
+        assert_eq!(snapshot.last_exit_code, None);
         assert_eq!(snapshot.deterministic_failure, None);
         ledger
             .begin_attempt(&command_key, false)
             .await
-            .expect("handler-completed validation without typed proof remains retryable");
+            .expect("handler-completed validation does not enter the generic retry cache");
     }
 
     #[tokio::test]
@@ -4187,114 +2936,6 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
             );
         }
     }
-
-    #[tokio::test]
-    async fn audit189_production_binding_invalidates_ledger_reuse_after_covered_mutation() {
-        let temp = tempfile::tempdir().expect("validation binding fixture");
-        let repository = temp.path().join("repo");
-        let codex_home = temp.path().join("codex-home");
-        initialize_git_repository(&repository);
-        std::fs::write(repository.join("kd4_features.toml"), "# fixture\n")
-            .expect("KD4 marker writes");
-        std::fs::create_dir_all(repository.join("src")).expect("source directory creates");
-        std::fs::write(repository.join("src/covered.rs"), "before\n")
-            .expect("covered source writes");
-        let evidence = crate::task_evidence::TaskEvidenceLedger::load_or_new(
-            codex_home.clone(),
-            codex_protocol::ThreadId::new(),
-            &repository,
-        )
-        .await;
-        let route = ValidationRoute {
-            leaves: vec![codex_protocol::plan_tool::ValidationRouteLeaf {
-                argv: vec![
-                    "cargo".to_string(),
-                    "test".to_string(),
-                    "-p".to_string(),
-                    "fixture".to_string(),
-                    "covered_case".to_string(),
-                ],
-                uncertainty: "covered behavior remains correct".to_string(),
-                covered_paths: vec!["src/covered.rs".to_string()],
-                covered_contracts: vec!["covered-contract".to_string()],
-                timeout_ms: 30_000,
-                semantic_timeout: false,
-            }],
-            ordering: Default::default(),
-        };
-        let leaf = &route.leaves[0];
-        let invocation = crate::tools::handlers::command_shape::CommandInvocation::Argv {
-            program: leaf.argv[0].clone(),
-            args: leaf.argv[1..].to_vec(),
-        };
-        let implementation_identity = evidence
-            .direct_validation_implementation_binding_for_leaf(leaf)
-            .await
-            .expect("production implementation binding")
-            .0;
-        let proof_key = crate::validation_admission::validation_identity_with_scope(
-            repository.to_string_lossy().as_bytes(),
-            repository.to_string_lossy(),
-            &invocation,
-            "test-environment",
-            "test-toolchain",
-            "test-configuration",
-            implementation_identity,
-            &leaf.uncertainty,
-            &leaf.covered_paths,
-            &leaf.covered_contracts,
-        );
-        let ledger = CommandExecutionLedger::load_or_new(
-            codex_home.clone(),
-            "binding-producer".to_string(),
-            &repository,
-        )
-        .await;
-        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            &codex_home,
-            "binding-producer",
-            AUDIT_CARGO_SUCCESS,
-        )
-        .await;
-        assert!(
-            ledger
-                .publish_completed_validation(
-                    proof_key.clone(),
-                    route.clone(),
-                    "binding-call".to_string(),
-                    artifact,
-                    Instant::now(),
-                    0,
-                    None,
-                )
-                .await
-        );
-        assert!(ledger.reusable_validation(&proof_key).await.is_some());
-
-        std::fs::write(repository.join("src/covered.rs"), "after\n")
-            .expect("covered source mutates");
-        let changed_implementation = evidence
-            .direct_validation_implementation_binding_for_leaf(leaf)
-            .await
-            .expect("changed production implementation binding")
-            .0;
-        let changed_key = crate::validation_admission::validation_identity_with_scope(
-            repository.to_string_lossy().as_bytes(),
-            repository.to_string_lossy(),
-            &invocation,
-            "test-environment",
-            "test-toolchain",
-            "test-configuration",
-            changed_implementation,
-            &leaf.uncertainty,
-            &leaf.covered_paths,
-            &leaf.covered_contracts,
-        );
-        assert_ne!(proof_key, changed_key);
-        assert!(ledger.reusable_validation(&changed_key).await.is_none());
-        assert!(ledger.reusable_validation(&proof_key).await.is_none());
-    }
-
     #[tokio::test]
     async fn audit189_rg_classifier_drives_narrowing_ledger_for_real_commands() {
         use crate::shell::ShellType;
@@ -4385,7 +3026,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
         compound_ledger
             .admit_search_narrowing(&broad)
             .await
-            .expect_err("compound rg output cannot authorize repository-wide expansion");
+            .expect("compound output does not turn advisory guidance into a rejection");
     }
 
     #[tokio::test]
@@ -4397,6 +3038,176 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
         assert_eq!(ledger.observe_repository_revision("turn-2", 0).await, 1);
         assert_eq!(ledger.observe_repository_revision("turn-2", 2).await, 3);
         assert_eq!(ledger.observe_repository_revision("turn-1", 1).await, 3);
+    }
+
+    #[tokio::test]
+    async fn workspace_identity_and_persisted_search_misses_load_on_first_command() {
+        let temp = tempfile::tempdir().expect("workspace identity fixture");
+        let repository = temp.path().join("repo");
+        let codex_home = temp.path().join("codex-home");
+        initialize_git_repository(&repository);
+        let search = |turn_id: &str, repository_epoch: u64, workspace_identity: &str| {
+            CommandAttemptKey::new(
+                "exec_command",
+                codex_exec_server::LOCAL_ENVIRONMENT_ID,
+                repository.to_string_lossy(),
+                &["rg".to_string(), "needle".to_string(), "src".to_string()],
+            )
+            .with_repository_epoch(repository_epoch)
+            .with_workspace_identity(Some(workspace_identity))
+            .with_search_narrowing(
+                turn_id,
+                "repository",
+                Some(RgSearchNarrowing {
+                    breadth: RgSearchBreadth::Narrow,
+                    query_identity: "needle".to_string(),
+                    search_identity: "needle:src".to_string(),
+                    scope_identity: "src".to_string(),
+                    parent_scope_identity: Some("repository".to_string()),
+                    can_record_miss: true,
+                }),
+            )
+        };
+
+        let producer = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            "thread".to_string(),
+            &repository,
+        )
+        .await;
+        let producer_epoch = producer.observe_repository_revision("turn-a", 0).await;
+        let producer_identity = producer
+            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
+            .await
+            .expect("first command observes the workspace");
+        let first_search = search("turn-a", producer_epoch, &producer_identity);
+        producer
+            .begin_attempt(&first_search, false)
+            .await
+            .expect("first search runs");
+        producer.record_exit(&first_search, 1).await;
+        producer.finish_turn("turn-a").await;
+
+        let unused = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            "unused-thread".to_string(),
+            &repository,
+        )
+        .await;
+        unused.finish_turn("unused-turn").await;
+        assert!(
+            unused
+                .state
+                .lock()
+                .await
+                .repository
+                .observed_workspace_identity
+                .is_none(),
+            "finishing a turn without a command must not inspect the workspace"
+        );
+
+        let matching = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            "thread".to_string(),
+            &repository,
+        )
+        .await;
+        let supplied_identity =
+            crate::git_workspace::capture_workspace_evidence_identity(&repository)
+                .await
+                .expect("matching supplied identity");
+        let matching_epoch = matching
+            .observe_repository_revision_with_identity("turn-match", 0, Some(supplied_identity))
+            .await;
+        let matching_identity = matching
+            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
+            .await
+            .expect("supplied identity initializes the ledger");
+        assert_eq!(matching_identity, producer_identity);
+        assert!(
+            matches!(
+                matching
+                    .begin_attempt(
+                        &search("turn-match", matching_epoch, &matching_identity),
+                        false,
+                    )
+                    .await,
+                Err(CommandAttemptBlocked {
+                    reason: CommandAttemptBlockedReason::SearchMiss,
+                    ..
+                })
+            ),
+            "the first supplied identity observation must load a matching persisted miss"
+        );
+
+        let consumer =
+            CommandExecutionLedger::load_or_new(codex_home, "thread".to_string(), &repository)
+                .await;
+        {
+            let state = consumer.state.lock().await;
+            assert!(
+                state.repository.observed_workspace_identity.is_none(),
+                "ledger construction must not inspect the workspace"
+            );
+            assert!(state.search.misses.is_empty());
+        }
+
+        tokio::fs::write(
+            repository.join("external-edit.txt"),
+            b"changed before first command",
+        )
+        .await
+        .expect("external workspace edit");
+        let consumer_epoch = consumer.observe_repository_revision("turn-b", 0).await;
+        let consumer_identity = consumer
+            .current_workspace_identity_hash(codex_exec_server::LOCAL_ENVIRONMENT_ID, &repository)
+            .await
+            .expect("first command observes the edited workspace");
+        assert_ne!(producer_identity, consumer_identity);
+        consumer
+            .begin_attempt(&search("turn-b", consumer_epoch, &consumer_identity), false)
+            .await
+            .expect("a pre-command workspace edit invalidates the persisted search miss");
+    }
+
+    #[tokio::test]
+    async fn finish_turn_persists_the_last_authoritative_workspace_identity_without_recapture() {
+        let temp = tempfile::tempdir().expect("workspace identity fixture");
+        let repository = temp.path().join("repo");
+        let codex_home = temp.path().join("codex-home");
+        initialize_git_repository(&repository);
+        let mut ledger = CommandExecutionLedger::load_or_new(
+            codex_home.clone(),
+            "thread".to_string(),
+            &repository,
+        )
+        .await;
+
+        ledger.observe_repository_revision("turn-a", 0).await;
+        let expected_identity = ledger
+            .state
+            .lock()
+            .await
+            .repository
+            .observed_workspace_identity
+            .clone()
+            .expect("workspace identity was observed")
+            .1;
+        ledger.persistence.as_mut().expect("persistent ledger").cwd =
+            repository.join("missing-after-observation");
+
+        ledger.finish_turn("turn-a").await;
+
+        let cache_path = codex_home
+            .join("command-execution-cache")
+            .join("thread.json");
+        let document: CommandExecutionCacheDocument = serde_json::from_slice(
+            &tokio::fs::read(cache_path)
+                .await
+                .expect("finish persists without another workspace capture"),
+        )
+        .expect("valid command cache document");
+        assert_eq!(document.workspace_identity, expected_identity);
     }
 
     #[tokio::test]

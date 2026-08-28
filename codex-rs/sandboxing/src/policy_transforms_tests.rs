@@ -1,5 +1,6 @@
 use super::effective_file_system_sandbox_policy;
 use super::intersect_permission_profiles;
+use super::intersect_uri_permission_profiles;
 use super::merge_file_system_policy_with_additional_permissions;
 use super::normalize_additional_permissions;
 use super::should_require_platform_sandbox;
@@ -12,10 +13,48 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use dunce::canonicalize;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+
+#[test]
+fn intersect_uri_permission_profiles_resolves_project_roots_in_foreign_cwd() {
+    let cwd = PathUri::parse("file:///home/remote/project").expect("foreign cwd URI");
+    let child = cwd.join("generated").expect("child URI");
+    let requested = UriAdditionalPermissionProfile {
+        network: None,
+        file_system: Some(FileSystemPermissions {
+            entries: vec![FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                },
+                access: FileSystemAccessMode::Write,
+            }],
+            glob_scan_max_depth: None,
+        }),
+    };
+    let granted = UriAdditionalPermissionProfile {
+        network: None,
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            /*read*/ None,
+            Some(vec![child.clone()]),
+        )),
+    };
+
+    assert_eq!(
+        intersect_uri_permission_profiles(requested, granted, &cwd),
+        UriAdditionalPermissionProfile {
+            network: None,
+            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                /*read*/ None,
+                Some(vec![child]),
+            )),
+        }
+    );
+}
 
 #[test]
 fn full_access_restricted_policy_skips_platform_sandbox_when_network_is_enabled() {

@@ -1142,6 +1142,7 @@ mod tests {
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::NetworkPermissions;
     use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::PathUri;
     use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
@@ -1253,8 +1254,10 @@ mod tests {
                     enabled: Some(true),
                 }),
                 file_system: Some(FileSystemPermissions::from_read_write_roots(
-                    Some(vec![absolute_path("/tmp/readme.txt")]),
-                    Some(vec![absolute_path("/tmp/out.txt")]),
+                    Some(vec![PathUri::from_abs_path(&absolute_path(
+                        "/tmp/readme.txt",
+                    ))]),
+                    Some(vec![PathUri::from_abs_path(&absolute_path("/tmp/out.txt"))]),
                 )),
             },
         }

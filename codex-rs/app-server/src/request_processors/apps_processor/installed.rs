@@ -83,6 +83,7 @@ impl AppsRequestProcessor {
                     );
                     let auth_status_entries = compute_auth_statuses(
                         mcp_servers.iter(),
+                        &config.codex_home,
                         config.mcp_oauth_credentials_store_mode,
                         config.auth_keyring_backend_kind(),
                         auth.as_ref(),
@@ -118,6 +119,7 @@ impl AppsRequestProcessor {
                         /*elicitation_reviewer*/ None,
                         /*elicitation_lifecycle*/ None,
                         codex_mcp::ElicitationRequestRouter::default(),
+                        /*previous_manager*/ None,
                     )
                     .await;
 

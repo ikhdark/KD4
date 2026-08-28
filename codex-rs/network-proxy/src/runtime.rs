@@ -174,6 +174,20 @@ pub struct ConfigState {
     pub blocked_total: u64,
 }
 
+/// Immutable policy used for all checks belonging to one proxy request.
+///
+/// Creating the snapshot performs the live-config reload check once. Subsequent policy reads do
+/// not touch the config layers again and do not hold the runtime state lock.
+#[derive(Clone)]
+pub(crate) struct RequestPolicySnapshot {
+    config: NetworkProxyConfig,
+    allow_set: GlobSet,
+    deny_set: GlobSet,
+    mitm: Option<Arc<MitmState>>,
+    mitm_hooks: MitmHooksByHost,
+    credential_broker: CredentialBroker,
+}
+
 pub trait ConfigReloader: Send + Sync {
     /// Human-readable description of where config is loaded from, for logs.
     fn source_label(&self) -> String;
@@ -376,6 +390,19 @@ impl NetworkProxyState {
         self.credential_broker.inject_request_headers(host, headers);
     }
 
+    pub(crate) async fn request_policy_snapshot(&self) -> Result<RequestPolicySnapshot> {
+        self.reload_if_needed().await?;
+        let guard = self.state.read().await;
+        Ok(RequestPolicySnapshot {
+            config: guard.config.clone(),
+            allow_set: guard.allow_set.clone(),
+            deny_set: guard.deny_set.clone(),
+            mitm: guard.mitm.clone(),
+            mitm_hooks: guard.mitm_hooks.clone(),
+            credential_broker: self.credential_broker.clone(),
+        })
+    }
+
     pub async fn plaintext_credential_injection_enabled(&self) -> Result<bool> {
         self.reload_if_needed().await?;
         let guard = self.state.read().await;
@@ -449,84 +476,18 @@ impl NetworkProxyState {
     }
 
     pub async fn host_blocked(&self, host: &str, port: u16) -> Result<HostBlockDecision> {
-        self.reload_if_needed().await?;
-        let host = match Host::parse(host) {
-            Ok(host) => host,
-            Err(_) => return Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowed)),
-        };
-        let (deny_set, allow_set, allow_local_binding, allowed_domains) = {
-            let guard = self.state.read().await;
-            let allowed_domains = guard.config.allowed_domains();
-            (
-                guard.deny_set.clone(),
-                guard.allow_set.clone(),
-                guard.config.allow_local_binding,
-                allowed_domains,
-            )
-        };
-        let allowed_domains_empty = allowed_domains.is_none();
-        let allowed_domains = allowed_domains.unwrap_or_default();
-
-        let host_str = host.as_str();
-
-        // Decision order matters:
-        //  1) explicit deny always wins
-        //  2) local/private networking is opt-in (defense-in-depth)
-        //  3) allowlist is enforced when configured
-        if globset_matches_host_or_unscoped(&deny_set, host_str) {
-            return Ok(HostBlockDecision::Blocked(HostBlockReason::Denied));
-        }
-
-        let is_allowlisted = globset_matches_host_or_unscoped(&allow_set, host_str);
-        if !allow_local_binding {
-            // If the intent is "prevent access to local/internal networks", we must not rely solely
-            // on string checks like `localhost` / `127.0.0.1`. Attackers can use DNS rebinding or
-            // public suffix services that map hostnames onto private IPs.
-            //
-            // We therefore do a best-effort DNS + IP classification check before allowing the
-            // request. Explicit local/loopback literals are allowed only when explicitly
-            // allowlisted; hostnames that resolve to local/private IPs are blocked even if
-            // allowlisted.
-            let local_literal = {
-                let host_no_scope = unscoped_ip_literal(host_str).unwrap_or(host_str);
-                if is_loopback_host(&host) {
-                    true
-                } else if let Ok(ip) = host_no_scope.parse::<IpAddr>() {
-                    is_non_public_ip(ip)
-                } else {
-                    false
-                }
-            };
-
-            if local_literal {
-                if !is_explicit_local_allowlisted(&allowed_domains, &host) {
-                    return Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal));
-                }
-            } else if host_resolves_to_non_public_ip(
-                host_str,
-                port,
-                DNS_LOOKUP_TIMEOUT,
-                |host, port| async move {
-                    lookup_host((host.as_str(), port))
-                        .await
-                        .map(Iterator::collect)
-                },
-            )
+        self.request_policy_snapshot()
+            .await?
+            .host_blocked(host, port)
             .await
-            {
-                return Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal));
-            }
-        }
-
-        if allowed_domains_empty || !is_allowlisted {
-            Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowed))
-        } else {
-            Ok(HostBlockDecision::Allowed)
-        }
     }
 
-    pub async fn record_blocked(&self, mut entry: BlockedRequest) -> Result<()> {
+    pub async fn record_blocked(&self, entry: BlockedRequest) -> Result<()> {
         self.reload_if_needed().await?;
+        self.record_blocked_for_request(entry).await
+    }
+
+    pub(crate) async fn record_blocked_for_request(&self, mut entry: BlockedRequest) -> Result<()> {
         entry.execution_id = self.execution_id();
         let blocked_for_observer = entry.clone();
         let blocked_request_observer = self.blocked_request_observer.read().await.clone();
@@ -580,79 +541,26 @@ impl NetworkProxyState {
     }
 
     pub async fn is_unix_socket_allowed(&self, path: &str) -> Result<bool> {
-        self.reload_if_needed().await?;
-        if !unix_socket_permissions_supported() {
-            return Ok(false);
-        }
-
-        // We only support absolute unix socket paths (a relative path would be ambiguous with
-        // respect to the proxy process's CWD and can lead to confusing allowlist behavior).
-        let requested_path = Path::new(path);
-        if !requested_path.is_absolute() {
-            return Ok(false);
-        }
-
-        let guard = self.state.read().await;
-        if guard.config.dangerously_allow_all_unix_sockets {
-            return Ok(true);
-        }
-
-        // Normalize the path while keeping the absolute-path requirement explicit.
-        let requested_abs = match AbsolutePathBuf::from_absolute_path(requested_path) {
-            Ok(path) => path,
-            Err(_) => return Ok(false),
-        };
-        let requested_canonical = std::fs::canonicalize(requested_abs.as_path()).ok();
-        for allowed in &guard.config.allow_unix_sockets() {
-            let allowed_path = match ValidatedUnixSocketPath::parse(allowed) {
-                Ok(ValidatedUnixSocketPath::Native(path)) => path,
-                Ok(ValidatedUnixSocketPath::UnixStyleAbsolute(_)) => continue,
-                Err(err) => {
-                    warn!("ignoring invalid network.allow_unix_sockets entry at runtime: {err:#}");
-                    continue;
-                }
-            };
-
-            if allowed_path.as_path() == requested_abs.as_path() {
-                return Ok(true);
-            }
-
-            // Best-effort canonicalization to reduce surprises with symlinks.
-            // If canonicalization fails (e.g., socket not created yet), fall back to raw comparison.
-            let Some(requested_canonical) = &requested_canonical else {
-                continue;
-            };
-            if let Ok(allowed_canonical) = std::fs::canonicalize(allowed_path.as_path())
-                && &allowed_canonical == requested_canonical
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        self.request_policy_snapshot()
+            .await?
+            .is_unix_socket_allowed(path)
+            .await
     }
 
     pub async fn method_allowed(&self, method: &str) -> Result<bool> {
-        self.reload_if_needed().await?;
-        let guard = self.state.read().await;
-        Ok(guard.config.mode.allows_method(method))
+        Ok(self.request_policy_snapshot().await?.method_allowed(method))
     }
 
     pub async fn allow_upstream_proxy(&self) -> Result<bool> {
-        self.reload_if_needed().await?;
-        let guard = self.state.read().await;
-        Ok(guard.config.allow_upstream_proxy)
+        Ok(self.request_policy_snapshot().await?.allow_upstream_proxy())
     }
 
     pub async fn allow_local_binding(&self) -> Result<bool> {
-        self.reload_if_needed().await?;
-        let guard = self.state.read().await;
-        Ok(guard.config.allow_local_binding)
+        Ok(self.request_policy_snapshot().await?.allow_local_binding())
     }
 
     pub async fn network_mode(&self) -> Result<NetworkMode> {
-        self.reload_if_needed().await?;
-        let guard = self.state.read().await;
-        Ok(guard.config.mode)
+        Ok(self.request_policy_snapshot().await?.network_mode())
     }
 
     pub async fn set_network_mode(&self, mode: NetworkMode) -> Result<()> {
@@ -681,35 +589,7 @@ impl NetworkProxyState {
     }
 
     pub async fn mitm_state(&self) -> Result<Option<Arc<MitmState>>> {
-        self.reload_if_needed().await?;
-        let guard = self.state.read().await;
-        Ok(guard.mitm.clone())
-    }
-
-    pub(crate) async fn evaluate_mitm_hook_request(
-        &self,
-        host: &str,
-        req: &rama_http::Request,
-    ) -> Result<HookEvaluation> {
-        self.reload_if_needed().await?;
-        let guard = self.state.read().await;
-        Ok(evaluate_mitm_hooks(&guard.mitm_hooks, host, req))
-    }
-
-    pub(crate) async fn host_mitm_requirement(&self, host: &str) -> Result<HostMitmRequirement> {
-        self.reload_if_needed().await?;
-        let normalized_host = normalize_host(host);
-        let host_has_mitm_hooks = {
-            let guard = self.state.read().await;
-            guard.mitm_hooks.contains_key(&normalized_host)
-        };
-        Ok(if host_has_mitm_hooks {
-            HostMitmRequirement::Always
-        } else if self.credential_broker.host_requires_mitm(&normalized_host) {
-            HostMitmRequirement::Tls
-        } else {
-            HostMitmRequirement::None
-        })
+        Ok(self.request_policy_snapshot().await?.mitm_state())
     }
 
     pub async fn add_allowed_domain(&self, host: &str) -> Result<()> {
@@ -815,6 +695,146 @@ impl NetworkProxyState {
     }
 }
 
+impl RequestPolicySnapshot {
+    pub(crate) fn enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    pub(crate) fn plaintext_credential_injection_enabled(&self) -> bool {
+        self.config.dangerously_allow_plaintext_credential_injection
+    }
+
+    pub(crate) async fn host_blocked(&self, host: &str, port: u16) -> Result<HostBlockDecision> {
+        let host = match Host::parse(host) {
+            Ok(host) => host,
+            Err(_) => return Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowed)),
+        };
+        let deny_set = &self.deny_set;
+        let allow_set = &self.allow_set;
+        let allow_local_binding = self.config.allow_local_binding;
+        let allowed_domains = self.config.allowed_domains();
+        let allowed_domains_empty = allowed_domains.is_none();
+        let allowed_domains = allowed_domains.unwrap_or_default();
+
+        let host_str = host.as_str();
+
+        // Decision order matters:
+        //  1) explicit deny always wins
+        //  2) local/private networking is opt-in (defense-in-depth)
+        //  3) allowlist is enforced when configured
+        if globset_matches_host_or_unscoped(deny_set, host_str) {
+            return Ok(HostBlockDecision::Blocked(HostBlockReason::Denied));
+        }
+
+        let is_allowlisted = globset_matches_host_or_unscoped(allow_set, host_str);
+        if !allow_local_binding {
+            // If the intent is "prevent access to local/internal networks", we must not rely solely
+            // on string checks like `localhost` / `127.0.0.1`. Attackers can use DNS rebinding or
+            // public suffix services that map hostnames onto private IPs.
+            //
+            // We therefore do a best-effort DNS + IP classification check before allowing the
+            // request. Explicit local/loopback literals are allowed only when explicitly
+            // allowlisted; hostnames that resolve to local/private IPs are blocked even if
+            // allowlisted.
+            let local_literal = {
+                let host_no_scope = unscoped_ip_literal(host_str).unwrap_or(host_str);
+                if is_loopback_host(&host) {
+                    true
+                } else if let Ok(ip) = host_no_scope.parse::<IpAddr>() {
+                    is_non_public_ip(ip)
+                } else {
+                    false
+                }
+            };
+
+            if local_literal {
+                if !is_explicit_local_allowlisted(&allowed_domains, &host) {
+                    return Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal));
+                }
+            } else if host_resolves_to_non_public_ip(
+                host_str,
+                port,
+                DNS_LOOKUP_TIMEOUT,
+                |host, port| async move {
+                    lookup_host((host.as_str(), port))
+                        .await
+                        .map(Iterator::collect)
+                },
+            )
+            .await
+            {
+                return Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal));
+            }
+        }
+
+        if allowed_domains_empty || !is_allowlisted {
+            Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowed))
+        } else {
+            Ok(HostBlockDecision::Allowed)
+        }
+    }
+
+    pub(crate) async fn is_unix_socket_allowed(&self, path: &str) -> Result<bool> {
+        if !unix_socket_permissions_supported() {
+            return Ok(false);
+        }
+
+        // We only support absolute unix socket paths (a relative path would be ambiguous with
+        // respect to the proxy process's CWD and can lead to confusing allowlist behavior).
+        let requested_path = Path::new(path);
+        if !requested_path.is_absolute() {
+            return Ok(false);
+        }
+
+        if self.config.dangerously_allow_all_unix_sockets {
+            return Ok(true);
+        }
+
+        let path = path.to_string();
+        let allowed = self.config.allow_unix_sockets();
+        run_blocking_policy_io(move || unix_socket_path_is_allowed(&path, &allowed)).await
+    }
+
+    pub(crate) fn method_allowed(&self, method: &str) -> bool {
+        self.config.mode.allows_method(method)
+    }
+
+    pub(crate) fn allow_upstream_proxy(&self) -> bool {
+        self.config.allow_upstream_proxy
+    }
+
+    pub(crate) fn allow_local_binding(&self) -> bool {
+        self.config.allow_local_binding
+    }
+
+    pub(crate) fn network_mode(&self) -> NetworkMode {
+        self.config.mode
+    }
+
+    pub(crate) fn mitm_state(&self) -> Option<Arc<MitmState>> {
+        self.mitm.clone()
+    }
+
+    pub(crate) fn evaluate_mitm_hook_request(
+        &self,
+        host: &str,
+        req: &rama_http::Request,
+    ) -> HookEvaluation {
+        evaluate_mitm_hooks(&self.mitm_hooks, host, req)
+    }
+
+    pub(crate) fn host_mitm_requirement(&self, host: &str) -> HostMitmRequirement {
+        let normalized_host = normalize_host(host);
+        if self.mitm_hooks.contains_key(&normalized_host) {
+            HostMitmRequirement::Always
+        } else if self.credential_broker.host_requires_mitm(&normalized_host) {
+            HostMitmRequirement::Tls
+        } else {
+            HostMitmRequirement::None
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DomainListKind {
     Allow,
@@ -860,6 +880,51 @@ impl DomainListKind {
 
 pub(crate) fn unix_socket_permissions_supported() -> bool {
     false
+}
+
+fn unix_socket_path_is_allowed(path: &str, allowed_paths: &[String]) -> bool {
+    let requested_path = Path::new(path);
+    let requested_abs = match AbsolutePathBuf::from_absolute_path(requested_path) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    let requested_canonical = std::fs::canonicalize(requested_abs.as_path()).ok();
+    for allowed in allowed_paths {
+        let allowed_path = match ValidatedUnixSocketPath::parse(allowed) {
+            Ok(ValidatedUnixSocketPath::Native(path)) => path,
+            Ok(ValidatedUnixSocketPath::UnixStyleAbsolute(_)) => continue,
+            Err(err) => {
+                warn!("ignoring invalid network.allow_unix_sockets entry at runtime: {err:#}");
+                continue;
+            }
+        };
+
+        if allowed_path.as_path() == requested_abs.as_path() {
+            return true;
+        }
+
+        // Best-effort canonicalization to reduce surprises with symlinks. If canonicalization
+        // fails (e.g., the socket is not created yet), retain the raw-path comparison above.
+        let Some(requested_canonical) = &requested_canonical else {
+            continue;
+        };
+        if let Ok(allowed_canonical) = std::fs::canonicalize(allowed_path.as_path())
+            && &allowed_canonical == requested_canonical
+        {
+            return true;
+        }
+    }
+    false
+}
+
+async fn run_blocking_policy_io<T, F>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .context("policy filesystem task failed")
 }
 
 async fn host_resolves_to_non_public_ip<F, Fut>(
@@ -1056,6 +1121,17 @@ mod tests {
 
     fn strings(entries: &[&str]) -> Vec<String> {
         entries.iter().map(|entry| (*entry).to_string()).collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confirmed_performance_policy_filesystem_work_uses_blocking_pool() {
+        let async_thread = std::thread::current().id();
+
+        let blocking_thread = run_blocking_policy_io(|| std::thread::current().id())
+            .await
+            .unwrap();
+
+        assert_ne!(blocking_thread, async_thread);
     }
 
     fn network_settings(allowed_domains: &[&str], denied_domains: &[&str]) -> NetworkProxyConfig {
@@ -1963,8 +2039,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unix_socket_allowlist_is_rejected_on_non_macos() {
-        let socket_path = "/tmp/example.sock".to_string();
+    async fn unix_socket_allowlist_is_rejected_on_windows() {
+        let socket_path = r"C:\temp\example.sock".to_string();
         let state = network_proxy_state_for_policy({
             let mut network = network_settings_with_unix_sockets(
                 &["example.com"],

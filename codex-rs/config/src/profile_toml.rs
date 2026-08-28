@@ -47,6 +47,7 @@ pub struct ConfigProfile {
     pub include_apps_instructions: Option<bool>,
     pub include_collaboration_mode_instructions: Option<bool>,
     pub include_environment_context: Option<bool>,
+    pub kd4_workflow_enabled: Option<bool>,
     pub tools: Option<ToolsToml>,
     pub web_search: Option<WebSearchMode>,
     pub analytics: Option<AnalyticsConfigToml>,

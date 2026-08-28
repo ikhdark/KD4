@@ -12,10 +12,8 @@ use crate::compact::compaction_status_from_result;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote::process_compacted_history;
-use crate::hook_runtime::PostCompactHookOutcome;
-use crate::hook_runtime::PreCompactHookOutcome;
-use crate::hook_runtime::run_post_compact_hooks;
-use crate::hook_runtime::run_pre_compact_hooks;
+use crate::hook_runtime::run_post_compact_hook_gate;
+use crate::hook_runtime::run_pre_compact_hook_gate;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_retry::ResponsesStreamRequest;
@@ -37,6 +35,7 @@ use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::WarningEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
 use codex_rollout_trace::CompactionTraceContext;
 use codex_rollout_trace::InferenceTraceContext;
@@ -51,6 +50,18 @@ use attempt::run_remote_compact_v2_attempt;
 // Compact attempts can run much longer than normal turns, so keep the per-transport
 // retry budget smaller than the general Responses stream retry budget.
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
+
+fn preserve_model_fallback_failure(
+    previous_error: &CodexErr,
+    final_error: CodexErr,
+) -> (WarningEvent, CodexErr) {
+    let warning = WarningEvent {
+        message: format!(
+            "Remote compaction failed with the previous model: {previous_error}; retry with the current model also failed: {final_error}"
+        ),
+    };
+    (warning, final_error)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_inline_remote_auto_compact_task(
@@ -143,28 +154,17 @@ async fn run_remote_compact_task_inner(
         phase,
     )
     .await;
-    let pre_compact_outcome = run_pre_compact_hooks(sess, turn_context, trigger).await;
-    match pre_compact_outcome {
-        PreCompactHookOutcome::Continue => {}
-        PreCompactHookOutcome::Stopped { reason } => {
-            crate::hook_runtime::emit_hook_stop_reason(
-                sess,
-                turn_context,
-                "PreCompact",
-                reason.as_deref(),
+    if run_pre_compact_hook_gate(sess, turn_context, trigger).await {
+        let error = CodexErr::TurnAborted;
+        attempt
+            .track(
+                sess.as_ref(),
+                codex_analytics::CompactionStatus::Interrupted,
+                Some(&error),
+                analytics_details,
             )
             .await;
-            let error = CodexErr::TurnAborted;
-            attempt
-                .track(
-                    sess.as_ref(),
-                    codex_analytics::CompactionStatus::Interrupted,
-                    Some(&error),
-                    analytics_details,
-                )
-                .await;
-            return Err(error);
-        }
+        return Err(error);
     }
     let result = run_remote_compact_task_inner_impl(
         sess,
@@ -185,16 +185,7 @@ async fn run_remote_compact_task_inner(
             .task_evidence
             .compaction_recovery_summary()
             .await;
-        let post_compact_outcome =
-            run_post_compact_hooks(sess, turn_context, trigger, Some(&recovery_summary)).await;
-        if let PostCompactHookOutcome::Stopped { reason } = post_compact_outcome {
-            crate::hook_runtime::emit_hook_stop_reason(
-                sess,
-                turn_context,
-                "PostCompact",
-                reason.as_deref(),
-            )
-            .await;
+        if run_post_compact_hook_gate(sess, turn_context, trigger, Some(&recovery_summary)).await {
             attempt
                 .track(sess.as_ref(), status, codex_error, analytics_details)
                 .await;
@@ -290,9 +281,11 @@ async fn run_remote_compact_task_inner_impl(
             match fallback_result {
                 Ok(attempt) => (attempt, fallback_turn_context),
                 Err(fallback_error) => {
-                    return Err(CodexErr::Fatal(format!(
-                        "remote compaction failed with the previous model: {error}; retry with the current model also failed: {fallback_error}"
-                    )));
+                    let (warning, fallback_error) =
+                        preserve_model_fallback_failure(&error, fallback_error);
+                    sess.send_event(fallback_turn_context, EventMsg::Warning(warning))
+                        .await;
+                    return Err(fallback_error);
                 }
             }
         }
@@ -603,6 +596,39 @@ mod tests {
             rx_event,
             attempt_identity: None,
             consumer_dropped: CancellationToken::new(),
+        }
+    }
+
+    #[test]
+    fn dual_model_failure_preserves_final_typed_error_and_both_diagnostics() {
+        use codex_protocol::error::UsageLimitReachedError;
+        use codex_protocol::protocol::CodexErrorInfo;
+
+        let cases = [
+            (CodexErr::ServerOverloaded, CodexErrorInfo::ServerOverloaded),
+            (
+                CodexErr::UsageLimitReached(UsageLimitReachedError {
+                    plan_type: None,
+                    resets_at: None,
+                    rate_limits: None,
+                    promo_message: None,
+                    rate_limit_reached_type: None,
+                }),
+                CodexErrorInfo::UsageLimitExceeded,
+            ),
+        ];
+
+        for (final_error, expected_info) in cases {
+            let final_message = final_error.to_string();
+            let (warning, final_error) = preserve_model_fallback_failure(
+                &CodexErr::InvalidRequest("previous-model marker".to_string()),
+                final_error,
+            );
+
+            assert!(warning.message.contains("previous-model marker"));
+            assert!(warning.message.contains(&final_message));
+            assert_eq!(final_error.to_codex_protocol_error(), expected_info);
+            assert!(!matches!(final_error, CodexErr::Fatal(_)));
         }
     }
 

@@ -192,8 +192,12 @@ pub(crate) fn get_command(
             ));
         }
         return Ok(ResolvedCommand {
-            command: invocation.to_exec_args(&powershell, use_login_shell),
-            safety_command: invocation.to_safety_args(&powershell, use_login_shell),
+            command: invocation
+                .to_exec_args(&powershell, use_login_shell)
+                .map_err(|error| error.to_string())?,
+            safety_command: invocation
+                .to_safety_args(&powershell, use_login_shell)
+                .map_err(|error| error.to_string())?,
             shell_type: ShellType::PowerShell,
             use_login_shell,
             preflight_shell_type: Some(ShellType::PowerShell),
@@ -207,7 +211,9 @@ pub(crate) fn get_command(
                     .to_string(),
             );
         }
-        let command = invocation.to_exec_args(session_shell.as_ref(), use_login_shell);
+        let command = invocation
+            .to_exec_args(session_shell.as_ref(), use_login_shell)
+            .map_err(|error| error.to_string())?;
         return Ok(ResolvedCommand {
             safety_command: command.clone(),
             command,
@@ -224,7 +230,9 @@ pub(crate) fn get_command(
         .transpose()
         .map_err(|err| err.to_string())?;
     let shell = model_shell.as_ref().unwrap_or(session_shell.as_ref());
-    let command = invocation.to_exec_args(shell, use_login_shell);
+    let command = invocation
+        .to_exec_args(shell, use_login_shell)
+        .map_err(|error| error.to_string())?;
     Ok(ResolvedCommand {
         safety_command: command.clone(),
         command,

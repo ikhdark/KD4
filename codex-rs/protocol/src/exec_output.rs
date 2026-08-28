@@ -16,6 +16,8 @@ use std::time::Duration;
 pub struct StreamOutput<T: Clone> {
     pub text: T,
     pub truncated_after_lines: Option<u32>,
+    /// True when the producer observed bytes that could not be retained.
+    pub truncated: bool,
 }
 
 impl StreamOutput<String> {
@@ -23,6 +25,7 @@ impl StreamOutput<String> {
         Self {
             text,
             truncated_after_lines: None,
+            truncated: false,
         }
     }
 }
@@ -32,6 +35,7 @@ impl StreamOutput<Vec<u8>> {
         StreamOutput {
             text: bytes_to_string_smart(&self.text),
             truncated_after_lines: self.truncated_after_lines,
+            truncated: self.truncated,
         }
     }
 }

@@ -9,6 +9,8 @@ use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::config_toml::ConfigToml;
+use codex_config::types::McpServerConfig;
+use codex_config::types::McpServerTransportConfig;
 use codex_config::types::ToolSuggestConfig;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::types::ToolSuggestDiscoverable;
@@ -25,6 +27,8 @@ use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use rmcp::model::ElicitationAction;
 use serde_json::json;
+use std::collections::HashMap;
+use std::time::Duration;
 use tempfile::tempdir;
 
 #[test]
@@ -118,15 +122,17 @@ fn remote_plugin_completion_rejects_catalog_refresh_failure_with_connectors_acce
 }
 
 #[test]
-fn implemented_below_ignored_above_local_plugin_completion_requires_requested_connectors() {
+fn local_plugin_completion_requires_requested_connectors() {
     let requested_connectors = vec!["connector_calendar".to_string()];
 
     assert!(!verified_local_plugin_install_completed(
+        true,
         true,
         &requested_connectors,
         None,
     ));
     assert!(!verified_local_plugin_install_completed(
+        true,
         true,
         &requested_connectors,
         Some(&[]),
@@ -134,9 +140,98 @@ fn implemented_below_ignored_above_local_plugin_completion_requires_requested_co
 }
 
 #[test]
-fn implemented_below_ignored_above_local_plugin_without_connectors_preserves_completion() {
-    assert!(verified_local_plugin_install_completed(true, &[], None));
-    assert!(!verified_local_plugin_install_completed(false, &[], None));
+fn local_plugin_completion_requires_requested_mcp_servers() {
+    assert!(!verified_local_plugin_install_completed(
+        true,
+        false,
+        &[],
+        None
+    ));
+    assert!(verified_local_plugin_install_completed(
+        true,
+        true,
+        &[],
+        None
+    ));
+    assert!(!verified_local_plugin_install_completed(
+        false,
+        true,
+        &[],
+        None
+    ));
+}
+
+#[tokio::test]
+async fn requested_mcp_servers_are_refreshed_before_install_completion() {
+    let command = match core_test_support::stdio_server_bin() {
+        Ok(command) => command,
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "test_stdio_server unavailable; skipping plugin MCP refresh regression"
+            );
+            return;
+        }
+    };
+    let (session, mut turn, _events) = make_session_and_context_with_rx().await;
+    let turn_context = Arc::get_mut(&mut turn).expect("test turn should be uniquely owned");
+    let config = Arc::make_mut(&mut turn_context.config);
+    let mut servers = config.mcp_servers.get().clone();
+    servers.insert(
+        "installed-plugin-server".to_string(),
+        McpServerConfig {
+            auth: Default::default(),
+            transport: McpServerTransportConfig::Stdio {
+                command,
+                args: Vec::new(),
+                env: None,
+                env_vars: Vec::new(),
+                cwd: None,
+            },
+            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+            enabled: true,
+            required: false,
+            supports_parallel_tool_calls: false,
+            disabled_reason: None,
+            startup_timeout_sec: Some(Duration::from_secs(10)),
+            tool_timeout_sec: None,
+            default_tools_approval_mode: None,
+            enabled_tools: None,
+            disabled_tools: None,
+            scopes: None,
+            oauth: None,
+            oauth_resource: None,
+            tools: HashMap::new(),
+        },
+    );
+    config
+        .mcp_servers
+        .set(servers)
+        .expect("plugin MCP server configuration should be accepted");
+    let refresh_config = config.clone();
+
+    assert!(
+        refresh_requested_mcp_servers_after_install(
+            &session,
+            &turn,
+            &refresh_config,
+            &["installed-plugin-server".to_string()],
+            "sample@openai-curated",
+        )
+        .await,
+        "completion must wait for the installed plugin MCP server"
+    );
+    assert!(
+        session
+            .services
+            .latest_mcp_runtime()
+            .manager()
+            .list_all_tools()
+            .await
+            .iter()
+            .any(|tool| tool.server_name == "installed-plugin-server"),
+        "the refreshed current-session runtime should expose the plugin MCP tools"
+    );
 }
 
 #[tokio::test]

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -11,11 +12,13 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 
 use super::ExecServerClient;
+use super::spawn_stdio_command;
 use crate::ExecServerError;
 use crate::NoiseChannelIdentity;
 use crate::NoiseChannelPublicKey;
 use crate::NoiseRendezvousConnectBundle;
 use crate::NoiseRendezvousConnectProvider;
+use crate::client_api::StdioExecServerCommand;
 
 struct SequenceNoiseConnectProvider {
     bundles: Mutex<VecDeque<NoiseRendezvousConnectBundle>>,
@@ -108,5 +111,31 @@ async fn initial_noise_connection_refreshes_bundle_after_unauthorized_handshake(
     );
     unauthorized_server.await??;
     accepted_server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_command_uses_declared_environment_and_managed_process_tree() -> Result<()> {
+    let program = std::env::var("SystemRoot")
+        .map(std::path::PathBuf::from)?
+        .join("System32")
+        .join("cmd.exe");
+    let command = StdioExecServerCommand {
+        program: program.to_string_lossy().into_owned(),
+        args: vec![
+            "/D".to_string(),
+            "/S".to_string(),
+            "/C".to_string(),
+            "if defined PATH (exit 9) else (exit 0)".to_string(),
+        ],
+        env: HashMap::new(),
+        cwd: None,
+    };
+
+    let (mut child, managed_root) = spawn_stdio_command(&command).await?;
+    assert!(managed_root.id() > 0);
+    let status = child.wait().await?;
+
+    assert_eq!(status.code(), Some(0));
     Ok(())
 }

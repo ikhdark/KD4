@@ -9,6 +9,40 @@ fn map_api_error_maps_server_overloaded() {
 }
 
 #[test]
+fn map_api_error_distinguishes_transport_stream_failures_from_provider_retries() {
+    let transport = map_api_error(ApiError::Stream("websocket closed".to_string()));
+    let provider = map_api_error(ApiError::Retryable {
+        message: "response.failed".to_string(),
+        delay: None,
+    });
+
+    assert!(matches!(transport, CodexErr::ResponseStreamFailed(_)));
+    assert!(matches!(provider, CodexErr::Stream(message, None) if message == "response.failed"));
+}
+
+#[test]
+fn map_api_error_preserves_network_failures_as_transport_stream_failures() {
+    let error = map_api_error(ApiError::Transport(TransportError::Network(
+        "connection reset".to_string(),
+    )));
+
+    assert!(matches!(error, CodexErr::ResponseStreamFailed(_)));
+}
+
+#[test]
+fn map_api_error_keeps_exhausted_pre_dispatch_failure_non_retryable() {
+    let err = map_api_error(ApiError::Transport(TransportError::PreDispatch(
+        "temporary auth lookup failure".to_string(),
+    )));
+
+    assert!(!err.is_retryable());
+    let CodexErr::PreDispatchRetryExhausted(message) = err else {
+        panic!("expected exhausted pre-dispatch error, got {err:?}");
+    };
+    assert_eq!(message, "temporary auth lookup failure");
+}
+
+#[test]
 fn map_api_error_maps_server_overloaded_from_503_body() {
     let body = serde_json::json!({
         "error": {
@@ -39,8 +73,9 @@ fn map_api_error_maps_cloudflare_blocked_response_to_user_message() {
         ),
     }));
 
-    let CodexErr::UnexpectedStatus(err) = err else {
-        panic!("expected CodexErr::UnexpectedStatus, got {err:?}");
+    assert!(!err.is_retryable());
+    let CodexErr::RegionRestricted(err) = err else {
+        panic!("expected CodexErr::RegionRestricted, got {err:?}");
     };
     assert_eq!(
         err.user_message.as_deref(),

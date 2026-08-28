@@ -10,6 +10,17 @@
             "null"
           ]
         },
+        "consumer": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ExperimentalFeatureConsumer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which side of the app-server boundary consumes this flag. Optional for clients generated before consumer metadata existed."
+        },
         "defaultEnabled": {
           "description": "Whether this feature is enabled by default.",
           "type": "boolean"
@@ -52,6 +63,13 @@
         "stage"
       ],
       "type": "object"
+    },
+    "ExperimentalFeatureConsumer": {
+      "enum": [
+        "runtime",
+        "client"
+      ],
+      "type": "string"
     },
     "ExperimentalFeatureStage": {
       "oneOf": [

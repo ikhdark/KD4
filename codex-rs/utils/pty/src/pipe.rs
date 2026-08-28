@@ -17,14 +17,16 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use tokio::time::Duration;
-
 use crate::ManagedRootProcess;
+use crate::WINDOWS_CREATE_SUSPENDED;
+use crate::WINDOWS_PROCESS_OPERATION_TIMEOUT;
+use crate::configure_windows_command_args;
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
 use crate::process::ProcessSignal;
 use crate::process::SpawnedProcess;
 use crate::process::exit_code_from_status;
+use crate::run_windows_process_operation;
 
 use std::os::windows::io::AsRawHandle;
 
@@ -36,27 +38,6 @@ use std::os::windows::io::RawHandle;
 
 enum WindowsChildTerminator {
     Job { process: OwnedHandle },
-}
-
-const WINDOWS_PROCESS_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
-
-async fn run_windows_spawn_operation<T, F>(timeout: Duration, operation: F) -> io::Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> io::Result<T> + Send + 'static,
-{
-    tokio::time::timeout(timeout, tokio::task::spawn_blocking(operation))
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                ErrorKind::TimedOut,
-                format!(
-                    "Windows process creation did not return within {} seconds",
-                    timeout.as_secs()
-                ),
-            )
-        })?
-        .map_err(|error| io::Error::other(format!("Windows process spawn task failed: {error}")))?
 }
 
 struct PipeChildTerminator {
@@ -142,9 +123,7 @@ async fn spawn_process_with_stdin_mode(
     for (key, value) in env {
         command.env(key, value);
     }
-    for arg in args {
-        command.arg(arg);
-    }
+    configure_windows_command_args(command.as_std_mut(), std::ffi::OsStr::new(program), args);
     match stdin_mode {
         PipeStdinMode::Piped => {
             command.stdin(Stdio::piped());
@@ -155,6 +134,7 @@ async fn spawn_process_with_stdin_mode(
     }
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    command.creation_flags(WINDOWS_CREATE_SUSPENDED);
 
     let managed = Arc::new(ManagedRootProcess::reserve_with_reclaim().await?);
 
@@ -164,14 +144,15 @@ async fn spawn_process_with_stdin_mode(
         // ensures that a child returned after this future times out is terminated when the
         // detached spawn result is discarded.
         command.kill_on_drop(true);
-        run_windows_spawn_operation(WINDOWS_PROCESS_SPAWN_TIMEOUT, move || command.spawn()).await?
+        run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || command.spawn())
+            .await?
     };
 
     let windows_terminator = {
         let pid = child
             .id()
             .ok_or_else(|| io::Error::other("missing child pid"))?;
-        if let Err(error) = managed.attach(pid) {
+        if let Err(error) = managed.attach_and_resume(pid) {
             let _ = child.start_kill();
             let _ = child.wait().await;
             return Err(error.into());

@@ -1,16 +1,13 @@
 use anyhow::Context as _;
-use anyhow::ensure;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
-use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -23,9 +20,6 @@ use codex_config::types::McpServerEnvVar;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::config::Config;
 use codex_exec_server::CreateDirectoryOptions;
-use codex_exec_server::Environment;
-use codex_exec_server::HttpRedirectPolicy;
-use codex_exec_server::HttpRequestParams;
 use codex_http_client::HttpClientBuilder;
 use codex_login::CodexAuth;
 use codex_mcp::MCP_SANDBOX_STATE_META_CAPABILITY;
@@ -52,19 +46,15 @@ use codex_utils_cargo_bin::cargo_bin;
 use codex_utils_path_uri::PathUri;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::assert_regex_match;
-use core_test_support::is_remote_test_environment;
 use core_test_support::responses;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
-use core_test_support::skip_if_no_remote_env;
-use core_test_support::skip_if_wine_exec;
 use core_test_support::stdio_server_bin;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
-use core_test_support::test_docker_container_name;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
 use http::StatusCode;
@@ -167,105 +157,13 @@ enum McpCallEvent {
     End(String),
 }
 
-const REMOTE_MCP_ENVIRONMENT: &str = "remote";
-
 fn remote_aware_environment_id() -> String {
-    if is_remote_test_environment() {
-        REMOTE_MCP_ENVIRONMENT.to_string()
-    } else {
-        codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string()
-    }
+    codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string()
 }
 
-/// Returns the stdio MCP test server command path for the active test placement.
-///
-/// Local test runs can execute the host-built test binary directly. Remote-aware
-/// runs start MCP stdio through the executor inside Docker, so the host path
-/// would be meaningless to the process that actually launches the server. When
-/// the remote test environment is active, copy the binary into the executor
-/// container and return that in-container path instead.
+/// Returns the native Windows stdio MCP test server command path.
 fn remote_aware_stdio_server_bin() -> anyhow::Result<String> {
-    let bin = stdio_server_bin()?;
-    let Some(container_name) = test_docker_container_name() else {
-        return Ok(bin);
-    };
-
-    // Keep the Docker path rewrite scoped to tests that use `build_remote_aware`.
-    // Other MCP tests still start their stdio server from the orchestrator test
-    // process, even when the full-ci remote env is present.
-    //
-    // Remote-aware MCP tests run the executor inside Docker. The stdio test
-    // server is built on the host, so hand the executor a copied in-container
-    // path instead of the host build artifact path.
-    // Several remote-aware MCP tests can run in parallel; give each copied
-    // binary its own path so one test cannot replace another test's executable.
-    copy_binary_to_remote_env(&container_name, Path::new(&bin), "test_stdio_server")
-}
-
-/// Builds a collision-resistant in-container path for copied test binaries.
-fn unique_remote_path(binary_name: &str) -> anyhow::Result<String> {
-    let unique_suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    Ok(format!(
-        "/tmp/codex-remote-env/{binary_name}-{}-{unique_suffix}",
-        std::process::id()
-    ))
-}
-
-/// Copies a host-built helper binary into the remote test container.
-fn copy_binary_to_remote_env(
-    container_name: &str,
-    host_path: &Path,
-    binary_name: &str,
-) -> anyhow::Result<String> {
-    let remote_path = unique_remote_path(binary_name)?;
-    let mkdir_output = StdCommand::new("docker")
-        .args([
-            "exec",
-            container_name,
-            "mkdir",
-            "-p",
-            "/tmp/codex-remote-env",
-        ])
-        .output()
-        .context("create remote MCP test binary directory")?;
-    ensure!(
-        mkdir_output.status.success(),
-        "docker mkdir remote MCP test binary directory failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&mkdir_output.stdout).trim(),
-        String::from_utf8_lossy(&mkdir_output.stderr).trim()
-    );
-
-    let container_target = format!("{container_name}:{remote_path}");
-    let copy_output = StdCommand::new("docker")
-        .arg("cp")
-        .arg(host_path)
-        .arg(&container_target)
-        .output()
-        .with_context(|| {
-            format!(
-                "copy {} to remote MCP test env",
-                host_path.to_string_lossy()
-            )
-        })?;
-    ensure!(
-        copy_output.status.success(),
-        "docker cp {binary_name} failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&copy_output.stdout).trim(),
-        String::from_utf8_lossy(&copy_output.stderr).trim()
-    );
-
-    let chmod_output = StdCommand::new("docker")
-        .args(["exec", container_name, "chmod", "+x", remote_path.as_str()])
-        .output()
-        .with_context(|| format!("mark remote {binary_name} executable"))?;
-    ensure!(
-        chmod_output.status.success(),
-        "docker chmod {binary_name} failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&chmod_output.stdout).trim(),
-        String::from_utf8_lossy(&chmod_output.stderr).trim()
-    );
-
-    Ok(remote_path)
+    Ok(stdio_server_bin()?)
 }
 
 struct TestMcpServerOptions {
@@ -419,11 +317,6 @@ async fn openai_form_capability_is_not_advertised_by_default() -> anyhow::Result
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn openai_form_capability_updates_for_loaded_thread() -> anyhow::Result<()> {
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
-
     let server = start_mock_server().await;
     let server_name = "capabilities";
     let command = stdio_server_bin()?;
@@ -470,11 +363,6 @@ async fn openai_form_capability_updates_for_loaded_thread() -> anyhow::Result<()
 }
 
 async fn assert_openai_form_capability_advertisement(expected: bool) -> anyhow::Result<()> {
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
-
     let server = start_mock_server().await;
     let server_name = "capabilities";
     let command = stdio_server_bin()?;
@@ -513,17 +401,7 @@ fn assert_cwd_tool_output(structured: &Value, expected_cwd: &Path) {
         .and_then(Value::as_str)
         .expect("cwd tool should return a string cwd");
 
-    if is_remote_test_environment() {
-        assert_eq!(
-            structured,
-            &json!({
-                "cwd": expected_cwd.to_string_lossy(),
-            })
-        );
-        return;
-    }
-
-    // Local Windows can report the same absolute directory through an 8.3 path.
+    // Windows can report the same absolute directory through an 8.3 path.
     // Canonical paths keep the assertion focused on cwd precedence.
     assert_eq!(
         Path::new(actual_cwd)
@@ -538,11 +416,6 @@ fn assert_cwd_tool_output(structured: &Value, expected_cwd: &Path) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_test_value)]
 async fn stdio_server_round_trip() -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -740,11 +613,6 @@ async fn shutdown_cancels_startup_prewarm_waiting_for_mcp_startup() -> anyhow::R
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_cwd)]
 async fn stdio_server_uses_configured_cwd_before_runtime_fallback() -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -806,11 +674,6 @@ async fn stdio_server_uses_configured_cwd_before_runtime_fallback() -> anyhow::R
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn stdio_mcp_tool_call_includes_sandbox_state_meta() -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -893,11 +756,6 @@ async fn stdio_mcp_tool_call_includes_sandbox_state_meta() -> anyhow::Result<()>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stdio_mcp_parallel_tool_calls_default_false_runs_serially() -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1013,11 +871,6 @@ async fn stdio_mcp_parallel_tool_calls_default_false_runs_serially() -> anyhow::
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stdio_mcp_read_only_tool_calls_run_concurrently_without_server_opt_in()
 -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1115,11 +968,6 @@ async fn stdio_mcp_read_only_tool_calls_run_concurrently_without_server_opt_in()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stdio_mcp_parallel_tool_calls_opt_in_runs_concurrently() -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1209,11 +1057,6 @@ async fn stdio_mcp_parallel_tool_calls_opt_in_runs_concurrently() -> anyhow::Res
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_test_value)]
 async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1357,11 +1200,6 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_test_value)]
 async fn stdio_image_responses_resize_large_image() -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1459,11 +1297,6 @@ async fn stdio_image_responses_resize_large_image() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_test_value)]
 async fn stdio_image_responses_preserve_original_detail_metadata() -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1550,11 +1383,6 @@ async fn stdio_image_responses_preserve_original_detail_metadata() -> anyhow::Re
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_test_value)]
 async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1713,11 +1541,6 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_test_value)]
 async fn stdio_server_propagates_whitelisted_env_vars() -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1835,11 +1658,6 @@ async fn stdio_server_propagates_whitelisted_env_vars() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_env_source)]
 async fn stdio_server_propagates_explicit_local_env_var_source() -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1928,147 +1746,13 @@ async fn stdio_server_propagates_explicit_local_env_var_source() -> anyhow::Resu
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[serial(mcp_env_source)]
-async fn remote_stdio_env_var_source_does_not_copy_local_env() -> anyhow::Result<()> {
-    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
-    skip_if_no_network!(Ok(()));
-    skip_if_no_remote_env!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let call_id = "call-remote-source";
-    let server_name = "rmcp_remote_source";
-    let namespace = format!("mcp__{server_name}");
-    let env_name = "MCP_TEST_REMOTE_SOURCE_ONLY";
-
-    mount_sse_once(
-        &server,
-        responses::sse(vec![
-            responses::ev_response_created("resp-1"),
-            responses::ev_function_call_with_namespace(
-                call_id,
-                &namespace,
-                "echo",
-                &format!(r#"{{"message":"ping","env_var":"{env_name}"}}"#),
-            ),
-            responses::ev_completed("resp-1"),
-        ]),
-    )
-    .await;
-    mount_sse_once(
-        &server,
-        responses::sse(vec![
-            responses::ev_assistant_message("msg-1", "rmcp echo tool completed successfully."),
-            responses::ev_completed("resp-2"),
-        ]),
-    )
-    .await;
-
-    let _guard = EnvVarGuard::set(env_name, OsStr::new("local-value-should-not-cross"));
-    let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
-
-    let fixture = test_codex()
-        .with_config(move |config| {
-            insert_mcp_server(
-                config,
-                server_name,
-                stdio_transport(
-                    rmcp_test_server_bin,
-                    /*env*/ None,
-                    vec![McpServerEnvVar::Config {
-                        name: env_name.to_string(),
-                        source: Some("remote".to_string()),
-                    }],
-                ),
-                TestMcpServerOptions {
-                    environment_id: remote_aware_environment_id(),
-                    ..Default::default()
-                },
-            );
-        })
-        .build_with_auto_env(&server)
-        .await?;
-    wait_for_mcp_server(&fixture.codex, server_name).await?;
-
-    fixture
-        .codex
-        .submit(read_only_user_turn(&fixture, "call the rmcp echo tool"))
-        .await?;
-
-    wait_for_event(&fixture.codex, |ev| {
-        matches!(ev, EventMsg::McpToolCallBegin(_))
-    })
-    .await;
-    let end_event = wait_for_event(&fixture.codex, |ev| {
-        matches!(ev, EventMsg::McpToolCallEnd(_))
-    })
-    .await;
-    let EventMsg::McpToolCallEnd(end) = end_event else {
-        unreachable!("event guard guarantees McpToolCallEnd");
-    };
-    let structured = end
-        .result
-        .as_ref()
-        .expect("rmcp echo tool should return success")
-        .structured_content
-        .as_ref()
-        .expect("structured content");
-    assert_eq!(structured["env"], Value::Null);
-
-    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-    server.verify().await;
-    Ok(())
-}
-
-/// Remote runtime websocket URL used by remote-aware MCP integration tests.
-const REMOTE_EXEC_SERVER_URL_ENV_VAR: &str = "CODEX_TEST_REMOTE_EXEC_SERVER_URL";
 /// OAuth metadata path served by the Streamable HTTP MCP test server.
 const STREAMABLE_HTTP_METADATA_PATH: &str = "/.well-known/oauth-authorization-server/mcp";
 
 /// Streamable HTTP test server plus the process handle needed for cleanup.
 struct StreamableHttpTestServer {
     server_url: String,
-    process: StreamableHttpTestServerProcess,
-}
-
-/// Tracks whether the Streamable HTTP test server runs on the host or remotely.
-enum StreamableHttpTestServerProcess {
-    Local(Child),
-    Remote(RemoteStreamableHttpServer),
-}
-
-/// Remote Streamable HTTP server process and copied files to remove on drop.
-struct RemoteStreamableHttpServer {
-    container_name: String,
-    pid: String,
-    paths_to_remove: Vec<String>,
-}
-
-impl Drop for RemoteStreamableHttpServer {
-    /// Stops the remote process and removes copied test artifacts best-effort.
-    fn drop(&mut self) {
-        self.kill();
-        if self.paths_to_remove.is_empty() {
-            return;
-        }
-        let script = format!("rm -f {}", self.paths_to_remove.join(" "));
-        let _ = StdCommand::new("docker")
-            .args(["exec", &self.container_name, "sh", "-lc", &script])
-            .output();
-    }
-}
-
-impl RemoteStreamableHttpServer {
-    /// Stops the remote Streamable HTTP test server process.
-    fn kill(&self) {
-        let _ = StdCommand::new("docker")
-            .args(["exec", &self.container_name, "kill", &self.pid])
-            .output();
-    }
+    process: Child,
 }
 
 impl StreamableHttpTestServer {
@@ -2077,34 +1761,26 @@ impl StreamableHttpTestServer {
         &self.server_url
     }
 
-    /// Stops the local or remote test server and waits for local process exit.
+    /// Stops the native Windows test server and waits for process exit.
     async fn shutdown(mut self) {
-        match &mut self.process {
-            StreamableHttpTestServerProcess::Local(child) => match child.try_wait() {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    let _ = child.kill().await;
-                }
-                Err(error) => {
-                    eprintln!("failed to check streamable http server status: {error}");
-                    let _ = child.kill().await;
-                }
-            },
-            StreamableHttpTestServerProcess::Remote(server) => {
-                server.kill();
+        match self.process.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let _ = self.process.kill().await;
             }
-        }
-        if let StreamableHttpTestServerProcess::Local(child) = &mut self.process
-            && let Err(error) = child.wait().await
-        {
+            Err(error) => {
+                eprintln!("failed to check streamable http server status: {error}");
+                let _ = self.process.kill().await;
+            }
+        };
+        if let Err(error) = self.process.wait().await {
             eprintln!("failed to await streamable http server shutdown: {error}");
         }
     }
 }
 
-/// What this tests: Codex can discover and call a Streamable HTTP MCP tool in
-/// both local and remote-aware placements, and the tool observes the expected
-/// environment value from the server process that actually handled the request.
+/// What this tests: Codex can discover and call a Streamable HTTP MCP tool from
+/// the native Windows test environment, preserving the server environment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn streamable_http_tool_call_round_trip() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
@@ -2143,9 +1819,7 @@ async fn streamable_http_tool_call_round_trip() -> anyhow::Result<()> {
     )
     .await;
 
-    // Phase 2: start the Streamable HTTP MCP test server in the active
-    // placement. In full CI this may be the remote environment container; locally
-    // it is a host process.
+    // Phase 2: start the Streamable HTTP MCP test server as a local process.
     let expected_env_value = "propagated-env-http";
     let Some(http_server) =
         start_streamable_http_test_server(expected_env_value, /*expected_token*/ None).await?
@@ -2154,9 +1828,7 @@ async fn streamable_http_tool_call_round_trip() -> anyhow::Result<()> {
     };
     let server_url = http_server.url().to_string();
 
-    // Phase 3: configure Codex with the Streamable HTTP MCP server and build a
-    // fixture that selects remote MCP placement only when the remote test
-    // environment is active.
+    // Phase 3: configure Codex with the Streamable HTTP MCP server.
     let fixture = test_codex()
         .with_config(move |config| {
             insert_mcp_server(
@@ -2506,7 +2178,7 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
     )?;
 
     // Phase 4: configure Codex with the OAuth-backed Streamable HTTP MCP
-    // server and build the fixture in the active local or remote-aware mode.
+    // server in the native Windows environment.
     let fixture = test_codex()
         .with_home(temp_home.clone())
         .with_config(move |config| {
@@ -2594,8 +2266,7 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         .expect("env snapshot inserted");
     assert_eq!(env_value, expected_env_value);
 
-    // Phase 9: verify the scripted model calls were consumed and clean up the
-    // placement-aware MCP server.
+    // Phase 9: verify the scripted model calls were consumed and clean up.
     wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     server.verify().await;
@@ -2605,7 +2276,7 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Starts the Streamable HTTP MCP test server in the active test placement.
+/// Starts the Streamable HTTP MCP test server as a native Windows process.
 async fn start_streamable_http_test_server(
     expected_env_value: &str,
     expected_token: Option<&str>,
@@ -2617,18 +2288,6 @@ async fn start_streamable_http_test_server(
             return Ok(None);
         }
     };
-
-    if let Some(container_name) = test_docker_container_name() {
-        return Ok(Some(
-            start_remote_streamable_http_test_server(
-                &container_name,
-                &rmcp_http_server_bin,
-                expected_env_value,
-                expected_token,
-            )
-            .await?,
-        ));
-    }
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
@@ -2649,155 +2308,8 @@ async fn start_streamable_http_test_server(
     wait_for_local_streamable_http_server(&mut child, &server_url, Duration::from_secs(5)).await?;
     Ok(Some(StreamableHttpTestServer {
         server_url,
-        process: StreamableHttpTestServerProcess::Local(child),
+        process: child,
     }))
-}
-
-/// Starts the Streamable HTTP MCP test server inside the remote test container.
-async fn start_remote_streamable_http_test_server(
-    container_name: &str,
-    rmcp_http_server_bin: &Path,
-    expected_env_value: &str,
-    expected_token: Option<&str>,
-) -> anyhow::Result<StreamableHttpTestServer> {
-    let remote_path = copy_binary_to_remote_env(
-        container_name,
-        rmcp_http_server_bin,
-        "test_streamable_http_server",
-    )?;
-    let bound_addr_file = format!("{remote_path}.addr");
-    let log_file = format!("{remote_path}.log");
-    let mut env_assignments = vec![
-        format!(
-            "MCP_STREAMABLE_HTTP_BIND_ADDR={}",
-            sh_single_quote("0.0.0.0:0")
-        ),
-        format!(
-            "MCP_STREAMABLE_HTTP_BOUND_ADDR_FILE={}",
-            sh_single_quote(&bound_addr_file)
-        ),
-        format!("MCP_TEST_VALUE={}", sh_single_quote(expected_env_value)),
-    ];
-    if let Some(expected_token) = expected_token {
-        env_assignments.push(format!(
-            "MCP_EXPECT_BEARER={}",
-            sh_single_quote(expected_token)
-        ));
-    }
-
-    let script = format!(
-        "{} nohup {} > {} 2>&1 < /dev/null & echo $!",
-        env_assignments.join(" "),
-        sh_single_quote(&remote_path),
-        sh_single_quote(&log_file)
-    );
-    let start_output = StdCommand::new("docker")
-        .args(["exec", container_name, "sh", "-lc", &script])
-        .output()
-        .context("start remote streamable HTTP MCP test server")?;
-    ensure!(
-        start_output.status.success(),
-        "docker start streamable HTTP MCP test server failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&start_output.stdout).trim(),
-        String::from_utf8_lossy(&start_output.stderr).trim()
-    );
-    let pid = String::from_utf8(start_output.stdout)
-        .context("remote streamable HTTP server pid must be utf-8")?
-        .trim()
-        .to_string();
-    ensure!(
-        !pid.is_empty(),
-        "remote streamable HTTP server pid is empty"
-    );
-
-    let remote_bind_addr =
-        wait_for_remote_bound_addr(container_name, &bound_addr_file, Duration::from_secs(5))
-            .await?;
-    let container_ip = remote_container_ip(container_name)?;
-    let server_url = format!("http://{}:{}/mcp", container_ip, remote_bind_addr.port());
-    // The orchestrator can see the Docker container IP, but the behavior under
-    // test is whether the remote-side MCP client can reach it. Probe through
-    // remote HTTP before handing the URL to the Codex fixture.
-    wait_for_remote_streamable_http_server(&server_url, Duration::from_secs(5)).await?;
-    if expected_token.is_some() {
-        wait_for_streamable_http_metadata(&server_url, Duration::from_secs(5)).await?;
-    }
-
-    Ok(StreamableHttpTestServer {
-        server_url,
-        process: StreamableHttpTestServerProcess::Remote(RemoteStreamableHttpServer {
-            container_name: container_name.to_string(),
-            pid,
-            paths_to_remove: vec![remote_path, bound_addr_file, log_file],
-        }),
-    })
-}
-
-/// Single-quotes a value for the small shell snippets sent through Docker.
-fn sh_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-/// Waits until the remote test server writes the socket address it bound to.
-async fn wait_for_remote_bound_addr(
-    container_name: &str,
-    bound_addr_file: &str,
-    timeout: Duration,
-) -> anyhow::Result<SocketAddr> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let output = StdCommand::new("docker")
-            .args(["exec", container_name, "cat", bound_addr_file])
-            .output()
-            .context("read remote streamable HTTP server bound address")?;
-        if output.status.success() {
-            let bound_addr = String::from_utf8(output.stdout)
-                .context("remote streamable HTTP bound address must be utf-8")?;
-            return bound_addr
-                .trim()
-                .parse()
-                .context("parse remote streamable HTTP bound address");
-        }
-        if Instant::now() >= deadline {
-            return Err(anyhow::anyhow!(
-                "timed out waiting for remote streamable HTTP bound address: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Reads the container IP that the host-side test process can use.
-fn remote_container_ip(container_name: &str) -> anyhow::Result<String> {
-    let output = StdCommand::new("docker")
-        .args([
-            "inspect",
-            "-f",
-            "{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}",
-            container_name,
-        ])
-        .output()
-        .context("inspect remote MCP test container IP")?;
-    ensure!(
-        output.status.success(),
-        "docker inspect remote MCP test container IP failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout).trim(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    let inspect_output =
-        String::from_utf8(output.stdout).context("remote MCP test container IP must be utf-8")?;
-    let ip = inspect_output
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default()
-        .to_string();
-    if ip.is_empty() {
-        Ok("127.0.0.1".to_string())
-    } else {
-        Ok(ip)
-    }
 }
 
 /// Waits for the local Streamable HTTP test server to publish OAuth metadata.
@@ -2818,103 +2330,6 @@ async fn wait_for_local_streamable_http_server(
 
         let remaining = deadline.saturating_duration_since(Instant::now());
 
-        if remaining.is_zero() {
-            return Err(anyhow::anyhow!(
-                "timed out waiting for streamable HTTP server metadata at {metadata_url}: deadline reached"
-            ));
-        }
-
-        match tokio::time::timeout(remaining, client.get(&metadata_url).send()).await {
-            Ok(Ok(response)) if response.status() == StatusCode::OK => return Ok(()),
-            Ok(Ok(response)) => {
-                if Instant::now() >= deadline {
-                    return Err(anyhow::anyhow!(
-                        "timed out waiting for streamable HTTP server metadata at {metadata_url}: HTTP {}",
-                        response.status()
-                    ));
-                }
-            }
-            Ok(Err(error)) => {
-                if Instant::now() >= deadline {
-                    return Err(anyhow::anyhow!(
-                        "timed out waiting for streamable HTTP server metadata at {metadata_url}: {error}"
-                    ));
-                }
-            }
-            Err(_) => {
-                return Err(anyhow::anyhow!(
-                    "timed out waiting for streamable HTTP server metadata at {metadata_url}: request timed out"
-                ));
-            }
-        }
-
-        sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Waits for the remote Streamable HTTP test server via remote HTTP.
-async fn wait_for_remote_streamable_http_server(
-    server_url: &str,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    let websocket_url = std::env::var(REMOTE_EXEC_SERVER_URL_ENV_VAR).with_context(|| {
-        format!("{REMOTE_EXEC_SERVER_URL_ENV_VAR} must be set for remote streamable HTTP MCP tests")
-    })?;
-    let environment = Environment::create_for_tests(Some(websocket_url))?;
-    let http_client = environment.get_http_client();
-    let metadata_url = streamable_http_metadata_url(server_url);
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(anyhow::anyhow!(
-                "timed out waiting for remote streamable HTTP server metadata at {metadata_url}: deadline reached"
-            ));
-        }
-
-        let request = HttpRequestParams {
-            method: "GET".to_string(),
-            url: metadata_url.clone(),
-            headers: Vec::new(),
-            body: None,
-            timeout_ms: Some(remaining.as_millis().clamp(1, 1_000) as u64),
-            redirect_policy: HttpRedirectPolicy::Follow,
-            request_id: "buffered-request".to_string(),
-            stream_response: false,
-        };
-        match http_client.http_request(request).await {
-            Ok(response) if response.status == StatusCode::OK.as_u16() => return Ok(()),
-            Ok(response) => {
-                if Instant::now() >= deadline {
-                    return Err(anyhow::anyhow!(
-                        "timed out waiting for remote streamable HTTP server metadata at {metadata_url}: HTTP {}",
-                        response.status
-                    ));
-                }
-            }
-            Err(error) => {
-                if Instant::now() >= deadline {
-                    return Err(anyhow::anyhow!(
-                        "timed out waiting for remote streamable HTTP server metadata at {metadata_url}: {error}"
-                    ));
-                }
-            }
-        }
-
-        sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Waits for OAuth metadata from the host-side test process.
-async fn wait_for_streamable_http_metadata(
-    server_url: &str,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    let deadline = Instant::now() + timeout;
-    let metadata_url = streamable_http_metadata_url(server_url);
-    let client = HttpClientBuilder::new().build_direct()?;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(anyhow::anyhow!(
                 "timed out waiting for streamable HTTP server metadata at {metadata_url}: deadline reached"

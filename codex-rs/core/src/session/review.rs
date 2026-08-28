@@ -109,6 +109,7 @@ pub(super) async fn spawn_review_thread(
         sub_id: review_turn_id.clone(),
         trace_id: current_span_trace_id(),
         config: per_turn_config,
+        base_instructions: Arc::clone(&parent_turn_context.base_instructions),
         auth_manager: auth_manager_for_context,
         model_info: model_info.clone(),
         session_telemetry: session_telemetry_for_context,
@@ -139,15 +140,18 @@ pub(super) async fn spawn_review_thread(
         deferred_tool_activations: Arc::new(std::sync::RwLock::new(
             crate::session::turn_context::DeferredToolActivationState::default(),
         )),
+        kd4_workflow_enabled: parent_turn_context.kd4_workflow_enabled,
         validation_authorization: Arc::clone(&parent_turn_context.validation_authorization),
-        validation_singleflight: Arc::clone(&parent_turn_context.validation_singleflight),
         turn_metadata_state,
         extension_data,
         turn_skills: TurnSkillsContext::new(parent_turn_context.turn_skills.snapshot.clone()),
         turn_timing_state: Arc::new(TurnTimingState::default()),
+        tool_call_acceptance: Arc::new(crate::state::ToolCallAcceptanceGate::default()),
+        durable_history_completed_commits: Arc::new(Mutex::new(HashSet::new())),
         terminal_error: Arc::new(Mutex::new(None)),
         server_model_warning_emitted: AtomicBool::new(false),
         model_verification_emitted: AtomicBool::new(false),
+        memory_pollution_signal_claimed: AtomicBool::new(false),
     };
 
     // Seed the child task with the review prompt as the initial user message.

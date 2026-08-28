@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::tests::make_session_and_context_with_rx;
 use crate::state::ActiveTurn;
+use crate::state::TurnTerminalCoordinator;
 
 async fn wait_until_held(pause_state: &mut watch::Receiver<bool>) {
     pause_state
@@ -146,8 +147,27 @@ async fn permission_request_holds_an_elicitation_until_response() {
 #[tokio::test]
 async fn request_user_input_holds_an_elicitation_until_response() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    let terminal = TurnTerminalCoordinator::new(turn_context.sub_id.clone());
+    let active_turn = ActiveTurn {
+        terminal: Some(terminal.clone()),
+        ..ActiveTurn::default()
+    };
+    *session.active_turn.lock().await = Some(active_turn);
     let mut pause_state = session.subscribe_elicitation_pause_state();
+
+    session
+        .notify_user_input_response(
+            "stray-turn",
+            RequestUserInputResponse {
+                answers: HashMap::new(),
+                interrupted: true,
+            },
+        )
+        .await;
+    assert!(
+        !terminal.interrupt_pending(),
+        "a stray interruption response must not fence the active turn"
+    );
 
     let request = tokio::spawn({
         let session = session.clone();
@@ -171,12 +191,20 @@ async fn request_user_input_holds_an_elicitation_until_response() {
 
     let response = RequestUserInputResponse {
         answers: HashMap::new(),
-        interrupted: false,
+        interrupted: true,
     };
     session
         .notify_user_input_response(&turn_context.sub_id, response)
         .await;
 
-    request.await.expect("request user input task");
+    let response = request
+        .await
+        .expect("request user input task")
+        .expect("accepted request user input response");
+    assert!(response.interrupted);
+    assert!(
+        terminal.interrupt_pending(),
+        "the accepted interrupted response must fence the active turn"
+    );
     wait_until_released(&mut pause_state).await;
 }

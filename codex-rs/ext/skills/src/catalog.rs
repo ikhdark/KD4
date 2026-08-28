@@ -1,4 +1,5 @@
 use codex_core_skills::model::SkillDependencies;
+use codex_protocol::protocol::SkillScope;
 use codex_utils_path_uri::PathUri;
 
 /// Source authority that owns a skill package and must be used to read it.
@@ -117,6 +118,7 @@ pub struct SkillCatalogEntry {
     pub dependencies: Option<SkillDependencies>,
     pub enabled: bool,
     pub prompt_visible: bool,
+    pub source_scope: Option<SkillScope>,
 }
 
 impl SkillCatalogEntry {
@@ -138,6 +140,7 @@ impl SkillCatalogEntry {
             dependencies: None,
             enabled: true,
             prompt_visible: true,
+            source_scope: None,
         }
     }
 
@@ -153,6 +156,11 @@ impl SkillCatalogEntry {
 
     pub fn with_dependencies(mut self, dependencies: Option<SkillDependencies>) -> Self {
         self.dependencies = dependencies;
+        self
+    }
+
+    pub fn with_source_scope(mut self, source_scope: SkillScope) -> Self {
+        self.source_scope = Some(source_scope);
         self
     }
 

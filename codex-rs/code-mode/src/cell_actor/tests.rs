@@ -117,6 +117,7 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (initial_event_tx, initial_event_rx) = oneshot::channel();
     let (runtime_event_tx, runtime_event_rx) = mpsc::unbounded_channel();
+    let output_admission = Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES));
     let (runtime_tx, runtime_terminate_handle) = spawn_runtime(
         HashMap::new(),
         ExecuteRequest {
@@ -128,6 +129,7 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
         },
         60_000,
         runtime_event_tx,
+        Arc::clone(&output_admission),
         /*task_failure_handler*/ None,
     )
     .unwrap();
@@ -139,6 +141,7 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
             runtime_tx,
             runtime_terminate_handle,
             cell_state,
+            output_admission,
         },
         event_rx,
         command_rx,
@@ -222,11 +225,12 @@ async fn yield_timer_preempts_buffered_runtime_output() {
     harness.event_tx.send(RuntimeEvent::Started).unwrap();
     harness
         .event_tx
-        .send(RuntimeEvent::ContentItem(
-            FunctionCallOutputContentItem::InputText {
+        .send(RuntimeEvent::ContentItem {
+            item: FunctionCallOutputContentItem::InputText {
                 text: "queued output".to_string(),
             },
-        ))
+            admitted_bytes: 0,
+        })
         .unwrap();
 
     assert_eq!(
@@ -263,11 +267,12 @@ async fn state_change_observer_wakes_on_output_without_an_empty_timer_yield() {
 
     harness
         .event_tx
-        .send(RuntimeEvent::ContentItem(
-            FunctionCallOutputContentItem::InputText {
+        .send(RuntimeEvent::ContentItem {
+            item: FunctionCallOutputContentItem::InputText {
                 text: "meaningful output".to_string(),
             },
-        ))
+            admitted_bytes: 0,
+        })
         .unwrap();
     assert_eq!(
         harness.initial_event_rx.await.unwrap(),
@@ -306,11 +311,12 @@ async fn orchestration_correctness_state_change_delivers_already_buffered_output
 
     harness
         .event_tx
-        .send(RuntimeEvent::ContentItem(
-            FunctionCallOutputContentItem::InputText {
+        .send(RuntimeEvent::ContentItem {
+            item: FunctionCallOutputContentItem::InputText {
                 text: "buffered state change".to_string(),
             },
-        ))
+            admitted_bytes: 0,
+        })
         .unwrap();
     harness
         .event_tx
@@ -415,11 +421,12 @@ async fn observation_dropped_before_dequeue_does_not_consume_output() {
     );
     harness
         .event_tx
-        .send(RuntimeEvent::ContentItem(
-            FunctionCallOutputContentItem::InputText {
+        .send(RuntimeEvent::ContentItem {
+            item: FunctionCallOutputContentItem::InputText {
                 text: "survives pre-dequeue cancellation".to_string(),
             },
-        ))
+            admitted_bytes: 0,
+        })
         .unwrap();
     harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
     harness
@@ -478,11 +485,12 @@ async fn dropped_yield_observer_preserves_output_for_the_next_observation() {
     drop(dropped_observation);
     harness
         .event_tx
-        .send(RuntimeEvent::ContentItem(
-            FunctionCallOutputContentItem::InputText {
+        .send(RuntimeEvent::ContentItem {
+            item: FunctionCallOutputContentItem::InputText {
                 text: "survives active cancellation".to_string(),
             },
-        ))
+            admitted_bytes: 0,
+        })
         .unwrap();
     harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
     harness

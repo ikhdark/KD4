@@ -1,25 +1,11 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 
-use serde::Deserialize;
 use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
 
 use crate::tools::handlers::command_shape::CommandInvocation;
 
-pub(crate) const VALIDATION_POLICY_VERSION: u32 = 1;
-pub(crate) const VALIDATION_COST_THRESHOLD_MS: u64 = 30_000;
-pub(crate) const MIN_SKIP_CONFIDENCE: f64 = 0.95;
-pub(crate) const VALIDATION_MODEL_VERSION: i64 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ValidationOperation {
     Test,
@@ -29,64 +15,22 @@ pub(crate) enum ValidationOperation {
     Fuzz,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ValidationBreadth {
-    Selector,
-    Module,
-    Package,
-    Repository,
-    Workspace,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ValidationEcosystem {
-    Rust,
-    Python,
-    DotNet,
-    Node,
-    Go,
-    Java,
-    Other,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ValidationAuthorizationDecision {
-    Grant,
-    Deny,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ValidationAuthorizationRule {
-    pub(crate) policy_version: u32,
-    pub(crate) sequence: u64,
-    pub(crate) operation: ValidationOperation,
-    pub(crate) ecosystem: Option<ValidationEcosystem>,
-    pub(crate) minimum_breadth: Option<ValidationBreadth>,
-    pub(crate) maximum_breadth: Option<ValidationBreadth>,
-    pub(crate) selector: Option<String>,
-    pub(crate) decision: ValidationAuthorizationDecision,
-}
+const ALL_OPERATIONS: [ValidationOperation; 5] = [
+    ValidationOperation::Test,
+    ValidationOperation::Check,
+    ValidationOperation::Lint,
+    ValidationOperation::Bench,
+    ValidationOperation::Fuzz,
+];
 
 #[derive(Debug, Default)]
 pub(crate) struct ValidationAuthorization {
     enabled: bool,
     pub(crate) revision: u64,
-    next_sequence: u64,
-    pub(crate) rules: Vec<ValidationAuthorizationRule>,
-    rule_indexes_by_operation: [Vec<usize>; 5],
+    denied: [bool; 5],
 }
 
 pub(crate) type SharedValidationAuthorization = Arc<RwLock<ValidationAuthorization>>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ValidationAuthorizationMatch {
-    Authorized,
-    Prohibited,
-    Unspecified,
-}
 
 impl ValidationAuthorization {
     pub(crate) fn enabled() -> Self {
@@ -100,41 +44,31 @@ impl ValidationAuthorization {
         if !self.enabled {
             return false;
         }
-        let parsed = parse_directives(text);
-        if parsed.is_empty() {
+        let directives = parse_directives(text);
+        if directives.is_empty() {
             return false;
         }
         self.revision = self.revision.saturating_add(1);
-        for mut rule in parsed {
-            rule.sequence = self.next_sequence;
-            self.next_sequence = self.next_sequence.saturating_add(1);
-            let rule_index = self.rules.len();
-            self.rule_indexes_by_operation[operation_index(rule.operation)].push(rule_index);
-            self.rules.push(rule);
+        for (operation, denied) in directives {
+            self.denied[operation_index(operation)] = denied;
         }
         true
     }
 
-    pub(crate) fn decision_for(
-        &self,
-        operation: ValidationOperation,
-        ecosystem: ValidationEcosystem,
-        breadth: ValidationBreadth,
-        selector: Option<&str>,
-    ) -> ValidationAuthorizationMatch {
-        decision_for_rules(
-            self.rule_indexes_by_operation[operation_index(operation)]
-                .iter()
-                .filter_map(|&index| self.rules.get(index)),
-            operation,
-            ecosystem,
-            breadth,
-            selector,
-        )
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn is_denied(&self, operation: ValidationOperation) -> bool {
+        self.denied[operation_index(operation)]
+    }
+
+    fn has_any_denial(&self) -> bool {
+        self.denied.iter().copied().any(std::convert::identity)
     }
 }
 
-fn operation_index(operation: ValidationOperation) -> usize {
+const fn operation_index(operation: ValidationOperation) -> usize {
     match operation {
         ValidationOperation::Test => 0,
         ValidationOperation::Check => 1,
@@ -144,163 +78,240 @@ fn operation_index(operation: ValidationOperation) -> usize {
     }
 }
 
-fn decision_for_rules<'a>(
-    rules: impl Iterator<Item = &'a ValidationAuthorizationRule>,
-    operation: ValidationOperation,
-    ecosystem: ValidationEcosystem,
-    breadth: ValidationBreadth,
-    selector: Option<&str>,
-) -> ValidationAuthorizationMatch {
-    let mut latest_grant = None;
-    let mut latest_deny = None;
-    for rule in rules.filter(|rule| {
-        rule.policy_version == VALIDATION_POLICY_VERSION
-            && rule.operation == operation
-            && rule
-                .ecosystem
-                .is_none_or(|candidate| candidate == ecosystem)
-            && breadth_matches(rule, breadth)
-            && selector_matches(rule, selector)
-    }) {
-        let candidate = (rule_specificity(rule), rule.sequence);
-        match rule.decision {
-            ValidationAuthorizationDecision::Grant => latest_grant = Some(candidate),
-            ValidationAuthorizationDecision::Deny => latest_deny = Some(candidate),
+fn parse_directives(text: &str) -> Vec<(ValidationOperation, bool)> {
+    let mut normalized = text
+        .replace(['\u{2018}', '\u{2019}'], "'")
+        .to_ascii_lowercase();
+    for starter in [
+        "do not ",
+        "don't ",
+        "dont ",
+        "never ",
+        "must not ",
+        "may not ",
+        "cannot ",
+        "can't ",
+        "you must not ",
+        "you may not ",
+        "you cannot ",
+        "you can't ",
+        "no ",
+        "skip ",
+        "without running ",
+        "without executing ",
+        "run ",
+        "rerun ",
+        "re-run ",
+        "execute ",
+        "perform ",
+        "start ",
+        "allow ",
+        "permit ",
+        "you may ",
+        "you can ",
+        "go ahead and ",
+        "feel free to ",
+    ] {
+        normalized = normalized.replace(&format!(", {starter}"), &format!(";{starter}"));
+        normalized = normalized.replace(&format!(" and {starter}"), &format!(";{starter}"));
+        normalized = normalized.replace(
+            &format!(", please {starter}"),
+            &format!(";please {starter}"),
+        );
+        normalized = normalized.replace(
+            &format!(" and please {starter}"),
+            &format!(";please {starter}"),
+        );
+    }
+    normalized = normalized
+        .replace(",;", ";")
+        .replace(" but ", ";")
+        .replace(" then ", ";");
+
+    let mut directives = Vec::new();
+    for clause in normalized.lines().flat_map(|line| line.split(['.', ';'])) {
+        directives.extend(parse_directive(clause));
+        if let Some(denial) = imperative_suffix_denial(clause) {
+            directives.extend(parse_directive(denial));
         }
     }
-    match (latest_grant, latest_deny) {
-        (Some((grant_specificity, grant_sequence)), Some((deny_specificity, deny_sequence))) => {
-            if deny_specificity > grant_specificity || deny_sequence > grant_sequence {
-                ValidationAuthorizationMatch::Prohibited
-            } else {
-                ValidationAuthorizationMatch::Authorized
-            }
-        }
-        (None, Some(_)) => ValidationAuthorizationMatch::Prohibited,
-        (Some(_), None) => ValidationAuthorizationMatch::Authorized,
-        (None, None) => ValidationAuthorizationMatch::Unspecified,
+    directives
+}
+
+fn imperative_suffix_denial(clause: &str) -> Option<&str> {
+    let clause = clause
+        .trim()
+        .strip_prefix("please, ")
+        .or_else(|| clause.trim().strip_prefix("please "))
+        .unwrap_or_else(|| clause.trim());
+    let imperative = clause.split_whitespace().next().is_some_and(|verb| {
+        matches!(
+            verb,
+            "add"
+                | "build"
+                | "change"
+                | "complete"
+                | "continue"
+                | "create"
+                | "do"
+                | "finish"
+                | "fix"
+                | "implement"
+                | "keep"
+                | "proceed"
+                | "remove"
+                | "update"
+        )
+    });
+    if !imperative {
+        return None;
     }
+    clause
+        .find(" without running ")
+        .map(|index| &clause[index + 1..])
+        .or_else(|| {
+            clause
+                .find(" without executing ")
+                .map(|index| &clause[index + 1..])
+        })
 }
 
-fn selector_matches(rule: &ValidationAuthorizationRule, selector: Option<&str>) -> bool {
-    match (&rule.selector, selector) {
-        (None, _) => true,
-        (Some(expected), Some(actual)) => expected == actual,
-        (Some(_), None) => false,
+fn parse_directive(clause: &str) -> Vec<(ValidationOperation, bool)> {
+    let clause = clause.trim();
+    if clause.is_empty() || clause.contains('?') {
+        return Vec::new();
     }
-}
+    let clause = clause
+        .strip_prefix("please, ")
+        .or_else(|| clause.strip_prefix("please "))
+        .unwrap_or(clause)
+        .trim();
 
-fn rule_specificity(rule: &ValidationAuthorizationRule) -> u8 {
-    u8::from(rule.minimum_breadth.is_some())
-        + u8::from(rule.maximum_breadth.is_some())
-        + u8::from(rule.ecosystem.is_some())
-        + u8::from(rule.selector.is_some())
-}
+    let (denied, body) = if let Some(body) = [
+        "do not ",
+        "don't ",
+        "dont ",
+        "never ",
+        "must not ",
+        "may not ",
+        "cannot ",
+        "can't ",
+        "you must not ",
+        "you may not ",
+        "you cannot ",
+        "you can't ",
+    ]
+    .iter()
+    .find_map(|prefix| clause.strip_prefix(prefix))
+    {
+        let Some(body) = validation_action_body(body) else {
+            return Vec::new();
+        };
+        (true, body)
+    } else if let Some(body) = clause.strip_prefix("no ") {
+        let Some(body) = bare_no_validation_body(body) else {
+            return Vec::new();
+        };
+        (true, body)
+    } else if let Some(body) = clause.strip_prefix("skip ") {
+        (true, body)
+    } else if let Some(body) = clause
+        .strip_prefix("without running ")
+        .or_else(|| clause.strip_prefix("without executing "))
+    {
+        (true, body)
+    } else {
+        let clause = ["you may ", "you can ", "go ahead and ", "feel free to "]
+            .iter()
+            .find_map(|prefix| clause.strip_prefix(prefix))
+            .unwrap_or(clause);
+        let Some(body) = validation_action_body(clause) else {
+            return Vec::new();
+        };
+        (false, body)
+    };
 
-fn breadth_matches(rule: &ValidationAuthorizationRule, breadth: ValidationBreadth) -> bool {
-    if breadth == ValidationBreadth::Unknown {
-        return rule.decision == ValidationAuthorizationDecision::Deny;
-    }
-    rule.minimum_breadth.is_none_or(|min| breadth >= min)
-        && rule.maximum_breadth.is_none_or(|max| breadth <= max)
-}
-
-fn parse_directives(text: &str) -> Vec<ValidationAuthorizationRule> {
-    text.lines()
-        .flat_map(|line| line.split(['.', ';', '\n']))
-        .filter_map(parse_directive)
+    operations_from_instruction(body)
+        .into_iter()
+        .map(|operation| (operation, denied))
         .collect()
 }
 
-fn parse_directive(clause: &str) -> Option<ValidationAuthorizationRule> {
-    let clause = clause.trim().to_ascii_lowercase();
-    if clause.is_empty() || clause.contains('?') || clause.contains(['\'', '"', '`']) {
-        return None;
-    }
-    let normalized = clause.strip_prefix("please ").unwrap_or(&clause).trim();
-    let (decision, body) = if let Some(body) = normalized
-        .strip_prefix("do not ")
-        .or_else(|| normalized.strip_prefix("don't "))
-        .or_else(|| normalized.strip_prefix("dont "))
-        .or_else(|| normalized.strip_prefix("never "))
+fn bare_no_validation_body(body: &str) -> Option<&str> {
+    let mut saw_operation = false;
+    for component in body
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|component| !component.is_empty())
     {
-        (ValidationAuthorizationDecision::Deny, body)
-    } else if let Some(body) = normalized.strip_prefix("run ") {
-        (ValidationAuthorizationDecision::Grant, body)
-    } else {
-        return None;
-    };
-    let body = if decision == ValidationAuthorizationDecision::Deny {
-        body.strip_prefix("run ").unwrap_or(body)
-    } else {
-        body
-    };
-
-    let (operation, minimum_breadth, maximum_breadth) = if body == "tests" {
-        if decision == ValidationAuthorizationDecision::Deny {
-            (ValidationOperation::Test, None, None)
-        } else {
-            (
-                ValidationOperation::Test,
-                None,
-                Some(ValidationBreadth::Package),
-            )
+        match component {
+            "test" | "tests" | "testing" | "suite" | "suites" | "check" | "checks" | "checking"
+            | "lint" | "lints" | "linting" | "clippy" | "bench" | "benches" | "benchmark"
+            | "benchmarks" | "benchmarking" | "fuzz" | "fuzzing" | "fuzzer" | "fuzzers"
+            | "validation" | "validations" => saw_operation = true,
+            "and" | "or" | "any" | "all" | "more" | "further" => {}
+            _ => return None,
         }
-    } else if body == "focused tests" || body == "tests for this change" {
-        (
-            ValidationOperation::Test,
-            None,
-            Some(ValidationBreadth::Package),
-        )
-    } else if body == "all tests" {
-        (ValidationOperation::Test, None, None)
-    } else if body == "the full suite" || body == "the workspace suite" || body == "full suite" {
-        (
-            ValidationOperation::Test,
-            Some(ValidationBreadth::Repository),
-            None,
-        )
-    } else if body == "checks" {
-        (
-            ValidationOperation::Check,
-            None,
-            Some(ValidationBreadth::Package),
-        )
-    } else if body == "lint" {
-        (
-            ValidationOperation::Lint,
-            None,
-            Some(ValidationBreadth::Package),
-        )
-    } else {
-        return None;
-    };
-    Some(ValidationAuthorizationRule {
-        policy_version: VALIDATION_POLICY_VERSION,
-        sequence: 0,
-        operation,
-        ecosystem: None,
-        minimum_breadth,
-        maximum_breadth,
-        selector: None,
-        decision,
-    })
+    }
+    saw_operation.then_some(body)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ValidationCostCertainty {
-    Certain,
-    Uncertain,
+fn validation_action_body(text: &str) -> Option<&str> {
+    let text = text.trim();
+    for prefix in [
+        "run ", "rerun ", "re-run ", "execute ", "perform ", "start ", "allow ", "permit ",
+    ] {
+        if let Some(body) = text.strip_prefix(prefix) {
+            return Some(body);
+        }
+    }
+
+    let first = text
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or_default();
+    matches!(
+        first,
+        "test" | "check" | "lint" | "bench" | "benchmark" | "fuzz"
+    )
+    .then_some(text)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+fn operations_from_instruction(body: &str) -> Vec<ValidationOperation> {
+    let components = body
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| matches!(*component, "validation" | "validations"))
+    {
+        return ALL_OPERATIONS.to_vec();
+    }
+
+    let mut operations = Vec::new();
+    for component in components {
+        let operation = match component {
+            "test" | "tests" | "testing" | "suite" | "suites" => Some(ValidationOperation::Test),
+            "check" | "checks" | "checking" => Some(ValidationOperation::Check),
+            "lint" | "lints" | "linting" | "clippy" => Some(ValidationOperation::Lint),
+            "bench" | "benches" | "benchmark" | "benchmarks" | "benchmarking" => {
+                Some(ValidationOperation::Bench)
+            }
+            "fuzz" | "fuzzing" | "fuzzer" | "fuzzers" => Some(ValidationOperation::Fuzz),
+            _ => None,
+        };
+        if let Some(operation) = operation
+            && !operations.contains(&operation)
+        {
+            operations.push(operation);
+        }
+    }
+    operations
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidationCommandDescriptor {
     pub(crate) operation: ValidationOperation,
-    pub(crate) ecosystem: ValidationEcosystem,
-    pub(crate) breadth: ValidationBreadth,
-    pub(crate) selector: Option<String>,
-    pub(crate) command_family: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,7 +319,7 @@ pub(crate) enum ValidationClassification {
     NonValidation,
     Validation {
         leaves: Vec<ValidationCommandDescriptor>,
-        cost_certainty: ValidationCostCertainty,
+        has_unclassified_targets: bool,
     },
     Opaque,
 }
@@ -317,16 +328,6 @@ pub(crate) enum ValidationClassification {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ValidationSkipReason {
     UserProhibitedValidation,
-    PredictedValidationCost,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct ValidationPrediction {
-    pub(crate) tier: String,
-    pub(crate) predicted_duration_ms: u64,
-    pub(crate) predictive_lower_bound_ms: u64,
-    pub(crate) confidence: f64,
-    pub(crate) effective_sample_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -334,1068 +335,195 @@ pub(crate) struct ValidationSkippedToolOutput {
     pub(crate) reason: ValidationSkipReason,
     pub(crate) skip_disposition: codex_tools::ToolOutputSkipDisposition,
     pub(crate) command_was_executed: bool,
-    pub(crate) predicted_duration_ms: Option<u64>,
-    pub(crate) predictive_lower_bound_ms: Option<u64>,
-    pub(crate) threshold_ms: u64,
-    pub(crate) confidence: Option<f64>,
-    pub(crate) tier: Option<String>,
-    pub(crate) effective_sample_count: Option<u64>,
-    pub(crate) command_family: String,
-    pub(crate) breadth: ValidationBreadth,
-    pub(crate) cheaper_alternatives: Vec<String>,
+    pub(crate) operation: Option<ValidationOperation>,
 }
 
 impl ValidationSkippedToolOutput {
-    fn prohibited(descriptor: &ValidationCommandDescriptor) -> Self {
+    fn prohibited(operation: Option<ValidationOperation>) -> Self {
         Self {
             reason: ValidationSkipReason::UserProhibitedValidation,
             skip_disposition: codex_tools::ToolOutputSkipDisposition::Suppressed,
             command_was_executed: false,
-            predicted_duration_ms: None,
-            predictive_lower_bound_ms: None,
-            threshold_ms: VALIDATION_COST_THRESHOLD_MS,
-            confidence: None,
-            tier: None,
-            effective_sample_count: None,
-            command_family: descriptor.command_family.clone(),
-            breadth: descriptor.breadth,
-            cheaper_alternatives: cheaper_alternatives(descriptor),
-        }
-    }
-
-    fn predicted(
-        descriptor: &ValidationCommandDescriptor,
-        prediction: ValidationPrediction,
-    ) -> Self {
-        let cheaper_alternatives = cheaper_alternatives(descriptor);
-        let skip_disposition = if cheaper_alternatives.is_empty() {
-            codex_tools::ToolOutputSkipDisposition::BlockingRequiredOperation
-        } else {
-            codex_tools::ToolOutputSkipDisposition::Deferred
-        };
-        Self {
-            reason: ValidationSkipReason::PredictedValidationCost,
-            skip_disposition,
-            command_was_executed: false,
-            predicted_duration_ms: Some(prediction.predicted_duration_ms),
-            predictive_lower_bound_ms: Some(prediction.predictive_lower_bound_ms),
-            threshold_ms: VALIDATION_COST_THRESHOLD_MS,
-            confidence: Some(prediction.confidence),
-            tier: Some(prediction.tier),
-            effective_sample_count: Some(prediction.effective_sample_count),
-            command_family: descriptor.command_family.clone(),
-            breadth: descriptor.breadth,
-            cheaper_alternatives,
+            operation,
         }
     }
 }
 
+#[cfg(test)]
 pub(crate) fn prohibited_skip_for(
     authorization: &ValidationAuthorization,
     invocation: &CommandInvocation,
+    explicitly_tagged: bool,
 ) -> Option<ValidationSkippedToolOutput> {
-    let ValidationAnalysis {
-        classification,
-        validation_like_wrapper,
-    } = analyze_validation(invocation);
-    if let Some(descriptor) = validation_like_wrapper
-        && authorization.decision_for(
-            descriptor.operation,
-            descriptor.ecosystem,
-            descriptor.breadth,
-            descriptor.selector.as_deref(),
-        ) == ValidationAuthorizationMatch::Prohibited
-    {
-        return Some(ValidationSkippedToolOutput::prohibited(&descriptor));
-    }
-    let ValidationClassification::Validation { leaves, .. } = classification else {
+    let classification = classify_validation(invocation);
+    prohibited_skip_for_classification(authorization, &classification, explicitly_tagged)
+}
+
+pub(crate) fn prohibited_skip_for_classification(
+    authorization: &ValidationAuthorization,
+    classification: &ValidationClassification,
+    explicitly_tagged: bool,
+) -> Option<ValidationSkippedToolOutput> {
+    if !authorization.is_enabled() {
         return None;
-    };
-    leaves
-        .iter()
-        .find(|leaf| {
-            authorization.decision_for(
-                leaf.operation,
-                leaf.ecosystem,
-                leaf.breadth,
-                leaf.selector.as_deref(),
-            ) == ValidationAuthorizationMatch::Prohibited
-        })
-        .map(ValidationSkippedToolOutput::prohibited)
-}
-
-fn wrapper_descriptor(program: &str, args: &[String]) -> Option<ValidationCommandDescriptor> {
-    let binary = program
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(program)
-        .trim_end_matches(".exe")
-        .to_ascii_lowercase();
-    let selector = match binary.as_str() {
-        "make" | "just" | "task" => wrapper_recipe_argument(args),
-        "npm" | "pnpm" => args
-            .first()
-            .filter(|arg| arg.as_str() == "run")
-            .and_then(|_| args.get(1))
-            .map(String::as_str),
-        "yarn" => match args.first().map(String::as_str) {
-            Some("run") => args.get(1).map(String::as_str),
-            Some(script) if !script.starts_with('-') => Some(script),
-            _ => None,
-        },
-        _ => None,
-    }?;
-    let operation = wrapper_recipe_operation(selector)?;
-    let ecosystem = ValidationEcosystem::Other;
-    let breadth = ValidationBreadth::Unknown;
-    Some(ValidationCommandDescriptor {
-        operation,
-        ecosystem,
-        breadth,
-        selector: Some(selector.to_string()),
-        command_family: format!("{ecosystem:?}:{operation:?}:{breadth:?}"),
-    })
-}
-
-fn wrapper_recipe_argument(args: &[String]) -> Option<&str> {
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if matches!(
-            arg.as_str(),
-            "-C" | "-f" | "--directory" | "--file" | "--justfile" | "--working-directory"
-        ) {
-            skip_next = true;
-            continue;
-        }
-        if arg.starts_with('-') || arg.contains('=') {
-            continue;
-        }
-        if wrapper_recipe_operation(arg).is_some() {
-            return Some(arg);
-        }
     }
-    None
-}
-
-fn wrapper_recipe_operation(selector: &str) -> Option<ValidationOperation> {
-    selector
-        .to_ascii_lowercase()
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .find_map(|component| match component {
-            "test" | "tests" | "testing" => Some(ValidationOperation::Test),
-            "check" | "checks" => Some(ValidationOperation::Check),
-            "lint" | "lints" | "clippy" => Some(ValidationOperation::Lint),
-            "bench" | "benchmark" | "benchmarks" => Some(ValidationOperation::Bench),
-            "fuzz" | "fuzzing" => Some(ValidationOperation::Fuzz),
-            _ => None,
-        })
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ReusableValidationResult {
-    pub(crate) value: serde_json::Value,
-}
-
-/// Cheap identity used only to join validation that is already running.
-///
-/// This deliberately contains no validation-input manifest. Completed evidence
-/// freshness is decided by the durable validation evidence path instead.
-pub(crate) type InFlightValidationKey = codex_protocol::validation::ValidationProofKey;
-
-#[derive(Debug)]
-pub(crate) struct ValidationFlight {
-    leader_call_id: String,
-    result: tokio::sync::Mutex<Option<ReusableValidationResult>>,
-    notify: tokio::sync::Notify,
-    abandoned: AtomicBool,
-    waiters: AtomicUsize,
-    cancellation: CancellationToken,
-}
-
-#[derive(Debug)]
-pub(crate) struct ValidationLeader {
-    identity: InFlightValidationKey,
-    flight: Arc<ValidationFlight>,
-    registry: SharedValidationSingleflight,
-}
-
-impl Clone for ValidationLeader {
-    fn clone(&self) -> Self {
-        self.flight.waiters.fetch_add(1, Ordering::Relaxed);
-        Self {
-            identity: self.identity.clone(),
-            flight: Arc::clone(&self.flight),
-            registry: Arc::clone(&self.registry),
-        }
-    }
-}
-
-impl Drop for ValidationLeader {
-    fn drop(&mut self) {
-        if self.flight.waiters.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.flight.abandoned.store(true, Ordering::Release);
-            self.flight.cancellation.cancel();
-            self.flight.notify.notify_waiters();
-            let identity = self.identity.clone();
-            let flight = Arc::clone(&self.flight);
-            let registry = Arc::clone(&self.registry);
-            tokio::spawn(async move {
-                let mut registry = registry.lock().await;
-                if registry
-                    .get(&identity)
-                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &flight))
-                {
-                    registry.remove(&identity);
-                }
-            });
-        }
-    }
-}
-
-impl ValidationLeader {
-    pub(crate) fn shared_from_call_id(&self) -> &str {
-        &self.flight.leader_call_id
-    }
-
-    pub(crate) async fn join(&self) -> Option<ReusableValidationResult> {
-        loop {
-            let notified = self.flight.notify.notified();
-            if let Some(result) = self.flight.result.lock().await.clone() {
-                return Some(result);
+    match classification {
+        ValidationClassification::Validation {
+            leaves,
+            has_unclassified_targets,
+        } => {
+            if explicitly_tagged && *has_unclassified_targets && authorization.has_any_denial() {
+                Some(ValidationSkippedToolOutput::prohibited(None))
+            } else {
+                leaves
+                    .iter()
+                    .find(|leaf| authorization.is_denied(leaf.operation))
+                    .map(|leaf| ValidationSkippedToolOutput::prohibited(Some(leaf.operation)))
             }
-            if self.flight.abandoned.load(Ordering::Acquire) {
-                return None;
-            }
-            notified.await;
         }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct ValidationLeaderOwnership {
-    identity: InFlightValidationKey,
-    flight: Arc<ValidationFlight>,
-    registry: SharedValidationSingleflight,
-    committed: bool,
-}
-
-impl Drop for ValidationLeaderOwnership {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        self.flight.abandoned.store(true, Ordering::Release);
-        self.flight.cancellation.cancel();
-        self.flight.notify.notify_waiters();
-        let identity = self.identity.clone();
-        let flight = Arc::clone(&self.flight);
-        let registry = Arc::clone(&self.registry);
-        tokio::spawn(async move {
-            let mut registry = registry.lock().await;
-            if registry
-                .get(&identity)
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &flight))
-            {
-                registry.remove(&identity);
-            }
-        });
-    }
-}
-
-impl ValidationLeaderOwnership {
-    pub(crate) fn cancellation_token(&self) -> CancellationToken {
-        self.flight.cancellation.clone()
-    }
-
-    pub(crate) async fn complete(mut self, result: ReusableValidationResult) {
-        // Publish before unlinking the flight. Otherwise a new caller can
-        // become leader in the gap while existing followers still have no
-        // result to observe.
-        *self.flight.result.lock().await = Some(result);
+        ValidationClassification::NonValidation | ValidationClassification::Opaque
+            if explicitly_tagged && authorization.has_any_denial() =>
         {
-            let mut registry = self.registry.lock().await;
-            if registry
-                .get(&self.identity)
-                .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
-            {
-                registry.remove(&self.identity);
-            }
+            Some(ValidationSkippedToolOutput::prohibited(None))
         }
-        self.flight.notify.notify_waiters();
-        self.committed = true;
+        ValidationClassification::NonValidation | ValidationClassification::Opaque => None,
     }
-
-    pub(crate) async fn abandon(mut self) {
-        let mut registry = self.registry.lock().await;
-        if registry
-            .get(&self.identity)
-            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
-        {
-            registry.remove(&self.identity);
-        }
-        drop(registry);
-        self.flight.abandoned.store(true, Ordering::Release);
-        self.flight.cancellation.cancel();
-        self.flight.notify.notify_waiters();
-        self.committed = true;
-    }
-}
-
-pub(crate) type SharedValidationSingleflight =
-    Arc<tokio::sync::Mutex<HashMap<InFlightValidationKey, Arc<ValidationFlight>>>>;
-
-static DISABLED_VALIDATION_SINGLEFLIGHT: LazyLock<SharedValidationSingleflight> =
-    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())));
-
-/// Creates the in-flight validation registry owned by one turn context.
-/// Completed results are never cached, and unrelated sessions never share a
-/// command-execution decision. Disabled turns share one inert registry because
-/// validation admission never registers work for them.
-pub(crate) fn new_validation_singleflight(enabled: bool) -> SharedValidationSingleflight {
-    if enabled {
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()))
-    } else {
-        Arc::clone(&DISABLED_VALIDATION_SINGLEFLIGHT)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum ValidationRegistration {
-    Leader {
-        execution: Box<ValidationLeaderOwnership>,
-        waiter: ValidationLeader,
-    },
-    Follower(ValidationLeader),
-}
-
-pub(crate) async fn register_if_absent(
-    registry: &SharedValidationSingleflight,
-    identity: InFlightValidationKey,
-    call_id: &str,
-    _caller_cancellation: &CancellationToken,
-) -> ValidationRegistration {
-    let mut flights = registry.lock().await;
-    if let Some(flight) = flights.get(&identity).cloned() {
-        flight.waiters.fetch_add(1, Ordering::Relaxed);
-        return ValidationRegistration::Follower(ValidationLeader {
-            identity,
-            flight,
-            registry: Arc::clone(registry),
-        });
-    }
-    let flight = Arc::new(ValidationFlight {
-        leader_call_id: call_id.to_string(),
-        result: tokio::sync::Mutex::new(None),
-        notify: tokio::sync::Notify::new(),
-        abandoned: AtomicBool::new(false),
-        waiters: AtomicUsize::new(1),
-        // Admission transfers process ownership away from the first caller. A
-        // caller cancellation detaches its waiter; only the execution owner or
-        // the last disappearing waiter may cancel the shared process.
-        cancellation: CancellationToken::new(),
-    });
-    flights.insert(identity.clone(), Arc::clone(&flight));
-    ValidationRegistration::Leader {
-        execution: Box::new(ValidationLeaderOwnership {
-            identity: identity.clone(),
-            flight: Arc::clone(&flight),
-            registry: Arc::clone(registry),
-            committed: false,
-        }),
-        waiter: ValidationLeader {
-            identity,
-            flight,
-            registry: Arc::clone(registry),
-        },
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ValidationObservationPlan {
-    keys: Vec<ValidationObservationKey>,
-}
-
-impl ValidationObservationPlan {
-    fn keys_for_descriptor(&self, descriptor_index: usize) -> &[ValidationObservationKey] {
-        const KEYS_PER_DESCRIPTOR: usize = 3;
-        let start = descriptor_index.saturating_mul(KEYS_PER_DESCRIPTOR);
-        self.keys
-            .get(start..start.saturating_add(KEYS_PER_DESCRIPTOR))
-            .unwrap_or_default()
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ValidationObservationKey {
-    scope: codex_state::ValidationHistoryScope,
-    repository: Option<Vec<u8>>,
-    fingerprint: Vec<u8>,
-    descriptor: ValidationCommandDescriptor,
 }
 
 #[derive(Debug)]
 pub(crate) enum ValidationAdmission {
     Execute {
         authorization_revision: u64,
-        observation: Option<ValidationObservationPlan>,
+        is_validation: bool,
+        classification: ValidationClassification,
     },
     Skip(ValidationSkippedToolOutput),
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ValidationLaunchPlan {
-    pub(crate) invocation: CommandInvocation,
+    pub(crate) classification: ValidationClassification,
     pub(crate) authorization_revision: u64,
-    pub(crate) observation: Option<ValidationObservationPlan>,
-    /// Filled only after the launch-boundary admission has rechecked the
-    /// current implementation, environment, configuration, and coverage.
-    pub(crate) proof_key: Option<codex_protocol::validation::ValidationProofKey>,
-    /// The exact predeclared leaf route, when this is an automatic launch.
+    pub(crate) explicitly_tagged: bool,
     pub(crate) structured_route: Option<codex_protocol::plan_tool::ValidationRoute>,
-    /// The plan step whose implementation identity was bound when the validation
-    /// launch was admitted. Command completion must not rediscover this binding
-    /// after the process has run because task evidence may have advanced by then.
     pub(crate) bound_plan_step: Option<(String, u64)>,
+    pub(crate) bound_work_unit: Option<(String, u64)>,
     pub(crate) validation_call_id: Option<String>,
     pub(crate) turn_timing_state: Option<Arc<crate::turn_timing::TurnTimingState>>,
-    pub(crate) force_fresh: bool,
+    pub(crate) focused_validation_token:
+        Option<crate::agent::task_coordinator::FocusedValidationToken>,
 }
 
+pub(crate) fn recheck_validation_launch(
+    authorization: &ValidationAuthorization,
+    launch: &ValidationLaunchPlan,
+) -> Option<ValidationSkippedToolOutput> {
+    (authorization.revision != launch.authorization_revision)
+        .then(|| {
+            prohibited_skip_for_classification(
+                authorization,
+                &launch.classification,
+                launch.explicitly_tagged,
+            )
+        })
+        .flatten()
+}
+
+#[cfg(test)]
 pub(crate) async fn admit_validation(
     authorization: &SharedValidationAuthorization,
-    state: Option<&codex_state::StateRuntime>,
-    repository: &[u8],
     invocation: &CommandInvocation,
+    explicitly_tagged: bool,
 ) -> ValidationAdmission {
-    let (enabled, authorization_revision) = {
-        let guard = authorization.read().await;
-        (guard.enabled, guard.revision)
-    };
-    if !enabled {
+    admit_validation_invocations(
+        authorization,
+        std::slice::from_ref(invocation),
+        explicitly_tagged,
+    )
+    .await
+}
+
+pub(crate) async fn admit_validation_invocations(
+    authorization: &SharedValidationAuthorization,
+    invocations: &[CommandInvocation],
+    explicitly_tagged: bool,
+) -> ValidationAdmission {
+    let authorization = authorization.read().await;
+    if !authorization.is_enabled() {
         return ValidationAdmission::Execute {
-            authorization_revision,
-            observation: None,
+            authorization_revision: authorization.revision,
+            is_validation: false,
+            classification: ValidationClassification::NonValidation,
         };
     }
-    let classification = classify_validation(invocation);
-    let ValidationClassification::Validation {
-        leaves,
-        cost_certainty,
-    } = classification
-    else {
-        return ValidationAdmission::Execute {
-            authorization_revision: authorization.read().await.revision,
-            observation: None,
-        };
-    };
-    let (revision, denied, authorized) = {
-        let guard = authorization.read().await;
-        let revision = guard.revision;
-        let (denied, authorized) = summarize_authorization(&leaves, |leaf| {
-            guard.decision_for(
-                leaf.operation,
-                leaf.ecosystem,
-                leaf.breadth,
-                leaf.selector.as_deref(),
-            )
-        });
-        (revision, denied, authorized)
-    };
-    if let Some(denied) = denied.as_ref() {
-        return ValidationAdmission::Skip(ValidationSkippedToolOutput::prohibited(denied));
-    }
-    let observation = observation_plan(repository, &leaves);
-    if authorized || cost_certainty == ValidationCostCertainty::Uncertain {
-        return ValidationAdmission::Execute {
-            authorization_revision: revision,
-            observation: Some(observation),
-        };
-    }
-    let Some(state) = state else {
-        return ValidationAdmission::Execute {
-            authorization_revision: revision,
-            observation: Some(observation),
-        };
-    };
-    for (descriptor_index, descriptor) in leaves.iter().enumerate() {
-        match predict(state, observation.keys_for_descriptor(descriptor_index)).await {
-            Ok(Some(prediction)) if prediction_requires_skip(&prediction) => {
-                return ValidationAdmission::Skip(ValidationSkippedToolOutput::predicted(
-                    descriptor, prediction,
-                ));
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::debug!(%error, "validation cost lookup failed open");
-                return ValidationAdmission::Execute {
-                    authorization_revision: revision,
-                    observation: Some(observation),
-                };
-            }
-        }
-    }
-    ValidationAdmission::Execute {
-        authorization_revision: revision,
-        observation: Some(observation),
-    }
-}
-
-fn summarize_authorization(
-    leaves: &[ValidationCommandDescriptor],
-    mut decision_for: impl FnMut(&ValidationCommandDescriptor) -> ValidationAuthorizationMatch,
-) -> (Option<ValidationCommandDescriptor>, bool) {
-    let mut all_authorized = true;
-    for leaf in leaves {
-        match decision_for(leaf) {
-            ValidationAuthorizationMatch::Prohibited => return (Some(leaf.clone()), false),
-            ValidationAuthorizationMatch::Authorized => {}
-            ValidationAuthorizationMatch::Unspecified => all_authorized = false,
-        }
-    }
-    (None, all_authorized)
-}
-
-fn prediction_requires_skip(prediction: &ValidationPrediction) -> bool {
-    prediction.confidence >= MIN_SKIP_CONFIDENCE
-        && prediction.predictive_lower_bound_ms > VALIDATION_COST_THRESHOLD_MS
-}
-
-pub(crate) fn admission_still_authorized(
-    authorization: &ValidationAuthorization,
-    invocation: &CommandInvocation,
-) -> bool {
-    prohibited_skip_for(authorization, invocation).is_none()
-}
-
-#[derive(Clone)]
-pub(crate) struct ValidationObservationToken {
-    plan: ValidationObservationPlan,
-    state: Arc<codex_state::StateRuntime>,
-    recorded: Arc<AtomicBool>,
-    armed: Arc<AtomicBool>,
-}
-
-impl std::fmt::Debug for ValidationObservationToken {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ValidationObservationToken")
-            .field("plan", &self.plan)
-            .field("recorded", &self.recorded.load(Ordering::Acquire))
-            .field("armed", &self.armed.load(Ordering::Acquire))
-            .finish_non_exhaustive()
-    }
-}
-
-impl ValidationObservationToken {
-    pub(crate) fn new(
-        plan: ValidationObservationPlan,
-        state: Arc<codex_state::StateRuntime>,
-    ) -> Self {
-        Self {
-            plan,
-            state,
-            recorded: Arc::new(AtomicBool::new(false)),
-            armed: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub(crate) fn arm(&self) {
-        self.armed.store(true, Ordering::Release);
-    }
-
-    pub(crate) async fn record_completed(&self, duration_ms: u64) {
-        self.record(codex_state::ValidationHistoryObservation::Completed { duration_ms })
-            .await;
-    }
-
-    pub(crate) async fn record_cancelled(&self, elapsed_ms: u64) {
-        self.record(codex_state::ValidationHistoryObservation::Cancelled {
-            elapsed_ms,
-            threshold_ms: VALIDATION_COST_THRESHOLD_MS,
-        })
-        .await;
-    }
-
-    async fn record(&self, observation: codex_state::ValidationHistoryObservation) {
-        if !self.armed.load(Ordering::Acquire) || self.recorded.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let keys = self.plan.keys.iter().map(history_key).collect::<Vec<_>>();
-        self.state
-            .validation_history()
-            .record_batch(&keys, observation)
-            .await;
-    }
-}
-
-fn observation_plan(
-    repository: &[u8],
-    leaves: &[ValidationCommandDescriptor],
-) -> ValidationObservationPlan {
-    let mut keys = Vec::new();
-    for descriptor in leaves {
-        let exact = descriptor_fingerprint(descriptor, true);
-        let family = descriptor_fingerprint(descriptor, false);
-        keys.push(ValidationObservationKey {
-            scope: codex_state::ValidationHistoryScope::RepositoryFingerprint,
-            repository: Some(repository.to_vec()),
-            fingerprint: exact,
-            descriptor: descriptor.clone(),
-        });
-        keys.push(ValidationObservationKey {
-            scope: codex_state::ValidationHistoryScope::RepositoryFamily,
-            repository: Some(repository.to_vec()),
-            fingerprint: family.clone(),
-            descriptor: descriptor.clone(),
-        });
-        keys.push(ValidationObservationKey {
-            scope: codex_state::ValidationHistoryScope::GlobalFamily,
-            repository: None,
-            fingerprint: family,
-            descriptor: descriptor.clone(),
-        });
-    }
-    ValidationObservationPlan { keys }
-}
-
-async fn predict(
-    state: &codex_state::StateRuntime,
-    candidates: &[ValidationObservationKey],
-) -> anyhow::Result<Option<ValidationPrediction>> {
-    for key in candidates {
-        let aggregate = state.validation_history().lookup(history_key(key)).await?;
-        let Some(aggregate) = aggregate else { continue };
-        let minimum = match key.scope {
-            codex_state::ValidationHistoryScope::RepositoryFingerprint => 8,
-            codex_state::ValidationHistoryScope::RepositoryFamily => 16,
-            codex_state::ValidationHistoryScope::GlobalFamily => 64,
-        };
-        if let Some(prediction) = prediction_from_aggregate(&aggregate, minimum, key.scope) {
-            return Ok(Some(prediction));
-        }
-    }
-    Ok(None)
-}
-
-fn prediction_from_aggregate(
-    aggregate: &codex_state::ValidationHistoryAggregate,
-    minimum: u64,
-    scope: codex_state::ValidationHistoryScope,
-) -> Option<ValidationPrediction> {
-    // Censored observations do not carry enough information to estimate the
-    // duration variance. Do not advertise a confidence level unless the sample
-    // consists entirely of completed observations.
-    if aggregate.completed_count < minimum
-        || aggregate.censored_below_count > 0
-        || aggregate.censored_above_count > 0
+    let classification = classify_validation_invocations(invocations);
+    if let Some(skipped) =
+        prohibited_skip_for_classification(&authorization, &classification, explicitly_tagged)
     {
-        return None;
+        return ValidationAdmission::Skip(skipped);
     }
-    let n = aggregate.completed_count as f64;
-    let mean = aggregate.duration_sum_ms / n;
-    let variance = ((aggregate.duration_sum_squares_ms - aggregate.duration_sum_ms * mean)
-        / (n - 1.0))
-        .max(0.0);
-    let lower = (mean
-        - one_sided_student_t_95(aggregate.completed_count - 1)
-            * variance.sqrt()
-            * (1.0 + 1.0 / n).sqrt())
-    .max(0.0);
-    Some(ValidationPrediction {
-        tier: match scope {
-            codex_state::ValidationHistoryScope::RepositoryFingerprint => "repository_fingerprint",
-            codex_state::ValidationHistoryScope::RepositoryFamily => "repository_family",
-            codex_state::ValidationHistoryScope::GlobalFamily => "global_family",
-        }
-        .to_string(),
-        predicted_duration_ms: mean.round() as u64,
-        predictive_lower_bound_ms: lower.floor() as u64,
-        confidence: MIN_SKIP_CONFIDENCE,
-        effective_sample_count: aggregate.completed_count,
-    })
-}
-
-/// Conservative one-sided 95% Student-t critical values.
-///
-/// The admission thresholds require at least eight observations, so a compact
-/// upper-envelope table is enough and avoids treating estimated variance as if
-/// it were known. Each bucket uses the critical value at its smallest degree of
-/// freedom and is therefore conservative for the rest of the bucket.
-fn one_sided_student_t_95(degrees_of_freedom: u64) -> f64 {
-    match degrees_of_freedom {
-        0..=7 => 1.895,
-        8..=15 => 1.860,
-        16..=31 => 1.746,
-        32..=63 => 1.694,
-        64..=127 => 1.669,
-        _ => 1.658,
-    }
-}
-
-fn history_key(key: &ValidationObservationKey) -> codex_state::ValidationHistoryKey<'_> {
-    codex_state::ValidationHistoryKey {
-        scope: key.scope,
-        repository: key.repository.as_deref(),
-        fingerprint: &key.fingerprint,
-        operation: key.descriptor.operation as i64,
-        ecosystem: key.descriptor.ecosystem as i64,
-        breadth: key.descriptor.breadth as i64,
-        model_version: VALIDATION_MODEL_VERSION,
-    }
-}
-
-fn descriptor_fingerprint(descriptor: &ValidationCommandDescriptor, exact: bool) -> Vec<u8> {
-    format!(
-        "v{VALIDATION_MODEL_VERSION}:{:?}:{:?}:{:?}:{}:{}",
-        descriptor.operation,
-        descriptor.ecosystem,
-        descriptor.breadth,
-        descriptor.command_family,
-        if exact {
-            descriptor.selector.as_deref().unwrap_or("")
-        } else {
-            ""
-        }
-    )
-    .into_bytes()
-}
-
-pub(crate) fn validation_identity(
-    repository: &[u8],
-    cwd: impl Into<String>,
-    invocation: &CommandInvocation,
-    environment: impl Into<String>,
-    toolchain: impl Into<String>,
-    workspace_revision: u64,
-) -> InFlightValidationKey {
-    validation_identity_with_scope(
-        repository,
-        cwd,
-        invocation,
-        environment,
-        toolchain,
-        "",
-        workspace_revision.to_string(),
-        "",
-        &[],
-        &[],
-    )
-}
-
-/// Configuration dimension for a validation whose implementation identity is
-/// already derived from its declared covered paths. Repository mutations are
-/// intentionally excluded: unrelated changes must not defeat scoped reuse.
-pub(crate) fn scoped_validation_configuration_identity(features: impl std::fmt::Debug) -> String {
-    format!("features={features:?}")
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn validation_identity_with_scope(
-    repository: &[u8],
-    cwd: impl Into<String>,
-    invocation: &CommandInvocation,
-    environment: impl Into<String>,
-    toolchain: impl Into<String>,
-    configuration: impl Into<String>,
-    implementation_identity: impl Into<String>,
-    uncertainty: &str,
-    covered_paths: &[String],
-    covered_contracts: &[String],
-) -> InFlightValidationKey {
-    let canonical_route = canonical_test_proof_route(invocation)
-        .unwrap_or_else(|| serde_json::to_vec(&invocation.hook_input()).unwrap_or_default());
-    let canonical_route_hash = format!("{:x}", Sha256::digest(canonical_route));
-    let mut paths = covered_paths.to_vec();
-    paths.sort();
-    paths.dedup();
-    let mut contracts = covered_contracts.to_vec();
-    contracts.sort();
-    contracts.dedup();
-    let coverage_identity = if paths.is_empty() && contracts.is_empty() {
-        // Unknown coverage is intentionally repository-wide; never invent a
-        // narrower identity from command text.
-        "repository-wide".to_string()
-    } else {
-        let encoded =
-            serde_json::to_vec(&(uncertainty.trim(), paths, contracts)).unwrap_or_default();
-        format!("{:x}", Sha256::digest(encoded))
-    };
-    InFlightValidationKey {
-        repository: String::from_utf8_lossy(repository).into_owned(),
-        cwd: cwd.into(),
-        canonical_route_hash,
-        implementation_identity: implementation_identity.into(),
-        coverage_identity,
-        environment_identity: environment.into(),
-        toolchain_identity: toolchain.into(),
-        configuration_identity: configuration.into(),
-        validation_contract_version: codex_protocol::validation::VALIDATION_CONTRACT_VERSION,
-    }
-}
-
-/// Canonicalizes runner spelling away from a focused test proof. Cargo and
-/// nextest receipts are equivalent only when package, features, and exact test
-/// IDs are identical; environment, toolchain, and configuration remain
-/// separate `ValidationProofKey` dimensions. Scoped implementation identity
-/// owns repository freshness for declared covered paths.
-fn canonical_test_proof_route(invocation: &CommandInvocation) -> Option<Vec<u8>> {
-    let CommandInvocation::Argv { program, args } = invocation else {
-        return None;
-    };
-    let (forwarded, package_fallback) = match (program.as_str(), args.first()?.as_str()) {
-        ("cargo", "test") => (&args[1..], None),
-        ("just", "test-fast") => (&args[1..], None),
-        ("just", "test-lane" | "test-lane-fast") => (&args[2..], None),
-        ("just", "test-lane-package") => (&args[2..], args.get(1).map(String::as_str)),
-        _ => return None,
-    };
-    let mut package = package_fallback.map(str::to_string);
-    let mut features = Vec::new();
-    let mut test_ids = Vec::new();
-    let mut target_selectors = Vec::new();
-    let mut target_flags = Vec::new();
-    let mut harness_args = Vec::new();
-    let mut all_features = false;
-    let mut no_default_features = false;
-    let mut cargo_exact = program != "cargo";
-    let mut index = 0;
-    while index < forwarded.len() {
-        let argument = &forwarded[index];
-        if program == "cargo" && argument == "--" {
-            let harness = &forwarded[index + 1..];
-            cargo_exact = harness.iter().any(|argument| argument == "--exact");
-            harness_args.extend(
-                harness
-                    .iter()
-                    .filter(|argument| argument.as_str() != "--exact")
-                    .cloned(),
-            );
-            break;
-        }
-        let (option, inline) = argument
-            .split_once('=')
-            .map_or((argument.as_str(), None), |(option, value)| {
-                (option, Some(value))
-            });
-        match option {
-            "-p" | "--package" => {
-                package = inline
-                    .or_else(|| forwarded.get(index + 1).map(String::as_str))
-                    .map(str::to_string);
-                index += usize::from(inline.is_none());
-            }
-            "--features" => {
-                let value = inline.or_else(|| forwarded.get(index + 1).map(String::as_str))?;
-                features.extend(
-                    value
-                        .split(',')
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string),
-                );
-                index += usize::from(inline.is_none());
-            }
-            "--all-features" => all_features = true,
-            "--no-default-features" => no_default_features = true,
-            "-E" | "--filterset" | "--filter-expr" => {
-                let expression = inline.or_else(|| forwarded.get(index + 1).map(String::as_str))?;
-                let test_id = expression.strip_prefix("test(=")?.strip_suffix(')')?;
-                if !exact_test_id(test_id) {
-                    return None;
-                }
-                test_ids.push(test_id.to_string());
-                index += usize::from(inline.is_none());
-            }
-            "--test" | "--bin" | "--example" | "--bench" | "--manifest-path" | "--target"
-                if program == "cargo" =>
-            {
-                let value = inline.or_else(|| forwarded.get(index + 1).map(String::as_str))?;
-                target_selectors.push(format!("{option}={value}"));
-                index += usize::from(inline.is_none());
-            }
-            "--target-dir" | "-j" | "--jobs" if program == "cargo" => {
-                let _ = inline.or_else(|| forwarded.get(index + 1).map(String::as_str))?;
-                index += usize::from(inline.is_none());
-            }
-            "--lib" | "--bins" | "--tests" | "--benches" | "--all-targets" | "--doc" => {
-                target_flags.push(option.to_string());
-            }
-            _ if program == "cargo" && !argument.starts_with('-') && exact_test_id(argument) => {
-                test_ids.push(argument.clone());
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    if package.as_deref().is_none_or(str::is_empty) || test_ids.is_empty() || !cargo_exact {
-        return None;
-    }
-    features.sort();
-    features.dedup();
-    test_ids.sort();
-    test_ids.dedup();
-    target_selectors.sort();
-    target_selectors.dedup();
-    target_flags.sort();
-    target_flags.dedup();
-    serde_json::to_vec(&serde_json::json!({
-        "operation": "test",
-        "package": package,
-        "features": features,
-        "all_features": all_features,
-        "no_default_features": no_default_features,
-        "selected_test_ids": test_ids,
-        "target_selectors": target_selectors,
-        "target_flags": target_flags,
-        "harness_args": harness_args,
-    }))
-    .ok()
-}
-
-fn exact_test_id(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
-}
-
-pub(crate) fn validation_argv_semantically_covers(
-    executed: &[String],
-    required: &[String],
-) -> bool {
-    let invocation = |argv: &[String]| {
-        let (program, args) = argv.split_first()?;
-        Some(CommandInvocation::Argv {
-            program: program.clone(),
-            args: args.to_vec(),
-        })
-    };
-    let Some(executed_invocation) = invocation(executed) else {
-        return false;
-    };
-    let Some(required_invocation) = invocation(required) else {
-        return false;
-    };
-    let Some(executed_route) = canonical_test_proof_route(&executed_invocation) else {
-        return executed == required;
-    };
-    let Some(required_route) = canonical_test_proof_route(&required_invocation) else {
-        return false;
-    };
-    let Ok(executed): Result<serde_json::Value, _> = serde_json::from_slice(&executed_route) else {
-        return false;
-    };
-    let Ok(required): Result<serde_json::Value, _> = serde_json::from_slice(&required_route) else {
-        return false;
-    };
-    executed["package"] == required["package"]
-        && executed["features"] == required["features"]
-        && executed["all_features"] == required["all_features"]
-        && executed["no_default_features"] == required["no_default_features"]
-        && executed["target_selectors"] == required["target_selectors"]
-        && executed["target_flags"] == required["target_flags"]
-        && executed["harness_args"] == required["harness_args"]
-        && required["selected_test_ids"]
-            .as_array()
-            .is_some_and(|required_ids| {
-                executed["selected_test_ids"]
-                    .as_array()
-                    .is_some_and(|executed_ids| {
-                        required_ids
-                            .iter()
-                            .all(|test_id| executed_ids.contains(test_id))
-                    })
-            })
-}
-
-fn cheaper_alternatives(descriptor: &ValidationCommandDescriptor) -> Vec<String> {
-    match descriptor.operation {
-        ValidationOperation::Test => vec![
-            "run the nearest module or package test".to_string(),
-            "reuse an identical completed validation".to_string(),
-        ],
-        ValidationOperation::Check | ValidationOperation::Lint => {
-            vec!["limit validation to the affected package".to_string()]
-        }
-        ValidationOperation::Bench | ValidationOperation::Fuzz => Vec::new(),
-    }
-}
-
-struct ValidationAnalysis {
-    classification: ValidationClassification,
-    validation_like_wrapper: Option<ValidationCommandDescriptor>,
-}
-
-fn analyze_validation(invocation: &CommandInvocation) -> ValidationAnalysis {
-    match invocation {
-        CommandInvocation::Argv { program, args } => ValidationAnalysis {
-            classification: classify_argv(program, args),
-            validation_like_wrapper: wrapper_descriptor(program, args),
-        },
-        CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) => {
-            analyze_script(script, 0, true)
-        }
+    let is_validation =
+        explicitly_tagged || matches!(&classification, ValidationClassification::Validation { .. });
+    ValidationAdmission::Execute {
+        authorization_revision: authorization.revision,
+        is_validation,
+        classification,
     }
 }
 
 pub(crate) fn classify_validation(invocation: &CommandInvocation) -> ValidationClassification {
-    analyze_validation(invocation).classification
-}
-
-fn classify_script(script: &str, depth: usize) -> ValidationClassification {
-    analyze_script(script, depth, false).classification
-}
-
-fn analyze_script(script: &str, depth: usize, find_wrapper: bool) -> ValidationAnalysis {
-    if depth > 4 {
-        return ValidationAnalysis {
-            classification: ValidationClassification::Opaque,
-            validation_like_wrapper: None,
-        };
+    #[cfg(test)]
+    VALIDATION_CLASSIFICATION_COUNT.with(|count| count.set(count.get() + 1));
+    match invocation {
+        CommandInvocation::Argv { program, args } => classify_argv(program, args),
+        CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) => {
+            classify_simple_script(script, 0)
+        }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static VALIDATION_CLASSIFICATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_validation_classification_count() {
+    VALIDATION_CLASSIFICATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn validation_classification_count() -> usize {
+    VALIDATION_CLASSIFICATION_COUNT.with(std::cell::Cell::get)
+}
+
+pub(crate) fn classify_validation_invocations(
+    invocations: &[CommandInvocation],
+) -> ValidationClassification {
+    combine_validation_classifications(invocations.iter().map(classify_validation))
+}
+
+fn combine_validation_classifications(
+    classifications: impl IntoIterator<Item = ValidationClassification>,
+) -> ValidationClassification {
     let mut leaves = Vec::new();
-    let mut uncertain = false;
-    let mut validation_like_wrapper = None;
-    let normalized = script
-        .replace("&&", ";")
-        .replace("||", ";")
-        .replace(['\r', '\n'], ";");
-    for leaf in normalized.split(';') {
-        let leaf_is_dynamic = leaf.contains("$(") || leaf.contains('`') || leaf.contains("${");
-        let Some(words) = shlex::split(leaf) else {
-            uncertain = true;
-            continue;
-        };
-        if words.is_empty() {
-            continue;
-        }
-        if find_wrapper && validation_like_wrapper.is_none() {
-            validation_like_wrapper = wrapper_descriptor(&words[0], &words[1..]);
-        }
-        if leaf_is_dynamic && !looks_like_known_validation(&words) {
-            uncertain = true;
-            continue;
-        }
-        let classified = classify_argv(&words[0], &words[1..]);
-        match classified {
+    let mut has_unclassified_targets = false;
+    let mut saw_opaque = false;
+    for classification in classifications {
+        match classification {
             ValidationClassification::Validation {
                 leaves: mut found,
-                cost_certainty,
+                has_unclassified_targets: found_unclassified,
             } => {
                 leaves.append(&mut found);
-                uncertain |=
-                    leaf_is_dynamic || cost_certainty == ValidationCostCertainty::Uncertain;
+                has_unclassified_targets |= found_unclassified;
             }
-            ValidationClassification::Opaque => uncertain = true,
-            ValidationClassification::NonValidation if leaf_is_dynamic => uncertain = true,
+            ValidationClassification::Opaque => saw_opaque = true,
             ValidationClassification::NonValidation => {}
         }
     }
-    let classification = if leaves.is_empty() {
-        if uncertain {
+    if leaves.is_empty() {
+        if saw_opaque {
             ValidationClassification::Opaque
         } else {
             ValidationClassification::NonValidation
@@ -1403,41 +531,96 @@ fn analyze_script(script: &str, depth: usize, find_wrapper: bool) -> ValidationA
     } else {
         ValidationClassification::Validation {
             leaves,
-            cost_certainty: if uncertain {
-                ValidationCostCertainty::Uncertain
-            } else {
-                ValidationCostCertainty::Certain
-            },
+            has_unclassified_targets: has_unclassified_targets || saw_opaque,
         }
-    };
-    ValidationAnalysis {
-        classification,
-        validation_like_wrapper,
     }
 }
 
-fn looks_like_known_validation(words: &[String]) -> bool {
-    words.iter().any(|word| {
-        matches!(
-            normalized_program_name(word.trim_matches(['\'', '"'])).as_str(),
-            "cargo"
-                | "pytest"
-                | "python"
-                | "python3"
-                | "dotnet"
-                | "go"
-                | "npm"
-                | "pnpm"
-                | "yarn"
-                | "mvn"
-                | "mvnw"
-                | "gradle"
-                | "gradlew"
-                | "just"
-                | "make"
-                | "task"
-        )
-    })
+const MAX_WRAPPER_DEPTH: usize = 4;
+
+fn classify_simple_script(script: &str, depth: usize) -> ValidationClassification {
+    if depth > MAX_WRAPPER_DEPTH {
+        return ValidationClassification::Opaque;
+    }
+    let Some(commands) = split_deterministic_script(script) else {
+        return ValidationClassification::Opaque;
+    };
+    let classifications = commands.into_iter().filter_map(|command| {
+        let Some(words) = shlex::split(command.trim()) else {
+            return Some(ValidationClassification::Opaque);
+        };
+        let first_command = words
+            .iter()
+            .position(|word| !is_shell_assignment(word))
+            .unwrap_or(words.len());
+        let program = words.get(first_command)?;
+        Some(classify_argv_at_depth(
+            program,
+            &words[first_command + 1..],
+            depth + 1,
+        ))
+    });
+    combine_validation_classifications(classifications)
+}
+
+fn split_deterministic_script(script: &str) -> Option<Vec<&str>> {
+    if script.contains("$(") || script.contains("${") || script.contains('`') {
+        return None;
+    }
+    let bytes = script.as_bytes();
+    let mut commands = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if byte == b'\\' && quote != Some(b'\'') {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            match quote {
+                Some(active) if active == byte => quote = None,
+                None => quote = Some(byte),
+                Some(_) => {}
+            }
+            index += 1;
+            continue;
+        }
+        if quote.is_some() {
+            index += 1;
+            continue;
+        }
+        let separator_length = match byte {
+            b';' | b'\r' | b'\n' => 1,
+            b'&' if bytes.get(index + 1) == Some(&b'&') => 2,
+            b'|' if bytes.get(index + 1) == Some(&b'|') => 2,
+            b'&' | b'|' => return None,
+            _ => 0,
+        };
+        if separator_length == 0 {
+            index += 1;
+            continue;
+        }
+        commands.push(&script[start..index]);
+        index += separator_length;
+        if byte == b'\r' && bytes.get(index) == Some(&b'\n') {
+            index += 1;
+        }
+        start = index;
+    }
+    if quote.is_some() || escaped {
+        return None;
+    }
+    commands.push(&script[start..]);
+    Some(commands)
 }
 
 fn classify_argv(program: &str, args: &[String]) -> ValidationClassification {
@@ -1449,99 +632,458 @@ fn classify_argv_at_depth(
     args: &[String],
     depth: usize,
 ) -> ValidationClassification {
-    if depth > 4 {
+    if depth > MAX_WRAPPER_DEPTH {
         return ValidationClassification::Opaque;
     }
     let binary = normalized_program_name(program);
+
     if matches!(binary.as_str(), "env" | "command" | "time") {
-        let Some(index) = args
-            .iter()
-            .position(|arg| !(arg.starts_with('-') || binary == "env" && arg.contains('=')))
-        else {
+        let Some(index) = wrapper_program_index(&binary, args) else {
             return ValidationClassification::Opaque;
         };
         return classify_argv_at_depth(&args[index], &args[index + 1..], depth + 1);
     }
     if matches!(binary.as_str(), "bash" | "sh") {
-        if let Some(index) = args.iter().position(|arg| arg == "-c")
-            && let Some(script) = args.get(index + 1)
-        {
-            return classify_script(script, depth + 1);
-        }
-        return ValidationClassification::Opaque;
+        let Some(index) = args.iter().position(|arg| shell_executes_command_arg(arg)) else {
+            return ValidationClassification::Opaque;
+        };
+        let Some(script) = args.get(index + 1) else {
+            return ValidationClassification::Opaque;
+        };
+        return classify_simple_script(script, depth + 1);
     }
     if matches!(binary.as_str(), "pwsh" | "powershell") {
-        if let Some(index) = args
+        let Some(index) = args
             .iter()
-            .position(|arg| arg.eq_ignore_ascii_case("-command"))
-            && args.get(index + 1).is_some()
-        {
-            return classify_script(&args[index + 1..].join(" "), depth + 1);
+            .position(|arg| arg.eq_ignore_ascii_case("-command") || arg.eq_ignore_ascii_case("-c"))
+        else {
+            return ValidationClassification::Opaque;
+        };
+        if args.get(index + 1).is_none() {
+            return ValidationClassification::Opaque;
         }
-        return ValidationClassification::Opaque;
+        return classify_simple_script(&args[index + 1..].join(" "), depth + 1);
     }
     if binary == "cmd" {
-        if let Some(index) = args.iter().position(|arg| arg.eq_ignore_ascii_case("/c"))
-            && args.get(index + 1).is_some()
-        {
-            return classify_script(&args[index + 1..].join(" "), depth + 1);
+        let Some(index) = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))
+        else {
+            return ValidationClassification::Opaque;
+        };
+        if args.get(index + 1).is_none() {
+            return ValidationClassification::Opaque;
         }
-        return ValidationClassification::Opaque;
+        return classify_simple_script(&args[index + 1..].join(" "), depth + 1);
     }
 
-    let descriptor = match (binary.as_str(), args.first().map(String::as_str)) {
-        ("cargo", Some("test")) => cargo_test_descriptor(args),
-        ("cargo", Some("check")) => {
-            descriptor(ValidationOperation::Check, ValidationEcosystem::Rust, args)
-        }
-        ("cargo", Some("clippy")) => {
-            descriptor(ValidationOperation::Lint, ValidationEcosystem::Rust, args)
-        }
-        ("cargo", Some("bench")) => {
-            descriptor(ValidationOperation::Bench, ValidationEcosystem::Rust, args)
-        }
-        ("pytest", _) if !pytest_is_information_only(args) => {
-            descriptor(ValidationOperation::Test, ValidationEcosystem::Python, args)
-        }
-        ("python" | "python3", Some("-m"))
-            if matches!(args.get(1).map(String::as_str), Some("pytest" | "unittest")) =>
-        {
-            descriptor(ValidationOperation::Test, ValidationEcosystem::Python, args)
-        }
-        ("dotnet", Some("test")) => {
-            descriptor(ValidationOperation::Test, ValidationEcosystem::DotNet, args)
-        }
-        ("go", Some("test")) => {
-            descriptor(ValidationOperation::Test, ValidationEcosystem::Go, args)
-        }
-        ("npm" | "pnpm" | "yarn", _) => match node_test_descriptor(&binary, args) {
-            Some(descriptor) => descriptor,
-            None => return ValidationClassification::NonValidation,
-        },
-        ("mvn" | "mvnw" | "gradle" | "gradlew", _) => match java_test_descriptor(&binary, args) {
-            Some(descriptor) => descriptor,
-            None => return ValidationClassification::NonValidation,
-        },
-        ("just", _) => match just_validation_descriptor(args) {
-            Some(descriptor) => descriptor,
-            None => return ValidationClassification::Opaque,
-        },
-        ("make" | "task", _) => match wrapper_descriptor(&binary, args) {
-            Some(descriptor) => descriptor,
-            None => return ValidationClassification::Opaque,
-        },
-        _ => return ValidationClassification::NonValidation,
-    };
-    ValidationClassification::Validation {
-        leaves: vec![descriptor],
-        cost_certainty: if args
-            .iter()
-            .any(|arg| arg.contains('$') || arg.contains('*'))
-        {
-            ValidationCostCertainty::Uncertain
+    let (operations, has_unclassified_targets) = recognize_operations(&binary, args);
+    classification_from_operations(operations, has_unclassified_targets)
+}
+
+fn classification_from_operations(
+    operations: Vec<ValidationOperation>,
+    has_unclassified_targets: bool,
+) -> ValidationClassification {
+    if operations.is_empty() {
+        if has_unclassified_targets {
+            ValidationClassification::Opaque
         } else {
-            ValidationCostCertainty::Certain
+            ValidationClassification::NonValidation
+        }
+    } else {
+        ValidationClassification::Validation {
+            leaves: operations
+                .into_iter()
+                .map(|operation| ValidationCommandDescriptor { operation })
+                .collect(),
+            has_unclassified_targets,
+        }
+    }
+}
+
+fn shell_executes_command_arg(arg: &str) -> bool {
+    arg == "-c"
+        || arg
+            .strip_prefix('-')
+            .filter(|flags| !flags.starts_with('-'))
+            .is_some_and(|flags| flags.contains('c'))
+}
+
+fn wrapper_program_index(binary: &str, args: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            return (index + 1 < args.len()).then_some(index + 1);
+        }
+        let takes_value = match binary {
+            "env" => matches!(arg.as_str(), "-u" | "--unset" | "-C" | "--chdir"),
+            "time" => matches!(arg.as_str(), "-f" | "--format" | "-o" | "--output"),
+            _ => false,
+        };
+        if takes_value {
+            index += 2;
+        } else if arg.starts_with('-') || binary == "env" && is_shell_assignment(arg) {
+            index += 1;
+        } else {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn is_shell_assignment(argument: &str) -> bool {
+    let Some((name, _)) = argument.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.chars().enumerate().all(|(index, character)| {
+            character == '_'
+                || character.is_ascii_alphanumeric() && (index > 0 || !character.is_ascii_digit())
+        })
+}
+
+fn recognize_operations(binary: &str, args: &[String]) -> (Vec<ValidationOperation>, bool) {
+    match binary {
+        "cargo" => cargo_operations(args),
+        "pytest" => (vec![ValidationOperation::Test], false),
+        "python" | "python3" => (python_operation(args).into_iter().collect(), false),
+        "dotnet" | "go" => (
+            args.first()
+                .is_some_and(|argument| argument.eq_ignore_ascii_case("test"))
+                .then_some(ValidationOperation::Test)
+                .into_iter()
+                .collect(),
+            false,
+        ),
+        "mvn" | "mvnw" | "gradle" | "gradlew" => (
+            jvm_test_operation(binary, args).into_iter().collect(),
+            false,
+        ),
+        "npm" | "pnpm" | "yarn" => (node_operations(binary, args), false),
+        "just" | "make" | "task" => wrapper_operations(binary, args),
+        _ => (Vec::new(), false),
+    }
+}
+
+fn cargo_operations(args: &[String]) -> (Vec<ValidationOperation>, bool) {
+    let subcommand_index = match cargo_subcommand_index(args) {
+        Ok(Some(index)) => index,
+        Ok(None) => return (Vec::new(), false),
+        Err(()) => return (Vec::new(), true),
+    };
+    let subcommand = args[subcommand_index].to_ascii_lowercase();
+    let operation = if subcommand == "nextest" {
+        args.get(subcommand_index + 1)
+            .filter(|argument| argument.eq_ignore_ascii_case("run"))
+            .map(|_| ValidationOperation::Test)
+    } else {
+        cargo_operation(&subcommand)
+    };
+    (operation.into_iter().collect(), false)
+}
+
+fn cargo_subcommand_index(args: &[String]) -> Result<Option<usize>, ()> {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if matches!(
+            argument.as_str(),
+            "--version" | "-V" | "--list" | "--help" | "-h"
+        ) {
+            return Ok(None);
+        }
+        if matches!(
+            argument.as_str(),
+            "--locked" | "--offline" | "--frozen" | "--quiet" | "-q" | "--verbose" | "-v"
+        ) || argument.starts_with('+') && argument.len() > 1
+            || argument.starts_with('-')
+                && argument.len() > 2
+                && argument[1..].chars().all(|flag| flag == 'v')
+        {
+            index += 1;
+            continue;
+        }
+        if matches!(argument.as_str(), "--color" | "--config" | "-Z" | "-C") {
+            if args.get(index + 1).is_none() {
+                return Err(());
+            }
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("--color=")
+            || argument.starts_with("--config=")
+            || argument.starts_with("-Z") && argument.len() > 2
+            || argument.starts_with("-C") && argument.len() > 2
+        {
+            index += 1;
+            continue;
+        }
+        if argument.starts_with('-') {
+            return Err(());
+        }
+        return Ok(Some(index));
+    }
+    Ok(None)
+}
+
+fn cargo_operation(argument: &str) -> Option<ValidationOperation> {
+    match argument.to_ascii_lowercase().as_str() {
+        "test" | "t" => Some(ValidationOperation::Test),
+        "check" => Some(ValidationOperation::Check),
+        "clippy" | "fmt" => Some(ValidationOperation::Lint),
+        "bench" => Some(ValidationOperation::Bench),
+        "fuzz" => Some(ValidationOperation::Fuzz),
+        _ => None,
+    }
+}
+
+fn python_operation(args: &[String]) -> Option<ValidationOperation> {
+    (args.first().is_some_and(|argument| argument == "-m")
+        && args
+            .get(1)
+            .is_some_and(|module| matches!(module.as_str(), "pytest" | "unittest")))
+    .then_some(ValidationOperation::Test)
+}
+
+fn jvm_test_operation(binary: &str, args: &[String]) -> Option<ValidationOperation> {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        let value_count = runner_option_value_count(binary, argument);
+        if value_count > 0 {
+            index += value_count + 1;
+            continue;
+        }
+        if !argument.starts_with('-')
+            && argument
+                .rsplit(':')
+                .next()
+                .is_some_and(|component| component.eq_ignore_ascii_case("test"))
+        {
+            return Some(ValidationOperation::Test);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn node_operations(binary: &str, args: &[String]) -> Vec<ValidationOperation> {
+    let Some(command_index) = node_command_index(binary, args) else {
+        return Vec::new();
+    };
+    let command = args[command_index].to_ascii_lowercase();
+    if command == "test" {
+        return vec![ValidationOperation::Test];
+    }
+    if matches!(command.as_str(), "run" | "run-script") {
+        return args[command_index + 1..]
+            .iter()
+            .find(|selector| selector.as_str() != "--" && !selector.starts_with('-'))
+            .map_or_else(Vec::new, |selector| selector_operations(selector));
+    }
+    if binary == "yarn" && command == "workspace" {
+        return args[command_index + 2..]
+            .iter()
+            .position(|argument| argument.eq_ignore_ascii_case("run"))
+            .and_then(|run_offset| args.get(command_index + 3 + run_offset))
+            .map_or_else(Vec::new, |selector| selector_operations(selector));
+    }
+    if matches!(binary, "pnpm" | "yarn") {
+        return selector_operations(&command);
+    }
+    Vec::new()
+}
+
+fn node_command_index(binary: &str, args: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            return args.get(index + 1).map(|_| index + 1);
+        }
+        let takes_value = matches!(
+            (binary, argument.as_str()),
+            ("npm", "--prefix") | ("pnpm", "--filter") | ("yarn", "--cwd")
+        );
+        if takes_value {
+            index += 2;
+        } else if argument.starts_with('-') {
+            index += 1;
+        } else {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn wrapper_operations(binary: &str, args: &[String]) -> (Vec<ValidationOperation>, bool) {
+    let mut operations = Vec::new();
+    let mut has_unclassified_targets = false;
+    let mut index = 0;
+    while let Some(selector) = args.get(index) {
+        let value_count = runner_option_value_count(binary, selector);
+        if value_count > 0 {
+            index += value_count + 1;
+            continue;
+        }
+        if selector == "--" || selector.starts_with('-') || selector.contains('=') {
+            index += 1;
+            continue;
+        }
+        let found = selector_operations(selector);
+        if found.is_empty() {
+            has_unclassified_targets = true;
+        } else {
+            extend_unique(&mut operations, found);
+        }
+        index += 1;
+    }
+    (operations, has_unclassified_targets)
+}
+
+fn runner_option_value_count(binary: &str, option: &str) -> usize {
+    match binary {
+        "just" => just_option_value_count(option),
+        "make" => match option {
+            "-C" | "-f" | "-I" | "-o" | "-W" | "--assume-new" | "--assume-old" | "--directory"
+            | "--eval" | "--file" | "--include-dir" | "--makefile" | "--new-file"
+            | "--old-file" | "--what-if" => 1,
+            _ => 0,
         },
+        "task" => match option {
+            "-C"
+            | "-d"
+            | "-I"
+            | "-o"
+            | "-t"
+            | "--completion"
+            | "--concurrency"
+            | "--dir"
+            | "--interval"
+            | "--output"
+            | "--output-group-begin"
+            | "--output-group-end"
+            | "--sort"
+            | "--taskfile" => 1,
+            _ => 0,
+        },
+        "mvn" | "mvnw" => match option {
+            "-b"
+            | "-D"
+            | "-emp"
+            | "-ep"
+            | "-f"
+            | "-gs"
+            | "-l"
+            | "-P"
+            | "-pl"
+            | "-rf"
+            | "-s"
+            | "-t"
+            | "-T"
+            | "--activate-profiles"
+            | "--builder"
+            | "--define"
+            | "--encrypt-master-password"
+            | "--encrypt-password"
+            | "--file"
+            | "--global-settings"
+            | "--log-file"
+            | "--projects"
+            | "--resume-from"
+            | "--settings"
+            | "--threads"
+            | "--toolchains" => 1,
+            _ => 0,
+        },
+        "gradle" | "gradlew" => match option {
+            "-b"
+            | "-c"
+            | "-g"
+            | "-I"
+            | "-p"
+            | "--build-file"
+            | "--configuration-cache-problems"
+            | "--console"
+            | "--dependency-verification"
+            | "--gradle-user-home"
+            | "--init-script"
+            | "--priority"
+            | "--project-cache-dir"
+            | "--project-dir"
+            | "--settings-file"
+            | "--warning-mode"
+            | "--write-verification-metadata" => 1,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn just_option_value_count(option: &str) -> usize {
+    match option {
+        "--set" => 2,
+        "-C"
+        | "-E"
+        | "-F"
+        | "-d"
+        | "-f"
+        | "--alias-style"
+        | "--ceiling"
+        | "--chooser"
+        | "--color"
+        | "--command-color"
+        | "--cygpath"
+        | "--directory"
+        | "--dotenv-command"
+        | "--dotenv-filename"
+        | "--dotenv-path"
+        | "--dump-format"
+        | "--evaluate-format"
+        | "--file"
+        | "--group"
+        | "--indentation"
+        | "--jobs"
+        | "--justfile"
+        | "--justfile-name"
+        | "--list-heading"
+        | "--list-prefix"
+        | "--shell"
+        | "--shell-arg"
+        | "--tempdir"
+        | "--timestamp-format"
+        | "--working-directory" => 1,
+        _ => 0,
+    }
+}
+
+fn selector_operations(selector: &str) -> Vec<ValidationOperation> {
+    let mut operations = Vec::new();
+    for component in selector
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|component| !component.is_empty())
+    {
+        let operation = match component {
+            "test" | "tests" | "testing" => Some(ValidationOperation::Test),
+            "check" | "checks" => Some(ValidationOperation::Check),
+            "lint" | "lints" | "clippy" | "fmt" | "format" => Some(ValidationOperation::Lint),
+            "bench" | "benchmark" | "benchmarks" => Some(ValidationOperation::Bench),
+            "fuzz" | "fuzzing" => Some(ValidationOperation::Fuzz),
+            _ => None,
+        };
+        if let Some(operation) = operation
+            && !operations.contains(&operation)
+        {
+            operations.push(operation);
+        }
+    }
+    operations
+}
+
+fn extend_unique(operations: &mut Vec<ValidationOperation>, additional: Vec<ValidationOperation>) {
+    for operation in additional {
+        if !operations.contains(&operation) {
+            operations.push(operation);
+        }
     }
 }
 
@@ -1560,1300 +1102,448 @@ fn normalized_program_name(program: &str) -> String {
     binary
 }
 
-fn pytest_is_information_only(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version"))
-}
-
-fn node_test_descriptor(binary: &str, args: &[String]) -> Option<ValidationCommandDescriptor> {
-    let selector = match (binary, args.first().map(String::as_str)) {
-        ("npm" | "pnpm" | "yarn", Some("test")) => "test",
-        ("npm" | "pnpm" | "yarn", Some("run")) => args.get(1)?.as_str(),
-        ("yarn", Some(script)) if !script.starts_with('-') => script,
-        _ => return None,
-    };
-    if wrapper_recipe_operation(selector) != Some(ValidationOperation::Test) {
-        return None;
-    }
-    Some(descriptor(
-        ValidationOperation::Test,
-        ValidationEcosystem::Node,
-        args,
-    ))
-}
-
-fn java_test_descriptor(binary: &str, args: &[String]) -> Option<ValidationCommandDescriptor> {
-    let is_test = match binary {
-        "mvn" | "mvnw" => !maven_tests_explicitly_skipped(args) && maven_has_test_goal(args),
-        "gradle" | "gradlew" => !gradle_test_is_excluded(args) && gradle_has_test_task(args),
-        _ => false,
-    };
-    is_test.then(|| descriptor(ValidationOperation::Test, ValidationEcosystem::Java, args))
-}
-
-fn maven_tests_explicitly_skipped(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        let arg = arg.to_ascii_lowercase();
-        arg == "-dskiptests"
-            || arg == "-dmaven.test.skip"
-            || arg
-                .strip_prefix("-dskiptests=")
-                .is_some_and(|value| value != "false")
-            || arg
-                .strip_prefix("-dmaven.test.skip=")
-                .is_some_and(|value| value != "false")
-    })
-}
-
-fn maven_has_test_goal(args: &[String]) -> bool {
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if matches!(
-            arg.as_str(),
-            "-D" | "-f"
-                | "--file"
-                | "-s"
-                | "--settings"
-                | "-gs"
-                | "--global-settings"
-                | "-t"
-                | "--toolchains"
-                | "-pl"
-                | "--projects"
-                | "-rf"
-                | "--resume-from"
-                | "-P"
-                | "--activate-profiles"
-                | "-T"
-                | "--threads"
-        ) {
-            skip_next = true;
-            continue;
-        }
-        if !arg.starts_with('-') && arg.eq_ignore_ascii_case("test") {
-            return true;
-        }
-    }
-    false
-}
-
-fn gradle_test_is_excluded(args: &[String]) -> bool {
-    args.windows(2).any(|pair| {
-        matches!(pair[0].as_str(), "-x" | "--exclude-task") && is_gradle_test_task(&pair[1])
-    }) || args.iter().any(|arg| {
-        arg.strip_prefix("--exclude-task=")
-            .is_some_and(is_gradle_test_task)
-            || arg
-                .strip_prefix("-x")
-                .filter(|task| !task.is_empty())
-                .is_some_and(is_gradle_test_task)
-    })
-}
-
-fn gradle_has_test_task(args: &[String]) -> bool {
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if matches!(
-            arg.as_str(),
-            "-x" | "--exclude-task"
-                | "--task"
-                | "-p"
-                | "--project-dir"
-                | "-g"
-                | "--gradle-user-home"
-                | "-I"
-                | "--init-script"
-                | "-c"
-                | "--settings-file"
-                | "--include-build"
-        ) {
-            skip_next = true;
-            continue;
-        }
-        if !arg.starts_with('-') && is_gradle_test_task(arg) {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_gradle_test_task(task: &str) -> bool {
-    task.rsplit(':')
-        .next()
-        .is_some_and(|task| task.eq_ignore_ascii_case("test"))
-}
-
-fn just_validation_descriptor(args: &[String]) -> Option<ValidationCommandDescriptor> {
-    let operation = match args.first()?.as_str() {
-        "test-fast" | "test-compile" | "test-lane-main" | "test-lane" | "test-lane-fast"
-        | "test-lane-package" => ValidationOperation::Test,
-        "source-map-check" | "check-lane" => ValidationOperation::Check,
-        "fmt-check" => ValidationOperation::Lint,
-        _ => return None,
-    };
-    Some(descriptor(operation, ValidationEcosystem::Rust, args))
-}
-
-fn cargo_test_descriptor(args: &[String]) -> ValidationCommandDescriptor {
-    let mut descriptor = descriptor(ValidationOperation::Test, ValidationEcosystem::Rust, args);
-    if let Some(selector) = args.get(1).filter(|selector| {
-        !selector.is_empty()
-            && !selector.starts_with('-')
-            && !selector.contains('$')
-            && !selector.contains('*')
-    }) {
-        descriptor.breadth = ValidationBreadth::Selector;
-        descriptor.selector = Some(selector.clone());
-        descriptor.command_family = format!(
-            "{:?}:{:?}:{:?}",
-            descriptor.ecosystem, descriptor.operation, descriptor.breadth
-        );
-    }
-    descriptor
-}
-
-fn descriptor(
-    operation: ValidationOperation,
-    ecosystem: ValidationEcosystem,
-    args: &[String],
-) -> ValidationCommandDescriptor {
-    let breadth = if args
-        .iter()
-        .any(|arg| arg.contains('$') || arg.contains('*'))
-    {
-        ValidationBreadth::Unknown
-    } else if args
-        .iter()
-        .any(|arg| arg == "--workspace" || arg == "--all")
-    {
-        ValidationBreadth::Workspace
-    } else if args.iter().any(|arg| arg == "-p" || arg == "--package") {
-        ValidationBreadth::Package
-    } else if args
-        .iter()
-        .any(|arg| arg.contains("::") || arg.contains("#"))
-    {
-        ValidationBreadth::Selector
-    } else {
-        match ecosystem {
-            ValidationEcosystem::Rust | ValidationEcosystem::Node => ValidationBreadth::Package,
-            ValidationEcosystem::Python => ValidationBreadth::Repository,
-            ValidationEcosystem::Go if args.iter().any(|arg| arg == "./...") => {
-                ValidationBreadth::Repository
-            }
-            ValidationEcosystem::Go => ValidationBreadth::Package,
-            ValidationEcosystem::DotNet
-            | ValidationEcosystem::Java
-            | ValidationEcosystem::Other => ValidationBreadth::Unknown,
-        }
-    };
-    ValidationCommandDescriptor {
-        operation,
-        ecosystem,
-        breadth,
-        selector: None,
-        command_family: format!("{ecosystem:?}:{operation:?}:{breadth:?}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn validation_analysis_discovers_wrapper_while_classifying_script() {
-        let analysis = analyze_validation(&CommandInvocation::Script(
-            "echo preparing; yarn run test:unit".into(),
-        ));
-
-        assert!(matches!(
-            analysis.classification,
-            ValidationClassification::Validation { ref leaves, .. }
-                if leaves.len() == 1
-                    && leaves[0].operation == ValidationOperation::Test
-                    && leaves[0].ecosystem == ValidationEcosystem::Node
-        ));
-        assert!(matches!(
-            analysis.validation_like_wrapper,
-            Some(ValidationCommandDescriptor {
-                operation: ValidationOperation::Test,
-                ecosystem: ValidationEcosystem::Other,
-                breadth: ValidationBreadth::Unknown,
-                selector: Some(ref selector),
-                ..
-            }) if selector == "test:unit"
-        ));
-    }
-
-    #[test]
-    fn authorization_summary_visits_each_leaf_at_most_once() {
-        let leaves = vec![
-            descriptor(ValidationOperation::Test, ValidationEcosystem::Rust, &[]),
-            descriptor(ValidationOperation::Check, ValidationEcosystem::Rust, &[]),
-            descriptor(ValidationOperation::Lint, ValidationEcosystem::Rust, &[]),
-        ];
-        let mut calls = 0;
-        let (denied, authorized) = summarize_authorization(&leaves, |leaf| {
-            calls += 1;
-            if leaf.operation == ValidationOperation::Check {
-                ValidationAuthorizationMatch::Prohibited
-            } else {
-                ValidationAuthorizationMatch::Authorized
-            }
-        });
-
-        assert_eq!(calls, 2);
-        assert_eq!(
-            denied.as_ref().map(|descriptor| descriptor.operation),
-            Some(ValidationOperation::Check)
-        );
-        assert!(!authorized);
-
-        calls = 0;
-        let (denied, authorized) = summarize_authorization(&leaves, |_| {
-            calls += 1;
-            ValidationAuthorizationMatch::Authorized
-        });
-        assert_eq!(calls, leaves.len());
-        assert_eq!(denied, None);
-        assert!(authorized);
-    }
-
-    #[test]
-    fn operation_index_matches_linear_authorization_decisions() {
-        let mut authorization = ValidationAuthorization::enabled();
-        assert!(authorization.update_from_user_input(
-            "Run focused tests; do not run the workspace suite; run checks; run lint."
-        ));
-
-        for operation in [
-            ValidationOperation::Test,
-            ValidationOperation::Check,
-            ValidationOperation::Lint,
-            ValidationOperation::Bench,
-            ValidationOperation::Fuzz,
-        ] {
-            for breadth in [
-                ValidationBreadth::Selector,
-                ValidationBreadth::Package,
-                ValidationBreadth::Workspace,
-                ValidationBreadth::Unknown,
-            ] {
-                let indexed = authorization.decision_for(
-                    operation,
-                    ValidationEcosystem::Rust,
-                    breadth,
-                    Some("selected_test"),
-                );
-                let linear = decision_for_rules(
-                    authorization.rules.iter(),
-                    operation,
-                    ValidationEcosystem::Rust,
-                    breadth,
-                    Some("selected_test"),
-                );
-                assert_eq!(indexed, linear, "{operation:?} {breadth:?}");
-            }
+    fn argv(program: &str, args: &[&str]) -> CommandInvocation {
+        CommandInvocation::Argv {
+            program: program.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
         }
     }
 
-    #[test]
-    fn observation_plan_reuses_each_descriptors_three_prediction_keys() {
-        let leaves = vec![
-            descriptor(ValidationOperation::Test, ValidationEcosystem::Rust, &[]),
-            descriptor(ValidationOperation::Check, ValidationEcosystem::Rust, &[]),
-        ];
-        let plan = observation_plan(b"repository", &leaves);
-
-        for (index, descriptor) in leaves.iter().enumerate() {
-            let keys = plan.keys_for_descriptor(index);
-            assert_eq!(keys.len(), 3);
-            assert_eq!(keys[0].descriptor, *descriptor);
-            assert_eq!(keys[1].descriptor, *descriptor);
-            assert_eq!(keys[2].descriptor, *descriptor);
-            assert_eq!(
-                keys[0].repository.as_deref(),
-                Some(b"repository".as_slice())
-            );
-            assert_eq!(
-                keys[1].repository.as_deref(),
-                Some(b"repository".as_slice())
-            );
-            assert_eq!(keys[2].repository, None);
-            assert_eq!(
-                keys[0].fingerprint,
-                descriptor_fingerprint(descriptor, true)
-            );
-            assert_eq!(
-                keys[1].fingerprint,
-                descriptor_fingerprint(descriptor, false)
-            );
-            assert_eq!(
-                keys[2].fingerprint,
-                descriptor_fingerprint(descriptor, false)
-            );
-        }
-        assert!(plan.keys_for_descriptor(leaves.len()).is_empty());
-    }
-
-    #[tokio::test]
-    async fn disabled_validation_policy_does_not_parse_or_classify_commands() {
-        let authorization = Arc::new(RwLock::new(ValidationAuthorization::default()));
-        assert!(
-            !authorization
-                .write()
-                .await
-                .update_from_user_input("Do not run tests.")
-        );
-
-        let admission = admit_validation(
-            &authorization,
-            None,
-            b"ordinary-repository",
-            &CommandInvocation::Script("cargo test --workspace".into()),
+    fn is_validation(invocation: &CommandInvocation) -> bool {
+        matches!(
+            classify_validation(invocation),
+            ValidationClassification::Validation { .. }
         )
-        .await;
-        assert!(matches!(
-            admission,
-            ValidationAdmission::Execute {
-                observation: None,
-                ..
-            }
-        ));
     }
 
     #[test]
-    fn prohibited_validation_wrappers_fail_closed() {
+    fn latest_explicit_instruction_replaces_operation_denial() {
         let mut authorization = ValidationAuthorization::enabled();
-        assert!(authorization.update_from_user_input("Do not run tests."));
+        assert!(authorization.update_from_user_input("do not run tests; run tests"));
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["test"]), false).is_none());
 
+        assert!(authorization.update_from_user_input("run lint; never run lint"));
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["clippy"]), false).is_some());
+
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input("do not run lint, run tests"));
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["test"]), false).is_none());
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["clippy"]), false).is_some());
+
+        for prefix in [
+            "must not",
+            "may not",
+            "cannot",
+            "can't",
+            "you must not",
+            "you may not",
+            "you cannot",
+            "you can't",
+        ] {
+            let mut authorization = ValidationAuthorization::enabled();
+            assert!(
+                authorization.update_from_user_input(&format!("run tests, {prefix} run tests"))
+            );
+            assert!(
+                prohibited_skip_for(&authorization, &argv("cargo", &["test"]), false).is_some(),
+                "{prefix}"
+            );
+        }
+
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input("do not run tests, you may run tests"));
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["test"]), false).is_none());
+
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input("do not run tests, please run tests"));
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["test"]), false).is_none());
+
+        assert!(authorization.update_from_user_input("do not run tests and lint"));
+        assert!(authorization.update_from_user_input("run tests"));
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["test"]), false).is_none());
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["clippy"]), false).is_some());
+
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input("do not run tests, lint, and checks"));
         for invocation in [
-            CommandInvocation::Argv {
-                program: "just".into(),
-                args: vec!["test".into()],
-            },
-            CommandInvocation::Argv {
-                program: "make".into(),
-                args: vec!["-C".into(), "codex-rs".into(), "integration-tests".into()],
-            },
-            CommandInvocation::Script("echo preparing; task test:focused".into()),
-            CommandInvocation::PowerShellScript("Write-Host preparing; yarn run test:unit".into()),
+            argv("cargo", &["test"]),
+            argv("cargo", &["clippy"]),
+            argv("cargo", &["check"]),
         ] {
             assert!(
-                prohibited_skip_for(&authorization, &invocation).is_some(),
-                "validation wrapper should be blocked: {invocation:?}"
+                prohibited_skip_for(&authorization, &invocation, false).is_some(),
+                "{invocation:?}"
             );
         }
     }
 
     #[test]
-    fn validation_wrapper_guard_does_not_block_unprohibited_recipes() {
+    fn only_straightforward_explicit_directives_change_denial_state() {
         let mut authorization = ValidationAuthorization::enabled();
-        assert!(authorization.update_from_user_input("Do not run tests."));
+        assert!(!authorization.update_from_user_input("do not modify tests"));
+        assert!(!authorization.update_from_user_input("tests were not run"));
+        assert!(!authorization.update_from_user_input("No tests were run."));
+        assert!(
+            !authorization
+                .update_from_user_input("The previous agent completed this without running tests.")
+        );
+        assert!(!authorization.update_from_user_input("that should not happen again"));
+        assert!(!authorization.update_from_user_input("should we run tests?"));
 
-        for invocation in [
-            CommandInvocation::Argv {
-                program: "just".into(),
-                args: vec!["build".into()],
-            },
-            CommandInvocation::Argv {
-                program: "task".into(),
-                args: vec!["check".into()],
-            },
-        ] {
-            assert!(prohibited_skip_for(&authorization, &invocation).is_none());
-        }
+        assert!(authorization.update_from_user_input("do not check"));
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["check"]), false).is_some());
+        assert!(authorization.update_from_user_input("don't test this change"));
+        assert!(
+            prohibited_skip_for(
+                &authorization,
+                &argv("cargo", &["test", "selected_case"]),
+                false,
+            )
+            .is_some()
+        );
+        assert!(authorization.update_from_user_input("you may run tests"));
+        assert!(prohibited_skip_for(&authorization, &argv("pytest", &["-q"]), false).is_none());
+
+        assert!(authorization.update_from_user_input("implement this without running tests"));
+        assert!(prohibited_skip_for(&authorization, &argv("pytest", &["-q"]), false).is_some());
+
+        assert!(authorization.update_from_user_input("no tests"));
+        assert!(prohibited_skip_for(&authorization, &argv("pytest", &["-q"]), false).is_some());
+        assert!(authorization.update_from_user_input("run tests"));
+        assert!(prohibited_skip_for(&authorization, &argv("pytest", &["-q"]), false).is_none());
     }
 
     #[test]
-    fn focused_grant_and_workspace_denial_coexist() {
+    fn scope_words_do_not_override_the_latest_operation_stance() {
+        let focused = argv("cargo", &["test", "selected_case"]);
+        let workspace = argv("cargo", &["test", "--workspace"]);
+
         let mut authorization = ValidationAuthorization::enabled();
         assert!(
             authorization
                 .update_from_user_input("Run focused tests; do not run the workspace suite.")
         );
-        assert_eq!(
-            authorization.decision_for(
-                ValidationOperation::Test,
-                ValidationEcosystem::Rust,
-                ValidationBreadth::Package,
-                None,
-            ),
-            ValidationAuthorizationMatch::Authorized
+        assert!(prohibited_skip_for(&authorization, &focused, false).is_some());
+        assert!(prohibited_skip_for(&authorization, &workspace, false).is_some());
+
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(
+            authorization
+                .update_from_user_input("Do not run the workspace suite; run focused tests.")
         );
-        assert_eq!(
-            authorization.decision_for(
-                ValidationOperation::Test,
-                ValidationEcosystem::Rust,
-                ValidationBreadth::Workspace,
-                None,
-            ),
-            ValidationAuthorizationMatch::Prohibited
-        );
+        assert!(prohibited_skip_for(&authorization, &focused, false).is_none());
+        assert!(prohibited_skip_for(&authorization, &workspace, false).is_none());
     }
 
-    #[test]
-    fn validation_authorization_ignores_foreign_policy_versions() {
-        let mut authorization = ValidationAuthorization::enabled();
-        assert!(authorization.update_from_user_input("Run focused tests."));
-        assert_eq!(
-            authorization.decision_for(
-                ValidationOperation::Test,
-                ValidationEcosystem::Rust,
-                ValidationBreadth::Selector,
-                Some("selected_test"),
-            ),
-            ValidationAuthorizationMatch::Authorized
-        );
-        authorization.rules[0].policy_version = VALIDATION_POLICY_VERSION + 1;
+    #[tokio::test]
+    async fn positive_instruction_is_not_required_and_feature_boundary_is_preserved() {
+        let enabled = Arc::new(RwLock::new(ValidationAuthorization::enabled()));
+        reset_validation_classification_count();
+        assert!(matches!(
+            admit_validation(&enabled, &argv("cargo", &["test"]), false).await,
+            ValidationAdmission::Execute {
+                is_validation: true,
+                ..
+            }
+        ));
+        assert_eq!(validation_classification_count(), 1);
 
-        assert_eq!(
-            authorization.decision_for(
-                ValidationOperation::Test,
-                ValidationEcosystem::Rust,
-                ValidationBreadth::Selector,
-                Some("selected_test"),
-            ),
-            ValidationAuthorizationMatch::Unspecified
-        );
-    }
-
-    #[test]
-    fn quoted_and_interrogative_text_do_not_authorize() {
-        let mut authorization = ValidationAuthorization::enabled();
-        assert!(!authorization.update_from_user_input(
-            "Write documentation saying 'run tests'. Why did it run tests?"
+        let disabled = Arc::new(RwLock::new(ValidationAuthorization::default()));
+        assert!(matches!(
+            admit_validation(&disabled, &argv("cargo", &["test"]), true).await,
+            ValidationAdmission::Execute {
+                is_validation: false,
+                ..
+            }
         ));
     }
 
     #[test]
-    fn broad_prohibition_matches_unknown_but_narrow_grant_does_not() {
-        let mut prohibited = ValidationAuthorization::enabled();
-        prohibited.update_from_user_input("Do not run tests.");
-        assert_eq!(
-            prohibited.decision_for(
-                ValidationOperation::Test,
-                ValidationEcosystem::Rust,
-                ValidationBreadth::Unknown,
-                None,
-            ),
-            ValidationAuthorizationMatch::Prohibited
+    fn tagged_unknown_target_is_blocked_by_any_active_denial() {
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input("do not run checks"));
+        assert!(
+            prohibited_skip_for(&authorization, &argv("custom-runner", &["verify"]), true)
+                .is_some()
         );
-        let mut granted = ValidationAuthorization::enabled();
-        granted.update_from_user_input("Run focused tests.");
-        assert_eq!(
-            granted.decision_for(
-                ValidationOperation::Test,
-                ValidationEcosystem::Rust,
-                ValidationBreadth::Unknown,
-                None,
-            ),
-            ValidationAuthorizationMatch::Unspecified
+        assert!(
+            prohibited_skip_for(&authorization, &argv("custom-runner", &["verify"]), false)
+                .is_none()
         );
+
+        let mixed = argv("make", &["test", "deploy"]);
+        assert!(prohibited_skip_for(&authorization, &mixed, true).is_some());
+        assert!(prohibited_skip_for(&authorization, &mixed, false).is_none());
     }
 
     #[test]
-    fn recognized_dynamic_validation_is_not_opaque() {
-        for (script, ecosystem) in [
-            ("cargo test ${SELECTOR}", ValidationEcosystem::Rust),
-            ("pytest tests/${SELECTOR}", ValidationEcosystem::Python),
-            ("dotnet test ${PROJECT}", ValidationEcosystem::DotNet),
-            ("go test ./${PACKAGE}", ValidationEcosystem::Go),
-            ("npm test -- ${SELECTOR}", ValidationEcosystem::Node),
-            ("mvn test -Dtest=${SELECTOR}", ValidationEcosystem::Java),
-            ("make test TARGET=${SELECTOR}", ValidationEcosystem::Other),
+    fn operation_recognizer_keeps_supported_runner_families() {
+        for invocation in [
+            argv("cargo", &["test", "--all-features"]),
+            argv("pytest", &["-q"]),
+            argv("python", &["-m", "unittest", "discover"]),
+            argv("dotnet", &["test", "--no-restore"]),
+            argv("go", &["test", "./..."]),
+            argv("npm", &["run", "test:unit", "--", "--watch=false"]),
+            argv("pnpm", &["run", "lint"]),
+            argv("yarn", &["test"]),
+            argv("mvn", &["test", "-Dgroups=unit"]),
+            argv("gradlew", &[":module:test", "--continue"]),
+            argv("just", &["fmt-check", "--unstable"]),
+            argv("make", &["integration-tests"]),
+            argv("task", &["check"]),
         ] {
-            let classified = classify_validation(&CommandInvocation::Script(script.into()));
-            assert!(matches!(
-                classified,
-                ValidationClassification::Validation {
-                    cost_certainty: ValidationCostCertainty::Uncertain,
-                    ref leaves,
-                }
-                    if leaves[0].ecosystem == ecosystem
-                        && leaves[0].breadth == ValidationBreadth::Unknown
-            ));
+            assert!(is_validation(&invocation), "{invocation:?}");
+        }
+    }
+
+    #[test]
+    fn cargo_global_options_nextest_and_fmt_preserve_validation_operations() {
+        for invocation in [
+            argv("cargo", &["nextest", "run"]),
+            argv("cargo", &["--locked", "test"]),
+            argv("cargo", &["--color", "always", "test"]),
+        ] {
+            assert!(
+                matches!(
+                    classify_validation(&invocation),
+                    ValidationClassification::Validation { ref leaves, .. }
+                        if leaves.len() == 1
+                            && leaves[0].operation == ValidationOperation::Test
+                ),
+                "{invocation:?}"
+            );
         }
 
-        assert_eq!(
-            classify_validation(&CommandInvocation::Script("go ${SUBCOMMAND}".into())),
-            ValidationClassification::Opaque,
-            "a known runtime with an unresolved subcommand must remain uncertain"
-        );
-    }
-
-    #[test]
-    fn cargo_test_recognizes_only_the_immediate_positional_selector() {
-        let classified = classify_validation(&CommandInvocation::Argv {
-            program: "cargo".into(),
-            args: vec!["test".into(), "selected_test".into()],
-        });
+        let offline_check = argv("cargo", &["--offline", "check"]);
         assert!(matches!(
-            classified,
+            classify_validation(&offline_check),
             ValidationClassification::Validation { ref leaves, .. }
-                if leaves[0].breadth == ValidationBreadth::Selector
-                    && leaves[0].selector.as_deref() == Some("selected_test")
+                if leaves.len() == 1 && leaves[0].operation == ValidationOperation::Check
         ));
 
-        let option_before_selector = classify_validation(&CommandInvocation::Argv {
-            program: "cargo".into(),
-            args: vec!["test".into(), "--workspace".into(), "selected_test".into()],
-        });
-        assert!(matches!(
-            option_before_selector,
-            ValidationClassification::Validation { ref leaves, .. }
-                if leaves[0].breadth == ValidationBreadth::Workspace
-                    && leaves[0].selector.is_none()
-        ));
-    }
+        for invocation in [
+            argv("cargo", &["fmt", "--check"]),
+            argv("cargo", &["+nightly", "fmt", "--", "--check"]),
+        ] {
+            assert!(
+                matches!(
+                    classify_validation(&invocation),
+                    ValidationClassification::Validation { ref leaves, .. }
+                        if leaves.len() == 1
+                            && leaves[0].operation == ValidationOperation::Lint
+                ),
+                "{invocation:?}"
+            );
+        }
 
-    #[test]
-    fn windows_cargo_executable_is_classified_as_validation() {
-        let classified = classify_validation(&CommandInvocation::Argv {
-            program: r"C:\Users\tester\.cargo\bin\cargo.exe".into(),
-            args: vec!["test".into(), "--quiet".into()],
-        });
-        assert!(matches!(
-            classified,
-            ValidationClassification::Validation { ref leaves, .. }
-                if leaves[0].operation == ValidationOperation::Test
-                    && leaves[0].ecosystem == ValidationEcosystem::Rust
-        ));
-    }
-
-    #[test]
-    fn directive_defaults_are_operation_isolated() {
         let mut authorization = ValidationAuthorization::enabled();
-        assert!(authorization.update_from_user_input("Run checks; run lint; do not run tests."));
-        assert_eq!(
-            authorization.decision_for(
-                ValidationOperation::Test,
-                ValidationEcosystem::Rust,
-                ValidationBreadth::Package,
-                None,
-            ),
-            ValidationAuthorizationMatch::Prohibited
-        );
-        assert_eq!(
-            authorization.decision_for(
-                ValidationOperation::Check,
-                ValidationEcosystem::Rust,
-                ValidationBreadth::Package,
-                None,
-            ),
-            ValidationAuthorizationMatch::Authorized
-        );
-        assert_eq!(
-            authorization.decision_for(
-                ValidationOperation::Lint,
-                ValidationEcosystem::Rust,
-                ValidationBreadth::Repository,
-                None,
-            ),
-            ValidationAuthorizationMatch::Unspecified
-        );
-
-        let mut revoked = ValidationAuthorization::enabled();
-        revoked.update_from_user_input("Run focused tests.");
-        revoked.update_from_user_input("Do not run tests.");
-        assert_eq!(
-            revoked.decision_for(
-                ValidationOperation::Test,
-                ValidationEcosystem::Rust,
-                ValidationBreadth::Package,
-                None,
-            ),
-            ValidationAuthorizationMatch::Prohibited
-        );
-    }
-
-    #[test]
-    fn quoted_shell_wrapper_preserves_validation_classification() {
-        let classified = classify_validation(&CommandInvocation::Script(
-            "env FOO=bar bash -c 'cargo test --workspace'".into(),
-        ));
-        assert!(matches!(
-            classified,
-            ValidationClassification::Validation { ref leaves, .. }
-                if leaves[0].breadth == ValidationBreadth::Workspace
-        ));
-    }
-
-    #[test]
-    fn threshold_is_strict_and_confidence_is_required() {
-        let mut prediction = ValidationPrediction {
-            tier: "repository_fingerprint".into(),
-            predicted_duration_ms: 45_000,
-            predictive_lower_bound_ms: VALIDATION_COST_THRESHOLD_MS,
-            confidence: MIN_SKIP_CONFIDENCE,
-            effective_sample_count: 8,
-        };
-        assert!(!prediction_requires_skip(&prediction));
-        prediction.predictive_lower_bound_ms += 1;
-        assert!(prediction_requires_skip(&prediction));
-        prediction.confidence = MIN_SKIP_CONFIDENCE - f64::EPSILON;
-        assert!(!prediction_requires_skip(&prediction));
-    }
-
-    #[test]
-    fn blocking_required_operation_is_produced_when_predicted_skip_has_no_alternative() {
-        let descriptor = descriptor(
-            ValidationOperation::Bench,
-            ValidationEcosystem::Rust,
-            &["bench".to_string()],
-        );
-        let skipped = ValidationSkippedToolOutput::predicted(
-            &descriptor,
-            ValidationPrediction {
-                tier: "repository_fingerprint".into(),
-                predicted_duration_ms: 45_000,
-                predictive_lower_bound_ms: VALIDATION_COST_THRESHOLD_MS + 1,
-                confidence: MIN_SKIP_CONFIDENCE,
-                effective_sample_count: 8,
-            },
-        );
-
-        assert_eq!(
-            skipped.skip_disposition,
-            codex_tools::ToolOutputSkipDisposition::BlockingRequiredOperation
-        );
-        assert!(skipped.cheaper_alternatives.is_empty());
-    }
-
-    #[test]
-    fn compound_keeps_validation_leaf_and_uncertain_cost() {
-        let classified = classify_validation(&CommandInvocation::Script(
-            "echo preparing && cargo test --workspace".into(),
-        ));
-        assert!(matches!(
-            classified,
-            ValidationClassification::Validation { leaves, .. }
-                if leaves[0].breadth == ValidationBreadth::Workspace
-        ));
-    }
-
-    #[test]
-    fn line_boundaries_keep_the_validation_leaf() {
-        for boundary in ["\n", "\r", "\r\n"] {
-            let classified = classify_validation(&CommandInvocation::Script(format!(
-                "echo preparing{boundary}cargo test --workspace"
-            )));
-            assert!(matches!(
-                classified,
-                ValidationClassification::Validation { ref leaves, .. }
-                    if leaves.len() == 1
-                        && leaves[0].breadth == ValidationBreadth::Workspace
-            ));
+        assert!(authorization.update_from_user_input("do not run tests or lint"));
+        for invocation in [
+            argv("cargo", &["nextest", "run"]),
+            argv("cargo", &["--locked", "test"]),
+            argv("cargo", &["fmt", "--check"]),
+            argv("cargo", &["+nightly", "fmt", "--", "--check"]),
+        ] {
+            assert!(
+                prohibited_skip_for(&authorization, &invocation, false).is_some(),
+                "{invocation:?}"
+            );
         }
-    }
 
-    #[test]
-    fn opaque_compound_leaf_disables_cost_certainty_but_keeps_known_validation() {
-        let classified = classify_validation(&CommandInvocation::Script(
-            "just prepare && cargo test --workspace".into(),
-        ));
-        assert!(matches!(
-            classified,
-            ValidationClassification::Validation {
-                cost_certainty: ValidationCostCertainty::Uncertain,
-                ref leaves,
-            } if leaves[0].breadth == ValidationBreadth::Workspace
-        ));
-    }
-
-    #[test]
-    fn generic_recipe_is_opaque() {
         assert_eq!(
-            classify_validation(&CommandInvocation::Script("just test".into())),
+            classify_validation(&argv("cargo", &["--unknown-global", "test"])),
             ValidationClassification::Opaque
         );
     }
 
     #[tokio::test]
-    async fn command_runner_classification_routes_are_consistent() {
-        let authorization = Arc::new(RwLock::new(ValidationAuthorization::enabled()));
-        let cases = [
-            (
-                CommandInvocation::Argv {
-                    program: "just".into(),
-                    args: vec!["test-fast".into(), "-p".into(), "codex-core".into()],
-                },
-                ValidationEcosystem::Rust,
-                ValidationOperation::Test,
-            ),
-            (
-                CommandInvocation::Argv {
-                    program: "just".into(),
-                    args: vec!["check-lane".into(), "codex-core".into()],
-                },
-                ValidationEcosystem::Rust,
-                ValidationOperation::Check,
-            ),
-            (
-                CommandInvocation::Argv {
-                    program: "python".into(),
-                    args: vec!["-m".into(), "unittest".into(), "scripts.test_policy".into()],
-                },
-                ValidationEcosystem::Python,
-                ValidationOperation::Test,
-            ),
-            (
-                CommandInvocation::Argv {
-                    program: "pytest.exe".into(),
-                    args: vec!["tests/test_policy.py".into()],
-                },
-                ValidationEcosystem::Python,
-                ValidationOperation::Test,
-            ),
-            (
-                CommandInvocation::Argv {
-                    program: "dotnet".into(),
-                    args: vec!["test".into(), "tests/TestProject.csproj".into()],
-                },
-                ValidationEcosystem::DotNet,
-                ValidationOperation::Test,
-            ),
-            (
-                CommandInvocation::Argv {
-                    program: "go".into(),
-                    args: vec!["test".into(), "./pkg".into()],
-                },
-                ValidationEcosystem::Go,
-                ValidationOperation::Test,
-            ),
-            (
-                CommandInvocation::Argv {
-                    program: "npm".into(),
-                    args: vec!["test".into(), "--".into(), "tests/policy.test.ts".into()],
-                },
-                ValidationEcosystem::Node,
-                ValidationOperation::Test,
-            ),
-            (
-                CommandInvocation::Argv {
-                    program: "pnpm.cmd".into(),
-                    args: vec!["run".into(), "test:unit".into()],
-                },
-                ValidationEcosystem::Node,
-                ValidationOperation::Test,
-            ),
-            (
-                CommandInvocation::Argv {
-                    program: "yarn".into(),
-                    args: vec!["test".into()],
-                },
-                ValidationEcosystem::Node,
-                ValidationOperation::Test,
-            ),
-            (
-                CommandInvocation::Argv {
-                    program: "mvnw.cmd".into(),
-                    args: vec!["-pl".into(), "core".into(), "test".into()],
-                },
-                ValidationEcosystem::Java,
-                ValidationOperation::Test,
-            ),
-            (
-                CommandInvocation::Argv {
-                    program: "gradlew".into(),
-                    args: vec![":core:test".into()],
-                },
-                ValidationEcosystem::Java,
-                ValidationOperation::Test,
-            ),
-            (
-                CommandInvocation::Argv {
-                    program: "make".into(),
-                    args: vec!["test".into()],
-                },
-                ValidationEcosystem::Other,
-                ValidationOperation::Test,
-            ),
+    async fn parsed_pipeline_stages_cannot_bypass_validation_denial() {
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input("do not run tests"));
+        let authorization = Arc::new(RwLock::new(authorization));
+        let invocations = [
+            argv("cargo", &["test"]),
+            argv("Select-Object", &["-First", "1"]),
         ];
-        for (invocation, ecosystem, operation) in &cases {
-            assert!(matches!(
-                classify_validation(invocation),
-                ValidationClassification::Validation { ref leaves, .. }
-                    if leaves[0].ecosystem == *ecosystem && leaves[0].operation == *operation
-            ));
-            assert!(matches!(
-                admit_validation(&authorization, None, b"repo", invocation).await,
-                ValidationAdmission::Execute {
-                    observation: Some(_),
-                    ..
-                }
-            ));
-        }
 
-        let mut prohibited = ValidationAuthorization::enabled();
-        assert!(prohibited.update_from_user_input("Do not run tests."));
-        let prohibited = Arc::new(RwLock::new(prohibited));
-        for (invocation, _, _) in cases
-            .iter()
-            .filter(|(_, _, operation)| *operation == ValidationOperation::Test)
-        {
-            assert!(
-                matches!(
-                    admit_validation(&prohibited, None, b"repo", invocation).await,
-                    ValidationAdmission::Skip(ValidationSkippedToolOutput {
-                        reason: ValidationSkipReason::UserProhibitedValidation,
-                        ..
-                    })
-                ),
-                "broad test prohibition must suppress {invocation:?}"
-            );
+        assert!(matches!(
+            admit_validation_invocations(&authorization, &invocations, false).await,
+            ValidationAdmission::Skip(ValidationSkippedToolOutput {
+                operation: Some(ValidationOperation::Test),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn late_authorization_recheck_reuses_the_admitted_classification() {
+        let mut authorization = ValidationAuthorization::enabled();
+        let launch = ValidationLaunchPlan {
+            classification: classify_validation(&argv("cargo", &["test"])),
+            authorization_revision: authorization.revision,
+            explicitly_tagged: false,
+            structured_route: None,
+            bound_plan_step: None,
+            bound_work_unit: None,
+            validation_call_id: None,
+            turn_timing_state: None,
+            focused_validation_token: None,
+        };
+        assert!(authorization.update_from_user_input("do not run tests"));
+        reset_validation_classification_count();
+
+        assert!(matches!(
+            recheck_validation_launch(&authorization, &launch),
+            Some(ValidationSkippedToolOutput {
+                operation: Some(ValidationOperation::Test),
+                ..
+            })
+        ));
+        assert_eq!(validation_classification_count(), 0);
+    }
+
+    #[test]
+    fn operation_recognition_does_not_parse_runner_modes() {
+        for invocation in [
+            argv("task", &["--summary", "test"]),
+            argv("go", &["test", "-c"]),
+            argv("dotnet", &["test", "--list-tests"]),
+        ] {
+            assert!(is_validation(&invocation), "{invocation:?}");
         }
 
         for invocation in [
-            CommandInvocation::Argv {
-                program: "pytest".into(),
-                args: vec!["--version".into()],
-            },
-            CommandInvocation::Argv {
-                program: "go".into(),
-                args: vec!["version".into()],
-            },
-            CommandInvocation::Argv {
-                program: "dotnet".into(),
-                args: vec!["build".into(), "src/App.csproj".into()],
-            },
-            CommandInvocation::Argv {
-                program: "npm".into(),
-                args: vec!["run".into(), "build".into()],
-            },
-            CommandInvocation::Argv {
-                program: "mvn".into(),
-                args: vec!["package".into()],
-            },
-            CommandInvocation::Argv {
-                program: "mvn".into(),
-                args: vec!["-DskipTests".into(), "test".into()],
-            },
-            CommandInvocation::Argv {
-                program: "mvn".into(),
-                args: vec!["-Dmaven.test.skip=true".into(), "test".into()],
-            },
-            CommandInvocation::Argv {
-                program: "gradlew".into(),
-                args: vec!["assemble".into()],
-            },
-            CommandInvocation::Argv {
-                program: "gradlew".into(),
-                args: vec!["-x".into(), "test".into(), "build".into()],
-            },
-            CommandInvocation::Argv {
-                program: "gradlew".into(),
-                args: vec!["--exclude-task=:core:test".into(), ":core:test".into()],
-            },
+            argv("npm", &["--help"]),
+            argv("just", &["--list"]),
+            argv("cargo", &["--version"]),
         ] {
-            assert_eq!(
-                classify_validation(&invocation),
-                ValidationClassification::NonValidation,
-                "ordinary command must not be classified as validation: {invocation:?}"
+            assert!(!is_validation(&invocation), "{invocation:?}");
+        }
+    }
+
+    #[test]
+    fn value_taking_node_flags_do_not_hide_the_script_selector() {
+        for invocation in [
+            argv("npm", &["--prefix", "web", "run", "lint"]),
+            argv("pnpm", &["--filter", "api", "test"]),
+            argv("yarn", &["--cwd", "web", "test"]),
+            argv("yarn", &["workspace", "web", "run", "check"]),
+        ] {
+            assert!(is_validation(&invocation), "{invocation:?}");
+        }
+    }
+
+    #[test]
+    fn forwarded_runner_arguments_are_not_validation_operations() {
+        for invocation in [
+            argv("cargo", &["run", "--", "test"]),
+            argv("dotnet", &["run", "test"]),
+            argv("go", &["run", "test"]),
+            argv("npm", &["install", "test"]),
+            argv("python", &["script.py", "-m", "pytest"]),
+            argv("gradle", &["-p", "test", "build"]),
+            argv("mvn", &["-f", "test", "package"]),
+            argv("make", &["-f", "test", "all"]),
+            argv("task", &["--dir", "test", "build"]),
+        ] {
+            assert!(!is_validation(&invocation), "{invocation:?}");
+        }
+    }
+
+    #[test]
+    fn just_scans_past_options_and_non_validation_recipes() {
+        let invocations = [
+            argv("just", &["--justfile", "Justfile", "test"]),
+            argv("just", &["prepare", "test"]),
+        ];
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input("no tests"));
+
+        for invocation in invocations {
+            assert!(is_validation(&invocation), "{invocation:?}");
+            assert!(
+                prohibited_skip_for(&authorization, &invocation, false).is_some(),
+                "{invocation:?}"
             );
         }
     }
 
-    #[tokio::test]
-    async fn singleflight_shares_concurrent_result_without_caching_it() {
-        let registry: SharedValidationSingleflight =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let task_cancellation = CancellationToken::new();
-        let invocation = CommandInvocation::Script("cargo clippy -p codex-core".into());
-        let key = validation_identity(b"repo", "codex-rs", &invocation, "rust-env", "stable", 7);
-        let (execution, first_waiter) =
-            match register_if_absent(&registry, key.clone(), "call-a", &task_cancellation).await {
-                ValidationRegistration::Leader { execution, waiter } => (execution, waiter),
-                ValidationRegistration::Follower(_) => panic!("first registration must lead"),
-            };
-        let follower =
-            match register_if_absent(&registry, key.clone(), "call-b", &task_cancellation).await {
-                ValidationRegistration::Follower(follower) => follower,
-                ValidationRegistration::Leader { .. } => panic!("second registration must follow"),
-            };
-        assert_eq!(follower.shared_from_call_id(), "call-a");
-
-        let result = ReusableValidationResult {
-            value: serde_json::json!({"ok": true}),
-        };
-        execution.complete(result.clone()).await;
-        assert_eq!(first_waiter.join().await.unwrap().value, result.value);
-        assert_eq!(follower.join().await.unwrap().value, result.value);
-        assert!(registry.lock().await.get(&key).is_none());
-
-        let later = match register_if_absent(&registry, key, "call-c", &task_cancellation).await {
-            ValidationRegistration::Leader { execution, .. } => execution,
-            ValidationRegistration::Follower(_) => {
-                panic!("a later registration must start a new flight")
-            }
-        };
-        later.abandon().await;
-    }
-
-    #[tokio::test]
-    async fn validation_singleflight_registry_is_local_to_its_turn() {
-        let first_turn = new_validation_singleflight(true);
-        let second_turn = new_validation_singleflight(true);
-        assert!(!Arc::ptr_eq(&first_turn, &second_turn));
-
-        let task_cancellation = CancellationToken::new();
-        let invocation = CommandInvocation::Script(
-            "cargo test -p codex-core validation_singleflight_registry_is_local_to_its_turn".into(),
-        );
-        let key = validation_identity(
-            b"process-registry-test-repo",
-            "codex-rs",
-            &invocation,
-            "rust-env",
-            "stable",
-            7,
-        );
-        let execution = match register_if_absent(
-            &first_turn,
-            key.clone(),
-            "first-turn-call",
-            &task_cancellation,
-        )
-        .await
-        {
-            ValidationRegistration::Leader { execution, .. } => execution,
-            ValidationRegistration::Follower(_) => panic!("first turn must lead"),
-        };
-        let second_execution =
-            match register_if_absent(&second_turn, key, "second-turn-call", &task_cancellation)
-                .await
-            {
-                ValidationRegistration::Leader { execution, .. } => execution,
-                ValidationRegistration::Follower(_) => {
-                    panic!("a distinct turn must own a distinct validation flight")
-                }
-            };
-        execution.abandon().await;
-        second_execution.abandon().await;
-    }
-
     #[test]
-    fn disabled_validation_singleflight_does_not_allocate_per_turn() {
-        let first_turn = new_validation_singleflight(false);
-        let second_turn = new_validation_singleflight(false);
-        let enabled_turn = new_validation_singleflight(true);
-
-        assert!(Arc::ptr_eq(&first_turn, &second_turn));
-        assert!(!Arc::ptr_eq(&first_turn, &enabled_turn));
-    }
-
-    #[tokio::test]
-    async fn individual_waiter_cancellation_does_not_cancel_shared_execution() {
-        let registry: SharedValidationSingleflight =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let first_cancellation = CancellationToken::new();
-        let second_cancellation = CancellationToken::new();
-        let invocation = CommandInvocation::Script("cargo clippy -p codex-core".into());
-        let key = validation_identity(b"repo", "codex-rs", &invocation, "env", "stable", 1);
-        let (execution, first_waiter) =
-            match register_if_absent(&registry, key.clone(), "call-a", &first_cancellation).await {
-                ValidationRegistration::Leader { execution, waiter } => (execution, waiter),
-                ValidationRegistration::Follower(_) => panic!("first registration must lead"),
-            };
-        let execution_cancellation = execution.cancellation_token();
-        let second_waiter =
-            match register_if_absent(&registry, key, "call-b", &second_cancellation).await {
-                ValidationRegistration::Follower(waiter) => waiter,
-                ValidationRegistration::Leader { .. } => panic!("second registration must follow"),
-            };
-
-        first_cancellation.cancel();
-        drop(first_waiter);
-        assert!(!execution_cancellation.is_cancelled());
-        let result = ReusableValidationResult {
-            value: serde_json::json!({"success": true}),
-        };
-        execution.complete(result.clone()).await;
-        assert_eq!(second_waiter.join().await.unwrap().value, result.value);
-    }
-
-    #[tokio::test]
-    async fn session_and_last_waiter_cancellation_terminate_a_flight() {
-        let registry: SharedValidationSingleflight =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let session_cancellation = CancellationToken::new();
-        let invocation = CommandInvocation::Script("cargo clippy -p codex-core".into());
-        let key = validation_identity(b"repo", "codex-rs", &invocation, "env", "stable", 1);
-        let (execution, first_waiter) =
-            match register_if_absent(&registry, key.clone(), "call-a", &session_cancellation).await
-            {
-                ValidationRegistration::Leader { execution, waiter } => (execution, waiter),
-                ValidationRegistration::Follower(_) => panic!("first registration must lead"),
-            };
-        let second_waiter =
-            match register_if_absent(&registry, key, "call-b", &session_cancellation).await {
-                ValidationRegistration::Follower(waiter) => waiter,
-                ValidationRegistration::Leader { .. } => panic!("second registration must follow"),
-            };
-        let execution_cancellation = execution.cancellation_token();
-        session_cancellation.cancel();
-        drop(first_waiter);
-        assert!(!execution_cancellation.is_cancelled());
-        drop(second_waiter);
-        execution_cancellation.cancelled().await;
-        execution.abandon().await;
-
-        let second_session_cancellation = CancellationToken::new();
-        let key = validation_identity(b"repo", "codex-rs", &invocation, "env", "stable", 2);
-        let (execution, waiter) = match register_if_absent(
-            &registry,
-            key,
-            "call-c",
-            &second_session_cancellation,
-        )
-        .await
-        {
-            ValidationRegistration::Leader { execution, waiter } => (execution, waiter),
-            ValidationRegistration::Follower(_) => panic!("new revision must lead"),
-        };
-        let execution_cancellation = execution.cancellation_token();
-        drop(waiter);
-        execution_cancellation.cancelled().await;
-        assert!(execution_cancellation.is_cancelled());
-        execution.abandon().await;
-    }
-
-    #[tokio::test]
-    async fn abandoned_execution_is_observed_by_all_remaining_waiters() {
-        let registry: SharedValidationSingleflight =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let caller_cancellation = CancellationToken::new();
-        let invocation = CommandInvocation::Script("cargo clippy -p codex-core".into());
-        let key = validation_identity(b"repo", "codex-rs", &invocation, "env", "stable", 3);
-        let (execution, first_waiter) = match register_if_absent(
-            &registry,
-            key.clone(),
-            "call-a",
-            &caller_cancellation,
-        )
-        .await
-        {
-            ValidationRegistration::Leader { execution, waiter } => (execution, waiter),
-            ValidationRegistration::Follower(_) => panic!("first registration must lead"),
-        };
-        let second_waiter = match register_if_absent(
-            &registry,
-            key.clone(),
-            "call-b",
-            &caller_cancellation,
-        )
-        .await
-        {
-            ValidationRegistration::Follower(waiter) => waiter,
-            ValidationRegistration::Leader { .. } => panic!("second registration must follow"),
-        };
-
-        execution.abandon().await;
-        assert!(first_waiter.join().await.is_none());
-        assert!(second_waiter.join().await.is_none());
-        match register_if_absent(&registry, key, "call-c", &caller_cancellation).await {
-            ValidationRegistration::Leader { execution, .. } => execution.abandon().await,
-            ValidationRegistration::Follower(_) => panic!("abandoned execution must not be reused"),
-        }
-    }
-
-    #[test]
-    fn inflight_identity_is_revision_environment_toolchain_and_coverage_bound() {
-        let package = CommandInvocation::Script("cargo clippy -p codex-core".into());
-        let workspace = CommandInvocation::Script("cargo clippy --workspace".into());
-        let baseline = validation_identity(b"repo", "codex-rs", &package, "env-a", "stable", 4);
-        assert_eq!(
-            baseline,
-            validation_identity(b"repo", "codex-rs", &package, "env-a", "stable", 4)
-        );
-        assert_ne!(
-            baseline,
-            validation_identity(b"repo", "codex-rs", &workspace, "env-a", "stable", 4)
-        );
-        assert_ne!(
-            baseline,
-            validation_identity(b"repo", "codex-rs", &package, "env-b", "stable", 4)
-        );
-        assert_ne!(
-            baseline,
-            validation_identity(b"repo", "codex-rs", &package, "env-a", "nightly", 4)
-        );
-        assert_ne!(
-            baseline,
-            validation_identity(b"repo", "codex-rs", &package, "env-a", "stable", 5)
-        );
-
-        let scoped = validation_identity_with_scope(
-            b"repo",
-            "codex-rs",
-            &package,
-            "env-a",
-            "stable",
-            "features-a",
-            "implementation-a",
-            "core behavior remains correct",
-            &["core/src/lib.rs".to_string()],
-            &["core-contract".to_string()],
-        );
-        for mismatch in [
-            validation_identity_with_scope(
-                b"repo",
-                "other-cwd",
-                &package,
-                "env-a",
-                "stable",
-                "features-a",
-                "implementation-a",
-                "core behavior remains correct",
-                &["core/src/lib.rs".to_string()],
-                &["core-contract".to_string()],
-            ),
-            validation_identity_with_scope(
-                b"repo",
-                "codex-rs",
-                &package,
-                "env-a",
-                "stable",
-                "features-b",
-                "implementation-a",
-                "core behavior remains correct",
-                &["core/src/lib.rs".to_string()],
-                &["core-contract".to_string()],
-            ),
-            validation_identity_with_scope(
-                b"repo",
-                "codex-rs",
-                &package,
-                "env-a",
-                "stable",
-                "features-a",
-                "implementation-b",
-                "core behavior remains correct",
-                &["core/src/lib.rs".to_string()],
-                &["core-contract".to_string()],
-            ),
-            validation_identity_with_scope(
-                b"repo",
-                "codex-rs",
-                &package,
-                "env-a",
-                "stable",
-                "features-a",
-                "implementation-a",
-                "core behavior remains correct",
-                &["core/src/other.rs".to_string()],
-                &["core-contract".to_string()],
-            ),
+    fn just_option_values_are_not_recipe_targets() {
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input("do not run lint"));
+        for invocation in [
+            argv("just", &["--shell", "bash", "test"]),
+            argv("just", &["--color", "always", "test"]),
+            argv("just", &["--set", "MODE", "test", "test"]),
         ] {
-            assert_ne!(scoped, mismatch);
+            assert!(is_validation(&invocation), "{invocation:?}");
+            assert!(
+                prohibited_skip_for(&authorization, &invocation, true).is_none(),
+                "{invocation:?}"
+            );
         }
     }
 
     #[test]
-    fn scoped_validation_reuse_key_ignores_repository_epoch() {
-        let invocation = CommandInvocation::Script("cargo test -p codex-core scoped".into());
-        let identity = |repository_epoch: u64, features: &[&str], implementation: &str| {
-            let _ = repository_epoch;
-            validation_identity_with_scope(
-                b"repo",
-                "codex-rs",
-                &invocation,
-                "env-a",
-                "stable",
-                scoped_validation_configuration_identity(features),
-                implementation,
-                "scoped behavior remains correct",
-                &["core/src/scoped.rs".to_string()],
-                &["scoped-contract".to_string()],
-            )
-        };
+    fn simple_commands_are_recognized_without_shell_emulation() {
+        let script = CommandInvocation::Script("cargo test".to_string());
+        assert!(is_validation(&script));
 
-        let baseline = identity(4, &["feature-a"], "implementation-a");
-        assert_eq!(
-            baseline,
-            identity(99, &["feature-a"], "implementation-a"),
-            "unrelated repository epochs must not invalidate a scoped proof"
+        let wrapped = argv("env", &["MODE=test", "bash", "-lc", "cargo test"]);
+        assert!(is_validation(&wrapped));
+
+        let powershell = CommandInvocation::PowerShellScript(
+            "Invoke-Expression -Verbose -Command 'cargo test'".to_string(),
         );
-        assert_ne!(baseline, identity(4, &["feature-b"], "implementation-a"));
-        assert_ne!(baseline, identity(4, &["feature-a"], "implementation-b"));
+        assert!(!is_validation(&powershell));
+
+        let cmd_for = argv("cmd", &["/c", "for %i in (do) do cargo test"]);
+        assert!(!is_validation(&cmd_for));
+
+        let nested = CommandInvocation::Script("echo $(cargo test)".to_string());
+        assert_eq!(
+            classify_validation(&nested),
+            ValidationClassification::Opaque
+        );
     }
 
     #[test]
-    fn recommended_fixes_combined_nextest_covers_equivalent_cargo_obligations() {
-        let combined = vec![
-            "just".to_string(),
-            "test-fast".to_string(),
-            "-p".to_string(),
-            "codex-core".to_string(),
-            "-E".to_string(),
-            "test(=alpha)".to_string(),
-            "-E".to_string(),
-            "test(=beta)".to_string(),
-        ];
-        let alpha = vec![
-            "cargo".to_string(),
-            "test".to_string(),
-            "-p".to_string(),
-            "codex-core".to_string(),
-            "alpha".to_string(),
-            "--".to_string(),
-            "--exact".to_string(),
-        ];
-        let unrelated = vec![
-            "cargo".to_string(),
-            "test".to_string(),
-            "-p".to_string(),
-            "codex-core".to_string(),
-            "gamma".to_string(),
-            "--".to_string(),
-            "--exact".to_string(),
-        ];
+    fn deterministic_compound_script_cannot_bypass_test_denial() {
+        let invocation =
+            CommandInvocation::Script("echo preparing && cargo test --workspace".to_string());
+        assert!(matches!(
+            classify_validation(&invocation),
+            ValidationClassification::Validation { ref leaves, .. }
+                if leaves.len() == 1 && leaves[0].operation == ValidationOperation::Test
+        ));
 
-        assert!(validation_argv_semantically_covers(&combined, &alpha));
-        assert!(!validation_argv_semantically_covers(&alpha, &combined));
-        assert!(!validation_argv_semantically_covers(&combined, &unrelated));
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input("do not run tests"));
+        assert!(prohibited_skip_for(&authorization, &invocation, false).is_some());
+
+        assert_eq!(
+            classify_validation(&CommandInvocation::Script(
+                "echo 'cargo test && still text'".to_string(),
+            )),
+            ValidationClassification::NonValidation
+        );
     }
 
     #[test]
-    fn focused_validation_identity_preserves_cargo_target_selectors() {
-        let integration_a = vec![
-            "cargo".to_string(),
-            "test".to_string(),
-            "-p".to_string(),
-            "codex-core".to_string(),
-            "--test".to_string(),
-            "integration_a".to_string(),
-            "focused_validation".to_string(),
-            "--".to_string(),
-            "--exact".to_string(),
-        ];
-        let integration_b = vec![
-            "cargo".to_string(),
-            "test".to_string(),
-            "-p".to_string(),
-            "codex-core".to_string(),
-            "--test".to_string(),
-            "integration_b".to_string(),
-            "focused_validation".to_string(),
-            "--".to_string(),
-            "--exact".to_string(),
-        ];
-
-        assert!(validation_argv_semantically_covers(
-            &integration_a,
-            &integration_a
-        ));
-        assert!(!validation_argv_semantically_covers(
-            &integration_a,
-            &integration_b
-        ));
+    fn runner_flags_flow_through_operation_recognition() {
+        for invocation in [
+            argv("cargo", &["test", "--", "--ignored"]),
+            argv("pytest", &["--maxfail=1", "tests/unit"]),
+            argv("dotnet", &["test", "--blame-hang"]),
+            argv("go", &["test", "-run", "Case", "./pkg"]),
+        ] {
+            assert!(is_validation(&invocation), "{invocation:?}");
+        }
     }
 }

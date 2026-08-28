@@ -17,12 +17,16 @@ use codex_app_server_protocol::ConfigReadResponse;
 use codex_app_server_protocol::ConfigRequirementsReadResponse;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWriteResponse;
+use codex_app_server_protocol::ExperimentalFeatureListParams;
+use codex_app_server_protocol::ExperimentalFeatureListResponse;
 use codex_app_server_protocol::ForcedChatgptWorkspaceIds;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode;
+use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ToolsV2;
 use codex_app_server_protocol::WriteStatus;
 use codex_core::config::set_project_trust_level;
@@ -1066,6 +1070,75 @@ async fn config_batch_write_applies_multiple_edits() -> Result<()> {
         .expect("sandbox workspace write");
     assert_eq!(sandbox.writable_roots, vec![writable_root]);
     assert!(!sandbox.network_access);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_batch_write_hot_reloads_supported_feature_for_loaded_thread() -> Result<()> {
+    let tmp_dir = TempDir::new()?;
+    let codex_home = tmp_dir.path().canonicalize()?;
+    write_config(&tmp_dir, "[features]\nmemories = false\n")?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            cwd: Some(codex_home.display().to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_start_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response(thread_start_response)?;
+
+    let batch_id = mcp
+        .send_config_batch_write_request(ConfigBatchWriteParams {
+            file_path: Some(codex_home.join("config.toml").display().to_string()),
+            edits: vec![ConfigEdit {
+                key_path: "features.memories".to_string(),
+                value: json!(true),
+                merge_strategy: MergeStrategy::Replace,
+            }],
+            expected_version: None,
+            reload_user_config: true,
+        })
+        .await?;
+    let batch_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(batch_id)),
+    )
+    .await??;
+    let batch_write: ConfigWriteResponse = to_response(batch_response)?;
+    assert_eq!(batch_write.status, WriteStatus::Ok);
+
+    let feature_list_id = mcp
+        .send_experimental_feature_list_request(ExperimentalFeatureListParams {
+            cursor: None,
+            limit: None,
+            thread_id: Some(thread.id),
+        })
+        .await?;
+    let feature_list_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(feature_list_id)),
+    )
+    .await??;
+    let feature_list: ExperimentalFeatureListResponse = to_response(feature_list_response)?;
+    let memories = feature_list
+        .data
+        .iter()
+        .find(|feature| feature.name == "memories")
+        .expect("memories feature should be present");
+    assert!(memories.enabled);
 
     Ok(())
 }

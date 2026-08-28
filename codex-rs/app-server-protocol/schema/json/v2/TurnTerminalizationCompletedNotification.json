@@ -68,12 +68,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "conservativeRerunCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "deliveryAttemptNs": {
           "default": 0,
           "format": "uint64",
@@ -143,12 +137,6 @@
         "preparationNs": {
           "default": 0,
           "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "proofReuseCount": {
-          "default": 0,
-          "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
         },

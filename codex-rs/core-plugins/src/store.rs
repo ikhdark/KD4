@@ -37,6 +37,101 @@ pub struct PluginInstallResult {
     pub installed_path: AbsolutePathBuf,
 }
 
+#[derive(Debug)]
+pub(crate) struct PendingPluginInstall {
+    result: PluginInstallResult,
+    target_root: PathBuf,
+    staged_root: PathBuf,
+    backup_root: Option<PathBuf>,
+    transaction_dir: Option<tempfile::TempDir>,
+    committed: bool,
+}
+
+impl PendingPluginInstall {
+    pub(crate) fn result(&self) -> &PluginInstallResult {
+        &self.result
+    }
+
+    pub(crate) fn commit(mut self) -> PluginInstallResult {
+        self.committed = true;
+        self.result.clone()
+    }
+
+    fn rollback(&mut self) -> io::Result<()> {
+        if self.target_root.exists() {
+            fs::rename(&self.target_root, &self.staged_root)?;
+        }
+        if let Some(backup_root) = self.backup_root.as_ref()
+            && backup_root.exists()
+            && let Err(err) = fs::rename(backup_root, &self.target_root)
+        {
+            if self.staged_root.exists() {
+                let _ = fs::rename(&self.staged_root, &self.target_root);
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PendingPluginInstall {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Err(err) = self.rollback() {
+            let preserved_at = self.transaction_dir.take().map(tempfile::TempDir::keep);
+            warn!(
+                "failed to roll back plugin install at {}: {err}; transaction files preserved at {}",
+                self.target_root.display(),
+                preserved_at.as_deref().map_or_else(
+                    || "<unknown>".to_string(),
+                    |path| path.display().to_string()
+                )
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingPluginUninstall {
+    target_root: PathBuf,
+    backup_root: Option<PathBuf>,
+    transaction_dir: Option<tempfile::TempDir>,
+    committed: bool,
+}
+
+impl PendingPluginUninstall {
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PendingPluginUninstall {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let Some(backup_root) = self.backup_root.as_ref() else {
+            return;
+        };
+        if !backup_root.exists() {
+            return;
+        }
+        if let Err(err) = fs::rename(backup_root, &self.target_root) {
+            let preserved_at = self.transaction_dir.take().map(tempfile::TempDir::keep);
+            warn!(
+                "failed to roll back plugin uninstall at {}: {err}; plugin files preserved at {}",
+                self.target_root.display(),
+                preserved_at.as_deref().map_or_else(
+                    || "<unknown>".to_string(),
+                    |path| path.display().to_string()
+                )
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PluginStore {
     codex_home: AbsolutePathBuf,
@@ -284,16 +379,36 @@ impl PluginStore {
         source_path: AbsolutePathBuf,
         plugin_id: PluginId,
     ) -> Result<PluginInstallResult, PluginStoreError> {
-        self.install_with_manifest(source_path, plugin_id, InstallManifest::OnDisk)
+        self.begin_install(source_path, plugin_id)
+            .map(PendingPluginInstall::commit)
     }
 
+    pub(crate) fn begin_install(
+        &self,
+        source_path: AbsolutePathBuf,
+        plugin_id: PluginId,
+    ) -> Result<PendingPluginInstall, PluginStoreError> {
+        self.begin_install_with_manifest(source_path, plugin_id, InstallManifest::OnDisk)
+    }
+
+    #[cfg(test)]
     pub(crate) fn install_with_fallback_manifest(
         &self,
         source_path: AbsolutePathBuf,
         plugin_id: PluginId,
         manifest_contents: &str,
     ) -> Result<PluginInstallResult, PluginStoreError> {
-        self.install_with_manifest(
+        self.begin_install_with_fallback_manifest(source_path, plugin_id, manifest_contents)
+            .map(PendingPluginInstall::commit)
+    }
+
+    pub(crate) fn begin_install_with_fallback_manifest(
+        &self,
+        source_path: AbsolutePathBuf,
+        plugin_id: PluginId,
+        manifest_contents: &str,
+    ) -> Result<PendingPluginInstall, PluginStoreError> {
+        self.begin_install_with_manifest(
             source_path,
             plugin_id,
             InstallManifest::Fallback(manifest_contents),
@@ -306,7 +421,17 @@ impl PluginStore {
         plugin_id: PluginId,
         plugin_version: String,
     ) -> Result<PluginInstallResult, PluginStoreError> {
-        self.install_with_version_and_manifest(
+        self.begin_install_with_version(source_path, plugin_id, plugin_version)
+            .map(PendingPluginInstall::commit)
+    }
+
+    pub(crate) fn begin_install_with_version(
+        &self,
+        source_path: AbsolutePathBuf,
+        plugin_id: PluginId,
+        plugin_version: String,
+    ) -> Result<PendingPluginInstall, PluginStoreError> {
+        self.begin_install_with_version_and_manifest(
             source_path,
             plugin_id,
             plugin_version,
@@ -321,7 +446,23 @@ impl PluginStore {
         plugin_version: String,
         manifest_contents: &str,
     ) -> Result<PluginInstallResult, PluginStoreError> {
-        self.install_with_version_and_manifest(
+        self.begin_install_with_version_and_fallback_manifest(
+            source_path,
+            plugin_id,
+            plugin_version,
+            manifest_contents,
+        )
+        .map(PendingPluginInstall::commit)
+    }
+
+    pub(crate) fn begin_install_with_version_and_fallback_manifest(
+        &self,
+        source_path: AbsolutePathBuf,
+        plugin_id: PluginId,
+        plugin_version: String,
+        manifest_contents: &str,
+    ) -> Result<PendingPluginInstall, PluginStoreError> {
+        self.begin_install_with_version_and_manifest(
             source_path,
             plugin_id,
             plugin_version,
@@ -329,24 +470,29 @@ impl PluginStore {
         )
     }
 
-    fn install_with_manifest(
+    fn begin_install_with_manifest(
         &self,
         source_path: AbsolutePathBuf,
         plugin_id: PluginId,
         manifest: InstallManifest<'_>,
-    ) -> Result<PluginInstallResult, PluginStoreError> {
+    ) -> Result<PendingPluginInstall, PluginStoreError> {
         let manifest = resolve_install_manifest(source_path.as_path(), manifest);
         let plugin_version = plugin_version_for_install_manifest(source_path.as_path(), manifest)?;
-        self.install_with_version_and_manifest(source_path, plugin_id, plugin_version, manifest)
+        self.begin_install_with_version_and_manifest(
+            source_path,
+            plugin_id,
+            plugin_version,
+            manifest,
+        )
     }
 
-    fn install_with_version_and_manifest(
+    fn begin_install_with_version_and_manifest(
         &self,
         source_path: AbsolutePathBuf,
         plugin_id: PluginId,
         plugin_version: String,
         manifest: InstallManifest<'_>,
-    ) -> Result<PluginInstallResult, PluginStoreError> {
+    ) -> Result<PendingPluginInstall, PluginStoreError> {
         if !source_path.as_path().is_dir() {
             return Err(PluginStoreError::Invalid(format!(
                 "plugin source path is not a directory: {}",
@@ -369,38 +515,29 @@ impl PluginStore {
             self.plugin_base_root(&plugin_id).as_path(),
             &plugin_version,
             manifest,
-        )?;
-        self.remove_remote_plugin_install_metadata(&plugin_id)?;
-
-        Ok(PluginInstallResult {
-            plugin_id,
-            plugin_version,
-            installed_path,
-        })
+            PluginInstallResult {
+                plugin_id,
+                plugin_version: plugin_version.clone(),
+                installed_path,
+            },
+        )
     }
 
     pub fn uninstall(&self, plugin_id: &PluginId) -> Result<(), PluginStoreError> {
-        remove_existing_target(self.plugin_base_root(plugin_id).as_path())
+        self.begin_uninstall(plugin_id)
+            .map(PendingPluginUninstall::commit)
+    }
+
+    pub(crate) fn begin_uninstall(
+        &self,
+        plugin_id: &PluginId,
+    ) -> Result<PendingPluginUninstall, PluginStoreError> {
+        stage_plugin_uninstall(self.plugin_base_root(plugin_id).as_path())
     }
 
     fn remote_plugin_install_metadata_path(&self, plugin_id: &PluginId) -> AbsolutePathBuf {
         self.plugin_base_root(plugin_id)
             .join(REMOTE_PLUGIN_INSTALL_METADATA_FILE)
-    }
-
-    fn remove_remote_plugin_install_metadata(
-        &self,
-        plugin_id: &PluginId,
-    ) -> Result<(), PluginStoreError> {
-        let path = self.remote_plugin_install_metadata_path(plugin_id);
-        match fs::remove_file(path.as_path()) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(PluginStoreError::io(
-                "failed to remove remote plugin install metadata",
-                err,
-            )),
-        }
     }
 }
 
@@ -557,28 +694,13 @@ fn plugin_name_for_source(
         .map(|_| plugin_name)
 }
 
-fn remove_existing_target(path: &Path) -> Result<(), PluginStoreError> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    if path.is_dir() {
-        fs::remove_dir_all(path).map_err(|err| {
-            PluginStoreError::io("failed to remove existing plugin cache entry", err)
-        })
-    } else {
-        fs::remove_file(path).map_err(|err| {
-            PluginStoreError::io("failed to remove existing plugin cache entry", err)
-        })
-    }
-}
-
 fn replace_plugin_root_atomically(
     source: &Path,
     target_root: &Path,
     plugin_version: &str,
     manifest: InstallManifest<'_>,
-) -> Result<(), PluginStoreError> {
+    result: PluginInstallResult,
+) -> Result<PendingPluginInstall, PluginStoreError> {
     let Some(parent) = target_root.parent() else {
         return Err(PluginStoreError::Invalid(format!(
             "plugin cache path has no parent: {}",
@@ -620,88 +742,61 @@ fn replace_plugin_root_atomically(
             .map_err(|err| PluginStoreError::io("failed to write fallback plugin manifest", err))?;
     }
 
-    let target_version_root = target_root.join(plugin_version);
-    if target_root.exists() && !target_version_root.exists() {
-        fs::rename(&staged_version_root, &target_version_root).map_err(|err| {
-            PluginStoreError::io("failed to activate updated plugin cache version", err)
-        })?;
-        remove_old_plugin_versions(target_root, plugin_version)?;
-        return Ok(());
-    }
-
-    if target_root.exists() {
-        let backup_dir = tempfile::Builder::new()
-            .prefix("plugin-backup-")
-            .tempdir_in(parent)
-            .map_err(|err| {
-                PluginStoreError::io("failed to create plugin cache backup directory", err)
-            })?;
-        let backup_root = backup_dir.path().join(plugin_dir_name);
-        fs::rename(target_root, &backup_root)
+    let backup_root = target_root
+        .exists()
+        .then(|| staged_dir.path().join("previous-plugin-root"));
+    if let Some(backup_root) = backup_root.as_ref() {
+        fs::rename(target_root, backup_root)
             .map_err(|err| PluginStoreError::io("failed to back up plugin cache entry", err))?;
-
-        if let Err(err) = fs::rename(&staged_root, target_root) {
-            let rollback_result = fs::rename(&backup_root, target_root);
-            return match rollback_result {
-                Ok(()) => Err(PluginStoreError::io(
-                    "failed to activate updated plugin cache entry",
-                    err,
-                )),
-                Err(rollback_err) => {
-                    let backup_path = backup_dir.keep().join(plugin_dir_name);
-                    Err(PluginStoreError::Invalid(format!(
-                        "failed to activate updated plugin cache entry at {}: {err}; failed to restore previous cache entry (left at {}): {rollback_err}",
-                        target_root.display(),
-                        backup_path.display()
-                    )))
-                }
-            };
-        }
-    } else {
-        fs::rename(&staged_root, target_root)
-            .map_err(|err| PluginStoreError::io("failed to activate plugin cache entry", err))?;
     }
 
-    Ok(())
-}
-
-fn remove_old_plugin_versions(
-    target_root: &Path,
-    plugin_version: &str,
-) -> Result<(), PluginStoreError> {
-    let Ok(entries) = fs::read_dir(target_root) else {
-        return Ok(());
+    let transaction = PendingPluginInstall {
+        result,
+        target_root: target_root.to_path_buf(),
+        staged_root,
+        backup_root,
+        transaction_dir: Some(staged_dir),
+        committed: false,
     };
-
-    for entry in entries.filter_map(Result::ok) {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let Ok(version) = entry.file_name().into_string() else {
-            continue;
-        };
-        if version == plugin_version || validate_plugin_version_segment(&version).is_err() {
-            continue;
-        }
-
-        if fs::remove_dir_all(entry.path()).is_err()
-            && old_plugin_version_would_stay_active(&version, plugin_version)
-        {
-            return Err(PluginStoreError::Invalid(format!(
-                "failed to activate updated plugin cache version `{plugin_version}` while `{version}` remains active"
-            )));
-        }
+    if let Err(err) = fs::rename(&transaction.staged_root, target_root) {
+        return Err(PluginStoreError::io(
+            "failed to activate updated plugin cache entry",
+            err,
+        ));
     }
-
-    Ok(())
+    Ok(transaction)
 }
 
-fn old_plugin_version_would_stay_active(old_version: &str, new_version: &str) -> bool {
-    old_version == DEFAULT_PLUGIN_VERSION
-        || compare_plugin_versions(old_version, new_version).is_gt()
+fn stage_plugin_uninstall(path: &Path) -> Result<PendingPluginUninstall, PluginStoreError> {
+    if !path.exists() {
+        return Ok(PendingPluginUninstall {
+            target_root: path.to_path_buf(),
+            backup_root: None,
+            transaction_dir: None,
+            committed: false,
+        });
+    }
+    let parent = path.parent().ok_or_else(|| {
+        PluginStoreError::Invalid(format!(
+            "plugin cache path has no parent: {}",
+            path.display()
+        ))
+    })?;
+    let transaction_dir = tempfile::Builder::new()
+        .prefix("plugin-uninstall-")
+        .tempdir_in(parent)
+        .map_err(|err| {
+            PluginStoreError::io("failed to create plugin uninstall staging directory", err)
+        })?;
+    let backup_root = transaction_dir.path().join("removed-plugin-root");
+    fs::rename(path, &backup_root)
+        .map_err(|err| PluginStoreError::io("failed to stage plugin cache removal", err))?;
+    Ok(PendingPluginUninstall {
+        target_root: path.to_path_buf(),
+        backup_root: Some(backup_root),
+        transaction_dir: Some(transaction_dir),
+        committed: false,
+    })
 }
 
 fn compare_plugin_versions(left: &str, right: &str) -> Ordering {

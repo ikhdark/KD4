@@ -19,9 +19,13 @@ pub(crate) fn create_tool_search_tool(
         ),
         (
             "limit".to_string(),
-            JsonSchema::integer(Some(format!(
-                "Maximum number of tools to return. Must be an integer from 1 through 64. Defaults to {default_limit}."
-            ))),
+            JsonSchema {
+                minimum: Some(serde_json::Number::from(1_u64)),
+                maximum: Some(serde_json::Number::from(64_u64)),
+                ..JsonSchema::integer(Some(format!(
+                    "Maximum number of tools to return. Must be an integer from 1 through 64. Defaults to {default_limit}."
+                )))
+            },
         ),
     ]);
 
@@ -110,10 +114,14 @@ mod tests {
                 parameters: JsonSchema::object(BTreeMap::from([
                         (
                             "limit".to_string(),
-                            JsonSchema::integer(Some(
+                            JsonSchema {
+                                minimum: Some(serde_json::Number::from(1_u64)),
+                                maximum: Some(serde_json::Number::from(64_u64)),
+                                ..JsonSchema::integer(Some(
                                     "Maximum number of tools to return. Must be an integer from 1 through 64. Defaults to 8."
                                         .to_string(),
-                                ),),
+                                ))
+                            },
                         ),
                         (
                             "query".to_string(),
@@ -139,6 +147,23 @@ mod tests {
         assert!(description.contains("named source metadata is unavailable"));
         assert!(description.contains("these deferred tools remain searchable"));
         assert!(!description.contains("None currently enabled."));
+    }
+
+    #[test]
+    fn tool_search_limit_schema_matches_runtime_range() {
+        let ToolSpec::ToolSearch { parameters, .. } =
+            create_tool_search_tool(&[], /*has_unnamed_tools*/ false, 8)
+        else {
+            panic!("expected tool search specification");
+        };
+        let schema = serde_json::to_value(parameters).expect("serialize tool_search schema");
+        let validator = jsonschema::validator_for(&schema).expect("compile tool_search schema");
+
+        assert!(validator.is_valid(&serde_json::json!({ "query": "q", "limit": 1 })));
+        assert!(validator.is_valid(&serde_json::json!({ "query": "q", "limit": 64 })));
+        assert!(!validator.is_valid(&serde_json::json!({ "query": "q", "limit": 0 })));
+        assert!(!validator.is_valid(&serde_json::json!({ "query": "q", "limit": 65 })));
+        assert!(!validator.is_valid(&serde_json::json!({ "query": "q", "limit": 1.5 })));
     }
 
     #[test]

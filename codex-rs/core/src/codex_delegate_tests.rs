@@ -27,6 +27,7 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
+use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::test_path_buf;
 use pretty_assertions::assert_eq;
@@ -390,6 +391,7 @@ async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
     let cancel_token = CancellationToken::new();
     let request_call_id = call_id.clone();
     let request_cwd = delegated_cwd.clone();
+    let request_cwd_uri = PathUri::from_abs_path(&delegated_cwd);
 
     let handle = tokio::spawn({
         let codex = Arc::clone(&codex);
@@ -414,6 +416,7 @@ async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
                         ..RequestPermissionProfile::default()
                     },
                     cwd: Some(request_cwd),
+                    cwd_uri: Some(request_cwd_uri),
                 },
                 &cancel_token,
             )
@@ -499,6 +502,7 @@ async fn handle_exec_approval_uses_call_id_for_guardian_review_and_approval_id_f
                     started_at_ms: 0,
                     command: vec!["rm".to_string(), "-rf".to_string(), "tmp".to_string()],
                     cwd: test_path_buf("/tmp").abs(),
+                    cwd_uri: None,
                     reason: Some("unsafe subcommand".to_string()),
                     network_approval_context: None,
                     proposed_execpolicy_amendment: None,

@@ -41,7 +41,6 @@ use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
-use core_test_support::skip_if_wine_exec;
 use core_test_support::stdio_server_bin;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
@@ -121,9 +120,14 @@ fn extract_running_cell_id(text: &str) -> String {
         .to_string()
 }
 
+fn powershell_single_quoted_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\'', "''")
+}
+
 fn wait_for_file_source(path: &Path) -> Result<String> {
-    let quoted_path = shlex::try_join([path.to_string_lossy().as_ref()])?;
-    let command = format!("if [ -f {quoted_path} ]; then printf ready; fi");
+    let quoted_path = powershell_single_quoted_path(path);
+    let command =
+        format!("if (Test-Path -LiteralPath '{quoted_path}') {{ [Console]::Out.Write('ready') }}");
     Ok(format!(
         r#"while ((await tools.exec_command({{ cmd: {command:?} }})).output !== "ready") {{
 }}"#
@@ -261,7 +265,7 @@ text("heartbeat-complete");"#,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn missing_process_host_returns_a_tool_error() -> Result<()> {
+async fn missing_process_host_falls_back_to_in_process_code_mode() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -274,18 +278,17 @@ async fn missing_process_host_returns_a_tool_error() -> Result<()> {
                 .enable(Feature::CodeMode)
                 .expect("code mode should be enabled");
         });
-    let (_test, follow_up_mock) =
-        run_code_mode_turn_with_builder(&server, "Run code mode", "text('unreachable')", builder)
-            .await?;
+    let (_test, follow_up_mock) = run_code_mode_turn_with_builder(
+        &server,
+        "Run code mode",
+        "text('fallback-ready')",
+        builder,
+    )
+    .await?;
 
-    let output = follow_up_mock
-        .single_request()
-        .custom_tool_call_output("call-1");
-    assert!(
-        output["output"]
-            .as_str()
-            .is_some_and(|output| output.contains("failed to spawn code-mode host"))
-    );
+    let request = follow_up_mock.single_request();
+    let items = custom_tool_output_items(&request, "call-1");
+    assert_eq!(text_item(&items, 0), "fallback-ready");
 
     Ok(())
 }
@@ -524,7 +527,6 @@ async fn run_code_mode_turn_with_rmcp_config(
     Ok((test, second_mock))
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_return_exec_command_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -534,7 +536,7 @@ async fn code_mode_can_return_exec_command_output() -> Result<()> {
         &server,
         "use exec to run exec_command",
         r#"
-text(JSON.stringify(await tools.exec_command({ cmd: "printf code_mode_exec_marker" })));
+text(JSON.stringify(await tools.exec_command({ cmd: "[Console]::Out.Write('code_mode_exec_marker')" })));
 "#,
     )
     .await?;
@@ -1006,7 +1008,6 @@ text(JSON.stringify({{
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_only_can_call_nested_tools() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1020,7 +1021,7 @@ async fn code_mode_only_can_call_nested_tools() -> Result<()> {
                 "call-1",
                 "exec",
                 r#"
-const output = await tools.exec_command({ cmd: "printf code_mode_only_nested_tool_marker" });
+const output = await tools.exec_command({ cmd: "[Console]::Out.Write('code_mode_only_nested_tool_marker')" });
 text(output.output);
 "#,
             ),
@@ -1137,7 +1138,6 @@ text(JSON.stringify(result));
     Ok(())
 }
 
-#[ignore = "flaky on windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_nested_tool_calls_can_run_in_parallel() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1156,7 +1156,7 @@ const args = {
   barrier: {
     id: "code-mode-parallel-tools-warmup",
     participants: 2,
-    timeout_ms: 1_000,
+    timeout_ms: 5_000,
   },
 };
 
@@ -1171,7 +1171,7 @@ const args = {
   barrier: {
     id: "code-mode-parallel-tools",
     participants: 2,
-    timeout_ms: 1_000,
+    timeout_ms: 5_000,
   },
 };
 
@@ -1235,7 +1235,6 @@ const TOKEN_POLICY_TEST_MODEL: &str = "gpt-5.4";
 
 // A nested `exec_command` limit applies to `result.output` inside JavaScript.
 // The outer code-mode and history budgets apply after the script calls `text`.
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_formats_truncated_result_with_warning() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1246,7 +1245,7 @@ async fn code_mode_exec_nested_limit_formats_truncated_result_with_warning() -> 
         "use exec_command from code mode",
         r#"
 const result = await tools.exec_command({
-  cmd: "printf '0123456789012345678901234567890123456789'",
+  cmd: "[Console]::Out.Write('0123456789012345678901234567890123456789')",
   max_output_tokens: 5
 });
 text(result.output);
@@ -1265,15 +1264,9 @@ text(result.output);
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_preserves_result_variable_before_default_history_truncation()
 -> Result<()> {
-    // TODO(anp): Remove after Wine exec returns complete nested-tool output to code mode.
-    skip_if_wine_exec!(
-        Ok(()),
-        "only part of nested exec_command stdout reaches the code-mode result"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1282,7 +1275,7 @@ async fn code_mode_exec_nested_limit_preserves_result_variable_before_default_hi
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 20000}
 const result = await tools.exec_command({
-  cmd: "python3 -c \"import sys; sys.stdout.write('x' * 50000)\"",
+  cmd: "[Console]::Out.Write('x' * 50000)",
   max_output_tokens: 20000
 });
 const resultVariableWasTruncated = result.output.length !== 50000;
@@ -1303,14 +1296,8 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_truncates_result_variable_when_exceeded() -> Result<()> {
-    // TODO(anp): Remove after Wine exec returns complete nested-tool output to code mode.
-    skip_if_wine_exec!(
-        Ok(()),
-        "only part of nested exec_command stdout reaches the code-mode result"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1319,7 +1306,7 @@ async fn code_mode_exec_nested_limit_truncates_result_variable_when_exceeded() -
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 25000}
 const result = await tools.exec_command({
-  cmd: "python3 -c \"import sys; sys.stdout.write('A' * 90000)\"",
+  cmd: "[Console]::Out.Write('A' * 90000)",
   max_output_tokens: 20000
 });
 const resultVariableWasTruncated = result.output.includes("…2500 tokens truncated…");
@@ -1349,15 +1336,9 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_preserves_result_variable_before_configured_history_truncation()
 -> Result<()> {
-    // TODO(anp): Remove after Wine exec returns complete nested-tool output to code mode.
-    skip_if_wine_exec!(
-        Ok(()),
-        "only part of nested exec_command stdout reaches the code-mode result"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1366,7 +1347,7 @@ async fn code_mode_exec_nested_limit_preserves_result_variable_before_configured
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 20000}
 const result = await tools.exec_command({
-  cmd: "python3 -c \"import sys; sys.stdout.write('x' * 50000)\"",
+  cmd: "[Console]::Out.Write('x' * 50000)",
   max_output_tokens: 20000
 });
 const resultVariableWasTruncated = result.output.length !== 50000;
@@ -1396,15 +1377,9 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_without_nested_limit_preserves_result_variable_before_default_history_truncation()
 -> Result<()> {
-    // TODO(anp): Remove after Wine exec returns complete nested-tool output to code mode.
-    skip_if_wine_exec!(
-        Ok(()),
-        "only part of nested exec_command stdout reaches the code-mode result"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1413,7 +1388,7 @@ async fn code_mode_exec_without_nested_limit_preserves_result_variable_before_de
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 20000}
 const result = await tools.exec_command({
-  cmd: "python3 -c \"import sys; sys.stdout.write('x' * 50000)\""
+  cmd: "[Console]::Out.Write('x' * 50000)"
 });
 const resultVariableWasTruncated = result.output.length !== 50000;
 text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${result.output}`);
@@ -1433,15 +1408,9 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_without_nested_limit_preserves_result_variable_before_configured_history_truncation()
 -> Result<()> {
-    // TODO(anp): Remove after Wine exec returns complete nested-tool output to code mode.
-    skip_if_wine_exec!(
-        Ok(()),
-        "only part of nested exec_command stdout reaches the code-mode result"
-    );
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1450,7 +1419,7 @@ async fn code_mode_exec_without_nested_limit_preserves_result_variable_before_co
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 20000}
 const result = await tools.exec_command({
-  cmd: "python3 -c \"import sys; sys.stdout.write('x' * 50000)\""
+  cmd: "[Console]::Out.Write('x' * 50000)"
 });
 const resultVariableWasTruncated = result.output.length !== 50000;
 text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${result.output}`);
@@ -1481,7 +1450,6 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
 
 // The outer directive limits output after JavaScript emits it; it does not
 // limit `result.output` returned by the nested command.
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_outer_limit_truncates_emitted_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1492,7 +1460,7 @@ async fn code_mode_exec_outer_limit_truncates_emitted_output() -> Result<()> {
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 5}
 const result = await tools.exec_command({
-  cmd: "printf '0123456789012345678901234567890123456789'"
+  cmd: "[Console]::Out.Write('0123456789012345678901234567890123456789')"
 });
 text(result.output);
 "#,
@@ -1552,7 +1520,6 @@ Error:\ boom\n
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_surfaces_handler_errors_as_exceptions() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1591,7 +1558,6 @@ try {
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1737,7 +1703,6 @@ text("phase 3");
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_yield_and_termination_are_not_starved_by_runtime_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1834,7 +1799,6 @@ while (true) {}
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_run_multiple_yielded_sessions() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -2002,7 +1966,6 @@ text("session b done");
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_concurrent_cells_merge_only_the_stored_values_they_write() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -2155,7 +2118,6 @@ yield_control();
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_wait_can_terminate_and_continue() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -2355,7 +2317,6 @@ await new Promise(() => {});"#,
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_wait_terminate_returns_completed_session_if_it_finished_after_yield_control()
 -> Result<()> {
@@ -2371,9 +2332,10 @@ async fn code_mode_wait_terminate_returns_completed_session_if_it_finished_after
     let session_a_done_marker = test.workspace_path("code-mode-session-a-done.txt");
     let session_a_wait = wait_for_file_source(&session_a_gate)?;
     let session_b_wait = wait_for_file_source(&session_b_gate)?;
-    let session_a_done_marker_quoted =
-        shlex::try_join([session_a_done_marker.to_string_lossy().as_ref()])?;
-    let session_a_done_command = format!("printf done > {session_a_done_marker_quoted}");
+    let session_a_done_marker_quoted = powershell_single_quoted_path(&session_a_done_marker);
+    let session_a_done_command = format!(
+        "Set-Content -NoNewline -LiteralPath '{session_a_done_marker_quoted}' -Value 'done'"
+    );
 
     let session_a_code = format!(
         r#"
@@ -2551,7 +2513,6 @@ text("session b done");
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_background_keeps_running_on_later_turn_without_wait() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -2562,10 +2523,12 @@ async fn code_mode_background_keeps_running_on_later_turn_without_wait() -> Resu
     });
     let test = builder.build(&server).await?;
     let resumed_file = test.workspace_path("code-mode-yield-resumed.txt");
-    let resumed_file_quoted = shlex::try_join([resumed_file.to_string_lossy().as_ref()])?;
-    let write_file_command = format!("printf resumed > {resumed_file_quoted}");
-    let wait_for_file_command =
-        format!("while [ ! -f {resumed_file_quoted} ]; do sleep 0.01; done; printf ready");
+    let resumed_file_quoted = powershell_single_quoted_path(&resumed_file);
+    let write_file_command =
+        format!("Set-Content -NoNewline -LiteralPath '{resumed_file_quoted}' -Value 'resumed'");
+    let wait_for_file_command = format!(
+        "while (-not (Test-Path -LiteralPath '{resumed_file_quoted}')) {{ Start-Sleep -Milliseconds 10 }}; [Console]::Out.Write('ready')"
+    );
     let code = format!(
         r#"
 text("before yield");
@@ -2644,7 +2607,6 @@ text("after yield");
     Ok(())
 }
 
-#[ignore = "no exec_command on Windows"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_wait_uses_its_own_max_tokens_budget() -> Result<()> {
     skip_if_no_network!(Ok(()));

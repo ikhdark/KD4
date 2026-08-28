@@ -1146,6 +1146,12 @@ mod tests {
         assert_eq!(start.service_tier, Some(Some("priority".to_string())));
         assert_eq!(start.service_tier, resume.service_tier);
         assert_eq!(resume.service_tier, fork.service_tier);
+        let expected_permission_profile = config.permissions.effective_permission_profile();
+        assert_eq!(start.permission_profile, Some(expected_permission_profile));
+        assert_eq!(start.permission_profile, resume.permission_profile);
+        assert_eq!(resume.permission_profile, fork.permission_profile);
+        assert_eq!(start.sandbox, resume.sandbox);
+        assert_eq!(resume.sandbox, fork.sandbox);
         assert_eq!(
             start.approvals_reviewer,
             Some(config.approvals_reviewer.into())
@@ -1157,6 +1163,21 @@ mod tests {
         );
         assert!(resume.exclude_turns);
         assert!(fork.exclude_turns);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_builders_do_not_mix_named_and_inline_permission_profiles() {
+        let config = build_test_config().await;
+        let overrides = ThreadLifecycleOverrides {
+            permissions: Some("configured-profile".to_string()),
+            ..Default::default()
+        };
+
+        let start = thread_start_params_from_config(&config, overrides, None);
+
+        assert_eq!(start.permissions.as_deref(), Some("configured-profile"));
+        assert_eq!(start.permission_profile, None);
+        assert_eq!(start.sandbox, None);
     }
 
     #[test]
@@ -1315,10 +1336,10 @@ mod tests {
             JSONRPCMessage::Response(JSONRPCResponse {
                 id: request.id,
                 result: serde_json::json!({
-                    "userAgent": "codex_cli_rs/9.8.7-test (Test OS; x86_64) rust",
-                    "codexHome": "/server/.codex",
-                    "platformFamily": "unix",
-                    "platformOs": "linux",
+                    "userAgent": "codex_cli_rs/9.8.7-test (Windows 11; x86_64) rust",
+                    "codexHome": "C:\\server\\.codex",
+                    "platformFamily": "windows",
+                    "platformOs": "windows",
                     "buildInfo": {
                         "version": "9.8.7-test",
                         "commit": "abc123",
@@ -1327,10 +1348,10 @@ mod tests {
                         "built": "2026-08-24T00:00:00Z"
                     },
                     "runtimeInfo": {
-                        "executablePath": "/server/bin/codex",
+                        "executablePath": "C:\\server\\bin\\codex.exe",
                         "installMethod": "npm",
                         "packageLayout": null,
-                        "expectedLocalBinaryPath": "/server/local/codex",
+                        "expectedLocalBinaryPath": "C:\\server\\local\\codex.exe",
                         "localBinaryMatch": false,
                         "warnings": [{
                             "code": "localBinaryMismatch",
@@ -1762,7 +1783,7 @@ mod tests {
             .expect("remote client should connect");
 
         assert_eq!(client.server_version(), Some("9.8.7-test"));
-        assert_eq!(client.codex_home(), Some("/server/.codex"));
+        assert_eq!(client.codex_home(), Some(r"C:\server\.codex"));
         let initialize = client.initialize_response();
         assert_eq!(
             initialize.build_info().map(|info| info.commit.as_str()),
@@ -1792,7 +1813,7 @@ mod tests {
                 .runtime_info()
                 .and_then(|runtime| runtime.get("executablePath"))
                 .and_then(serde_json::Value::as_str),
-            Some("/server/bin/codex")
+            Some(r"C:\server\bin\codex.exe")
         );
         let response: GetAccountResponse = client
             .request_typed(ClientRequest::GetAccount {

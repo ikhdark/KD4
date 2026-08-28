@@ -17,7 +17,6 @@ use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::GateKind;
 use codex_agent_task_store::GateStatus;
 use codex_agent_task_store::ValidationCallStatus;
-use codex_agent_task_store::ValidationProofKind;
 use codex_otel::SessionTelemetry;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -808,12 +807,21 @@ fn terminal_input(task: &AgentTask) -> TaskMetricTerminalInput {
                 && receipt.validation_call_ids.iter().all(|call_id| {
                     task.validation_calls.iter().any(|call| {
                         call.call_id == *call_id
-                            && call.proof_kind == ValidationProofKind::Focused
-                            && call
-                                .resolved_executable
-                                .as_deref()
-                                .is_some_and(|path| std::path::Path::new(path).is_absolute())
                             && call.status == ValidationCallStatus::Succeeded
+                            && call.evidence.end_epoch == Some(receipt.evidence_epoch)
+                            && call
+                                .evidence
+                                .validation_result
+                                .clone()
+                                .and_then(|value| {
+                                    serde_json::from_value::<
+                                        codex_protocol::validation::ValidationResult,
+                                    >(value)
+                                    .ok()
+                                })
+                                .is_some_and(|result| {
+                                    result.call_id == call.call_id && result.status.is_success()
+                                })
                     })
                 })
         });

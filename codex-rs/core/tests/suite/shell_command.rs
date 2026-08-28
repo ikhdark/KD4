@@ -1,6 +1,11 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::user_input::UserInput;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -11,7 +16,10 @@ use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::TestCodexHarness;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
+use serde_json::Value;
 use serde_json::json;
 use test_case::test_case;
 
@@ -144,6 +152,87 @@ async fn shell_command_works() -> anyhow::Result<()> {
 
     let output = harness.function_call_stdout(call_id).await;
     assert_shell_command_output(&output, "hello, world")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_prohibited_validation_is_suppressed_before_exec_begin() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = shell_command_harness_with(|builder| {
+        builder.with_model("gpt-5.4").with_config(|config| {
+            std::fs::write(
+                config.cwd.join("kd4_features.toml"),
+                "schema_version = 1\nfork = \"KD4\"\n",
+            )
+            .expect("write KD4 marker");
+        })
+    })
+    .await?;
+    let call_id = "prohibited-validation-call";
+    mount_shell_responses(
+        &harness,
+        call_id,
+        "cargo test -p codex-core prohibited_validation_should_not_run",
+        /*login*/ None,
+    )
+    .await;
+
+    let test = harness.test();
+    let codex = test.codex.clone();
+    let session_model = test.session_configured.model.clone();
+    let cwd = test.config.cwd.clone();
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "do not run tests".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                environments: Some(local_selections(cwd)),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: session_model,
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    let mut saw_exec_begin = false;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), codex.next_event()).await??;
+        match event.msg {
+            EventMsg::ExecCommandBegin(begin) if begin.call_id == call_id => {
+                saw_exec_begin = true;
+            }
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    assert!(
+        !saw_exec_begin,
+        "a user-prohibited validation must be suppressed before ExecCommandBegin"
+    );
+
+    let output = harness.function_call_stdout(call_id).await;
+    let structured: Value = serde_json::from_str(&output)?;
+    assert_eq!(structured["reason"], "user_prohibited_validation");
+    assert_eq!(structured["operation"], "test");
+    assert_eq!(structured["command_was_executed"], false);
 
     Ok(())
 }

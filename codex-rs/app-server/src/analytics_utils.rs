@@ -11,6 +11,23 @@ pub(crate) fn analytics_events_client_from_config(
     AnalyticsEventsClient::new(
         auth_manager,
         config.chatgpt_base_url.clone(),
-        config.analytics_enabled,
+        Some(app_server_analytics_enabled(config.analytics_enabled)),
+        config.http_client_factory(),
     )
+}
+
+fn app_server_analytics_enabled(configured: Option<bool>) -> bool {
+    configured.unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::app_server_analytics_enabled;
+
+    #[test]
+    fn unset_analytics_uses_the_app_server_disabled_default() {
+        assert!(!app_server_analytics_enabled(None));
+        assert!(!app_server_analytics_enabled(Some(false)));
+        assert!(app_server_analytics_enabled(Some(true)));
+    }
 }

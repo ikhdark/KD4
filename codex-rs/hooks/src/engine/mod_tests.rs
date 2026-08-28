@@ -20,6 +20,7 @@ use codex_config::TomlValue;
 use codex_plugin::PluginHookSource;
 use codex_plugin::PluginId;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
@@ -30,6 +31,7 @@ use tempfile::tempdir;
 
 use super::ClaudeHooksEngine;
 use super::CommandShell;
+use super::ConfiguredHandler;
 use crate::events::pre_tool_use::PreToolUseRequest;
 
 fn cwd() -> AbsolutePathBuf {
@@ -128,6 +130,36 @@ fn requirements_with_managed_hooks_only(
             ..ConfigRequirementsToml::default()
         },
     )
+}
+
+#[test]
+fn reports_configured_event_presence_without_building_a_request() {
+    let mut engine = ClaudeHooksEngine::new(
+        /*enabled*/ false,
+        /*bypass_hook_trust*/ false,
+        None,
+        Vec::new(),
+        Vec::new(),
+        CommandShell {
+            program: String::new(),
+            args: Vec::new(),
+        },
+    );
+    engine.handlers.push(ConfiguredHandler {
+        event_name: HookEventName::Stop,
+        matcher: None,
+        command: "echo stop".to_string(),
+        timeout_sec: 10,
+        status_message: None,
+        source_path: cwd(),
+        source: HookSource::Unknown,
+        display_order: 0,
+        env: HashMap::new(),
+    });
+
+    assert!(engine.has_handler_for(HookEventName::Stop));
+    assert!(!engine.has_handler_for(HookEventName::SubagentStop));
+    assert!(!engine.has_handler_for(HookEventName::UserPromptSubmit));
 }
 
 #[tokio::test]

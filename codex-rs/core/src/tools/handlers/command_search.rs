@@ -41,6 +41,10 @@ pub(crate) fn classify_rg_search_narrowing(
                 && rg_invocation_searches(argv)
         })
         .collect::<Vec<_>>();
+    if rg_commands.is_empty() {
+        return Ok(None);
+    }
+    let repository_root = normalized_search_path(repository_root);
     let mut query_identities = Vec::new();
     let mut search_identities = Vec::new();
     let mut all_targets = Vec::new();
@@ -68,7 +72,7 @@ pub(crate) fn classify_rg_search_narrowing(
         targets.sort_unstable();
         targets.dedup();
         for target in &targets {
-            match repository_owner_scope(target, repository_root) {
+            match repository_owner_scope(target, &repository_root) {
                 Some(owner_scope) => owner_scopes.push(owner_scope),
                 None => repository_wide = true,
             }
@@ -91,8 +95,8 @@ pub(crate) fn classify_rg_search_narrowing(
     owner_scopes.dedup();
     repository_wide |= owner_scopes.len() > 1;
     let scope_identity = path_scope_identity(&all_targets);
-    let parent_scope_identity = parent_scope_identity(&all_targets, repository_root);
-    Ok((!rg_commands.is_empty()).then(|| RgSearchNarrowing {
+    let parent_scope_identity = parent_scope_identity(&all_targets, &repository_root);
+    Ok(Some(RgSearchNarrowing {
         breadth: if repository_wide {
             RgSearchBreadth::Broad
         } else {
@@ -146,9 +150,7 @@ fn rg_query_identity(argv: &[String], path_indices: &[usize]) -> String {
 }
 
 fn repository_owner_scope(target: &Path, repository_root: &Path) -> Option<PathBuf> {
-    let target = normalized_search_path(target);
-    let repository_root = normalized_search_path(repository_root);
-    let relative = target.strip_prefix(&repository_root).ok()?;
+    let relative = target.strip_prefix(repository_root).ok()?;
     let mut components = relative.components();
     let first = components.next()?.as_os_str();
     if first.eq_ignore_ascii_case("codex-rs") {
@@ -168,10 +170,9 @@ fn path_scope_identity(targets: &[PathBuf]) -> String {
 }
 
 fn parent_scope_identity(targets: &[PathBuf], repository_root: &Path) -> Option<String> {
-    let repository_root = normalized_search_path(repository_root);
     let mut parents = Vec::new();
     for target in targets {
-        if target == &repository_root || !target.starts_with(&repository_root) {
+        if target == repository_root || !target.starts_with(repository_root) {
             return None;
         }
         parents.push(target.parent()?.to_path_buf());
@@ -182,6 +183,8 @@ fn parent_scope_identity(targets: &[PathBuf], repository_root: &Path) -> Option<
 }
 
 fn normalized_search_path(path: &Path) -> PathBuf {
+    #[cfg(test)]
+    SEARCH_PATH_NORMALIZATION_COUNT.with(|count| count.set(count.get() + 1));
     std::fs::canonicalize(path).unwrap_or_else(|_| {
         let mut normalized = PathBuf::new();
         for component in path.components() {
@@ -195,6 +198,21 @@ fn normalized_search_path(path: &Path) -> PathBuf {
         }
         normalized
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEARCH_PATH_NORMALIZATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_search_path_normalization_count() {
+    SEARCH_PATH_NORMALIZATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn search_path_normalization_count() -> usize {
+    SEARCH_PATH_NORMALIZATION_COUNT.with(std::cell::Cell::get)
 }
 
 pub(crate) fn rg_search_path_operands(

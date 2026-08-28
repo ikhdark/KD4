@@ -324,9 +324,7 @@ async fn plugins_popup_add_marketplace_tab_opens_prompt_and_submits_source() {
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
     match rx.try_recv() {
-        Ok(AppEvent::OpenMarketplaceAddLoading { source }) => {
-            assert_eq!(source, "owner/repo");
-        }
+        Ok(AppEvent::OpenMarketplaceAddLoading) => {}
         other => panic!("expected OpenMarketplaceAddLoading event, got {other:?}"),
     }
     match rx.try_recv() {
@@ -431,7 +429,7 @@ async fn marketplace_add_success_refreshes_to_new_marketplace_tab() {
         &mut chat,
         plugins_test_response(vec![plugins_test_curated_marketplace(Vec::new())]),
     );
-    chat.open_marketplace_add_loading_popup("owner/repo");
+    chat.open_marketplace_add_loading_popup();
     let loading_popup = render_bottom_popup(&chat, /*width*/ 100);
     assert!(
         !loading_popup.contains("owner/repo"),
@@ -439,7 +437,6 @@ async fn marketplace_add_success_refreshes_to_new_marketplace_tab() {
     );
     chat.on_marketplace_add_loaded(
         cwd.clone(),
-        "owner/repo".to_string(),
         Ok(MarketplaceAddResponse {
             marketplace_name: "debug".to_string(),
             installed_root: marketplace_root,

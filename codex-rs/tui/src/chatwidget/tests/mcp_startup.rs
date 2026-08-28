@@ -27,6 +27,29 @@ fn notify_mcp_status_error(chat: &mut ChatWidget, name: &str, error: &str) {
     );
 }
 
+fn notify_mcp_completed(
+    chat: &mut ChatWidget,
+    ready: &[&str],
+    failed: &[(&str, &str)],
+    cancelled: &[&str],
+) {
+    chat.handle_server_notification(
+        ServerNotification::McpServerStartupCompleted(McpServerStartupCompletedNotification {
+            thread_id: Some("thread-1".to_string()),
+            ready: ready.iter().map(|name| (*name).to_string()).collect(),
+            failed: failed
+                .iter()
+                .map(|(server, error)| McpServerStartupFailure {
+                    server: (*server).to_string(),
+                    error: (*error).to_string(),
+                })
+                .collect(),
+            cancelled: cancelled.iter().map(|name| (*name).to_string()).collect(),
+        }),
+        /*replay_kind*/ None,
+    );
+}
+
 #[tokio::test]
 async fn mcp_startup_ignores_status_for_other_thread() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -103,6 +126,39 @@ async fn mcp_startup_dedupes_same_round_duplicate_failure_warning() {
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
     assert_eq!(summary_text, "⚠ MCP startup incomplete (failed: alpha)\n");
+}
+
+#[tokio::test]
+async fn mcp_startup_aggregate_completion_finishes_incomplete_status_round() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+    chat.set_mcp_startup_expected_servers(["alpha".to_string(), "beta".to_string()]);
+
+    notify_mcp_status(&mut chat, "alpha", McpServerStartupState::Starting);
+    notify_mcp_completed(
+        &mut chat,
+        &["alpha"],
+        &[(
+            "beta",
+            "MCP client for `beta` failed to start: handshake failed",
+        )],
+        &["gamma"],
+    );
+
+    assert!(chat.mcp_startup_status.is_none());
+    assert!(!chat.bottom_pane.is_task_running());
+    let warning_text = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert_eq!(
+        warning_text,
+        concat!(
+            "⚠ MCP client for `beta` failed to start: handshake failed\n",
+            "⚠ MCP startup interrupted. The following servers were not initialized: gamma\n",
+            "⚠ MCP startup incomplete (failed: beta)\n",
+        )
+    );
 }
 
 #[tokio::test]

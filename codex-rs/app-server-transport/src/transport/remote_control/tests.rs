@@ -73,6 +73,18 @@ const TEST_REMOTE_CONTROL_SERVER_TOKEN: &str = "Remote Control Token";
 const TEST_REFRESHED_REMOTE_CONTROL_SERVER_TOKEN: &str = "Refreshed Remote Control Token";
 const TEST_REMOTE_CONTROL_SERVER_TOKEN_EXPIRES_AT: &str = "2999-01-01T00:00:00Z";
 
+#[test]
+fn remote_control_http_pool_retains_effective_proxy_policy() {
+    let pool = remote_control_http_clients(codex_http_client::HttpClientFactory::new(
+        codex_http_client::OutboundProxyPolicy::RespectSystemProxy,
+    ));
+
+    assert_eq!(
+        pool.outbound_proxy_policy(),
+        codex_http_client::OutboundProxyPolicy::RespectSystemProxy
+    );
+}
+
 fn remote_control_auth_manager() -> Arc<AuthManager> {
     auth_manager_from_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
 }
@@ -174,6 +186,9 @@ async fn plain_start_resolves_persisted_remote_control_preference() {
             installation_id: TEST_INSTALLATION_ID.to_string(),
             remote_control_target: None,
             server_name: test_server_name(),
+            http_clients: remote_control_http_clients(codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            )),
         },
         Some(state_db),
         remote_control_auth_manager(),
@@ -231,6 +246,9 @@ async fn explicit_disabled_start_ignores_persisted_enable() {
             remote_control_url: TEST_REMOTE_CONTROL_URL.to_string(),
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(state_db.clone()),
         remote_control_auth_manager(),
@@ -293,6 +311,9 @@ async fn managed_disable_overrides_startup_and_persisted_enablement() {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::DisabledByRequirements,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(state_db.clone()),
         remote_control_auth_manager(),
@@ -415,6 +436,9 @@ pub(super) fn remote_control_handle_with_current_enrollment(
         pairing_persistence_key: watch::channel(None).0,
         pairing_persistence_key_required: false,
         auth_manager,
+        http_clients: remote_control_http_clients(codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        )),
     }
 }
 
@@ -533,6 +557,9 @@ async fn remote_control_transport_manages_virtual_clients_and_routes_messages() 
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(state_db.clone()),
         remote_control_auth_manager(),
@@ -827,6 +854,9 @@ async fn remote_control_transport_reconnects_after_disconnect() {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(remote_control_state_runtime(&codex_home).await),
         remote_control_auth_manager(),
@@ -929,6 +959,9 @@ async fn remote_control_transport_refreshes_server_token_after_websocket_unautho
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(remote_control_state_runtime(&codex_home).await),
         remote_control_auth_manager(),
@@ -1010,6 +1043,9 @@ async fn remote_control_start_allows_remote_control_invalid_url_when_disabled() 
             remote_control_url: "https://internal.example.com/backend-api/".to_string(),
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         /*state_db*/ None,
         remote_control_auth_manager(),
@@ -1053,6 +1089,9 @@ async fn remote_control_start_allows_missing_auth_when_enabled() {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(remote_control_state_runtime(&codex_home).await),
         auth_manager,
@@ -1089,6 +1128,9 @@ async fn remote_control_start_reports_missing_state_db_as_disabled_when_enabled(
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         /*state_db*/ None,
         remote_control_auth_manager(),
@@ -1149,6 +1191,9 @@ async fn remote_control_handle_enable_disable_stops_and_restarts_connections() {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(remote_control_state_runtime(&codex_home).await),
         remote_control_auth_manager(),
@@ -1269,6 +1314,9 @@ async fn remote_control_transport_clears_outgoing_buffer_when_backend_acks() {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(remote_control_state_runtime(&codex_home).await),
         remote_control_auth_manager(),
@@ -1452,6 +1500,9 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(remote_control_state_runtime(&codex_home).await),
         remote_control_auth_manager(),
@@ -1704,6 +1755,9 @@ async fn remote_control_http_mode_refreshes_persisted_enrollment_before_connecti
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(state_db.clone()),
         remote_control_auth_manager_with_home(&codex_home),
@@ -1826,6 +1880,9 @@ async fn remote_control_stdio_mode_waits_for_client_name_before_connecting() {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(state_db.clone()),
         remote_control_auth_manager_with_home(&codex_home),
@@ -1913,6 +1970,9 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(state_db.clone()),
         auth_manager.clone(),
@@ -2020,6 +2080,9 @@ async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preferenc
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(state_db.clone()),
         auth_manager.clone(),
@@ -2138,6 +2201,9 @@ async fn remote_control_http_mode_reenrolls_when_refresh_reports_stale_enrollmen
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(state_db.clone()),
         remote_control_auth_manager_with_home(&codex_home),
@@ -2263,6 +2329,9 @@ async fn remote_control_http_mode_reenrolls_after_explicit_missing_server_404() 
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(state_db.clone()),
         remote_control_auth_manager_with_home(&codex_home),
@@ -2401,6 +2470,9 @@ async fn remote_control_http_mode_preserves_stale_enrollment_when_reenrollment_f
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(state_db.clone()),
         remote_control_auth_manager_with_home(&codex_home),
@@ -2523,6 +2595,9 @@ async fn remote_control_http_mode_preserves_enrollment_after_generic_websocket_4
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
             policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
         },
         Some(state_db.clone()),
         remote_control_auth_manager_with_home(&codex_home),

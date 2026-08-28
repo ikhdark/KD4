@@ -46,10 +46,10 @@ members = [
     "exec-server-protocol",
     "exec-server",
     "execpolicy",
+    "ext/builtins",
     "ext/connectors",
     "ext/extension-api",
     "ext/goal",
-    "ext/guardian",
     "ext/image-generation",
     "ext/items",
     "ext/memories",
@@ -159,6 +159,7 @@ codex-http-client = { path = "http-client" }
 codex-websocket-client = { path = "websocket-client" }
 codex-config = { path = "config" }
 codex-connectors = { path = "connectors" }
+codex-builtin-extensions = { path = "ext/builtins" }
 codex-connectors-extension = { path = "ext/connectors" }
 codex-context-fragments = { path = "context-fragments" }
 codex-core = { path = "core" }
@@ -172,7 +173,6 @@ codex-execpolicy = { path = "execpolicy" }
 codex-extension-api = { path = "ext/extension-api" }
 codex-extension-items = { path = "ext/items" }
 codex-goal-extension = { path = "ext/goal" }
-codex-guardian = { path = "ext/guardian" }
 codex-image-generation-extension = { path = "ext/image-generation" }
 codex-external-agent-migration = { path = "external-agent-migration" }
 codex-external-agent-sessions = { path = "external-agent-sessions" }

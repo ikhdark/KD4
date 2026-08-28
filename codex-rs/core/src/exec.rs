@@ -5,6 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -12,6 +13,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use async_channel::Sender;
+use futures::future::select_all;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
@@ -63,11 +65,9 @@ pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
 
 // Hardcode these since it does not seem worth including the libc crate just
 // for these.
-const SIGKILL_CODE: i32 = 9;
 const TIMEOUT_CODE: i32 = 64;
 const EXIT_CODE_SIGNAL_BASE: i32 = 128; // conventional shell: 128 + signal
 pub(crate) const EXEC_TIMEOUT_EXIT_CODE: i32 = 124; // conventional timeout exit code
-const CANCELLATION_TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(50);
 
 // I/O buffer sizing
 const READ_CHUNK_SIZE: usize = 8192; // bytes per read
@@ -126,6 +126,7 @@ pub const IO_DRAIN_TIMEOUT_MS: u64 = 2_000; // 2 s should be plenty for local pi
 #[derive(Debug)]
 pub struct ExecParams {
     pub command: Vec<String>,
+    pub codex_home: AbsolutePathBuf,
     pub cwd: AbsolutePathBuf,
     pub expiration: ExecExpiration,
     pub capture_policy: ExecCapturePolicy,
@@ -184,6 +185,11 @@ pub enum ExecExpiration {
         timeout: Duration,
         cancellation: CancellationToken,
     },
+    CancellationSet(Vec<CancellationToken>),
+    TimeoutOrCancellationSet {
+        timeout: Duration,
+        cancellations: Vec<CancellationToken>,
+    },
 }
 
 /// Why an `ExecExpiration` completed.
@@ -225,6 +231,10 @@ impl ExecExpiration {
                 cancel.cancelled().await;
                 ExecExpirationOutcome::Cancelled
             }
+            ExecExpiration::CancellationSet(cancellations) => {
+                wait_for_any_cancellation(cancellations).await;
+                ExecExpirationOutcome::Cancelled
+            }
             ExecExpiration::TimeoutOrCancellation {
                 timeout,
                 cancellation,
@@ -232,6 +242,16 @@ impl ExecExpiration {
                 tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => ExecExpirationOutcome::Cancelled,
+                    _ = tokio::time::sleep(timeout) => ExecExpirationOutcome::TimedOut,
+                }
+            }
+            ExecExpiration::TimeoutOrCancellationSet {
+                timeout,
+                cancellations,
+            } => {
+                tokio::select! {
+                    biased;
+                    _ = wait_for_any_cancellation(cancellations) => ExecExpirationOutcome::Cancelled,
                     _ = tokio::time::sleep(timeout) => ExecExpirationOutcome::TimedOut,
                 }
             }
@@ -243,19 +263,24 @@ impl ExecExpiration {
         match self {
             ExecExpiration::Timeout(duration) => Some(duration.as_millis() as u64),
             ExecExpiration::DefaultTimeout => Some(DEFAULT_EXEC_COMMAND_TIMEOUT_MS),
-            ExecExpiration::Cancellation(_) => None,
-            ExecExpiration::TimeoutOrCancellation { timeout, .. } => {
+            ExecExpiration::Cancellation(_) | ExecExpiration::CancellationSet(_) => None,
+            ExecExpiration::TimeoutOrCancellation { timeout, .. }
+            | ExecExpiration::TimeoutOrCancellationSet { timeout, .. } => {
                 Some(timeout.as_millis() as u64)
             }
         }
     }
 
-    pub(crate) fn cancellation_token(&self) -> Option<CancellationToken> {
+    fn cancellation_tokens(&self) -> Vec<CancellationToken> {
         match self {
-            ExecExpiration::Timeout(_) | ExecExpiration::DefaultTimeout => None,
+            ExecExpiration::Timeout(_) | ExecExpiration::DefaultTimeout => Vec::new(),
             ExecExpiration::Cancellation(cancellation)
             | ExecExpiration::TimeoutOrCancellation { cancellation, .. } => {
-                Some(cancellation.clone())
+                vec![cancellation.clone()]
+            }
+            ExecExpiration::CancellationSet(cancellations)
+            | ExecExpiration::TimeoutOrCancellationSet { cancellations, .. } => {
+                cancellations.clone()
             }
         }
     }
@@ -271,33 +296,40 @@ impl ExecExpiration {
                 cancellation,
             },
             ExecExpiration::Cancellation(existing) => {
-                ExecExpiration::Cancellation(cancel_when_either(existing, cancellation))
+                ExecExpiration::CancellationSet(vec![existing, cancellation])
+            }
+            ExecExpiration::CancellationSet(mut cancellations) => {
+                cancellations.push(cancellation);
+                ExecExpiration::CancellationSet(cancellations)
             }
             ExecExpiration::TimeoutOrCancellation {
                 timeout,
                 cancellation: existing,
-            } => ExecExpiration::TimeoutOrCancellation {
+            } => ExecExpiration::TimeoutOrCancellationSet {
                 timeout,
-                cancellation: cancel_when_either(existing, cancellation),
+                cancellations: vec![existing, cancellation],
             },
+            ExecExpiration::TimeoutOrCancellationSet {
+                timeout,
+                mut cancellations,
+            } => {
+                cancellations.push(cancellation);
+                ExecExpiration::TimeoutOrCancellationSet {
+                    timeout,
+                    cancellations,
+                }
+            }
         }
     }
 }
 
-pub(crate) fn cancel_when_either(
-    first: CancellationToken,
-    second: CancellationToken,
-) -> CancellationToken {
-    let combined = CancellationToken::new();
-    let cancel = combined.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = first.cancelled() => {}
-            _ = second.cancelled() => {}
-        }
-        cancel.cancel();
-    });
-    combined
+async fn wait_for_any_cancellation(cancellations: Vec<CancellationToken>) {
+    debug_assert!(!cancellations.is_empty());
+    let waits = cancellations
+        .into_iter()
+        .map(|cancellation| Box::pin(async move { cancellation.cancelled().await }))
+        .collect::<Vec<_>>();
+    let _ = select_all(waits).await;
 }
 
 impl ExecCapturePolicy {
@@ -393,6 +425,7 @@ pub fn build_exec_request(
 ) -> Result<ExecRequest> {
     let ExecParams {
         command,
+        codex_home,
         cwd,
         mut env,
         expiration,
@@ -465,7 +498,12 @@ pub fn build_exec_request(
     } else {
         windows_sandbox_workspace_roots.to_vec()
     };
-    ExecRequest::from_sandbox_exec_request(request, options, windows_sandbox_workspace_roots)
+    ExecRequest::from_sandbox_exec_request(
+        request,
+        options,
+        windows_sandbox_workspace_roots,
+        codex_home,
+    )
 }
 
 pub(crate) async fn execute_exec_request(
@@ -475,6 +513,7 @@ pub(crate) async fn execute_exec_request(
 ) -> Result<ExecToolCallOutput> {
     let ExecRequest {
         command,
+        codex_home,
         cwd,
         env,
         exec_server_env_config: _,
@@ -508,6 +547,7 @@ pub(crate) async fn execute_exec_request(
 
     let params = ExecParams {
         command,
+        codex_home,
         cwd,
         expiration,
         capture_policy,
@@ -637,7 +677,6 @@ async fn exec_windows_sandbox(
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
     windows_sandbox_filesystem_overrides: Option<&WindowsSandboxFilesystemOverrides>,
 ) -> Result<RawExecToolCallOutput> {
-    use crate::config::find_codex_home;
     use codex_windows_sandbox::CaptureOutputSink;
     use codex_windows_sandbox::CaptureOutputStream;
     use codex_windows_sandbox::run_windows_sandbox_capture_for_permission_profile_elevated;
@@ -645,6 +684,7 @@ async fn exec_windows_sandbox(
 
     let ExecParams {
         command,
+        codex_home,
         cwd,
         mut env,
         network,
@@ -665,9 +705,10 @@ async fn exec_windows_sandbox(
 
     // Windows sandbox capture still receives timeout and cancellation separately.
     let (cancellation, timeout_ms) = if capture_policy.uses_expiration() {
-        let cancellation = expiration.cancellation_token().map(|token| {
+        let cancellations = expiration.cancellation_tokens();
+        let cancellation = (!cancellations.is_empty()).then(|| {
             codex_windows_sandbox::WindowsSandboxCancellationToken::new(move || {
-                token.is_cancelled()
+                cancellations.iter().any(CancellationToken::is_cancelled)
             })
         });
         (cancellation, expiration.timeout_ms())
@@ -681,11 +722,6 @@ async fn exec_windows_sandbox(
         windows_sandbox_workspace_roots.to_vec()
     };
     let permission_profile = permission_profile.clone();
-    let codex_home = find_codex_home().map_err(|err| {
-        CodexErr::Io(io::Error::other(format!(
-            "windows sandbox: failed to resolve codex_home: {err}"
-        )))
-    })?;
     let command_path = command.first().cloned();
     let sandbox_level = windows_sandbox_level;
     let proxy_enforced = network.is_some();
@@ -696,26 +732,37 @@ async fn exec_windows_sandbox(
     let additional_deny_read_paths = windows_sandbox_filesystem_overrides
         .map(|overrides| overrides.additional_deny_read_paths.clone())
         .unwrap_or_default();
-    let output_sink = stdout_stream.map(|stream| {
-        let limiter = Arc::new(OutputDeltaLimiter::default());
+    let retained_bytes_cap = capture_policy.retained_bytes_cap();
+    let aggregate_capture = Arc::new(Mutex::new(OutputCapture::new(retained_bytes_cap)));
+    let aggregate_capture_for_sink = Arc::clone(&aggregate_capture);
+    let limiter = Arc::new(OutputDeltaLimiter::default());
+    let live_output_enabled = Arc::new(AtomicBool::new(true));
+    let live_output_enabled_for_sink = Arc::clone(&live_output_enabled);
+    let output_sink = Some(
         Arc::new(move |capture_stream: CaptureOutputStream, chunk: &[u8]| {
+            aggregate_capture_for_sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .append(chunk);
+            let Some(stream) = stdout_stream.as_ref() else {
+                return;
+            };
             if let Some(progress) = stream.progress.as_ref() {
                 progress.record_output();
             }
-            let chunk = match limiter.claim() {
-                OutputDeltaDecision::Emit => chunk.to_vec(),
-                OutputDeltaDecision::EmitCapNotice => EXEC_OUTPUT_DELTA_CAP_NOTICE.to_vec(),
-                OutputDeltaDecision::Suppress => return,
-            };
-            let event = output_delta_event(
-                &stream,
+            if !live_output_enabled_for_sink.load(Ordering::Acquire) {
+                return;
+            }
+            if !try_send_limited_output_delta(
+                stream,
                 matches!(capture_stream, CaptureOutputStream::Stderr),
-                chunk,
-            );
-            #[allow(clippy::let_unit_value)]
-            let _ = stream.tx_event.send_blocking(event);
-        }) as CaptureOutputSink
-    });
+                chunk.to_vec(),
+                &limiter,
+            ) {
+                live_output_enabled_for_sink.store(false, Ordering::Release);
+            }
+        }) as CaptureOutputSink,
+    );
     let elevated_read_roots_override = windows_sandbox_filesystem_overrides
         .and_then(|overrides| overrides.read_roots_override.clone());
     let elevated_read_roots_include_platform_defaults = windows_sandbox_filesystem_overrides
@@ -743,6 +790,7 @@ async fn exec_windows_sandbox(
                     deny_read_paths_override: &additional_deny_read_paths,
                     deny_write_paths_override: &additional_deny_write_paths,
                     output_sink: output_sink.clone(),
+                    retained_bytes_cap,
                 },
             )
         } else {
@@ -759,6 +807,7 @@ async fn exec_windows_sandbox(
                 &additional_deny_write_paths,
                 windows_sandbox_private_desktop,
                 output_sink,
+                retained_bytes_cap,
             )
         }
     })
@@ -784,27 +833,20 @@ async fn exec_windows_sandbox(
     };
 
     let exit_status = synthetic_exit_status(capture.exit_code);
-    let mut stdout_text = capture.stdout;
-    if let Some(max_bytes) = capture_policy.retained_bytes_cap()
-        && stdout_text.len() > max_bytes
-    {
-        stdout_text.truncate(max_bytes);
-    }
-    let mut stderr_text = capture.stderr;
-    if let Some(max_bytes) = capture_policy.retained_bytes_cap()
-        && stderr_text.len() > max_bytes
-    {
-        stderr_text.truncate(max_bytes);
-    }
     let stdout = StreamOutput {
-        text: stdout_text,
+        text: capture.stdout,
         truncated_after_lines: None,
+        truncated: capture.stdout_truncated,
     };
     let stderr = StreamOutput {
-        text: stderr_text,
+        text: capture.stderr,
         truncated_after_lines: None,
+        truncated: capture.stderr_truncated,
     };
-    let aggregated_output = aggregate_output(&stdout, &stderr, capture_policy.retained_bytes_cap());
+    let aggregated_output = aggregate_capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .snapshot();
 
     Ok(RawExecToolCallOutput {
         exit_status,
@@ -873,16 +915,53 @@ struct RawExecToolCallOutput {
     pub timed_out: bool,
 }
 
-#[inline]
-fn append_capped(dst: &mut Vec<u8>, src: &[u8], max_bytes: usize) {
-    if dst.len() >= max_bytes {
-        return;
-    }
-    let remaining = max_bytes.saturating_sub(dst.len());
-    let take = remaining.min(src.len());
-    dst.extend_from_slice(&src[..take]);
+#[derive(Debug)]
+struct OutputCapture {
+    text: Vec<u8>,
+    max_bytes: Option<usize>,
+    truncated: bool,
 }
 
+impl OutputCapture {
+    fn new(max_bytes: Option<usize>) -> Self {
+        Self {
+            text: Vec::with_capacity(
+                max_bytes.map_or(AGGREGATE_BUFFER_INITIAL_CAPACITY, |limit| {
+                    AGGREGATE_BUFFER_INITIAL_CAPACITY.min(limit)
+                }),
+            ),
+            max_bytes,
+            truncated: false,
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        let Some(max_bytes) = self.max_bytes else {
+            self.text.extend_from_slice(bytes);
+            return;
+        };
+        let remaining = max_bytes.saturating_sub(self.text.len());
+        let take = remaining.min(bytes.len());
+        self.text.extend_from_slice(&bytes[..take]);
+        self.truncated |= take < bytes.len();
+    }
+
+    fn mark_truncated(&mut self) {
+        self.truncated = true;
+    }
+
+    fn snapshot(&self) -> StreamOutput<Vec<u8>> {
+        StreamOutput {
+            text: self.text.clone(),
+            truncated_after_lines: None,
+            truncated: self.truncated,
+        }
+    }
+}
+
+type SharedOutputCapture = Arc<Mutex<OutputCapture>>;
+
+#[cfg(test)]
 fn aggregate_output(
     stdout: &StreamOutput<Vec<u8>>,
     stderr: &StreamOutput<Vec<u8>>,
@@ -896,6 +975,7 @@ fn aggregate_output(
         return StreamOutput {
             text: aggregated,
             truncated_after_lines: None,
+            truncated: stdout.truncated || stderr.truncated,
         };
     };
 
@@ -908,6 +988,7 @@ fn aggregate_output(
         return StreamOutput {
             text: aggregated,
             truncated_after_lines: None,
+            truncated: stdout.truncated || stderr.truncated,
         };
     }
 
@@ -924,6 +1005,7 @@ fn aggregate_output(
     StreamOutput {
         text: aggregated,
         truncated_after_lines: None,
+        truncated: true,
     }
 }
 
@@ -947,6 +1029,7 @@ async fn exec(
 ) -> Result<RawExecToolCallOutput> {
     let ExecParams {
         command,
+        codex_home: _,
         cwd,
         mut env,
         network,
@@ -996,7 +1079,7 @@ async fn exec(
     })
     .await?;
 
-    if let Err(err) = managed_root.attach(
+    if let Err(err) = managed_root.attach_and_resume(
         child
             .id()
             .ok_or_else(|| io::Error::other("missing child process id"))?,
@@ -1032,6 +1115,14 @@ fn kill_child_process_tree(child: &mut Child, managed_root: &ManagedRootProcess)
     child.start_kill()
 }
 
+async fn terminate_and_reap_child_process_tree(
+    child: &mut Child,
+    managed_root: &ManagedRootProcess,
+) -> io::Result<()> {
+    kill_child_process_tree(child, managed_root)?;
+    child.wait().await.map(|_| ())
+}
+
 /// Consumes the output of a child process according to the configured capture
 /// policy.
 async fn consume_output(
@@ -1058,18 +1149,23 @@ async fn consume_output(
 
     let retained_bytes_cap = capture_policy.retained_bytes_cap();
     let output_delta_limiter = Arc::new(OutputDeltaLimiter::default());
-    let stdout_handle = tokio::spawn(read_output(
+    let stdout_capture = Arc::new(Mutex::new(OutputCapture::new(retained_bytes_cap)));
+    let stderr_capture = Arc::new(Mutex::new(OutputCapture::new(retained_bytes_cap)));
+    let aggregate_capture = Arc::new(Mutex::new(OutputCapture::new(retained_bytes_cap)));
+    let stdout_handle = tokio::spawn(read_output_into_capture(
         BufReader::new(stdout_reader),
         stdout_stream.clone(),
         /*is_stderr*/ false,
-        retained_bytes_cap,
+        Arc::clone(&stdout_capture),
+        Some(Arc::clone(&aggregate_capture)),
         output_delta_limiter.clone(),
     ));
-    let stderr_handle = tokio::spawn(read_output(
+    let stderr_handle = tokio::spawn(read_output_into_capture(
         BufReader::new(stderr_reader),
         stdout_stream.clone(),
         /*is_stderr*/ true,
-        retained_bytes_cap,
+        Arc::clone(&stderr_capture),
+        Some(Arc::clone(&aggregate_capture)),
         output_delta_limiter,
     ));
 
@@ -1094,43 +1190,38 @@ async fn consume_output(
         outcome = &mut expiration_wait => {
             match outcome {
                 Some(ExecExpirationOutcome::TimedOut) => {
-                    kill_child_process_tree(
+                    terminate_and_reap_child_process_tree(
                         &mut child,
                         &managed_root,
-                    )?;
+                    ).await?;
                     (
                         synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE),
                         true,
                     )
                 }
                 Some(ExecExpirationOutcome::Cancelled) => {
-                    kill_child_process_tree(&mut child, &managed_root)?;
-                    if let Ok(status) = tokio::time::timeout(
-                        CANCELLATION_TERMINATION_GRACE_PERIOD,
-                        child.wait(),
-                    )
-                    .await
-                    {
-                        status?;
-                    }
+                    terminate_and_reap_child_process_tree(&mut child, &managed_root).await?;
                     (synthetic_exit_status_for_code(/*code*/ 1), false)
                 }
                 None => unreachable!("expiration wait only resolves while expiration is active"),
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            kill_child_process_tree(
-                &mut child,
-                &managed_root,
-            )?;
-            (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
-        }
     };
 
     let drain_deadline = tokio::time::Instant::now() + capture_policy.io_drain_timeout();
-    let (stdout, stderr) =
-        await_output_until_deadline(stdout_handle, stderr_handle, drain_deadline).await?;
-    let aggregated_output = aggregate_output(&stdout, &stderr, retained_bytes_cap);
+    let (stdout, stderr) = await_captured_output_until_deadline(
+        stdout_handle,
+        stderr_handle,
+        Arc::clone(&stdout_capture),
+        Arc::clone(&stderr_capture),
+        Arc::clone(&aggregate_capture),
+        drain_deadline,
+    )
+    .await?;
+    let aggregated_output = aggregate_capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .snapshot();
 
     Ok(RawExecToolCallOutput {
         exit_status,
@@ -1141,6 +1232,62 @@ async fn consume_output(
     })
 }
 
+async fn await_captured_output_until_deadline(
+    mut stdout_handle: tokio::task::JoinHandle<io::Result<()>>,
+    mut stderr_handle: tokio::task::JoinHandle<io::Result<()>>,
+    stdout_capture: SharedOutputCapture,
+    stderr_capture: SharedOutputCapture,
+    aggregate_capture: SharedOutputCapture,
+    deadline: tokio::time::Instant,
+) -> io::Result<(StreamOutput<Vec<u8>>, StreamOutput<Vec<u8>>)> {
+    async fn await_output(
+        handle: &mut tokio::task::JoinHandle<io::Result<()>>,
+        capture: &SharedOutputCapture,
+        aggregate_capture: &SharedOutputCapture,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<StreamOutput<Vec<u8>>> {
+        match tokio::time::timeout_at(deadline, &mut *handle).await {
+            Ok(join_result) => match join_result {
+                Ok(result) => result?,
+                Err(join_error) => return Err(io::Error::other(join_error)),
+            },
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mark_truncated();
+                aggregate_capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mark_truncated();
+            }
+        }
+        Ok(capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot())
+    }
+
+    let (stdout, stderr) = tokio::join!(
+        await_output(
+            &mut stdout_handle,
+            &stdout_capture,
+            &aggregate_capture,
+            deadline,
+        ),
+        await_output(
+            &mut stderr_handle,
+            &stderr_capture,
+            &aggregate_capture,
+            deadline,
+        ),
+    );
+    Ok((stdout?, stderr?))
+}
+
+#[cfg(test)]
 async fn await_output_until_deadline(
     mut stdout_handle: tokio::task::JoinHandle<io::Result<StreamOutput<Vec<u8>>>>,
     mut stderr_handle: tokio::task::JoinHandle<io::Result<StreamOutput<Vec<u8>>>>,
@@ -1160,6 +1307,7 @@ async fn await_output_until_deadline(
                 Ok(StreamOutput {
                     text: Vec::new(),
                     truncated_after_lines: None,
+                    truncated: true,
                 })
             }
         }
@@ -1172,18 +1320,39 @@ async fn await_output_until_deadline(
     Ok((stdout?, stderr?))
 }
 
+#[cfg(test)]
 async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
-    mut reader: R,
+    reader: R,
     stream: Option<StdoutStream>,
     is_stderr: bool,
     max_bytes: Option<usize>,
     output_delta_limiter: Arc<OutputDeltaLimiter>,
 ) -> io::Result<StreamOutput<Vec<u8>>> {
-    let mut buf = Vec::with_capacity(
-        max_bytes.map_or(AGGREGATE_BUFFER_INITIAL_CAPACITY, |max_bytes| {
-            AGGREGATE_BUFFER_INITIAL_CAPACITY.min(max_bytes)
-        }),
-    );
+    let capture = Arc::new(Mutex::new(OutputCapture::new(max_bytes)));
+    read_output_into_capture(
+        reader,
+        stream,
+        is_stderr,
+        Arc::clone(&capture),
+        None,
+        output_delta_limiter,
+    )
+    .await?;
+    let output = capture
+        .lock()
+        .expect("stream output capture lock poisoned")
+        .snapshot();
+    Ok(output)
+}
+
+async fn read_output_into_capture<R: AsyncRead + Unpin + Send + 'static>(
+    mut reader: R,
+    stream: Option<StdoutStream>,
+    is_stderr: bool,
+    capture: SharedOutputCapture,
+    aggregate_capture: Option<SharedOutputCapture>,
+    output_delta_limiter: Arc<OutputDeltaLimiter>,
+) -> io::Result<()> {
     let mut tmp = [0u8; READ_CHUNK_SIZE];
     let mut live_output_enabled = true;
     let mut pending_delta = Vec::with_capacity(READ_CHUNK_SIZE);
@@ -1198,6 +1367,17 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
             progress.record_output();
         }
 
+        if let Some(aggregate_capture) = &aggregate_capture {
+            aggregate_capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .append(&tmp[..n]);
+        }
+        capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .append(&tmp[..n]);
+
         if let Some(stream) = &stream
             && live_output_enabled
         {
@@ -1206,8 +1386,7 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
                 take_utf8_safe_output_chunk(&mut pending_delta, /*flush_incomplete*/ false)
             {
                 live_output_enabled =
-                    send_limited_output_delta(stream, is_stderr, chunk, &output_delta_limiter)
-                        .await;
+                    try_send_limited_output_delta(stream, is_stderr, chunk, &output_delta_limiter);
                 if !live_output_enabled {
                     pending_delta.clear();
                     break;
@@ -1215,11 +1394,6 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
             }
         }
 
-        if let Some(max_bytes) = max_bytes {
-            append_capped(&mut buf, &tmp[..n], max_bytes);
-        } else {
-            buf.extend_from_slice(&tmp[..n]);
-        }
         // Continue reading to EOF to avoid back-pressure
     }
 
@@ -1229,16 +1403,13 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
         while let Some(chunk) =
             take_utf8_safe_output_chunk(&mut pending_delta, /*flush_incomplete*/ true)
         {
-            if !send_limited_output_delta(stream, is_stderr, chunk, &output_delta_limiter).await {
+            if !try_send_limited_output_delta(stream, is_stderr, chunk, &output_delta_limiter) {
                 break;
             }
         }
     }
 
-    Ok(StreamOutput {
-        text: buf,
-        truncated_after_lines: None,
-    })
+    Ok(())
 }
 
 fn take_utf8_safe_output_chunk(pending: &mut Vec<u8>, flush_incomplete: bool) -> Option<Vec<u8>> {
@@ -1293,7 +1464,7 @@ fn output_delta_event(stream: &StdoutStream, is_stderr: bool, chunk: Vec<u8>) ->
     }
 }
 
-async fn send_limited_output_delta(
+fn try_send_limited_output_delta(
     stream: &StdoutStream,
     is_stderr: bool,
     chunk: Vec<u8>,
@@ -1305,9 +1476,7 @@ async fn send_limited_output_delta(
         OutputDeltaDecision::Suppress => return false,
     };
     let event = output_delta_event(stream, is_stderr, chunk);
-    #[allow(clippy::let_unit_value)]
-    let _ = stream.tx_event.send(event).await;
-    continue_streaming
+    stream.tx_event.try_send(event).is_ok() && continue_streaming
 }
 
 fn synthetic_exit_status(code: i32) -> ExitStatus {

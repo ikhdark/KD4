@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +15,7 @@ use codex_hooks::PermissionRequestDecision;
 use codex_hooks::PermissionRequestOutcome;
 use codex_hooks::PermissionRequestRequest;
 use codex_hooks::PostToolUseOutcome;
+use codex_hooks::PostToolUsePlan;
 use codex_hooks::PostToolUseRequest;
 use codex_hooks::PreToolUseOutcome;
 use codex_hooks::PreToolUseRequest;
@@ -31,6 +33,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookCompletedEvent;
+use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 use codex_protocol::protocol::HookStartedEvent;
@@ -52,6 +55,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::PermissionRequestPayload;
 
+#[derive(Default)]
 pub(crate) struct HookRuntimeOutcome {
     pub should_stop: bool,
     pub stop_reason: Option<String>,
@@ -235,9 +239,11 @@ pub(crate) async fn run_permission_request_hooks(
 /// already adapted by the tool handler into the stable hook contract. Passing
 /// raw internal tool data here would leak implementation details into user hook
 /// matchers and hook logs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_post_tool_use_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
+    plan: PostToolUsePlan,
     tool_use_id: String,
     tool_name: String,
     matcher_aliases: Vec<String>,
@@ -259,10 +265,10 @@ pub(crate) async fn run_post_tool_use_hooks(
         tool_response,
     };
     let hooks = sess.hooks();
-    let preview_runs = hooks.preview_post_tool_use(&request);
+    let preview_runs = hooks.preview_planned_post_tool_use(&plan, &request.tool_use_id);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
-    let outcome = hooks.run_post_tool_use(request).await;
+    let outcome = hooks.run_planned_post_tool_use(plan, request).await;
     emit_hook_completed_events(sess, turn_context, outcome.hook_events.clone()).await;
     outcome
 }
@@ -274,10 +280,32 @@ pub(crate) async fn run_turn_stop_hooks(
     stop_hook_active: bool,
     last_assistant_message: Option<String>,
 ) -> TurnStopHookOutcome {
-    let workspace_observation =
-        begin_completion_hook_workspace_observation(sess, turn_context, "Stop").await;
     // Resolve the stop hook kind from the session source before building the
     // request. Root turns run Stop; thread-spawned child turns run SubagentStop.
+    let event_name = match &turn_context.session_source {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }) => HookEventName::SubagentStop,
+        // Internal/synthetic subagents do not expose user-configured lifecycle
+        // hooks, so there is no Stop or SubagentStop request to dispatch.
+        SessionSource::SubAgent(_) => {
+            return TurnStopHookOutcome {
+                stop: StopOutcome::default(),
+                workspace_changed: false,
+                observation_error: None,
+            };
+        }
+        _ => HookEventName::Stop,
+    };
+    let hooks = sess.hooks();
+    if !hooks.has_handler_for(event_name) {
+        return TurnStopHookOutcome {
+            stop: StopOutcome::default(),
+            workspace_changed: false,
+            observation_error: None,
+        };
+    }
+
+    let workspace_observation =
+        begin_completion_hook_workspace_observation(sess, turn_context, "Stop").await;
     let (target, transcript_path) = match &turn_context.session_source {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             agent_role,
@@ -315,17 +343,7 @@ pub(crate) async fn run_turn_stop_hooks(
                 parent_transcript_path,
             )
         }
-        // Internal/synthetic subagents do not expose user-configured lifecycle
-        // hooks, so there is no Stop or SubagentStop request to dispatch.
-        SessionSource::SubAgent(_) => {
-            let (workspace_changed, observation_error) =
-                finish_completion_hook_workspace_observation(workspace_observation, "Stop").await;
-            return TurnStopHookOutcome {
-                stop: StopOutcome::default(),
-                workspace_changed,
-                observation_error,
-            };
-        }
+        SessionSource::SubAgent(_) => unreachable!("internal subagents returned before dispatch"),
         _ => (StopHookTarget::Stop, sess.hook_transcript_path().await),
     };
     let request = codex_hooks::StopRequest {
@@ -339,7 +357,6 @@ pub(crate) async fn run_turn_stop_hooks(
         last_assistant_message,
         target,
     };
-    let hooks = sess.hooks();
     emit_hook_started_events(sess, turn_context, hooks.preview_stop(&request)).await;
 
     let mut outcome = hooks.run_stop(request).await;
@@ -430,6 +447,20 @@ pub(crate) enum PostCompactHookOutcome {
     Stopped { reason: Option<String> },
 }
 
+pub(crate) async fn run_pre_compact_hook_gate(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    trigger: CompactionTrigger,
+) -> bool {
+    match run_pre_compact_hooks(sess, turn_context, trigger).await {
+        PreCompactHookOutcome::Continue => false,
+        PreCompactHookOutcome::Stopped { reason } => {
+            emit_hook_stop_reason(sess, turn_context, "PreCompact", reason.as_deref()).await;
+            true
+        }
+    }
+}
+
 pub(crate) async fn run_post_compact_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -457,6 +488,21 @@ pub(crate) async fn run_post_compact_hooks(
         }
     } else {
         PostCompactHookOutcome::Continue
+    }
+}
+
+pub(crate) async fn run_post_compact_hook_gate(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    trigger: CompactionTrigger,
+    compaction_summary: Option<&str>,
+) -> bool {
+    match run_post_compact_hooks(sess, turn_context, trigger, compaction_summary).await {
+        PostCompactHookOutcome::Continue => false,
+        PostCompactHookOutcome::Stopped { reason } => {
+            emit_hook_stop_reason(sess, turn_context, "PostCompact", reason.as_deref()).await;
+            true
+        }
     }
 }
 
@@ -604,6 +650,10 @@ pub(crate) async fn inspect_pending_input(
 ) -> HookRuntimeOutcome {
     match pending_input_item {
         TurnInput::UserInput { content, .. } => {
+            let hooks = sess.hooks();
+            if !hooks.has_handler_for(HookEventName::UserPromptSubmit) {
+                return HookRuntimeOutcome::default();
+            }
             let request = UserPromptSubmitRequest {
                 session_id: sess.session_id().into(),
                 turn_id: turn_context.sub_id.clone(),
@@ -614,7 +664,6 @@ pub(crate) async fn inspect_pending_input(
                 permission_mode: hook_permission_mode(turn_context),
                 prompt: UserMessageItem::new(content).message(),
             };
-            let hooks = sess.hooks();
             let preview_runs = hooks.preview_user_prompt_submit(&request);
             run_context_injecting_hook(
                 sess,
@@ -624,16 +673,8 @@ pub(crate) async fn inspect_pending_input(
             )
             .await
         }
-        TurnInput::ResponseItem(_) => HookRuntimeOutcome {
-            should_stop: false,
-            stop_reason: None,
-            additional_contexts: Vec::new(),
-        },
-        TurnInput::InterAgentCommunication(_) => HookRuntimeOutcome {
-            should_stop: false,
-            stop_reason: None,
-            additional_contexts: Vec::new(),
-        },
+        TurnInput::ResponseItem(_) => HookRuntimeOutcome::default(),
+        TurnInput::InterAgentCommunication(_) => HookRuntimeOutcome::default(),
     }
 }
 
@@ -662,6 +703,21 @@ pub(crate) async fn record_pending_input(
         }
     }
     record_additional_contexts(sess, turn_context, additional_contexts).await;
+}
+
+#[cfg(test)]
+mod compaction_hook_gate_contract_tests {
+    #[test]
+    fn local_and_remote_compaction_use_the_shared_hook_gates() {
+        for source in [
+            include_str!("compact.rs"),
+            include_str!("compact_remote_v2.rs"),
+        ] {
+            assert!(source.contains("run_pre_compact_hook_gate"));
+            assert!(source.contains("run_post_compact_hook_gate"));
+            assert!(!source.contains("emit_hook_stop_reason"));
+        }
+    }
 }
 
 async fn run_context_injecting_hook<Fut>(
@@ -696,7 +752,12 @@ impl HookRuntimeOutcome {
         turn_context: &Arc<TurnContext>,
         hook_name: &'static str,
     ) -> bool {
-        record_additional_contexts(sess, turn_context, self.additional_contexts).await;
+        if hook_name == "SessionStart" {
+            record_session_start_additional_contexts(sess, turn_context, self.additional_contexts)
+                .await;
+        } else {
+            record_additional_contexts(sess, turn_context, self.additional_contexts).await;
+        }
 
         if self.should_stop {
             emit_hook_stop_reason(sess, turn_context, hook_name, self.stop_reason.as_deref()).await;
@@ -729,6 +790,70 @@ pub(crate) async fn record_additional_contexts(
     turn_context: &Arc<TurnContext>,
     additional_contexts: Vec<String>,
 ) {
+    let developer_messages =
+        prepare_additional_context_items(sess, turn_context, additional_contexts).await;
+    if developer_messages.is_empty() {
+        return;
+    }
+
+    sess.record_conversation_items(turn_context, developer_messages.as_slice())
+        .await;
+}
+
+async fn record_session_start_additional_contexts(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    additional_contexts: Vec<String>,
+) {
+    let developer_messages =
+        prepare_additional_context_items(sess, turn_context, additional_contexts).await;
+    if developer_messages.is_empty() {
+        return;
+    }
+    let history = sess.clone_history().await;
+    let developer_messages =
+        dedupe_existing_developer_contexts(history.raw_items(), developer_messages);
+    if developer_messages.is_empty() {
+        return;
+    }
+    sess.record_conversation_items(turn_context, developer_messages.as_slice())
+        .await;
+}
+
+fn dedupe_existing_developer_contexts(
+    existing: &[ResponseItem],
+    candidates: Vec<ResponseItem>,
+) -> Vec<ResponseItem> {
+    let existing_text = existing
+        .iter()
+        .filter_map(single_developer_input_text)
+        .collect::<HashSet<_>>();
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            single_developer_input_text(candidate).is_none_or(|text| !existing_text.contains(text))
+        })
+        .collect()
+}
+
+fn single_developer_input_text(item: &ResponseItem) -> Option<&str> {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return None;
+    };
+    if role != "developer" {
+        return None;
+    }
+    match content.as_slice() {
+        [codex_protocol::models::ContentItem::InputText { text }] => Some(text),
+        _ => None,
+    }
+}
+
+pub(crate) async fn prepare_additional_context_items(
+    sess: &Arc<Session>,
+    _turn_context: &Arc<TurnContext>,
+    additional_contexts: Vec<String>,
+) -> Vec<ResponseItem> {
     let checkpoint_generation = sess.current_window_id().await;
     let additional_contexts = additional_contexts
         .into_iter()
@@ -747,13 +872,7 @@ pub(crate) async fn record_additional_contexts(
             }
         })
         .collect();
-    let developer_messages = additional_context_messages(additional_contexts);
-    if developer_messages.is_empty() {
-        return;
-    }
-
-    sess.record_conversation_items(turn_context, developer_messages.as_slice())
-        .await;
+    additional_context_messages(additional_contexts)
 }
 
 fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<ResponseItem> {
@@ -922,6 +1041,7 @@ mod tests {
 
     use super::CompletionHookWorkspaceObservationState;
     use super::additional_context_messages;
+    use super::dedupe_existing_developer_contexts;
     use super::finish_completion_hook_workspace_observation;
     use super::hook_run_analytics_payload;
     use super::hook_run_metric_tags;
@@ -1012,6 +1132,22 @@ mod tests {
                 ("developer", "first tide note".to_string()),
                 ("developer", "second tide note".to_string()),
             ],
+        );
+    }
+
+    #[test]
+    fn session_start_context_dedupes_markerless_resumed_history() {
+        let existing = additional_context_messages(vec!["same startup context".to_string()]);
+        let candidates = additional_context_messages(vec![
+            "same startup context".to_string(),
+            "new startup context".to_string(),
+        ]);
+
+        let deduped = dedupe_existing_developer_contexts(&existing, candidates);
+
+        assert_eq!(
+            deduped,
+            additional_context_messages(vec!["new startup context".to_string()])
         );
     }
 

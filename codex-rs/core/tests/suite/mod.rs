@@ -28,7 +28,6 @@ mod agent_jobs;
 mod agent_websocket;
 mod agents_md;
 mod apply_patch_cli;
-#[cfg(not(target_os = "windows"))]
 mod approvals;
 mod auto_review;
 mod cli_stream;
@@ -43,8 +42,8 @@ mod compact_remote;
 mod compact_resume_fork;
 mod completion_review;
 mod current_time_reminder;
+mod deprecation_notice;
 mod exec_policy;
-#[cfg(not(target_os = "windows"))]
 mod extension_sandbox;
 mod external_auth;
 mod fork_thread;
@@ -72,7 +71,6 @@ mod prompt_caching;
 mod prompt_debug_tests;
 mod quota_exceeded;
 mod remote_env;
-#[cfg(not(target_os = "windows"))]
 mod request_permissions;
 mod request_user_input;
 mod responses_api_proxy_headers;

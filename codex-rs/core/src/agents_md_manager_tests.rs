@@ -250,6 +250,30 @@ async fn repository_stable_context_reuse_is_scoped_to_one_manager() {
 }
 
 #[tokio::test]
+async fn unchanged_source_metadata_skips_project_file_read() {
+    let root = tempfile::tempdir().expect("workspace");
+    fs::write(root.path().join("AGENTS.md"), "stable instructions").expect("write AGENTS.md");
+    let config = config_for(&root).await;
+    let filesystem = Arc::new(ControlledFileSystem::new(config.cwd.join("AGENTS.md")));
+    let environment = Arc::new(Environment::default_for_tests_with_filesystem(
+        filesystem.clone(),
+    ));
+    let environments = environment_snapshot_with_environment(&config.cwd, 3, environment);
+    let manager = AgentsMdManager::new(/*user_instructions*/ None);
+
+    let first_observation = manager.refresh_and_observe(&config, &environments).await;
+    let first = first_observation.loaded.expect("first load");
+    assert_eq!(filesystem.target_stream_calls(), 1);
+
+    let second_observation = manager.refresh_and_observe(&config, &environments).await;
+    let second = second_observation.loaded.expect("metadata-cached load");
+
+    assert_eq!(second_observation.freshness, AgentsMdFreshness::Refreshed);
+    assert_eq!(filesystem.target_stream_calls(), 1);
+    assert!(Arc::ptr_eq(&first, &second));
+}
+
+#[tokio::test]
 async fn repository_stable_context_detects_same_session_provenance_replacement() {
     let root = tempfile::tempdir().expect("workspace");
     let agents_path = root.path().join("AGENTS.md");
@@ -367,7 +391,7 @@ async fn overlapping_refreshes_publish_in_request_order() {
 async fn step_refresh_captures_environments_after_entering_refresh_gate() {
     let root = tempfile::tempdir().expect("workspace");
     fs::write(root.path().join("AGENTS.md"), "initial instructions").expect("write AGENTS.md");
-    let config = config_for(&root).await;
+    let config = Arc::new(config_for(&root).await);
     let initial_generation = 20;
     let thread_environments = ThreadEnvironments::new(
         Arc::new(EnvironmentManager::default_for_tests()),
@@ -425,6 +449,7 @@ async fn same_key_read_failure_retains_last_successful_instructions_and_recovers
         &first,
         cached_observation.loaded.as_ref().expect("cached load")
     ));
+    fs::write(&agents_path, "unreadable version two").expect("write unreadable AGENTS.md");
     filesystem.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
     let retained_observation = manager.refresh_and_observe(&config, &environments).await;
     assert_eq!(
@@ -435,7 +460,7 @@ async fn same_key_read_failure_retains_last_successful_instructions_and_recovers
     assert!(Arc::ptr_eq(&first, &retained));
     assert_eq!(retained.text(), "version one");
 
-    fs::write(&agents_path, "version two").expect("write recovered AGENTS.md");
+    fs::write(&agents_path, "version two recovered").expect("write recovered AGENTS.md");
     let recovered_observation = manager.refresh_and_observe(&config, &environments).await;
     assert_eq!(
         recovered_observation.freshness,
@@ -443,7 +468,7 @@ async fn same_key_read_failure_retains_last_successful_instructions_and_recovers
     );
     let recovered = recovered_observation.loaded.expect("recovered load");
     assert!(!Arc::ptr_eq(&retained, &recovered));
-    assert_eq!(recovered.text(), "version two");
+    assert_eq!(recovered.text(), "version two recovered");
 }
 
 #[tokio::test]
@@ -458,6 +483,7 @@ async fn content_and_missing_higher_precedence_file_invalidate_cache() {
 
     manager.refresh(&config, &environments).await;
     let first = manager.get_loaded().await.expect("first load");
+    tokio::time::sleep(Duration::from_millis(10)).await;
     fs::write(&agents, "version two").expect("replace same-size contents");
     manager.refresh(&config, &environments).await;
     let changed = manager.get_loaded().await.expect("changed load");

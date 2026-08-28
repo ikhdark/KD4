@@ -141,6 +141,22 @@ impl Hooks {
         self.engine.preview_post_tool_use(request)
     }
 
+    pub fn plan_post_tool_use(
+        &self,
+        tool_name: &str,
+        matcher_aliases: &[String],
+    ) -> crate::PostToolUsePlan {
+        self.engine.plan_post_tool_use(tool_name, matcher_aliases)
+    }
+
+    pub fn preview_planned_post_tool_use(
+        &self,
+        plan: &crate::PostToolUsePlan,
+        tool_use_id: &str,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_planned_post_tool_use(plan, tool_use_id)
+    }
+
     pub async fn run_session_start(
         &self,
         request: SessionStartRequest,
@@ -164,6 +180,14 @@ impl Hooks {
         self.engine.run_post_tool_use(request).await
     }
 
+    pub async fn run_planned_post_tool_use(
+        &self,
+        plan: crate::PostToolUsePlan,
+        request: PostToolUseRequest,
+    ) -> PostToolUseOutcome {
+        self.engine.run_planned_post_tool_use(plan, request).await
+    }
+
     pub fn preview_pre_compact(
         &self,
         request: &PreCompactRequest,
@@ -184,6 +208,10 @@ impl Hooks {
 
     pub async fn run_post_compact(&self, request: PostCompactRequest) -> StatelessHookOutcome {
         self.engine.run_post_compact(request).await
+    }
+
+    pub fn has_handler_for(&self, event_name: codex_protocol::protocol::HookEventName) -> bool {
+        self.engine.has_handler_for(event_name)
     }
 
     pub fn preview_user_prompt_submit(

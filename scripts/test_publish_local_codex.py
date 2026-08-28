@@ -501,9 +501,18 @@ catch {{
         command = rf"""
 . {ps_single_quote(SCRIPT)} -ImportOnly
 function Get-CodexDesktopExecutableProof {{ return 'C:\Program Files\WindowsApps\OpenAI.Codex\app\Codex.exe' }}
-function Get-Process {{ return @() }}
+$script:Launched = $false
+function Get-CodexDesktopProcessesForPath {{
+    param([string]$DesktopPath)
+    if ($script:Launched) {{
+        return @([pscustomobject]@{{ Id = 91; Path = $DesktopPath }})
+    }}
+    return @()
+}}
+function Test-DesktopRuntimeProof {{ return $true }}
 function Start-Process {{
     param([string]$FilePath, [object[]]$ArgumentList)
+    $script:Launched = $true
     $script:Launch = [pscustomobject]@{{
         FilePath = $FilePath
         Argument = [string]$ArgumentList[0]
@@ -556,6 +565,85 @@ Restart-CodexDesktop `
         self.assertEqual(output["RestoredCliPath"], "before-cli")
         self.assertEqual(output["RestoredCodexHome"], "before-home")
         self.assertEqual(output["RestoredSqliteHome"], "before-sqlite")
+        self.assertIn("desktopRestart: restarted", result.stdout)
+
+    def test_explorer_success_without_desktop_process_fails_restart(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+function Get-CodexDesktopExecutableProof {{ return 'C:\Program Files\WindowsApps\OpenAI.Codex\app\Codex.exe' }}
+function Get-CodexDesktopProcessesForPath {{ return @() }}
+function Start-Process {{}}
+try {{
+    Restart-CodexDesktop `
+        -LocalCliPath 'C:\local\codex.exe' `
+        -LocalCodexHome 'C:\local\home' `
+        -LocalCodexSqliteHome 'C:\local\sqlite' `
+        -ActivationTimeoutSeconds 1
+    throw 'expected missing Desktop process to fail'
+}}
+catch {{
+    if ($_.Exception.Message -eq 'expected missing Desktop process to fail') {{ throw }}
+    $_.Exception.Message
+}}
+"""
+        result = subprocess.run(
+            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+            env=clean_env(),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("did not start", result.stdout)
+        self.assertNotIn("desktopRestart: restarted", result.stdout)
+
+    def test_live_desktop_with_mismatched_runtime_receipt_fails_restart(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        command = rf"""
+. {ps_single_quote(SCRIPT)} -ImportOnly
+function Get-CodexDesktopExecutableProof {{ return 'C:\Program Files\WindowsApps\OpenAI.Codex\app\Codex.exe' }}
+function Get-CodexDesktopProcessesForPath {{
+    param([string]$DesktopPath)
+    return @([pscustomobject]@{{ Id = 91; Path = $DesktopPath }})
+}}
+function Test-DesktopRuntimeProof {{ return $false }}
+function Start-Process {{}}
+function Stop-Process {{}}
+function Get-LiveProcessesById {{ return @() }}
+try {{
+    Restart-CodexDesktop `
+        -LocalCliPath 'C:\local\codex.exe' `
+        -LocalCodexHome 'C:\local\home' `
+        -LocalCodexSqliteHome 'C:\local\sqlite' `
+        -ActivationTimeoutSeconds 1
+    throw 'expected mismatched receipt to fail'
+}}
+catch {{
+    if ($_.Exception.Message -eq 'expected mismatched receipt to fail') {{ throw }}
+    $_.Exception.Message
+}}
+"""
+        result = subprocess.run(
+            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+            env=clean_env(),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("did not match", result.stdout)
+        self.assertNotIn("desktopRestart: restarted", result.stdout)
 
     def test_noop_restart_failure_is_terminal_after_committed_publish(self) -> None:
         publish_script = publish_source_text()

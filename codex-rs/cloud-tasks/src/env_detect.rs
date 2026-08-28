@@ -1,5 +1,4 @@
-use codex_http_client::HttpClient;
-use codex_http_client::HttpClientBuilder;
+use codex_http_client::RouteAwareClientPool;
 use http::HeaderMap;
 use http::header::CONTENT_TYPE;
 use std::collections::HashMap;
@@ -26,6 +25,7 @@ pub struct AutodetectSelection {
 }
 
 pub async fn autodetect_environment_id(
+    http: &RouteAwareClientPool,
     base_url: &CloudBaseUrl,
     headers: &HeaderMap,
     desired_label: Option<String>,
@@ -48,7 +48,7 @@ pub async fn autodetect_environment_id(
                 )
             };
             crate::append_error_log(format!("env: GET {url}"));
-            match get_json::<Vec<CodeEnvironment>>(&url, headers).await {
+            match get_json_with_client::<Vec<CodeEnvironment>>(http, &url, headers).await {
                 Ok(mut list) => {
                     crate::append_error_log(format!(
                         "env: by-repo returned {} env(s) for {owner}/{repo}",
@@ -77,7 +77,6 @@ pub async fn autodetect_environment_id(
     };
     crate::append_error_log(format!("env: GET {list_url}"));
     // Fetch and log the full environments JSON for debugging
-    let http = HttpClientBuilder::new().build_with_transport_default_proxy()?;
     let res = http.get(&list_url).headers(headers.clone()).send().await?;
     let status = res.status();
     let ct = res
@@ -147,16 +146,8 @@ fn pick_environment_row(
     None
 }
 
-async fn get_json<T: serde::de::DeserializeOwned>(
-    url: &str,
-    headers: &HeaderMap,
-) -> anyhow::Result<T> {
-    let http = HttpClientBuilder::new().build_with_transport_default_proxy()?;
-    get_json_with_client(&http, url, headers).await
-}
-
 async fn get_json_with_client<T: serde::de::DeserializeOwned>(
-    http: &HttpClient,
+    http: &RouteAwareClientPool,
     url: &str,
     headers: &HeaderMap,
 ) -> anyhow::Result<T> {
@@ -185,30 +176,44 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn get_json_uses_shared_http_client() {
+    async fn list_environments_reuses_caller_http_client() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/environments"))
+            .and(wiremock::matchers::path("/backend-api/wham/environments"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!([{"id": "env-1", "label": "Local"}])),
             )
+            .expect(1)
             .mount(&server)
             .await;
-        let http = HttpClientBuilder::new()
-            .build_direct()
-            .expect("shared HTTP client should build");
+        let http = crate::environment_http_clients(&codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ));
 
-        let environments: Vec<CodeEnvironment> = get_json_with_client(
+        let environments = list_environments_with_origins(
             &http,
-            &format!("{}/environments", server.uri()),
+            &CloudBaseUrl::new(&format!("{}/backend-api", server.uri())),
             &HeaderMap::new(),
+            &[],
         )
         .await
         .expect("environment response should decode");
 
         assert_eq!(environments.len(), 1);
         assert_eq!(environments[0].id, "env-1");
+    }
+
+    #[test]
+    fn environment_pool_retains_the_effective_proxy_policy() {
+        let http = crate::environment_http_clients(&codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::RespectSystemProxy,
+        ));
+
+        assert_eq!(
+            http.outbound_proxy_policy(),
+            codex_http_client::OutboundProxyPolicy::RespectSystemProxy
+        );
     }
 }
 
@@ -298,14 +303,24 @@ fn parse_owner_repo(url: &str) -> Option<(String, String)> {
 /// List environments for the current repo(s) with a fallback to the global list.
 /// Returns a de-duplicated, sorted set suitable for the TUI modal.
 pub async fn list_environments(
+    http: &RouteAwareClientPool,
     base_url: &CloudBaseUrl,
     headers: &HeaderMap,
+) -> anyhow::Result<Vec<crate::app::EnvironmentRow>> {
+    let origins = get_git_origins();
+    list_environments_with_origins(http, base_url, headers, &origins).await
+}
+
+async fn list_environments_with_origins(
+    http: &RouteAwareClientPool,
+    base_url: &CloudBaseUrl,
+    headers: &HeaderMap,
+    origins: &[String],
 ) -> anyhow::Result<Vec<crate::app::EnvironmentRow>> {
     let mut map: HashMap<String, crate::app::EnvironmentRow> = HashMap::new();
 
     // 1) By-repo lookup for each parsed GitHub origin
-    let origins = get_git_origins();
-    for origin in &origins {
+    for origin in origins {
         if let Some((owner, repo)) = parse_owner_repo(origin) {
             let url = if base_url.as_str().contains("/backend-api") {
                 format!(
@@ -318,7 +333,7 @@ pub async fn list_environments(
                     base_url, "github", owner, repo
                 )
             };
-            match get_json::<Vec<CodeEnvironment>>(&url, headers).await {
+            match get_json_with_client::<Vec<CodeEnvironment>>(http, &url, headers).await {
                 Ok(list) => {
                     info!("env_tui: by-repo {}:{} -> {} envs", owner, repo, list.len());
                     for e in list {
@@ -356,7 +371,7 @@ pub async fn list_environments(
     } else {
         format!("{base_url}/api/codex/environments")
     };
-    match get_json::<Vec<CodeEnvironment>>(&list_url, headers).await {
+    match get_json_with_client::<Vec<CodeEnvironment>>(http, &list_url, headers).await {
         Ok(list) => {
             info!("env_tui: global list -> {} envs", list.len());
             for e in list {

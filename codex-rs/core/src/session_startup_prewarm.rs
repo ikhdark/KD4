@@ -266,9 +266,6 @@ impl Session {
     /// transport configuration are stable. Tool and prompt construction intentionally do
     /// not participate in this key or gate this work.
     pub(crate) async fn schedule_startup_transport_preconnect(self: &Arc<Self>) {
-        if !crate::latency_switches::stage2_critical_path_enabled() {
-            return;
-        }
         if !self.services.model_client.startup_websocket_enabled() {
             let model_client = self.services.model_client.clone();
             let task = tokio::spawn(async move {

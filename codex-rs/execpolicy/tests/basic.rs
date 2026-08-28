@@ -1,5 +1,4 @@
 #![allow(clippy::expect_used)]
-use std::any::Any;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,23 +54,8 @@ fn starlark_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RuleSnapshot {
-    Prefix(PrefixRule),
-}
-
-fn rule_snapshots(rules: &[RuleRef]) -> Vec<RuleSnapshot> {
-    rules
-        .iter()
-        .map(|rule| {
-            let rule_any = rule.as_ref() as &dyn Any;
-            if let Some(prefix_rule) = rule_any.downcast_ref::<PrefixRule>() {
-                RuleSnapshot::Prefix(prefix_rule.clone())
-            } else {
-                panic!("unexpected rule type in RuleRef: {rule:?}");
-            }
-        })
-        .collect()
+fn rule_snapshots(rules: &[RuleRef]) -> Vec<PrefixRule> {
+    rules.iter().map(|rule| rule.as_ref().clone()).collect()
 }
 
 #[test]
@@ -245,14 +229,14 @@ fn add_prefix_rule_extends_policy() -> Result<()> {
 
     let rules = rule_snapshots(policy.rules().get_vec("ls").context("missing ls rules")?);
     assert_eq!(
-        vec![RuleSnapshot::Prefix(PrefixRule {
+        vec![PrefixRule {
             pattern: PrefixPattern {
                 first: Arc::from("ls"),
                 rest: vec![PatternToken::Single(String::from("-l"))].into(),
             },
             decision: Decision::Prompt,
             justification: None,
-        })],
+        }],
         rules
     );
 
@@ -332,22 +316,22 @@ prefix_rule(
     let git_rules = rule_snapshots(policy.rules().get_vec("git").context("missing git rules")?);
     assert_eq!(
         vec![
-            RuleSnapshot::Prefix(PrefixRule {
+            PrefixRule {
                 pattern: PrefixPattern {
                     first: Arc::from("git"),
                     rest: Vec::<PatternToken>::new().into(),
                 },
                 decision: Decision::Prompt,
                 justification: None,
-            }),
-            RuleSnapshot::Prefix(PrefixRule {
+            },
+            PrefixRule {
                 pattern: PrefixPattern {
                     first: Arc::from("git"),
                     rest: vec![PatternToken::Single("commit".to_string())].into(),
                 },
                 decision: Decision::Forbidden,
                 justification: None,
-            }),
+            },
         ],
         git_rules
     );
@@ -409,25 +393,25 @@ prefix_rule(
     );
     let sh_rules = rule_snapshots(policy.rules().get_vec("sh").context("missing sh rules")?);
     assert_eq!(
-        vec![RuleSnapshot::Prefix(PrefixRule {
+        vec![PrefixRule {
             pattern: PrefixPattern {
                 first: Arc::from("bash"),
                 rest: vec![PatternToken::Alts(vec!["-c".to_string(), "-l".to_string()])].into(),
             },
             decision: Decision::Allow,
             justification: None,
-        })],
+        }],
         bash_rules
     );
     assert_eq!(
-        vec![RuleSnapshot::Prefix(PrefixRule {
+        vec![PrefixRule {
             pattern: PrefixPattern {
                 first: Arc::from("sh"),
                 rest: vec![PatternToken::Alts(vec!["-c".to_string(), "-l".to_string()])].into(),
             },
             decision: Decision::Allow,
             justification: None,
-        })],
+        }],
         sh_rules
     );
 
@@ -474,7 +458,7 @@ prefix_rule(
 
     let rules = rule_snapshots(policy.rules().get_vec("npm").context("missing npm rules")?);
     assert_eq!(
-        vec![RuleSnapshot::Prefix(PrefixRule {
+        vec![PrefixRule {
             pattern: PrefixPattern {
                 first: Arc::from("npm"),
                 rest: vec![
@@ -488,7 +472,7 @@ prefix_rule(
             },
             decision: Decision::Allow,
             justification: None,
-        })],
+        }],
         rules
     );
 

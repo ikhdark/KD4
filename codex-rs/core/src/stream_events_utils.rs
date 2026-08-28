@@ -12,28 +12,40 @@ use crate::parse_turn_item;
 use crate::session::session::Session;
 use crate::session::turn::reconcile_turn_progress_event;
 use crate::session::turn_context::TurnContext;
+use crate::tools::parallel::ToolCallCompletion;
 use crate::tools::parallel::ToolCallRuntime;
+use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallBuildError;
 use crate::tools::router::ToolRouter;
 use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use codex_memories_read::citations::parse_memory_citation;
 use codex_memories_read::citations::thread_ids_from_memory_citation;
+use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::memory_citation::MemoryCitation;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ToolExecutionId;
+use codex_protocol::protocol::TurnTimingToolCallSource;
 use codex_rollout::state_integration;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_stream_parser::strip_proposed_plan_blocks;
 use futures::Future;
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use futures::future::Shared;
+use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::debug;
 use tracing::instrument;
 use tracing::warn;
 
 const GENERATED_IMAGE_ARTIFACTS_DIR: &str = "generated_images";
+
+fn tool_call_arguments_length(call: &ToolCall) -> usize {
+    call.payload.log_payload().len()
+}
 
 /// Returns the host-owned default artifact path for a generated image.
 pub fn image_generation_artifact_path(
@@ -105,21 +117,6 @@ pub(crate) fn raw_assistant_output_text_from_item(item: &ResponseItem) -> Option
     None
 }
 
-/// Persist a completed model response item and record any cited memory usage.
-pub(crate) async fn record_completed_response_item(
-    sess: &Session,
-    turn_context: &TurnContext,
-    item: &ResponseItem,
-) {
-    record_completed_response_item_with_finalized_facts(
-        sess,
-        turn_context,
-        item,
-        /*finalized_facts*/ None,
-    )
-    .await;
-}
-
 pub(crate) async fn record_completed_response_item_with_finalized_facts(
     sess: &Session,
     turn_context: &TurnContext,
@@ -177,6 +174,7 @@ pub(crate) async fn mark_thread_memory_mode_polluted_if_external_context(
 ) {
     if !turn_context.config.memories.disable_on_external_context
         || !response_item_may_include_external_context(item)
+        || !turn_context.claim_memory_pollution_signal()
     {
         return;
     }
@@ -222,9 +220,10 @@ async fn record_stage1_output_usage_for_memory_citation(
 /// queuing any tool execution futures. This records items immediately so
 /// history and rollout stay in sync even if the turn is later cancelled.
 pub(crate) type InFlightFuture<'f> =
-    Pin<Box<dyn Future<Output = Result<ResponseInputItem>> + Send + 'f>>;
+    Pin<Box<dyn Future<Output = Result<ToolCallCompletion>> + Send + 'f>>;
 
 pub(crate) struct InFlightToolCall {
+    pub(crate) call: ToolCall,
     pub(crate) call_id: String,
     pub(crate) execution_id: ToolExecutionId,
     pub(crate) timing: Arc<ToolDispatchTiming>,
@@ -232,25 +231,34 @@ pub(crate) struct InFlightToolCall {
 }
 
 pub(crate) struct InFlightToolResult {
+    pub(crate) call: ToolCall,
     pub(crate) call_id: String,
     pub(crate) execution_id: ToolExecutionId,
     pub(crate) timing: Arc<ToolDispatchTiming>,
-    pub(crate) result: Result<ResponseInputItem>,
+    pub(crate) result: Result<ToolCallCompletion>,
 }
 
 impl InFlightToolCall {
     #[cfg(test)]
     pub(crate) fn from_test_future(
         call_id: impl Into<String>,
-        future: InFlightFuture<'static>,
+        future: Pin<Box<dyn Future<Output = Result<ResponseInputItem>> + Send + 'static>>,
     ) -> Self {
+        let call_id = call_id.into();
         let timing = Arc::new(ToolDispatchTiming::new(tokio::time::Instant::now(), false));
         let execution_id = timing.execution_id().clone();
         Self {
-            call_id: call_id.into(),
+            call: ToolCall {
+                tool_name: codex_tools::ToolName::plain("test_tool"),
+                call_id: call_id.clone(),
+                payload: crate::tools::context::ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+            },
+            call_id,
             execution_id,
             timing,
-            future,
+            future: Box::pin(async move { future.await.map(ToolCallCompletion::nonterminal) }),
         }
     }
 
@@ -261,6 +269,7 @@ impl InFlightToolCall {
             reconcile_turn_progress_event(&turn_timing_state, 1, "relay enqueue");
         }
         InFlightToolResult {
+            call: self.call,
             call_id: self.call_id,
             execution_id: self.execution_id,
             timing: self.timing,
@@ -283,6 +292,103 @@ pub(crate) struct HandleOutputCtx {
     pub turn_store: Arc<ExtensionData>,
     pub tool_runtime: ToolCallRuntime,
     pub cancellation_token: CancellationToken,
+    pub response_item_recorder: OrderedResponseItemRecorder,
+}
+
+type ResponseItemPersistenceBarrier = Shared<BoxFuture<'static, ()>>;
+
+#[derive(Clone, Default)]
+pub(crate) struct OrderedResponseItemRecorder {
+    tail: Arc<Mutex<Option<ResponseItemPersistenceBarrier>>>,
+}
+
+impl OrderedResponseItemRecorder {
+    async fn enqueue(
+        &self,
+        sess: Arc<Session>,
+        turn_context: Arc<TurnContext>,
+        item: ResponseItem,
+        following_items: Vec<ResponseItem>,
+        finalized_facts: Option<FinalizedTurnItemFacts>,
+    ) -> ResponseItemPersistenceBarrier {
+        let mut tail = self.tail.lock().await;
+        let preceding = tail.clone();
+        let barrier = async move {
+            if let Some(preceding) = preceding {
+                preceding.await;
+            }
+            let mut items = Vec::with_capacity(1 + following_items.len());
+            items.push(item);
+            items.extend(following_items);
+            sess.record_conversation_items(&turn_context, &items).await;
+            let primary = &items[0];
+            let defers_mailbox_delivery = finalized_facts.as_ref().map_or_else(
+                || {
+                    completed_item_defers_mailbox_delivery_to_next_turn(
+                        primary,
+                        turn_context.collaboration_mode.mode == ModeKind::Plan,
+                    )
+                },
+                |facts| facts.defers_mailbox_delivery_to_next_turn,
+            );
+            if defers_mailbox_delivery {
+                sess.input_queue
+                    .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &turn_context.sub_id)
+                    .await;
+            }
+            mark_thread_memory_mode_polluted_if_external_context(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                primary,
+            )
+            .await;
+            let has_memory_citation = if let Some(memory_citation) = finalized_facts
+                .as_ref()
+                .and_then(|facts| facts.memory_citation.as_ref())
+            {
+                record_stage1_output_usage_for_memory_citation(
+                    sess.services.state_db.as_ref(),
+                    memory_citation,
+                )
+                .await
+            } else {
+                record_stage1_output_usage_and_detect_memory_citation(
+                    sess.services.state_db.as_ref(),
+                    primary,
+                )
+                .await
+            };
+            if has_memory_citation {
+                sess.record_memory_citation_for_turn(&turn_context.sub_id)
+                    .await;
+            }
+        }
+        .boxed()
+        .shared();
+        *tail = Some(barrier.clone());
+        drop(tokio::spawn(barrier.clone()));
+        barrier
+    }
+
+    pub(crate) async fn flush(&self) {
+        let tail = self.tail.lock().await.clone();
+        if let Some(tail) = tail {
+            tail.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn block_persistence_for_test(
+        &self,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let barrier = async move {
+            let _ = release.await;
+        }
+        .boxed()
+        .shared();
+        *self.tail.lock().await = Some(barrier);
+    }
 }
 
 pub(crate) async fn apply_turn_item_contributors(
@@ -374,11 +480,47 @@ pub(crate) async fn handle_output_item_done(
     let plan_mode = ctx.turn_context.collaboration_mode.mode == ModeKind::Plan;
 
     match ToolRouter::build_tool_call(item.clone()) {
-        // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
+        // The model emitted a tool call; admit it, persist it, and queue the tool execution.
         Ok(Some(call)) => {
             ctx.turn_context
                 .turn_timing_state
                 .record_model_emitted_tool_call();
+
+            output.eager_read_eligible = ctx
+                .tool_runtime
+                .take_eager_read_eligibility(&call, earlier_tool_calls_eligible);
+            let call_id = call.call_id.clone();
+            let timing = ctx
+                .tool_runtime
+                .create_tool_dispatch_timing(item_accepted_at, output.eager_read_eligible);
+            let execution_id = timing.execution_id().clone();
+            if ctx
+                .turn_context
+                .turn_timing_state
+                .reject_duplicate_tool_call_id_if_accepted(
+                    &call_id,
+                    TurnTimingToolCallSource::Direct,
+                )
+            {
+                return Err(CodexErr::Fatal(format!(
+                    "refusing tool call `{call_id}` because acceptance was sealed or the same call ID was already accepted in this model generation"
+                )));
+            }
+            let accepted = ctx.turn_context.tool_call_acceptance.try_accept(|| {
+                ctx.turn_context
+                    .turn_timing_state
+                    .try_record_accepted_tool_call(
+                        &call_id,
+                        &execution_id,
+                        TurnTimingToolCallSource::Direct,
+                        None,
+                    )
+            });
+            if !accepted {
+                return Err(CodexErr::Fatal(format!(
+                    "refusing tool call `{call_id}` because acceptance was sealed or the same call ID was already accepted in this model generation"
+                )));
+            }
             ctx.sess
                 .input_queue
                 .accept_mailbox_delivery_for_current_turn(
@@ -386,40 +528,44 @@ pub(crate) async fn handle_output_item_done(
                     &ctx.turn_context.sub_id,
                 )
                 .await;
-
-            let payload_preview = call.payload.log_payload().into_owned();
             tracing::info!(
                 thread_id = %ctx.sess.thread_id,
-                "ToolCall: {} {}",
-                call.tool_name,
-                payload_preview
+                tool_name = %call.tool_name,
+                call_id = %call.call_id,
+                arguments_length = tool_call_arguments_length(&call),
+                "ToolCall"
             );
 
-            record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
+            let persistence_barrier = ctx
+                .response_item_recorder
+                .enqueue(
+                    Arc::clone(&ctx.sess),
+                    Arc::clone(&ctx.turn_context),
+                    item,
+                    Vec::new(),
+                    None,
+                )
                 .await;
-
-            output.eager_read_eligible = ctx
-                .tool_runtime
-                .take_eager_read_eligibility(&call, earlier_tool_calls_eligible);
 
             let cancellation_token = ctx.cancellation_token.child_token();
             let tool_runtime = ctx.tool_runtime.clone();
-            let eager = output.eager_read_eligible;
-            let call_id = call.call_id.clone();
-            let timing = tool_runtime.create_tool_dispatch_timing(item_accepted_at, eager);
-            let execution_id = timing.execution_id().clone();
+            let accepted_call = call.clone();
             let future_timing = Arc::clone(&timing);
             // Keep deferred dispatch genuinely lazy. Eager callers poll this
-            // future after persistence; deferred callers do not construct the
-            // runtime dispatch task until the response tail has completed.
-            let tool_future: InFlightFuture<'static> = Box::pin(async move {
+            // future after its ordered persistence barrier; deferred callers
+            // do not construct the runtime dispatch task until the response
+            // tail has completed.
+            let completion = async move {
+                persistence_barrier.await;
                 tool_runtime
-                    .handle_tool_call_with_trace(call, cancellation_token, future_timing)
+                    .handle_model_tool_call_with_trace(call, cancellation_token, future_timing)
                     .await
-            });
+            };
+            let tool_future: InFlightFuture<'static> = Box::pin(completion);
 
             output.needs_follow_up = true;
             output.tool_future = Some(InFlightToolCall {
+                call: accepted_call,
                 call_id,
                 execution_id,
                 timing,
@@ -449,13 +595,17 @@ pub(crate) async fn handle_output_item_done(
                     .emit_turn_item_completed(&ctx.turn_context, finalized_turn_item.turn_item)
                     .await;
             }
-            record_completed_response_item_with_finalized_facts(
-                ctx.sess.as_ref(),
-                ctx.turn_context.as_ref(),
-                &item,
-                finalized_facts.as_ref(),
-            )
-            .await;
+            drop(
+                ctx.response_item_recorder
+                    .enqueue(
+                        Arc::clone(&ctx.sess),
+                        Arc::clone(&ctx.turn_context),
+                        item,
+                        Vec::new(),
+                        finalized_facts.clone(),
+                    )
+                    .await,
+            );
 
             output.last_agent_message = finalized_facts.and_then(|facts| facts.last_agent_message);
         }
@@ -468,19 +618,23 @@ pub(crate) async fn handle_output_item_done(
                 tools: Vec::new(),
                 omitted_result_count: None,
             };
-            record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
-                .await;
             // A malformed tool item is deferred and closes the eager prefix for
             // every later call in this model response.
             *earlier_tool_calls_eligible = false;
-            if let Some(response_item) = response_input_to_response_item(&response) {
-                ctx.sess
-                    .record_conversation_items(
-                        &ctx.turn_context,
-                        std::slice::from_ref(&response_item),
+            let following_items = response_input_to_response_item(&response)
+                .into_iter()
+                .collect();
+            drop(
+                ctx.response_item_recorder
+                    .enqueue(
+                        Arc::clone(&ctx.sess),
+                        Arc::clone(&ctx.turn_context),
+                        item,
+                        following_items,
+                        None,
                     )
-                    .await;
-            }
+                    .await,
+            );
 
             output.needs_follow_up = true;
         }

@@ -16,7 +16,6 @@ use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_protocol::protocol::TurnTimingDeterministicContinuationReceipt;
 use codex_tools::CanonicalToolResult;
 use codex_tools::CodeModeToolSearchStatus;
-use codex_tools::LoadableToolSpec;
 use codex_tools::ToolName;
 use codex_tools::ToolOutputDiagnosticClass;
 use codex_tools::ToolOutputOutcome;
@@ -40,9 +39,19 @@ use codex_utils_output_truncation::truncate_text_to_token_ceiling;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+std::thread_local! {
+    static FUNCTION_PROJECTION_METADATA_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
 
 pub use codex_tools::ToolOutput;
 pub use codex_tools::ToolPayload;
@@ -55,6 +64,102 @@ where
 }
 
 pub type SharedTurnDiffTracker = Arc<Mutex<TurnDiffTracker>>;
+
+/// Linearizes tool admission, ordinary completion, and cancellation. Keeping
+/// these transitions in one atomic prevents combinations such as "cancelled
+/// before admission" and "handler completed" from being observed together.
+#[derive(Debug)]
+pub(crate) struct ToolDispatchState {
+    state: AtomicU8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum ToolDispatchPhase {
+    WaitingForAdmission = 0,
+    Admitted = 1,
+    Completed = 2,
+    AbortedBeforeAdmission = 3,
+    AbortedAfterAdmission = 4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToolDispatchAbort {
+    BeforeAdmission,
+    AfterAdmission,
+    AlreadyTerminal,
+}
+
+impl ToolDispatchState {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: AtomicU8::new(ToolDispatchPhase::WaitingForAdmission as u8),
+        }
+    }
+
+    pub(crate) fn try_admit(&self) -> bool {
+        self.state
+            .compare_exchange(
+                ToolDispatchPhase::WaitingForAdmission as u8,
+                ToolDispatchPhase::Admitted as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn try_complete(&self) -> bool {
+        self.state
+            .compare_exchange(
+                ToolDispatchPhase::Admitted as u8,
+                ToolDispatchPhase::Completed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn try_abort(&self) -> ToolDispatchAbort {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let (next, outcome) = match current {
+                value if value == ToolDispatchPhase::WaitingForAdmission as u8 => (
+                    ToolDispatchPhase::AbortedBeforeAdmission,
+                    ToolDispatchAbort::BeforeAdmission,
+                ),
+                value if value == ToolDispatchPhase::Admitted as u8 => (
+                    ToolDispatchPhase::AbortedAfterAdmission,
+                    ToolDispatchAbort::AfterAdmission,
+                ),
+                _ => return ToolDispatchAbort::AlreadyTerminal,
+            };
+            if self
+                .state
+                .compare_exchange(current, next as u8, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return outcome;
+            }
+        }
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            value if value == ToolDispatchPhase::Completed as u8
+                || value == ToolDispatchPhase::AbortedBeforeAdmission as u8
+                || value == ToolDispatchPhase::AbortedAfterAdmission as u8
+        )
+    }
+
+    pub(crate) fn is_aborted(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            value if value == ToolDispatchPhase::AbortedBeforeAdmission as u8
+                || value == ToolDispatchPhase::AbortedAfterAdmission as u8
+        )
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolCallSource {
@@ -71,6 +176,30 @@ pub enum ToolCallSource {
     },
 }
 
+/// Internal semantic reason a required model-issued tool fixes the turn's
+/// outcome. This deliberately remains separate from the public completion
+/// enum: transport completion and semantic success are independent contracts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequiredToolTerminalCause {
+    Blocked,
+    Failure,
+    TimedOut,
+    RecoverableCancellation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RequiredToolTerminal {
+    pub(crate) call_id: String,
+    pub(crate) cause: RequiredToolTerminalCause,
+    pub(crate) message: String,
+}
+
+impl RequiredToolTerminal {
+    pub(crate) fn is_blocked(&self) -> bool {
+        self.cause == RequiredToolTerminalCause::Blocked
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolInvocation {
     pub session: Arc<Session>,
@@ -85,16 +214,23 @@ pub struct ToolInvocation {
 
 #[derive(Clone, Debug)]
 pub struct McpToolOutput {
-    pub result: CallToolResult,
-    pub tool_input: JsonValue,
-    pub wall_time: Duration,
-    pub original_image_detail_supported: bool,
-    pub truncation_policy: TruncationPolicy,
+    result: CallToolResult,
+    tool_input: JsonValue,
+    wall_time: Duration,
+    original_image_detail_supported: bool,
+    truncation_policy: TruncationPolicy,
+    projections: Arc<McpToolOutputProjections>,
+}
+
+#[derive(Debug, Default)]
+struct McpToolOutputProjections {
+    raw_json: OnceLock<Result<JsonValue, String>>,
+    provider_payload: OnceLock<FunctionCallOutputPayload>,
 }
 
 impl ToolOutput for McpToolOutput {
     fn log_preview(&self) -> String {
-        let payload = self.response_payload();
+        let payload = self.provider_payload();
         let preview = payload.body.to_text().unwrap_or_else(|| {
             serde_json::to_string(&self.result.content)
                 .unwrap_or_else(|err| format!("failed to serialize mcp result: {err}"))
@@ -107,8 +243,9 @@ impl ToolOutput for McpToolOutput {
     }
 
     fn sampling_request_signal(&self) -> Option<JsonValue> {
-        serde_json::to_value(&self.result)
+        self.raw_json_projection()
             .ok()
+            .cloned()
             .map(|semantic_evidence| {
                 if self.result.success() {
                     semantic_evidence_sampling_signal(semantic_evidence)
@@ -123,22 +260,24 @@ impl ToolOutput for McpToolOutput {
     }
 
     fn canonical_result(&self, _payload: &ToolPayload) -> Option<CanonicalToolResult> {
-        serde_json::to_value(&self.result)
+        self.raw_json_projection()
             .ok()
+            .cloned()
             .map(CanonicalToolResult::json)
     }
 
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
         ResponseInputItem::FunctionCallOutput {
             call_id: call_id.to_string(),
-            output: self.response_payload(),
+            output: self.provider_payload().clone(),
         }
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        serde_json::to_value(&self.result).unwrap_or_else(|err| {
-            JsonValue::String(format!("failed to serialize mcp result: {err}"))
-        })
+        self.raw_json_projection().map_or_else(
+            |err| JsonValue::String(format!("failed to serialize mcp result: {err}")),
+            Clone::clone,
+        )
     }
 
     fn post_tool_use_input(&self, _payload: &ToolPayload) -> Option<JsonValue> {
@@ -146,12 +285,46 @@ impl ToolOutput for McpToolOutput {
     }
 
     fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {
-        serde_json::to_value(&self.result).ok()
+        self.raw_json_projection().ok().cloned()
     }
 }
 
 impl McpToolOutput {
-    fn response_payload(&self) -> FunctionCallOutputPayload {
+    pub(crate) fn new(
+        result: CallToolResult,
+        tool_input: JsonValue,
+        wall_time: Duration,
+        original_image_detail_supported: bool,
+        truncation_policy: TruncationPolicy,
+    ) -> Self {
+        Self {
+            result,
+            tool_input,
+            wall_time,
+            original_image_detail_supported,
+            truncation_policy,
+            projections: Arc::new(McpToolOutputProjections::default()),
+        }
+    }
+
+    fn raw_json_projection(&self) -> Result<&JsonValue, &str> {
+        match self
+            .projections
+            .raw_json
+            .get_or_init(|| serde_json::to_value(&self.result).map_err(|err| err.to_string()))
+        {
+            Ok(value) => Ok(value),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn provider_payload(&self) -> &FunctionCallOutputPayload {
+        self.projections
+            .provider_payload
+            .get_or_init(|| self.build_provider_payload())
+    }
+
+    fn build_provider_payload(&self) -> FunctionCallOutputPayload {
         let mut payload = self.result.as_function_call_output_payload();
         if let Some(items) = payload.content_items_mut() {
             sanitize_original_image_detail(self.original_image_detail_supported, items);
@@ -181,26 +354,27 @@ impl McpToolOutput {
         // a small buffer for JSON escaping and wrapper overhead.
         truncate_function_output_payload(&payload, self.truncation_policy * 1.2)
     }
+
+    #[cfg(test)]
+    pub(crate) fn projection_cache_state(&self) -> (bool, bool) {
+        (
+            self.projections.raw_json.get().is_some(),
+            self.projections.provider_payload.get().is_some(),
+        )
+    }
 }
 
 #[derive(Clone)]
 pub struct ToolSearchOutput {
-    pub tools: Vec<LoadableToolSpec>,
+    pub tools: Vec<JsonValue>,
     pub omitted_result_count: usize,
 }
 
 impl ToolOutput for ToolSearchOutput {
     fn log_preview(&self) -> String {
-        let tools = self
-            .tools
-            .iter()
-            .map(|tool| {
-                serde_json::to_value(tool).unwrap_or_else(|err| {
-                    JsonValue::String(format!("failed to serialize tool_search output: {err}"))
-                })
-            })
-            .collect();
-        telemetry_preview(&JsonValue::Array(tools).to_string())
+        let tools = serde_json::to_string(&self.tools)
+            .unwrap_or_else(|err| format!("failed to serialize tool_search output: {err}"));
+        telemetry_preview(&tools)
     }
 
     fn success_for_logging(&self) -> bool {
@@ -216,15 +390,7 @@ impl ToolOutput for ToolSearchOutput {
                 "incomplete".to_string()
             },
             execution: "client".to_string(),
-            tools: self
-                .tools
-                .iter()
-                .map(|tool| {
-                    serde_json::to_value(tool).unwrap_or_else(|err| {
-                        JsonValue::String(format!("failed to serialize tool_search output: {err}"))
-                    })
-                })
-                .collect(),
+            tools: self.tools.clone(),
             omitted_result_count: Some(self.omitted_result_count),
         }
     }
@@ -235,18 +401,7 @@ impl ToolOutput for ToolSearchOutput {
         } else {
             CodeModeToolSearchStatus::Incomplete
         };
-        code_mode_tool_search_result(
-            status,
-            self.tools
-                .iter()
-                .map(|tool| {
-                    serde_json::to_value(tool).unwrap_or_else(|err| {
-                        JsonValue::String(format!("failed to serialize tool_search output: {err}"))
-                    })
-                })
-                .collect(),
-            Some(self.omitted_result_count),
-        )
+        code_mode_tool_search_result(status, self.tools.clone(), Some(self.omitted_result_count))
     }
 }
 
@@ -261,6 +416,17 @@ pub struct FunctionToolOutput {
     pub deterministic_continuation_receipts: Vec<TurnTimingDeterministicContinuationReceipt>,
     pub deterministic_continuation_owner_key: Option<String>,
     pub skip_disposition: Option<ToolOutputSkipDisposition>,
+}
+
+#[cfg(test)]
+impl FunctionToolOutput {
+    pub(crate) fn reset_projection_metadata_call_count() {
+        FUNCTION_PROJECTION_METADATA_CALLS.with(|calls| calls.set(0));
+    }
+
+    pub(crate) fn projection_metadata_call_count() -> usize {
+        FUNCTION_PROJECTION_METADATA_CALLS.with(std::cell::Cell::get)
+    }
 }
 
 impl FunctionToolOutput {
@@ -379,6 +545,9 @@ impl ToolOutput for FunctionToolOutput {
     }
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
+        #[cfg(test)]
+        FUNCTION_PROJECTION_METADATA_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         let model_success = if self.outcome.is_some() || self.skip_disposition.is_some() {
             Some(self.outcome_for_logging() == ToolOutputOutcome::Success)
         } else {
@@ -405,25 +574,11 @@ impl ToolOutput for FunctionToolOutput {
     }
 
     fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
-        if self
-            .body
-            .iter()
-            .any(|item| !matches!(item, FunctionCallOutputContentItem::InputText { .. }))
-        {
-            Some(CanonicalToolResult::json(self.code_mode_result(payload)))
-        } else {
-            let metadata = self.projection_metadata()?;
-            if metadata.spillable_text.len() == 1 {
-                Some(CanonicalToolResult::text(
-                    metadata
-                        .spillable_text
-                        .into_iter()
-                        .next()
-                        .unwrap_or_default(),
-                ))
-            } else {
-                Some(CanonicalToolResult::json(self.code_mode_result(payload)))
+        match self.body.as_slice() {
+            [FunctionCallOutputContentItem::InputText { text }] => {
+                Some(CanonicalToolResult::text(text.clone()))
             }
+            _ => Some(CanonicalToolResult::json(self.code_mode_result(payload))),
         }
     }
 
@@ -587,7 +742,7 @@ impl ToolOutput for ExecCommandToolOutput {
 
     fn outcome_for_logging(&self) -> ToolOutputOutcome {
         if self.process_id.is_some() {
-            ToolOutputOutcome::TimedOut
+            ToolOutputOutcome::Yielded
         } else if self.exit_code.is_some_and(|code| code != 0) {
             ToolOutputOutcome::Failure
         } else {
@@ -1113,11 +1268,11 @@ impl ExecCommandToolOutput {
         let truncated = formatted_truncate_text_with_output_limit(content, limits);
         let was_truncated = truncated.was_truncated;
         let mut projected_text = truncated.text;
-        if (summarized.is_some() || was_truncated)
+        if summarized.is_some()
+            && !was_truncated
             && let Some(original_tokens) = self.original_token_count
         {
-            let omitted_tokens = original_tokens.saturating_sub(limits.applied_limit);
-            let marker = format!("Warning: truncated output\n{omitted_tokens} tokens truncated");
+            let marker = format!("Warning: output summarized from {original_tokens} tokens");
             let notice_limit = self
                 .max_output_tokens
                 .unwrap_or(limits.applied_limit)
@@ -1167,24 +1322,17 @@ impl ExecCommandToolOutput {
         let max_tokens = self.model_output_limits(raw_output.as_ref()).applied_limit;
         let mut sections = Vec::new();
 
-        if !self.chunk_id.is_empty() {
-            sections.push(format!("Chunk ID: {}", self.chunk_id));
-        }
-
         let wall_time_seconds = self.wall_time.as_secs_f64();
-        sections.push(format!("Wall time: {wall_time_seconds:.4} seconds"));
-
-        if let Some(exit_code) = self.exit_code {
-            sections.push(format!("Process exited with code {exit_code}"));
-        }
-
-        if let Some(process_id) = &self.process_id {
-            sections.push(format!("Process running with session ID {process_id}"));
-        }
-
-        if let Some(original_token_count) = self.original_token_count {
-            sections.push(format!("Original token count: {original_token_count}"));
-        }
+        let process_status = match (self.exit_code, self.process_id.as_ref()) {
+            (Some(exit_code), _) => format!(
+                "Process exited with code {exit_code}; wall time: {wall_time_seconds:.4} seconds"
+            ),
+            (None, Some(process_id)) => format!(
+                "Process running with session ID {process_id}; wall time: {wall_time_seconds:.4} seconds"
+            ),
+            (None, None) => format!("Wall time: {wall_time_seconds:.4} seconds"),
+        };
+        sections.push(process_status);
 
         if let Some(repair_notice) = &self.repair_notice {
             sections.push(repair_notice.clone());

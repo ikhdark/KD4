@@ -41,10 +41,36 @@ pub(crate) fn logging_enabled() -> bool {
     tracing::enabled!(target: AGENT_COMMUNICATION_TARGET, tracing::Level::INFO)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AgentCommunicationLogMetadata {
+    content_type: &'static str,
+    content_bytes: usize,
+}
+
+pub(crate) fn agent_communication_log_metadata(
+    communication: &InterAgentCommunication,
+) -> AgentCommunicationLogMetadata {
+    if communication.content.is_empty() {
+        AgentCommunicationLogMetadata {
+            content_type: "encrypted",
+            content_bytes: communication
+                .encrypted_content
+                .as_deref()
+                .unwrap_or_default()
+                .len(),
+        }
+    } else {
+        AgentCommunicationLogMetadata {
+            content_type: "plain",
+            content_bytes: communication.content.len(),
+        }
+    }
+}
+
 pub(crate) fn emit_agent_communication_send(
     communication_id: &str,
     context: &AgentCommunicationContext,
-    communication: &InterAgentCommunication,
+    metadata: AgentCommunicationLogMetadata,
     receiver_thread_id: ThreadId,
 ) {
     tracing::info!(
@@ -56,11 +82,8 @@ pub(crate) fn emit_agent_communication_send(
             state = "send",
             sender_thread_id = %context.sender_thread_id,
             receiver_thread_id = %receiver_thread_id,
-            content = if communication.content.is_empty() {
-                communication.encrypted_content.as_deref().unwrap_or_default()
-            } else {
-                communication.content.as_str()
-            },
+            content_type = metadata.content_type,
+            content_bytes = metadata.content_bytes,
         },
         "agent communication"
     );
@@ -76,4 +99,44 @@ pub(crate) fn emit_agent_communication_receive(communication_id: &str) {
         },
         "agent communication"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_protocol::AgentPath;
+
+    use super::*;
+
+    #[test]
+    fn logging_contract_agent_communication_metadata_omits_content() {
+        let plain = InterAgentCommunication::new(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            Vec::new(),
+            "plain secret".to_string(),
+            false,
+        );
+        let encrypted = InterAgentCommunication::new_encrypted(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            Vec::new(),
+            "encrypted secret".to_string(),
+            false,
+        );
+
+        assert_eq!(
+            agent_communication_log_metadata(&plain),
+            AgentCommunicationLogMetadata {
+                content_type: "plain",
+                content_bytes: 12,
+            }
+        );
+        assert_eq!(
+            agent_communication_log_metadata(&encrypted),
+            AgentCommunicationLogMetadata {
+                content_type: "encrypted",
+                content_bytes: 16,
+            }
+        );
+    }
 }

@@ -1,5 +1,4 @@
 use crate::connect_policy::TargetCheckedTcpConnector;
-use crate::state::NetworkProxyState;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use rama_core::Layer;
 use rama_core::Service;
@@ -56,13 +55,25 @@ impl ProxyConfig {
 }
 
 fn read_proxy_env(keys: &[&str]) -> Option<ProxyAddress> {
+    read_proxy_env_with(keys, |key| std::env::var(key))
+}
+
+fn read_proxy_env_with<F>(keys: &[&str], mut read: F) -> Option<ProxyAddress>
+where
+    F: FnMut(&str) -> Result<String, std::env::VarError>,
+{
     for key in keys {
-        let Ok(value) = std::env::var(key) else {
-            continue;
+        let value = match read(key) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => continue,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                warn!("ignoring {key}: proxy address is not valid UTF-8");
+                return None;
+            }
         };
         let value = value.trim();
         if value.is_empty() {
-            continue;
+            return None;
         }
         match ProxyAddress::try_from(value) {
             Ok(proxy) => {
@@ -75,9 +86,11 @@ fn read_proxy_env(keys: &[&str]) -> Option<ProxyAddress> {
                     return Some(proxy);
                 }
                 warn!("ignoring {key}: non-http proxy protocol");
+                return None;
             }
             Err(err) => {
                 warn!("ignoring {key}: invalid proxy address ({err})");
+                return None;
             }
         }
     }
@@ -99,18 +112,18 @@ pub(crate) struct UpstreamClient {
 }
 
 impl UpstreamClient {
-    pub(crate) fn direct(state: Arc<NetworkProxyState>) -> Self {
+    pub(crate) fn direct_with_current_roots(allow_local_binding: bool) -> Self {
         Self::new(
             ProxyConfig::default(),
-            TargetCheckedTcpConnector::new(state),
+            TargetCheckedTcpConnector::from_allow_local_binding(allow_local_binding),
             client_root_certs(),
         )
     }
 
-    pub(crate) fn from_env_proxy(state: Arc<NetworkProxyState>) -> Self {
+    pub(crate) fn from_env_proxy_with_current_roots(allow_local_binding: bool) -> Self {
         Self::new(
             ProxyConfig::from_env(),
-            TargetCheckedTcpConnector::new(state),
+            TargetCheckedTcpConnector::from_allow_local_binding(allow_local_binding),
             client_root_certs(),
         )
     }

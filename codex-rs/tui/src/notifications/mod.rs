@@ -53,11 +53,7 @@ pub fn detect_backend(method: NotificationMethod) -> DesktopNotificationBackend 
 fn supports_osc9(terminal: &TerminalInfo) -> bool {
     matches!(
         terminal.name,
-        TerminalName::Ghostty
-            | TerminalName::Iterm2
-            | TerminalName::Kitty
-            | TerminalName::WarpTerminal
-            | TerminalName::WezTerm
+        TerminalName::WarpTerminal | TerminalName::WezTerm
     )
 }
 
@@ -76,7 +72,6 @@ mod tests {
             term_program: None,
             version: None,
             term: None,
-            multiplexer: None,
         }
     }
 
@@ -98,13 +93,7 @@ mod tests {
 
     #[test]
     fn supports_osc9_for_supported_terminals() {
-        for name in [
-            TerminalName::Ghostty,
-            TerminalName::Iterm2,
-            TerminalName::Kitty,
-            TerminalName::WarpTerminal,
-            TerminalName::WezTerm,
-        ] {
+        for name in [TerminalName::WarpTerminal, TerminalName::WezTerm] {
             assert!(
                 supports_osc9(&test_terminal(name)),
                 "{name:?} should support OSC 9"
@@ -115,14 +104,10 @@ mod tests {
     #[test]
     fn supports_osc9_for_unsupported_terminals() {
         for name in [
-            TerminalName::AppleTerminal,
             TerminalName::Alacritty,
             TerminalName::Dumb,
-            TerminalName::GnomeTerminal,
-            TerminalName::Konsole,
             TerminalName::Unknown,
             TerminalName::VsCode,
-            TerminalName::Vte,
             TerminalName::WindowsTerminal,
         ] {
             assert_eq!(

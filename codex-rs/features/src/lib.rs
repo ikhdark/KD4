@@ -56,6 +56,17 @@ pub enum Stage {
     Internal,
 }
 
+/// Identifies which side of the app-server boundary consumes a feature flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FeatureConsumer {
+    /// The Rust runtime reads the flag to select behavior.
+    Runtime,
+    /// A client reads the flag; Rust may transport or constrain it but must not
+    /// use it to select runtime behavior.
+    Client,
+}
+
 impl Stage {
     pub fn experimental_menu_name(self) -> Option<&'static str> {
         match self {
@@ -222,6 +233,10 @@ impl Feature {
 
     pub fn default_enabled(self) -> bool {
         self.info().default_enabled
+    }
+
+    pub fn consumer(self) -> FeatureConsumer {
+        self.info().consumer
     }
 
     fn info(self) -> FeatureSpec {
@@ -643,6 +658,7 @@ pub struct FeatureSpec {
     pub key: &'static str,
     pub stage: Stage,
     pub default_enabled: bool,
+    pub consumer: FeatureConsumer,
 }
 
 /// Stable machine-readable projection of the authoritative feature registry.
@@ -651,6 +667,7 @@ pub struct FeatureSpec {
 pub struct FeatureRegistryEntry {
     pub key: &'static str,
     pub default_enabled: bool,
+    pub consumer: FeatureConsumer,
 }
 
 pub fn feature_registry_entries() -> Vec<FeatureRegistryEntry> {
@@ -659,6 +676,7 @@ pub fn feature_registry_entries() -> Vec<FeatureRegistryEntry> {
         .map(|spec| FeatureRegistryEntry {
             key: spec.key,
             default_enabled: spec.default_enabled,
+            consumer: spec.consumer,
         })
         .collect()
 }
@@ -670,6 +688,7 @@ macro_rules! define_features {
             key: $key:expr,
             stage: $stage:expr,
             default_enabled: $default_enabled:expr,
+            $(consumer: $consumer:expr,)?
         }
     ),* $(,)?) => {
         pub const FEATURES: &[FeatureSpec] = &[
@@ -678,6 +697,7 @@ macro_rules! define_features {
                 key: $key,
                 stage: $stage,
                 default_enabled: $default_enabled,
+                consumer: define_features!(@consumer $($consumer)?),
             }),*
         ];
 
@@ -688,6 +708,7 @@ macro_rules! define_features {
                     key: $key,
                     stage: $stage,
                     default_enabled: $default_enabled,
+                    consumer: define_features!(@consumer $($consumer)?),
                 }),*
             }
         }
@@ -695,6 +716,9 @@ macro_rules! define_features {
         #[cfg(test)]
         const ALL_FEATURES: &[Feature] = &[$(Feature::$id),*];
     };
+
+    (@consumer $consumer:expr) => { $consumer };
+    (@consumer) => { FeatureConsumer::Runtime };
 }
 
 define_features! {
@@ -894,30 +918,35 @@ define_features! {
         key: "in_app_browser",
         stage: Stage::Stable,
         default_enabled: true,
+        consumer: FeatureConsumer::Client,
     },
     FeatureSpec {
         id: Feature::BrowserUse,
         key: "browser_use",
         stage: Stage::Stable,
         default_enabled: true,
+        consumer: FeatureConsumer::Client,
     },
     FeatureSpec {
         id: Feature::BrowserUseFullCdpAccess,
         key: "browser_use_full_cdp_access",
         stage: Stage::Stable,
         default_enabled: true,
+        consumer: FeatureConsumer::Client,
     },
     FeatureSpec {
         id: Feature::BrowserUseExternal,
         key: "browser_use_external",
         stage: Stage::Stable,
         default_enabled: true,
+        consumer: FeatureConsumer::Client,
     },
     FeatureSpec {
         id: Feature::ComputerUse,
         key: "computer_use",
         stage: Stage::Stable,
         default_enabled: true,
+        consumer: FeatureConsumer::Client,
     },
     FeatureSpec {
         id: Feature::RemotePlugin,

@@ -95,13 +95,18 @@ async fn forward_elicitation(
         return;
     }
     let params = event.request.to_mcp_create_params();
-    let receiver = outgoing
+    let pending_request = outgoing
         .send_request("elicitation/create", Some(params))
         .await;
+    let pending_request_id = pending_request.id;
+    let receiver = pending_request.receiver;
     tokio::spawn(async move {
         let response = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => None,
+            _ = cancellation.cancelled() => {
+                outgoing.cancel_request(&pending_request_id).await;
+                None
+            },
             response = receiver => response.ok(),
         }
         .and_then(|value| serde_json::from_value::<ElicitationCreateResponse>(value).ok());
@@ -300,6 +305,7 @@ async fn run_codex_tool_session_inner(
                             started_at_ms: _,
                             command,
                             cwd,
+                            cwd_uri: _,
                             call_id,
                             approval_id: _,
                             reason: _,

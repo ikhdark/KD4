@@ -41,6 +41,8 @@ pub(crate) use review::review_approval_request_with_cancel;
 pub(crate) use review::routes_approval_to_guardian;
 pub(crate) use review::routes_approval_to_guardian_with_reviewer;
 pub(crate) use review::spawn_approval_request_review;
+#[cfg(test)]
+pub(crate) use review::spawn_approval_request_review_with_runtime_error_for_test;
 pub(crate) use review_session::GuardianReviewSessionManager;
 pub(crate) use review_session::prompt_cache_key_override_for_review_session;
 

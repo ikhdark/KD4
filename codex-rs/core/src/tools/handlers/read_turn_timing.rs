@@ -7,10 +7,13 @@ use crate::tools::handlers::read_turn_timing_spec::create_read_turn_timing_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SamplingBoundaryItem;
 use codex_protocol::protocol::TurnTiming;
 use codex_protocol::protocol::TurnTimingProviderTokenUsage;
+use codex_rollout::ToolManifestDictionary;
 use codex_thread_store::ReadThreadParams;
 use codex_tools::JsonToolOutput;
 use codex_tools::ToolName;
@@ -22,6 +25,7 @@ use std::collections::HashMap;
 
 const SUMMARY_SLOW_MODEL_REQUEST_LIMIT: usize = 5;
 const SUMMARY_SLOW_TOOL_CALL_LIMIT: usize = 5;
+const SUMMARY_SAMPLING_BOUNDARY_LIMIT: usize = 5;
 const SUMMARY_ERROR_MESSAGE_LIMIT: usize = 500;
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +56,20 @@ struct TerminalTurnTiming {
     error_message: Option<String>,
     abort_reason: Option<Value>,
     timing: Option<TurnTiming>,
+    trace_id: Option<String>,
+    collaboration_mode_kind: Option<ModeKind>,
+    sampling_boundaries: Vec<SamplingBoundaryItem>,
+    tool_manifest_hash: Option<String>,
+    tool_manifest: Option<Value>,
+    tool_manifest_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TurnRolloutMetadata {
+    trace_id: Option<String>,
+    collaboration_mode_kind: Option<ModeKind>,
+    sampling_boundaries: Vec<SamplingBoundaryItem>,
+    tool_manifest_hash: Option<String>,
 }
 
 pub struct ReadTurnTimingHandler;
@@ -139,14 +157,39 @@ fn select_terminal_turn(
     let mut latest_started_turn_id = None;
     let mut selected = None;
     let mut terminalization_by_turn = HashMap::new();
+    let mut metadata_by_turn = HashMap::<String, TurnRolloutMetadata>::new();
+    let mut tool_manifests = ToolManifestDictionary::default();
+    let mut tool_manifest_errors = Vec::new();
 
     for item in items {
-        let RolloutItem::EventMsg(event) = item else {
-            continue;
+        let event = match item {
+            RolloutItem::ToolManifest(item) => {
+                if let Err(error) = tool_manifests.apply(item) {
+                    tool_manifest_errors.push(error);
+                }
+                continue;
+            }
+            RolloutItem::SamplingBoundary(boundary) => {
+                if let Some(turn_id) = boundary
+                    .turn_id
+                    .clone()
+                    .or_else(|| latest_started_turn_id.clone())
+                {
+                    let metadata = metadata_by_turn.entry(turn_id).or_default();
+                    metadata.sampling_boundaries.push(boundary.clone());
+                    metadata.tool_manifest_hash = tool_manifests.current_hash().map(str::to_string);
+                }
+                continue;
+            }
+            RolloutItem::EventMsg(event) => event,
+            _ => continue,
         };
         match event {
             EventMsg::TurnStarted(event) => {
                 latest_started_turn_id = Some(event.turn_id.clone());
+                let metadata = metadata_by_turn.entry(event.turn_id.clone()).or_default();
+                metadata.trace_id.clone_from(&event.trace_id);
+                metadata.collaboration_mode_kind = Some(event.collaboration_mode_kind);
             }
             EventMsg::TurnComplete(event)
                 if requested_turn_id.is_none_or(|turn_id| turn_id == event.turn_id) =>
@@ -164,6 +207,12 @@ fn select_terminal_turn(
                     error_message: event.error.as_ref().map(|error| error.message.clone()),
                     abort_reason: None,
                     timing: event.timing.clone(),
+                    trace_id: None,
+                    collaboration_mode_kind: None,
+                    sampling_boundaries: Vec::new(),
+                    tool_manifest_hash: None,
+                    tool_manifest: None,
+                    tool_manifest_errors: Vec::new(),
                 });
             }
             EventMsg::TurnAborted(event) => {
@@ -183,6 +232,12 @@ fn select_terminal_turn(
                         error_message: None,
                         abort_reason: serde_json::to_value(&event.reason).ok(),
                         timing: event.timing.clone(),
+                        trace_id: None,
+                        collaboration_mode_kind: None,
+                        sampling_boundaries: Vec::new(),
+                        tool_manifest_hash: None,
+                        tool_manifest: None,
+                        tool_manifest_errors: Vec::new(),
                     });
                 }
             }
@@ -200,6 +255,20 @@ fn select_terminal_turn(
     {
         timing.terminalization = terminalization.clone();
     }
+    if let Some(selected) = selected.as_mut() {
+        if let Some(metadata) = metadata_by_turn.remove(&selected.turn_id) {
+            selected.trace_id = metadata.trace_id;
+            selected.collaboration_mode_kind = metadata.collaboration_mode_kind;
+            selected.sampling_boundaries = metadata.sampling_boundaries;
+            selected.tool_manifest_hash = metadata.tool_manifest_hash;
+            selected.tool_manifest = selected
+                .tool_manifest_hash
+                .as_deref()
+                .and_then(|hash| tool_manifests.manifest(hash))
+                .cloned();
+        }
+        selected.tool_manifest_errors = tool_manifest_errors;
+    }
     selected
 }
 
@@ -213,6 +282,12 @@ fn full_timing(thread_id: &str, terminal: TerminalTurnTiming) -> Value {
         "timeToFirstTokenMs": terminal.time_to_first_token_ms,
         "errorMessage": terminal.error_message,
         "abortReason": terminal.abort_reason,
+        "traceId": terminal.trace_id,
+        "collaborationModeKind": terminal.collaboration_mode_kind,
+        "samplingBoundaries": terminal.sampling_boundaries.iter().map(sampling_boundary_json).collect::<Vec<_>>(),
+        "toolManifestHash": terminal.tool_manifest_hash,
+        "toolManifest": terminal.tool_manifest,
+        "toolManifestErrors": terminal.tool_manifest_errors,
         "timingAvailable": terminal.timing.is_some(),
         "timing": terminal.timing,
     })
@@ -220,6 +295,10 @@ fn full_timing(thread_id: &str, terminal: TerminalTurnTiming) -> Value {
 
 fn timing_summary(thread_id: &str, terminal: &TerminalTurnTiming) -> Value {
     let timing = terminal.timing.as_ref();
+    let sampling_boundary_start = terminal
+        .sampling_boundaries
+        .len()
+        .saturating_sub(SUMMARY_SAMPLING_BOUNDARY_LIMIT);
     json!({
         "threadId": thread_id,
         "turnId": terminal.turn_id,
@@ -229,8 +308,27 @@ fn timing_summary(thread_id: &str, terminal: &TerminalTurnTiming) -> Value {
         "timeToFirstTokenMs": terminal.time_to_first_token_ms,
         "errorMessage": terminal.error_message.as_deref().map(truncated_error_message),
         "abortReason": terminal.abort_reason,
+        "traceId": terminal.trace_id,
+        "collaborationModeKind": terminal.collaboration_mode_kind,
+        "samplingBoundaries": terminal.sampling_boundaries[sampling_boundary_start..]
+            .iter()
+            .map(sampling_boundary_json)
+            .collect::<Vec<_>>(),
+        "samplingBoundaryCount": terminal.sampling_boundaries.len(),
+        "toolManifestHash": terminal.tool_manifest_hash,
+        "toolManifestAvailable": terminal.tool_manifest.is_some(),
+        "toolManifestErrorCount": terminal.tool_manifest_errors.len(),
         "timingAvailable": timing.is_some(),
         "timing": timing.map(compact_timing),
+    })
+}
+
+fn sampling_boundary_json(boundary: &SamplingBoundaryItem) -> Value {
+    json!({
+        "samplingRequestId": boundary.sampling_request_id,
+        "physicalAttemptId": boundary.physical_attempt_id,
+        "turnId": boundary.turn_id,
+        "unresolvedContext": boundary.unresolved_context,
     })
 }
 
@@ -406,6 +504,9 @@ mod tests {
     use codex_protocol::protocol::TerminalizationRecoveryState;
     use codex_protocol::protocol::ToolExecutionId;
     use codex_protocol::protocol::ToolLifecycleBoundary;
+    use codex_protocol::protocol::ToolManifestDeltaEntry;
+    use codex_protocol::protocol::ToolManifestDeltaRemoval;
+    use codex_protocol::protocol::ToolManifestItem;
     use codex_protocol::protocol::TurnCompleteEvent;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::TurnTerminalizationCompleteEvent;
@@ -478,6 +579,63 @@ mod tests {
     }
 
     #[test]
+    fn rollout_metadata_is_available_to_timing_diagnostics() {
+        let first_manifest = json!({
+            "model_visible": [{"name": "shell"}],
+        });
+        let second_manifest = json!({
+            "model_visible": [{"name": "search"}],
+        });
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn".to_string(),
+                trace_id: Some("trace".to_string()),
+                started_at: Some(1),
+                model_context_window: None,
+                collaboration_mode_kind: ModeKind::Plan,
+            })),
+            RolloutItem::ToolManifest(ToolManifestItem::full("first".to_string(), first_manifest)),
+            RolloutItem::ToolManifest(ToolManifestItem::delta(
+                "second".to_string(),
+                "first".to_string(),
+                vec![ToolManifestDeltaEntry {
+                    collection: "model_visible".to_string(),
+                    name: "search".to_string(),
+                    index: 0,
+                    value: json!({"name": "search"}),
+                }],
+                vec![ToolManifestDeltaRemoval {
+                    collection: "model_visible".to_string(),
+                    name: "shell".to_string(),
+                }],
+            )),
+            RolloutItem::SamplingBoundary(SamplingBoundaryItem {
+                sampling_request_id: "request".to_string(),
+                physical_attempt_id: "attempt".to_string(),
+                turn_id: Some("turn".to_string()),
+                unresolved_context: false,
+            }),
+            completed("turn", TurnTiming::default()),
+        ];
+
+        let selected = select_terminal_turn(&items, None).expect("terminal turn");
+        let output = full_timing("thread", selected);
+
+        assert_eq!(output["traceId"], json!("trace"));
+        assert_eq!(output["collaborationModeKind"], json!("plan"));
+        assert_eq!(output["toolManifestHash"], json!("second"));
+        assert_eq!(output["toolManifest"], second_manifest);
+        assert_eq!(
+            output.pointer("/samplingBoundaries/0/samplingRequestId"),
+            Some(&json!("request"))
+        );
+        assert_eq!(
+            output.pointer("/samplingBoundaries/0/physicalAttemptId"),
+            Some(&json!("attempt"))
+        );
+    }
+
+    #[test]
     fn summary_is_bounded_even_with_many_model_requests() {
         let model_requests = (0..100)
             .map(|generation_index| TurnTimingModelRequest {
@@ -505,6 +663,12 @@ mod tests {
                 model_requests,
                 ..TurnTiming::default()
             }),
+            trace_id: None,
+            collaboration_mode_kind: None,
+            sampling_boundaries: Vec::new(),
+            tool_manifest_hash: None,
+            tool_manifest: None,
+            tool_manifest_errors: Vec::new(),
         };
 
         let summary = timing_summary("thread", &terminal);
@@ -547,6 +711,12 @@ mod tests {
             error_message: None,
             abort_reason: None,
             timing: Some(timing.clone()),
+            trace_id: None,
+            collaboration_mode_kind: None,
+            sampling_boundaries: Vec::new(),
+            tool_manifest_hash: None,
+            tool_manifest: None,
+            tool_manifest_errors: Vec::new(),
         };
 
         assert_eq!(

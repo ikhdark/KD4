@@ -98,6 +98,7 @@ use codex_protocol::protocol::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::user_input::TextElement;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use crossterm::event::KeyModifiers;
 use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
@@ -458,7 +459,7 @@ async fn history_lookup_response_is_routed_to_requesting_thread() -> Result<()> 
 }
 
 #[tokio::test]
-async fn enqueue_thread_event_does_not_block_when_channel_full() -> Result<()> {
+async fn enqueue_thread_event_uses_one_bounded_overflow_relay() -> Result<()> {
     let mut app = make_test_app().await;
     let thread_id = ThreadId::new();
     app.thread_event_channels
@@ -471,10 +472,16 @@ async fn enqueue_thread_event_does_not_block_when_channel_full() -> Result<()> {
         .await?;
     time::timeout(
         Duration::from_millis(50),
-        app.enqueue_thread_notification(thread_id, event),
+        app.enqueue_thread_notification(thread_id, event.clone()),
     )
     .await
     .expect("enqueue_thread_notification blocked on a full channel")?;
+    time::timeout(
+        Duration::from_millis(50),
+        app.enqueue_thread_notification(thread_id, event),
+    )
+    .await
+    .expect("enqueue_thread_notification blocked on a full overflow relay")?;
 
     let mut rx = app
         .thread_event_channels
@@ -492,6 +499,12 @@ async fn enqueue_thread_event_does_not_block_when_channel_full() -> Result<()> {
         .await
         .expect("timed out waiting for second event")
         .expect("channel closed unexpectedly");
+    assert!(
+        time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err(),
+        "overflow retained more than its configured capacity"
+    );
 
     Ok(())
 }
@@ -2647,6 +2660,7 @@ async fn inactive_thread_permissions_approval_preserves_file_system_permissions(
             environment_id: Some("remote".to_string()),
             started_at_ms: 0,
             cwd: test_absolute_path("/tmp"),
+            cwd_uri: PathUri::from_abs_path(&test_absolute_path("/tmp")),
             reason: Some("Need access to .git".to_string()),
             permissions: codex_app_server_protocol::RequestPermissionProfile {
                 network: Some(AdditionalNetworkPermissions {
@@ -2682,8 +2696,12 @@ async fn inactive_thread_permissions_approval_preserves_file_system_permissions(
                 enabled: Some(true),
             }),
             file_system: Some(FileSystemPermissions::from_read_write_roots(
-                Some(vec![test_absolute_path("/tmp/read-only")]),
-                Some(vec![test_absolute_path("/tmp/write")]),
+                Some(vec![PathUri::from_abs_path(&test_absolute_path(
+                    "/tmp/read-only",
+                ))]),
+                Some(vec![PathUri::from_abs_path(&test_absolute_path(
+                    "/tmp/write"
+                ))]),
             )),
         }
     );
@@ -3880,7 +3898,7 @@ async fn active_non_primary_shutdown_target_still_switches_for_other_pending_exi
 
 async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
     let mut app = make_test_app().await;
-    app.config.cwd = test_path_buf("/tmp/project").abs();
+    app.config.cwd = test_path_buf(r"C:\project").abs();
     app.chat_widget.set_model("gpt-test");
     app.chat_widget
         .set_reasoning_effort(Some(ReasoningEffortConfig::High));
@@ -3995,17 +4013,15 @@ async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
 }
 
 #[tokio::test]
-#[ignore = "snapshot path rendering differs on Windows"]
 async fn clear_ui_after_long_transcript_snapshots_fresh_header_only() {
     let rendered = render_clear_ui_header_after_long_transcript_for_snapshot().await;
     assert_app_snapshot!("clear_ui_after_long_transcript_fresh_header_only", rendered);
 }
 
 #[tokio::test]
-#[ignore = "snapshot path rendering differs on Windows"]
 async fn clear_ui_header_shows_fast_status_for_fast_capable_models() {
     let mut app = make_test_app().await;
-    app.config.cwd = test_path_buf("/tmp/project").abs();
+    app.config.cwd = test_path_buf(r"C:\project").abs();
     app.chat_widget.set_model("gpt-5.4");
     set_fast_mode_test_catalog(&mut app.chat_widget);
     app.chat_widget
@@ -6096,6 +6112,7 @@ async fn inactive_thread_settings_notification_updates_cached_collaboration_mode
             sandbox_policy: codex_app_server_protocol::SandboxPolicy::ReadOnly {
                 network_access: false,
             },
+            permission_profile: Some(PermissionProfile::read_only()),
             active_permission_profile: Some(
                 codex_app_server_protocol::ActivePermissionProfile::read_only(),
             ),

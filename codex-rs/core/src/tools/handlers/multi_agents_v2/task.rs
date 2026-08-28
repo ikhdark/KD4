@@ -37,10 +37,10 @@ use codex_agent_task_store::TaskActor;
 use codex_agent_task_store::TaskCapsuleV1;
 use codex_agent_task_store::ValidationCall;
 use codex_agent_task_store::ValidationCallStatus;
-use codex_agent_task_store::ValidationProofKind;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::validation::ValidationResult;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
@@ -241,16 +241,6 @@ async fn handle_submit_agent_receipt(
     let _workspace_operation_permit =
         crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root).await;
     let draft = args.into_receipt_draft();
-    if let Some(obligations) = store
-        .replay_required_evidence_missing(binding.attempt_id, &draft)
-        .await
-        .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?
-    {
-        return Err(task_store_error(
-            SUBMIT_AGENT_RECEIPT_TOOL,
-            StoreError::RequiredEvidenceMissing { obligations },
-        ));
-    }
     if let Err(error) = store.finalize_pending_mutations(binding.attempt_id).await {
         tracing::warn!(
             %error,
@@ -387,12 +377,14 @@ async fn derive_review_reason(
 }
 
 fn is_successful_focused_validation(call: &ValidationCall) -> bool {
-    call.proof_kind == ValidationProofKind::Focused
+    call.status == ValidationCallStatus::Succeeded
+        && call.evidence.end_epoch.is_some()
         && call
-            .resolved_executable
-            .as_deref()
-            .is_some_and(|path| Path::new(path).is_absolute())
-        && call.status == ValidationCallStatus::Succeeded
+            .evidence
+            .validation_result
+            .clone()
+            .and_then(|value| serde_json::from_value::<ValidationResult>(value).ok())
+            .is_some_and(|result| result.call_id == call.call_id && result.status.is_success())
 }
 
 async fn build_evaluation_context(
@@ -1197,7 +1189,6 @@ fn bounded_receipt_projection_with_proof_limit(
         "attempt_id": receipt.attempt_id,
         "status": receipt.status,
         "evidence_epoch": receipt.evidence_epoch,
-        "evidence_manifest_hash": (receipt.evidence_manifest_hash.len() <= MAX_PROJECTED_EXACT_STRING_BYTES).then_some(receipt.evidence_manifest_hash.as_str()),
         "sealed_at": receipt.sealed_at,
         "proof_references": proof_references,
         "changed_paths": changed_paths,
@@ -1259,14 +1250,7 @@ fn required_evidence_is_satisfied(task: &AgentTask, requirement: &str) -> bool {
             .as_ref()
             .is_some_and(|receipt| receipt.validation_call_ids.contains(&call.call_id))
             && call.command_summary == requirement
-            && call.status == ValidationCallStatus::Succeeded
-            && call.proof_kind == ValidationProofKind::Focused
-            && call.evidence.end_epoch.is_some()
-            && call.evidence.stale_reason.is_none()
-            && call
-                .resolved_executable
-                .as_deref()
-                .is_some_and(|path| Path::new(path).is_absolute())
+            && is_successful_focused_validation(call)
     })
 }
 
@@ -1288,7 +1272,6 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
                 "call_id": call.call_id,
                 "status": call.status,
                 "retained_output_ref": call.evidence.retained_output_ref.as_deref().filter(|value| value.len() <= MAX_PROJECTED_EXACT_STRING_BYTES),
-                "shared_from_call_id": call.evidence.shared_from_call_id.as_deref().filter(|value| value.len() <= MAX_PROJECTED_EXACT_STRING_BYTES),
             }))
         })
         .take(MAX_PROJECTED_VALIDATION_CALLS)
@@ -2340,7 +2323,6 @@ mod projection_tests {
             next_action: Some("durable next action ".repeat(1_000)),
             architecture_contract: None,
             evidence_epoch: 7,
-            evidence_manifest_hash: "manifest".repeat(8),
             sealed_at: Utc::now(),
         };
         let result = SubmitAgentReceiptResult {
@@ -2365,10 +2347,6 @@ mod projection_tests {
         );
         assert_eq!(metadata.essential_inline["criterion_counts"]["total"], 100);
         assert_eq!(metadata.essential_inline["evidence_epoch"], 7);
-        assert_eq!(
-            metadata.essential_inline["evidence_manifest_hash"],
-            receipt.evidence_manifest_hash
-        );
         assert_eq!(
             metadata.essential_inline["sealed_at"],
             serde_json::to_value(receipt.sealed_at).expect("sealed timestamp serializes")
@@ -2497,7 +2475,6 @@ mod projection_tests {
             next_action: Some("finish the open criterion".to_string()),
             architecture_contract: None,
             evidence_epoch: 13,
-            evidence_manifest_hash: "b".repeat(64),
             sealed_at: now,
         };
         let result = GetAgentTaskResult {
@@ -2569,8 +2546,6 @@ mod projection_tests {
                     call_id: "validation-satisfied".to_string(),
                     attempt_id,
                     command_summary: "focused validation one".to_string(),
-                    resolved_executable: Some(r"C:\focused-validation.exe".to_string()),
-                    proof_kind: ValidationProofKind::Focused,
                     evidence: ValidationEvidence {
                         end_epoch: Some(13),
                         ..ValidationEvidence::default()
@@ -2614,10 +2589,6 @@ mod projection_tests {
             "a".repeat(64)
         );
         assert_eq!(projection["receipt"]["evidence_epoch"], 13);
-        assert_eq!(
-            projection["receipt"]["evidence_manifest_hash"],
-            "b".repeat(64)
-        );
         assert_eq!(projection["unresolved_gates"].as_array().unwrap().len(), 1);
         assert_eq!(projection["unresolved_gates"][0]["kind"], "review");
         assert_eq!(

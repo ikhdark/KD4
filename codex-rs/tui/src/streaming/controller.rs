@@ -77,12 +77,18 @@ struct StreamCore {
     width: Option<usize>,
     /// Accumulated raw markdown source for the current stream.
     raw_source: String,
-    /// Full re-render of `raw_source` at `width`. Rebuilt on every committed delta.
+    /// Full re-render of `raw_source` at `width`. Rebuilt at most once per display frame.
     rendered_lines: Vec<HyperlinkLine>,
+    /// Whether committed source has arrived since the last full streaming render.
+    render_dirty: bool,
+    /// Source length represented by `rendered_lines`; zero preserves the immediate first render.
+    rendered_source_len: usize,
     /// Lines enqueued into the commit-animation queue.
     enqueued_stable_len: usize,
     /// Lines actually emitted to scrollback.
     emitted_stable_len: usize,
+    /// Changes whenever the visible tail lines or their stable-region boundary changes.
+    visible_tail_revision: u64,
     /// Session cwd used to keep local file-link display stable during stream re-renders.
     cwd: PathBuf,
     file_opener: UriBasedFileOpener,
@@ -91,6 +97,10 @@ struct StreamCore {
     stable_prefix_len_cache: Option<StablePrefixLenCache>,
     /// Incremental holdback scanner state for append-only source updates.
     holdback_scanner: TableHoldbackScanner,
+    #[cfg(test)]
+    streaming_render_count: usize,
+    #[cfg(test)]
+    finalize_render_count: usize,
 }
 
 struct StablePrefixLenCache {
@@ -117,13 +127,20 @@ impl StreamCore {
             width,
             raw_source: String::with_capacity(1024),
             rendered_lines: Vec::with_capacity(64),
+            render_dirty: false,
+            rendered_source_len: 0,
             enqueued_stable_len: 0,
             emitted_stable_len: 0,
+            visible_tail_revision: 0,
             cwd: cwd.to_path_buf(),
             file_opener,
             render_mode,
             stable_prefix_len_cache: None,
             holdback_scanner: TableHoldbackScanner::new(),
+            #[cfg(test)]
+            streaming_render_count: 0,
+            #[cfg(test)]
+            finalize_render_count: 0,
         }
     }
 
@@ -146,26 +163,47 @@ impl StreamCore {
         {
             self.raw_source.push_str(&committed_source);
             self.holdback_scanner.push_source_chunk(&committed_source);
-            self.recompute_streaming_render();
-            enqueued = self.sync_stable_queue();
+            self.render_dirty = true;
+            if self.rendered_source_len == 0 {
+                enqueued = self.flush_render_for_frame();
+            }
         }
         enqueued
     }
 
+    /// Apply all committed deltas in one full render at the display-frame boundary.
+    fn flush_render_for_frame(&mut self) -> bool {
+        if !self.render_dirty {
+            return false;
+        }
+        self.recompute_streaming_render();
+        self.sync_stable_queue()
+    }
+
     /// Drain the collector, render the final source snapshot, and return lines not yet emitted.
     ///
-    /// This intentionally re-renders from the full raw source instead of
-    /// trying to stitch together queued stable lines and the current tail. The
-    /// final render is the canonical transcript representation used for
-    /// consolidation, so callers that skip `reset()` can accidentally replay a
-    /// finished stream into the next answer.
+    /// The final full-source render remains the canonical transcript
+    /// representation. When the streaming snapshot already represents the
+    /// exact final source, reuse it rather than rendering identical markdown a
+    /// second time.
     fn finalize_remaining(&mut self) -> Vec<HyperlinkLine> {
         let remainder_source = self.state.collector.finalize_and_drain_source();
         if !remainder_source.is_empty() {
             self.raw_source.push_str(&remainder_source);
             self.holdback_scanner.push_source_chunk(&remainder_source);
         }
-        let rendered = self.render_source(&self.raw_source);
+        let rendered = if remainder_source.is_empty()
+            && !self.render_dirty
+            && self.rendered_source_len == self.raw_source.len()
+        {
+            self.rendered_lines.clone()
+        } else {
+            #[cfg(test)]
+            {
+                self.finalize_render_count += 1;
+            }
+            self.render_source(&self.raw_source)
+        };
         if self.emitted_stable_len >= rendered.len() {
             Vec::new()
         } else {
@@ -229,6 +267,23 @@ impl StreamCore {
         self.enqueued_stable_len < self.rendered_lines.len()
     }
 
+    #[inline]
+    fn visible_tail_revision(&self) -> u64 {
+        self.visible_tail_revision
+    }
+
+    fn bump_visible_tail_revision(&mut self) {
+        self.visible_tail_revision = self.visible_tail_revision.wrapping_add(1);
+    }
+
+    fn clear_queue(&mut self) {
+        self.state.clear_queue();
+        if self.enqueued_stable_len != self.emitted_stable_len {
+            self.enqueued_stable_len = self.emitted_stable_len;
+            self.bump_visible_tail_revision();
+        }
+    }
+
     /// Update rendering width and rebuild queued stable lines for the new layout.
     ///
     /// Re-renders once at the new width and rebuilds queue state from the
@@ -277,6 +332,8 @@ impl StreamCore {
         self.state.clear();
         self.raw_source.clear();
         self.rendered_lines.clear();
+        self.render_dirty = false;
+        self.rendered_source_len = 0;
         self.enqueued_stable_len = 0;
         self.emitted_stable_len = 0;
         self.stable_prefix_len_cache = None;
@@ -297,6 +354,13 @@ impl StreamCore {
 
     fn recompute_streaming_render(&mut self) {
         self.rendered_lines = self.render_source(&self.raw_source);
+        self.render_dirty = false;
+        self.rendered_source_len = self.raw_source.len();
+        self.bump_visible_tail_revision();
+        #[cfg(test)]
+        {
+            self.streaming_render_count += 1;
+        }
     }
 
     fn set_render_mode(&mut self, render_mode: HistoryRenderMode) {
@@ -351,6 +415,7 @@ impl StreamCore {
                 );
             }
             self.enqueued_stable_len = target_stable_len;
+            self.bump_visible_tail_revision();
             return self.state.queued_len() > 0;
         }
 
@@ -361,6 +426,7 @@ impl StreamCore {
         self.state
             .enqueue(self.rendered_lines[self.enqueued_stable_len..target_stable_len].to_vec());
         self.enqueued_stable_len = target_stable_len;
+        self.bump_visible_tail_revision();
         true
     }
 
@@ -376,7 +442,10 @@ impl StreamCore {
             self.state
                 .enqueue(self.rendered_lines[self.emitted_stable_len..target_stable_len].to_vec());
         }
-        self.enqueued_stable_len = target_stable_len;
+        if self.enqueued_stable_len != target_stable_len {
+            self.enqueued_stable_len = target_stable_len;
+            self.bump_visible_tail_revision();
+        }
     }
 
     /// How many rendered lines to withhold as mutable tail.
@@ -496,6 +565,10 @@ impl StreamController {
         self.core.push_delta(delta)
     }
 
+    pub(crate) fn flush_render_for_frame(&mut self) -> bool {
+        self.core.flush_render_for_frame()
+    }
+
     /// Finalize the active stream. Returns the final cell (if any remaining lines) and the raw
     /// markdown source for consolidation.
     pub(crate) fn finalize(&mut self) -> (Option<Box<dyn HistoryCell>>, Option<String>) {
@@ -552,9 +625,13 @@ impl StreamController {
         self.core.has_tail()
     }
 
+    #[inline]
+    pub(crate) fn tail_sync_key(&self) -> (u64, bool) {
+        (self.core.visible_tail_revision(), self.tail_starts_stream())
+    }
+
     pub(crate) fn clear_queue(&mut self) {
-        self.core.state.clear_queue();
-        self.core.enqueued_stable_len = self.core.emitted_stable_len;
+        self.core.clear_queue();
     }
 
     pub(crate) fn set_width(&mut self, width: Option<usize>) {
@@ -615,6 +692,10 @@ impl PlanStreamController {
         self.core.push_delta(delta)
     }
 
+    pub(crate) fn flush_render_for_frame(&mut self) -> bool {
+        self.core.flush_render_for_frame()
+    }
+
     /// Finalize the active stream. Returns the final cell (if any remaining
     /// lines) plus raw markdown source for consolidation.
     pub(crate) fn finalize(&mut self) -> (Option<Box<dyn HistoryCell>>, Option<String>) {
@@ -670,6 +751,16 @@ impl PlanStreamController {
         !self.header_emitted && self.core.enqueued_stable_len == 0
     }
 
+    #[inline]
+    pub(crate) fn tail_sync_key(&self) -> (u64, bool, bool, bool) {
+        (
+            self.core.visible_tail_revision(),
+            self.header_emitted,
+            self.top_padding_emitted,
+            self.tail_starts_stream(),
+        )
+    }
+
     pub(crate) fn current_tail_display_lines(&self) -> Vec<HyperlinkLine> {
         let lines = self.current_tail_lines();
         if lines.is_empty() {
@@ -683,8 +774,7 @@ impl PlanStreamController {
     }
 
     pub(crate) fn clear_queue(&mut self) {
-        self.core.state.clear_queue();
-        self.core.enqueued_stable_len = self.core.emitted_stable_len;
+        self.core.clear_queue();
     }
 
     pub(crate) fn set_width(&mut self, width: Option<usize>) {
@@ -832,6 +922,41 @@ mod tests {
             lines.extend(cell.transcript_lines(u16::MAX));
         }
         lines_to_plain_strings(&lines)
+    }
+
+    #[test]
+    fn committed_deltas_coalesce_full_source_render_until_frame_flush() {
+        let mut ctrl = stream_controller(Some(80));
+
+        ctrl.push("first line\n");
+        assert_eq!(
+            ctrl.core.streaming_render_count, 1,
+            "first render is immediate"
+        );
+        ctrl.push("second line\n");
+        ctrl.push("third line\n");
+
+        assert_eq!(
+            ctrl.core.streaming_render_count, 1,
+            "multiple deltas in one frame must not repeat the full-source render"
+        );
+        ctrl.flush_render_for_frame();
+        assert_eq!(ctrl.core.streaming_render_count, 2);
+        assert_eq!(ctrl.core.rendered_source_len, ctrl.core.raw_source.len());
+    }
+
+    #[test]
+    fn finalize_reuses_the_current_full_source_render() {
+        let mut ctrl = stream_controller(Some(80));
+        ctrl.push("first line\n");
+        assert_eq!(ctrl.core.streaming_render_count, 1);
+
+        let _ = ctrl.finalize();
+
+        assert_eq!(
+            ctrl.core.finalize_render_count, 0,
+            "finalizing an already-rendered source must not render it again"
+        );
     }
 
     #[test]

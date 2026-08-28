@@ -1,10 +1,13 @@
 mod streamable_http_test_support;
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
+use axum::Router;
 use codex_exec_server::Environment;
 use codex_exec_server::ExecServerError;
 use codex_exec_server::HttpClient;
@@ -14,7 +17,30 @@ use codex_exec_server::HttpResponseBodyStream;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
+use rmcp::ErrorData as McpError;
+use rmcp::handler::server::ServerHandler;
+use rmcp::model::CallToolRequestParams;
+use rmcp::model::CallToolResult;
+use rmcp::model::CancelledNotificationParam;
+use rmcp::model::JsonObject;
+use rmcp::model::ListToolsResult;
+use rmcp::model::PaginatedRequestParams;
+use rmcp::model::ReadResourceRequestParams;
+use rmcp::model::RequestId;
+use rmcp::model::ServerCapabilities;
+use rmcp::model::ServerInfo;
+use rmcp::model::Tool;
+use rmcp::service::NotificationContext;
+use rmcp::service::RequestContext;
+use rmcp::service::RoleServer;
+use rmcp::transport::StreamableHttpServerConfig;
+use rmcp::transport::StreamableHttpService;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde_json::Value;
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use streamable_http_test_support::arm_initialize_post_failure;
 use streamable_http_test_support::arm_initialize_post_json_rpc_failure;
@@ -28,6 +54,7 @@ use streamable_http_test_support::expected_echo_result;
 use streamable_http_test_support::spawn_streamable_http_server;
 
 const JSON_RPC_INTERNAL_ERROR_CODE: i64 = -32603;
+const RESOURCE_URI: &str = "memo://codex/example-note";
 const SIMULATED_NO_RESPONSE_MESSAGE: &str =
     "http/request failed: error sending request for url (simulated no response)";
 
@@ -36,6 +63,130 @@ struct FailFirstInitializeHttpClient {
     inner: Arc<dyn HttpClient>,
     failures_remaining: Arc<AtomicUsize>,
     initialize_attempts: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct DelayReinitializeHttpClient {
+    inner: Arc<dyn HttpClient>,
+    initialize_attempts: Arc<AtomicUsize>,
+    reinitialize_delay: Duration,
+}
+
+impl DelayReinitializeHttpClient {
+    fn new(inner: Arc<dyn HttpClient>, reinitialize_delay: Duration) -> Self {
+        Self {
+            inner,
+            initialize_attempts: Arc::new(AtomicUsize::new(0)),
+            reinitialize_delay,
+        }
+    }
+
+    fn initialize_attempts(&self) -> usize {
+        self.initialize_attempts.load(Ordering::SeqCst)
+    }
+}
+
+impl HttpClient for DelayReinitializeHttpClient {
+    fn http_request(
+        &self,
+        params: HttpRequestParams,
+    ) -> BoxFuture<'_, Result<HttpRequestResponse, ExecServerError>> {
+        self.inner.http_request(params)
+    }
+
+    fn http_request_stream(
+        &self,
+        params: HttpRequestParams,
+    ) -> BoxFuture<'_, Result<(HttpRequestResponse, HttpResponseBodyStream), ExecServerError>> {
+        let inner = Arc::clone(&self.inner);
+        let initialize_attempts = Arc::clone(&self.initialize_attempts);
+        let reinitialize_delay = self.reinitialize_delay;
+
+        async move {
+            if is_initialize_post(&params) && initialize_attempts.fetch_add(1, Ordering::SeqCst) > 0
+            {
+                tokio::time::sleep(reinitialize_delay).await;
+            }
+
+            inner.http_request_stream(params).await
+        }
+        .boxed()
+    }
+}
+
+#[derive(Clone)]
+struct CancellationObserverServer {
+    started_requests: mpsc::UnboundedSender<RequestId>,
+    cancellations: mpsc::UnboundedSender<CancelledNotificationParam>,
+}
+
+impl ServerHandler for CancellationObserverServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let input_schema: JsonObject = serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false
+        }))
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(ListToolsResult {
+            tools: vec![Tool::new(
+                Cow::Borrowed("slow"),
+                Cow::Borrowed("Wait until the request is cancelled."),
+                Arc::new(input_schema),
+            )],
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        _request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let _ = self.started_requests.send(context.id.clone());
+        context.ct.cancelled().await;
+        Err(McpError::internal_error("request cancelled", None))
+    }
+
+    async fn on_cancelled(
+        &self,
+        notification: CancelledNotificationParam,
+        _context: NotificationContext<RoleServer>,
+    ) {
+        let _ = self.cancellations.send(notification);
+    }
+}
+
+async fn start_cancellation_observer_server(
+    started_requests: mpsc::UnboundedSender<RequestId>,
+    cancellations: mpsc::UnboundedSender<CancelledNotificationParam>,
+) -> anyhow::Result<(String, JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(CancellationObserverServer {
+                started_requests: started_requests.clone(),
+                cancellations: cancellations.clone(),
+            })
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let router = Router::new().nest_service("/mcp", service);
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    Ok((format!("http://{addr}"), handle))
 }
 
 impl FailFirstInitializeHttpClient {
@@ -225,6 +376,102 @@ async fn streamable_http_tools_list_retries_json_rpc_transient_status() -> anyho
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn streamable_http_resource_reads_retry_transient_http_status() -> anyhow::Result<()> {
+    let (_server, base_url) = spawn_streamable_http_server().await?;
+    let client = create_client(&base_url).await?;
+
+    let expected_resources = client
+        .list_resources(/*params*/ None, Some(Duration::from_secs(5)))
+        .await?;
+    let expected_templates = client
+        .list_resource_templates(/*params*/ None, Some(Duration::from_secs(5)))
+        .await?;
+    let expected_resource = client
+        .read_resource(
+            ReadResourceRequestParams::new(RESOURCE_URI),
+            Some(Duration::from_secs(5)),
+        )
+        .await?;
+
+    arm_session_post_failure(&base_url, /*status*/ 502, /*remaining*/ 1, &[]).await?;
+    assert_eq!(
+        client
+            .list_resources(/*params*/ None, Some(Duration::from_secs(5)))
+            .await?,
+        expected_resources
+    );
+
+    arm_session_post_failure(&base_url, /*status*/ 502, /*remaining*/ 1, &[]).await?;
+    assert_eq!(
+        client
+            .list_resource_templates(/*params*/ None, Some(Duration::from_secs(5)))
+            .await?,
+        expected_templates
+    );
+
+    arm_session_post_failure(&base_url, /*status*/ 502, /*remaining*/ 1, &[]).await?;
+    assert_eq!(
+        client
+            .read_resource(
+                ReadResourceRequestParams::new(RESOURCE_URI),
+                Some(Duration::from_secs(5)),
+            )
+            .await?,
+        expected_resource
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn streamable_http_resource_reads_retry_json_rpc_transient_status() -> anyhow::Result<()> {
+    let (_server, base_url) = spawn_streamable_http_server().await?;
+    let client = create_client(&base_url).await?;
+
+    let expected_resources = client
+        .list_resources(/*params*/ None, Some(Duration::from_secs(5)))
+        .await?;
+    let expected_templates = client
+        .list_resource_templates(/*params*/ None, Some(Duration::from_secs(5)))
+        .await?;
+    let expected_resource = client
+        .read_resource(
+            ReadResourceRequestParams::new(RESOURCE_URI),
+            Some(Duration::from_secs(5)),
+        )
+        .await?;
+
+    arm_session_post_json_rpc_failure(&base_url, /*status*/ 502, /*remaining*/ 1).await?;
+    assert_eq!(
+        client
+            .list_resources(/*params*/ None, Some(Duration::from_secs(5)))
+            .await?,
+        expected_resources
+    );
+
+    arm_session_post_json_rpc_failure(&base_url, /*status*/ 502, /*remaining*/ 1).await?;
+    assert_eq!(
+        client
+            .list_resource_templates(/*params*/ None, Some(Duration::from_secs(5)))
+            .await?,
+        expected_templates
+    );
+
+    arm_session_post_json_rpc_failure(&base_url, /*status*/ 502, /*remaining*/ 1).await?;
+    assert_eq!(
+        client
+            .read_resource(
+                ReadResourceRequestParams::new(RESOURCE_URI),
+                Some(Duration::from_secs(5)),
+            )
+            .await?,
+        expected_resource
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn streamable_http_404_session_expiry_recovers_and_retries_once() -> anyhow::Result<()> {
     let (_server, base_url) = spawn_streamable_http_server().await?;
     let client = create_client(&base_url).await?;
@@ -242,6 +489,122 @@ async fn streamable_http_404_session_expiry_recovers_and_retries_once() -> anyho
 
     let recovered = call_echo_tool(&client, "recovered").await?;
     assert_eq!(recovered, expected_echo_result("recovered"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn streamable_http_operation_timeout_covers_session_reinitialization() -> anyhow::Result<()> {
+    let (_server, base_url) = spawn_streamable_http_server().await?;
+    let http_client = DelayReinitializeHttpClient::new(
+        Environment::default_for_tests().get_http_client(),
+        Duration::from_secs(2),
+    );
+    let client = create_client_with_http_client(&base_url, Arc::new(http_client.clone())).await?;
+
+    arm_session_post_failure(
+        &base_url,
+        /*status*/ 404,
+        /*remaining*/ 1,
+        /*www_authenticate_headers*/ &[],
+    )
+    .await?;
+
+    let started_at = Instant::now();
+    let error = client
+        .call_tool(
+            "echo".to_string(),
+            Some(serde_json::json!({ "message": "recovery-timeout" })),
+            /*meta*/ None,
+            Some(Duration::from_millis(100)),
+        )
+        .await
+        .expect_err("session reinitialization must stay within the operation timeout");
+
+    assert!(
+        error.to_string().contains("timed out awaiting tools/call"),
+        "unexpected timeout error: {error:#}"
+    );
+    assert_eq!(http_client.initialize_attempts(), 2);
+    assert!(
+        started_at.elapsed() < Duration::from_secs(1),
+        "operation exceeded its single timeout budget: {:?}",
+        started_at.elapsed()
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn streamable_http_timeout_cancels_the_live_request_id() -> anyhow::Result<()> {
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let (cancellation_tx, mut cancellation_rx) = mpsc::unbounded_channel();
+    let (base_url, server_handle) =
+        start_cancellation_observer_server(started_tx, cancellation_tx).await?;
+    let client = create_client(&base_url).await?;
+
+    let error = client
+        .call_tool(
+            "slow".to_string(),
+            /*arguments*/ None,
+            /*meta*/ None,
+            Some(Duration::from_millis(100)),
+        )
+        .await
+        .expect_err("slow tool call must time out");
+    assert!(
+        error.to_string().contains("timed out awaiting tools/call"),
+        "unexpected timeout error: {error:#}"
+    );
+
+    let started_request_id = timeout(Duration::from_secs(2), started_rx.recv())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("server closed the started-request channel"))?;
+    let cancellation = timeout(Duration::from_secs(2), cancellation_rx.recv())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("server did not observe request cancellation"))?;
+    assert_eq!(cancellation.request_id, started_request_id);
+    assert_eq!(cancellation.reason.as_deref(), Some("request timeout"));
+
+    server_handle.abort();
+    let _ = server_handle.await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn dropping_streamable_http_operation_cancels_the_live_request_id() -> anyhow::Result<()> {
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let (cancellation_tx, mut cancellation_rx) = mpsc::unbounded_channel();
+    let (base_url, server_handle) =
+        start_cancellation_observer_server(started_tx, cancellation_tx).await?;
+    let client = create_client(&base_url).await?;
+
+    let operation = tokio::spawn(async move {
+        client
+            .call_tool(
+                "slow".to_string(),
+                /*arguments*/ None,
+                /*meta*/ None,
+                /*timeout*/ None,
+            )
+            .await
+    });
+    let started_request_id = timeout(Duration::from_secs(2), started_rx.recv())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("server closed the started-request channel"))?;
+
+    operation.abort();
+    let _ = operation.await;
+
+    let cancellation = timeout(Duration::from_secs(2), cancellation_rx.recv())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("server did not observe request cancellation"))?;
+    assert_eq!(cancellation.request_id, started_request_id);
+    assert_eq!(cancellation.reason.as_deref(), Some("request cancelled"));
+
+    server_handle.abort();
+    let _ = server_handle.await;
 
     Ok(())
 }

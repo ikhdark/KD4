@@ -21,6 +21,7 @@ pub use live_thread::LiveThread;
 pub use live_thread::LiveThreadInitGuard;
 pub use local::LocalThreadStore;
 pub use local::LocalThreadStoreConfig;
+pub use local::StagedThreadDelete;
 pub use store::ThreadStore;
 pub use store::ThreadStoreFuture;
 pub use thread_name::normalize_thread_name;

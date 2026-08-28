@@ -69,6 +69,45 @@ impl CodeModeSessionProvider for InProcessCodeModeSessionProvider {
     }
 }
 
+/// Tries a preferred session provider first and degrades to a compatible local
+/// provider when the preferred provider cannot create a session.
+pub struct FallbackCodeModeSessionProvider {
+    preferred: Arc<dyn CodeModeSessionProvider>,
+    fallback: Arc<dyn CodeModeSessionProvider>,
+}
+
+impl FallbackCodeModeSessionProvider {
+    pub fn new(
+        preferred: Arc<dyn CodeModeSessionProvider>,
+        fallback: Arc<dyn CodeModeSessionProvider>,
+    ) -> Self {
+        Self {
+            preferred,
+            fallback,
+        }
+    }
+}
+
+impl CodeModeSessionProvider for FallbackCodeModeSessionProvider {
+    fn create_session<'a>(
+        &'a self,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        Box::pin(async move {
+            match self.preferred.create_session(Arc::clone(&delegate)).await {
+                Ok(session) => Ok(session),
+                Err(error) => {
+                    tracing::warn!(
+                        error,
+                        "preferred code-mode session provider unavailable; using fallback"
+                    );
+                    self.fallback.create_session(delegate).await
+                }
+            }
+        })
+    }
+}
+
 pub struct InProcessCodeModeSession {
     runtime: SessionRuntime<ProtocolDelegate>,
 }

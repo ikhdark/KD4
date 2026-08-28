@@ -27,6 +27,7 @@ use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::local_selections;
@@ -73,36 +74,36 @@ async fn extension_tool_receives_turn_environment_sandbox() -> Result<()> {
             model_info.input_modalities = vec![InputModality::Text, InputModality::Image];
         })
         .with_config(|config| {
+            config.set_windows_sandbox_enabled(true);
             assert!(config.web_search_mode.set(WebSearchMode::Live).is_ok());
         });
     let test = builder.build(&server).await?;
     let denied_path = test.config.cwd.join("denied.png");
-    std::fs::write(&denied_path, b"not readable")?;
+    std::fs::write(&denied_path, TINY_PNG_BYTES)?;
+    Mock::given(method("POST"))
+        .and(path("/v1/images/edits"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
 
     let call_id = "image-edit-denied";
-    let response_mock = responses::mount_sse_sequence(
+    let _response_mock = responses::mount_sse_once(
         &server,
-        vec![
-            responses::sse(vec![
-                responses::ev_response_created("resp-1"),
-                responses::ev_function_call_with_namespace(
-                    call_id,
-                    "image_gen",
-                    "imagegen",
-                    &json!({
-                        "prompt": "edit the image",
-                        "referenced_image_paths": [denied_path.display().to_string()],
-                    })
-                    .to_string(),
-                ),
-                responses::ev_completed("resp-1"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-2"),
-                responses::ev_assistant_message("msg-1", "done"),
-                responses::ev_completed("resp-2"),
-            ]),
-        ],
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call_with_namespace(
+                call_id,
+                "image_gen",
+                "imagegen",
+                &json!({
+                    "prompt": "edit the image",
+                    "referenced_image_paths": [denied_path.display().to_string()],
+                })
+                .to_string(),
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
     )
     .await;
 
@@ -120,21 +121,18 @@ async fn extension_tool_receives_turn_environment_sandbox() -> Result<()> {
         NetworkSandboxPolicy::Restricted,
     );
 
-    test.submit_turn_with_permission_profile("edit the denied image", permission_profile)
+    let completion = test
+        .submit_turn_with_permission_profile_and_capture_completion(
+            "edit the denied image",
+            permission_profile,
+        )
         .await?;
-
-    let request = response_mock
-        .last_request()
-        .context("missing request containing extension output")?;
-    let output = request
-        .function_call_output_content_and_success(call_id)
-        .and_then(|(content, _)| content)
-        .context("extension error text should be present")?;
+    let output = completion
+        .error
+        .context("denied extension read should fail the turn")?
+        .message;
     assert!(
-        output.starts_with(&format!(
-            "unable to read referenced image at `{}`:",
-            denied_path.display()
-        )),
+        output.contains("required tool") && output.contains("failed"),
         "unexpected extension error: {output}"
     );
 
@@ -193,7 +191,9 @@ async fn extension_tool_uses_granted_turn_permissions_without_local_persistence(
     std::fs::write(&image_path, TINY_PNG_BYTES)?;
     let requested_permissions = RequestPermissionProfile {
         file_system: Some(FileSystemPermissions::from_read_write_roots(
-            Some(vec![image_dir.path().canonicalize()?.try_into()?]),
+            Some(vec![PathUri::from_abs_path(
+                &image_dir.path().canonicalize()?.try_into()?,
+            )]),
             Some(Vec::new()),
         )),
         ..RequestPermissionProfile::default()
@@ -299,10 +299,16 @@ async fn extension_tool_uses_granted_turn_permissions_without_local_persistence(
     let output = request.function_call_output(image_call_id);
     assert_eq!(
         output["output"],
-        json!([{
-            "type": "input_image",
-            "image_url": TINY_PNG_DATA_URL,
-        }])
+        json!([
+            {
+                "type": "input_text",
+                "text": "",
+            },
+            {
+                "type": "input_image",
+                "image_url": TINY_PNG_DATA_URL,
+            }
+        ])
     );
     assert!(!test.config.codex_home.join("generated_images").exists());
 

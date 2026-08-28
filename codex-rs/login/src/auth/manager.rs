@@ -49,7 +49,6 @@ pub use crate::auth::storage::AuthDotJson;
 pub use crate::auth::storage::AuthKeyringBackendKind;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::create_auth_storage;
-use crate::auth::util::try_parse_error_message;
 use crate::default_client::create_client;
 use crate::default_client::create_default_auth_client;
 use crate::outbound_proxy::AuthRouteConfig;
@@ -1534,37 +1533,37 @@ async fn request_chatgpt_token_refresh(
         Ok(refresh_response)
     } else {
         let body = response.text().await.unwrap_or_default();
-        tracing::error!("Failed to refresh token: {status}: {body}");
-        let failed = classify_refresh_token_failure(&body);
-        if status == StatusCode::UNAUTHORIZED || failed.reason != RefreshTokenFailedReason::Other {
+        let body_bytes = body.len();
+        let failure_body = parse_refresh_token_failure_body(&body);
+        let failed = classify_refresh_token_failure(failure_body.backend_code.as_deref());
+        let permanent =
+            status == StatusCode::UNAUTHORIZED || failed.reason != RefreshTokenFailedReason::Other;
+        tracing::warn!(
+            status = status.as_u16(),
+            backend_code = failure_body.backend_code.as_deref().unwrap_or(""),
+            body_bytes,
+            permanent,
+            "token refresh rejected"
+        );
+        if permanent {
             Err(RefreshTokenError::Permanent(failed))
         } else {
-            let message = try_parse_error_message(&body);
-            Err(RefreshTokenError::Transient(std::io::Error::other(
-                format!("Failed to refresh token: {status}: {message}"),
-            )))
+            let message = match failure_body.backend_code {
+                Some(code) => format!("Failed to refresh token: {status} ({code})"),
+                None => format!("Failed to refresh token: {status}"),
+            };
+            Err(RefreshTokenError::Transient(std::io::Error::other(message)))
         }
     }
 }
 
-fn classify_refresh_token_failure(body: &str) -> RefreshTokenFailedError {
-    let code = extract_refresh_token_error_code(body);
-
-    let normalized_code = code.as_deref().map(str::to_ascii_lowercase);
-    let reason = match normalized_code.as_deref() {
+fn classify_refresh_token_failure(backend_code: Option<&str>) -> RefreshTokenFailedError {
+    let reason = match backend_code {
         Some("refresh_token_expired") => RefreshTokenFailedReason::Expired,
         Some("refresh_token_reused") => RefreshTokenFailedReason::Exhausted,
         Some("refresh_token_invalidated") => RefreshTokenFailedReason::Revoked,
         _ => RefreshTokenFailedReason::Other,
     };
-
-    if reason == RefreshTokenFailedReason::Other {
-        tracing::warn!(
-            backend_code = normalized_code.as_deref(),
-            backend_body = body,
-            "Encountered unknown response while refreshing token"
-        );
-    }
 
     let message = match reason {
         RefreshTokenFailedReason::Expired => REFRESH_TOKEN_EXPIRED_MESSAGE.to_string(),
@@ -1576,30 +1575,45 @@ fn classify_refresh_token_failure(body: &str) -> RefreshTokenFailedError {
     RefreshTokenFailedError::new(reason, message)
 }
 
-fn extract_refresh_token_error_code(body: &str) -> Option<String> {
+const MAX_REFRESH_TOKEN_ERROR_CODE_BYTES: usize = 64;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RefreshTokenFailureBody {
+    backend_code: Option<String>,
+}
+
+fn parse_refresh_token_failure_body(body: &str) -> RefreshTokenFailureBody {
     if body.trim().is_empty() {
-        return None;
+        return RefreshTokenFailureBody::default();
     }
 
-    let Value::Object(map) = serde_json::from_str::<Value>(body).ok()? else {
-        return None;
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(body) else {
+        return RefreshTokenFailureBody::default();
     };
 
-    if let Some(error_value) = map.get("error") {
+    let code = if let Some(error_value) = map.get("error") {
         match error_value {
-            Value::Object(obj) => {
-                if let Some(code) = obj.get("code").and_then(Value::as_str) {
-                    return Some(code.to_string());
-                }
-            }
-            Value::String(code) => {
-                return Some(code.to_string());
-            }
-            _ => {}
+            Value::Object(obj) => obj.get("code").and_then(Value::as_str),
+            Value::String(code) => Some(code.as_str()),
+            _ => None,
         }
+    } else {
+        None
     }
+    .or_else(|| map.get("code").and_then(Value::as_str));
 
-    map.get("code").and_then(Value::as_str).map(str::to_string)
+    let backend_code = code.and_then(sanitize_refresh_token_error_code);
+    RefreshTokenFailureBody { backend_code }
+}
+
+fn sanitize_refresh_token_error_code(code: &str) -> Option<String> {
+    let normalized = code.to_ascii_lowercase();
+    (!normalized.is_empty()
+        && normalized.len() <= MAX_REFRESH_TOKEN_ERROR_CODE_BYTES
+        && normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+    .then_some(normalized)
 }
 
 #[derive(Serialize)]
@@ -2244,10 +2258,7 @@ impl AuthManager {
         }
 
         let auth = self.auth_cached()?;
-        if Self::should_refresh_proactively(&auth)
-            && let Err(err) = self.refresh_token().await
-        {
-            tracing::error!("Failed to refresh token: {}", err);
+        if Self::should_refresh_proactively(&auth) && self.refresh_token().await.is_err() {
             return Some(auth);
         }
         self.auth_cached()

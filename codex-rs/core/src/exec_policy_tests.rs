@@ -265,9 +265,9 @@ async fn format_exec_policy_error_with_source_renders_range() {
     fs::write(
         &broken_path,
         r#"prefix_rule(
-    pattern = ["tmux capture-pane"],
+    pattern = ["powershell.exe -Command Get-Location"],
     decision = "allow",
-    match = ["tmux capture-pane -p"],
+    match = ["powershell.exe -Command Get-Location -Verbose"],
 )"#,
     )
     .expect("write broken policy file");
@@ -1456,6 +1456,43 @@ async fn exec_approval_requirement_falls_back_to_heuristics() {
 }
 
 #[tokio::test]
+async fn authorization_identity_keeps_direct_argv_opaque() {
+    let mut parser = PolicyParser::new();
+    parser
+        .parse(
+            "test.rules",
+            r#"prefix_rule(pattern=["ls"], decision="allow")"#,
+        )
+        .expect("parse policy");
+    let manager = ExecPolicyManager::new(Arc::new(parser.build()));
+    let command = vec![
+        "/workspace/bash".to_string(),
+        "-lc".to_string(),
+        "ls".to_string(),
+    ];
+
+    let requirement = manager
+        .create_exec_approval_requirement_for_direct_argv(ExecApprovalRequest {
+            command: &command,
+            command_for_safety: Some(&["bash".to_string(), "-lc".to_string(), "ls".to_string()]),
+            approval_policy: AskForApproval::UnlessTrusted,
+            permission_profile: PermissionProfile::read_only(),
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            prefix_rule: None,
+        })
+        .await;
+
+    assert_eq!(
+        requirement,
+        ExecApprovalRequirement::NeedsApproval {
+            reason: None,
+            proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(command)),
+        }
+    );
+}
+
+#[tokio::test]
 async fn empty_bash_lc_script_falls_back_to_original_command() {
     let command = vec!["bash".to_string(), "-lc".to_string(), "".to_string()];
 
@@ -2016,9 +2053,7 @@ fn vec_str(items: &[&str]) -> Vec<String> {
 /// Exercises the Windows-specific unmatched-command rendering path.
 #[tokio::test]
 async fn verify_approval_requirement_for_unsafe_powershell_command() {
-    // `brew install powershell` to run this test on a Mac!
-    // Note `pwsh` is required to parse a PowerShell command to see if it
-    // is safe.
+    // `pwsh` is required to parse a PowerShell command to see if it is safe.
     if which::which("pwsh").is_err() {
         return;
     }

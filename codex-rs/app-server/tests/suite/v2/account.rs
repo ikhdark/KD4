@@ -23,6 +23,7 @@ use codex_app_server_protocol::GetAuthStatusParams;
 use codex_app_server_protocol::GetAuthStatusResponse;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
@@ -67,6 +68,30 @@ const WORKSPACE_ID_INITIAL: &str = "123e4567-e89b-42d3-a456-426614174011";
 const WORKSPACE_ID_REFRESHED: &str = "123e4567-e89b-42d3-a456-426614174012";
 const WORKSPACE_ID_DEVICE: &str = "123e4567-e89b-42d3-a456-426614174013";
 const WORKSPACE_ID_STALE: &str = "123e4567-e89b-42d3-a456-426614174014";
+
+async fn read_response_before_login_completion(
+    mcp: &mut TestAppServer,
+    request_id: i64,
+) -> Result<JSONRPCResponse> {
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            match mcp.read_next_message().await? {
+                JSONRPCMessage::Response(response)
+                    if response.id == RequestId::Integer(request_id) =>
+                {
+                    return Ok(response);
+                }
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == "account/login/completed" =>
+                {
+                    bail!("account/login/completed arrived before account/login/start response");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await?
+}
 
 // Helper to create a minimal config.toml for the app server
 #[derive(Default)]
@@ -1172,11 +1197,7 @@ async fn login_account_chatgpt_device_code_succeeds_and_notifies() -> Result<()>
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp.send_login_account_chatgpt_device_code_request().await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
+    let resp = read_response_before_login_completion(&mut mcp, request_id).await?;
     let login: LoginAccountResponse = to_response(resp)?;
     let LoginAccountResponse::ChatgptDeviceCode {
         login_id,
@@ -1250,11 +1271,7 @@ async fn login_account_chatgpt_device_code_failure_notifies_without_account_upda
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp.send_login_account_chatgpt_device_code_request().await?;
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
+    let resp = read_response_before_login_completion(&mut mcp, request_id).await?;
     let login: LoginAccountResponse = to_response(resp)?;
     let LoginAccountResponse::ChatgptDeviceCode { login_id, .. } = login else {
         bail!("unexpected login response: {login:?}");

@@ -287,8 +287,8 @@ mod job {
         rollout_cwd: &Path,
         stage_one_context: &StageOneRequestContext,
     ) -> anyhow::Result<(StageOneOutput, Option<TokenUsage>)> {
-        let (rollout_items, _, _) = RolloutRecorder::load_rollout_items(rollout_path).await?;
-        let rollout_contents = serialize_filtered_rollout_response_items(&rollout_items)?;
+        let rollout_contents =
+            serialize_filtered_rollout_response_items_from_path(rollout_path).await?;
 
         let mut prompt = Prompt::default();
         prompt.input = vec![ResponseItem::Message {
@@ -402,6 +402,7 @@ mod job {
     }
 
     /// Serializes filtered stage-1 memory items for prompt inclusion.
+    #[cfg(test)]
     pub(super) fn serialize_filtered_rollout_response_items(
         items: &[RolloutItem],
     ) -> codex_protocol::error::Result<String> {
@@ -422,22 +423,59 @@ mod job {
                 | RolloutItem::EventMsg(_) => None,
             })
             .collect::<Vec<_>>();
+        serialize_filtered_response_items(filtered)
+    }
+
+    pub(super) async fn serialize_filtered_rollout_response_items_from_path(
+        rollout_path: &Path,
+    ) -> anyhow::Result<String> {
+        let mut filtered = Vec::new();
+        RolloutRecorder::for_each_rollout_item(rollout_path, |item| match item {
+            RolloutItem::ResponseItem(item) => {
+                if let Some(item) = sanitize_owned_response_item_for_memories(item) {
+                    filtered.push(item);
+                }
+            }
+            RolloutItem::InterAgentCommunication(communication) => {
+                filtered.push(communication.to_model_input_item());
+            }
+            RolloutItem::SessionMeta(_)
+            | RolloutItem::ToolManifest(_)
+            | RolloutItem::SamplingBoundary(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::Compacted(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::EventMsg(_) => {}
+        })
+        .await?;
+        Ok(serialize_filtered_response_items(filtered)?)
+    }
+
+    fn serialize_filtered_response_items(
+        filtered: Vec<ResponseItem>,
+    ) -> codex_protocol::error::Result<String> {
         let serialized = serde_json::to_string(&filtered).map_err(|err| {
             CodexErr::InvalidRequest(format!("failed to serialize rollout memory: {err}"))
         })?;
         Ok(redact_secrets(serialized))
     }
 
+    #[cfg(test)]
     fn sanitize_response_item_for_memories(item: &ResponseItem) -> Option<ResponseItem> {
-        let ResponseItem::Message {
-            id,
-            role,
-            content,
-            phase,
-            internal_chat_message_metadata_passthrough: metadata,
-        } = item
-        else {
-            return should_persist_response_item_for_memories(item).then(|| item.clone());
+        sanitize_owned_response_item_for_memories(item.clone())
+    }
+
+    fn sanitize_owned_response_item_for_memories(item: ResponseItem) -> Option<ResponseItem> {
+        let (id, role, content, phase, metadata) = match item {
+            ResponseItem::Message {
+                id,
+                role,
+                content,
+                phase,
+                internal_chat_message_metadata_passthrough: metadata,
+            } => (id, role, content, phase, metadata),
+            item => return should_persist_response_item_for_memories(&item).then_some(item),
         };
 
         if role == "developer" {
@@ -445,24 +483,29 @@ mod job {
         }
 
         if role != "user" {
-            return Some(item.clone());
+            return Some(ResponseItem::Message {
+                id,
+                role,
+                content,
+                phase,
+                internal_chat_message_metadata_passthrough: metadata,
+            });
         }
 
         let content = content
-            .iter()
+            .into_iter()
             .filter(|content_item| !is_memory_excluded_contextual_user_fragment(content_item))
-            .cloned()
             .collect::<Vec<_>>();
         if content.is_empty() {
             return None;
         }
 
         Some(ResponseItem::Message {
-            id: id.clone(),
-            role: role.clone(),
+            id,
+            role,
             content,
-            phase: phase.clone(),
-            internal_chat_message_metadata_passthrough: metadata.clone(),
+            phase,
+            internal_chat_message_metadata_passthrough: metadata,
         })
     }
 
@@ -762,6 +805,56 @@ mod tests {
 
         assert!(!serialized.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
         assert!(serialized.contains("[REDACTED_SECRET]"));
+    }
+
+    #[tokio::test]
+    async fn streams_memory_rollout_with_the_same_filtering_and_redaction() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let rollout_path = temp_dir.path().join("rollout.jsonl");
+        let retained = RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call_123".to_string(),
+            output: codex_protocol::models::FunctionCallOutputPayload {
+                body: codex_protocol::models::FunctionCallOutputBody::Text(
+                    r#"{"token":"sk-abcdefghijklmnopqrstuvwxyz123456"}"#.to_string(),
+                ),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        });
+        let discarded = RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "x".repeat(64 * 1024),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        });
+        let items = vec![retained, discarded];
+        let jsonl = items
+            .iter()
+            .map(|item| {
+                serde_json::to_string(&codex_protocol::protocol::RolloutLine {
+                    timestamp: "2026-08-28T00:00:00Z".to_string(),
+                    item: item.clone(),
+                })
+                .expect("rollout line")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        tokio::fs::write(&rollout_path, format!("{jsonl}\n"))
+            .await
+            .expect("write rollout");
+
+        let expected = job::serialize_filtered_rollout_response_items(&items).expect("serialize");
+        let actual = job::serialize_filtered_rollout_response_items_from_path(&rollout_path)
+            .await
+            .expect("stream rollout");
+
+        assert_eq!(actual, expected);
+        assert!(!actual.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+        assert!(!actual.contains(&"x".repeat(1024)));
     }
 
     #[test]

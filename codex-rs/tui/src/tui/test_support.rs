@@ -6,7 +6,6 @@ use ratatui::layout::Position;
 use ratatui::layout::Size;
 
 use super::Tui;
-use super::terminal_stderr::TerminalStderrGuard;
 use crate::custom_terminal::Terminal;
 
 pub(crate) fn make_test_tui() -> io::Result<Tui> {
@@ -19,10 +18,5 @@ pub(crate) fn make_test_tui() -> io::Result<Tui> {
         },
         Position { x: 0, y: 0 },
     );
-    let stderr_guard = TerminalStderrGuard::install()?;
-    Ok(Tui::new(
-        terminal,
-        /*enhanced_keys_supported*/ false,
-        stderr_guard,
-    ))
+    Ok(Tui::new(terminal, /*enhanced_keys_supported*/ false))
 }

@@ -4353,6 +4353,10 @@
       "description": "System instructions.",
       "type": "string"
     },
+    "kd4_workflow_enabled": {
+      "description": "Explicitly enables or disables the KD4 repository workflow. When unset, Codex continues to detect KD4 repositories from their marker file.",
+      "type": "boolean"
+    },
     "log_dir": {
       "allOf": [
         {

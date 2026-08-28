@@ -35,6 +35,7 @@ use tempfile::TempDir;
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 use wiremock::MockServer;
+use wiremock::http::Method;
 
 /// Verify that submitting `Op::Review` emits review item lifecycle,
 /// legacy review events, and TurnComplete when the model returns a structured review payload.
@@ -1048,6 +1049,93 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
 
     let _codex_home_guard = codex_home;
     server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_missing_base_branch_errors_without_model_request() {
+    skip_if_no_network!();
+
+    let repo = TempDir::new().expect("create repository directory");
+    run_git_command(repo.path(), &["init", "-b", "main"]);
+    run_git_command(repo.path(), &["config", "user.email", "test@example.com"]);
+    run_git_command(repo.path(), &["config", "user.name", "Test User"]);
+    std::fs::write(repo.path().join("file.txt"), "initial\n").expect("write repository file");
+    run_git_command(repo.path(), &["add", "."]);
+    run_git_command(repo.path(), &["commit", "-m", "initial"]);
+
+    assert_base_branch_review_rejected_without_model_request(repo.path(), "missing-branch").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_unborn_repository_errors_without_model_request() {
+    skip_if_no_network!();
+
+    let repo = TempDir::new().expect("create repository directory");
+    run_git_command(repo.path(), &["init", "-b", "main"]);
+
+    assert_base_branch_review_rejected_without_model_request(repo.path(), "main").await;
+}
+
+fn run_git_command(repo_path: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn assert_base_branch_review_rejected_without_model_request(
+    repo_path: &std::path::Path,
+    branch: &str,
+) {
+    let server = start_mock_server().await;
+    let codex_home = Arc::new(TempDir::new().expect("create codex home"));
+    let cwd = repo_path.to_path_buf();
+    let codex = new_conversation_for_server(&server, Arc::clone(&codex_home), move |config| {
+        config.cwd = cwd.abs();
+    })
+    .await;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::BaseBranch {
+                    branch: branch.to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .expect("submit review");
+
+    let event = wait_for_event(&codex, |event| matches!(event, EventMsg::Error(_))).await;
+    let EventMsg::Error(error) = event else {
+        unreachable!("predicate only accepts error events");
+    };
+    assert_eq!(
+        error.message,
+        format!(
+            "cannot review base branch '{branch}': repository HEAD or base branch could not be resolved"
+        )
+    );
+
+    let model_requests = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| {
+            request.method == Method::POST && request.url.path().ends_with("/responses")
+        })
+        .count();
+    assert_eq!(model_requests, 0, "invalid review must not reach the model");
 }
 
 fn assistant_message_sse(text: &str) -> Vec<serde_json::Value> {

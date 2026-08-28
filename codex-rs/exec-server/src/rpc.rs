@@ -349,6 +349,7 @@ impl RpcClient {
         for task in &self.transport_tasks {
             task.abort();
         }
+        let _ = self.transport.terminate_and_wait().await;
         drain_pending(&self.pending).await;
     }
 
@@ -411,6 +412,7 @@ impl RpcClient {
         &self,
         method: &str,
         params: &P,
+        call_timeout: Duration,
     ) -> Result<T, RpcCallError>
     where
         P: Serialize,
@@ -426,7 +428,8 @@ impl RpcClient {
                 }
             },
         };
-        self.call_inner(method, params, RpcCallTimeout::None).await
+        self.call_inner(method, params, RpcCallTimeout::After(call_timeout))
+            .await
     }
 
     async fn call_inner<P, T>(
@@ -666,6 +669,7 @@ async fn drain_pending(pending: &Mutex<HashMap<RequestId, PendingRequest>>) {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Stdio;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -680,6 +684,7 @@ mod tests {
     use tokio::io::AsyncBufReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::io::BufReader;
+    use tokio::process::Command;
     use tokio::task::JoinSet;
     use tokio::time::timeout;
     use tracing::Instrument;
@@ -727,6 +732,48 @@ mod tests {
         if let Err(err) = writer.write_all(format!("{encoded}\n").as_bytes()).await {
             panic!("failed to write JSON-RPC line: {err}");
         }
+    }
+
+    fn long_running_child() -> tokio::process::Child {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.args(["/D", "/S", "/C", "ping -n 60 127.0.0.1 >NUL"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 60"]);
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn long-running child")
+    }
+
+    #[tokio::test]
+    async fn rpc_client_close_waits_for_stdio_child_supervisor() {
+        let (client_reader, _server_writer) = tokio::io::duplex(64);
+        let (client_writer, _server_reader) = tokio::io::duplex(64);
+        let connection = JsonRpcConnection::from_stdio(
+            client_reader,
+            client_writer,
+            "stdio child shutdown test".to_string(),
+        )
+        .with_child_process(long_running_child());
+        let transport = connection.transport.clone();
+        let (client, _events_rx) = RpcClient::new(connection);
+
+        timeout(Duration::from_secs(10), client.close_transport())
+            .await
+            .expect("stdio child supervisor should finish");
+
+        assert!(transport.termination_completed());
     }
 
     #[tokio::test]
@@ -863,6 +910,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_client_cleanup_timeout_removes_pending_request() {
+        let (client_stdin, server_reader) = tokio::io::duplex(4096);
+        let (server_writer, client_stdout) = tokio::io::duplex(4096);
+        let (release_server_tx, release_server_rx) = tokio::sync::oneshot::channel();
+        let connection =
+            JsonRpcConnection::from_stdio(client_stdout, client_stdin, "test-rpc".to_string());
+        let (client, _events_rx) = RpcClient::new(connection);
+
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_reader).lines();
+            let request = read_jsonrpc_line(&mut lines).await;
+            assert!(matches!(request, JSONRPCMessage::Request(_)));
+            let _server_writer = server_writer;
+            let _ = release_server_rx.await;
+        });
+
+        let call_timeout = Duration::from_millis(10);
+        let result = client
+            .call_for_cleanup::<_, serde_json::Value>(
+                "cleanup",
+                &serde_json::json!({}),
+                call_timeout,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(super::RpcCallError::TimedOut { method, timeout })
+                if method == "cleanup" && timeout == call_timeout
+        ));
+        assert_eq!(client.pending_request_count().await, 0);
+
+        let _ = release_server_tx.send(());
+        if let Err(err) = server.await {
+            panic!("server task failed: {err}");
+        }
+    }
+
+    #[tokio::test]
     async fn rpc_client_bounds_in_flight_calls_and_preserves_cleanup() {
         let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel(/*buffer*/ 1);
         outgoing_tx
@@ -935,7 +1020,11 @@ mod tests {
         calls.spawn(async move {
             let params = serde_json::json!({});
             cleanup_client
-                .call_for_cleanup::<_, serde_json::Value>("cleanup", &params)
+                .call_for_cleanup::<_, serde_json::Value>(
+                    "cleanup",
+                    &params,
+                    Duration::from_secs(30),
+                )
                 .await
         });
         timeout(Duration::from_secs(1), async {
@@ -949,7 +1038,11 @@ mod tests {
         let cleanup_params = serde_json::json!({});
         let cleanup_overflow = timeout(
             Duration::from_secs(1),
-            client.call_for_cleanup::<_, serde_json::Value>("cleanup-overflow", &cleanup_params),
+            client.call_for_cleanup::<_, serde_json::Value>(
+                "cleanup-overflow",
+                &cleanup_params,
+                Duration::from_secs(30),
+            ),
         )
         .await
         .expect("cleanup circuit breaker should not block");

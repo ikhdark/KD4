@@ -2,6 +2,9 @@
 
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 
 use super::ParsedProxyListDecision;
 use super::RequestOrigin;
@@ -46,6 +49,9 @@ use windows_sys::Win32::Networking::WinHttp::WinHttpGetIEProxyConfigForCurrentUs
 use windows_sys::Win32::Networking::WinHttp::WinHttpGetProxyForUrl;
 use windows_sys::Win32::Networking::WinHttp::WinHttpOpen;
 use windows_sys::core::PWSTR;
+
+static WINHTTP_SESSION: LazyLock<Mutex<Option<Arc<WinHttpSession>>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 pub(super) fn resolve(request_url: &str, origin: &RequestOrigin) -> SystemProxyDecision {
     let ie_config = match current_user_ie_proxy_config() {
@@ -123,33 +129,38 @@ fn resolve_with_winhttp_options(
     origin: &RequestOrigin,
     mut options: WINHTTP_AUTOPROXY_OPTIONS,
 ) -> SystemProxyDecision {
-    let Some(session) = WinHttpSession::open() else {
-        return SystemProxyDecision::Unavailable {
-            failure: classify_winhttp_error(last_error()),
-        };
-    };
-
     let request_url = wide_null(request_url);
     let mut proxy_info = WINHTTP_PROXY_INFO {
         dwAccessType: WINHTTP_ACCESS_TYPE_NO_PROXY,
         lpszProxy: ptr::null_mut(),
         lpszProxyBypass: ptr::null_mut(),
     };
-    let ok = unsafe {
-        WinHttpGetProxyForUrl(
-            session.0,
-            request_url.as_ptr(),
-            &mut options,
-            &mut proxy_info,
-        )
-    };
-    if ok == FALSE {
+    let result = with_shared_winhttp_session(|session| {
+        let ok = unsafe {
+            WinHttpGetProxyForUrl(
+                session.raw_handle(),
+                request_url.as_ptr(),
+                &mut options,
+                &mut proxy_info,
+            )
+        };
+        if ok == FALSE {
+            Err(last_error())
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = result {
         return SystemProxyDecision::Unavailable {
-            failure: classify_winhttp_error(last_error()),
+            failure: classify_winhttp_error(error),
         };
     }
 
     let proxy_info = ProxyInfo::from_raw(proxy_info);
+    proxy_info_decision(&proxy_info, origin)
+}
+
+fn proxy_info_decision(proxy_info: &ProxyInfo, origin: &RequestOrigin) -> SystemProxyDecision {
     if proxy_info.access_type == WINHTTP_ACCESS_TYPE_NO_PROXY {
         return SystemProxyDecision::Direct;
     }
@@ -157,6 +168,13 @@ fn resolve_with_winhttp_options(
         return SystemProxyDecision::Unavailable {
             failure: RouteFailureClass::ProxyResolutionUnavailable,
         };
+    }
+    if proxy_info
+        .proxy_bypass
+        .as_deref()
+        .is_some_and(|bypass| proxy_bypass_matches_origin(bypass, origin))
+    {
+        return SystemProxyDecision::Direct;
     }
     let Some(proxy) = proxy_info.proxy.as_deref() else {
         return SystemProxyDecision::Unavailable {
@@ -222,7 +240,7 @@ struct IeProxyConfig {
 struct ProxyInfo {
     access_type: u32,
     proxy: Option<String>,
-    _proxy_bypass: Option<String>,
+    proxy_bypass: Option<String>,
 }
 
 impl ProxyInfo {
@@ -230,7 +248,7 @@ impl ProxyInfo {
         Self {
             access_type: raw.dwAccessType,
             proxy: GlobalWideString::from_raw(raw.lpszProxy).into_string(),
-            _proxy_bypass: GlobalWideString::from_raw(raw.lpszProxyBypass).into_string(),
+            proxy_bypass: GlobalWideString::from_raw(raw.lpszProxyBypass).into_string(),
         }
     }
 }
@@ -265,10 +283,10 @@ impl Drop for GlobalWideString {
     }
 }
 
-struct WinHttpSession(*mut c_void);
+struct WinHttpSession(usize);
 
 impl WinHttpSession {
-    fn open() -> Option<Self> {
+    fn open() -> Result<Self, u32> {
         let agent = wide_null("Codex");
         let handle = unsafe {
             WinHttpOpen(
@@ -280,21 +298,44 @@ impl WinHttpSession {
             )
         };
         if handle.is_null() {
-            None
+            Err(last_error())
         } else {
-            Some(Self(handle))
+            Ok(Self(handle as usize))
         }
+    }
+
+    fn raw_handle(&self) -> *mut c_void {
+        self.0 as *mut c_void
     }
 }
 
 impl Drop for WinHttpSession {
     fn drop(&mut self) {
-        if !self.0.is_null() {
+        let handle = self.raw_handle();
+        if !handle.is_null() {
             unsafe {
-                WinHttpCloseHandle(self.0);
+                WinHttpCloseHandle(handle);
             }
         }
     }
+}
+
+fn with_shared_winhttp_session<T>(
+    operation: impl FnOnce(&WinHttpSession) -> Result<T, u32>,
+) -> Result<T, u32> {
+    let session = {
+        let mut shared = WINHTTP_SESSION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(session) = shared.as_ref() {
+            Arc::clone(session)
+        } else {
+            let session = Arc::new(WinHttpSession::open()?);
+            *shared = Some(Arc::clone(&session));
+            session
+        }
+    };
+    operation(&session)
 }
 
 fn proxy_bypass_matches_origin(proxy_bypass: &str, origin: &RequestOrigin) -> bool {

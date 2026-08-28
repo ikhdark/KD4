@@ -2,6 +2,7 @@ use super::*;
 use codex_app_server_protocol::PluginAuthPolicy;
 use codex_app_server_protocol::PluginInstallPolicy;
 use codex_app_server_protocol::PluginInterface;
+use codex_http_client::OutboundProxyPolicy;
 use codex_login::CodexAuth;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
@@ -23,9 +24,10 @@ use wiremock::matchers::query_param;
 use wiremock::matchers::query_param_is_missing;
 
 fn test_config(server: &MockServer) -> RemotePluginServiceConfig {
-    RemotePluginServiceConfig {
-        chatgpt_base_url: format!("{}/backend-api", server.uri()),
-    }
+    RemotePluginServiceConfig::new(
+        format!("{}/backend-api", server.uri()),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    )
 }
 
 fn test_auth() -> CodexAuth {
@@ -231,9 +233,10 @@ async fn save_remote_plugin_share_creates_workspace_plugin() {
         .mount(&server)
         .await;
 
-    let result = save_remote_plugin_share(
+    let result = save_remote_plugin_share_with_client(
+        &config.http_clients,
         &config,
-        Some(&auth),
+        &auth,
         codex_home.path(),
         &plugin_path,
         /*remote_plugin_id*/ None,

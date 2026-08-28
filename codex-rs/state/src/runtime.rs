@@ -61,6 +61,7 @@ use std::sync::atomic::AtomicI64;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::warn;
+use uuid::Uuid;
 
 mod agent_jobs;
 mod backfill;
@@ -170,12 +171,13 @@ pub struct StateRuntime {
     default_provider: String,
     pool: Arc<sqlx::SqlitePool>,
     logs_pool: Arc<sqlx::SqlitePool>,
+    agent_job_runner_instance_id: String,
+    agent_job_runner_heartbeat_shutdown: tokio::sync::watch::Sender<bool>,
     db_telemetry: Option<DbTelemetryHandle>,
     #[cfg(test)]
     log_retention_test_control: Arc<logs::LogRetentionTestControl>,
     thread_goals: GoalStore,
     memories: MemoryStore,
-    validation_history: crate::ValidationHistoryStore,
     thread_updated_at_millis: Arc<AtomicI64>,
     thread_recency_at_millis: Arc<AtomicI64>,
 }
@@ -310,14 +312,36 @@ SELECT
             };
         let thread_updated_at_millis = thread_updated_at_millis.unwrap_or(0);
         let thread_recency_at_millis = thread_recency_at_millis.unwrap_or(0);
-        let validation_history =
-            crate::ValidationHistoryStore::new(Arc::clone(&pool), &codex_home).await;
+        let agent_job_runner_instance_id = Uuid::new_v4().to_string();
+        if let Err(err) = agent_jobs::register_agent_job_runner_instance(
+            pool.as_ref(),
+            agent_job_runner_instance_id.as_str(),
+        )
+        .await
+        {
+            close_sqlite_pools(&[
+                pool.as_ref(),
+                logs_pool.as_ref(),
+                goals_pool.as_ref(),
+                memories_pool.as_ref(),
+            ])
+            .await;
+            return Err(err);
+        }
+        let (agent_job_runner_heartbeat_shutdown, heartbeat_shutdown_rx) =
+            tokio::sync::watch::channel(false);
+        agent_jobs::spawn_agent_job_runner_heartbeat(
+            Arc::clone(&pool),
+            agent_job_runner_instance_id.clone(),
+            heartbeat_shutdown_rx,
+        );
         let runtime = Arc::new(Self {
             thread_goals: GoalStore::new(Arc::clone(&goals_pool)),
             memories: MemoryStore::new(Arc::clone(&memories_pool), Arc::clone(&pool)),
-            validation_history,
             pool,
             logs_pool,
+            agent_job_runner_instance_id,
+            agent_job_runner_heartbeat_shutdown,
             db_telemetry: telemetry_override,
             #[cfg(test)]
             log_retention_test_control: Arc::new(logs::LogRetentionTestControl::default()),
@@ -348,12 +372,21 @@ SELECT
         &self.memories
     }
 
-    pub fn validation_history(&self) -> &crate::ValidationHistoryStore {
-        &self.validation_history
+    pub fn is_closed(&self) -> bool {
+        self.pool.is_closed()
     }
 
     /// Close all SQLite pools and wait for outstanding pool workers to exit.
     pub async fn close(&self) {
+        self.agent_job_runner_heartbeat_shutdown.send_replace(true);
+        if let Err(error) = agent_jobs::unregister_agent_job_runner_instance(
+            self.pool.as_ref(),
+            self.agent_job_runner_instance_id.as_str(),
+        )
+        .await
+        {
+            warn!(%error, "failed to unregister agent job runner instance");
+        }
         self.memories.close().await;
         self.thread_goals.close().await;
         self.logs_pool.close().await;

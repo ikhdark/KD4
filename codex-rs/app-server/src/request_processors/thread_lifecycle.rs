@@ -1,5 +1,6 @@
 use super::*;
 use crate::thread_state::TerminalEventDisposition;
+use crate::thread_state::acknowledge_terminal_notification;
 use crate::thread_status::ThreadStatusSubscription;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
@@ -8,9 +9,33 @@ pub(super) const THREAD_UNLOADING_DELAY: Duration = Duration::from_secs(5 * 60);
 const THREAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_INACTIVE_THREADS: usize = 8;
 
+async fn release_turn_start_for_event(
+    thread_state_manager: &ThreadStateManager,
+    thread_id: ThreadId,
+    event_turn_id: &str,
+    event: &EventMsg,
+    active_turn_id: Option<&str>,
+) {
+    let is_terminal = matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_));
+    let failed_before_start =
+        matches!(event, EventMsg::Error(_)) && active_turn_id != Some(event_turn_id);
+    if is_terminal || failed_before_start {
+        thread_state_manager
+            .release_turn_start(thread_id, event_turn_id)
+            .await;
+    }
+}
+
 struct EligibleThread {
     sequence: u64,
+    listener_generation: u64,
     evict_tx: mpsc::UnboundedSender<EvictionRequest>,
+}
+
+enum ThreadConnectionAdmission<T> {
+    Admitted(T),
+    ConnectionClosed,
+    ThreadClosing,
 }
 
 #[derive(Default)]
@@ -32,19 +57,34 @@ impl Drop for EvictionCompletion {
 struct ThreadUnloadAuthorityState {
     unloading: HashSet<ThreadId>,
     eligible: HashMap<ThreadId, EligibleThread>,
+    eligibility_owners: HashMap<ThreadId, u64>,
     next_sequence: u64,
 }
 
-#[derive(Default)]
 pub(crate) struct PendingThreadUnloads {
     state: Mutex<ThreadUnloadAuthorityState>,
+    admission_gate: Semaphore,
     changed: Notify,
+}
+
+impl Default for PendingThreadUnloads {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(ThreadUnloadAuthorityState::default()),
+            admission_gate: Semaphore::new(1),
+            changed: Notify::new(),
+        }
+    }
 }
 
 impl PendingThreadUnloads {
     pub(super) async fn begin(&self, thread_id: ThreadId) -> bool {
+        let Ok(_admission_permit) = self.admission_gate.acquire().await else {
+            return false;
+        };
         let mut state = self.state.lock().await;
         state.eligible.remove(&thread_id);
+        state.eligibility_owners.remove(&thread_id);
         state.unloading.insert(thread_id)
     }
 
@@ -58,28 +98,105 @@ impl PendingThreadUnloads {
         self.state.lock().await.unloading.contains(thread_id)
     }
 
+    async fn admit_listener_connection(
+        &self,
+        thread_state_manager: &ThreadStateManager,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+        raw_events_enabled: bool,
+    ) -> ThreadConnectionAdmission<Arc<Mutex<ThreadState>>> {
+        let Ok(_admission_permit) = self.admission_gate.acquire().await else {
+            return ThreadConnectionAdmission::ThreadClosing;
+        };
+        if self.state.lock().await.unloading.contains(&thread_id) {
+            return ThreadConnectionAdmission::ThreadClosing;
+        }
+        let thread_state = thread_state_manager
+            .try_ensure_connection_subscribed(thread_id, connection_id, raw_events_enabled)
+            .await;
+        match thread_state {
+            Some(thread_state) => ThreadConnectionAdmission::Admitted(thread_state),
+            None => ThreadConnectionAdmission::ConnectionClosed,
+        }
+    }
+
+    async fn admit_resume_connection(
+        &self,
+        thread_state_manager: &ThreadStateManager,
+        thread_id: ThreadId,
+        connection_id: ConnectionId,
+    ) -> ThreadConnectionAdmission<()> {
+        let Ok(_admission_permit) = self.admission_gate.acquire().await else {
+            return ThreadConnectionAdmission::ThreadClosing;
+        };
+        if self.state.lock().await.unloading.contains(&thread_id) {
+            return ThreadConnectionAdmission::ThreadClosing;
+        }
+        let added = thread_state_manager
+            .try_add_connection_to_thread(thread_id, connection_id)
+            .await;
+        if added {
+            ThreadConnectionAdmission::Admitted(())
+        } else {
+            ThreadConnectionAdmission::ConnectionClosed
+        }
+    }
+
     async fn set_eligible(
         &self,
         thread_id: ThreadId,
+        listener_generation: u64,
         eligible: bool,
         evict_tx: &mpsc::UnboundedSender<EvictionRequest>,
     ) {
         let evict_tx = {
             let mut state = self.state.lock().await;
-            state
+            let closed = state
                 .eligible
-                .retain(|_, entry| !entry.evict_tx.is_closed());
-            if !eligible || state.unloading.contains(&thread_id) {
+                .iter()
+                .filter(|(_, entry)| entry.evict_tx.is_closed())
+                .map(|(thread_id, _)| *thread_id)
+                .collect::<Vec<_>>();
+            for closed_thread_id in closed {
+                state.eligible.remove(&closed_thread_id);
+                state.eligibility_owners.remove(&closed_thread_id);
+            }
+            if state.unloading.contains(&thread_id) {
+                state.eligible.remove(&thread_id);
+                state.eligibility_owners.remove(&thread_id);
+                return;
+            }
+            match state.eligibility_owners.get(&thread_id).copied() {
+                Some(owner_generation) if owner_generation == listener_generation => {}
+                Some(owner_generation)
+                    if listener_generation_is_newer(listener_generation, owner_generation) =>
+                {
+                    state
+                        .eligibility_owners
+                        .insert(thread_id, listener_generation);
+                }
+                Some(_) => return,
+                None => {
+                    state
+                        .eligibility_owners
+                        .insert(thread_id, listener_generation);
+                }
+            }
+            if !eligible {
                 state.eligible.remove(&thread_id);
                 return;
             }
-            if !state.eligible.contains_key(&thread_id) {
+            if let Some(entry) = state.eligible.get_mut(&thread_id) {
+                entry.listener_generation = listener_generation;
+                entry.evict_tx = evict_tx.clone();
+            } else {
                 let sequence = state.next_sequence;
                 state.next_sequence = state.next_sequence.wrapping_add(1);
                 state.eligible.insert(
                     thread_id,
                     EligibleThread {
                         sequence,
+                        listener_generation,
                         evict_tx: evict_tx.clone(),
                     },
                 );
@@ -92,27 +209,55 @@ impl PendingThreadUnloads {
                 .iter()
                 .min_by_key(|(_, entry)| entry.sequence)
                 .map(|(thread_id, _)| *thread_id);
-            oldest.and_then(|thread_id| state.eligible.remove(&thread_id))
+            oldest.and_then(|thread_id| {
+                state
+                    .eligible
+                    .remove(&thread_id)
+                    .map(|entry| (thread_id, entry))
+            })
         };
-        if let Some(entry) = evict_tx {
-            let _ = entry.evict_tx.send(EvictionRequest::default());
+        if let Some((thread_id, entry)) = evict_tx
+            && entry.evict_tx.send(EvictionRequest::default()).is_err()
+        {
+            self.unregister_eligibility(thread_id, entry.listener_generation)
+                .await;
+        }
+    }
+
+    async fn unregister_eligibility(&self, thread_id: ThreadId, listener_generation: u64) {
+        let mut state = self.state.lock().await;
+        if state.eligibility_owners.get(&thread_id) == Some(&listener_generation) {
+            state.eligibility_owners.remove(&thread_id);
+            state.eligible.remove(&thread_id);
         }
     }
 
     pub(crate) async fn evict_one_eligible_and_wait(&self) {
         let entry = {
             let mut state = self.state.lock().await;
-            state
+            let closed = state
                 .eligible
-                .retain(|_, entry| !entry.evict_tx.is_closed());
+                .iter()
+                .filter(|(_, entry)| entry.evict_tx.is_closed())
+                .map(|(thread_id, _)| *thread_id)
+                .collect::<Vec<_>>();
+            for closed_thread_id in closed {
+                state.eligible.remove(&closed_thread_id);
+                state.eligibility_owners.remove(&closed_thread_id);
+            }
             let oldest = state
                 .eligible
                 .iter()
                 .min_by_key(|(_, entry)| entry.sequence)
                 .map(|(thread_id, _)| *thread_id);
-            oldest.and_then(|thread_id| state.eligible.remove(&thread_id))
+            oldest.and_then(|thread_id| {
+                state
+                    .eligible
+                    .remove(&thread_id)
+                    .map(|entry| (thread_id, entry))
+            })
         };
-        let Some(entry) = entry else {
+        let Some((thread_id, entry)) = entry else {
             return;
         };
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -124,6 +269,9 @@ impl PendingThreadUnloads {
             .is_ok()
         {
             let _ = completion_rx.await;
+        } else {
+            self.unregister_eligibility(thread_id, entry.listener_generation)
+                .await;
         }
     }
 
@@ -136,6 +284,11 @@ impl PendingThreadUnloads {
             changed.await;
         }
     }
+}
+
+fn listener_generation_is_newer(candidate: u64, current: u64) -> bool {
+    let distance = candidate.wrapping_sub(current);
+    distance != 0 && distance < (1_u64 << 63)
 }
 
 #[derive(Clone)]
@@ -161,6 +314,7 @@ struct UnloadingState {
     is_active: (bool, Instant),
     evict_tx: mpsc::UnboundedSender<EvictionRequest>,
     evict_rx: mpsc::UnboundedReceiver<EvictionRequest>,
+    listener_generation: Option<u64>,
 }
 
 enum UnloadingTrigger {
@@ -198,9 +352,14 @@ impl UnloadingState {
             is_active,
             evict_tx,
             evict_rx,
+            listener_generation: None,
         };
-        state.sync_eligibility().await;
         Some(state)
+    }
+
+    async fn register_listener(&mut self, listener_generation: u64) {
+        self.listener_generation = Some(listener_generation);
+        self.sync_eligibility().await;
     }
 
     fn unloading_target(&self) -> Option<Instant> {
@@ -236,9 +395,13 @@ impl UnloadingState {
     }
 
     async fn sync_eligibility(&self) {
+        let Some(listener_generation) = self.listener_generation else {
+            return;
+        };
         self.authority
             .set_eligible(
                 self.thread_id,
+                listener_generation,
                 !self.has_subscribers.0 && !self.is_active.0,
                 &self.evict_tx,
             )
@@ -246,9 +409,11 @@ impl UnloadingState {
     }
 
     async fn unregister(&self) {
-        self.authority
-            .set_eligible(self.thread_id, false, &self.evict_tx)
-            .await;
+        if let Some(listener_generation) = self.listener_generation {
+            self.authority
+                .unregister_eligibility(self.thread_id, listener_generation)
+                .await;
+        }
     }
 
     fn note_thread_activity_observed(&mut self) {
@@ -353,24 +518,25 @@ pub(super) async fn ensure_conversation_listener_for_instance(
     connection_id: ConnectionId,
     raw_events_enabled: bool,
 ) -> Result<EnsureConversationListenerResult, JSONRPCErrorError> {
-    let thread_state = {
-        if listener_task_context
-            .pending_thread_unloads
-            .contains(&conversation_id)
-            .await
-        {
+    let thread_state = match listener_task_context
+        .pending_thread_unloads
+        .admit_listener_connection(
+            &listener_task_context.thread_state_manager,
+            conversation_id,
+            connection_id,
+            raw_events_enabled,
+        )
+        .await
+    {
+        ThreadConnectionAdmission::Admitted(thread_state) => thread_state,
+        ThreadConnectionAdmission::ConnectionClosed => {
+            return Ok(EnsureConversationListenerResult::ConnectionClosed);
+        }
+        ThreadConnectionAdmission::ThreadClosing => {
             return Err(invalid_request(format!(
                 "thread {conversation_id} is closing; retry after the thread is closed"
             )));
         }
-        let Some(thread_state) = listener_task_context
-            .thread_state_manager
-            .try_ensure_connection_subscribed(conversation_id, connection_id, raw_events_enabled)
-            .await
-        else {
-            return Ok(EnsureConversationListenerResult::ConnectionClosed);
-        };
-        thread_state
     };
     if let Err(error) = ensure_listener_task_running(
         listener_task_context.clone(),
@@ -431,6 +597,12 @@ pub(super) async fn ensure_listener_task_running(
             "thread {conversation_id} is closing; retry after the thread is closed"
         )));
     };
+    {
+        let thread_state = thread_state.lock().await;
+        if thread_state.listener_matches(&conversation) {
+            return Ok(());
+        }
+    }
     let config = conversation.config().await;
     let environments = conversation.environment_selections().await;
     let watch_registration = listener_task_context
@@ -465,6 +637,7 @@ pub(super) async fn ensure_listener_task_running(
             .register_listener_command_tx(conversation_id, listener_command_tx);
         (listener_command_rx, listener_generation)
     };
+    unloading_state.register_listener(listener_generation).await;
     let ListenerTaskContext {
         outgoing,
         thread_manager,
@@ -514,11 +687,25 @@ pub(super) async fn ensure_listener_task_running(
                     let subscribed_connection_ids = thread_state_manager
                         .subscribed_connection_ids(conversation_id)
                         .await;
-                    let terminal_disposition = thread_state.lock().await.classify_terminal_event(
-                        &event.id,
+                    let durable_terminal_fingerprint = if matches!(
                         &event.msg,
-                        &subscribed_connection_ids,
-                    );
+                        EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
+                    ) {
+                        conversation
+                            .durably_acknowledged_terminal_fingerprint(&event.id)
+                            .await
+                    } else {
+                        None
+                    };
+                    let terminal_disposition = thread_state
+                        .lock()
+                        .await
+                        .classify_terminal_event_with_durable_acknowledgement(
+                            &event.id,
+                            &event.msg,
+                            &subscribed_connection_ids,
+                            durable_terminal_fingerprint.as_deref(),
+                        );
                     match terminal_disposition {
                         TerminalEventDisposition::RetryNotification(replay) => {
                             let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
@@ -541,15 +728,14 @@ pub(super) async fn ensure_listener_task_running(
                                 &dispatch.targeted_connection_ids,
                                 &dispatch.accepted_connection_ids,
                             );
-                            if accepted
-                                && conversation
-                                    .acknowledge_terminal_event(&event.id, &replay.fingerprint)
-                                    .await
-                            {
-                                thread_state.lock().await.mark_terminal_acknowledged(
+                            if accepted {
+                                acknowledge_terminal_notification(
+                                    conversation.as_ref(),
+                                    &thread_state,
                                     &event.id,
                                     &replay.fingerprint,
-                                );
+                                )
+                                .await;
                             }
                             continue;
                         }
@@ -570,15 +756,16 @@ pub(super) async fn ensure_listener_task_running(
                             continue;
                         }
                         TerminalEventDisposition::Acknowledge { fingerprint } => {
-                            if conversation
-                                .acknowledge_terminal_event(&event.id, &fingerprint)
-                                .await
-                            {
-                                thread_state
-                                    .lock()
-                                    .await
-                                    .mark_terminal_acknowledged(&event.id, &fingerprint);
-                            }
+                            acknowledge_terminal_notification(
+                                conversation.as_ref(),
+                                &thread_state,
+                                &event.id,
+                                &fingerprint,
+                            )
+                            .await;
+                            continue;
+                        }
+                        TerminalEventDisposition::SuppressAcknowledged => {
                             continue;
                         }
                         TerminalEventDisposition::RejectConflict => {
@@ -607,14 +794,19 @@ pub(super) async fn ensure_listener_task_running(
                                 .track_current_turn_event(&event.id, &event.msg);
                         }
                     }
-                    if matches!(
+                    let active_turn_id = thread_state
+                        .lock()
+                        .await
+                        .open_turn_id()
+                        .map(str::to_owned);
+                    release_turn_start_for_event(
+                        &thread_state_manager,
+                        conversation_id,
+                        &event.id,
                         &event.msg,
-                        EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
-                    ) {
-                        thread_state_manager
-                            .release_in_flight_task(conversation_id, &event.id)
-                            .await;
-                    }
+                        active_turn_id.as_deref(),
+                    )
+                    .await;
                     let raw_events_enabled = thread_state.lock().await.experimental_raw_events;
                     if matches!(&event.msg, EventMsg::RawResponseItem(_)) && !raw_events_enabled {
                         continue;
@@ -1022,10 +1214,41 @@ pub(super) async fn handle_pending_thread_resume_request(
     pending_thread_unloads: &Arc<PendingThreadUnloads>,
     pending: crate::thread_state::PendingThreadResumeRequest,
 ) {
-    thread_state
+    if let Some(history_items) = pending.history_items.as_deref() {
+        let replay_fingerprints = conversation
+            .terminal_events_requiring_app_server_acknowledgement()
+            .await;
+        if !thread_state.lock().await.seed_resume_history_for_listener(
+            history_items,
+            pending.listener_generation,
+            replay_fingerprints.as_ref(),
+        ) {
+            outgoing
+                .send_error(
+                    pending.request_id,
+                    internal_error(format!(
+                        "thread {conversation_id} listener changed while composing resume response"
+                    )),
+                )
+                .await;
+            return;
+        }
+    } else if !thread_state
         .lock()
         .await
-        .seed_terminal_ledger_from_history(&pending.history_items);
+        .resume_history_is_seeded_for_current_listener()
+    {
+        outgoing
+            .send_error(
+                pending.request_id,
+                internal_error(format!(
+                    "thread {conversation_id} resume history is not initialized for the active listener"
+                )),
+            )
+            .await;
+        return;
+    }
+    let history_items = pending.history_items.as_deref().unwrap_or(&[]);
     let active_turn = {
         let state = thread_state.lock().await;
         state.active_turn_snapshot()
@@ -1050,7 +1273,7 @@ pub(super) async fn handle_pending_thread_resume_request(
     let token_usage_turn_id = if pending.include_turns {
         Some(populate_thread_turns_from_history_with_token_usage(
             &mut thread,
-            &pending.history_items,
+            history_items,
             active_turn.as_ref(),
         ))
     } else {
@@ -1066,14 +1289,21 @@ pub(super) async fn handle_pending_thread_resume_request(
         thread_status,
         has_live_in_progress_turn,
     );
-    let mut initial_turns_page = if let Some(params) = pending.initial_turns_page.as_ref() {
-        match super::thread_processor::build_thread_resume_initial_turns_page(
-            &pending.history_items,
-            thread.status.clone(),
-            has_live_in_progress_turn,
-            active_turn,
-            params,
-        ) {
+    let mut initial_turns_page = if let Some(page) = pending.prepared_initial_turns_page {
+        Some(page)
+    } else if let Some(params) = pending.initial_turns_page.as_ref() {
+        let page = if pending.include_turns {
+            super::thread_processor::build_thread_resume_initial_turns_page(&thread.turns, params)
+        } else {
+            super::thread_processor::build_thread_resume_initial_turns_page_from_history(
+                history_items,
+                thread.status.clone(),
+                has_live_in_progress_turn,
+                active_turn,
+                params,
+            )
+        };
+        match page {
             Ok(page) => Some(page),
             Err(error) => {
                 outgoing.send_error(request_id, error).await;
@@ -1090,8 +1320,12 @@ pub(super) async fn handle_pending_thread_resume_request(
         }
     }
 
+    match pending_thread_unloads
+        .admit_resume_connection(thread_state_manager, conversation_id, connection_id)
+        .await
     {
-        if pending_thread_unloads.contains(&conversation_id).await {
+        ThreadConnectionAdmission::Admitted(()) => {}
+        ThreadConnectionAdmission::ThreadClosing => {
             outgoing
                 .send_error(
                     request_id,
@@ -1102,10 +1336,7 @@ pub(super) async fn handle_pending_thread_resume_request(
                 .await;
             return;
         }
-        if !thread_state_manager
-            .try_add_connection_to_thread(conversation_id, connection_id)
-            .await
-        {
+        ThreadConnectionAdmission::ConnectionClosed => {
             tracing::debug!(
                 thread_id = %conversation_id,
                 connection_id = ?connection_id,
@@ -1116,6 +1347,8 @@ pub(super) async fn handle_pending_thread_resume_request(
     }
 
     let config_snapshot = pending.config_snapshot;
+    let selected_environment =
+        super::thread_processor::selected_thread_environment(&config_snapshot);
     let cwd = config_snapshot.cwd().clone();
     let ThreadConfigSnapshot {
         model,
@@ -1143,11 +1376,13 @@ pub(super) async fn handle_pending_thread_resume_request(
         model_provider: model_provider_id,
         service_tier,
         cwd,
+        selected_environment,
         runtime_workspace_roots: workspace_roots,
         instruction_sources,
         approval_policy: approval_policy.into(),
         approvals_reviewer: approvals_reviewer.into(),
         sandbox,
+        permission_profile: Some(permission_profile),
         active_permission_profile,
         reasoning_effort,
         initial_turns_page,
@@ -1320,6 +1555,75 @@ mod tests {
     use core_test_support::load_default_config_for_test;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn pre_start_error_releases_claim_but_in_turn_error_retains_it() {
+        let error = EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+            message: "injected rejection".to_string(),
+            codex_error_info: None,
+        });
+
+        let rejected_manager = ThreadStateManager::new();
+        let rejected_thread = ThreadId::new();
+        assert_eq!(
+            rejected_manager
+                .claim_turn_start(Some("retryable"), rejected_thread, "turn-rejected")
+                .await,
+            crate::thread_state::TurnStartClaim::Claimed
+        );
+        release_turn_start_for_event(
+            &rejected_manager,
+            rejected_thread,
+            "turn-rejected",
+            &error,
+            None,
+        )
+        .await;
+        assert_eq!(
+            rejected_manager
+                .claim_turn_start(Some("retryable"), rejected_thread, "turn-retry")
+                .await,
+            crate::thread_state::TurnStartClaim::Claimed
+        );
+
+        let running_manager = ThreadStateManager::new();
+        let running_thread = ThreadId::new();
+        assert_eq!(
+            running_manager
+                .claim_turn_start(Some("running"), running_thread, "turn-running")
+                .await,
+            crate::thread_state::TurnStartClaim::Claimed
+        );
+        let open_turn_id = {
+            let mut state = ThreadState::default();
+            state.track_current_turn_event(
+                "turn-running",
+                &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: "turn-running".to_string(),
+                    trace_id: None,
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                }),
+            );
+            state.track_current_turn_event("turn-running", &error);
+            state.open_turn_id().map(str::to_owned)
+        };
+        release_turn_start_for_event(
+            &running_manager,
+            running_thread,
+            "turn-running",
+            &error,
+            open_turn_id.as_deref(),
+        )
+        .await;
+        assert!(matches!(
+            running_manager
+                .claim_turn_start(Some("running"), ThreadId::new(), "turn-other")
+                .await,
+            crate::thread_state::TurnStartClaim::IdenticalTask(_)
+        ));
+    }
+
     struct LateShutdownFixture {
         thread_manager: Arc<ThreadManager>,
         outgoing: Arc<OutgoingMessageSender>,
@@ -1458,6 +1762,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_listener_skips_thread_skill_registration_and_watcher_is_lazy() {
+        let fixture = LateShutdownFixture::new().await;
+        let config = fixture.thread.config().await;
+        let skills_watcher = SkillsWatcher::new(
+            fixture.thread_manager.skills_service(),
+            Arc::clone(&fixture.outgoing),
+        );
+        let context = ListenerTaskContext {
+            thread_manager: Arc::clone(&fixture.thread_manager),
+            thread_state_manager: fixture.thread_state_manager.clone(),
+            outgoing: Arc::clone(&fixture.outgoing),
+            pending_thread_unloads: Arc::clone(&fixture.pending_thread_unloads),
+            thread_watch_manager: fixture.thread_watch_manager.clone(),
+            thread_list_state_permit: Arc::new(Semaphore::new(1)),
+            fallback_model_provider: config.model_provider_id.clone(),
+            codex_home: config.codex_home.to_path_buf(),
+            skills_watcher: Arc::clone(&skills_watcher),
+        };
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let thread_settings =
+            thread_settings_from_config_snapshot(&fixture.thread.config_snapshot().await);
+        fixture.original_thread_state.lock().await.set_listener(
+            cancel_tx,
+            &fixture.thread,
+            codex_file_watcher::WatchRegistration::default(),
+            thread_settings,
+        );
+
+        ensure_listener_task_running(
+            context,
+            fixture.thread_id,
+            Arc::clone(&fixture.thread),
+            Arc::clone(&fixture.original_thread_state),
+        )
+        .await
+        .expect("matching listener should already be running");
+
+        assert_eq!(skills_watcher.thread_config_registration_count(), 0);
+        skills_watcher.register_runtime_extra_roots(&[]);
+        assert!(
+            !skills_watcher.is_initialized(),
+            "construction and empty roots must not allocate a skills file watcher"
+        );
+        skills_watcher.register_runtime_extra_roots(std::slice::from_ref(&config.cwd));
+        skills_watcher.register_runtime_extra_roots(std::slice::from_ref(&config.cwd));
+        assert!(skills_watcher.is_initialized());
+        assert_eq!(skills_watcher.initialization_count(), 1);
+    }
+
+    #[tokio::test]
     async fn resume_waiter_is_released_only_after_unload_finishes() {
         let pending = Arc::new(PendingThreadUnloads::default());
         let thread_id = ThreadId::new();
@@ -1477,6 +1831,64 @@ mod tests {
             .expect("resume waiter should not panic");
     }
 
+    #[tokio::test]
+    // The held thread-state guard is the contention this test uses to keep admission in flight.
+    #[allow(clippy::await_holding_invalid_type)]
+    async fn unload_begin_waits_for_listener_connection_admission() {
+        let authority = Arc::new(PendingThreadUnloads::default());
+        let thread_state_manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection_id = ConnectionId(1);
+        thread_state_manager
+            .connection_initialized(connection_id, ConnectionCapabilities::default())
+            .await;
+        let thread_state = thread_state_manager
+            .try_ensure_connection_subscribed(thread_id, connection_id, false)
+            .await
+            .expect("initialized connection subscribes");
+        assert!(
+            thread_state_manager
+                .unsubscribe_connection_from_thread(thread_id, connection_id)
+                .await
+        );
+
+        let thread_state_guard = thread_state.lock().await;
+        let admission_authority = Arc::clone(&authority);
+        let admission_manager = thread_state_manager.clone();
+        let admission = tokio::spawn(async move {
+            admission_authority
+                .admit_listener_connection(&admission_manager, thread_id, connection_id, true)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !thread_state_manager.has_subscribers(thread_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admission should subscribe before updating per-thread state");
+
+        let begin_authority = Arc::clone(&authority);
+        let begin = tokio::spawn(async move { begin_authority.begin(thread_id).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !begin.is_finished(),
+            "unload begin must wait until subscription admission is complete"
+        );
+
+        drop(thread_state_guard);
+        assert!(matches!(
+            admission.await.expect("admission task should not panic"),
+            ThreadConnectionAdmission::Admitted(_)
+        ));
+        assert!(begin.await.expect("unload begin task should not panic"));
+        assert!(
+            thread_state_manager.has_subscribers(thread_id).await,
+            "the unload listener's final eligibility check must observe the admitted connection"
+        );
+        authority.finish(&thread_id).await;
+    }
+
     #[test]
     fn inactive_thread_unload_delay_is_five_minutes() {
         assert_eq!(THREAD_UNLOADING_DELAY, Duration::from_secs(5 * 60));
@@ -1489,7 +1901,7 @@ mod tests {
         for _ in 0..=MAX_INACTIVE_THREADS {
             let thread_id = ThreadId::new();
             let (evict_tx, evict_rx) = mpsc::unbounded_channel();
-            authority.set_eligible(thread_id, true, &evict_tx).await;
+            authority.set_eligible(thread_id, 1, true, &evict_tx).await;
             receivers.push(evict_rx);
         }
 
@@ -1510,11 +1922,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_listener_cannot_remove_replacement_lru_eligibility() {
+        let authority = PendingThreadUnloads::default();
+        let thread_id = ThreadId::new();
+        let (old_evict_tx, _old_evict_rx) = mpsc::unbounded_channel();
+        let (replacement_evict_tx, _replacement_evict_rx) = mpsc::unbounded_channel();
+
+        authority
+            .set_eligible(thread_id, 1, true, &old_evict_tx)
+            .await;
+        authority
+            .set_eligible(thread_id, 2, true, &replacement_evict_tx)
+            .await;
+        authority.unregister_eligibility(thread_id, 1).await;
+
+        let state = authority.state.lock().await;
+        assert_eq!(state.eligibility_owners.get(&thread_id), Some(&2));
+        assert!(
+            state
+                .eligible
+                .get(&thread_id)
+                .is_some_and(|entry| entry.evict_tx.same_channel(&replacement_evict_tx)),
+            "stale listener cleanup must preserve the replacement listener's eviction channel"
+        );
+    }
+
+    #[tokio::test]
     async fn admission_eviction_waits_for_unload_completion() {
         let authority = Arc::new(PendingThreadUnloads::default());
         let thread_id = ThreadId::new();
         let (evict_tx, mut evict_rx) = mpsc::unbounded_channel();
-        authority.set_eligible(thread_id, true, &evict_tx).await;
+        authority.set_eligible(thread_id, 1, true, &evict_tx).await;
 
         let eviction_authority = Arc::clone(&authority);
         let eviction = tokio::spawn(async move {

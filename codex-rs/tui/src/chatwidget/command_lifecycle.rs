@@ -285,13 +285,8 @@ impl ChatWidget {
             .active_cell
             .as_mut()
             .and_then(|c| c.as_any_mut().downcast_mut::<ExecCell>())
-            && let Some(new_exec) = cell.with_added_call(
-                id.clone(),
-                command.clone(),
-                parsed_cmd.clone(),
-                source,
-                /*interaction_input*/ None,
-            )
+            && let Some(new_exec) =
+                cell.with_added_call(id.clone(), command.clone(), parsed_cmd.clone(), source)
         {
             *cell = new_exec;
             self.bump_active_cell_revision();
@@ -303,7 +298,6 @@ impl ChatWidget {
                 command,
                 parsed_cmd,
                 source,
-                /*interaction_input*/ None,
                 self.config.animations,
             )));
             self.bump_active_cell_revision();
@@ -382,9 +376,9 @@ impl ChatWidget {
         // Unified exec interaction rows intentionally hide command output text in the exec cell and
         // instead render the interaction-specific content elsewhere in the UI.
         let output = if is_unified_exec_interaction {
-            CommandOutput::new(exit_code, String::new(), String::new())
+            CommandOutput::from_shared_output(exit_code, String::new())
         } else {
-            CommandOutput::new(exit_code, aggregated_output.clone(), aggregated_output)
+            CommandOutput::from_shared_output(exit_code, aggregated_output)
         };
 
         match end_target {
@@ -411,7 +405,6 @@ impl ChatWidget {
                     command,
                     parsed,
                     source,
-                    /*interaction_input*/ None,
                     self.config.animations,
                 );
                 let completed = orphan.complete_call(&id, output, duration);
@@ -428,7 +421,6 @@ impl ChatWidget {
                     command,
                     parsed,
                     source,
-                    /*interaction_input*/ None,
                     self.config.animations,
                 );
                 let completed = cell.complete_call(&id, output, duration);

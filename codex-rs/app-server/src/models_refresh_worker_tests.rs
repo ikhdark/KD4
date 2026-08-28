@@ -74,7 +74,7 @@ impl ModelsEndpointClient for TestModelsEndpoint {
 }
 
 #[tokio::test(start_paused = true)]
-async fn defers_initial_refresh_then_refreshes_periodically_and_stops_when_dropped() {
+async fn activity_before_deadline_arms_remaining_delay_and_periodic_refresh() {
     let codex_home = tempdir().expect("temp dir");
     let endpoint = TestModelsEndpoint::new();
     let models_manager: SharedModelsManager = Arc::new(OpenAiModelsManager::new(
@@ -93,7 +93,12 @@ async fn defers_initial_refresh_then_refreshes_periodically_and_stops_when_dropp
     tokio::task::yield_now().await;
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 0);
 
-    tokio::time::advance(refresh_interval).await;
+    tokio::time::advance(refresh_interval / 2).await;
+    models_manager.get_remote_models().await;
+    tokio::task::yield_now().await;
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 0);
+
+    tokio::time::advance(refresh_interval / 2).await;
     endpoint.wait_for_fetch_count(/*expected*/ 1).await;
 
     tokio::time::advance(refresh_interval).await;
@@ -104,6 +109,32 @@ async fn defers_initial_refresh_then_refreshes_periodically_and_stops_when_dropp
     tokio::task::yield_now().await;
 
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn activity_after_deadline_refreshes_before_serving_catalog() {
+    let codex_home = tempdir().expect("temp dir");
+    let endpoint = TestModelsEndpoint::new();
+    let models_manager: SharedModelsManager = Arc::new(OpenAiModelsManager::new(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        /*auth_manager*/ None,
+        Arc::new(|| "test-provider-identity".to_string()),
+    ));
+    let refresh_interval = Duration::from_secs(10);
+    let worker = spawn_with_interval(
+        &models_manager,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        refresh_interval,
+    );
+
+    tokio::time::advance(refresh_interval * 3).await;
+    tokio::task::yield_now().await;
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 0);
+
+    models_manager.get_remote_models().await;
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);
+    worker.shutdown_and_wait().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -123,6 +154,8 @@ async fn shutdown_cancels_and_joins_an_inflight_refresh() {
         refresh_interval,
     );
 
+    models_manager.get_remote_models().await;
+    tokio::task::yield_now().await;
     tokio::time::advance(refresh_interval).await;
     endpoint.wait_for_fetch_count(1).await;
     tokio::time::advance(refresh_interval).await;

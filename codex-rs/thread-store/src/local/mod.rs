@@ -4,10 +4,13 @@ mod delete_thread;
 mod helpers;
 mod list_threads;
 mod live_writer;
+mod projection;
 mod read_thread;
 mod search_threads;
 mod unarchive_thread;
 mod update_thread_metadata;
+
+pub use delete_thread::StagedThreadDelete;
 
 #[cfg(test)]
 mod test_support;
@@ -60,6 +63,7 @@ use crate::UpdateThreadMetadataParams;
 pub struct LocalThreadStore {
     pub(super) config: LocalThreadStoreConfig,
     live_recorders: Arc<Mutex<HashMap<ThreadId, LiveRecorderEntry>>>,
+    projections: Arc<Mutex<HashMap<ThreadId, projection::SharedLocalThreadProjection>>>,
     state_db: Option<StateDbHandle>,
 }
 
@@ -107,6 +111,7 @@ impl LocalThreadStore {
         Self {
             config,
             live_recorders: Arc::new(Mutex::new(HashMap::new())),
+            projections: Arc::new(Mutex::new(HashMap::new())),
             state_db,
         }
     }
@@ -114,6 +119,14 @@ impl LocalThreadStore {
     /// Return the state DB handle used by local rollout writers.
     pub async fn state_db(&self) -> Option<StateDbHandle> {
         self.state_db.clone()
+    }
+
+    /// Stage local rollout files for deletion while a caller commits related state.
+    pub async fn stage_thread_deletes(
+        &self,
+        thread_ids: &[ThreadId],
+    ) -> ThreadStoreResult<StagedThreadDelete<'_>> {
+        delete_thread::stage_thread_deletes(self, thread_ids).await
     }
 
     /// Read a local rollout-backed thread by path.
@@ -260,7 +273,12 @@ impl ThreadStore for LocalThreadStore {
     }
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { live_writer::create_thread(self, params).await })
+        Box::pin(async move {
+            let thread_id = params.thread_id;
+            live_writer::create_thread(self, params).await?;
+            projection::initialize_empty(self, thread_id).await?;
+            Ok(())
+        })
     }
 
     fn create_thread_with_repository_context(
@@ -269,33 +287,111 @@ impl ThreadStore for LocalThreadStore {
         repository_context: Option<RepositoryContext>,
     ) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
+            let thread_id = params.thread_id;
             live_writer::create_thread_with_repository_context(self, params, repository_context)
-                .await
+                .await?;
+            projection::initialize_empty(self, thread_id).await?;
+            Ok(())
         })
     }
 
     fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { live_writer::resume_thread(self, params).await })
+        Box::pin(async move {
+            let thread_id = params.thread_id;
+            let include_archived = params.include_archived;
+            let history = params.history.clone();
+            live_writer::resume_thread(self, params).await?;
+            if let Some(history) = history {
+                projection::initialize_from_items(self, thread_id, history.as_slice()).await?;
+            } else {
+                projection::initialize_from_store(self, thread_id, include_archived).await?;
+            }
+            Ok(())
+        })
     }
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { live_writer::append_items(self, params).await })
+        Box::pin(async move {
+            let thread_id = params.thread_id;
+            let persisted_items = codex_rollout::persisted_rollout_items(
+                params.items.as_slice(),
+                ThreadHistoryMode::Legacy,
+            );
+            let (projection, _operation) =
+                projection::initialized_entry_for_append(self, thread_id).await?;
+            live_writer::append_items(self, params).await?;
+            if !persisted_items.is_empty() {
+                projection
+                    .append_durable(persisted_items.as_slice())
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn append_items_ordered(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let thread_id = params.thread_id;
+            let persisted_items = codex_rollout::persisted_rollout_items(
+                params.items.as_slice(),
+                ThreadHistoryMode::Legacy,
+            );
+            let (projection, _operation) =
+                projection::initialized_entry_for_append(self, thread_id).await?;
+            live_writer::append_items_ordered(self, params).await?;
+            if !persisted_items.is_empty() {
+                projection.append_pending(persisted_items).await;
+            }
+            Ok(())
+        })
     }
 
     fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { live_writer::persist_thread(self, thread_id).await })
+        Box::pin(async move {
+            if let Some(projection) = projection::existing_entry(self, thread_id).await {
+                let _operation = projection.acquire_operation().await?;
+                live_writer::persist_thread(self, thread_id).await?;
+                projection.commit_pending().await?;
+            } else {
+                live_writer::persist_thread(self, thread_id).await?;
+            }
+            Ok(())
+        })
     }
 
     fn flush_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { live_writer::flush_thread(self, thread_id).await })
+        Box::pin(async move {
+            if let Some(projection) = projection::existing_entry(self, thread_id).await {
+                let _operation = projection.acquire_operation().await?;
+                live_writer::flush_thread(self, thread_id).await?;
+                projection.commit_pending().await?;
+            } else {
+                live_writer::flush_thread(self, thread_id).await?;
+            }
+            Ok(())
+        })
     }
 
     fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { live_writer::shutdown_thread(self, thread_id).await })
+        Box::pin(async move {
+            if let Some(projection) = projection::existing_entry(self, thread_id).await {
+                let _operation = projection.acquire_operation().await?;
+                live_writer::shutdown_thread(self, thread_id).await?;
+                projection.commit_pending().await?;
+                projection::remove_if_current(self, thread_id, &projection).await;
+            } else {
+                live_writer::shutdown_thread(self, thread_id).await?;
+            }
+            Ok(())
+        })
     }
 
     fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { live_writer::discard_thread(self, thread_id).await })
+        Box::pin(async move {
+            live_writer::discard_thread(self, thread_id).await?;
+            projection::remove(self, thread_id).await;
+            Ok(())
+        })
     }
 
     fn load_history(
@@ -327,6 +423,14 @@ impl ThreadStore for LocalThreadStore {
         params: SearchThreadsParams,
     ) -> ThreadStoreFuture<'_, ThreadSearchPage> {
         Box::pin(async move { search_threads::search_threads(self, params).await })
+    }
+
+    fn list_turns(&self, params: crate::ListTurnsParams) -> ThreadStoreFuture<'_, crate::TurnPage> {
+        Box::pin(async move { projection::list_turns(self, params).await })
+    }
+
+    fn list_items(&self, params: crate::ListItemsParams) -> ThreadStoreFuture<'_, crate::ItemPage> {
+        Box::pin(async move { projection::list_items(self, params).await })
     }
 
     fn update_thread_metadata(
@@ -374,6 +478,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::InMemoryThreadStore;
     use crate::LiveThread;
     use crate::ThreadPersistenceMetadata;
     use crate::local::test_support::test_config;
@@ -431,6 +536,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_evicts_projection_and_next_read_rebuilds_it() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let thread_id = ThreadId::default();
+
+        store
+            .create_thread(create_thread_params(thread_id))
+            .await
+            .expect("create live thread");
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![
+                    RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                        turn_id: "turn-1".to_string(),
+                        trace_id: None,
+                        started_at: None,
+                        model_context_window: None,
+                        collaboration_mode_kind: Default::default(),
+                    })),
+                    user_message_item("persisted message"),
+                    RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                        surfaced_result: None,
+                        turn_id: "turn-1".to_string(),
+                        last_agent_message: None,
+                        error: None,
+                        completed_at: None,
+                        duration_ms: None,
+                        time_to_first_token_ms: None,
+                        completion: None,
+                        timing: None,
+                    })),
+                ],
+            })
+            .await
+            .expect("append turn");
+        assert!(store.projections.lock().await.contains_key(&thread_id));
+
+        store
+            .shutdown_thread(thread_id)
+            .await
+            .expect("shutdown live thread");
+        assert!(!store.projections.lock().await.contains_key(&thread_id));
+
+        let rebuilt = store
+            .list_turns(crate::ListTurnsParams {
+                thread_id,
+                include_archived: false,
+                cursor: None,
+                page_size: 10,
+                sort_direction: crate::SortDirection::Asc,
+                items_view: crate::StoredTurnItemsView::Full,
+            })
+            .await
+            .expect("rebuild projection from durable rollout");
+        assert_eq!(
+            rebuilt
+                .turns
+                .iter()
+                .map(|turn| turn.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-1"]
+        );
+        assert!(store.projections.lock().await.contains_key(&thread_id));
+    }
+
+    #[tokio::test]
     async fn raw_append_items_does_not_update_sqlite_metadata() {
         // This pins the ThreadStore contract: raw appends are history-only. Callers that need
         // metadata updates must use LiveThread or call update_thread_metadata explicitly.
@@ -468,6 +640,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_projection_pages_durable_turns_and_items_incrementally() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let thread_id = ThreadId::default();
+        let turn_items = |turn_id: &str, message: &str| {
+            vec![
+                RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                    turn_id: turn_id.to_string(),
+                    trace_id: None,
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                })),
+                user_message_item(message),
+                RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                    surfaced_result: None,
+                    turn_id: turn_id.to_string(),
+                    last_agent_message: None,
+                    error: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                    completion: None,
+                    timing: None,
+                })),
+            ]
+        };
+
+        store
+            .create_thread(create_thread_params(thread_id))
+            .await
+            .expect("create live thread");
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: turn_items("turn-1", "first"),
+            })
+            .await
+            .expect("append durable turn");
+        store
+            .append_items_ordered(AppendThreadItemsParams {
+                thread_id,
+                items: turn_items("turn-2", "second"),
+            })
+            .await
+            .expect("append ordered turn");
+
+        let before_flush = store
+            .list_turns(crate::ListTurnsParams {
+                thread_id,
+                include_archived: false,
+                cursor: None,
+                page_size: 10,
+                sort_direction: crate::SortDirection::Asc,
+                items_view: crate::StoredTurnItemsView::Full,
+            })
+            .await
+            .expect("list durable turns before flush");
+        assert_eq!(
+            before_flush
+                .turns
+                .iter()
+                .map(|turn| turn.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-1"]
+        );
+
+        store.flush_thread(thread_id).await.expect("flush thread");
+        let first_page = store
+            .list_turns(crate::ListTurnsParams {
+                thread_id,
+                include_archived: false,
+                cursor: None,
+                page_size: 1,
+                sort_direction: crate::SortDirection::Asc,
+                items_view: crate::StoredTurnItemsView::Full,
+            })
+            .await
+            .expect("list first turn page");
+        assert_eq!(first_page.turns[0].turn_id, "turn-1");
+        let second_page = store
+            .list_turns(crate::ListTurnsParams {
+                thread_id,
+                include_archived: false,
+                cursor: first_page.next_cursor,
+                page_size: 1,
+                sort_direction: crate::SortDirection::Asc,
+                items_view: crate::StoredTurnItemsView::Full,
+            })
+            .await
+            .expect("list second turn page");
+        assert_eq!(second_page.turns[0].turn_id, "turn-2");
+        let materialized_turn: codex_app_server_protocol::Turn = serde_json::from_slice(
+            second_page.turns[0]
+                .metadata_json
+                .as_deref()
+                .expect("materialized turn"),
+        )
+        .expect("deserialize materialized turn");
+        assert_eq!(materialized_turn.id, "turn-2");
+
+        let item_page = store
+            .list_items(crate::ListItemsParams {
+                thread_id,
+                turn_id: Some("turn-2".to_string()),
+                include_archived: false,
+                cursor: None,
+                page_size: 10,
+                sort_direction: crate::SortDirection::Asc,
+            })
+            .await
+            .expect("list projected turn items");
+        assert_eq!(item_page.items.len(), 1);
+        let item: codex_app_server_protocol::ThreadItem =
+            serde_json::from_slice(item_page.items[0].materialized_thread_item_json.as_slice())
+                .expect("deserialize projected item");
+        assert!(matches!(
+            item,
+            codex_app_server_protocol::ThreadItem::UserMessage { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn live_thread_observes_appended_items_into_sqlite_metadata() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
@@ -500,6 +795,59 @@ mod tests {
         );
         assert_eq!(metadata.preview.as_deref(), Some("observed append"));
         assert_eq!(metadata.title, "observed append");
+    }
+
+    #[tokio::test]
+    async fn ordered_live_append_defers_rollout_and_metadata_until_flush() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
+        let thread_id = ThreadId::default();
+        let live_thread = LiveThread::create(store.clone(), create_thread_params(thread_id))
+            .await
+            .expect("create live thread");
+        let rollout_path = store
+            .live_rollout_path(thread_id)
+            .await
+            .expect("load rollout path");
+
+        live_thread
+            .append_items_ordered(&[user_message_item("ordered append")])
+            .await
+            .expect("queue ordered append");
+
+        assert!(
+            !tokio::fs::try_exists(&rollout_path)
+                .await
+                .expect("stat rollout"),
+            "ordered append must not materialize the rollout before the terminal barrier"
+        );
+        assert_eq!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .expect("sqlite metadata read"),
+            None,
+            "ordered append must leave metadata pending"
+        );
+
+        live_thread.flush().await.expect("flush terminal barrier");
+        assert_rollout_contains_message(rollout_path.as_path(), "ordered append").await;
+        let metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("sqlite metadata read")
+            .expect("metadata after terminal barrier");
+        assert_eq!(
+            metadata.first_user_message.as_deref(),
+            Some("ordered append")
+        );
     }
 
     #[tokio::test]
@@ -626,6 +974,32 @@ mod tests {
                 .await
                 .expect("sqlite metadata read"),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn live_thread_shutdown_failure_does_not_publish_pending_metadata() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let thread_id = ThreadId::default();
+        let live_thread = LiveThread::create(store.clone(), create_thread_params(thread_id))
+            .await
+            .expect("create live thread");
+        live_thread
+            .append_items_ordered(&[user_message_item("pending shutdown")])
+            .await
+            .expect("queue ordered append");
+        store.fail_next_shutdown().await;
+
+        live_thread
+            .shutdown()
+            .await
+            .expect_err("injected rollout shutdown must fail");
+
+        let calls = store.calls().await;
+        assert_eq!(calls.shutdown_thread, 1);
+        assert_eq!(
+            calls.update_thread_metadata, 0,
+            "metadata must not advance if the rollout shutdown barrier fails"
         );
     }
 

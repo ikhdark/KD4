@@ -194,14 +194,35 @@ impl ProcessHandle {
         }
     }
 
+    /// Releases the Windows pseudoconsole after its root process exits.
+    ///
+    /// ConPTY keeps its output pipe open until the pseudoconsole handles are
+    /// closed. Releasing them here lets the reader drain buffered output and
+    /// then observe EOF without aborting the reader task.
+    pub fn release_pty_after_exit(&self) {
+        self.close_stdin();
+        if let Ok(mut killer_opt) = self.killer.lock() {
+            killer_opt.take();
+        }
+        if let Ok(mut handles) = self._pty_handles.lock() {
+            handles.take();
+        }
+    }
+
     /// Attempts to kill the child while leaving the reader/writer tasks alive
     /// so callers can still drain output until EOF.
-    pub fn request_terminate(&self) {
-        if let Ok(mut killer_opt) = self.killer.lock()
-            && let Some(mut killer) = killer_opt.take()
-        {
-            let _ = killer.kill();
-        }
+    pub fn request_terminate(&self) -> io::Result<()> {
+        let mut killer_opt = self
+            .killer
+            .lock()
+            .map_err(|_| io::Error::other("failed to lock process terminator"))?;
+        let Some(killer) = killer_opt.as_mut() else {
+            return Ok(());
+        };
+
+        killer.kill()?;
+        killer_opt.take();
+        Ok(())
     }
 
     pub fn signal(&self, signal: ProcessSignal) -> io::Result<()> {
@@ -216,10 +237,10 @@ impl ProcessHandle {
     }
 
     /// Attempts to kill the child and abort helper tasks.
-    pub fn terminate(&self) {
-        self.request_terminate();
-
+    pub fn terminate(&self) -> io::Result<()> {
+        self.request_terminate()?;
         self.finish();
+        Ok(())
     }
 
     /// Releases a finished child without signalling it and aborts helper tasks.
@@ -266,7 +287,10 @@ impl ProcessHandle {
 
 impl Drop for ProcessHandle {
     fn drop(&mut self) {
-        self.terminate();
+        if let Err(error) = self.terminate() {
+            log::warn!("failed to terminate process while dropping its handle: {error}");
+            self.finish();
+        }
     }
 }
 
@@ -275,10 +299,30 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     struct TestTerminator {
         dropped: Arc<AtomicBool>,
         killed: Arc<AtomicBool>,
+    }
+
+    struct RetryTerminator {
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ChildTerminator for RetryTerminator {
+        fn signal(&mut self, _signal: ProcessSignal) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                Err(io::Error::other("injected termination failure"))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     impl ChildTerminator for TestTerminator {
@@ -327,6 +371,89 @@ mod tests {
         assert!(handle.writer_sender().is_closed());
     }
 
+    #[tokio::test]
+    async fn failed_termination_keeps_terminator_for_retry() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let idle_task = || tokio::spawn(std::future::pending::<()>());
+        let handle = ProcessHandle::new(
+            writer_tx,
+            Box::new(RetryTerminator {
+                attempts: Arc::clone(&attempts),
+            }),
+            idle_task(),
+            Vec::new(),
+            idle_task(),
+            idle_task(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(StdMutex::new(None)),
+            None,
+            None,
+        );
+
+        let error = handle
+            .terminate()
+            .expect_err("first termination attempt should fail");
+        assert_eq!(error.to_string(), "injected termination failure");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(!handle.writer_sender().is_closed());
+
+        handle
+            .terminate()
+            .expect("retained terminator should succeed on retry");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(handle.writer_sender().is_closed());
+    }
+
+    #[tokio::test]
+    async fn lossless_driver_output_survives_backpressure() {
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (driver_tx, driver_rx) = mpsc::channel(1);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let SpawnedProcess {
+            session,
+            mut stdout_rx,
+            ..
+        } = spawn_from_driver(ProcessDriver {
+            writer_tx,
+            stdout_rx: driver_rx.into(),
+            stderr_rx: None,
+            exit_rx,
+            terminator: None,
+            writer_handle: None,
+            resizer: None,
+        });
+        let expected = (0_u32..512).map(u32::to_le_bytes).collect::<Vec<[u8; 4]>>();
+        let producer_expected = expected.clone();
+        let producer = tokio::spawn(async move {
+            for chunk in producer_expected {
+                driver_tx.send(chunk.to_vec()).await.expect("send output");
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let received = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut received = Vec::new();
+            while let Some(chunk) = stdout_rx.recv().await {
+                received.push(chunk);
+            }
+            received
+        })
+        .await
+        .expect("lossless output should drain");
+        producer.await.expect("output producer should finish");
+        exit_tx.send(0).expect("send process exit");
+
+        assert_eq!(
+            received,
+            expected
+                .into_iter()
+                .map(|chunk| chunk.to_vec())
+                .collect::<Vec<_>>()
+        );
+        session.finish();
+    }
+
     #[test]
     fn opaque_pty_handle_uses_send_directly() {
         let removed_trait = ["trait PtyHandle", "KeepAlive"].concat();
@@ -336,7 +463,7 @@ mod tests {
 
 /// Adapts a closure into a `ChildTerminator` implementation.
 struct ClosureTerminator {
-    inner: Option<Box<dyn FnMut() + Send + Sync>>,
+    inner: Option<Box<dyn FnMut() -> io::Result<()> + Send + Sync>>,
 }
 
 impl ChildTerminator for ClosureTerminator {
@@ -346,7 +473,7 @@ impl ChildTerminator for ClosureTerminator {
 
     fn kill(&mut self) -> io::Result<()> {
         if let Some(inner) = self.inner.as_mut() {
-            (inner)();
+            (inner)()?;
         }
         Ok(())
     }
@@ -399,12 +526,48 @@ pub struct SpawnedProcess {
 /// Driver-backed process handles for non-standard spawn backends.
 pub struct ProcessDriver {
     pub writer_tx: mpsc::Sender<Vec<u8>>,
-    pub stdout_rx: broadcast::Receiver<Vec<u8>>,
-    pub stderr_rx: Option<broadcast::Receiver<Vec<u8>>>,
+    pub stdout_rx: ProcessOutputReceiver,
+    pub stderr_rx: Option<ProcessOutputReceiver>,
     pub exit_rx: oneshot::Receiver<i32>,
-    pub terminator: Option<Box<dyn FnMut() + Send + Sync>>,
+    pub terminator: Option<Box<dyn FnMut() -> io::Result<()> + Send + Sync>>,
     pub writer_handle: Option<JoinHandle<()>>,
     pub resizer: Option<ResizeFn>,
+}
+
+/// Output receiver supplied by a driver-backed process. Backends that require
+/// exact byte delivery should use the bounded `Lossless` variant.
+pub enum ProcessOutputReceiver {
+    Broadcast(broadcast::Receiver<Vec<u8>>),
+    Lossless(mpsc::Receiver<Vec<u8>>),
+}
+
+impl From<broadcast::Receiver<Vec<u8>>> for ProcessOutputReceiver {
+    fn from(receiver: broadcast::Receiver<Vec<u8>>) -> Self {
+        Self::Broadcast(receiver)
+    }
+}
+
+impl From<mpsc::Receiver<Vec<u8>>> for ProcessOutputReceiver {
+    fn from(receiver: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self::Lossless(receiver)
+    }
+}
+
+enum ProcessOutputRecvError {
+    Lagged,
+    Closed,
+}
+
+impl ProcessOutputReceiver {
+    async fn recv(&mut self) -> Result<Vec<u8>, ProcessOutputRecvError> {
+        match self {
+            Self::Broadcast(receiver) => receiver.recv().await.map_err(|error| match error {
+                broadcast::error::RecvError::Lagged(_) => ProcessOutputRecvError::Lagged,
+                broadcast::error::RecvError::Closed => ProcessOutputRecvError::Closed,
+            }),
+            Self::Lossless(receiver) => receiver.recv().await.ok_or(ProcessOutputRecvError::Closed),
+        }
+    }
 }
 
 /// Build a `SpawnedProcess` from a driver that supplies stdin/output/exit channels.
@@ -423,7 +586,7 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
     let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(256);
     let (exit_seen_tx, exit_seen_rx) = watch::channel(false);
     let spawn_stream_reader =
-        |mut output_rx: broadcast::Receiver<Vec<u8>>,
+        |mut output_rx: ProcessOutputReceiver,
          output_tx: mpsc::Sender<Vec<u8>>,
          mut exit_seen_rx: watch::Receiver<bool>| {
             tokio::spawn(async move {
@@ -452,8 +615,8 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(ProcessOutputRecvError::Lagged) => continue,
+                        Err(ProcessOutputRecvError::Closed) => break,
                     }
                 }
             })

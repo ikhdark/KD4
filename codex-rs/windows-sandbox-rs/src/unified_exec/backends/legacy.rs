@@ -30,7 +30,6 @@ use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -81,8 +80,8 @@ fn spawn_legacy_process(
     use_private_desktop: bool,
     tty: bool,
     stdin_open: bool,
-    stdout_tx: broadcast::Sender<Vec<u8>>,
-    stderr_tx: Option<broadcast::Sender<Vec<u8>>>,
+    stdout_tx: mpsc::Sender<Vec<u8>>,
+    stderr_tx: Option<mpsc::Sender<Vec<u8>>>,
     writer_rx: mpsc::Receiver<Vec<u8>>,
     logs_base_dir: Option<&Path>,
 ) -> Result<LegacyProcessHandles> {
@@ -169,10 +168,10 @@ fn spawn_legacy_process(
 
 fn spawn_output_reader(
     output_read: HANDLE,
-    output_tx: broadcast::Sender<Vec<u8>>,
+    output_tx: mpsc::Sender<Vec<u8>>,
 ) -> std::thread::JoinHandle<()> {
     read_handle_loop(output_read, move |chunk| {
-        let _ = output_tx.send(chunk.to_vec());
+        let _ = output_tx.blocking_send(chunk.to_vec());
     })
 }
 
@@ -210,7 +209,7 @@ fn terminate_job_or_process(
     job: &JobObject,
     process_handle: &Arc<StdMutex<Option<SendableHandle>>>,
     logs_base_dir: Option<&Path>,
-) {
+) -> std::io::Result<()> {
     if let Err(job_err) = job.terminate() {
         log_note(
             &format!("legacy spawn failed to terminate process tree: {job_err}"),
@@ -220,15 +219,18 @@ fn terminate_job_or_process(
             && let Some(handle) = guard.as_ref()
             && unsafe { TerminateProcess(raw_handle(*handle), 1) } == 0
         {
+            let process_err = std::io::Error::last_os_error();
             log_note(
-                &format!(
-                    "legacy spawn failed to terminate root process: {}",
-                    unsafe { GetLastError() }
-                ),
+                &format!("legacy spawn failed to terminate root process: {process_err}"),
                 logs_base_dir,
             );
+            return Err(std::io::Error::other(format!(
+                "failed to terminate process tree ({job_err}); root fallback also failed: {process_err}"
+            )));
         }
+        return Err(job_err);
     }
+    Ok(())
 }
 
 fn write_all_handle(handle: HANDLE, mut bytes: &[u8]) -> Result<()> {
@@ -455,11 +457,11 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
     )?;
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
-    let (stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(256);
+    let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(256);
     let stderr_rx = if tty {
         None
     } else {
-        Some(broadcast::channel::<Vec<u8>>(256))
+        Some(mpsc::channel::<Vec<u8>>(256))
     };
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
 
@@ -522,7 +524,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
                 false
             }
             WAIT_TIMEOUT => {
-                terminate_job_or_process(
+                let _ = terminate_job_or_process(
                     &job_for_wait,
                     &wait_handle,
                     wait_logs_base_dir.as_deref(),
@@ -538,7 +540,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
                     ),
                     wait_logs_base_dir.as_deref(),
                 );
-                terminate_job_or_process(
+                let _ = terminate_job_or_process(
                     &job_for_wait,
                     &wait_handle,
                     wait_logs_base_dir.as_deref(),
@@ -553,7 +555,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
                     ),
                     wait_logs_base_dir.as_deref(),
                 );
-                terminate_job_or_process(
+                let _ = terminate_job_or_process(
                     &job_for_wait,
                     &wait_handle,
                     wait_logs_base_dir.as_deref(),
@@ -589,14 +591,15 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         let process_handle = Arc::clone(&process_handle);
         let logs_base_dir = common.logs_base_dir;
         Some(Box::new(move || {
-            terminate_job_or_process(&job, &process_handle, logs_base_dir.as_deref());
-        }) as Box<dyn FnMut() + Send + Sync>)
+            terminate_job_or_process(&job, &process_handle, logs_base_dir.as_deref())
+        })
+            as Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>)
     };
 
     let driver = ProcessDriver {
         writer_tx,
-        stdout_rx,
-        stderr_rx: stderr_rx.map(|(_tx, rx)| rx),
+        stdout_rx: stdout_rx.into(),
+        stderr_rx: stderr_rx.map(|(_tx, rx)| rx.into()),
         exit_rx,
         terminator,
         writer_handle: Some(writer_handle),

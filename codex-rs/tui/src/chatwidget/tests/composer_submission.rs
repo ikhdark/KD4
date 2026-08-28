@@ -1132,25 +1132,12 @@ async fn unbound_queued_message_edit_does_not_fall_back_to_alt_up() {
 }
 
 #[tokio::test]
-async fn shift_left_edits_most_recent_queued_message_in_apple_terminal() {
-    assert_shift_left_edits_most_recent_queued_message_for_terminal(TerminalInfo {
-        name: TerminalName::AppleTerminal,
-        term_program: None,
-        version: None,
-        term: None,
-        multiplexer: None,
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn shift_left_edits_most_recent_queued_message_in_warp_terminal() {
     assert_shift_left_edits_most_recent_queued_message_for_terminal(TerminalInfo {
         name: TerminalName::WarpTerminal,
         term_program: None,
         version: None,
         term: None,
-        multiplexer: None,
     })
     .await;
 }
@@ -1162,42 +1149,18 @@ async fn shift_left_edits_most_recent_queued_message_in_vscode_terminal() {
         term_program: None,
         version: None,
         term: None,
-        multiplexer: None,
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn shift_left_edits_most_recent_queued_message_in_tmux() {
-    assert_shift_left_edits_most_recent_queued_message_for_terminal(TerminalInfo {
-        name: TerminalName::Iterm2,
-        term_program: None,
-        version: None,
-        term: None,
-        multiplexer: Some(Multiplexer::Tmux { version: None }),
     })
     .await;
 }
 
 #[test]
-fn queued_message_edit_binding_mapping_covers_special_terminals_and_tmux() {
-    assert_eq!(
-        queued_message_edit_binding_for_terminal(TerminalInfo {
-            name: TerminalName::AppleTerminal,
-            term_program: None,
-            version: None,
-            term: None,
-            multiplexer: None,
-        }),
-        crate::key_hint::shift(KeyCode::Left)
-    );
+fn queued_message_edit_binding_mapping_covers_windows_terminals() {
     assert_eq!(
         queued_message_edit_binding_for_terminal(TerminalInfo {
             name: TerminalName::WarpTerminal,
             term_program: None,
             version: None,
             term: None,
-            multiplexer: None,
         }),
         crate::key_hint::shift(KeyCode::Left)
     );
@@ -1207,27 +1170,15 @@ fn queued_message_edit_binding_mapping_covers_special_terminals_and_tmux() {
             term_program: None,
             version: None,
             term: None,
-            multiplexer: None,
         }),
         crate::key_hint::shift(KeyCode::Left)
     );
     assert_eq!(
         queued_message_edit_binding_for_terminal(TerminalInfo {
-            name: TerminalName::Iterm2,
+            name: TerminalName::WindowsTerminal,
             term_program: None,
             version: None,
             term: None,
-            multiplexer: Some(Multiplexer::Tmux { version: None }),
-        }),
-        crate::key_hint::shift(KeyCode::Left)
-    );
-    assert_eq!(
-        queued_message_edit_binding_for_terminal(TerminalInfo {
-            name: TerminalName::Iterm2,
-            term_program: None,
-            version: None,
-            term: None,
-            multiplexer: None,
         }),
         crate::key_hint::alt(KeyCode::Up)
     );

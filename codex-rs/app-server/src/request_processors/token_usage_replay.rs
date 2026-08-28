@@ -50,8 +50,8 @@ pub(super) async fn send_thread_token_usage_update_to_connection(
         token_usage: ThreadTokenUsage::from(info),
     };
     outgoing
-        .send_server_notification_to_connections(
-            &[connection_id],
+        .send_initial_component_notification_to_connection(
+            connection_id,
             ServerNotification::ThreadTokenUsageUpdated(notification),
         )
         .await;

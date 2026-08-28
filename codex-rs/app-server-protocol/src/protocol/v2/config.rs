@@ -26,6 +26,8 @@ use ts_rs::TS;
 #[ts(tag = "type")]
 #[ts(export_to = "v2/")]
 pub enum ConfigLayerSource {
+    // Keep this historical doc string stable because it is emitted into the
+    // versioned schema for the compatibility-only variant.
     /// Managed preferences layer delivered by MDM (macOS only).
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]

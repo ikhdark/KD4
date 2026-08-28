@@ -2,6 +2,7 @@ use super::*;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::tools::context::ToolCallSource;
+use crate::tools::handlers::shell;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolRegistry;
@@ -49,34 +50,19 @@ fn plan_output_always_signals_mutation_obligation_state() {
 }
 
 #[test]
-fn pending_validation_result_does_not_readmit_a_durable_candidate() {
+fn pending_validation_result_renders_an_admitted_candidate() {
     let route = ValidationRoute {
         leaves: vec![ValidationRouteLeaf {
             argv: vec!["cargo".to_string(), "test".to_string()],
-            uncertainty: String::new(),
             covered_paths: vec!["codex-rs/core/src/tools/handlers/plan.rs".to_string()],
-            covered_contracts: vec!["update_plan response rendering".to_string()],
             timeout_ms: 10_000,
-            semantic_timeout: false,
         }],
         ordering: ValidationRouteOrdering::StopOnFailure,
     };
-    assert!(
-        super::super::shell::validate_structured_validation_leaf(
-            &route.leaves[0],
-            PathBuf::from(".").as_path()
-        )
-        .is_err(),
-        "the fixture must remain semantically inadmissible so this detects a rendering-layer recheck"
-    );
     let result = pending_validation_result(AutoValidationCandidate {
         step_id: "step".to_string(),
         step_revision: 1,
         route: route.clone(),
-        implementation_revision: 1,
-        implementation_identity: "implementation".to_string(),
-        leaf_implementation_identities: vec!["leaf".to_string()],
-        repository_wide: false,
     });
 
     assert!(result["unsupported_runner"].is_null());
@@ -96,9 +82,7 @@ async fn task_evidence_plan_rejects_unadmitted_validation_route_at_input() {
                 "validation_route": {
                     "leaves": [{
                         "argv": ["cargo", "test"],
-                        "uncertainty": "",
-                        "covered_paths": ["codex-rs/core/src/tools/handlers/plan.rs"],
-                        "covered_contracts": ["update_plan input admission"],
+                        "covered_paths": [],
                         "timeout_ms": 10000
                     }]
                 }
@@ -122,7 +106,7 @@ async fn task_evidence_plan_rejects_unadmitted_validation_route_at_input() {
     assert!(matches!(
         result,
         Err(FunctionCallError::RespondToModel(message))
-            if message == "structured validation route could not be bound: auto-validation must state the uncertainty this command resolves"
+            if message.contains("covered_paths")
     ));
     let evidence = read_persisted_plan(&evidence_path).await;
     assert_eq!(evidence["plan"], serde_json::json!([]));
@@ -421,6 +405,7 @@ async fn task_evidence_plan_does_not_mirror_into_session_store() {
         arguments: plan_arguments("Keep one authoritative plan owner"),
     };
 
+    shell::reset_validation_repository_discovery_count();
     PlanHandler::new(true)
         .handle(ToolInvocation {
             session: Arc::clone(&session),
@@ -434,6 +419,11 @@ async fn task_evidence_plan_does_not_mirror_into_session_store() {
         })
         .await
         .expect("task-evidence plan update");
+    assert_eq!(
+        shell::validation_repository_discovery_count(),
+        0,
+        "route-less plan updates must not inspect repository state"
+    );
 
     assert_eq!(
         read_persisted_plan(&evidence_path).await["plan"][0]["step"],
@@ -626,14 +616,7 @@ fn update_plan_schema_exposes_task_evidence_contract() {
             &tool,
             "/parameters/properties/validation_route/properties/leaves/items/properties"
         ),
-        vec![
-            "argv",
-            "covered_contracts",
-            "covered_paths",
-            "semantic_timeout",
-            "timeout_ms",
-            "uncertainty",
-        ]
+        vec!["argv", "covered_paths", "timeout_ms",]
     );
 
     for pointer in [
@@ -679,13 +662,7 @@ fn update_plan_schema_exposes_task_evidence_contract() {
     );
     assert_eq!(
         tool.pointer("/parameters/properties/validation_route/properties/leaves/items/required"),
-        Some(&serde_json::json!([
-            "argv",
-            "uncertainty",
-            "covered_paths",
-            "covered_contracts",
-            "timeout_ms"
-        ]))
+        Some(&serde_json::json!(["argv", "covered_paths", "timeout_ms"]))
     );
     assert!(description.contains("All update fields are optional"));
     assert!(description.contains("Structured validation routes"));

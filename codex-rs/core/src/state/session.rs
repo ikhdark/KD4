@@ -1,8 +1,8 @@
 //! Session-wide mutable state.
 
-use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::ResponseItem;
-use codex_sandboxing::policy_transforms::merge_permission_profiles;
+use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
+use codex_sandboxing::policy_transforms::merge_uri_permission_profiles;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -19,7 +19,6 @@ use crate::session::time_reminder::CurrentTimeReminderState;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::session_startup_prewarm::SessionStartupTransportHandle;
 use crate::tool_history::ModelGenerationId;
-use crate::tool_history::ToolHistoryCandidate;
 use crate::tool_history::ToolHistoryState;
 use codex_protocol::protocol::ContextFragmentDigest;
 use codex_protocol::protocol::RateLimitSnapshot;
@@ -60,7 +59,7 @@ pub(crate) struct SessionState {
     pub(crate) current_time_reminder: CurrentTimeReminderState,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
-    granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
+    granted_permissions_by_approval_scope_id: HashMap<String, UriAdditionalPermissionProfile>,
     last_passed_root_completion_turn_id: Option<String>,
     next_turn_is_first: bool,
     pending_context_baseline: Option<ContextBaselineCandidate>,
@@ -95,7 +94,7 @@ impl SessionState {
             current_time_reminder: CurrentTimeReminderState::default(),
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
-            granted_permissions_by_environment_id: HashMap::new(),
+            granted_permissions_by_approval_scope_id: HashMap::new(),
             last_passed_root_completion_turn_id: None,
             next_turn_is_first: true,
             pending_context_baseline: None,
@@ -143,16 +142,20 @@ impl SessionState {
         self.history.tool_history_state()
     }
 
-    pub(crate) fn register_tool_history_candidate(&mut self, candidate: ToolHistoryCandidate) {
-        self.history.register_tool_history_candidate(candidate);
+    pub(crate) fn apply_tool_history_mutation(
+        &mut self,
+        mutation: &crate::tool_history::ToolHistoryMutation,
+    ) -> bool {
+        self.history.apply_tool_history_mutation(mutation)
     }
 
-    pub(crate) fn mark_tool_history_consumed(
+    pub(crate) fn mark_tool_history_consumed_with_delta(
         &mut self,
         input: &[ResponseItem],
         generation: ModelGenerationId,
-    ) -> bool {
-        self.history.mark_tool_history_consumed(input, generation)
+    ) -> std::collections::BTreeSet<String> {
+        self.history
+            .mark_tool_history_consumed_with_delta(input, generation)
     }
 
     #[cfg(test)]
@@ -342,26 +345,26 @@ impl SessionState {
 
     pub(crate) fn record_granted_permissions(
         &mut self,
-        environment_id: &str,
-        permissions: AdditionalPermissionProfile,
+        approval_scope_id: &str,
+        permissions: UriAdditionalPermissionProfile,
     ) {
-        let granted_permissions = merge_permission_profiles(
-            self.granted_permissions_by_environment_id
-                .get(environment_id),
+        let granted_permissions = merge_uri_permission_profiles(
+            self.granted_permissions_by_approval_scope_id
+                .get(approval_scope_id),
             Some(&permissions),
         );
         if let Some(granted_permissions) = granted_permissions {
-            self.granted_permissions_by_environment_id
-                .insert(environment_id.to_string(), granted_permissions);
+            self.granted_permissions_by_approval_scope_id
+                .insert(approval_scope_id.to_string(), granted_permissions);
         }
     }
 
     pub(crate) fn granted_permissions(
         &self,
-        environment_id: &str,
-    ) -> Option<AdditionalPermissionProfile> {
-        self.granted_permissions_by_environment_id
-            .get(environment_id)
+        approval_scope_id: &str,
+    ) -> Option<UriAdditionalPermissionProfile> {
+        self.granted_permissions_by_approval_scope_id
+            .get(approval_scope_id)
             .cloned()
     }
 }

@@ -585,14 +585,9 @@ impl FileSystemSandboxPolicy {
             },
             access: FileSystemAccessMode::Write,
         });
-        if !exclude_slash_tmp {
-            entries.push(FileSystemSandboxEntry {
-                path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::SlashTmp,
-                },
-                access: FileSystemAccessMode::Write,
-            });
-        }
+        // Retain the legacy field in persisted and wire representations, but
+        // `/tmp` has no Windows runtime meaning and must never grant access.
+        let _ = exclude_slash_tmp;
         if !exclude_tmpdir_env_var {
             entries.push(FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
@@ -1523,14 +1518,7 @@ fn resolve_file_system_special_path(
                 Some(tmpdir)
             }
         }
-        FileSystemSpecialPath::SlashTmp => {
-            #[allow(clippy::expect_used)]
-            let slash_tmp = AbsolutePathBuf::from_absolute_path("/tmp").expect("/tmp is absolute");
-            if !slash_tmp.as_path().is_dir() {
-                return None;
-            }
-            Some(slash_tmp)
-        }
+        FileSystemSpecialPath::SlashTmp => None,
     }
 }
 
@@ -1665,14 +1653,8 @@ fn legacy_runtime_file_system_policy_for_cwd(
         },
     ];
 
-    if !*exclude_slash_tmp {
-        entries.push(FileSystemSandboxEntry {
-            path: FileSystemPath::Special {
-                value: FileSystemSpecialPath::SlashTmp,
-            },
-            access: FileSystemAccessMode::Write,
-        });
-    }
+    // Compatibility-only on Windows; do not materialize a POSIX `/tmp` root.
+    let _ = exclude_slash_tmp;
     if !*exclude_tmpdir_env_var {
         entries.push(FileSystemSandboxEntry {
             path: FileSystemPath::Special {
@@ -1920,6 +1902,35 @@ mod tests {
 
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn workspace_write_ignores_legacy_slash_tmp_setting_on_windows() {
+        for exclude_slash_tmp in [false, true] {
+            let legacy = SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: true,
+                exclude_slash_tmp,
+            };
+
+            let profile_policy = FileSystemSandboxPolicy::from(&legacy);
+            let runtime_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+                &legacy,
+                Path::new(r"C:\workspace"),
+            );
+
+            for policy in [&profile_policy, &runtime_policy] {
+                assert!(policy.entries.iter().all(|entry| {
+                    !matches!(
+                        &entry.path,
+                        FileSystemPath::Special {
+                            value: FileSystemSpecialPath::SlashTmp
+                        }
+                    )
+                }));
+            }
+        }
+    }
 
     #[test]
     fn unknown_special_paths_are_ignored_by_legacy_bridge() -> std::io::Result<()> {

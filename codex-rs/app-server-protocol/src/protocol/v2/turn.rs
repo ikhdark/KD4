@@ -7,6 +7,7 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::plan_tool::PlanItemArg as CorePlanItemArg;
 use codex_protocol::plan_tool::StepStatus as CorePlanStepStatus;
@@ -121,8 +122,15 @@ pub struct TurnStartParams {
     /// Override the sandbox policy for this turn and subsequent turns.
     #[ts(optional = nullable)]
     pub sandbox_policy: Option<SandboxPolicy>,
+    /// Exact permission profile for this turn and subsequent turns. When both
+    /// this and the legacy `sandboxPolicy` projection are present, this field
+    /// is authoritative.
+    #[experimental("turn/start.permissionProfile")]
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub permission_profile: Option<PermissionProfile>,
     /// Select a named permissions profile id for this turn and subsequent
-    /// turns. Cannot be combined with `sandboxPolicy`.
+    /// turns. Cannot be combined with `sandboxPolicy` or `permissionProfile`.
     #[experimental("turn/start.permissions")]
     #[ts(optional = nullable)]
     pub permissions: Option<String>,

@@ -345,6 +345,14 @@ impl CatalogRequestProcessor {
                         && (workspace_codex_plugins_enabled
                             || !matches!(spec.id, Feature::Apps | Feature::Plugins)),
                     default_enabled: spec.default_enabled,
+                    consumer: Some(match spec.consumer {
+                        codex_features::FeatureConsumer::Runtime => {
+                            codex_app_server_protocol::ExperimentalFeatureConsumer::Runtime
+                        }
+                        codex_features::FeatureConsumer::Client => {
+                            codex_app_server_protocol::ExperimentalFeatureConsumer::Client
+                        }
+                    }),
                 }
             })
             .collect::<Vec<_>>();

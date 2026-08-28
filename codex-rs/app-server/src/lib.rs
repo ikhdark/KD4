@@ -9,6 +9,7 @@ use codex_config::thread_config_loader_for_endpoint;
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
 use codex_login::AuthManager;
+use codex_login::default_client::set_default_client_residency_requirement;
 #[cfg(debug_assertions)]
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
@@ -46,6 +47,7 @@ use crate::transport::start_control_socket_acceptor;
 use crate::transport::start_remote_control;
 use crate::transport::start_stdio_connection;
 use crate::transport::start_websocket_acceptor;
+use crate::transport::validate_websocket_listener;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCMessage;
@@ -78,6 +80,23 @@ use tracing_subscriber::registry::Registry;
 use tracing_subscriber::util::SubscriberInitExt;
 
 const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database.";
+const STARTUP_WARNING_TARGET: &str = "codex_app_server::startup_warning";
+const DEFAULT_STDERR_LOG_FILTER: &str = "error,codex_app_server::startup_warning=warn";
+
+fn default_stderr_log_filter() -> EnvFilter {
+    EnvFilter::new(DEFAULT_STDERR_LOG_FILTER)
+}
+
+fn stderr_log_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| default_stderr_log_filter())
+}
+
+fn emit_startup_warning(warning: &ConfigWarningNotification) {
+    match &warning.details {
+        Some(details) => warn!(target: STARTUP_WARNING_TARGET, "{} {}", warning.summary, details),
+        None => warn!(target: STARTUP_WARNING_TARGET, "{}", warning.summary),
+    }
+}
 
 mod analytics_utils;
 mod app_info;
@@ -436,15 +455,7 @@ pub async fn run_main(
         )
     })?;
     let codex_home = find_codex_home()?;
-    let local_runtime_paths =
-        ExecServerRuntimePaths::from_optional_path(arg0_paths.codex_self_exe.clone())?;
-    let environment_manager = if loader_overrides.ignore_user_config {
-        EnvironmentManager::from_env(Some(local_runtime_paths)).await
-    } else {
-        EnvironmentManager::from_codex_home(codex_home.clone(), Some(local_runtime_paths)).await
-    }
-    .map(Arc::new)
-    .map_err(std::io::Error::other)?;
+    let ignore_user_config = loader_overrides.ignore_user_config;
     let config_manager = ConfigManager::new(
         codex_home.to_path_buf(),
         cli_kv_overrides.clone(),
@@ -499,6 +510,50 @@ pub async fn run_main(
             (default_config, auth_manager)
         }
     };
+
+    set_default_client_residency_requirement(config.enforce_residency.value());
+
+    let remote_control_policy = if config
+        .config_layer_stack
+        .requirements()
+        .allow_remote_control
+        .as_ref()
+        .is_some_and(|requirement| !requirement.value)
+    {
+        RemoteControlPolicy::DisabledByRequirements
+    } else {
+        RemoteControlPolicy::Allowed
+    };
+    let remote_control_startup_mode = runtime_options.remote_control_startup_mode;
+    let remote_control_explicitly_requested =
+        remote_control_startup_mode == RemoteControlStartupMode::EnabledEphemeral;
+    if remote_control_explicitly_requested
+        && remote_control_policy == RemoteControlPolicy::DisabledByRequirements
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "remote control is disabled by managed requirements",
+        ));
+    }
+
+    let mut websocket_auth_policy = match &transport {
+        AppServerTransport::WebSocket { bind_address } => {
+            let policy = policy_from_settings(&auth)?;
+            validate_websocket_listener(*bind_address, &policy)?;
+            Some(policy)
+        }
+        _ => None,
+    };
+
+    let local_runtime_paths =
+        ExecServerRuntimePaths::from_optional_path(arg0_paths.codex_self_exe.clone())?;
+    let environment_manager = if ignore_user_config {
+        EnvironmentManager::from_env(Some(local_runtime_paths)).await
+    } else {
+        EnvironmentManager::from_codex_home(codex_home.clone(), Some(local_runtime_paths)).await
+    }
+    .map(Arc::new)
+    .map_err(std::io::Error::other)?;
 
     let otel = codex_core::otel_init::build_provider(
         &config,
@@ -568,12 +623,12 @@ pub async fn run_main(
             .json()
             .with_writer(std::io::stderr)
             .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
-            .with_filter(EnvFilter::from_default_env())
+            .with_filter(stderr_log_filter())
             .boxed(),
         LogFormat::Default => tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
             .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
-            .with_filter(EnvFilter::from_default_env())
+            .with_filter(stderr_log_filter())
             .boxed(),
     };
 
@@ -594,32 +649,7 @@ pub async fn run_main(
         .with(otel_tracing_layer)
         .try_init();
     for warning in &config_warnings {
-        match &warning.details {
-            Some(details) => error!("{} {}", warning.summary, details),
-            None => error!("{}", warning.summary),
-        }
-    }
-    let remote_control_policy = if config
-        .config_layer_stack
-        .requirements()
-        .allow_remote_control
-        .as_ref()
-        .is_some_and(|requirement| !requirement.value)
-    {
-        RemoteControlPolicy::DisabledByRequirements
-    } else {
-        RemoteControlPolicy::Allowed
-    };
-    let remote_control_startup_mode = runtime_options.remote_control_startup_mode;
-    let remote_control_explicitly_requested =
-        remote_control_startup_mode == RemoteControlStartupMode::EnabledEphemeral;
-    if remote_control_explicitly_requested
-        && remote_control_policy == RemoteControlPolicy::DisabledByRequirements
-    {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "remote control is disabled by managed requirements",
-        ));
+        emit_startup_warning(warning);
     }
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let transport_shutdown_token = CancellationToken::new();
@@ -656,7 +686,11 @@ pub async fn run_main(
                 *bind_address,
                 transport_event_tx.clone(),
                 transport_shutdown_token.clone(),
-                policy_from_settings(&auth)?,
+                websocket_auth_policy.take().ok_or_else(|| {
+                    std::io::Error::other(
+                        "websocket auth policy was not resolved during startup preflight",
+                    )
+                })?,
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -693,6 +727,7 @@ pub async fn run_main(
             remote_control_url: config.chatgpt_base_url.clone(),
             installation_id: installation_id.clone(),
             policy: remote_control_policy,
+            http_client_factory: config.http_client_factory(),
         },
         state_db.clone(),
         auth_manager.clone(),
@@ -1016,7 +1051,9 @@ pub async fn run_main(
                                             warn!("dropping notification from unknown connection: {connection_id:?}");
                                             continue;
                                         }
-                                        processor.process_notification(notification).await;
+                                        processor
+                                            .process_notification(connection_id, notification)
+                                            .await;
                                     }
                                     JSONRPCMessage::Error(err) => {
                                         if !connections.contains_key(&connection_id) {
@@ -1277,14 +1314,67 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
     use super::LogFormat;
+    use super::STARTUP_WARNING_TARGET;
+    use super::default_stderr_log_filter;
+    use super::emit_startup_warning;
     #[cfg(debug_assertions)]
     use super::loader_overrides_with_test_user_config_file;
+    use codex_app_server_protocol::ConfigWarningNotification;
     #[cfg(debug_assertions)]
     use codex_config::LoaderOverrides;
     #[cfg(debug_assertions)]
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+    use tracing::Event;
+    use tracing::Level;
+    use tracing::Subscriber;
+    use tracing::warn;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::Context;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<(String, Level)>>>);
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            self.0.lock().expect("capture lock").push((
+                event.metadata().target().to_string(),
+                *event.metadata().level(),
+            ));
+        }
+    }
+
+    #[test]
+    fn logging_contract_startup_warning_is_warn_and_default_visible() {
+        let capture = EventCapture::default();
+        let captured = Arc::clone(&capture.0);
+        let subscriber =
+            tracing_subscriber::registry().with(capture.with_filter(default_stderr_log_filter()));
+        let warning = ConfigWarningNotification {
+            summary: "configuration warning".to_string(),
+            details: Some("warning details".to_string()),
+            path: None,
+            range: None,
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            emit_startup_warning(&warning);
+            warn!(target: "codex_app_server::unrelated", "unrelated warning");
+        });
+
+        assert_eq!(
+            *captured.lock().expect("capture lock"),
+            vec![(STARTUP_WARNING_TARGET.to_string(), Level::WARN)]
+        );
+    }
 
     #[test]
     fn log_format_from_env_value_matches_json_values_case_insensitively() {

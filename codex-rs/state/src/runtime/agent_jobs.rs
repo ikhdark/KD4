@@ -1,7 +1,81 @@
 use super::*;
 use crate::model::AgentJobItemRow;
+use tokio::sync::watch;
+use tokio::time::MissedTickBehavior;
+
+const AGENT_JOB_RUNNER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const AGENT_JOB_RUNNER_LEASE_TIMEOUT_SECONDS: i64 = 30;
+
+pub(super) async fn register_agent_job_runner_instance(
+    pool: &SqlitePool,
+    runner_instance_id: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+INSERT INTO agent_job_runner_instances (runner_instance_id, heartbeat_at)
+VALUES (?, ?)
+ON CONFLICT(runner_instance_id) DO UPDATE SET heartbeat_at = excluded.heartbeat_at
+        "#,
+    )
+    .bind(runner_instance_id)
+    .bind(Utc::now().timestamp())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub(super) fn spawn_agent_job_runner_heartbeat(
+    pool: Arc<SqlitePool>,
+    runner_instance_id: String,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(AGENT_JOB_RUNNER_HEARTBEAT_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(error) = sqlx::query(
+                        "UPDATE agent_job_runner_instances SET heartbeat_at = ? WHERE runner_instance_id = ?",
+                    )
+                    .bind(Utc::now().timestamp())
+                    .bind(runner_instance_id.as_str())
+                    .execute(pool.as_ref())
+                    .await
+                    {
+                        tracing::warn!(%error, %runner_instance_id, "failed to heartbeat agent job runner instance");
+                    }
+                }
+            }
+        }
+    });
+}
+
+pub(super) async fn unregister_agent_job_runner_instance(
+    pool: &SqlitePool,
+    runner_instance_id: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM agent_job_runner_instances WHERE runner_instance_id = ?")
+        .bind(runner_instance_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
 
 impl StateRuntime {
+    pub const AGENT_JOB_RESTART_ERROR: &'static str =
+        "agent job runner was interrupted by a process restart";
+
+    pub fn agent_job_runner_instance_id(&self) -> &str {
+        self.agent_job_runner_instance_id.as_str()
+    }
+
     pub async fn create_agent_job(
         &self,
         params: &AgentJobCreateParams,
@@ -33,12 +107,13 @@ INSERT INTO agent_jobs (
     input_headers_json,
     input_csv_path,
     output_csv_path,
+    runner_instance_id,
     created_at,
     updated_at,
     started_at,
     completed_at,
     last_error
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
             "#,
         )
         .bind(params.id.as_str())
@@ -51,6 +126,7 @@ INSERT INTO agent_jobs (
         .bind(input_headers_json)
         .bind(params.input_csv_path.as_str())
         .bind(params.output_csv_path.as_str())
+        .bind(self.agent_job_runner_instance_id())
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -96,6 +172,110 @@ INSERT INTO agent_job_items (
         self.get_agent_job(job_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("failed to load created agent job {job_id}"))
+    }
+
+    pub async fn reconcile_orphaned_agent_jobs_after_restart(
+        &self,
+    ) -> anyhow::Result<Vec<AgentJob>> {
+        let now = Utc::now().timestamp();
+        let stale_before = now.saturating_sub(AGENT_JOB_RUNNER_LEASE_TIMEOUT_SECONDS);
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            r#"
+SELECT jobs.id, jobs.runner_instance_id
+FROM agent_jobs AS jobs
+LEFT JOIN agent_job_runner_instances AS runners
+    ON runners.runner_instance_id = jobs.runner_instance_id
+WHERE
+    jobs.status = ?
+    AND jobs.runner_instance_id IS NOT NULL
+    AND jobs.runner_instance_id <> ?
+    AND (runners.runner_instance_id IS NULL OR runners.heartbeat_at < ?)
+ORDER BY jobs.created_at ASC, jobs.id ASC
+            "#,
+        )
+        .bind(AgentJobStatus::Running.as_str())
+        .bind(self.agent_job_runner_instance_id())
+        .bind(stale_before)
+        .fetch_all(&mut *tx)
+        .await?;
+        let candidates = rows
+            .into_iter()
+            .map(|row| -> Result<(String, String), sqlx::Error> {
+                Ok((
+                    row.try_get::<String, _>("id")?,
+                    row.try_get::<String, _>("runner_instance_id")?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut job_ids = Vec::with_capacity(candidates.len());
+        for (job_id, owner_runner_instance_id) in candidates {
+            let updated = sqlx::query(
+                r#"
+UPDATE agent_jobs
+SET status = ?, updated_at = ?, completed_at = ?, last_error = ?
+WHERE
+    id = ?
+    AND status = ?
+    AND runner_instance_id = ?
+    AND runner_instance_id <> ?
+    AND NOT EXISTS (
+        SELECT 1
+        FROM agent_job_runner_instances AS runners
+        WHERE runners.runner_instance_id = ? AND runners.heartbeat_at >= ?
+    )
+                "#,
+            )
+            .bind(AgentJobStatus::Failed.as_str())
+            .bind(now)
+            .bind(now)
+            .bind(Self::AGENT_JOB_RESTART_ERROR)
+            .bind(job_id.as_str())
+            .bind(AgentJobStatus::Running.as_str())
+            .bind(owner_runner_instance_id.as_str())
+            .bind(self.agent_job_runner_instance_id())
+            .bind(owner_runner_instance_id.as_str())
+            .bind(stale_before)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() == 0 {
+                continue;
+            }
+            sqlx::query(
+                r#"
+UPDATE agent_job_items
+SET
+    status = ?,
+    assigned_thread_id = NULL,
+    updated_at = ?,
+    completed_at = ?,
+    last_error = ?
+WHERE job_id = ? AND status IN (?, ?)
+                "#,
+            )
+            .bind(AgentJobItemStatus::Failed.as_str())
+            .bind(now)
+            .bind(now)
+            .bind(Self::AGENT_JOB_RESTART_ERROR)
+            .bind(job_id.as_str())
+            .bind(AgentJobItemStatus::Pending.as_str())
+            .bind(AgentJobItemStatus::Running.as_str())
+            .execute(&mut *tx)
+            .await?;
+            job_ids.push(job_id);
+        }
+        tx.commit().await?;
+
+        let mut jobs = Vec::with_capacity(job_ids.len());
+        for job_id in job_ids {
+            let job = self
+                .get_agent_job(job_id.as_str())
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("reconciled agent job {job_id} was not found"))?;
+            jobs.push(job);
+        }
+        Ok(jobs)
     }
 
     pub async fn get_agent_job(&self, job_id: &str) -> anyhow::Result<Option<AgentJob>> {
@@ -728,6 +908,92 @@ mod tests {
             .await?;
         assert!(marked_running);
         Ok((job_id, item_id, thread_id))
+    }
+
+    #[tokio::test]
+    async fn durability_regression_restart_reconciles_only_orphaned_agent_jobs()
+    -> anyhow::Result<()> {
+        let codex_home = unique_temp_dir();
+        let owner = StateRuntime::init(codex_home.clone(), "test-provider".to_string()).await?;
+        let (job_id, item_id, _thread_id) = create_running_single_item_job(owner.as_ref()).await?;
+        let observer = StateRuntime::init(codex_home, "test-provider".to_string()).await?;
+        assert_ne!(
+            owner.agent_job_runner_instance_id(),
+            observer.agent_job_runner_instance_id()
+        );
+
+        let live_foreign_jobs = observer
+            .reconcile_orphaned_agent_jobs_after_restart()
+            .await?;
+        assert!(live_foreign_jobs.is_empty());
+        assert_eq!(
+            observer
+                .get_agent_job(job_id.as_str())
+                .await?
+                .expect("job should exist")
+                .status,
+            AgentJobStatus::Running
+        );
+
+        owner.close().await;
+        let reconciled = observer
+            .reconcile_orphaned_agent_jobs_after_restart()
+            .await?;
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].id, job_id);
+        assert_eq!(reconciled[0].status, AgentJobStatus::Failed);
+        assert_eq!(
+            reconciled[0].last_error.as_deref(),
+            Some(StateRuntime::AGENT_JOB_RESTART_ERROR)
+        );
+
+        let item = observer
+            .get_agent_job_item(job_id.as_str(), item_id.as_str())
+            .await?
+            .expect("job item should exist");
+        assert_eq!(item.status, AgentJobItemStatus::Failed);
+        assert_eq!(item.assigned_thread_id, None);
+        assert_eq!(
+            item.last_error.as_deref(),
+            Some(StateRuntime::AGENT_JOB_RESTART_ERROR)
+        );
+        assert!(item.completed_at.is_some());
+        assert!(
+            observer
+                .reconcile_orphaned_agent_jobs_after_restart()
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_preserves_legacy_null_owner_jobs() -> anyhow::Result<()> {
+        let codex_home = unique_temp_dir();
+        let owner = StateRuntime::init(codex_home.clone(), "test-provider".to_string()).await?;
+        let (job_id, _item_id, _thread_id) = create_running_single_item_job(owner.as_ref()).await?;
+        sqlx::query("UPDATE agent_jobs SET runner_instance_id = NULL WHERE id = ?")
+            .bind(job_id.as_str())
+            .execute(owner.pool.as_ref())
+            .await?;
+        owner.close().await;
+
+        let observer = StateRuntime::init(codex_home, "test-provider".to_string()).await?;
+        assert!(
+            observer
+                .reconcile_orphaned_agent_jobs_after_restart()
+                .await?
+                .is_empty()
+        );
+        assert_eq!(
+            observer
+                .get_agent_job(job_id.as_str())
+                .await?
+                .expect("legacy job should remain available")
+                .status,
+            AgentJobStatus::Running
+        );
+        Ok(())
     }
 
     #[tokio::test]

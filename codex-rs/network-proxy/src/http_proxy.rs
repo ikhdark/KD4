@@ -12,7 +12,7 @@ use crate::network_policy::NetworkPolicyRequestArgs;
 use crate::network_policy::NetworkProtocol;
 use crate::network_policy::emit_allow_decision_audit_event;
 use crate::network_policy::emit_block_decision_audit_event;
-use crate::network_policy::evaluate_host_policy;
+use crate::network_policy::evaluate_host_policy_with_snapshot;
 use crate::policy::normalize_host;
 use crate::reasons::REASON_METHOD_NOT_ALLOWED;
 use crate::reasons::REASON_MITM_REQUIRED;
@@ -87,6 +87,12 @@ enum ConnectMitmMode {
     DetectTls,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ConnectDialPolicy {
+    allow_upstream_proxy: bool,
+    allow_local_binding: bool,
+}
+
 pub async fn run_http_proxy(
     state: Arc<NetworkProxyState>,
     addr: SocketAddr,
@@ -132,8 +138,7 @@ async fn run_http_proxy_with_listener(
 
     // This proxy listener only needs HTTP/1 proxy semantics. Using Rama's auto builder
     // forces every accepted socket through the HTTP version sniffing pre-read path before proxy
-    // request parsing, which can stall some local clients on macOS before CONNECT/absolute-form
-    // handling runs at all.
+    // request parsing, which can stall local clients before CONNECT/absolute-form handling runs.
     let http_service = HttpServer::http1().service(
         (
             UpgradeLayer::new(
@@ -178,6 +183,10 @@ async fn http_connect_accept(
         .get::<Arc<NetworkProxyState>>()
         .cloned()
         .ok_or_else(|| text_response(StatusCode::INTERNAL_SERVER_ERROR, "missing state"))?;
+    let policy = app_state
+        .request_policy_snapshot()
+        .await
+        .map_err(|err| internal_error("failed to load request policy", err))?;
 
     let authority = match RequestContext::try_from(&req).map(|ctx| ctx.host_with_port()) {
         Ok(authority) => authority,
@@ -193,11 +202,7 @@ async fn http_connect_accept(
     }
 
     let client = client_addr(&req);
-    let enabled = app_state
-        .enabled()
-        .await
-        .map_err(|err| internal_error("failed to read enabled state", err))?;
-    if !enabled {
+    if !policy.enabled() {
         let client = client.as_deref().unwrap_or_default();
         warn!("CONNECT blocked; proxy disabled (client={client}, host={host})");
         return Err(proxy_disabled_response(
@@ -223,7 +228,9 @@ async fn http_connect_accept(
         exec_policy_hint: None,
     });
 
-    match evaluate_host_policy(&app_state, policy_decider.as_ref(), &request).await {
+    match evaluate_host_policy_with_snapshot(&app_state, &policy, policy_decider.as_ref(), &request)
+        .await
+    {
         Ok(NetworkDecision::Deny {
             reason,
             source,
@@ -238,7 +245,7 @@ async fn http_connect_accept(
                 port: authority.port,
             };
             let _ = app_state
-                .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+                .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
                     host: host.clone(),
                     reason: reason.clone(),
                     client: client.clone(),
@@ -264,25 +271,9 @@ async fn http_connect_accept(
         }
     }
 
-    let mode = app_state
-        .network_mode()
-        .await
-        .map_err(|err| internal_error("failed to read network mode", err))?;
-
-    let mitm_state = match app_state.mitm_state().await {
-        Ok(state) => state,
-        Err(err) => {
-            error!("failed to load MITM state: {err}");
-            return Err(text_response(StatusCode::INTERNAL_SERVER_ERROR, "error"));
-        }
-    };
-    let host_mitm_requirement = match app_state.host_mitm_requirement(&host).await {
-        Ok(requirement) => requirement,
-        Err(err) => {
-            error!("failed to inspect MITM requirements for {host}: {err}");
-            return Err(text_response(StatusCode::INTERNAL_SERVER_ERROR, "error"));
-        }
-    };
+    let mode = policy.network_mode();
+    let mitm_state = policy.mitm_state();
+    let host_mitm_requirement = policy.host_mitm_requirement(&host);
     let connect_mitm_mode = if mode == NetworkMode::Limited {
         ConnectMitmMode::Enabled
     } else {
@@ -317,7 +308,7 @@ async fn http_connect_accept(
             port: authority.port,
         };
         let _ = app_state
-            .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+            .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
                 host: host.clone(),
                 reason: REASON_MITM_REQUIRED.to_string(),
                 client: client.clone(),
@@ -339,6 +330,10 @@ async fn http_connect_accept(
     req.extensions_mut().insert(ProxyTarget(authority));
     req.extensions_mut().insert(connect_mitm_mode);
     req.extensions_mut().insert(mode);
+    req.extensions_mut().insert(ConnectDialPolicy {
+        allow_upstream_proxy: policy.allow_upstream_proxy(),
+        allow_local_binding: policy.allow_local_binding(),
+    });
     if connect_mitm_mode != ConnectMitmMode::Disabled
         && let Some(mitm_state) = mitm_state
     {
@@ -412,19 +407,12 @@ where
         .get::<ProxyTarget>()
         .map(|target| target.0.clone())
         .ok_or_else(|| OpaqueError::from_display("missing forward authority"))?;
-    let app_state = upgraded
+    let dial_policy = upgraded
         .extensions()
-        .get::<Arc<NetworkProxyState>>()
-        .cloned()
-        .ok_or_else(|| OpaqueError::from_display("missing app state"))?;
-    let allow_upstream_proxy = match app_state.allow_upstream_proxy().await {
-        Ok(allowed) => allowed,
-        Err(err) => {
-            error!("failed to read upstream proxy setting: {err}");
-            false
-        }
-    };
-    let proxy = if allow_upstream_proxy {
+        .get::<ConnectDialPolicy>()
+        .copied()
+        .ok_or_else(|| OpaqueError::from_display("missing CONNECT dial policy"))?;
+    let proxy = if dial_policy.allow_upstream_proxy {
         proxy_for_connect()
     } else {
         None
@@ -447,7 +435,9 @@ where
 
     let req = TcpRequest::new_with_extensions(authority.clone(), extensions)
         .with_protocol(Protocol::HTTPS);
-    let proxy_connector = HttpProxyConnector::optional(TargetCheckedTcpConnector::new(app_state));
+    let proxy_connector = HttpProxyConnector::optional(
+        TargetCheckedTcpConnector::from_allow_local_binding(dial_policy.allow_local_binding),
+    );
     let tls_config = TlsConnectorDataBuilder::new()
         .with_alpn_protocols_http_auto()
         .build();
@@ -511,19 +501,15 @@ async fn http_plain_proxy(
             return Ok(text_response(StatusCode::INTERNAL_SERVER_ERROR, "error"));
         }
     };
-    let client = client_addr(&req);
-    let method_allowed = match app_state
-        .method_allowed(req.method().as_str())
-        .await
-        .map_err(|err| internal_error("failed to evaluate method policy", err))
-    {
-        Ok(allowed) => allowed,
-        Err(resp) => return Ok(resp),
+    let policy = match app_state.request_policy_snapshot().await {
+        Ok(policy) => policy,
+        Err(err) => return Ok(internal_error("failed to load request policy", err)),
     };
+    let client = client_addr(&req);
+    let method_allowed = policy.method_allowed(req.method().as_str());
 
-    // `x-unix-socket` is an escape hatch for talking to local daemons. We keep it tightly scoped:
-    // macOS-only + explicit allowlist by default, to avoid turning the proxy into a general local
-    // capability escalation mechanism.
+    // Keep the legacy `x-unix-socket` request shape readable, but reject it on the Windows-only
+    // runtime before any local socket access.
     if let Some(unix_socket_header) = req.headers().get("x-unix-socket") {
         let socket_path = match unix_socket_header.to_str() {
             Ok(value) => value.to_string(),
@@ -535,15 +521,7 @@ async fn http_plain_proxy(
                 ));
             }
         };
-        let enabled = match app_state
-            .enabled()
-            .await
-            .map_err(|err| internal_error("failed to read enabled state", err))
-        {
-            Ok(enabled) => enabled,
-            Err(resp) => return Ok(resp),
-        };
-        if !enabled {
+        if !policy.enabled() {
             let client = client.as_deref().unwrap_or_default();
             warn!("unix socket blocked; proxy disabled (client={client}, path={socket_path})");
             return Ok(proxy_disabled_response(
@@ -595,14 +573,14 @@ async fn http_plain_proxy(
                     client_addr: client.as_deref(),
                 },
             );
-            warn!("unix socket proxy unsupported on this platform (path={socket_path})");
+            warn!("unix socket proxy unsupported on Windows (path={socket_path})");
             return Ok(text_response(
                 StatusCode::NOT_IMPLEMENTED,
                 "unix sockets unsupported",
             ));
         }
 
-        return match app_state.is_unix_socket_allowed(&socket_path).await {
+        return match policy.is_unix_socket_allowed(&socket_path).await {
             Ok(true) => {
                 emit_http_allow_decision_audit_event(
                     &app_state,
@@ -679,15 +657,7 @@ async fn http_plain_proxy(
         );
         return Ok(text_response(StatusCode::BAD_REQUEST, reason));
     }
-    let enabled = match app_state
-        .enabled()
-        .await
-        .map_err(|err| internal_error("failed to read enabled state", err))
-    {
-        Ok(enabled) => enabled,
-        Err(resp) => return Ok(resp),
-    };
-    if !enabled {
+    if !policy.enabled() {
         let client = client.as_deref().unwrap_or_default();
         let method = req.method();
         warn!("request blocked; proxy disabled (client={client}, host={host}, method={method})");
@@ -714,7 +684,9 @@ async fn http_plain_proxy(
         exec_policy_hint: None,
     });
 
-    match evaluate_host_policy(&app_state, policy_decider.as_ref(), &request).await {
+    match evaluate_host_policy_with_snapshot(&app_state, &policy, policy_decider.as_ref(), &request)
+        .await
+    {
         Ok(NetworkDecision::Deny {
             reason,
             source,
@@ -729,7 +701,7 @@ async fn http_plain_proxy(
                 port,
             };
             let _ = app_state
-                .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+                .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
                     host: host.clone(),
                     reason: reason.clone(),
                     client: client.clone(),
@@ -774,7 +746,7 @@ async fn http_plain_proxy(
             port,
         };
         let _ = app_state
-            .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+            .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
                 host: host.clone(),
                 reason: REASON_METHOD_NOT_ALLOWED.to_string(),
                 client: client.clone(),
@@ -798,31 +770,16 @@ async fn http_plain_proxy(
         ));
     }
 
-    if let Err(err) =
-        inject_plaintext_credentials_if_enabled(app_state.as_ref(), &host, req.headers_mut()).await
-    {
-        return Ok(internal_error(
-            "failed to read plaintext credential injection config",
-            err,
-        ));
-    }
+    inject_plaintext_credentials_if_enabled(app_state.as_ref(), &policy, &host, req.headers_mut());
 
     let client = client.as_deref().unwrap_or_default();
     let method = req.method();
     info!("request allowed (client={client}, host={host}, method={method})");
 
-    let allow_upstream_proxy = match app_state
-        .allow_upstream_proxy()
-        .await
-        .map_err(|err| internal_error("failed to read upstream proxy config", err))
-    {
-        Ok(allow) => allow,
-        Err(resp) => return Ok(resp),
-    };
-    let client = if allow_upstream_proxy {
-        UpstreamClient::from_env_proxy(app_state.clone())
+    let client = if policy.allow_upstream_proxy() {
+        UpstreamClient::from_env_proxy_with_current_roots(policy.allow_local_binding())
     } else {
-        UpstreamClient::direct(app_state.clone())
+        UpstreamClient::direct_with_current_roots(policy.allow_local_binding())
     };
 
     // Strip hop-by-hop headers only after extracting metadata used for policy correlation.
@@ -836,15 +793,15 @@ async fn http_plain_proxy(
     }
 }
 
-async fn inject_plaintext_credentials_if_enabled(
+fn inject_plaintext_credentials_if_enabled(
     app_state: &NetworkProxyState,
+    policy: &crate::runtime::RequestPolicySnapshot,
     host: &str,
     headers: &mut HeaderMap,
-) -> Result<()> {
-    if app_state.plaintext_credential_injection_enabled().await? {
+) {
+    if policy.plaintext_credential_injection_enabled() {
         app_state.inject_request_credentials(host, headers);
     }
-    Ok(())
 }
 
 async fn proxy_via_unix_socket(req: Request, socket_path: &str) -> Result<Response> {
@@ -991,7 +948,7 @@ async fn proxy_disabled_response(
 
     let blocked_host = host.clone();
     let _ = app_state
-        .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+        .record_blocked_for_request(BlockedRequest::new(BlockedRequestArgs {
             host: blocked_host,
             reason: REASON_PROXY_DISABLED.to_string(),
             client,
@@ -1068,7 +1025,11 @@ mod tests {
 
     use crate::config::NetworkMode;
     use crate::config::NetworkProxyConfig;
+    use crate::runtime::ConfigReloader;
+    use crate::runtime::ConfigReloaderFuture;
     use crate::runtime::network_proxy_state_for_policy;
+    use crate::state::NetworkProxyConstraints;
+    use crate::state::build_config_state;
     use pretty_assertions::assert_eq;
     use rama_http::Method;
     use rama_http::Request;
@@ -1077,11 +1038,59 @@ mod tests {
     use std::net::TcpListener as StdTcpListener;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener as TokioTcpListener;
     use tokio::time::Duration;
     use tokio::time::timeout;
+
+    struct CountingReloader {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ConfigReloader for CountingReloader {
+        fn source_label(&self) -> String {
+            "counting test reloader".to_string()
+        }
+
+        fn maybe_reload(&self) -> ConfigReloaderFuture<'_, Option<crate::runtime::ConfigState>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(None) })
+        }
+
+        fn reload_now(&self) -> ConfigReloaderFuture<'_, crate::runtime::ConfigState> {
+            Box::pin(async { Err(anyhow::anyhow!("reload not supported")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmed_performance_http_request_reloads_policy_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(NetworkProxyState::with_reloader(
+            build_config_state(
+                NetworkProxyConfig::default(),
+                NetworkProxyConstraints::default(),
+            )
+            .unwrap(),
+            Arc::new(CountingReloader {
+                calls: calls.clone(),
+            }),
+        ));
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("http://example.com/")
+            .header("host", "example.com")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(state);
+
+        let response = http_plain_proxy(None, None, req).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn http_connect_accept_blocks_in_limited_mode() {
@@ -1229,13 +1238,13 @@ mod tests {
                 .expect("valid authorization header"),
         )]);
 
+        let disabled_policy = disabled_state.request_policy_snapshot().await.unwrap();
         inject_plaintext_credentials_if_enabled(
             disabled_state.as_ref(),
+            &disabled_policy,
             "api.github.com",
             &mut disabled_headers,
-        )
-        .await
-        .expect("disabled plaintext injection check should succeed");
+        );
         assert_eq!(
             disabled_headers.get(header::AUTHORIZATION),
             Some(&HeaderValue::from_str(&format!("Bearer {dummy_token}")).unwrap())
@@ -1258,13 +1267,13 @@ mod tests {
                 .expect("valid authorization header"),
         )]);
 
+        let enabled_policy = enabled_state.request_policy_snapshot().await.unwrap();
         inject_plaintext_credentials_if_enabled(
             enabled_state.as_ref(),
+            &enabled_policy,
             "api.github.com",
             &mut enabled_headers,
-        )
-        .await
-        .expect("enabled plaintext injection check should succeed");
+        );
         assert_eq!(
             enabled_headers.get(header::AUTHORIZATION),
             Some(&HeaderValue::from_str(&format!("Bearer {real_token}")).unwrap())

@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use tokio::sync::OwnedMutexGuard;
 use tokio::task::AbortHandle;
 use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::Span;
 
@@ -20,9 +21,10 @@ use codex_protocol::protocol::SamplingGenerationId;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
+use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
-use codex_sandboxing::policy_transforms::merge_permission_profiles;
+use codex_sandboxing::policy_transforms::merge_uri_permission_profiles;
 use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
@@ -31,7 +33,6 @@ use crate::session::TurnInputQueue;
 use crate::session::reasoning_governor::ReasoningPolicyRecorder;
 use crate::session::turn_context::TurnContext;
 use crate::tasks::SessionTask;
-use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
 
@@ -84,9 +85,15 @@ pub(crate) enum TaskKind {
 
 pub(crate) struct RunningTask {
     pub(crate) done: Arc<Notify>,
+    /// Level-triggered completion state paired with `done`. `Notify` alone is
+    /// edge-triggered and its retained permit can be consumed by an earlier
+    /// finalizer before a fail-safe verifies that the worker dropped.
+    pub(crate) worker_done: Arc<AtomicBool>,
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn SessionTask>,
     pub(crate) cancellation_token: CancellationToken,
+    pub(crate) auxiliary_cancellation_token: CancellationToken,
+    pub(crate) auxiliary_tasks: JoinSet<()>,
     pub(crate) worker_abort_handle: AbortHandle,
     pub(crate) _supervisor_handle: JoinHandle<()>,
     pub(crate) task_span: Span,
@@ -97,6 +104,7 @@ pub(crate) struct RunningTask {
 #[derive(Debug)]
 pub(crate) struct TurnTerminalCoordinator {
     turn_id: String,
+    terminal_decision_gate: std::sync::Mutex<()>,
     claimed: AtomicBool,
     analytics_emission_claimed: AtomicBool,
     durable_terminal_committed: AtomicBool,
@@ -105,11 +113,10 @@ pub(crate) struct TurnTerminalCoordinator {
     delivery_state: AtomicU8,
     completion_notify: Notify,
     cleanup_completion_notify: Notify,
-    interrupt_pending: AtomicBool,
-    interrupt_terminal_ready: AtomicBool,
-    interrupt_persistence_failed: AtomicBool,
+    interrupt_fence_state: AtomicU8,
     interrupt_resolution_notify: Notify,
     sampling_admission_gate: Arc<Mutex<()>>,
+    tool_call_acceptance: Arc<ToolCallAcceptanceGate>,
     wake_generation: AtomicU64,
     completion_waiters: AtomicU32,
     #[cfg(test)]
@@ -127,6 +134,55 @@ pub(crate) enum TerminalDeliveryState {
     Claimed = 1,
     Delivered = 2,
     DeliveryFailed = 3,
+}
+
+/// The interrupt durability fence is one state machine, not three independent
+/// facts. In particular, terminal admission is legal only after the interrupted
+/// output is durable (or its persistence attempt has definitively failed), while
+/// provider sampling stays fenced until terminal cleanup releases the state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum InterruptFenceState {
+    Open = 0,
+    PendingPersistence = 1,
+    OutputDurable = 2,
+    PersistenceFailed = 3,
+}
+
+/// Serializes tool-call admission against terminal sealing. Timing observes
+/// accepted calls, but it does not own this lifecycle decision.
+#[derive(Debug, Default)]
+pub(crate) struct ToolCallAcceptanceGate {
+    sealed: std::sync::Mutex<bool>,
+}
+
+impl ToolCallAcceptanceGate {
+    pub(crate) fn try_accept(&self, accept: impl FnOnce() -> bool) -> bool {
+        let sealed = self
+            .sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !*sealed && accept()
+    }
+
+    fn seal(&self, record_seal: impl FnOnce()) {
+        let mut sealed = self
+            .sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*sealed {
+            *sealed = true;
+            record_seal();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_sealed(&self) -> bool {
+        *self
+            .sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,10 +233,38 @@ impl TerminalDeliveryState {
     }
 }
 
+impl InterruptFenceState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::PendingPersistence,
+            2 => Self::OutputDurable,
+            3 => Self::PersistenceFailed,
+            _ => Self::Open,
+        }
+    }
+
+    fn is_fenced(self) -> bool {
+        self != Self::Open
+    }
+
+    fn terminal_ready(self) -> bool {
+        matches!(self, Self::OutputDurable | Self::PersistenceFailed)
+    }
+}
+
 impl TurnTerminalCoordinator {
+    #[cfg(test)]
     pub(crate) fn new(turn_id: String) -> Arc<Self> {
+        Self::new_with_tool_call_acceptance(turn_id, Arc::new(ToolCallAcceptanceGate::default()))
+    }
+
+    pub(crate) fn new_with_tool_call_acceptance(
+        turn_id: String,
+        tool_call_acceptance: Arc<ToolCallAcceptanceGate>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             turn_id,
+            terminal_decision_gate: std::sync::Mutex::new(()),
             claimed: AtomicBool::new(false),
             analytics_emission_claimed: AtomicBool::new(false),
             durable_terminal_committed: AtomicBool::new(false),
@@ -189,11 +273,10 @@ impl TurnTerminalCoordinator {
             delivery_state: AtomicU8::new(TerminalDeliveryState::NotAttempted as u8),
             completion_notify: Notify::new(),
             cleanup_completion_notify: Notify::new(),
-            interrupt_pending: AtomicBool::new(false),
-            interrupt_terminal_ready: AtomicBool::new(false),
-            interrupt_persistence_failed: AtomicBool::new(false),
+            interrupt_fence_state: AtomicU8::new(InterruptFenceState::Open as u8),
             interrupt_resolution_notify: Notify::new(),
             sampling_admission_gate: Arc::new(Mutex::new(())),
+            tool_call_acceptance,
             wake_generation: AtomicU64::new(1),
             completion_waiters: AtomicU32::new(0),
             #[cfg(test)]
@@ -203,6 +286,11 @@ impl TurnTerminalCoordinator {
             #[cfg(test)]
             panic_before_worker_cancellation: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn seal_tool_call_acceptance(&self, timing: &crate::turn_timing::TurnTimingState) {
+        self.tool_call_acceptance
+            .seal(|| timing.record_tool_call_acceptance_closed());
     }
 
     pub(crate) fn turn_id(&self) -> &str {
@@ -232,15 +320,17 @@ impl TurnTerminalCoordinator {
     }
 
     pub(crate) fn try_claim(self: &Arc<Self>) -> Option<TurnTerminalPermit> {
+        let _decision = self
+            .terminal_decision_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let interrupt_fence = self.interrupt_fence_state();
+        if interrupt_fence.is_fenced() && !interrupt_fence.terminal_ready() {
+            return None;
+        }
         self.claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
-        if self.interrupt_pending.load(Ordering::Acquire)
-            && !self.interrupt_terminal_ready.load(Ordering::Acquire)
-        {
-            self.claimed.store(false, Ordering::Release);
-            return None;
-        }
         Some(TurnTerminalPermit {
             coordinator: Arc::clone(self),
             cleanup_completed: false,
@@ -269,22 +359,19 @@ impl TurnTerminalCoordinator {
     pub(crate) async fn mark_interrupt_pending(&self) -> bool {
         let _waiter = TerminalWaiterGuard::new(&self.sampling_admission_waiters);
         let _admission_gate = self.sampling_admission_gate.lock().await;
+        let _decision = self
+            .terminal_decision_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.claimed.load(Ordering::Acquire) {
             return false;
         }
-        self.interrupt_persistence_failed
-            .store(false, Ordering::Release);
-        self.interrupt_terminal_ready
-            .store(false, Ordering::Release);
         self.wake_generation.fetch_add(1, Ordering::AcqRel);
-        self.interrupt_pending.store(true, Ordering::Release);
-        if self.claimed.load(Ordering::Acquire) {
-            self.interrupt_pending.store(false, Ordering::Release);
-            self.interrupt_resolution_notify.notify_waiters();
-            false
-        } else {
-            true
-        }
+        self.interrupt_fence_state.store(
+            InterruptFenceState::PendingPersistence as u8,
+            Ordering::Release,
+        );
+        true
     }
 
     pub(crate) async fn acquire_sampling_admission(&self) -> Option<OwnedMutexGuard<()>> {
@@ -298,7 +385,7 @@ impl TurnTerminalCoordinator {
     }
 
     pub(crate) fn sampling_admission(&self) -> SamplingAdmission {
-        if self.interrupt_pending.load(Ordering::Acquire) {
+        if self.interrupt_fence_state().is_fenced() {
             SamplingAdmission::Fenced
         } else {
             SamplingAdmission::Allowed
@@ -306,7 +393,7 @@ impl TurnTerminalCoordinator {
     }
 
     pub(crate) fn interrupt_pending(&self) -> bool {
-        self.interrupt_pending.load(Ordering::Acquire)
+        self.interrupt_fence_state().is_fenced()
     }
 
     /// Open terminal admission after the interrupted tool output has crossed
@@ -315,11 +402,17 @@ impl TurnTerminalCoordinator {
         &self,
         expected_generation: &SamplingGenerationId,
     ) -> TerminalWakeResult {
+        let _decision = self
+            .terminal_decision_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.wake_generation_matches(expected_generation) {
             return TerminalWakeResult::Stale;
         }
-        debug_assert!(self.interrupt_pending());
-        self.interrupt_terminal_ready.store(true, Ordering::Release);
+        if self.interrupt_fence_state() == InterruptFenceState::PendingPersistence {
+            self.interrupt_fence_state
+                .store(InterruptFenceState::OutputDurable as u8, Ordering::Release);
+        }
         self.interrupt_resolution_notify.notify_waiters();
         TerminalWakeResult::Applied
     }
@@ -328,19 +421,25 @@ impl TurnTerminalCoordinator {
         &self,
         expected_generation: &SamplingGenerationId,
     ) -> TerminalWakeResult {
+        let _decision = self
+            .terminal_decision_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.wake_generation_matches(expected_generation) {
             return TerminalWakeResult::Stale;
         }
-        debug_assert!(self.interrupt_pending());
-        self.interrupt_persistence_failed
-            .store(true, Ordering::Release);
-        self.interrupt_terminal_ready.store(true, Ordering::Release);
+        if self.interrupt_fence_state() == InterruptFenceState::PendingPersistence {
+            self.interrupt_fence_state.store(
+                InterruptFenceState::PersistenceFailed as u8,
+                Ordering::Release,
+            );
+        }
         self.interrupt_resolution_notify.notify_waiters();
         TerminalWakeResult::Applied
     }
 
     pub(crate) fn interrupt_persistence_failed(&self) -> bool {
-        self.interrupt_persistence_failed.load(Ordering::Acquire)
+        self.interrupt_fence_state() == InterruptFenceState::PersistenceFailed
     }
 
     pub(crate) async fn wait_for_interrupt_resolution(
@@ -353,7 +452,7 @@ impl TurnTerminalCoordinator {
             if !self.wake_generation_matches(expected_generation) {
                 return TerminalWakeResult::Stale;
             }
-            if self.interrupt_terminal_ready.load(Ordering::Acquire) || !self.interrupt_pending() {
+            if self.interrupt_fence_state() != InterruptFenceState::PendingPersistence {
                 return TerminalWakeResult::Applied;
             }
             notified.await;
@@ -361,10 +460,17 @@ impl TurnTerminalCoordinator {
     }
 
     fn release_interrupt_fence(&self) {
-        self.interrupt_terminal_ready
-            .store(false, Ordering::Release);
-        self.interrupt_pending.store(false, Ordering::Release);
+        let _decision = self
+            .terminal_decision_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.interrupt_fence_state
+            .store(InterruptFenceState::Open as u8, Ordering::Release);
         self.interrupt_resolution_notify.notify_waiters();
+    }
+
+    fn interrupt_fence_state(&self) -> InterruptFenceState {
+        InterruptFenceState::from_u8(self.interrupt_fence_state.load(Ordering::Acquire))
     }
 
     pub(crate) async fn wait_completed(&self) {
@@ -500,6 +606,11 @@ impl Drop for TurnTerminalPermit {
         if !self.cleanup_completed
             && self.coordinator.delivery_state() == TerminalDeliveryState::NotAttempted
         {
+            let _decision = self
+                .coordinator
+                .terminal_decision_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.coordinator.claimed.store(false, Ordering::Release);
         }
     }
@@ -515,7 +626,7 @@ pub(crate) struct TurnState {
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
     pub(crate) pending_input: TurnInputQueue,
     mailbox_delivery_phase: MailboxDeliveryPhase,
-    granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
+    granted_permissions_by_approval_scope_id: HashMap<String, UriAdditionalPermissionProfile>,
     strict_auto_review_enabled: bool,
     pub(crate) tool_calls: u64,
     pub(crate) has_memory_citation: bool,
@@ -527,6 +638,7 @@ pub(crate) struct PendingRequestPermissions {
     pub(crate) tx_response: oneshot::Sender<RequestPermissionsResponse>,
     pub(crate) requested_permissions: RequestPermissionProfile,
     pub(crate) environment: TurnEnvironmentSelection,
+    pub(crate) approval_scope_id: String,
 }
 
 impl TurnState {
@@ -638,26 +750,26 @@ impl TurnState {
 
     pub(crate) fn record_granted_permissions(
         &mut self,
-        environment_id: &str,
-        permissions: AdditionalPermissionProfile,
+        approval_scope_id: &str,
+        permissions: UriAdditionalPermissionProfile,
     ) {
-        let granted_permissions = merge_permission_profiles(
-            self.granted_permissions_by_environment_id
-                .get(environment_id),
+        let granted_permissions = merge_uri_permission_profiles(
+            self.granted_permissions_by_approval_scope_id
+                .get(approval_scope_id),
             Some(&permissions),
         );
         if let Some(granted_permissions) = granted_permissions {
-            self.granted_permissions_by_environment_id
-                .insert(environment_id.to_string(), granted_permissions);
+            self.granted_permissions_by_approval_scope_id
+                .insert(approval_scope_id.to_string(), granted_permissions);
         }
     }
 
     pub(crate) fn granted_permissions(
         &self,
-        environment_id: &str,
-    ) -> Option<AdditionalPermissionProfile> {
-        self.granted_permissions_by_environment_id
-            .get(environment_id)
+        approval_scope_id: &str,
+    ) -> Option<UriAdditionalPermissionProfile> {
+        self.granted_permissions_by_approval_scope_id
+            .get(approval_scope_id)
             .cloned()
     }
 

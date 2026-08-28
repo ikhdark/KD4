@@ -5,12 +5,35 @@ use codex_mcp::McpConfig;
 use codex_mcp::McpConnectionManager;
 use codex_mcp::McpRuntimeContext;
 
+pub(crate) struct McpManagerLifecycle {
+    manager: Arc<McpConnectionManager>,
+}
+
+impl McpManagerLifecycle {
+    fn new(manager: Arc<McpConnectionManager>) -> Self {
+        Self { manager }
+    }
+}
+
+impl Drop for McpManagerLifecycle {
+    fn drop(&mut self) {
+        let manager = Arc::clone(&self.manager);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            manager.shutdown().await;
+        });
+    }
+}
+
 /// MCP config, plugin availability, exact environment bindings, and manager for one request.
 pub struct McpRuntimeSnapshot {
     generation: u64,
     config: Arc<McpConfig>,
     plugins_available: bool,
     manager: Arc<McpConnectionManager>,
+    manager_lifecycle: Arc<McpManagerLifecycle>,
     runtime_context: McpRuntimeContext,
     available_environment_ids: Vec<String>,
 }
@@ -24,11 +47,34 @@ impl McpRuntimeSnapshot {
         runtime_context: McpRuntimeContext,
         available_environment_ids: Vec<String>,
     ) -> Self {
+        let manager_lifecycle = Arc::new(McpManagerLifecycle::new(Arc::clone(&manager)));
+        Self::new_with_manager_lifecycle(
+            generation,
+            config,
+            plugins_available,
+            manager,
+            manager_lifecycle,
+            runtime_context,
+            available_environment_ids,
+        )
+    }
+
+    pub(crate) fn new_with_manager_lifecycle(
+        generation: u64,
+        config: Arc<McpConfig>,
+        plugins_available: bool,
+        manager: Arc<McpConnectionManager>,
+        manager_lifecycle: Arc<McpManagerLifecycle>,
+        runtime_context: McpRuntimeContext,
+        available_environment_ids: Vec<String>,
+    ) -> Self {
+        debug_assert!(Arc::ptr_eq(&manager, &manager_lifecycle.manager));
         Self {
             generation,
             config,
             plugins_available,
             manager,
+            manager_lifecycle,
             runtime_context,
             available_environment_ids,
         }
@@ -53,6 +99,10 @@ impl McpRuntimeSnapshot {
 
     pub(crate) fn manager_arc(&self) -> Arc<McpConnectionManager> {
         Arc::clone(&self.manager)
+    }
+
+    pub(crate) fn manager_lifecycle_arc(&self) -> Arc<McpManagerLifecycle> {
+        Arc::clone(&self.manager_lifecycle)
     }
 
     pub fn runtime_context(&self) -> &McpRuntimeContext {
@@ -114,5 +164,40 @@ impl fmt::Debug for McpRuntimeSnapshot {
             .debug_struct("McpRuntimeSnapshot")
             .field("generation", &self.generation)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_config::Constrained;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::protocol::AskForApproval;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn final_runtime_lifecycle_owner_starts_manager_shutdown() {
+        let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        let manager = Arc::new(
+            McpConnectionManager::new_uninitialized_with_permission_profile(
+                &approval_policy,
+                &PermissionProfile::default(),
+                /*prefix_mcp_tool_names*/ true,
+            ),
+        );
+        let first = Arc::new(McpManagerLifecycle::new(Arc::clone(&manager)));
+        let second = Arc::clone(&first);
+
+        drop(first);
+        assert!(!manager.shutdown_started());
+        drop(second);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !manager.shutdown_started() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("final runtime lifecycle owner should start manager shutdown");
     }
 }

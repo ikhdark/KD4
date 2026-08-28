@@ -72,6 +72,52 @@ fn trace_field_value<'a>(fields: &'a [(&str, &str)], key: &str) -> Option<&'a st
         .find_map(|(field_key, value)| (*field_key == key).then_some(*value))
 }
 
+fn tool_result_events_enabled() -> bool {
+    tracing::enabled!(
+        target: crate::targets::OTEL_LOG_ONLY_TARGET,
+        tracing::Level::INFO
+    ) || tracing::enabled!(
+        target: crate::targets::OTEL_TRACE_SAFE_TARGET,
+        tracing::Level::INFO
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UserPromptSummary {
+    prompt: Option<String>,
+    prompt_length: usize,
+    text_input_count: usize,
+    image_input_count: usize,
+    local_image_input_count: usize,
+}
+
+fn summarize_user_prompt(items: &[UserInput], include_prompt: bool) -> UserPromptSummary {
+    let mut summary = UserPromptSummary {
+        prompt: include_prompt.then(String::new),
+        prompt_length: 0,
+        text_input_count: 0,
+        image_input_count: 0,
+        local_image_input_count: 0,
+    };
+
+    for item in items {
+        match item {
+            UserInput::Text { text, .. } => {
+                summary.prompt_length += text.chars().count();
+                summary.text_input_count += 1;
+                if let Some(prompt) = &mut summary.prompt {
+                    prompt.push_str(text);
+                }
+            }
+            UserInput::Image { .. } => summary.image_input_count += 1,
+            UserInput::LocalImage { .. } => summary.local_image_input_count += 1,
+            _ => {}
+        }
+    }
+
+    summary
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthEnvTelemetryMetadata {
     pub openai_api_key_env_present: bool,
@@ -437,6 +483,28 @@ impl SessionTelemetry {
         }
     }
 
+    fn record_count_and_duration(
+        &self,
+        count_name: &str,
+        duration_name: &str,
+        inc: i64,
+        duration: Duration,
+        tags: &[(&str, &str)],
+    ) {
+        let res: MetricsResult<()> = (|| {
+            let Some(metrics) = &self.metrics else {
+                return Ok(());
+            };
+
+            let tags = self.tags_with_metadata(tags)?;
+            metrics.record_count_and_duration(count_name, duration_name, inc, duration, &tags)
+        })();
+
+        if let Err(e) = res {
+            tracing::warn!("paired metrics [{count_name}, {duration_name}] failed: {e}");
+        }
+    }
+
     /// Records a coarse startup phase for production latency breakdowns.
     pub fn record_startup_phase(
         &self,
@@ -779,13 +847,10 @@ impl SessionTelemetry {
         let status_str = status
             .map(|code| code.to_string())
             .unwrap_or_else(|| "none".to_string());
-        self.counter(
+        self.record_count_and_duration(
             API_CALL_COUNT_METRIC,
-            /*inc*/ 1,
-            &[("status", status_str.as_str()), ("success", success_str)],
-        );
-        self.record_duration(
             API_CALL_DURATION_METRIC,
+            /*inc*/ 1,
             duration,
             &[("status", status_str.as_str()), ("success", success_str)],
         );
@@ -835,9 +900,16 @@ impl SessionTelemetry {
         let available = unavailable_reason.is_none();
         let available_str = if available { "true" } else { "false" };
         let tags = [("phase", phase), ("available", available_str)];
-        self.counter("codex.transport_phase.count", 1, &tags);
         if let Some(duration) = duration {
-            self.record_duration("codex.transport_phase.duration", duration, &tags);
+            self.record_count_and_duration(
+                "codex.transport_phase.count",
+                "codex.transport_phase.duration",
+                1,
+                duration,
+                &tags,
+            );
+        } else {
+            self.counter("codex.transport_phase.count", 1, &tags);
         }
         if let Some(wire_bytes) = wire_bytes.and_then(|value| i64::try_from(value).ok()) {
             self.histogram("codex.transport_phase.wire_bytes", wire_bytes, &tags);
@@ -868,8 +940,13 @@ impl SessionTelemetry {
         duration: Duration,
     ) {
         let tags = [("phase", phase)];
-        self.counter("codex.sse_phase.count", 1, &tags);
-        self.record_duration("codex.sse_phase.duration", duration, &tags);
+        self.record_count_and_duration(
+            "codex.sse_phase.count",
+            "codex.sse_phase.duration",
+            1,
+            duration,
+            &tags,
+        );
         log_and_trace_event!(
             self,
             common: {
@@ -950,13 +1027,10 @@ impl SessionTelemetry {
         agent_identity_telemetry: Option<&AgentIdentityTelemetry>,
     ) {
         let success_str = if error.is_none() { "true" } else { "false" };
-        self.counter(
+        self.record_count_and_duration(
             WEBSOCKET_REQUEST_COUNT_METRIC,
-            /*inc*/ 1,
-            &[("success", success_str)],
-        );
-        self.record_duration(
             WEBSOCKET_REQUEST_DURATION_METRIC,
+            /*inc*/ 1,
             duration,
             &[("success", success_str)],
         );
@@ -1070,8 +1144,13 @@ impl SessionTelemetry {
         let kind_str = kind.as_deref().unwrap_or(WEBSOCKET_UNKNOWN_KIND);
         let success_str = if success { "true" } else { "false" };
         let tags = [("kind", kind_str), ("success", success_str)];
-        self.counter(WEBSOCKET_EVENT_COUNT_METRIC, /*inc*/ 1, &tags);
-        self.record_duration(WEBSOCKET_EVENT_DURATION_METRIC, duration, &tags);
+        self.record_count_and_duration(
+            WEBSOCKET_EVENT_COUNT_METRIC,
+            WEBSOCKET_EVENT_DURATION_METRIC,
+            /*inc*/ 1,
+            duration,
+            &tags,
+        );
     }
 
     pub fn log_sse_event<E>(
@@ -1082,35 +1161,7 @@ impl SessionTelemetry {
         E: std::fmt::Display,
     {
         match response {
-            Ok(Some(Ok(sse))) => {
-                if sse.data.trim() == "[DONE]" {
-                    self.sse_event(&sse.event, duration);
-                } else {
-                    match serde_json::from_str::<serde_json::Value>(&sse.data) {
-                        Ok(error) if sse.event == "response.failed" => {
-                            self.sse_event_failed(Some(&sse.event), duration, &error);
-                        }
-                        Ok(content) if sse.event == "response.output_item.done" => {
-                            match serde_json::from_value::<ResponseItem>(content) {
-                                Ok(_) => self.sse_event(&sse.event, duration),
-                                Err(_) => {
-                                    self.sse_event_failed(
-                                        Some(&sse.event),
-                                        duration,
-                                        &"failed to parse response.output_item.done",
-                                    );
-                                }
-                            };
-                        }
-                        Ok(_) => {
-                            self.sse_event(&sse.event, duration);
-                        }
-                        Err(error) => {
-                            self.sse_event_failed(Some(&sse.event), duration, &error);
-                        }
-                    }
-                }
-            }
+            Ok(Some(Ok(_))) => {}
             Ok(Some(Err(error))) => {
                 self.sse_event_failed(/*kind*/ None, duration, error);
             }
@@ -1125,14 +1176,23 @@ impl SessionTelemetry {
         }
     }
 
+    pub fn log_sse_event_result(
+        &self,
+        kind: &str,
+        duration: Duration,
+        error: Option<&dyn std::fmt::Display>,
+    ) {
+        match error {
+            Some(error) => self.sse_event_failed(Some(kind), duration, error),
+            None => self.sse_event(kind, duration),
+        }
+    }
+
     fn sse_event(&self, kind: &str, duration: Duration) {
-        self.counter(
+        self.record_count_and_duration(
             SSE_EVENT_COUNT_METRIC,
-            /*inc*/ 1,
-            &[("kind", kind), ("success", "true")],
-        );
-        self.record_duration(
             SSE_EVENT_DURATION_METRIC,
+            /*inc*/ 1,
             duration,
             &[("kind", kind), ("success", "true")],
         );
@@ -1144,18 +1204,15 @@ impl SessionTelemetry {
         );
     }
 
-    pub fn sse_event_failed<T>(&self, kind: Option<&String>, duration: Duration, error: &T)
+    pub fn sse_event_failed<T>(&self, kind: Option<&str>, duration: Duration, error: &T)
     where
-        T: std::fmt::Display,
+        T: std::fmt::Display + ?Sized,
     {
-        let kind_str = kind.map_or(SSE_UNKNOWN_KIND, String::as_str);
-        self.counter(
+        let kind_str = kind.unwrap_or(SSE_UNKNOWN_KIND);
+        self.record_count_and_duration(
             SSE_EVENT_COUNT_METRIC,
-            /*inc*/ 1,
-            &[("kind", kind_str), ("success", "false")],
-        );
-        self.record_duration(
             SSE_EVENT_DURATION_METRIC,
+            /*inc*/ 1,
             duration,
             &[("kind", kind_str), ("success", "false")],
         );
@@ -1225,6 +1282,14 @@ impl SessionTelemetry {
             log: {},
             trace: {},
         );
+    }
+
+    /// Emits only the explicit allowlist in [`ModelAttemptTelemetry`].
+    pub fn model_attempt_logging_enabled(&self) -> bool {
+        tracing::enabled!(
+            target: crate::targets::OTEL_LOG_ONLY_TARGET,
+            tracing::Level::INFO
+        )
     }
 
     /// Emits only the explicit allowlist in [`ModelAttemptTelemetry`].
@@ -1363,45 +1428,22 @@ impl SessionTelemetry {
     }
 
     pub fn user_prompt(&self, items: &[UserInput]) {
-        let prompt = items
-            .iter()
-            .flat_map(|item| match item {
-                UserInput::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        let text_input_count = items
-            .iter()
-            .filter(|item| matches!(item, UserInput::Text { .. }))
-            .count();
-        let image_input_count = items
-            .iter()
-            .filter(|item| matches!(item, UserInput::Image { .. }))
-            .count();
-        let local_image_input_count = items
-            .iter()
-            .filter(|item| matches!(item, UserInput::LocalImage { .. }))
-            .count();
-
-        let prompt_to_log = if self.metadata.log_user_prompts {
-            prompt.as_str()
-        } else {
-            "[REDACTED]"
-        };
+        let summary = summarize_user_prompt(items, self.metadata.log_user_prompts);
+        let prompt_to_log = summary.prompt.as_deref().unwrap_or("[REDACTED]");
 
         log_event!(
             self,
             event.name = "codex.user_prompt",
-            prompt_length = %prompt.chars().count(),
+            prompt_length = %summary.prompt_length,
             prompt = %prompt_to_log,
         );
         trace_event!(
             self,
             event.name = "codex.user_prompt",
-            prompt_length = %prompt.chars().count(),
-            text_input_count = text_input_count as i64,
-            image_input_count = image_input_count as i64,
-            local_image_input_count = local_image_input_count as i64,
+            prompt_length = %summary.prompt_length,
+            text_input_count = summary.text_input_count as i64,
+            image_input_count = summary.image_input_count as i64,
+            local_image_input_count = summary.local_image_input_count as i64,
         );
     }
 
@@ -1454,7 +1496,7 @@ impl SessionTelemetry {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn log_tool_result_with_tags<F, Fut, T, E, Describe>(
+    pub async fn log_tool_result_with_tags<F, Fut, T, E, IsSuccess, Describe>(
         &self,
         tool_name: &str,
         call_id: &str,
@@ -1462,33 +1504,42 @@ impl SessionTelemetry {
         extra_tags: &[(&str, &str)],
         extra_trace_fields: &[(&str, &str)],
         f: F,
+        is_success: IsSuccess,
         describe: Describe,
     ) -> Result<T, E>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
-        Describe: FnOnce(&T) -> (String, bool),
+        IsSuccess: FnOnce(&T) -> bool,
+        Describe: FnOnce(&T) -> String,
         E: std::fmt::Display,
     {
         let start = Instant::now();
         let result = f().await;
         let duration = start.elapsed();
 
-        let (output, success) = match &result {
-            Ok(value) => describe(value),
-            Err(error) => (error.to_string(), false),
+        let success = match &result {
+            Ok(value) => is_success(value),
+            Err(_) => false,
         };
-
-        self.tool_result_with_tags(
-            tool_name,
-            call_id,
-            arguments,
-            duration,
-            success,
-            &output,
-            extra_tags,
-            extra_trace_fields,
-        );
+        if tool_result_events_enabled() {
+            let output = match &result {
+                Ok(value) => describe(value),
+                Err(error) => error.to_string(),
+            };
+            self.tool_result_with_tags(
+                tool_name,
+                call_id,
+                arguments,
+                duration,
+                success,
+                &output,
+                extra_tags,
+                extra_trace_fields,
+            );
+        } else {
+            self.record_tool_result_metrics(tool_name, duration, success, extra_tags);
+        }
 
         result
     }
@@ -1500,7 +1551,8 @@ impl SessionTelemetry {
             tool_name = %tool_name,
             duration_ms = %Duration::ZERO.as_millis(),
             success = %false,
-            output = %error,
+            output_length = error.len() as i64,
+            output_line_count = error.lines().count() as i64,
             mcp_server = "",
             mcp_server_origin = "",
         );
@@ -1513,7 +1565,6 @@ impl SessionTelemetry {
             output_length = error.len() as i64,
             output_line_count = error.lines().count() as i64,
             tool_origin = %"builtin",
-            error.message = %error,
         );
     }
 
@@ -1529,13 +1580,8 @@ impl SessionTelemetry {
         extra_tags: &[(&str, &str)],
         extra_trace_fields: &[(&str, &str)],
     ) {
+        self.record_tool_result_metrics(tool_name, duration, success, extra_tags);
         let success_str = if success { "true" } else { "false" };
-        let mut tags = Vec::with_capacity(2 + extra_tags.len());
-        tags.push(("tool", tool_name));
-        tags.push(("success", success_str));
-        tags.extend_from_slice(extra_tags);
-        self.counter(TOOL_CALL_COUNT_METRIC, /*inc*/ 1, &tags);
-        self.record_duration(TOOL_CALL_DURATION_METRIC, duration, &tags);
         let mcp_server = trace_field_value(extra_trace_fields, "mcp_server").unwrap_or("");
         let mcp_server_origin =
             trace_field_value(extra_trace_fields, "mcp_server_origin").unwrap_or("");
@@ -1544,10 +1590,11 @@ impl SessionTelemetry {
             event.name = "codex.tool_result",
             tool_name = %tool_name,
             call_id = %call_id,
-            arguments = %arguments,
             duration_ms = %duration.as_millis(),
             success = %success_str,
-            output = %output,
+            arguments_length = arguments.len() as i64,
+            output_length = output.len() as i64,
+            output_line_count = output.lines().count() as i64,
             mcp_server = %mcp_server,
             mcp_server_origin = %mcp_server_origin,
         );
@@ -1563,6 +1610,27 @@ impl SessionTelemetry {
             output_line_count = output.lines().count() as i64,
             tool_origin = if mcp_server.is_empty() { "builtin" } else { "mcp" },
             mcp_tool = !mcp_server.is_empty(),
+        );
+    }
+
+    fn record_tool_result_metrics(
+        &self,
+        tool_name: &str,
+        duration: Duration,
+        success: bool,
+        extra_tags: &[(&str, &str)],
+    ) {
+        let success_str = if success { "true" } else { "false" };
+        let mut tags = Vec::with_capacity(2 + extra_tags.len());
+        tags.push(("tool", tool_name));
+        tags.push(("success", success_str));
+        tags.extend_from_slice(extra_tags);
+        self.record_count_and_duration(
+            TOOL_CALL_COUNT_METRIC,
+            TOOL_CALL_DURATION_METRIC,
+            /*inc*/ 1,
+            duration,
+            &tags,
         );
     }
 
@@ -1681,9 +1749,7 @@ fn duration_from_ms_value(value: Option<&serde_json::Value>) -> Option<Duration>
 
 #[cfg(test)]
 mod model_attempt_privacy_tests {
-    use super::normalized_context_component_hash;
-    use super::normalized_context_component_semantic_id;
-    use super::normalized_model_attempt_label;
+    use super::*;
 
     #[test]
     fn categorical_labels_accept_normalized_ids_and_reject_arbitrary_strings() {
@@ -1725,6 +1791,72 @@ mod model_attempt_privacy_tests {
 }
 
 #[cfg(test)]
+mod user_prompt_summary_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn prompt_items() -> Vec<UserInput> {
+        vec![
+            UserInput::Text {
+                text: "hello ".to_string(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Image {
+                image_url: "data:image/png;base64,AA==".to_string(),
+                detail: None,
+            },
+            UserInput::Text {
+                text: "world".to_string(),
+                text_elements: Vec::new(),
+            },
+            UserInput::LocalImage {
+                path: PathBuf::from("image.png"),
+                detail: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn redacted_prompt_is_counted_without_being_concatenated() {
+        let summary = summarize_user_prompt(&prompt_items(), false);
+
+        assert_eq!(summary.prompt, None);
+        assert_eq!(summary.prompt_length, 11);
+        assert_eq!(summary.text_input_count, 2);
+        assert_eq!(summary.image_input_count, 1);
+        assert_eq!(summary.local_image_input_count, 1);
+    }
+
+    #[test]
+    fn enabled_prompt_logging_preserves_text_concatenation() {
+        let summary = summarize_user_prompt(&prompt_items(), true);
+
+        assert_eq!(summary.prompt.as_deref(), Some("hello world"));
+        assert_eq!(summary.prompt_length, 11);
+    }
+
+    #[test]
+    fn model_attempt_gate_is_closed_without_a_log_exporter() {
+        let _subscriber =
+            tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
+        let telemetry = SessionTelemetry::new(
+            ThreadId::new(),
+            "test-model",
+            "test-model",
+            None,
+            None,
+            None,
+            "test".to_string(),
+            false,
+            "test".to_string(),
+            SessionSource::Cli,
+        );
+
+        assert!(!telemetry.model_attempt_logging_enabled());
+    }
+}
+
+#[cfg(test)]
 mod tool_result_passthrough_tests {
     use super::*;
 
@@ -1762,7 +1894,8 @@ mod tool_result_passthrough_tests {
                         value: 42,
                     })
                 },
-                |result| (result.preview.clone(), true),
+                |_| true,
+                |result| result.preview.clone(),
             )
             .await
             .expect("typed tool result should pass through telemetry");
@@ -1774,5 +1907,44 @@ mod tool_result_passthrough_tests {
                 value: 42,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_event_targets_do_not_build_a_tool_preview() {
+        let _subscriber =
+            tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
+        let telemetry = SessionTelemetry::new(
+            ThreadId::new(),
+            "test-model",
+            "test-model",
+            None,
+            None,
+            None,
+            "test".to_string(),
+            false,
+            "test".to_string(),
+            SessionSource::Cli,
+        );
+        let preview_called = std::cell::Cell::new(false);
+
+        let result = telemetry
+            .log_tool_result_with_tags(
+                "test_tool",
+                "call-1",
+                "{}",
+                &[],
+                &[],
+                || async { Ok::<u64, &'static str>(42) },
+                |_| true,
+                |_| {
+                    preview_called.set(true);
+                    "preview".to_string()
+                },
+            )
+            .await
+            .expect("tool result");
+
+        assert_eq!(result, 42);
+        assert!(!preview_called.get());
     }
 }

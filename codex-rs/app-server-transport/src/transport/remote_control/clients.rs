@@ -11,7 +11,10 @@ use codex_app_server_protocol::RemoteControlClientsListParams;
 use codex_app_server_protocol::RemoteControlClientsListResponse;
 use codex_app_server_protocol::RemoteControlClientsRevokeParams;
 use codex_app_server_protocol::RemoteControlClientsRevokeResponse;
+use codex_http_client::HttpClient;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
+#[cfg(test)]
 use codex_login::default_client::create_client_without_request_logging;
 use serde::Deserialize;
 use std::io;
@@ -66,28 +69,27 @@ struct ClientManagementResponse {
     body: Vec<u8>,
 }
 
+#[cfg(test)]
 pub(super) async fn list_remote_control_clients(
     remote_control_url: &str,
     auth_manager: &Arc<AuthManager>,
     params: RemoteControlClientsListParams,
 ) -> io::Result<RemoteControlClientsListResponse> {
-    if params.environment_id.is_empty() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "remote control client list requires environmentId",
-        ));
-    }
-    if params
-        .limit
-        .is_some_and(|limit| !(1..=100).contains(&limit))
-    {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "remote control client list limit must be between 1 and 100",
-        ));
-    }
+    validate_client_list_params(&params)?;
+    let client = create_client_without_request_logging()?;
+    list_remote_control_clients_with_client(&client, remote_control_url, auth_manager, params).await
+}
+
+pub(super) async fn list_remote_control_clients_with_client(
+    client: &HttpClient,
+    remote_control_url: &str,
+    auth_manager: &Arc<AuthManager>,
+    params: RemoteControlClientsListParams,
+) -> io::Result<RemoteControlClientsListResponse> {
+    validate_client_list_params(&params)?;
     let url = environment_clients_url(remote_control_url, &params.environment_id)?;
     let response = send_client_management_request(
+        client,
         auth_manager,
         ClientManagementRequest::List {
             url: &url,
@@ -121,23 +123,59 @@ pub(super) async fn list_remote_control_clients(
     })
 }
 
+pub(super) async fn list_remote_control_clients_with_pool(
+    http_clients: &RouteAwareClientPool,
+    remote_control_url: &str,
+    auth_manager: &Arc<AuthManager>,
+    params: RemoteControlClientsListParams,
+) -> io::Result<RemoteControlClientsListResponse> {
+    validate_client_list_params(&params)?;
+    let url = environment_clients_url(remote_control_url, &params.environment_id)?;
+    let client = http_clients
+        .client_for_url(url.as_str())
+        .await
+        .map_err(io::Error::other)?;
+    list_remote_control_clients_with_client(&client, remote_control_url, auth_manager, params).await
+}
+
+fn validate_client_list_params(params: &RemoteControlClientsListParams) -> io::Result<()> {
+    if params.environment_id.is_empty() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "remote control client list requires environmentId",
+        ));
+    }
+    if params
+        .limit
+        .is_some_and(|limit| !(1..=100).contains(&limit))
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "remote control client list limit must be between 1 and 100",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) async fn revoke_remote_control_client(
     remote_control_url: &str,
     auth_manager: &Arc<AuthManager>,
     params: RemoteControlClientsRevokeParams,
 ) -> io::Result<RemoteControlClientsRevokeResponse> {
-    if params.environment_id.is_empty() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "remote control client revoke requires environmentId",
-        ));
-    }
-    if params.client_id.is_empty() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "remote control client revoke requires clientId",
-        ));
-    }
+    validate_client_revoke_params(&params)?;
+    let client = create_client_without_request_logging()?;
+    revoke_remote_control_client_with_client(&client, remote_control_url, auth_manager, params)
+        .await
+}
+
+pub(super) async fn revoke_remote_control_client_with_client(
+    client: &HttpClient,
+    remote_control_url: &str,
+    auth_manager: &Arc<AuthManager>,
+    params: RemoteControlClientsRevokeParams,
+) -> io::Result<RemoteControlClientsRevokeResponse> {
+    validate_client_revoke_params(&params)?;
     let mut url = environment_clients_url(remote_control_url, &params.environment_id)?;
     url.path_segments_mut()
         .map_err(|()| {
@@ -148,6 +186,7 @@ pub(super) async fn revoke_remote_control_client(
         })?
         .push(&params.client_id);
     let response = send_client_management_request(
+        client,
         auth_manager,
         ClientManagementRequest::Revoke { url: &url },
         "revoke remote control client",
@@ -163,7 +202,48 @@ pub(super) async fn revoke_remote_control_client(
     Ok(RemoteControlClientsRevokeResponse {})
 }
 
+pub(super) async fn revoke_remote_control_client_with_pool(
+    http_clients: &RouteAwareClientPool,
+    remote_control_url: &str,
+    auth_manager: &Arc<AuthManager>,
+    params: RemoteControlClientsRevokeParams,
+) -> io::Result<RemoteControlClientsRevokeResponse> {
+    validate_client_revoke_params(&params)?;
+    let mut url = environment_clients_url(remote_control_url, &params.environment_id)?;
+    url.path_segments_mut()
+        .map_err(|()| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "remote control URL cannot be a base",
+            )
+        })?
+        .push(&params.client_id);
+    let client = http_clients
+        .client_for_url(url.as_str())
+        .await
+        .map_err(io::Error::other)?;
+    revoke_remote_control_client_with_client(&client, remote_control_url, auth_manager, params)
+        .await
+}
+
+fn validate_client_revoke_params(params: &RemoteControlClientsRevokeParams) -> io::Result<()> {
+    if params.environment_id.is_empty() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "remote control client revoke requires environmentId",
+        ));
+    }
+    if params.client_id.is_empty() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "remote control client revoke requires clientId",
+        ));
+    }
+    Ok(())
+}
+
 async fn send_client_management_request(
+    client: &HttpClient,
     auth_manager: &Arc<AuthManager>,
     request: ClientManagementRequest<'_>,
     action: &str,
@@ -171,22 +251,22 @@ async fn send_client_management_request(
     let mut auth_recovery = auth_manager.unauthorized_recovery();
     let mut auth_change_rx = auth_manager.auth_change_receiver();
     let auth = load_remote_control_auth(auth_manager).await?;
-    let response = send_client_management_request_once(&auth, &request, action).await?;
+    let response = send_client_management_request_once(client, &auth, &request, action).await?;
     if response.status.as_u16() != 401
         || !recover_remote_control_auth(&mut auth_recovery, &mut auth_change_rx).await
     {
         return Ok(response);
     }
     let auth = load_remote_control_auth(auth_manager).await?;
-    send_client_management_request_once(&auth, &request, action).await
+    send_client_management_request_once(client, &auth, &request, action).await
 }
 
 async fn send_client_management_request_once(
+    client: &HttpClient,
     auth: &RemoteControlConnectionAuth,
     request: &ClientManagementRequest<'_>,
     action: &str,
 ) -> io::Result<ClientManagementResponse> {
-    let client = create_client_without_request_logging()?;
     let auth_headers = auth.request_headers()?;
     let request = match request {
         ClientManagementRequest::List { url, params } => {

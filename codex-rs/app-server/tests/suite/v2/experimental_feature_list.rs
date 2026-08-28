@@ -9,6 +9,7 @@ use app_test_support::write_chatgpt_auth;
 use codex_app_server_protocol::ConfigReadParams;
 use codex_app_server_protocol::ConfigReadResponse;
 use codex_app_server_protocol::ExperimentalFeature;
+use codex_app_server_protocol::ExperimentalFeatureConsumer;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetResponse;
 use codex_app_server_protocol::ExperimentalFeatureListParams;
@@ -91,6 +92,12 @@ async fn experimental_feature_list_returns_feature_metadata_with_stage() -> Resu
                 announcement,
                 enabled: config.features.enabled(spec.id),
                 default_enabled: spec.default_enabled,
+                consumer: Some(match spec.consumer {
+                    codex_features::FeatureConsumer::Runtime => {
+                        ExperimentalFeatureConsumer::Runtime
+                    }
+                    codex_features::FeatureConsumer::Client => ExperimentalFeatureConsumer::Client,
+                }),
             }
         })
         .collect::<Vec<_>>();

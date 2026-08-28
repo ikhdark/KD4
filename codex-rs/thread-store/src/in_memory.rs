@@ -52,12 +52,15 @@ mod tests {
     use super::*;
     use crate::ListItemsParams;
     use crate::ListTurnsParams;
+    use crate::LiveThread;
     use crate::SortDirection;
     use crate::StoredTurnItemsView;
     use crate::ThreadPersistenceMetadata;
     use crate::ThreadSortKey;
     use codex_protocol::models::BaseInstructions;
+    use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::TurnCompleteEvent;
 
     #[tokio::test]
     async fn default_turn_pagination_methods_return_unsupported() {
@@ -99,6 +102,50 @@ mod tests {
                 operation: "list_items"
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn live_terminal_lookup_uses_append_index_without_loading_history() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let thread_id = ThreadId::default();
+        let live_thread = LiveThread::create(
+            store.clone(),
+            create_thread_params(thread_id, ThreadHistoryMode::Legacy),
+        )
+        .await
+        .expect("create live thread");
+        let terminal = RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            surfaced_result: None,
+            turn_id: "turn-1".to_string(),
+            last_agent_message: None,
+            error: None,
+            completion: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+            timing: None,
+        }));
+
+        live_thread
+            .append_items(std::slice::from_ref(&terminal))
+            .await
+            .expect("append terminal event");
+        let found = live_thread
+            .terminal_event("turn-1", /*include_archived*/ true)
+            .await
+            .expect("lookup terminal event")
+            .expect("terminal event should be indexed");
+        let missing = live_thread
+            .terminal_event("turn-2", /*include_archived*/ true)
+            .await
+            .expect("lookup absent terminal event");
+
+        assert!(matches!(
+            found,
+            EventMsg::TurnComplete(TurnCompleteEvent { turn_id, .. }) if turn_id == "turn-1"
+        ));
+        assert!(missing.is_none());
+        assert_eq!(store.calls().await.load_history, 0);
     }
 
     #[tokio::test]
@@ -362,7 +409,9 @@ fn stores_guard() -> MutexGuard<'static, HashMap<String, Arc<InMemoryThreadStore
 pub struct InMemoryThreadStoreCalls {
     pub create_thread: usize,
     pub resume_thread: usize,
+    pub append_items_requests: usize,
     pub append_items: usize,
+    pub append_items_ordered: usize,
     pub persist_thread: usize,
     pub flush_thread: usize,
     pub shutdown_thread: usize,
@@ -396,6 +445,8 @@ struct InMemoryThreadStoreState {
     metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
     names: HashMap<ThreadId, Option<String>>,
     rollout_paths: HashMap<PathBuf, ThreadId>,
+    #[cfg(test)]
+    fail_next_shutdown: bool,
 }
 
 impl InMemoryThreadStore {
@@ -417,6 +468,11 @@ impl InMemoryThreadStore {
     /// Returns the calls observed by this store.
     pub async fn calls(&self) -> InMemoryThreadStoreCalls {
         self.state.lock().await.calls.clone()
+    }
+
+    #[cfg(test)]
+    pub async fn fail_next_shutdown(&self) {
+        self.state.lock().await.fail_next_shutdown = true;
     }
 
     async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
@@ -481,17 +537,25 @@ impl InMemoryThreadStore {
         Ok(())
     }
 
-    async fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreResult<()> {
+    async fn append_items_with_ordering(
+        &self,
+        params: AppendThreadItemsParams,
+        ordered: bool,
+    ) -> ThreadStoreResult<()> {
         if params.items.is_empty() {
             return Ok(());
         }
         let mut state = self.state.lock().await;
+        state.calls.append_items_requests += 1;
         let history_mode = history_mode_from_state(&state, params.thread_id);
         let persisted_items = persisted_rollout_items(params.items.as_slice(), history_mode);
         if persisted_items.is_empty() {
             return Ok(());
         }
         state.calls.append_items += 1;
+        if ordered {
+            state.calls.append_items_ordered += 1;
+        }
         state
             .histories
             .entry(params.thread_id)
@@ -622,7 +686,15 @@ impl ThreadStore for InMemoryThreadStore {
     }
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(InMemoryThreadStore::append_items(self, params))
+        Box::pin(InMemoryThreadStore::append_items_with_ordering(
+            self, params, false,
+        ))
+    }
+
+    fn append_items_ordered(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(InMemoryThreadStore::append_items_with_ordering(
+            self, params, true,
+        ))
     }
 
     fn persist_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
@@ -641,7 +713,14 @@ impl ThreadStore for InMemoryThreadStore {
 
     fn shutdown_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            self.state.lock().await.calls.shutdown_thread += 1;
+            let mut state = self.state.lock().await;
+            state.calls.shutdown_thread += 1;
+            #[cfg(test)]
+            if std::mem::take(&mut state.fail_next_shutdown) {
+                return Err(ThreadStoreError::Internal {
+                    message: "injected shutdown failure".to_string(),
+                });
+            }
             Ok(())
         })
     }

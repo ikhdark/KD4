@@ -1,10 +1,10 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 
 use crate::FunctionCallError;
 use crate::agent::task_capabilities::validate_independent_review_shell;
 use crate::maybe_emit_implicit_skill_invocation;
+use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
@@ -12,18 +12,16 @@ use crate::tools::command_execution::CompletionApplyResult;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::command_output_artifact::replace_raw_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
-use crate::tools::handlers::apply_granted_turn_permissions;
+use crate::tools::handlers::apply_granted_turn_permissions_uri;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
-use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
+use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair_async;
 use crate::tools::handlers::command_search::classify_rg_search_narrowing;
 use crate::tools::handlers::command_search::reject_rg_search_without_native_scope;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
-use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
@@ -44,8 +42,8 @@ use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::generate_chunk_id;
 use crate::validation_admission::ValidationAdmission;
 use crate::validation_admission::ValidationLaunchPlan;
-use crate::validation_admission::ValidationRegistration;
-use crate::validation_admission::admit_validation;
+use crate::validation_admission::ValidationSkippedToolOutput;
+use crate::validation_admission::admit_validation_invocations;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
 use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
@@ -60,35 +58,16 @@ use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathConvention;
 use serde::Deserialize;
 
-use super::super::shell::ValidationProofPreparation;
-use super::super::shell::ValidationProofPreparationArgs;
-use super::super::shell::joined_validation_structured_output;
-use super::super::shell::prepare_validation_proof;
+use super::super::shell::ValidationLaunchPreparationArgs;
+use super::super::shell::prepare_validation_launch;
 use super::super::shell::validation_environment_hash;
 use super::super::shell::validation_structured_output;
 use super::super::shell_spec::CommandToolOptions;
-use super::super::shell_spec::create_exec_command_tool_with_environment_id;
+use super::super::shell_spec::create_exec_command_tool_for_policy;
 use super::ExecCommandArgs;
 use super::ExecCommandEnvironmentArgs;
 use super::get_command;
 use super::post_unified_exec_tool_use_payload;
-
-pub(super) fn completed_validation_not_applicable_output(
-    response: &ExecCommandToolOutput,
-    validation_result: Option<codex_protocol::validation::ValidationResult>,
-) -> FunctionToolOutput {
-    let value = serde_json::json!({
-        "text": response.response_text(),
-        "success": null,
-        "execution_outcome": "executed_not_applicable",
-        "command_was_executed": true,
-        "exit_code": response.exit_code,
-        "skip_disposition": codex_tools::ToolOutputSkipDisposition::NotApplicable,
-        "validation_result": validation_result,
-    });
-    validation_structured_output(value)
-        .with_skip_disposition(codex_tools::ToolOutputSkipDisposition::NotApplicable)
-}
 
 #[derive(Debug, Deserialize)]
 struct ExecCommandHookArgs {
@@ -129,6 +108,7 @@ pub(super) fn exec_command_hook_input(arguments: &str) -> Option<serde_json::Val
 #[derive(Clone, Copy)]
 pub(crate) struct ExecCommandHandlerOptions {
     pub(crate) allow_login_shell: bool,
+    pub(crate) allow_escalated_sandbox_permissions: bool,
     pub(crate) exec_permission_approvals_enabled: bool,
     pub(crate) include_environment_id: bool,
     pub(crate) include_shell_parameter: bool,
@@ -138,11 +118,24 @@ pub struct ExecCommandHandler {
     options: ExecCommandHandlerOptions,
 }
 
+pub(super) fn record_late_validation_skip(
+    turn: &crate::session::turn_context::TurnContext,
+    skipped: &ValidationSkippedToolOutput,
+) {
+    if matches!(
+        skipped.skip_disposition,
+        codex_tools::ToolOutputSkipDisposition::Suppressed
+    ) {
+        turn.turn_timing_state.record_suppressed_validation_output();
+    }
+}
+
 impl Default for ExecCommandHandler {
     fn default() -> Self {
         Self {
             options: ExecCommandHandlerOptions {
                 allow_login_shell: false,
+                allow_escalated_sandbox_permissions: false,
                 exec_permission_approvals_enabled: false,
                 include_environment_id: false,
                 include_shell_parameter: true,
@@ -205,19 +198,31 @@ pub(super) fn attach_powershell_failure_advisory(
     }
 }
 
+pub(super) async fn finalize_sandbox_denial_artifact(
+    pending_artifact: &crate::tools::command_output_artifact::RawOutputArtifact,
+    preserved_artifact: Option<crate::tools::command_output_artifact::RawOutputArtifact>,
+    fallback_output: &[u8],
+) -> crate::tools::command_output_artifact::RawOutputArtifact {
+    match preserved_artifact {
+        Some(artifact) => artifact,
+        None => replace_raw_output_artifact(pending_artifact, fallback_output).await,
+    }
+}
+
 impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(crate::tools::EXEC_COMMAND_TOOL_NAME)
     }
 
     fn spec(&self) -> ToolSpec {
-        create_exec_command_tool_with_environment_id(
+        create_exec_command_tool_for_policy(
             CommandToolOptions {
                 allow_login_shell: self.options.allow_login_shell,
                 exec_permission_approvals_enabled: self.options.exec_permission_approvals_enabled,
             },
             self.options.include_environment_id,
             self.options.include_shell_parameter,
+            self.options.allow_escalated_sandbox_permissions,
         )
     }
 
@@ -231,7 +236,7 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
 }
 
 impl ExecCommandHandler {
-    async fn handle_call(
+    pub(crate) async fn handle_call(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
@@ -240,7 +245,7 @@ impl ExecCommandHandler {
             step_context,
             tracker,
             call_id,
-            cancellation_token,
+            cancellation_token: _,
             payload,
             ..
         } = invocation;
@@ -357,19 +362,21 @@ impl ExecCommandHandler {
         )
         .map_err(FunctionCallError::RespondToModel)?;
         let original_safety_command = original_resolved_command.safety_command.clone();
-        let preflight = preflight_invocation_with_equivalent_repair(
+        let preflight = preflight_invocation_with_equivalent_repair_async(
             &original_invocation,
             &original_safety_command,
             original_resolved_command.preflight_shell_type,
         )
+        .await
         .map_err(|issue| {
             FunctionCallError::RespondToModel(format!(
                 "{issue}\nRegenerate the command and call `exec_command` again."
             ))
         })?;
         let repaired = preflight.repaired();
+        let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
-        let repair_notice = preflight.repair_notice;
+        let mut repair_notice = preflight.repair_notice;
         if repaired {
             args.replace_command_invocation(&command_invocation);
         }
@@ -384,36 +391,10 @@ impl ExecCommandHandler {
         } else {
             original_resolved_command
         };
-        let native_repository = native_cwd
-            .as_ref()
-            .map(|cwd| resolve_repository_root(cwd.as_path()));
-        let repository_key = native_repository
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| cwd.to_string());
-        let search_narrowing = if let Some(native_cwd) = native_cwd.as_ref() {
-            let repository_root = native_repository.as_deref().unwrap_or(native_cwd.as_path());
-            let search = classify_rg_search_narrowing(
-                &resolved_command.safety_command,
-                resolved_command.preflight_shell_type,
-                native_cwd.as_path(),
-                repository_root,
-            )
-            .map_err(FunctionCallError::RespondToModel)?;
-            search.map(|search| (repository_root.to_string_lossy().into_owned(), search))
-        } else {
-            reject_rg_search_without_native_scope(
-                &resolved_command.safety_command,
-                resolved_command.preflight_shell_type,
-            )
-            .map_err(FunctionCallError::RespondToModel)?;
-            None
-        };
-        let mut validation_launch = match admit_validation(
+        let mut validation_launch = match admit_validation_invocations(
             &turn.validation_authorization,
-            session.services.state_db.as_deref(),
-            repository_key.as_bytes(),
-            &command_invocation,
+            &validation_invocations,
+            args.validation.is_some(),
         )
         .await
         {
@@ -431,27 +412,40 @@ impl ExecCommandHandler {
             }
             ValidationAdmission::Execute {
                 authorization_revision,
-                observation,
-            } => observation.map(|observation| ValidationLaunchPlan {
-                invocation: command_invocation.clone(),
+                is_validation,
+                classification,
+            } => is_validation.then(|| ValidationLaunchPlan {
+                classification,
                 authorization_revision,
-                observation: Some(observation),
-                proof_key: None,
+                explicitly_tagged: args.validation.is_some(),
                 structured_route: None,
                 bound_plan_step: None,
+                bound_work_unit: None,
                 validation_call_id: None,
                 turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
-                force_fresh: args.force_fresh,
+                focused_validation_token: None,
             }),
         };
+        super::super::shell::downgrade_unattributed_validation(
+            &mut validation_launch,
+            args.validation.is_some(),
+            &mut repair_notice,
+        );
         let direct_validation_route = if validation_launch.is_some() {
             let context = args.validation.as_ref().ok_or_else(|| {
                 FunctionCallError::RespondToModel(
-                    "validation commands require `validation` metadata stating the uncertainty, covered_paths, and covered_contracts"
+                    "validation commands require `validation` metadata with nonempty covered_paths"
                         .to_string(),
                 )
             })?;
-            let repository = native_repository.as_ref().ok_or_else(|| {
+            let validation_repository = native_cwd.as_ref().and_then(|cwd| {
+                super::super::shell::validation_repository_root_if_needed(
+                    true,
+                    cwd.as_path(),
+                    turn.config.cwd.as_path(),
+                )
+            });
+            let repository = validation_repository.as_ref().ok_or_else(|| {
                 FunctionCallError::RespondToModel(
                     "direct validation coverage requires a host-native repository path".to_string(),
                 )
@@ -468,9 +462,28 @@ impl ExecCommandHandler {
         } else {
             None
         };
-        // Admission authorizes the validation; it does not prove that a nonzero outcome is
-        // deterministic. All outcomes remain ordinary retryable command records here.
-        let validation_observation = Arc::new(StdMutex::new(None));
+        let search_narrowing = if validation_launch.is_none() {
+            if let Some(native_cwd) = native_cwd.as_ref() {
+                let repository_root = resolve_repository_root(native_cwd.as_path());
+                let search = classify_rg_search_narrowing(
+                    &resolved_command.safety_command,
+                    resolved_command.preflight_shell_type,
+                    native_cwd.as_path(),
+                    &repository_root,
+                )
+                .map_err(FunctionCallError::RespondToModel)?;
+                search.map(|search| (repository_root.to_string_lossy().into_owned(), search))
+            } else {
+                reject_rg_search_without_native_scope(
+                    &resolved_command.safety_command,
+                    resolved_command.preflight_shell_type,
+                )
+                .map_err(FunctionCallError::RespondToModel)?;
+                None
+            }
+        } else {
+            None
+        };
         validate_independent_review_shell(
             &turn.session_source,
             is_known_safe_command(&resolved_command.safety_command),
@@ -495,6 +508,7 @@ impl ExecCommandHandler {
         let shell_type = resolved_command.shell_type;
         let use_login_shell = resolved_command.use_login_shell;
         let is_powershell_script = command_invocation.is_powershell_script();
+        let shell_wrapper_is_owned = !command_invocation.is_argv();
         let command_for_display = hook_command.clone();
 
         let ExecCommandArgs {
@@ -512,12 +526,11 @@ impl ExecCommandHandler {
         let exec_permission_approvals_enabled =
             session.features().enabled(Feature::ExecPermissionApprovals);
         let requested_additional_permissions = additional_permissions.clone();
-        // TODO(anp): Make permission matching operate on PathUri for remote environments.
         let permission_cwd = native_cwd.as_ref().unwrap_or(&turn.config.cwd);
-        let effective_additional_permissions = apply_granted_turn_permissions(
+        let effective_additional_permissions = apply_granted_turn_permissions_uri(
             context.session.as_ref(),
-            &turn_environment.environment_id,
-            permission_cwd.as_path(),
+            turn_environment.environment.approval_scope_id(),
+            &cwd,
             sandbox_permissions,
             additional_permissions,
         )
@@ -543,34 +556,41 @@ impl ExecCommandHandler {
             )));
         }
 
-        let normalized_additional_permissions = match implicit_granted_permissions(
-            sandbox_permissions,
-            requested_additional_permissions.as_ref(),
-            &effective_additional_permissions,
-        )
-        .map_or_else(
-            || {
-                normalize_and_validate_additional_permissions(
-                    additional_permissions_allowed,
-                    context.turn.approval_policy.value(),
-                    effective_additional_permissions.sandbox_permissions,
-                    effective_additional_permissions.additional_permissions,
-                    effective_additional_permissions.permissions_preapproved,
-                    permission_cwd,
-                )
-            },
-            |permissions| Ok(Some(permissions)),
-        ) {
+        let implicit_grant = !sandbox_permissions.uses_additional_permissions()
+            && !matches!(sandbox_permissions, SandboxPermissions::RequireEscalated)
+            && requested_additional_permissions.is_none();
+        let normalized_additional_permissions = match if implicit_grant {
+            Ok(effective_additional_permissions
+                .additional_permissions
+                .clone())
+        } else {
+            normalize_and_validate_additional_permissions(
+                additional_permissions_allowed,
+                context.turn.approval_policy.value(),
+                effective_additional_permissions.sandbox_permissions,
+                effective_additional_permissions
+                    .additional_permissions
+                    .clone(),
+                effective_additional_permissions.permissions_preapproved,
+                permission_cwd,
+            )
+        } {
             Ok(normalized) => normalized,
             Err(err) => {
                 return Err(FunctionCallError::RespondToModel(err));
             }
         };
-
+        let normalized_additional_permissions_uri = if implicit_grant {
+            effective_additional_permissions
+                .additional_permissions_uri
+                .clone()
+        } else {
+            normalized_additional_permissions.clone().map(Into::into)
+        };
         let sandbox_context = (
             sandbox_permissions,
             effective_additional_permissions.sandbox_permissions,
-            &normalized_additional_permissions,
+            &normalized_additional_permissions_uri,
             effective_additional_permissions.permissions_preapproved,
             context.turn.approval_policy.value(),
             context.turn.windows_sandbox_level,
@@ -621,12 +641,14 @@ impl ExecCommandHandler {
         } else {
             attempt_key
         };
-        session
-            .services
-            .command_execution
-            .admit_search_narrowing(&attempt_key)
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
+        if validation_launch.is_none() {
+            session
+                .services
+                .command_execution
+                .admit_search_narrowing(&attempt_key)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+        }
         let known_delta = if session.features().enabled(Feature::KnownDeltaStore)
             && !environment_is_remote
             && !tty
@@ -634,7 +656,10 @@ impl ExecCommandHandler {
             && let Some(native_cwd) = native_cwd.as_ref()
             && let CommandInvocation::Argv { program, args } = &command_invocation
             && known_delta_store::is_immutable_git_show_candidate(program, args)
-        {
+            && let Some(authorization_scope) = known_delta_store::authorization_scope_fingerprint(
+                &turn.file_system_sandbox_context(normalized_additional_permissions.clone(), &cwd),
+                effective_additional_permissions.sandbox_permissions,
+            ) {
             let metadata_source = turn
                 .turn_metadata_state
                 .git_metadata_source()
@@ -647,13 +672,14 @@ impl ExecCommandHandler {
                 .map_or(known_delta_store::ProjectNamespaceHint::Discover, |_| {
                     known_delta_store::ProjectNamespaceHint::Resolved(project_namespace.as_deref())
                 });
-            known_delta_store::prepare_immutable_git_show(
+            known_delta_store::prepare_immutable_git_show_with_authorization_scope(
                 turn.config.codex_home.as_path(),
                 &session.thread_id.to_string(),
                 native_cwd,
                 program,
                 args,
                 project_namespace_hint,
+                &authorization_scope,
                 force_fresh,
             )
             .await
@@ -663,67 +689,25 @@ impl ExecCommandHandler {
         let known_delta_hit = known_delta
             .as_ref()
             .is_some_and(crate::tools::known_delta_store::PreparedKnownDelta::is_hit);
-        let (validation_leader, validation_waiter) = loop {
-            match prepare_validation_proof(ValidationProofPreparationArgs {
-                session: session.as_ref(),
-                turn: turn.as_ref(),
-                validation_launch: &mut validation_launch,
-                direct_validation_route: direct_validation_route.as_ref(),
-                repository_key: repository_key.as_bytes(),
-                cwd: &validation_cwd,
-                command_invocation: &command_invocation,
-                environment: &effective_environment,
-                environment_hash: &environment_hash,
-                execution_context: &runtime_context,
-                repository_epoch,
-                call_id: &call_id,
-                cancellation_token: &cancellation_token,
-                force_fresh,
-            })
-            .await?
-            {
-                ValidationProofPreparation::NotValidation => break (None, None),
-                ValidationProofPreparation::Reused(output) => {
-                    return Ok(boxed_tool_output(output));
-                }
-                ValidationProofPreparation::Registered(ValidationRegistration::Leader {
-                    execution,
-                    waiter,
-                }) => break (Some(*execution), Some(waiter)),
-                ValidationProofPreparation::Registered(ValidationRegistration::Follower(
-                    waiter,
-                )) => {
-                    let shared_from_call_id = waiter.shared_from_call_id().to_string();
-                    let joined = tokio::select! {
-                        result = waiter.join() => result,
-                        _ = cancellation_token.cancelled() => {
-                            return Err(FunctionCallError::RespondToModel(
-                                "shared validation wait was cancelled".to_string(),
-                            ));
-                        }
-                    };
-                    if let Some(result) = joined {
-                        return Ok(boxed_tool_output(joined_validation_structured_output(
-                            result.value,
-                            &call_id,
-                            &shared_from_call_id,
-                        )));
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }
-        };
-        if !known_delta_hit {
+        prepare_validation_launch(ValidationLaunchPreparationArgs {
+            session: session.as_ref(),
+            validation_launch: &mut validation_launch,
+            direct_validation_route: direct_validation_route.as_ref(),
+            call_id: &call_id,
+        })
+        .await?;
+        let validation_attempt = validation_launch.is_some();
+        if !known_delta_hit && !validation_attempt {
             session
                 .services
                 .command_execution
-                .begin_attempt_with_freshness(&attempt_key, repair_notice.is_some(), force_fresh)
+                .begin_attempt_with_freshness(&attempt_key, repaired, force_fresh)
                 .await
                 .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
         }
-        let validation_leader = Arc::new(StdMutex::new(validation_leader));
         let interception_started_at = std::time::Instant::now();
         let intercepted = intercept_apply_patch(
+            validation_attempt,
             &command,
             &cwd,
             fs.as_ref(),
@@ -751,7 +735,7 @@ impl ExecCommandHandler {
                     &raw_output,
                 )
                 .await;
-                if !known_delta_hit {
+                if !known_delta_hit && !validation_attempt {
                     session
                         .services
                         .command_execution
@@ -775,7 +759,7 @@ impl ExecCommandHandler {
             }
             Ok(None) => {}
             Err(err) => {
-                if !known_delta_hit {
+                if !known_delta_hit && !validation_attempt {
                     err.record_attempt_failure(&session.services.command_execution, &attempt_key)
                         .await;
                 }
@@ -802,6 +786,7 @@ impl ExecCommandHandler {
                     attempt_key: attempt_key.clone(),
                     raw_output_artifact: raw_output_artifact.clone(),
                     shell_type,
+                    shell_wrapper_is_owned,
                     hook_command: hook_command.clone(),
                     process_id,
                     yield_time_ms,
@@ -819,14 +804,12 @@ impl ExecCommandHandler {
                     tty,
                     sandbox_permissions: effective_additional_permissions.sandbox_permissions,
                     additional_permissions: normalized_additional_permissions,
+                    additional_permissions_uri: normalized_additional_permissions_uri,
                     additional_permissions_preapproved: effective_additional_permissions
                         .permissions_preapproved,
                     justification,
                     prefix_rule,
                     validation_launch,
-                    validation_observation,
-                    validation_leader,
-                    validation_waiter,
                     known_delta,
                 },
                 process_id_reservation,
@@ -853,7 +836,7 @@ impl ExecCommandHandler {
                     .clone()
                     .unwrap_or_else(|| raw_output_artifact.clone());
                 response.repair_notice = repair_notice;
-                if !known_delta_hit {
+                if !known_delta_hit && !validation_attempt {
                     if let Some(process_id) = response.process_id {
                         session
                             .services
@@ -890,33 +873,21 @@ impl ExecCommandHandler {
                     }
                 }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
-                let skip_disposition = direct_validation_route.as_ref().and_then(|route| {
-                    response.exit_code.and_then(|exit_code| {
-                        crate::tools::command_execution::completed_validation_skip_disposition(
-                            route.route(),
-                            &response.raw_output,
-                            exit_code,
-                        )
-                    })
-                });
-                if skip_disposition == Some(codex_tools::ToolOutputSkipDisposition::NotApplicable) {
-                    let validation_result = session
-                        .services
-                        .command_execution
-                        .validation_result_for_call(&call_id)
-                        .await;
-                    Ok(boxed_tool_output(
-                        completed_validation_not_applicable_output(&response, validation_result),
-                    ))
-                } else {
-                    Ok(boxed_tool_output(response))
-                }
+                Ok(boxed_tool_output(response))
             }
-            Err(UnifiedExecError::SandboxDenied { output, .. }) => {
+            Err(UnifiedExecError::SandboxDenied {
+                output,
+                raw_output_artifact: preserved_artifact,
+                ..
+            }) => {
                 let output_text = output.aggregated_output.text;
-                let finalized_artifact =
-                    replace_raw_output_artifact(&raw_output_artifact, output_text.as_bytes()).await;
-                if !known_delta_hit {
+                let finalized_artifact = finalize_sandbox_denial_artifact(
+                    &raw_output_artifact,
+                    preserved_artifact,
+                    output_text.as_bytes(),
+                )
+                .await;
+                if !known_delta_hit && !validation_attempt {
                     let tracked = if let Some((execution_id, parent_tool_execution_id)) =
                         tracked_execution.as_ref()
                     {
@@ -965,6 +936,7 @@ impl ExecCommandHandler {
                 Ok(boxed_tool_output(response))
             }
             Err(UnifiedExecError::ValidationSkipped(skipped)) => {
+                record_late_validation_skip(&turn, &skipped);
                 let skip_disposition = skipped.skip_disposition;
                 Ok(boxed_tool_output(
                     validation_structured_output(serde_json::to_value(skipped).unwrap_or_default())
@@ -976,7 +948,7 @@ impl ExecCommandHandler {
                     &err,
                     UnifiedExecError::CreateProcess { .. } | UnifiedExecError::ProcessFailed { .. }
                 );
-                if retry_failure && !known_delta_hit {
+                if retry_failure && !known_delta_hit && !validation_attempt {
                     let finalized_running_process =
                         if matches!(&err, UnifiedExecError::ProcessFailed { .. }) {
                             if let Some((execution_id, parent_tool_execution_id)) =
@@ -1049,6 +1021,10 @@ impl CoreToolRuntime for ExecCommandHandler {
             tool_name: HookToolName::exec_command(),
             tool_input,
         })
+    }
+
+    fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
+        matches!(&invocation.payload, ToolPayload::Function { .. }).then(HookToolName::exec_command)
     }
 
     fn with_updated_hook_input(

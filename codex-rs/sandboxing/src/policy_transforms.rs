@@ -1,5 +1,6 @@
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
+use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
@@ -10,8 +11,11 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::permissions::ReadDenyMatcher;
+use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
+use codex_utils_path_uri::PathConvention;
+use codex_utils_path_uri::PathUri;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
@@ -68,6 +72,42 @@ pub fn normalize_additional_permissions(
     })
 }
 
+/// Normalizes a permission overlay without projecting its paths onto the host.
+pub fn normalize_uri_additional_permissions(
+    additional_permissions: UriAdditionalPermissionProfile,
+) -> Result<UriAdditionalPermissionProfile, String> {
+    let network = additional_permissions
+        .network
+        .filter(|network| !network.is_empty());
+    let file_system = match additional_permissions.file_system {
+        Some(file_system) => {
+            let mut entries = Vec::with_capacity(file_system.entries.len());
+            for entry in file_system.entries {
+                if matches!(&entry.path, FileSystemPath::GlobPattern { .. })
+                    && entry.access != FileSystemAccessMode::Deny
+                {
+                    return Err(
+                        "glob file system permissions only support deny-read entries".to_string(),
+                    );
+                }
+                if !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
+            let file_system = FileSystemPermissions {
+                entries,
+                glob_scan_max_depth: file_system.glob_scan_max_depth,
+            };
+            (!file_system.is_empty()).then_some(file_system)
+        }
+        None => None,
+    };
+    Ok(UriAdditionalPermissionProfile {
+        network,
+        file_system,
+    })
+}
+
 pub fn merge_permission_profiles(
     base: Option<&AdditionalPermissionProfile>,
     permissions: Option<&AdditionalPermissionProfile>,
@@ -119,6 +159,185 @@ pub fn merge_permission_profiles(
             .filter(|permissions| !permissions.is_empty())
         }
         None => Some(permissions.clone()).filter(|permissions| !permissions.is_empty()),
+    }
+}
+
+pub fn merge_uri_permission_profiles(
+    base: Option<&UriAdditionalPermissionProfile>,
+    permissions: Option<&UriAdditionalPermissionProfile>,
+) -> Option<UriAdditionalPermissionProfile> {
+    let Some(permissions) = permissions else {
+        return base.cloned();
+    };
+
+    match base {
+        Some(base) => {
+            let network = match (base.network.as_ref(), permissions.network.as_ref()) {
+                (
+                    Some(NetworkPermissions {
+                        enabled: Some(true),
+                    }),
+                    _,
+                )
+                | (
+                    _,
+                    Some(NetworkPermissions {
+                        enabled: Some(true),
+                    }),
+                ) => Some(NetworkPermissions {
+                    enabled: Some(true),
+                }),
+                _ => None,
+            };
+            let file_system = match (base.file_system.as_ref(), permissions.file_system.as_ref()) {
+                (Some(base), Some(permissions)) => Some(FileSystemPermissions {
+                    entries: merge_permission_entries(&base.entries, &permissions.entries),
+                    glob_scan_max_depth: merge_glob_scan_max_depth(
+                        &base.entries,
+                        base.glob_scan_max_depth.map(usize::from),
+                        &permissions.entries,
+                        permissions.glob_scan_max_depth.map(usize::from),
+                    )
+                    .and_then(NonZeroUsize::new),
+                })
+                .filter(|file_system| !file_system.is_empty()),
+                (Some(base), None) => Some(base.clone()),
+                (None, Some(permissions)) => Some(permissions.clone()),
+                (None, None) => None,
+            };
+            Some(UriAdditionalPermissionProfile {
+                network,
+                file_system,
+            })
+            .filter(|permissions| !permissions.is_empty())
+        }
+        None => Some(permissions.clone()).filter(|permissions| !permissions.is_empty()),
+    }
+}
+
+/// Restricts a URI grant to the paths and access modes that were requested.
+pub fn intersect_uri_permission_profiles(
+    requested: UriAdditionalPermissionProfile,
+    granted: UriAdditionalPermissionProfile,
+    cwd: &PathUri,
+) -> UriAdditionalPermissionProfile {
+    let file_system = requested
+        .file_system
+        .map(|requested_file_system| {
+            let granted_file_system = granted.file_system.unwrap_or_default();
+            let mut entries = Vec::new();
+            for entry in granted_file_system
+                .entries
+                .iter()
+                .filter(|entry| uri_grant_is_within_request(&requested_file_system, entry, cwd))
+            {
+                if !entries.contains(entry) {
+                    entries.push(entry.clone());
+                }
+            }
+            // Extra deny entries only narrow a grant, so preserving requested and
+            // granted denies is safe and keeps glob constraints intact.
+            for entry in requested_file_system
+                .entries
+                .iter()
+                .chain(granted_file_system.entries.iter())
+                .filter(|entry| entry.access == FileSystemAccessMode::Deny)
+            {
+                if !entries.contains(entry) {
+                    entries.push(entry.clone());
+                }
+            }
+            FileSystemPermissions {
+                glob_scan_max_depth: merge_glob_scan_max_depth(
+                    &requested_file_system.entries,
+                    requested_file_system.glob_scan_max_depth.map(usize::from),
+                    &granted_file_system.entries,
+                    granted_file_system.glob_scan_max_depth.map(usize::from),
+                )
+                .and_then(NonZeroUsize::new),
+                entries,
+            }
+        })
+        .filter(|file_system| !file_system.is_empty());
+    let network = match (requested.network, granted.network) {
+        (
+            Some(NetworkPermissions {
+                enabled: Some(true),
+            }),
+            Some(NetworkPermissions {
+                enabled: Some(true),
+            }),
+        ) => Some(NetworkPermissions {
+            enabled: Some(true),
+        }),
+        _ => None,
+    };
+    UriAdditionalPermissionProfile {
+        network,
+        file_system,
+    }
+}
+
+fn uri_grant_is_within_request(
+    requested: &FileSystemPermissions<PathUri>,
+    granted: &FileSystemSandboxEntry<PathUri>,
+    cwd: &PathUri,
+) -> bool {
+    if !granted.access.can_read() {
+        return false;
+    }
+    let FileSystemPath::Path { path: granted_path } = &granted.path else {
+        return requested.entries.iter().any(|requested_entry| {
+            requested_entry.path == granted.path
+                && access_covers(requested_entry.access, granted.access)
+        });
+    };
+    let denied = requested.entries.iter().any(|requested_entry| {
+        if requested_entry.access != FileSystemAccessMode::Deny {
+            return false;
+        }
+        match resolve_uri_permission_path(&requested_entry.path, cwd) {
+            Some(path) => granted_path.starts_with(&path),
+            // A deny glob cannot be evaluated portably on the host. Reject the
+            // grant rather than risk widening access in the selected environment.
+            None => matches!(&requested_entry.path, FileSystemPath::GlobPattern { .. }),
+        }
+    });
+    !denied
+        && requested.entries.iter().any(|requested_entry| {
+            resolve_uri_permission_path(&requested_entry.path, cwd).is_some_and(|path| {
+                granted_path.starts_with(&path)
+                    && access_covers(requested_entry.access, granted.access)
+            })
+        })
+}
+
+fn resolve_uri_permission_path(path: &FileSystemPath<PathUri>, cwd: &PathUri) -> Option<PathUri> {
+    match path {
+        FileSystemPath::Path { path } => Some(path.clone()),
+        FileSystemPath::GlobPattern { .. } => None,
+        FileSystemPath::Special { value } => match value {
+            FileSystemSpecialPath::Root => {
+                let mut root = cwd.clone();
+                while let Some(parent) = root.parent() {
+                    root = parent;
+                }
+                Some(root)
+            }
+            FileSystemSpecialPath::ProjectRoots { subpath } => match subpath {
+                Some(subpath) => subpath.to_str().and_then(|subpath| cwd.join(subpath).ok()),
+                None => Some(cwd.clone()),
+            },
+            FileSystemSpecialPath::SlashTmp
+                if cwd.infer_path_convention() == Some(PathConvention::Posix) =>
+            {
+                cwd.join("/tmp").ok()
+            }
+            FileSystemSpecialPath::SlashTmp => None,
+            FileSystemSpecialPath::Tmpdir
+            | FileSystemSpecialPath::Minimal
+            | FileSystemSpecialPath::Unknown { .. } => None,
+        },
     }
 }
 
@@ -194,10 +413,10 @@ pub fn intersect_permission_profiles(
     }
 }
 
-fn merge_glob_scan_max_depth(
-    left_entries: &[FileSystemSandboxEntry],
+fn merge_glob_scan_max_depth<PathType>(
+    left_entries: &[FileSystemSandboxEntry<PathType>],
     left_depth: Option<usize>,
-    right_entries: &[FileSystemSandboxEntry],
+    right_entries: &[FileSystemSandboxEntry<PathType>],
     right_depth: Option<usize>,
 ) -> Option<usize> {
     let left_depth = effective_glob_scan_depth(left_entries, left_depth);
@@ -214,8 +433,8 @@ fn merge_glob_scan_max_depth(
     }
 }
 
-fn effective_glob_scan_depth(
-    entries: &[FileSystemSandboxEntry],
+fn effective_glob_scan_depth<PathType>(
+    entries: &[FileSystemSandboxEntry<PathType>],
     depth: Option<usize>,
 ) -> Option<GlobScanDepth> {
     entries
@@ -403,10 +622,10 @@ fn resolve_permission_path(path: &FileSystemPath, cwd: &Path) -> Option<Absolute
     }
 }
 
-fn merge_permission_entries(
-    base: &[FileSystemSandboxEntry],
-    permissions: &[FileSystemSandboxEntry],
-) -> Vec<FileSystemSandboxEntry> {
+fn merge_permission_entries<PathType: Clone + PartialEq>(
+    base: &[FileSystemSandboxEntry<PathType>],
+    permissions: &[FileSystemSandboxEntry<PathType>],
+) -> Vec<FileSystemSandboxEntry<PathType>> {
     let mut merged = Vec::with_capacity(base.len() + permissions.len());
     for entry in base.iter().chain(permissions.iter()) {
         if !merged.contains(entry) {
@@ -504,6 +723,57 @@ pub fn effective_permission_profile(
         &effective_file_system_policy,
         effective_network_policy,
     )
+}
+
+pub fn effective_permission_profile_uri(
+    permission_profile: &PermissionProfile,
+    additional_permissions: Option<&UriAdditionalPermissionProfile>,
+) -> PermissionProfile<PathUri> {
+    let mut effective: PermissionProfile<PathUri> = permission_profile.clone().into();
+    let Some(additional_permissions) = additional_permissions else {
+        return effective;
+    };
+    let network_enabled = additional_permissions
+        .network
+        .as_ref()
+        .and_then(|network| network.enabled)
+        .unwrap_or(false);
+    match &mut effective {
+        PermissionProfile::Managed {
+            file_system,
+            network,
+        } => {
+            if network_enabled {
+                *network = NetworkSandboxPolicy::Enabled;
+            }
+            if let (
+                ManagedFileSystemPermissions::Restricted {
+                    entries,
+                    glob_scan_max_depth,
+                },
+                Some(additional_file_system),
+            ) = (file_system, additional_permissions.file_system.as_ref())
+            {
+                let base_entries = entries.clone();
+                let base_depth = *glob_scan_max_depth;
+                *entries = merge_permission_entries(&base_entries, &additional_file_system.entries);
+                *glob_scan_max_depth = merge_glob_scan_max_depth(
+                    &base_entries,
+                    base_depth.map(usize::from),
+                    &additional_file_system.entries,
+                    additional_file_system.glob_scan_max_depth.map(usize::from),
+                )
+                .and_then(NonZeroUsize::new);
+            }
+        }
+        PermissionProfile::External { network } => {
+            if network_enabled {
+                *network = NetworkSandboxPolicy::Enabled;
+            }
+        }
+        PermissionProfile::Disabled => {}
+    }
+    effective
 }
 
 pub fn should_require_platform_sandbox(

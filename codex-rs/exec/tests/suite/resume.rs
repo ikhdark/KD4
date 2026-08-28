@@ -149,8 +149,11 @@ async fn exec_resume_last_fails_when_history_is_empty() -> anyhow::Result<()> {
 }
 
 #[test]
-fn exec_resume_without_selector_fails_instead_of_starting_thread() {
+fn exec_resume_without_selector_rejects_before_state_and_environment_initialization() {
     let test = test_codex_exec();
+    std::fs::write(test.home_path().join("environments.toml"), "invalid = [")
+        .expect("write malformed environment config");
+    let state_db_path = test.home_path().join("state_5.sqlite");
 
     test.cmd()
         .arg("--skip-git-repo-check")
@@ -160,6 +163,11 @@ fn exec_resume_without_selector_fails_instead_of_starting_thread() {
         .stderr(contains(
             "resume requires a session ID or name, or the --last flag",
         ));
+
+    assert!(
+        !state_db_path.exists(),
+        "deterministic resume rejection must not create the state database"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

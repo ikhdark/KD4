@@ -10,21 +10,9 @@ fn force_pet_image_support(chat: &mut ChatWidget) {
     ));
 }
 
-fn force_tmux_pet_image_unsupported(chat: &mut ChatWidget) {
-    chat.set_pet_image_support_for_tests(crate::pets::PetImageSupport::Unsupported(
-        crate::pets::PetImageUnsupportedReason::Tmux,
-    ));
-}
-
 fn force_terminal_pet_image_unsupported(chat: &mut ChatWidget) {
     chat.set_pet_image_support_for_tests(crate::pets::PetImageSupport::Unsupported(
         crate::pets::PetImageUnsupportedReason::Terminal,
-    ));
-}
-
-fn force_old_iterm2_pet_image_unsupported(chat: &mut ChatWidget) {
-    chat.set_pet_image_support_for_tests(crate::pets::PetImageSupport::Unsupported(
-        crate::pets::PetImageUnsupportedReason::Iterm2TooOld,
     ));
 }
 
@@ -304,6 +292,10 @@ async fn queued_empty_bang_shell_reports_help_when_dequeued_and_drains_next_inpu
     assert!(
         rendered.contains(USER_SHELL_COMMAND_HELP_TITLE),
         "expected delayed shell help, got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Example: !Get-ChildItem"),
+        "expected Windows shell example, got {rendered:?}"
     );
 
     match next_submit_op(&mut op_rx) {
@@ -2476,7 +2468,7 @@ async fn slash_pets_with_arg_selects_named_pet() {
 #[serial]
 async fn slash_pets_disable_disables_pets_even_on_unsupported_terminal() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    force_tmux_pet_image_unsupported(&mut chat);
+    force_terminal_pet_image_unsupported(&mut chat);
 
     chat.bottom_pane
         .set_composer_text("/pets disable".to_string(), Vec::new(), Vec::new());
@@ -2491,7 +2483,7 @@ async fn slash_pets_disable_disables_pets_even_on_unsupported_terminal() {
 #[serial]
 async fn slash_pet_hide_disables_pets_even_on_unsupported_terminal() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    force_tmux_pet_image_unsupported(&mut chat);
+    force_terminal_pet_image_unsupported(&mut chat);
 
     chat.bottom_pane
         .set_composer_text("/pet hide".to_string(), Vec::new(), Vec::new());
@@ -2506,7 +2498,7 @@ async fn slash_pet_hide_disables_pets_even_on_unsupported_terminal() {
 #[serial]
 async fn slash_pets_on_unsupported_terminal_warns_without_picker() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    force_tmux_pet_image_unsupported(&mut chat);
+    force_terminal_pet_image_unsupported(&mut chat);
 
     chat.dispatch_command(SlashCommand::Pets);
 
@@ -2517,15 +2509,15 @@ async fn slash_pets_on_unsupported_terminal_warns_without_picker() {
         .map(|lines| lines_to_single_string(lines))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("Pets are disabled in tmux."));
-    assert!(rendered.contains("outside tmux"));
+    assert!(rendered.contains("Pets aren’t available in this terminal."));
+    assert!(rendered.contains("Kitty graphics or Sixel support"));
 }
 
 #[tokio::test]
 #[serial]
 async fn slash_pets_with_arg_on_unsupported_terminal_warns_without_selection() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    force_tmux_pet_image_unsupported(&mut chat);
+    force_terminal_pet_image_unsupported(&mut chat);
 
     chat.bottom_pane
         .set_composer_text("/pets chefito".to_string(), Vec::new(), Vec::new());
@@ -2537,7 +2529,7 @@ async fn slash_pets_with_arg_on_unsupported_terminal_warns_without_selection() {
         .map(|lines| lines_to_single_string(lines))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("Pets are disabled in tmux."));
+    assert!(rendered.contains("Pets aren’t available in this terminal."));
     assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
     assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
 }
@@ -2559,25 +2551,6 @@ async fn slash_pets_on_unsupported_terminal_shows_terminal_warning() {
         .join("\n");
     assert!(rendered.contains("Pets aren’t available in this terminal."));
     assert!(rendered.contains("Kitty graphics or Sixel support"));
-}
-
-#[tokio::test]
-#[serial]
-async fn slash_pets_on_old_iterm2_shows_upgrade_warning() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    force_old_iterm2_pet_image_unsupported(&mut chat);
-
-    chat.dispatch_command(SlashCommand::Pets);
-
-    assert!(!chat.bottom_pane.has_active_view());
-    let cells = drain_insert_history(&mut rx);
-    let rendered = cells
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(rendered.contains("Pets require iTerm2 3.6 or newer."));
-    assert!(rendered.contains("Upgrade iTerm2 to use terminal pets."));
 }
 
 #[tokio::test]

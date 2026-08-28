@@ -5,6 +5,8 @@
 - This is the user's local fork of [`openai/codex`](https://github.com/openai/codex).
   Operate only on fork-local source and artifacts. Upstream synchronization or
   distribution requires a request that explicitly names it.
+- This is a local project for the user's own use and is not intended for public
+  release or distribution.
 - Treat the active repository root as the checkout location; do not hard-code a
   workstation-specific checkout path.
 - `C:\Users\kuh\Desktop\LOCAL-KD` is the fork home and
@@ -20,8 +22,9 @@
 
 ### Scope and workspace
 
-- Read every applicable `AGENTS.md` from the repository root through each path
-  touched, and read every user-provided or user-named file in full.
+- Read the root `AGENTS.md` in full, and read every user-provided or user-named
+  file in full.
+- Communicate with the user in plain language.
 - Work only within the requested scope. Do not broaden a directed fix or add
   unrelated cleanup, refactoring, dependency changes, or activation work.
 - Do not publish, deploy, or modify upstream state unless the user explicitly
@@ -89,9 +92,9 @@
   duplicate or generated representations, compatibility boundary, and named
   validation route. Record a source path or a scoped search with no match for
   each category.
-- `.codex/AGENTS.md` covers workspace routing; `scripts/AGENTS.md` covers
-  maintenance scripts; `.codex/config.toml` and `.codex/skills` own local
-  configuration, fork-local skills, and validation workflows.
+- `SOURCEMAP.md` covers workspace and maintenance-script routing;
+  `.codex/config.toml` and `.codex/skills` own local configuration, fork-local
+  skills, and validation workflows.
 - Modify the requested behavior and the contract relationships identified
   above.
 - After adding, deleting, moving, or renaming a repository file or directory,
@@ -115,9 +118,9 @@
   named, report the missing route before editing.
 - Do not run the full `codex-rs/core` test suite unless the user requests that
   exact scope.
-- For a script edit, follow `scripts/AGENTS.md`. Run its named test; if none is
-  named, run the sibling unit test. If none exists, run the interpreter syntax
-  check and configured formatter or linter.
+- For a script edit, follow the validation route named in `SOURCEMAP.md`. If no
+  route is named, run the sibling unit test. If none exists, run the interpreter
+  syntax check and configured formatter or linter.
 
 ## Sessions and rollout audits
 

@@ -1,5 +1,6 @@
 use async_channel::Receiver;
 use codex_otel::set_parent_from_w3c_trace_context;
+use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::Submission;
 use std::time::Duration;
 use tracing::Instrument;
@@ -175,6 +176,33 @@ pub(super) async fn user_input_or_turn_inner(
     else {
         unreachable!();
     };
+
+    // App-server turn/start submissions register a one-shot admission before
+    // enqueueing. Holding this guard through task installation makes the
+    // active-turn check and the reserved-ID start one atomic admission.
+    let Ok(task_start_permit) = sess.task_start_gate.acquire().await else {
+        unreachable!("session-owned task-start semaphore is never closed");
+    };
+    let mut start_only_admission = {
+        let mut task_start = sess.task_start_state.lock().await;
+        match task_start.pending_start_only_admissions.remove(&sub_id) {
+            Some(admission) => Some((task_start_permit, admission)),
+            None => {
+                drop(task_start_permit);
+                None
+            }
+        }
+    };
+    if start_only_admission.is_some() && sess.active_turn.lock().await.is_some() {
+        if let Some((task_start_permit, admission)) = start_only_admission.take() {
+            drop(task_start_permit);
+            let _ = admission.send(Err(CodexErr::InvalidRequest(
+                "a turn is already active".to_string(),
+            )));
+        }
+        return;
+    }
+
     let emit_thread_settings_applied = thread_settings != ThreadSettingsOverrides::default();
     let updates = if emit_thread_settings_applied {
         thread_settings_update(sess, thread_settings).await
@@ -183,9 +211,16 @@ pub(super) async fn user_input_or_turn_inner(
     };
     let final_output_json_schema = Some(final_output_json_schema);
 
-    let Ok(session_configuration) = sess.apply_turn_settings(&sub_id, &updates).await else {
-        // apply_turn_settings already emits the error event.
-        return;
+    let session_configuration = match sess.apply_turn_settings(&sub_id, &updates).await {
+        Ok(session_configuration) => session_configuration,
+        Err(err) => {
+            // apply_turn_settings already emits the error event.
+            if let Some((task_start_permit, admission)) = start_only_admission.take() {
+                drop(task_start_permit);
+                let _ = admission.send(Err(err));
+            }
+            return;
+        }
     };
     if emit_thread_settings_applied {
         sess.send_event_raw_without_materializing_rollout(Event {
@@ -198,81 +233,101 @@ pub(super) async fn user_input_or_turn_inner(
         .persist_thread_settings_snapshot_if_unmaterialized()
         .await
     {
+        let message = format!("failed to persist initial thread settings: {err}");
         sess.send_event_raw_without_materializing_rollout(Event {
-            id: sub_id,
+            id: sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
-                message: format!("failed to persist initial thread settings: {err}"),
+                message: message.clone(),
                 codex_error_info: Some(CodexErrorInfo::InternalServerError),
             }),
         })
         .await;
+        if let Some((task_start_permit, admission)) = start_only_admission.take() {
+            drop(task_start_permit);
+            let _ = admission.send(Err(CodexErr::Fatal(message)));
+        }
         return;
     }
-    match sess
-        .steer_input(
-            items,
-            additional_context.clone(),
-            /*expected_turn_id*/ None,
-            client_user_message_id.clone(),
-            responsesapi_client_metadata.clone(),
-        )
-        .await
-    {
-        Ok(_) => {}
-        Err(SteerInputError::NoActiveTurn(items)) => {
-            let current_context = sess
-                .new_turn_from_configuration(
-                    sub_id.clone(),
-                    session_configuration,
-                    final_output_json_schema,
-                )
-                .await;
-            sess.maybe_emit_model_warnings_for_turn(current_context.as_ref())
-                .await;
-            if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
-                current_context
-                    .turn_metadata_state
-                    .set_responsesapi_client_metadata(responsesapi_client_metadata);
-            }
-            current_context
-                .update_validation_authorization(&items)
-                .await;
-            current_context.update_multi_agent_spawn_authorization(&items);
-            current_context.session_telemetry.user_prompt(&items);
-            sess.refresh_mcp_servers_if_requested(
-                &current_context,
-                Some(sess.mcp_elicitation_reviewer()),
+    let items = if start_only_admission.is_some() {
+        items
+    } else {
+        match sess
+            .steer_input(
+                items,
+                additional_context.clone(),
+                /*expected_turn_id*/ None,
+                client_user_message_id.clone(),
+                responsesapi_client_metadata.clone(),
             )
-            .await;
-            let additional_context_input = {
-                let mut state = sess.state.lock().await;
-                state.additional_context.merge(additional_context)
-            };
-            let mut task_input = additional_context_input
-                .into_iter()
-                .map(ResponseItem::from)
-                .map(TurnInput::ResponseItem)
-                .collect::<Vec<_>>();
-            if !items.is_empty() {
-                task_input.push(TurnInput::UserInput {
-                    content: items,
-                    client_id: client_user_message_id,
-                });
+            .await
+        {
+            Ok(_) => return,
+            Err(SteerInputError::NoActiveTurn(items)) => items,
+            Err(err) => {
+                sess.send_event_raw(Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(err.to_error_event()),
+                })
+                .await;
+                return;
             }
-            sess.spawn_task(
+        }
+    };
+
+    let current_context = sess
+        .new_turn_from_configuration(
+            sub_id.clone(),
+            session_configuration,
+            final_output_json_schema,
+        )
+        .await;
+    sess.maybe_emit_model_warnings_for_turn(current_context.as_ref())
+        .await;
+    if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
+        current_context
+            .turn_metadata_state
+            .set_responsesapi_client_metadata(responsesapi_client_metadata);
+    }
+    current_context
+        .update_validation_authorization(&items)
+        .await;
+    current_context.update_multi_agent_spawn_authorization(&items);
+    current_context.session_telemetry.user_prompt(&items);
+    sess.refresh_mcp_servers_if_requested(&current_context, Some(sess.mcp_elicitation_reviewer()))
+        .await;
+    let additional_context_input = {
+        let mut state = sess.state.lock().await;
+        state.additional_context.merge(additional_context)
+    };
+    let mut task_input = additional_context_input
+        .into_iter()
+        .map(ResponseItem::from)
+        .map(TurnInput::ResponseItem)
+        .collect::<Vec<_>>();
+    if !items.is_empty() {
+        task_input.push(TurnInput::UserInput {
+            content: items,
+            client_id: client_user_message_id,
+        });
+    }
+    if let Some((task_start_permit, admission)) = start_only_admission.take() {
+        let result = sess
+            .start_task_with_admission(
+                &task_start_permit,
                 Arc::clone(&current_context),
                 task_input,
                 crate::tasks::RegularTask::new(),
             )
             .await;
-        }
-        Err(err) => {
-            sess.send_event_raw(Event {
-                id: sub_id,
-                msg: EventMsg::Error(err.to_error_event()),
-            })
-            .await;
-        }
+        drop(task_start_permit);
+        let _ = admission.send(result);
+    } else {
+        sess.spawn_task(
+            Arc::clone(&current_context),
+            task_input,
+            crate::tasks::RegularTask::new(),
+        )
+        .await;
     }
 }
 
@@ -299,20 +354,21 @@ pub async fn inter_agent_communication(
 }
 
 pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command: String) {
-    if let Some((turn_context, cancellation_token)) =
-        sess.active_turn_context_and_cancellation_token().await
-    {
-        let session = Arc::clone(sess);
-        tokio::spawn(async move {
+    let active_command = command.clone();
+    let session = Arc::clone(sess);
+    if sess
+        .spawn_active_turn_auxiliary(move |turn_context, cancellation_token| async move {
             execute_user_shell_command(
                 session,
                 turn_context,
-                command,
+                active_command,
                 cancellation_token,
                 UserShellCommandMode::ActiveTurnAuxiliary,
             )
             .await;
-        });
+        })
+        .await
+    {
         return;
     }
 
@@ -423,18 +479,6 @@ pub async fn request_user_input_response(
     id: String,
     response: RequestUserInputResponse,
 ) {
-    let terminal = if response.interrupted {
-        sess.active_turn
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|active| active.terminal.clone())
-    } else {
-        None
-    };
-    if let Some(terminal) = terminal {
-        terminal.mark_interrupt_pending().await;
-    }
     sess.notify_user_input_response(&id, response).await;
 }
 
@@ -542,8 +586,12 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .into_iter()
         .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
         .collect::<Vec<_>>();
-    sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
-        .await;
+    sess.apply_rollout_reconstruction(
+        turn_context.as_ref(),
+        replay_items.as_slice(),
+        /*invalidate_unified_exec_sessions*/ false,
+    )
+    .await;
     sess.recompute_token_usage(turn_context.as_ref()).await;
     let reconciled_history = sess.clone_history().await;
     if !sess
@@ -619,8 +667,10 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
+pub(super) const TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 async fn shutdown_session_runtime(sess: &Arc<Session>) {
-    sess.begin_shutdown();
+    sess.begin_shutdown().await;
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
@@ -643,7 +693,17 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     if let Err(err) = sess.services.code_mode_service.shutdown().await {
         warn!("failed to shutdown code mode session: {err}");
     }
-    sess.flush_tool_history_persistence().await;
+    if tokio::time::timeout(
+        TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT,
+        sess.flush_tool_history_persistence(),
+    )
+    .await
+    .is_err()
+    {
+        warn!(
+            "timed out flushing completed-tool history during session shutdown; continuing cleanup with persistence still pending"
+        );
+    }
     sess.services
         .latest_mcp_runtime()
         .manager_arc()

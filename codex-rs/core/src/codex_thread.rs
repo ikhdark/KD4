@@ -54,6 +54,7 @@ use rmcp::model::ReadResourceRequestParams;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 
 use codex_rollout::state_integration::StateDbHandle;
@@ -304,16 +305,61 @@ impl CodexThread {
     ) -> CodexResult<()> {
         debug_assert!(matches!(op, Op::UserInput { .. }));
         let execution_guard = self.reserve_execution_guard(&op).await?;
-        self.submit_submission_with_execution_guard(
-            Submission {
-                id: turn_id,
-                op,
-                client_user_message_id,
-                trace,
-            },
-            execution_guard,
-        )
-        .await
+        let (admission_tx, admission_rx) = oneshot::channel();
+        {
+            let mut task_start = self.codex.session.task_start_state.lock().await;
+            match task_start
+                .pending_start_only_admissions
+                .entry(turn_id.clone())
+            {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(admission_tx);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "turn id {turn_id} already has a pending start admission"
+                    )));
+                }
+            }
+        }
+
+        if let Err(err) = self
+            .submit_submission_with_execution_guard(
+                Submission {
+                    id: turn_id.clone(),
+                    op,
+                    client_user_message_id,
+                    trace,
+                },
+                execution_guard,
+            )
+            .await
+        {
+            self.codex
+                .session
+                .task_start_state
+                .lock()
+                .await
+                .pending_start_only_admissions
+                .remove(&turn_id);
+            return Err(err);
+        }
+
+        match admission_rx.await {
+            Ok(result) => result,
+            Err(_) => {
+                self.codex
+                    .session
+                    .task_start_state
+                    .lock()
+                    .await
+                    .pending_start_only_admissions
+                    .remove(&turn_id);
+                Err(CodexErr::Fatal(format!(
+                    "turn start admission acknowledgement was dropped for {turn_id}"
+                )))
+            }
+        }
     }
 
     /// Persist whether this thread is eligible for future memory generation.
@@ -549,6 +595,26 @@ impl CodexThread {
             .await
     }
 
+    /// Returns the durable terminal acknowledgement fingerprint, when one exists.
+    #[doc(hidden)]
+    pub async fn durably_acknowledged_terminal_fingerprint(&self, turn_id: &str) -> Option<String> {
+        self.codex
+            .session
+            .durably_acknowledged_terminal_fingerprint(turn_id)
+            .await
+    }
+
+    /// Returns terminal fingerprints that still require app-server notification acknowledgement.
+    #[doc(hidden)]
+    pub async fn terminal_events_requiring_app_server_acknowledgement(
+        &self,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        self.codex
+            .session
+            .terminal_events_requiring_app_server_acknowledgement()
+            .await
+    }
+
     pub async fn agent_status(&self) -> AgentStatus {
         self.codex.agent_status().await
     }
@@ -767,6 +833,12 @@ impl CodexThread {
 
     pub async fn environment_selections(&self) -> Vec<TurnEnvironmentSelection> {
         self.codex.thread_environment_selections().await
+    }
+
+    /// Reports whether the selected primary environment exposes a shell.
+    /// `None` means that the thread has no selected environment.
+    pub async fn primary_environment_has_shell(&self) -> Option<bool> {
+        self.codex.thread_primary_environment_has_shell().await
     }
 
     /// Passively inspects the selected capability roots whose environments are ready now.

@@ -19,6 +19,10 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::hash::Hash;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 #[cfg(test)]
@@ -36,14 +40,22 @@ pub(crate) struct FsWatchManager {
     outgoing: Arc<OutgoingMessageSender>,
     file_watcher: Option<Arc<FileWatcher>>,
     state: Arc<AsyncMutex<FsWatchState>>,
+    #[cfg(test)]
+    watch_setup_count: Arc<AtomicUsize>,
 }
 
 #[derive(Default)]
 struct FsWatchState {
     entries: HashMap<WatchKey, WatchEntry>,
+    next_reservation_id: u64,
 }
 
-struct WatchEntry {
+enum WatchEntry {
+    Pending { reservation_id: u64 },
+    Active(ActiveWatchEntry),
+}
+
+struct ActiveWatchEntry {
     cancellation: CancellationToken,
     abort_handle: AbortHandle,
     done_rx: oneshot::Receiver<()>,
@@ -53,12 +65,14 @@ struct WatchEntry {
 
 impl WatchEntry {
     async fn stop(self) {
-        self.cancellation.cancel();
-        if tokio::time::timeout(FS_WATCH_SHUTDOWN_GRACE, self.done_rx)
-            .await
-            .is_err()
-        {
-            self.abort_handle.abort();
+        if let Self::Active(entry) = self {
+            entry.cancellation.cancel();
+            if tokio::time::timeout(FS_WATCH_SHUTDOWN_GRACE, entry.done_rx)
+                .await
+                .is_err()
+            {
+                entry.abort_handle.abort();
+            }
         }
     }
 }
@@ -82,6 +96,8 @@ impl FsWatchManager {
             outgoing,
             file_watcher,
             state: Arc::new(AsyncMutex::new(FsWatchState::default())),
+            #[cfg(test)]
+            watch_setup_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -94,6 +110,7 @@ impl FsWatchManager {
             outgoing,
             file_watcher: Some(file_watcher),
             state: Arc::new(AsyncMutex::new(FsWatchState::default())),
+            watch_setup_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -108,86 +125,132 @@ impl FsWatchManager {
             connection_id,
             watch_id: watch_id.clone(),
         };
-        let file_watcher = self
-            .file_watcher
-            .as_ref()
-            .ok_or_else(|| internal_error("filesystem watching is unavailable"))?;
-        let outgoing = self.outgoing.clone();
-        let (subscriber, rx) = file_watcher.add_subscriber();
-        let watch_root = params.path.clone();
-        let registration = subscriber
-            .register_paths(vec![WatchPath {
-                path: params.path.to_path_buf(),
-                recursive: false,
-            }])
-            .map_err(|err| internal_error(format!("failed to register filesystem watch: {err}")))?;
-        let cancellation = rpc_gate.cancellation_token().child_token();
-        let task_cancellation = cancellation.clone();
-        let task_watch_id = watch_id.clone();
-        let (start_tx, start_rx) = oneshot::channel();
-        let (done_tx, done_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            if start_rx.await.is_ok() {
-                let mut rx = DebouncedWatchReceiver::new(rx, FS_CHANGED_NOTIFICATION_DEBOUNCE);
-                loop {
-                    let event = tokio::select! {
-                        biased;
-                        _ = task_cancellation.cancelled() => break,
-                        event = rx.recv() => match event {
-                            Some(event) => event,
-                            None => break,
-                        },
-                    };
-                    let mut changed_paths = event
-                        .paths
-                        .into_iter()
-                        .map(|path| watch_root.join(path))
-                        .collect::<Vec<_>>();
-                    if event.rescan_required {
-                        changed_paths.push(watch_root.clone());
+        let reservation_id = {
+            let mut state = self.state.lock().await;
+            let reservation_id = state.next_reservation_id;
+            let reservation =
+                rpc_gate.try_commit(|| match state.entries.entry(watch_key.clone()) {
+                    Entry::Occupied(_) => Err(invalid_request(format!(
+                        "watchId already exists: {watch_id}"
+                    ))),
+                    Entry::Vacant(entry) => {
+                        entry.insert(WatchEntry::Pending { reservation_id });
+                        Ok(reservation_id)
                     }
-                    changed_paths.sort_by(|left, right| left.as_path().cmp(right.as_path()));
-                    changed_paths.dedup();
-                    if !changed_paths.is_empty()
-                        && !outgoing
-                            .send_server_notification_to_connection_bounded(
-                                connection_id,
-                                ServerNotification::FsChanged(FsChangedNotification {
-                                    watch_id: task_watch_id.clone(),
-                                    changed_paths,
-                                }),
-                                &task_cancellation,
-                            )
-                            .await
-                    {
-                        break;
-                    }
+                });
+            match reservation {
+                None => return Err(invalid_request("connection is closed")),
+                Some(Err(err)) => return Err(err),
+                Some(Ok(reservation_id)) => {
+                    state.next_reservation_id = state.next_reservation_id.wrapping_add(1);
+                    reservation_id
                 }
             }
-            let _ = done_tx.send(());
-        });
-        let mut pending_entry = Some(WatchEntry {
-            cancellation,
-            abort_handle: task.abort_handle(),
-            done_rx,
-            _subscriber: subscriber,
-            _registration: registration,
-        });
-        drop(task);
+        };
 
+        #[cfg(test)]
+        self.watch_setup_count.fetch_add(1, Ordering::AcqRel);
+        let setup_result = (|| {
+            let file_watcher = self
+                .file_watcher
+                .as_ref()
+                .ok_or_else(|| internal_error("filesystem watching is unavailable"))?;
+            let outgoing = self.outgoing.clone();
+            let (subscriber, rx) = file_watcher.add_subscriber();
+            let watch_root = params.path.clone();
+            let registration = subscriber
+                .register_paths(vec![WatchPath {
+                    path: params.path.to_path_buf(),
+                    recursive: false,
+                }])
+                .map_err(|err| {
+                    internal_error(format!("failed to register filesystem watch: {err}"))
+                })?;
+            let cancellation = rpc_gate.cancellation_token().child_token();
+            let task_cancellation = cancellation.clone();
+            let task_watch_id = watch_id.clone();
+            let (start_tx, start_rx) = oneshot::channel();
+            let (done_tx, done_rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                if start_rx.await.is_ok() {
+                    let mut rx = DebouncedWatchReceiver::new(rx, FS_CHANGED_NOTIFICATION_DEBOUNCE);
+                    loop {
+                        let event = tokio::select! {
+                            biased;
+                            _ = task_cancellation.cancelled() => break,
+                            event = rx.recv() => match event {
+                                Some(event) => event,
+                                None => break,
+                            },
+                        };
+                        let mut changed_paths = event
+                            .paths
+                            .into_iter()
+                            .map(|path| watch_root.join(path))
+                            .collect::<Vec<_>>();
+                        if event.rescan_required {
+                            changed_paths.push(watch_root.clone());
+                        }
+                        changed_paths.sort_by(|left, right| left.as_path().cmp(right.as_path()));
+                        changed_paths.dedup();
+                        if !changed_paths.is_empty()
+                            && !outgoing
+                                .send_server_notification_to_connection_bounded(
+                                    connection_id,
+                                    ServerNotification::FsChanged(FsChangedNotification {
+                                        watch_id: task_watch_id.clone(),
+                                        changed_paths,
+                                    }),
+                                    &task_cancellation,
+                                )
+                                .await
+                        {
+                            break;
+                        }
+                    }
+                }
+                let _ = done_tx.send(());
+            });
+            let entry = ActiveWatchEntry {
+                cancellation,
+                abort_handle: task.abort_handle(),
+                done_rx,
+                _subscriber: subscriber,
+                _registration: registration,
+            };
+            drop(task);
+            Ok::<_, JSONRPCErrorError>((entry, start_tx))
+        })();
+        let (entry, start_tx) = match setup_result {
+            Ok(setup) => setup,
+            Err(err) => {
+                self.remove_pending_reservation(&watch_key, reservation_id)
+                    .await;
+                return Err(err);
+            }
+        };
+        let mut pending_entry = Some(entry);
         let commit_result = {
             let mut state = self.state.lock().await;
-            rpc_gate.try_commit(|| match state.entries.entry(watch_key) {
-                Entry::Occupied(_) => Err(invalid_request(format!(
-                    "watchId already exists: {watch_id}"
-                ))),
-                Entry::Vacant(entry) => {
-                    let Some(pending_entry) = pending_entry.take() else {
-                        return Err(internal_error("watch entry missing during registration"));
-                    };
-                    entry.insert(pending_entry);
-                    Ok(())
+            rpc_gate.try_commit(|| {
+                let Some(entry) = state.entries.get_mut(&watch_key) else {
+                    return Err(invalid_request("watch registration was canceled"));
+                };
+                if !matches!(
+                    entry,
+                    WatchEntry::Pending {
+                        reservation_id: current
+                    } if *current == reservation_id
+                ) {
+                    return Err(internal_error(
+                        "watch reservation changed during registration",
+                    ));
                 }
+                let Some(pending_entry) = pending_entry.take() else {
+                    return Err(internal_error("watch entry missing during registration"));
+                };
+                *entry = WatchEntry::Active(pending_entry);
+                Ok(())
             })
         };
         if commit_result.as_ref().is_some_and(Result::is_ok) {
@@ -196,11 +259,30 @@ impl FsWatchManager {
             drop(start_tx);
         }
         if let Some(entry) = pending_entry {
-            entry.stop().await;
+            WatchEntry::Active(entry).stop().await;
         }
+        self.remove_pending_reservation(&watch_key, reservation_id)
+            .await;
         commit_result.ok_or_else(|| invalid_request("connection is closed"))??;
 
         Ok(FsWatchResponse { path: params.path })
+    }
+
+    async fn remove_pending_reservation(&self, watch_key: &WatchKey, reservation_id: u64) {
+        let mut state = self.state.lock().await;
+        if matches!(
+            state.entries.get(watch_key),
+            Some(WatchEntry::Pending {
+                reservation_id: current
+            }) if *current == reservation_id
+        ) {
+            state.entries.remove(watch_key);
+        }
+    }
+
+    #[cfg(test)]
+    fn watch_setup_count(&self) -> usize {
+        self.watch_setup_count.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -284,6 +366,7 @@ mod tests {
             )),
             file_watcher: None,
             state: Arc::new(AsyncMutex::new(FsWatchState::default())),
+            watch_setup_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -307,6 +390,7 @@ mod tests {
 
         assert_eq!(error.message, "filesystem watching is unavailable");
         assert!(manager.state.lock().await.entries.is_empty());
+        assert_eq!(manager.watch_setup_count(), 1);
     }
 
     #[tokio::test]
@@ -332,6 +416,7 @@ mod tests {
 
         assert_eq!(error.message, "connection is closed");
         assert!(manager.state.lock().await.entries.is_empty());
+        assert_eq!(manager.watch_setup_count(), 0);
     }
 
     #[tokio::test]
@@ -444,6 +529,7 @@ mod tests {
 
         assert_eq!(error.message, "watchId already exists: watch-head");
         assert_eq!(manager.state.lock().await.entries.len(), 1);
+        assert_eq!(manager.watch_setup_count(), 1);
     }
 
     #[tokio::test]

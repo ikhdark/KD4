@@ -329,6 +329,7 @@ async fn input_state_determined_environment_mismatch_blocks_exact_retry_without_
         .expect("first attempt");
 
     let result = intercept_apply_patch(
+        /*is_validation*/ false,
         &command,
         &cwd,
         fs.as_ref(),
@@ -410,6 +411,7 @@ async fn input_state_determined_implicit_patch_blocks_exact_retry_without_mutati
         .expect("first attempt");
 
     let error = match intercept_apply_patch(
+        /*is_validation*/ false,
         &command,
         &cwd,
         turn_environment.environment.get_filesystem().as_ref(),
@@ -445,6 +447,42 @@ async fn input_state_determined_implicit_patch_blocks_exact_retry_without_mutati
         blocked
             .render_for_model()
             .contains("apply_patch implicit invocation")
+    );
+}
+
+#[tokio::test]
+async fn validation_commands_bypass_apply_patch_interception() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let turn_environment = turn
+        .environments
+        .primary()
+        .expect("primary environment")
+        .clone();
+    let cwd = turn_environment.cwd().clone();
+    let command = vec![
+        "apply_patch".to_string(),
+        "*** Begin Patch\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch".to_string(),
+    ];
+
+    let result = intercept_apply_patch(
+        /*is_validation*/ true,
+        &command,
+        &cwd,
+        turn_environment.environment.get_filesystem().as_ref(),
+        turn_environment,
+        session,
+        turn,
+        /*tracker*/ None,
+        "validation-apply-patch-call",
+        "shell",
+    )
+    .await;
+
+    assert!(
+        matches!(result, Ok(None)),
+        "validation must proceed through ordinary command execution"
     );
 }
 

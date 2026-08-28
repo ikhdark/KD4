@@ -6,6 +6,9 @@
 //!   orchestrator has forwarded `http/request` over JSON-RPC
 
 use std::error::Error as StdError;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use codex_exec_server_protocol::JSONRPCErrorError;
@@ -51,9 +54,18 @@ pub(crate) struct PendingReqwestHttpBodyStream {
 /// Validates `http/request` parameters and runs the actual HTTP call used
 /// by the exec-server route and the local [`HttpClient`] backend.
 pub(crate) struct ReqwestHttpRequestRunner {
-    client: SharedHttpClient,
+    client: Arc<SharedHttpClient>,
     timeout: Option<Duration>,
 }
+
+#[derive(Default)]
+struct ReqwestHttpClients {
+    follow_redirects: Option<Arc<SharedHttpClient>>,
+    stop_redirects: Option<Arc<SharedHttpClient>>,
+}
+
+static HTTP_CLIENTS: LazyLock<Mutex<ReqwestHttpClients>> =
+    LazyLock::new(|| Mutex::new(ReqwestHttpClients::default()));
 
 impl ReqwestHttpClient {
     fn build_client(
@@ -67,6 +79,25 @@ impl ReqwestHttpClient {
         builder
             .build_with_transport_default_proxy()
             .map_err(|error| ExecServerError::HttpRequest(error.to_string()))
+    }
+
+    fn shared_client(
+        redirect_policy: HttpRedirectPolicy,
+    ) -> Result<Arc<SharedHttpClient>, ExecServerError> {
+        let mut clients = HTTP_CLIENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = match redirect_policy {
+            HttpRedirectPolicy::Follow => &mut clients.follow_redirects,
+            HttpRedirectPolicy::Stop => &mut clients.stop_redirects,
+        };
+        if let Some(client) = slot.as_ref() {
+            return Ok(client.clone());
+        }
+
+        let client = Arc::new(Self::build_client(redirect_policy)?);
+        *slot = Some(client.clone());
+        Ok(client)
     }
 }
 
@@ -123,7 +154,7 @@ impl ReqwestHttpRequestRunner {
         timeout_ms: Option<u64>,
         redirect_policy: HttpRedirectPolicy,
     ) -> Result<Self, JSONRPCErrorError> {
-        let client = ReqwestHttpClient::build_client(redirect_policy)
+        let client = ReqwestHttpClient::shared_client(redirect_policy)
             .map_err(|error| internal_error(error.to_string()))?;
         Ok(Self {
             client,
@@ -333,6 +364,8 @@ fn error_source_chain(error: &HttpError) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use pretty_assertions::assert_eq;
     use wiremock::Mock;
     use wiremock::MockServer;
@@ -342,6 +375,19 @@ mod tests {
     use wiremock::matchers::path;
 
     use super::*;
+
+    #[test]
+    fn request_runners_reuse_client_per_redirect_policy() {
+        let first = ReqwestHttpClient::shared_client(HttpRedirectPolicy::Follow)
+            .expect("build first HTTP client");
+        let second = ReqwestHttpClient::shared_client(HttpRedirectPolicy::Follow)
+            .expect("reuse HTTP client");
+        let stop = ReqwestHttpClient::shared_client(HttpRedirectPolicy::Stop)
+            .expect("build no-redirect HTTP client");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &stop));
+    }
 
     #[tokio::test]
     async fn request_runner_uses_shared_client_for_buffered_http_request() {

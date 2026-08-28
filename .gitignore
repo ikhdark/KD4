@@ -72,6 +72,9 @@ apply_patch/
 # coverage
 coverage/
 
+# benchmarks
+/docs/benchmarks/turn-latency/
+
 # personal files
 personal/
 /kd-ui/

@@ -88,6 +88,17 @@ impl ToolManifestDictionary {
     }
 
     pub fn encode_item(&mut self, item: &ToolManifestItem) -> Result<ToolManifestItem, String> {
+        if item.is_reference() {
+            if !self.manifests.contains_key(&item.hash) {
+                return Err(format!(
+                    "tool manifest reference hash {} is unavailable",
+                    item.hash
+                ));
+            }
+            self.current_hash = Some(item.hash.clone());
+            return Ok(item.clone());
+        }
+
         if let Some(manifest) = item.manifest.as_ref() {
             if let Some(existing) = self.manifests.get(&item.hash) {
                 if existing != manifest {
@@ -387,5 +398,26 @@ mod tests {
             .expect_err("a reused hash must still reject a conflicting definition");
         assert!(error.contains("conflicting definitions"));
         assert_eq!(writer.manifest("known"), Some(&original));
+    }
+
+    #[test]
+    fn known_reference_is_accepted_without_redecoding_the_dictionary() {
+        let original = manifest(&["shell", "read"]);
+        let mut writer = ToolManifestDictionary::default();
+        writer.encode("known".to_string(), original.clone());
+
+        let reference = writer
+            .encode_item(&ToolManifestItem::reference("known".to_string()))
+            .expect("a known reference should remain a reference");
+
+        assert!(reference.is_reference());
+        assert_eq!(writer.current_hash(), Some("known"));
+        assert_eq!(writer.manifest("known"), Some(&original));
+        assert!(
+            writer
+                .encode_item(&ToolManifestItem::reference("missing".to_string()))
+                .expect_err("an unknown reference must fail closed")
+                .contains("unavailable")
+        );
     }
 }

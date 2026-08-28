@@ -60,6 +60,9 @@ impl ThreadEventStore {
                 | ThreadBufferedEvent::Notification(ServerNotification::HookStarted(_))
                 | ThreadBufferedEvent::Notification(ServerNotification::HookCompleted(_))
                 | ThreadBufferedEvent::Notification(ServerNotification::McpServerStatusUpdated(_))
+                | ThreadBufferedEvent::Notification(ServerNotification::McpServerStartupCompleted(
+                    _
+                ))
                 | ThreadBufferedEvent::FeedbackSubmission(_)
         )
     }
@@ -290,21 +293,146 @@ fn file_change_item_changes(
 }
 
 #[derive(Debug)]
+struct ThreadEventOverflowState {
+    queue: VecDeque<ThreadBufferedEvent>,
+    in_flight: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ThreadEventForwarder {
+    sender: mpsc::Sender<ThreadBufferedEvent>,
+    overflow: Arc<std::sync::Mutex<ThreadEventOverflowState>>,
+    overflow_ready: Arc<tokio::sync::Notify>,
+    overflow_capacity: usize,
+}
+
+impl ThreadEventForwarder {
+    fn new(
+        sender: mpsc::Sender<ThreadBufferedEvent>,
+        overflow_capacity: usize,
+    ) -> (Self, JoinHandle<()>) {
+        let overflow = Arc::new(std::sync::Mutex::new(ThreadEventOverflowState {
+            queue: VecDeque::new(),
+            in_flight: false,
+        }));
+        let overflow_ready = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(run_thread_event_overflow(
+            sender.clone(),
+            Arc::clone(&overflow),
+            Arc::clone(&overflow_ready),
+        ));
+        (
+            Self {
+                sender,
+                overflow,
+                overflow_ready,
+                overflow_capacity,
+            },
+            task,
+        )
+    }
+
+    pub(super) fn try_send(&self, thread_id: ThreadId, event: ThreadBufferedEvent) {
+        if self.sender.is_closed() {
+            tracing::warn!("thread {thread_id} event channel closed");
+            return;
+        }
+
+        {
+            let mut overflow = self
+                .overflow
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if overflow.in_flight || !overflow.queue.is_empty() {
+                self.enqueue_overflow(thread_id, &mut overflow, event);
+                return;
+            }
+        }
+
+        match self.sender.try_send(event) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                let mut overflow = self
+                    .overflow
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.enqueue_overflow(thread_id, &mut overflow, event);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("thread {thread_id} event channel closed");
+            }
+        }
+    }
+
+    fn enqueue_overflow(
+        &self,
+        thread_id: ThreadId,
+        overflow: &mut ThreadEventOverflowState,
+        event: ThreadBufferedEvent,
+    ) {
+        let retained = overflow.queue.len() + usize::from(overflow.in_flight);
+        if retained >= self.overflow_capacity {
+            tracing::warn!(
+                "thread {thread_id} event overflow is full; retaining event only in the replay store"
+            );
+            return;
+        }
+        overflow.queue.push_back(event);
+        self.overflow_ready.notify_one();
+    }
+}
+
+async fn run_thread_event_overflow(
+    sender: mpsc::Sender<ThreadBufferedEvent>,
+    overflow: Arc<std::sync::Mutex<ThreadEventOverflowState>>,
+    overflow_ready: Arc<tokio::sync::Notify>,
+) {
+    loop {
+        let notified = overflow_ready.notified();
+        let event = {
+            let mut overflow = overflow
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let event = overflow.queue.pop_front();
+            if event.is_some() {
+                overflow.in_flight = true;
+            }
+            event
+        };
+        let Some(event) = event else {
+            notified.await;
+            continue;
+        };
+        let sent = sender.send(event).await.is_ok();
+        overflow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .in_flight = false;
+        if !sent {
+            return;
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct ThreadEventChannel {
-    pub(super) sender: mpsc::Sender<ThreadBufferedEvent>,
+    pub(super) forwarder: ThreadEventForwarder,
     pub(super) receiver: Option<mpsc::Receiver<ThreadBufferedEvent>>,
     pub(super) store: Arc<Mutex<ThreadEventStore>>,
     attachment: ThreadEventAttachment,
+    overflow_task: JoinHandle<()>,
 }
 
 impl ThreadEventChannel {
     pub(super) fn new(capacity: usize) -> Self {
         let (sender, receiver) = mpsc::channel(capacity);
+        let (forwarder, overflow_task) = ThreadEventForwarder::new(sender, capacity);
         Self {
-            sender,
+            forwarder,
             receiver: Some(receiver),
             store: Arc::new(Mutex::new(ThreadEventStore::new(capacity))),
             attachment: ThreadEventAttachment::Live,
+            overflow_task,
         }
     }
 
@@ -323,14 +451,22 @@ impl ThreadEventChannel {
         turns: Vec<Turn>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(capacity);
+        let (forwarder, overflow_task) = ThreadEventForwarder::new(sender, capacity);
         Self {
-            sender,
+            forwarder,
             receiver: Some(receiver),
             store: Arc::new(Mutex::new(ThreadEventStore::new_with_session(
                 capacity, session, turns,
             ))),
             attachment: ThreadEventAttachment::Live,
+            overflow_task,
         }
+    }
+}
+
+impl Drop for ThreadEventChannel {
+    fn drop(&mut self) {
+        self.overflow_task.abort();
     }
 }
 

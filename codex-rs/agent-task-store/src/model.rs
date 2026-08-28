@@ -793,7 +793,6 @@ pub enum ValidationCallStatus {
     Failed,
     NotExecuted,
     Cancelled,
-    Superseded,
 }
 
 impl ValidationCallStatus {
@@ -806,23 +805,12 @@ impl ValidationCallStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ValidationProofKind {
-    #[default]
-    LegacyUnclassified,
-    Focused,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidationCall {
     pub call_id: String,
     pub attempt_id: AttemptId,
     pub command_summary: String,
-    #[serde(default)]
-    pub resolved_executable: Option<String>,
-    #[serde(default)]
-    pub proof_kind: ValidationProofKind,
     #[serde(default)]
     pub evidence: ValidationEvidence,
     pub status: ValidationCallStatus,
@@ -830,98 +818,20 @@ pub struct ValidationCall {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidationEvidence {
-    /// Immutable completion-candidate identity. Missing values mark legacy
-    /// evidence that may be displayed but must never satisfy proof reuse.
     #[serde(default)]
-    pub candidate_id: String,
-    #[serde(default)]
-    pub implementation_identity: String,
-    #[serde(default)]
-    pub source_evidence_epoch: Option<u64>,
-    #[serde(default)]
-    pub normalized_invocation: String,
-    #[serde(default)]
-    pub coverage_identity: String,
     pub start_epoch: u64,
+    #[serde(default)]
     pub end_epoch: Option<u64>,
     #[serde(default)]
-    pub covered_scopes: Vec<RepoScope>,
-    pub covered_manifest: Vec<WorkspaceManifestEntry>,
-    #[serde(default)]
-    pub execution_snapshot: Option<Box<ValidationExecutionSnapshot>>,
-    pub covered_contracts: Vec<String>,
-    pub manifest_hash: String,
-    pub repository_wide: bool,
-    pub cwd: Option<String>,
-    pub environment_hash: Option<String>,
-    pub toolchain: Option<String>,
-    #[serde(default)]
-    pub features_configuration_identity: String,
-    #[serde(default)]
-    pub covered_input_manifest_hash: String,
-    #[serde(default)]
-    pub dependency_manifest_hash: String,
-    #[serde(default)]
-    pub successful_result: Option<bool>,
-    #[serde(default)]
-    pub retained_output_digest: String,
     pub retained_output_ref: Option<String>,
     #[serde(default)]
     pub output_summary: Option<String>,
-    /// Backward-compatible structured terminal projection. The task store
-    /// remains protocol-agnostic and preserves the canonical JSON value.
     #[serde(default)]
     pub validation_result: Option<serde_json::Value>,
+    #[serde(default)]
     pub lease_expires_at: Option<DateTime<Utc>>,
-    pub shared_from_call_id: Option<String>,
-    pub stale_reason: Option<String>,
-}
-
-impl ValidationEvidence {
-    pub fn has_complete_request_identity(&self) -> bool {
-        !self.candidate_id.is_empty()
-            && !self.implementation_identity.is_empty()
-            && self.source_evidence_epoch.is_some()
-            && !self.normalized_invocation.is_empty()
-            && !self.coverage_identity.is_empty()
-            && !self.manifest_hash.is_empty()
-            && self.cwd.as_deref().is_some_and(|cwd| !cwd.is_empty())
-            && self
-                .environment_hash
-                .as_deref()
-                .is_some_and(|hash| !hash.is_empty())
-            && self
-                .toolchain
-                .as_deref()
-                .is_some_and(|toolchain| !toolchain.is_empty())
-            && !self.covered_input_manifest_hash.is_empty()
-            && !self.dependency_manifest_hash.is_empty()
-            && !self.features_configuration_identity.is_empty()
-    }
-
-    pub fn is_reusable_success(&self) -> bool {
-        self.has_complete_request_identity()
-            && self.successful_result == Some(true)
-            && !self.retained_output_digest.is_empty()
-            && self
-                .retained_output_ref
-                .as_deref()
-                .is_some_and(|output_ref| !output_ref.is_empty())
-            && self.stale_reason.is_none()
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ValidationExecutionSnapshot {
-    pub manifest: Vec<WorkspaceManifestEntry>,
-    pub manifest_hash: String,
-    #[serde(default)]
-    pub capture_mode: WorkspaceCaptureMode,
-    #[serde(default)]
-    pub complete: bool,
-    #[serde(default)]
-    pub discovery_errors: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1008,8 +918,6 @@ pub struct AgentReceipt {
     pub architecture_contract: Option<SealedArchitectureContractV1>,
     #[serde(default)]
     pub evidence_epoch: u64,
-    #[serde(default)]
-    pub evidence_manifest_hash: String,
     pub sealed_at: DateTime<Utc>,
 }
 
@@ -1294,6 +1202,12 @@ pub struct AgentTask {
     #[serde(default)]
     pub integration_handoffs: Vec<IsolationHandoff>,
     pub observations: Vec<RuntimeObservation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentTaskAuthorization {
+    pub admission_origin: AssignmentAdmissionOrigin,
+    pub current_attempt: Attempt,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

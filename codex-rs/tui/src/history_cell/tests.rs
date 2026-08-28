@@ -619,10 +619,9 @@ async fn session_info_uses_availability_nux_tooltip_override() {
 }
 
 #[tokio::test]
-#[ignore = "snapshot path rendering differs on Windows"]
 async fn session_info_availability_nux_tooltip_snapshot() {
     let mut config = test_config().await;
-    config.cwd = test_path_buf("/tmp/project").abs();
+    config.cwd = test_path_buf(r"C:\project").abs();
     let cell = new_session_info(
         &config,
         "gpt-5",
@@ -1641,7 +1640,6 @@ fn coalesces_sequential_reads_within_one_call() {
             source: ExecCommandSource::Agent,
             start_time: Some(Instant::now()),
             duration: None,
-            interaction_input: None,
         },
         /*animations_enabled*/ true,
     );
@@ -1668,7 +1666,6 @@ fn coalesces_reads_across_multiple_calls() {
             source: ExecCommandSource::Agent,
             start_time: Some(Instant::now()),
             duration: None,
-            interaction_input: None,
         },
         /*animations_enabled*/ true,
     );
@@ -1685,7 +1682,6 @@ fn coalesces_reads_across_multiple_calls() {
                 path: "shimmer.rs".into(),
             }],
             ExecCommandSource::Agent,
-            /*interaction_input*/ None,
         )
         .unwrap();
     cell.complete_call("c2", CommandOutput::default(), Duration::from_millis(1));
@@ -1700,7 +1696,6 @@ fn coalesces_reads_across_multiple_calls() {
                 path: "status_indicator_widget.rs".into(),
             }],
             ExecCommandSource::Agent,
-            /*interaction_input*/ None,
         )
         .unwrap();
     cell.complete_call("c3", CommandOutput::default(), Duration::from_millis(1));
@@ -1737,7 +1732,6 @@ fn coalesced_reads_dedupe_names() {
             source: ExecCommandSource::Agent,
             start_time: Some(Instant::now()),
             duration: None,
-            interaction_input: None,
         },
         /*animations_enabled*/ true,
     );
@@ -1761,7 +1755,6 @@ fn multiline_command_wraps_with_extra_indent_on_subsequent_lines() {
             source: ExecCommandSource::Agent,
             start_time: Some(Instant::now()),
             duration: None,
-            interaction_input: None,
         },
         /*animations_enabled*/ true,
     );
@@ -1787,7 +1780,6 @@ fn single_line_command_compact_when_fits() {
             source: ExecCommandSource::Agent,
             start_time: Some(Instant::now()),
             duration: None,
-            interaction_input: None,
         },
         /*animations_enabled*/ true,
     );
@@ -1811,7 +1803,6 @@ fn single_line_command_wraps_with_four_space_continuation() {
             source: ExecCommandSource::Agent,
             start_time: Some(Instant::now()),
             duration: None,
-            interaction_input: None,
         },
         /*animations_enabled*/ true,
     );
@@ -1834,7 +1825,6 @@ fn multiline_command_without_wrap_uses_branch_then_eight_spaces() {
             source: ExecCommandSource::Agent,
             start_time: Some(Instant::now()),
             duration: None,
-            interaction_input: None,
         },
         /*animations_enabled*/ true,
     );
@@ -1858,7 +1848,6 @@ fn multiline_command_both_lines_wrap_with_correct_prefixes() {
             source: ExecCommandSource::Agent,
             start_time: Some(Instant::now()),
             duration: None,
-            interaction_input: None,
         },
         /*animations_enabled*/ true,
     );
@@ -1882,7 +1871,6 @@ fn stderr_tail_more_than_five_lines_snapshot() {
             source: ExecCommandSource::Agent,
             start_time: Some(Instant::now()),
             duration: None,
-            interaction_input: None,
         },
         /*animations_enabled*/ true,
     );
@@ -1928,7 +1916,6 @@ fn ran_cell_multiline_with_stderr_snapshot() {
             source: ExecCommandSource::Agent,
             start_time: Some(Instant::now()),
             duration: None,
-            interaction_input: None,
         },
         /*animations_enabled*/ true,
     );

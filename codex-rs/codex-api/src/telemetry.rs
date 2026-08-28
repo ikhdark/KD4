@@ -73,6 +73,14 @@ pub trait SseTelemetry: Send + Sync {
         duration: Duration,
     );
 
+    fn on_sse_event(
+        &self,
+        _kind: &str,
+        _duration: Duration,
+        _error: Option<&dyn std::fmt::Display>,
+    ) {
+    }
+
     fn on_sse_phase(&self, _phase: SsePollPhase, _ordinal: u64, _duration: Duration) {}
 
     fn on_sse_cleanup(&self, _outcome: SseCleanupOutcome, _duration: Duration) {}

@@ -339,6 +339,21 @@ fn test_create_amazon_bedrock_provider() {
 }
 
 #[test]
+fn amazon_bedrock_identity_requires_bedrock_auth_configuration() {
+    let custom_provider: ModelProviderInfo = toml::from_str(
+        r#"
+name = "Amazon Bedrock"
+base_url = "https://custom.example.test/v1"
+wire_api = "responses"
+"#,
+    )
+    .expect("custom provider config");
+
+    assert!(!custom_provider.is_amazon_bedrock());
+    assert!(ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None).is_amazon_bedrock());
+}
+
+#[test]
 fn test_amazon_bedrock_provider_adds_mantle_client_agent_header() {
     let api_provider = ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None)
         .to_api_provider(/*auth_mode*/ None)

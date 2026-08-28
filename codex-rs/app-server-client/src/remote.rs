@@ -1129,11 +1129,7 @@ async fn deliver_event(
 }
 
 fn jsonrpc_request_from_client_request(request: ClientRequest) -> JSONRPCRequest {
-    let value = match serde_json::to_value(request) {
-        Ok(value) => value,
-        Err(err) => panic!("client request should serialize: {err}"),
-    };
-    match serde_json::from_value(value) {
+    match JSONRPCRequest::try_from(request) {
         Ok(request) => request,
         Err(err) => panic!("client request should encode as JSON-RPC request: {err}"),
     }
@@ -1142,11 +1138,7 @@ fn jsonrpc_request_from_client_request(request: ClientRequest) -> JSONRPCRequest
 fn jsonrpc_notification_from_client_notification(
     notification: ClientNotification,
 ) -> JSONRPCNotification {
-    let value = match serde_json::to_value(notification) {
-        Ok(value) => value,
-        Err(err) => panic!("client notification should serialize: {err}"),
-    };
-    match serde_json::from_value(value) {
+    match JSONRPCNotification::try_from(notification) {
         Ok(notification) => notification,
         Err(err) => panic!("client notification should encode as JSON-RPC notification: {err}"),
     }
@@ -1202,6 +1194,30 @@ mod tests {
         };
 
         assert!(command.is_abandoned_request());
+    }
+
+    #[test]
+    fn confirmed_performance_client_adapters_preserve_jsonrpc_shape() {
+        let request = jsonrpc_request_from_client_request(ClientRequest::GetAccount {
+            request_id: RequestId::Integer(7),
+            params: codex_app_server_protocol::GetAccountParams {
+                refresh_token: true,
+            },
+        });
+        assert_eq!(request.method, "account/read");
+        assert_eq!(request.id, RequestId::Integer(7));
+        assert_eq!(
+            request.params,
+            Some(serde_json::json!({ "refreshToken": true }))
+        );
+
+        assert_eq!(
+            jsonrpc_notification_from_client_notification(ClientNotification::Initialized),
+            JSONRPCNotification {
+                method: "initialized".to_string(),
+                params: None,
+            }
+        );
     }
 
     #[tokio::test]

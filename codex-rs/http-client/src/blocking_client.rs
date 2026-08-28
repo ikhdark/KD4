@@ -10,7 +10,8 @@ use http::StatusCode;
 
 use crate::BuildCustomCaTransportError;
 use crate::HttpError;
-use crate::custom_ca::build_blocking_reqwest_client_with_custom_ca;
+use crate::custom_ca::CustomCaPolicy;
+use crate::custom_ca::build_blocking_reqwest_client_with_custom_ca_policy;
 
 /// Configures a blocking client without exposing the underlying transport.
 pub struct BlockingHttpClientBuilder {
@@ -48,6 +49,8 @@ impl BlockingHttpClientBuilder {
     }
 
     /// Replaces the transport root set with the certificate encoded by `pem`.
+    ///
+    /// Process custom CA environment variables are not added to this exclusive root set.
     pub fn tls_certs_only_pem(mut self, pem: &[u8]) -> Result<Self, HttpError> {
         let certificate = reqwest::Certificate::from_pem(pem)?;
         self.tls_certs_only = Some(vec![certificate]);
@@ -78,6 +81,25 @@ impl BlockingHttpClientBuilder {
     }
 
     fn build_inner(self, direct: bool) -> Result<BlockingHttpClient, BuildCustomCaTransportError> {
+        self.build_inner_using(direct, build_blocking_reqwest_client_with_custom_ca_policy)
+    }
+
+    fn build_inner_using(
+        self,
+        direct: bool,
+        build_with_custom_ca: impl FnOnce(
+            reqwest::blocking::ClientBuilder,
+            CustomCaPolicy,
+        ) -> Result<
+            reqwest::blocking::Client,
+            BuildCustomCaTransportError,
+        >,
+    ) -> Result<BlockingHttpClient, BuildCustomCaTransportError> {
+        let custom_ca_policy = if self.tls_certs_only.is_some() {
+            CustomCaPolicy::ExplicitRootSet
+        } else {
+            CustomCaPolicy::HonorProcessEnvironment
+        };
         let mut builder = reqwest::blocking::Client::builder();
         if direct {
             builder = builder.no_proxy();
@@ -95,8 +117,7 @@ impl BlockingHttpClientBuilder {
             builder = builder.identity(identity);
         }
         builder = builder.https_only(self.https_only);
-        build_blocking_reqwest_client_with_custom_ca(builder)
-            .map(|inner| BlockingHttpClient { inner })
+        build_with_custom_ca(builder, custom_ca_policy).map(|inner| BlockingHttpClient { inner })
     }
 }
 

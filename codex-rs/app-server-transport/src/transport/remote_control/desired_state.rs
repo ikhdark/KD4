@@ -115,7 +115,8 @@ impl RemoteControlHandle {
         let status = self.status();
         let mut current_enrollment = self.current_enrollment.lock().await;
         let (enrollment, _) = self
-            .load_or_enroll_server(
+            .load_or_enroll_server_with_source(
+                super::RemoteControlHttpClientSource::Pool(&self.http_clients),
                 &current_enrollment,
                 &mut auth,
                 &status.installation_id,

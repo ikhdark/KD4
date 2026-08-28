@@ -1,3 +1,6 @@
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 use tree_sitter::Node;
@@ -8,15 +11,29 @@ use tree_sitter_bash::LANGUAGE as BASH;
 use crate::shell_detect::ShellType;
 use crate::shell_detect::detect_shell_type;
 
-/// Parse the provided bash source using tree-sitter-bash, returning a Tree on
-/// success or None if parsing failed.
-pub fn try_parse_shell(shell_lc_arg: &str) -> Option<Tree> {
+thread_local! {
+    static BASH_PARSER: RefCell<Parser> = RefCell::new(new_bash_parser());
+}
+
+#[cfg(test)]
+thread_local! {
+    static BASH_PARSER_INITIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn new_bash_parser() -> Parser {
+    #[cfg(test)]
+    BASH_PARSER_INITIALIZATIONS.with(|count| count.set(count.get().saturating_add(1)));
     let lang = BASH.into();
     let mut parser = Parser::new();
     #[expect(clippy::expect_used)]
     parser.set_language(&lang).expect("load bash grammar");
-    let old_tree: Option<&Tree> = None;
-    parser.parse(shell_lc_arg, old_tree)
+    parser
+}
+
+/// Parse the provided bash source using tree-sitter-bash, returning a Tree on
+/// success or None if parsing failed.
+pub fn try_parse_shell(shell_lc_arg: &str) -> Option<Tree> {
+    BASH_PARSER.with(|parser| parser.borrow_mut().parse(shell_lc_arg, /*old_tree*/ None))
 }
 
 /// Parse a script which may contain multiple simple commands joined only by
@@ -340,6 +357,12 @@ fn parse_double_quoted_string(node: Node, src: &str) -> Option<String> {
     let stripped = raw
         .strip_prefix('"')
         .and_then(|text| text.strip_suffix('"'))?;
+    // Bash gives backslashes semantic meaning inside double quotes. Until this
+    // parser decodes every supported escape exactly, reject such strings so
+    // authorization falls back to the exact outer shell argv.
+    if stripped.contains('\\') {
+        return None;
+    }
     Some(stripped.to_string())
 }
 
@@ -362,6 +385,22 @@ mod tests {
 
     fn parse_seq(src: &str) -> Option<Vec<Vec<String>>> {
         parse_shell_script_into_commands(src)
+    }
+
+    #[test]
+    fn repeated_parses_reuse_the_thread_local_parser() {
+        let initializations_before = BASH_PARSER_INITIALIZATIONS.get();
+
+        assert!(try_parse_shell("echo one").is_some());
+        assert!(try_parse_shell("echo two").is_some());
+
+        assert!(
+            BASH_PARSER_INITIALIZATIONS
+                .get()
+                .saturating_sub(initializations_before)
+                <= 1,
+            "one test thread must initialize at most one parser"
+        );
     }
 
     #[test]
@@ -395,6 +434,15 @@ mod tests {
         assert_eq!(
             cmds2,
             vec![vec!["echo".to_string(), "hi there".to_string()]]
+        );
+    }
+
+    #[test]
+    fn authorization_identity_rejects_backslashes_in_double_quoted_strings() {
+        assert!(parse_seq(r#"tool "a\"b""#).is_none());
+        assert_eq!(
+            parse_seq(r#"tool 'a\"b'"#),
+            Some(vec![vec!["tool".to_string(), r#"a\"b"#.to_string()]])
         );
     }
 

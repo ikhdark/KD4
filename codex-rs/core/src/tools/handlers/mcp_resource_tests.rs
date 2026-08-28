@@ -136,6 +136,7 @@ async fn step_context_with_blocked_mcp_server(
         /*elicitation_reviewer*/ None,
         /*elicitation_lifecycle*/ None,
         ElicitationRequestRouter::default(),
+        /*previous_manager*/ None,
     )
     .await;
     tokio::time::timeout(Duration::from_secs(2), connected_rx)

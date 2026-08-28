@@ -19,16 +19,16 @@ impl Shell {
 
     /// Takes a string of shell and returns the full list of command args to
     /// use with `exec()` to run the shell command.
-    pub fn derive_exec_args(&self, command: &str, use_login_shell: bool) -> Vec<String> {
+    pub fn derive_exec_args(
+        &self,
+        command: &str,
+        use_login_shell: bool,
+    ) -> anyhow::Result<Vec<String>> {
         match self.shell_type {
-            ShellType::Zsh | ShellType::Bash | ShellType::Sh => {
-                let arg = if use_login_shell { "-lc" } else { "-c" };
-                vec![
-                    self.shell_path.to_string_lossy().to_string(),
-                    arg.to_string(),
-                    command.to_string(),
-                ]
-            }
+            ShellType::Zsh | ShellType::Bash | ShellType::Sh => anyhow::bail!(
+                "shell `{}` is retained for compatibility but cannot execute on Windows",
+                self.shell_type.name()
+            ),
             ShellType::PowerShell => {
                 let mut args = vec![self.shell_path.to_string_lossy().to_string()];
                 if !use_login_shell {
@@ -37,13 +37,13 @@ impl Shell {
 
                 args.push("-Command".to_string());
                 args.push(command.to_string());
-                args
+                Ok(args)
             }
             ShellType::Cmd => {
                 let mut args = vec![self.shell_path.to_string_lossy().to_string()];
                 args.push("/c".to_string());
                 args.push(command.to_string());
-                args
+                Ok(args)
             }
         }
     }
@@ -61,11 +61,12 @@ impl From<DetectedShell> for Shell {
 impl Shell {
     pub(crate) fn from_environment_shell_info(shell_info: ShellInfo) -> anyhow::Result<Self> {
         let shell_type = match shell_info.name.as_str() {
-            "zsh" => ShellType::Zsh,
-            "bash" => ShellType::Bash,
             "powershell" => ShellType::PowerShell,
-            "sh" => ShellType::Sh,
             "cmd" => ShellType::Cmd,
+            "zsh" | "bash" | "sh" => anyhow::bail!(
+                "shell `{}` is retained for compatibility but cannot execute on Windows",
+                shell_info.name
+            ),
             name => anyhow::bail!("unknown environment shell `{name}`"),
         };
 

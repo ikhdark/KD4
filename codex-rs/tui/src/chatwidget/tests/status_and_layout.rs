@@ -7,12 +7,44 @@ use codex_protocol::openai_models::SPEED_TIER_FAST;
 use pretty_assertions::assert_eq;
 use ratatui::backend::TestBackend;
 use serial_test::serial;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
+#[derive(Debug)]
+struct CountingHistoryCell {
+    display_calls: Arc<AtomicUsize>,
+}
+
+impl HistoryCell for CountingHistoryCell {
+    fn display_lines(&self, _width: u16) -> Vec<ratatui::text::Line<'static>> {
+        self.display_calls.fetch_add(1, Ordering::Relaxed);
+        vec!["visible".into()]
+    }
+
+    fn raw_lines(&self) -> Vec<ratatui::text::Line<'static>> {
+        vec!["visible".into()]
+    }
+}
 
 fn enable_test_ambient_pet(chat: &mut ChatWidget) {
     chat.set_pet_image_support_for_tests(crate::pets::PetImageSupport::Supported(
         crate::pets::ImageProtocol::Kitty,
     ));
     chat.install_test_ambient_pet_for_tests(/*animations_enabled*/ false);
+}
+
+#[tokio::test]
+async fn adding_visible_history_during_a_turn_renders_the_cell_once() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+    let display_calls = Arc::new(AtomicUsize::new(0));
+
+    chat.add_to_history(CountingHistoryCell {
+        display_calls: Arc::clone(&display_calls),
+    });
+
+    assert_eq!(display_calls.load(Ordering::Relaxed), 1);
 }
 
 fn take_workspace_headline_request_id(
@@ -367,6 +399,60 @@ async fn flush_answer_stream_requests_scrollback_reflow_for_live_table_tail() {
 }
 
 #[tokio::test]
+async fn partial_table_deltas_do_not_reinstall_unchanged_agent_or_plan_tail() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let cwd = chat.config.cwd.to_path_buf();
+
+    let mut agent = crate::streaming::controller::StreamController::new(
+        Some(80),
+        cwd.as_path(),
+        chat.config.file_opener,
+        HistoryRenderMode::Rich,
+    );
+    agent.push("| Name | Notes |\n");
+    agent.push("| --- | --- |\n");
+    agent.flush_render_for_frame();
+    chat.stream_controller = Some(agent);
+    chat.sync_active_stream_tail();
+    let agent_revision = chat.transcript.active_cell_revision;
+
+    chat.stream_controller
+        .as_mut()
+        .expect("agent stream")
+        .push("| partial row");
+    chat.sync_active_stream_tail();
+    assert_eq!(
+        chat.transcript.active_cell_revision, agent_revision,
+        "newline-gated agent input did not change the visible tail",
+    );
+
+    chat.stream_controller = None;
+    chat.clear_active_stream_tail();
+    let mut plan = crate::streaming::controller::PlanStreamController::new(
+        Some(80),
+        cwd.as_path(),
+        chat.config.file_opener,
+        HistoryRenderMode::Rich,
+    );
+    plan.push("| Step | Owner |\n");
+    plan.push("| --- | --- |\n");
+    plan.flush_render_for_frame();
+    chat.plan_stream_controller = Some(plan);
+    chat.sync_active_stream_tail();
+    let plan_revision = chat.transcript.active_cell_revision;
+
+    chat.plan_stream_controller
+        .as_mut()
+        .expect("plan stream")
+        .push("| partial row");
+    chat.sync_active_stream_tail();
+    assert_eq!(
+        chat.transcript.active_cell_revision, plan_revision,
+        "newline-gated plan input did not change the visible tail",
+    );
+}
+
+#[tokio::test]
 async fn completed_plan_table_tail_skips_provisional_history_insert() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let cwd = chat.config.cwd.to_path_buf();
@@ -460,7 +546,6 @@ async fn completed_plan_consolidates_streamed_cell_with_authoritative_final_text
 }
 
 #[tokio::test]
-#[ignore = "disabled on windows"]
 async fn configured_pet_load_is_deferred_until_after_construction() {
     let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
     let tx = AppEventSender::new(tx_raw);

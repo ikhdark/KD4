@@ -33,6 +33,7 @@ use std::sync::atomic::AtomicBool;
 
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
 use rand::Rng;
@@ -119,6 +120,7 @@ pub(crate) struct ExecCommandRequest {
     pub attempt_key: CommandAttemptKey,
     pub raw_output_artifact: RawOutputArtifact,
     pub shell_type: ShellType,
+    pub shell_wrapper_is_owned: bool,
     pub hook_command: String,
     pub process_id: u32,
     pub yield_time_ms: u64,
@@ -132,15 +134,11 @@ pub(crate) struct ExecCommandRequest {
     pub tty: bool,
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
+    pub additional_permissions_uri: Option<UriAdditionalPermissionProfile>,
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
     pub validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
-    pub validation_observation:
-        Arc<StdMutex<Option<crate::validation_admission::ValidationObservationToken>>>,
-    pub validation_leader:
-        Arc<StdMutex<Option<crate::validation_admission::ValidationLeaderOwnership>>>,
-    pub validation_waiter: Option<crate::validation_admission::ValidationLeader>,
     pub known_delta: Option<PreparedKnownDelta>,
 }
 
@@ -279,7 +277,6 @@ pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
 }
 
 pub(crate) fn clamp_yield_time_for_readiness(yield_time_ms: u64, executor_ready: bool) -> u64 {
-    let executor_ready = executor_ready && crate::latency_switches::stage5_executor_enabled();
     let yield_time_ms = if !executor_ready {
         yield_time_ms.max(WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS)
     } else {
@@ -298,6 +295,6 @@ pub(crate) fn generate_chunk_id() -> String {
 #[cfg(test)]
 #[path = "process_tests.rs"]
 mod process_tests;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;

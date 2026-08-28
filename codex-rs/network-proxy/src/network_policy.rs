@@ -1,6 +1,7 @@
 use crate::reasons::REASON_POLICY_DENIED;
 use crate::runtime::HostBlockDecision;
 use crate::runtime::HostBlockReason;
+use crate::runtime::RequestPolicySnapshot;
 use crate::state::NetworkProxyState;
 use anyhow::Result;
 use chrono::SecondsFormat;
@@ -296,13 +297,24 @@ where
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn evaluate_host_policy(
     state: &NetworkProxyState,
     decider: Option<&Arc<dyn NetworkPolicyDecider>>,
     request: &NetworkPolicyRequest,
 ) -> Result<NetworkDecision> {
+    let policy = state.request_policy_snapshot().await?;
+    evaluate_host_policy_with_snapshot(state, &policy, decider, request).await
+}
+
+pub(crate) async fn evaluate_host_policy_with_snapshot(
+    state: &NetworkProxyState,
+    policy: &RequestPolicySnapshot,
+    decider: Option<&Arc<dyn NetworkPolicyDecider>>,
+    request: &NetworkPolicyRequest,
+) -> Result<NetworkDecision> {
     let execution_id = state.execution_id();
-    let host_decision = state.host_blocked(&request.host, request.port).await?;
+    let host_decision = policy.host_blocked(&request.host, request.port).await?;
     let (decision, policy_override) = match host_decision {
         HostBlockDecision::Allowed => (NetworkDecision::Allow, false),
         HostBlockDecision::Blocked(HostBlockReason::NotAllowed) => {
@@ -837,7 +849,7 @@ mod tests {
             auth_mode: Some("Chatgpt".to_string()),
             originator: Some("codex_cli_rs".to_string()),
             user_email: Some("test@example.com".to_string()),
-            terminal_type: Some("iTerm.app/3.6.5".to_string()),
+            terminal_type: Some("WindowsTerminal/1.23.12611.0".to_string()),
             model: Some("gpt-5.3-codex".to_string()),
             slug: Some("gpt-5.3-codex".to_string()),
         };
@@ -868,7 +880,10 @@ mod tests {
         assert_eq!(event.field("originator"), Some("codex_cli_rs"));
         assert_eq!(event.field("user.account_id"), Some("acct-1"));
         assert_eq!(event.field("user.email"), Some("test@example.com"));
-        assert_eq!(event.field("terminal.type"), Some("iTerm.app/3.6.5"));
+        assert_eq!(
+            event.field("terminal.type"),
+            Some("WindowsTerminal/1.23.12611.0")
+        );
         assert_eq!(event.field("model"), Some("gpt-5.3-codex"));
         assert_eq!(event.field("slug"), Some("gpt-5.3-codex"));
     }

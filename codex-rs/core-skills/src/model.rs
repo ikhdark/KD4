@@ -19,6 +19,23 @@ use sha2::Sha256;
 const SKILL_CATALOG_ID_DOMAIN: &[u8] = b"codex.skill-catalog-id.v1";
 pub const SKILL_CATALOG_LOCATOR_PREFIX: &str = "skill:";
 
+pub fn skill_instruction_role(scope: SkillScope) -> &'static str {
+    match scope {
+        SkillScope::System => "system",
+        SkillScope::Admin => "developer",
+        SkillScope::Repo | SkillScope::User => "user",
+    }
+}
+
+pub fn skill_scope_label(scope: SkillScope) -> &'static str {
+    match scope {
+        SkillScope::Repo => "repo",
+        SkillScope::User => "user",
+        SkillScope::System => "system",
+        SkillScope::Admin => "admin",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkillMetadata {
     pub name: String,
@@ -177,12 +194,7 @@ impl HostSkillsSnapshot {
 
 pub fn skill_catalog_id(skill: &SkillMetadata) -> String {
     let source_kind = "host";
-    let scope = match skill.scope {
-        SkillScope::Repo => "repo",
-        SkillScope::User => "user",
-        SkillScope::System => "system",
-        SkillScope::Admin => "admin",
-    };
+    let scope = skill_scope_label(skill.scope);
     let plugin_id = skill.plugin_id.as_deref().unwrap_or_default();
     let canonical_host_locator = PathUri::from_abs_path(&skill.path_to_skills_md).to_string();
     let mut hasher = Sha256::new();

@@ -48,7 +48,7 @@ impl CommandInvocation {
         script_body: Option<&str>,
     ) -> Result<Self, FunctionCallError> {
         let script = script.and_then(non_blank);
-        let program = program.and_then(non_empty);
+        let program = program.and_then(non_blank);
         let script_body = script_body.and_then(non_blank);
         let has_argv_fields = program.is_some() || args.is_some();
         let has_powershell_script_fields = script_body.is_some();
@@ -117,25 +117,35 @@ impl CommandInvocation {
         }
     }
 
-    pub(crate) fn to_exec_args(&self, shell: &Shell, use_login_shell: bool) -> Vec<String> {
+    pub(crate) fn to_exec_args(
+        &self,
+        shell: &Shell,
+        use_login_shell: bool,
+    ) -> Result<Vec<String>, FunctionCallError> {
         match self {
-            Self::Script(script) => shell.derive_exec_args(script, use_login_shell),
+            Self::Script(script) => shell
+                .derive_exec_args(script, use_login_shell)
+                .map_err(|error| FunctionCallError::RespondToModel(error.to_string())),
             Self::PowerShellScript(script_body) => {
-                self.to_powershell_exec_args(shell, script_body, use_login_shell)
+                Ok(self.to_powershell_exec_args(shell, script_body, use_login_shell))
             }
             Self::Argv { program, args } => {
                 let mut command = Vec::with_capacity(args.len() + 1);
                 command.push(program.clone());
                 command.extend(args.iter().cloned());
-                command
+                Ok(command)
             }
         }
     }
 
-    pub(crate) fn to_safety_args(&self, shell: &Shell, use_login_shell: bool) -> Vec<String> {
+    pub(crate) fn to_safety_args(
+        &self,
+        shell: &Shell,
+        use_login_shell: bool,
+    ) -> Result<Vec<String>, FunctionCallError> {
         match self {
             Self::PowerShellScript(script_body) => {
-                self.to_powershell_safety_args(shell, script_body, use_login_shell)
+                Ok(self.to_powershell_safety_args(shell, script_body, use_login_shell))
             }
             _ => self.to_exec_args(shell, use_login_shell),
         }
@@ -286,11 +296,7 @@ impl CommandInvocation {
         use_login_shell: bool,
     ) -> Vec<String> {
         debug_assert_eq!(shell.shell_type, ShellType::PowerShell);
-        let mut command = vec![shell.shell_path.to_string_lossy().to_string()];
-        command.push("-NoLogo".to_string());
-        if !use_login_shell {
-            command.push("-NoProfile".to_string());
-        }
+        let mut command = powershell_base_args(shell, use_login_shell);
         command.extend(encoded_command_args(&format!(
             "{}{}",
             codex_shell_command::powershell::UTF8_OUTPUT_PREFIX,
@@ -306,15 +312,20 @@ impl CommandInvocation {
         use_login_shell: bool,
     ) -> Vec<String> {
         debug_assert_eq!(shell.shell_type, ShellType::PowerShell);
-        let mut command = vec![shell.shell_path.to_string_lossy().to_string()];
-        command.push("-NoLogo".to_string());
-        if !use_login_shell {
-            command.push("-NoProfile".to_string());
-        }
+        let mut command = powershell_base_args(shell, use_login_shell);
         command.push("-Command".to_string());
         command.push(script_body.to_string());
         command
     }
+}
+
+fn powershell_base_args(shell: &Shell, use_login_shell: bool) -> Vec<String> {
+    let mut command = vec![shell.shell_path.to_string_lossy().to_string()];
+    command.push("-NoLogo".to_string());
+    if !use_login_shell {
+        command.push("-NoProfile".to_string());
+    }
+    command
 }
 
 fn encoded_command_args(script: &str) -> [String; 2] {
@@ -323,11 +334,6 @@ fn encoded_command_args(script: &str) -> [String; 2] {
         utf16.extend_from_slice(&unit.to_le_bytes());
     }
     ["-EncodedCommand".to_string(), BASE64_STANDARD.encode(utf16)]
-}
-
-fn non_empty(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 fn non_blank(value: &str) -> Option<&str> {

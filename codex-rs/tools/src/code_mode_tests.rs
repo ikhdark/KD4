@@ -1,9 +1,12 @@
 use super::augment_tool_spec_for_code_mode;
+use super::collect_code_mode_tool_definitions;
 use super::tool_spec_to_code_mode_tool_definition;
 use crate::AdditionalProperties;
 use crate::FreeformTool;
 use crate::FreeformToolFormat;
 use crate::JsonSchema;
+use crate::ResponsesApiNamespace;
+use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
 use crate::ToolName;
 use crate::ToolSpec;
@@ -117,6 +120,44 @@ declare const tools: { apply_patch(input: string, options?: { timeout_ms?: numbe
             input_schema: None,
             output_schema: None,
         })
+    );
+}
+
+#[test]
+fn collect_code_mode_tool_definitions_preserves_flattened_name_collisions() {
+    let function = |name: &str, description: &str| ResponsesApiTool {
+        name: name.to_string(),
+        description: description.to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::default(),
+        output_schema: None,
+    };
+    let specs = [
+        ToolSpec::Function(function("acme__lookup", "Plain tool")),
+        ToolSpec::Namespace(ResponsesApiNamespace {
+            name: "acme".to_string(),
+            description: "Acme tools".to_string(),
+            tools: vec![ResponsesApiNamespaceTool::Function(function(
+                "lookup",
+                "Namespaced tool",
+            ))],
+        }),
+    ];
+
+    let definitions = collect_code_mode_tool_definitions(&specs);
+
+    assert_eq!(definitions.len(), 2);
+    assert!(definitions.iter().all(|tool| tool.name == "acme__lookup"));
+    assert!(
+        definitions
+            .iter()
+            .any(|tool| tool.tool_name == ToolName::plain("acme__lookup"))
+    );
+    assert!(
+        definitions
+            .iter()
+            .any(|tool| tool.tool_name == ToolName::namespaced("acme", "lookup"))
     );
 }
 

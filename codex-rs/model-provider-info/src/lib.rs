@@ -423,7 +423,7 @@ impl ModelProviderInfo {
     }
 
     pub fn is_amazon_bedrock(&self) -> bool {
-        self.name == AMAZON_BEDROCK_PROVIDER_NAME
+        self.name == AMAZON_BEDROCK_PROVIDER_NAME && self.aws.is_some()
     }
 
     pub fn supports_remote_compaction(&self) -> bool {

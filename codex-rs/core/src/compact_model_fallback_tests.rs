@@ -42,6 +42,16 @@ fn current_model_fallback_matches_model_specific_failures() {
     }
 
     let non_fallback_errors = [
+        CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            status: StatusCode::UNAUTHORIZED,
+            body: String::new(),
+            user_message: None,
+            url: None,
+            cf_ray: None,
+            request_id: None,
+            identity_authorization_error: None,
+            identity_error_code: None,
+        }),
         CodexErr::QuotaExceeded,
         CodexErr::CyberPolicy {
             message: "policy".to_string(),
@@ -55,4 +65,20 @@ fn current_model_fallback_matches_model_specific_failures() {
             "unexpected current-model fallback for {error:?}"
         );
     }
+}
+
+#[test]
+fn region_restricted_does_not_trigger_current_model_fallback() {
+    let error = CodexErr::RegionRestricted(UnexpectedResponseError {
+        status: StatusCode::FORBIDDEN,
+        body: "Cloudflare blocked".to_string(),
+        user_message: Some("service unavailable in this region".to_string()),
+        url: None,
+        cf_ray: None,
+        request_id: None,
+        identity_authorization_error: None,
+        identity_error_code: None,
+    });
+
+    assert!(!should_retry_with_current_model(&error));
 }

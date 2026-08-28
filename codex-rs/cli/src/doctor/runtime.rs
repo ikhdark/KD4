@@ -29,6 +29,9 @@ use super::describe_install_context;
 use super::doctor_install_context;
 use super::push_path_detail;
 
+const DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH: &str = "runtime/desktop-app-server-runtime.json";
+const DESKTOP_CLIENT_NAME: &str = "codex_desktop";
+
 /// Builds the process provenance row for the current Codex executable.
 ///
 /// This check is informational and should not fail on its own; inconsistent
@@ -64,8 +67,8 @@ pub(super) fn runtime_check() -> DoctorCheck {
     .details(details)
 }
 
-/// Resolves the explicitly configured local binary, or the fork's implicit
-/// Windows LOCAL-KD target. Other platforms opt in through an explicit env var.
+/// Resolves the explicitly configured local binary, or the fork's implicit Windows LOCAL-KD
+/// target.
 pub(super) fn local_publish_target_path() -> Option<PathBuf> {
     let local_cli_path = env::var_os("CODEX_CLI_PATH")
         .filter(|value| !value.is_empty())
@@ -75,17 +78,15 @@ pub(super) fn local_publish_target_path() -> Option<PathBuf> {
         .map(PathBuf::from);
     let default_home = env::var_os("USERPROFILE")
         .filter(|value| !value.is_empty())
-        .or_else(|| env::var_os("HOME").filter(|value| !value.is_empty()))
         .map(PathBuf::from);
 
-    local_publish_target_path_from_inputs(local_cli_path, local_publish_dir, default_home, true)
+    local_publish_target_path_from_inputs(local_cli_path, local_publish_dir, default_home)
 }
 
 fn local_publish_target_path_from_inputs(
     local_cli_path: Option<PathBuf>,
     local_publish_dir: Option<PathBuf>,
     default_home: Option<PathBuf>,
-    is_windows: bool,
 ) -> Option<PathBuf> {
     if let Some(path) = local_cli_path {
         return Some(path);
@@ -93,10 +94,9 @@ fn local_publish_target_path_from_inputs(
 
     let publish_dir = match local_publish_dir {
         Some(path) => path,
-        None if is_windows => default_home?.join("Desktop").join("LOCAL-KD"),
-        None => return None,
+        None => default_home?.join("Desktop").join("LOCAL-KD"),
     };
-    Some(publish_dir.join(if is_windows { "codex.exe" } else { "codex" }))
+    Some(publish_dir.join("codex.exe"))
 }
 
 /// Reports the local payload managed by the configured local publish path.
@@ -254,6 +254,7 @@ pub(super) async fn local_publish_check(target_path: PathBuf) -> DoctorCheck {
 /// from the selected local target, without starting or stopping Desktop.
 pub(super) async fn desktop_runtime_chain_check(
     target_path: PathBuf,
+    expected_codex_home: Option<PathBuf>,
     show_details: bool,
 ) -> DoctorCheck {
     let mut details = vec![
@@ -300,11 +301,62 @@ pub(super) async fn desktop_runtime_chain_check(
         .remediation("Restart Codex Desktop after publishing the local Codex binary.");
     }
 
+    let Some(expected_codex_home) = expected_codex_home else {
+        details.push("desktop runtime receipt: <CODEX_HOME unavailable>".to_string());
+        return DoctorCheck::new(
+            "desktop.runtime_chain",
+            "desktop",
+            CheckStatus::Warning,
+            "Desktop CODEX_HOME could not be verified",
+        )
+        .details(details)
+        .remediation("Set CODEX_HOME to the fork data home and restart Codex Desktop.");
+    };
+    let receipt_path = expected_codex_home.join(DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH);
+    details.push(format!(
+        "desktop runtime receipt: {}",
+        receipt_path.display()
+    ));
+    let receipt = match read_desktop_runtime_receipt(&receipt_path) {
+        Ok(receipt) => receipt,
+        Err(err) => {
+            details.push(format!("desktop runtime receipt status: {err}"));
+            return DoctorCheck::new(
+                "desktop.runtime_chain",
+                "desktop",
+                CheckStatus::Warning,
+                "Desktop runtime receipt is unavailable",
+            )
+            .details(details)
+            .remediation("Restart Codex Desktop and wait for app-server initialization.");
+        }
+    };
+    push_desktop_runtime_receipt_details(&mut details, &receipt);
+    if let Err(err) = validate_desktop_runtime_receipt(
+        &receipt,
+        &processes,
+        &target_path,
+        std::process::id(),
+        &expected_codex_home,
+        BuildInfo::current(),
+    ) {
+        details.push(format!("desktop runtime receipt status: {err}"));
+        return DoctorCheck::new(
+            "desktop.runtime_chain",
+            "desktop",
+            CheckStatus::Warning,
+            "Desktop runtime provenance does not match the selected local fork",
+        )
+        .details(details)
+        .remediation("Restart Codex Desktop with the selected local binary and CODEX_HOME.");
+    }
+    details.push("desktop runtime receipt status: matched".to_string());
+
     DoctorCheck::new(
         "desktop.runtime_chain",
         "desktop",
         CheckStatus::Ok,
-        "Desktop app-server is running from the selected local binary",
+        "Desktop app-server matches the selected local binary, build, and CODEX_HOME",
     )
     .details(details)
 }
@@ -534,6 +586,106 @@ struct DesktopProcessEvidence {
     is_app_server: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct DesktopRuntimeReceipt {
+    schema_version: u32,
+    pid: u32,
+    executable_path: PathBuf,
+    codex_home: PathBuf,
+    client_name: String,
+    build_version: String,
+    build_commit: String,
+    build_dirty: String,
+    build_profile: String,
+    build_built: String,
+}
+
+fn read_desktop_runtime_receipt(path: &Path) -> Result<DesktopRuntimeReceipt, String> {
+    let file = File::open(path).map_err(|err| err.to_string())?;
+    serde_json::from_reader(file).map_err(|err| err.to_string())
+}
+
+fn validate_desktop_runtime_receipt(
+    receipt: &DesktopRuntimeReceipt,
+    processes: &[DesktopProcessEvidence],
+    target_path: &Path,
+    current_pid: u32,
+    expected_codex_home: &Path,
+    expected_build: BuildInfo,
+) -> Result<(), String> {
+    if receipt.schema_version != 1 {
+        return Err(format!(
+            "unsupported schema version {}",
+            receipt.schema_version
+        ));
+    }
+    if receipt.client_name != DESKTOP_CLIENT_NAME {
+        return Err(format!(
+            "receipt client {} is not Codex Desktop",
+            receipt.client_name
+        ));
+    }
+    if receipt.pid == current_pid {
+        return Err("receipt identifies the doctor process".to_string());
+    }
+    let Some(process) = processes.iter().find(|process| process.pid == receipt.pid) else {
+        return Err(format!("receipt PID {} is not live", receipt.pid));
+    };
+    if !process.is_app_server {
+        return Err(format!("receipt PID {} is not an app-server", receipt.pid));
+    }
+    if !process
+        .path
+        .as_deref()
+        .is_some_and(|path| same_path(path, target_path))
+    {
+        return Err("live receipt process is not running the selected binary".to_string());
+    }
+    if !same_path(&receipt.executable_path, target_path) {
+        return Err("receipt executable does not match the selected binary".to_string());
+    }
+    if !same_path(&receipt.codex_home, expected_codex_home) {
+        return Err("receipt CODEX_HOME does not match the intended fork home".to_string());
+    }
+    let expected_identity = [
+        expected_build.version,
+        expected_build.commit,
+        expected_build.dirty,
+        expected_build.profile,
+        expected_build.built,
+    ];
+    let receipt_identity = [
+        receipt.build_version.as_str(),
+        receipt.build_commit.as_str(),
+        receipt.build_dirty.as_str(),
+        receipt.build_profile.as_str(),
+        receipt.build_built.as_str(),
+    ];
+    if receipt_identity != expected_identity {
+        return Err("receipt build identity does not match the selected binary".to_string());
+    }
+    Ok(())
+}
+
+fn push_desktop_runtime_receipt_details(
+    details: &mut Vec<String>,
+    receipt: &DesktopRuntimeReceipt,
+) {
+    details.push(format!("receipt PID: {}", receipt.pid));
+    details.push(format!(
+        "receipt executable: {}",
+        receipt.executable_path.display()
+    ));
+    details.push(format!(
+        "receipt CODEX_HOME: {}",
+        receipt.codex_home.display()
+    ));
+    details.push(format!("receipt client: {}", receipt.client_name));
+    details.push(format!("receipt build commit: {}", receipt.build_commit));
+    details.push(format!("receipt build built: {}", receipt.build_built));
+}
+
 async fn desktop_process_probe() -> Result<Vec<self::DesktopProcessEvidence>, String> {
     let mut command = tokio::process::Command::new("powershell");
     command
@@ -617,6 +769,26 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    fn matching_receipt(
+        executable_path: PathBuf,
+        codex_home: PathBuf,
+        pid: u32,
+    ) -> DesktopRuntimeReceipt {
+        let build = BuildInfo::current();
+        DesktopRuntimeReceipt {
+            schema_version: 1,
+            pid,
+            executable_path,
+            codex_home,
+            client_name: "codex_desktop".to_string(),
+            build_version: build.version.to_string(),
+            build_commit: build.commit.to_string(),
+            build_dirty: build.dirty.to_string(),
+            build_profile: build.profile.to_string(),
+            build_built: build.built.to_string(),
+        }
+    }
+
     #[test]
     fn runtime_check_reports_shared_build_info() {
         let build_info = BuildInfo::current();
@@ -635,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn local_publish_target_resolution_is_explicit_off_windows() {
+    fn local_publish_target_resolution_uses_windows_executable_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cli = temp.path().join("explicit-codex");
         let publish_dir = temp.path().join("publish");
@@ -646,7 +818,6 @@ mod tests {
                 Some(cli.clone()),
                 Some(publish_dir.clone()),
                 Some(home.clone()),
-                false,
             ),
             Some(cli)
         );
@@ -655,16 +826,11 @@ mod tests {
                 None,
                 Some(publish_dir.clone()),
                 Some(home.clone()),
-                false,
             ),
-            Some(publish_dir.join("codex"))
+            Some(publish_dir.join("codex.exe"))
         );
         assert_eq!(
-            local_publish_target_path_from_inputs(None, None, Some(home.clone()), false),
-            None
-        );
-        assert_eq!(
-            local_publish_target_path_from_inputs(None, None, Some(home.clone()), true),
+            local_publish_target_path_from_inputs(None, None, Some(home.clone())),
             Some(home.join("Desktop").join("LOCAL-KD").join("codex.exe"))
         );
     }
@@ -727,5 +893,112 @@ mod tests {
 
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].pid, 13);
+    }
+
+    #[test]
+    fn desktop_runtime_receipt_requires_a_live_matching_pid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("codex.exe");
+        let home = temp.path().join("LOCAL-KD");
+        let receipt = matching_receipt(target.clone(), home.clone(), 42);
+
+        let err = validate_desktop_runtime_receipt(
+            &receipt,
+            &[],
+            &target,
+            10,
+            &home,
+            BuildInfo::current(),
+        )
+        .expect_err("an absent receipt PID must not prove a Desktop restart");
+
+        assert!(err.contains("not live"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn desktop_runtime_receipt_rejects_non_desktop_client() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("codex.exe");
+        let home = temp.path().join("LOCAL-KD");
+        let processes = vec![DesktopProcessEvidence {
+            pid: 42,
+            path: Some(target.clone()),
+            is_app_server: true,
+        }];
+        let mut receipt = matching_receipt(target.clone(), home.clone(), 42);
+        receipt.client_name = "codex_vscode".to_string();
+
+        let err = validate_desktop_runtime_receipt(
+            &receipt,
+            &processes,
+            &target,
+            10,
+            &home,
+            BuildInfo::current(),
+        )
+        .expect_err("a non-Desktop receipt must not prove a Desktop restart");
+
+        assert!(err.contains("not Codex Desktop"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn desktop_runtime_receipt_rejects_wrong_binary_or_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("codex.exe");
+        let wrong_binary = temp.path().join("official-codex.exe");
+        let home = temp.path().join("LOCAL-KD");
+        let wrong_home = temp.path().join("official-home");
+        let processes = vec![DesktopProcessEvidence {
+            pid: 42,
+            path: Some(target.clone()),
+            is_app_server: true,
+        }];
+
+        let wrong_binary_receipt = matching_receipt(wrong_binary, home.clone(), 42);
+        let binary_err = validate_desktop_runtime_receipt(
+            &wrong_binary_receipt,
+            &processes,
+            &target,
+            10,
+            &home,
+            BuildInfo::current(),
+        )
+        .expect_err("a wrong receipt executable must fail");
+        assert!(binary_err.contains("executable"));
+
+        let wrong_home_receipt = matching_receipt(target.clone(), wrong_home, 42);
+        let home_err = validate_desktop_runtime_receipt(
+            &wrong_home_receipt,
+            &processes,
+            &target,
+            10,
+            &home,
+            BuildInfo::current(),
+        )
+        .expect_err("a wrong receipt CODEX_HOME must fail");
+        assert!(home_err.contains("CODEX_HOME"));
+    }
+
+    #[test]
+    fn desktop_runtime_receipt_accepts_matching_live_fork_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("codex.exe");
+        let home = temp.path().join("LOCAL-KD");
+        let processes = vec![DesktopProcessEvidence {
+            pid: 42,
+            path: Some(target.clone()),
+            is_app_server: true,
+        }];
+        let receipt = matching_receipt(target.clone(), home.clone(), 42);
+
+        validate_desktop_runtime_receipt(
+            &receipt,
+            &processes,
+            &target,
+            10,
+            &home,
+            BuildInfo::current(),
+        )
+        .expect("matching live receipt should prove the selected fork runtime");
     }
 }

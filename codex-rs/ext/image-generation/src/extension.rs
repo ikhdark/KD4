@@ -10,6 +10,9 @@ use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ToolCall;
 use codex_extension_api::ToolContributor;
 use codex_extension_api::ToolExecutor;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
@@ -31,6 +34,7 @@ struct ImageGenerationExtensionConfig {
     available: bool,
     provider: ModelProviderInfo,
     save_root: Option<AbsolutePathBuf>,
+    http_clients: RouteAwareClientPool,
 }
 
 impl ImageGenerationExtensionConfig {
@@ -42,8 +46,13 @@ impl ImageGenerationExtensionConfig {
                 || config.model_provider.uses_openai_actor_authorization(),
             provider: config.model_provider.clone(),
             save_root: resolve_save_root(config),
+            http_clients: image_generation_http_clients(config.http_client_factory()),
         }
     }
+}
+
+fn image_generation_http_clients(http_client_factory: HttpClientFactory) -> RouteAwareClientPool {
+    RouteAwareClientPool::new(http_client_factory, ClientRouteClass::Api)
 }
 
 impl ThreadLifecycleContributor<Config> for ImageGenerationExtension {
@@ -94,10 +103,10 @@ impl ToolContributor for ImageGenerationExtension {
         }
 
         vec![Arc::new(ImageGenerationTool::new(
-            CodexImagesBackend::new(create_model_provider(
-                config.provider.clone(),
-                Some(self.auth_manager.clone()),
-            )),
+            CodexImagesBackend::new(
+                create_model_provider(config.provider.clone(), Some(self.auth_manager.clone())),
+                config.http_clients.clone(),
+            ),
             config.save_root.clone(),
             thread_store.level_id().to_string(),
         ))]
@@ -117,4 +126,23 @@ pub fn install(
     registry.thread_lifecycle_contributor(extension.clone());
     registry.config_contributor(extension.clone());
     registry.tool_contributor(extension);
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn image_generation_pool_retains_the_effective_proxy_policy() {
+        let http_clients = super::image_generation_http_clients(HttpClientFactory::new(
+            OutboundProxyPolicy::RespectSystemProxy,
+        ));
+
+        assert_eq!(
+            http_clients.outbound_proxy_policy(),
+            OutboundProxyPolicy::RespectSystemProxy
+        );
+    }
 }

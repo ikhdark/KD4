@@ -81,11 +81,13 @@ impl HttpClient {
     where
         U: IntoUrl,
     {
-        let url_str = url.as_str().to_string();
+        let diagnostic_url = self
+            .request_logging_enabled()
+            .then(|| url.as_str().to_string());
         RequestBuilder::new(
             self.inner.request(method.clone(), url),
             method,
-            url_str,
+            diagnostic_url,
             self.request_logging,
         )
     }
@@ -95,15 +97,21 @@ impl HttpClient {
         request: reqwest::Request,
     ) -> Result<reqwest::Response, reqwest::Error> {
         let method = request.method().clone();
-        let url = request.url().to_string();
+        let diagnostic_url = self
+            .request_logging_enabled()
+            .then(|| request.url().to_string());
 
         match self.execute_without_request_logging(request).await {
             Ok(response) => {
-                self.log_response(&method, &url, &response);
+                if let Some(url) = diagnostic_url.as_deref() {
+                    self.log_response(&method, url, &response);
+                }
                 Ok(response)
             }
             Err(error) => {
-                self.log_error(&method, &url, &error);
+                if let Some(url) = diagnostic_url.as_deref() {
+                    self.log_error(&method, url, &error);
+                }
                 Err(error)
             }
         }
@@ -171,7 +179,7 @@ pub(crate) enum RequestLogging {
 pub struct RequestBuilder {
     builder: reqwest::RequestBuilder,
     method: Method,
-    url: String,
+    diagnostic_url: Option<String>,
     request_logging: RequestLogging,
 }
 
@@ -179,13 +187,13 @@ impl RequestBuilder {
     fn new(
         builder: reqwest::RequestBuilder,
         method: Method,
-        url: String,
+        diagnostic_url: Option<String>,
         request_logging: RequestLogging,
     ) -> Self {
         Self {
             builder,
             method,
-            url,
+            diagnostic_url,
             request_logging,
         }
     }
@@ -194,7 +202,7 @@ impl RequestBuilder {
         Self {
             builder: f(self.builder),
             method: self.method,
-            url: self.url,
+            diagnostic_url: self.diagnostic_url,
             request_logging: self.request_logging,
         }
     }
@@ -260,10 +268,12 @@ impl RequestBuilder {
 
         match self.builder.headers(headers).send().await {
             Ok(response) => {
-                if self.request_logging == RequestLogging::Enabled {
+                if let (RequestLogging::Enabled, Some(url)) =
+                    (self.request_logging, self.diagnostic_url.as_deref())
+                {
                     tracing::debug!(
                         method = %self.method,
-                        url = %self.url,
+                        url = %url,
                         status = %response.status(),
                         headers = ?response.headers(),
                         version = ?response.version(),
@@ -274,11 +284,13 @@ impl RequestBuilder {
                 Ok(response)
             }
             Err(error) => {
-                if self.request_logging == RequestLogging::Enabled {
+                if let (RequestLogging::Enabled, Some(url)) =
+                    (self.request_logging, self.diagnostic_url.as_deref())
+                {
                     let status = error.status();
                     tracing::debug!(
                         method = %self.method,
-                        url = %self.url,
+                        url = %url,
                         status = status.map(|s| s.as_u16()),
                         error = %error,
                         "Request failed"
@@ -327,6 +339,20 @@ mod tests {
     use tracing::trace_span;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
+
+    #[test]
+    fn disabled_request_logging_does_not_capture_diagnostic_url() {
+        let disabled = HttpClient::new_without_request_logging(reqwest::Client::new());
+        let disabled_request = disabled.get("https://example.com/secret?token=test");
+        assert!(disabled_request.diagnostic_url.is_none());
+
+        let enabled = HttpClient::new(reqwest::Client::new());
+        let enabled_request = enabled.get("https://example.com/visible");
+        assert_eq!(
+            enabled_request.diagnostic_url.as_deref(),
+            Some("https://example.com/visible")
+        );
+    }
 
     #[test]
     fn inject_trace_headers_uses_current_span_context() {

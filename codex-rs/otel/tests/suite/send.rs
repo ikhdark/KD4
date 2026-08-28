@@ -6,6 +6,49 @@ use crate::harness::latest_metrics;
 use codex_otel::Result;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
+use std::time::Duration;
+
+#[test]
+fn paired_count_and_duration_use_the_same_attributes() -> Result<()> {
+    let (metrics, exporter) =
+        build_metrics_with_defaults(&[("service", "codex-cli"), ("env", "prod")])?;
+
+    metrics.record_count_and_duration(
+        "codex.test.count",
+        "codex.test.duration_ms",
+        1,
+        Duration::from_millis(25),
+        &[("kind", "paired")],
+    )?;
+    metrics.shutdown()?;
+
+    let resource_metrics = latest_metrics(&exporter);
+    let counter = find_metric(&resource_metrics, "codex.test.count").expect("counter metric");
+    let counter_point = match counter.data() {
+        opentelemetry_sdk::metrics::data::AggregatedMetrics::U64(
+            opentelemetry_sdk::metrics::data::MetricData::Sum(sum),
+        ) => sum.data_points().next().expect("counter point"),
+        _ => panic!("unexpected counter aggregation"),
+    };
+    assert_eq!(counter_point.value(), 1);
+
+    let duration =
+        find_metric(&resource_metrics, "codex.test.duration_ms").expect("duration metric");
+    let duration_point = match duration.data() {
+        opentelemetry_sdk::metrics::data::AggregatedMetrics::F64(
+            opentelemetry_sdk::metrics::data::MetricData::Histogram(histogram),
+        ) => histogram.data_points().next().expect("duration point"),
+        _ => panic!("unexpected duration aggregation"),
+    };
+    assert_eq!(duration_point.sum(), 25.0);
+    assert_eq!(duration_point.count(), 1);
+    assert_eq!(
+        attributes_to_map(counter_point.attributes()),
+        attributes_to_map(duration_point.attributes())
+    );
+
+    Ok(())
+}
 
 // Ensures counters/histograms render with default + per-call tags.
 #[test]

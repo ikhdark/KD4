@@ -21,6 +21,7 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub deny_read_paths_override: &'a [AbsolutePathBuf],
     pub deny_write_paths_override: &'a [AbsolutePathBuf],
     pub output_sink: Option<crate::CaptureOutputSink>,
+    pub retained_bytes_cap: Option<usize>,
 }
 
 mod windows_impl {
@@ -117,6 +118,7 @@ mod windows_impl {
             deny_read_paths_override,
             deny_write_paths_override,
             output_sink,
+            retained_bytes_cap,
         } = request;
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
@@ -228,8 +230,8 @@ mod windows_impl {
             let (pipe_write, mut pipe_read) = transport.into_files();
             let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation)?;
 
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
+            let mut stdout = crate::RetainedCapture::new(retained_bytes_cap);
+            let mut stderr = crate::RetainedCapture::new(retained_bytes_cap);
             let result = loop {
                 let msg = match read_frame(&mut pipe_read) {
                     Ok(Some(msg)) => msg,
@@ -241,13 +243,13 @@ mod windows_impl {
                     Message::Output { payload } => match decode_bytes(&payload.data_b64) {
                         Ok(bytes) => match payload.stream {
                             OutputStream::Stdout => {
-                                stdout.extend_from_slice(&bytes);
+                                stdout.append(&bytes);
                                 if let Some(output_sink) = output_sink.as_ref() {
                                     output_sink(crate::CaptureOutputStream::Stdout, &bytes);
                                 }
                             }
                             OutputStream::Stderr => {
-                                stderr.extend_from_slice(&bytes);
+                                stderr.append(&bytes);
                                 if let Some(output_sink) = output_sink.as_ref() {
                                     output_sink(crate::CaptureOutputStream::Stderr, &bytes);
                                 }
@@ -282,10 +284,14 @@ mod windows_impl {
                 log_failure(&command, &format!("exit code {exit_code}"), logs_base_dir);
             }
 
+            let (stdout, stdout_truncated) = stdout.into_parts();
+            let (stderr, stderr_truncated) = stderr.into_parts();
             Ok(CaptureResult {
                 exit_code,
                 stdout,
                 stderr,
+                stdout_truncated,
+                stderr_truncated,
                 timed_out,
             })
         })()

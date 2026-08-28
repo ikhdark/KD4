@@ -9,10 +9,21 @@ const LEGACY_SAFETY_ACCESS_BLOCK_PREFIX: &str =
     "Invalid prompt: we've limited access to this content for safety reasons.";
 const BIO_POLICY_SAFETY_ACCESS_BLOCK_PREFIX: &str =
     "This content was flagged for possible biological risk.";
+const RUNTIME_METRICS_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn is_safety_access_block_message(message: &str) -> bool {
     message.starts_with(LEGACY_SAFETY_ACCESS_BLOCK_PREFIX)
         || message.starts_with(BIO_POLICY_SAFETY_ACCESS_BLOCK_PREFIX)
+}
+
+fn runtime_metrics_refresh_due(last_refresh: &mut Option<Instant>, now: Instant) -> bool {
+    if last_refresh
+        .is_some_and(|last| now.saturating_duration_since(last) < RUNTIME_METRICS_REFRESH_INTERVAL)
+    {
+        return false;
+    }
+    *last_refresh = Some(now);
+    true
 }
 
 impl ChatWidget {
@@ -52,8 +63,10 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn refresh_runtime_metrics(&mut self) {
-        self.collect_runtime_metrics_delta();
+    pub(super) fn refresh_runtime_metrics(&mut self, now: Instant) {
+        if runtime_metrics_refresh_due(&mut self.last_runtime_metrics_refresh, now) {
+            self.collect_runtime_metrics_delta();
+        }
     }
 
     // Raw reasoning uses the same flow as summarized reasoning
@@ -68,6 +81,7 @@ impl ChatWidget {
             self.request_pending_usage_output_insertion_after_stream_shutdown();
         }
         self.turn_runtime_metrics = RuntimeMetricsSummary::default();
+        self.last_runtime_metrics_refresh = None;
         self.session_telemetry.reset_runtime_metrics();
         self.update_task_running_state();
         self.status_state.retry_status_header = None;
@@ -81,6 +95,7 @@ impl ChatWidget {
         }
         self.reasoning_summary_parts.clear();
         self.reasoning_buffer.clear();
+        self.active_reasoning_policy = None;
         self.set_ambient_pet_notification(
             crate::pets::PetNotificationKind::Running,
             /*body*/ None,
@@ -176,12 +191,14 @@ impl ChatWidget {
         self.input_queue.user_turn_pending_start = false;
         self.clear_active_hook_cell();
         self.turn_lifecycle.finish();
+        self.last_runtime_metrics_refresh = None;
         self.clear_safety_buffering();
         self.update_task_running_state();
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
         self.last_unified_wait = None;
         self.unified_exec_wait_streak = None;
+        self.active_reasoning_policy = None;
         if !from_replay {
             let body = Notification::agent_turn_preview(&notification_response);
             self.set_ambient_pet_notification(crate::pets::PetNotificationKind::Review, body);
@@ -507,5 +524,26 @@ impl ChatWidget {
         }
 
         "Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_metrics_refresh_is_throttled_independently_of_tick_rate() {
+        let start = Instant::now();
+        let mut last_refresh = None;
+
+        assert!(runtime_metrics_refresh_due(&mut last_refresh, start));
+        assert!(!runtime_metrics_refresh_due(
+            &mut last_refresh,
+            start + std::time::Duration::from_millis(249)
+        ));
+        assert!(runtime_metrics_refresh_due(
+            &mut last_refresh,
+            start + std::time::Duration::from_millis(250)
+        ));
     }
 }

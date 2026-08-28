@@ -38,9 +38,12 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerResponse;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
-use codex_login::default_client::create_client;
+use codex_login::default_client::create_client_pool;
 use codex_plugin::PluginId;
 use codex_plugin::PluginTelemetryMetadata;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
@@ -54,6 +57,16 @@ use tokio::sync::mpsc;
 const ANALYTICS_EVENTS_QUEUE_SIZE: usize = 256;
 const ANALYTICS_EVENTS_TIMEOUT: Duration = Duration::from_secs(10);
 const ANALYTICS_EVENT_DEDUPE_MAX_KEYS: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AnalyticsFailureLogMetadata {
+    status: u16,
+    body_bytes: usize,
+}
+
+fn analytics_failure_log_metadata(status: u16, body_bytes: usize) -> AnalyticsFailureLogMetadata {
+    AnalyticsFailureLogMetadata { status, body_bytes }
+}
 
 #[derive(Clone)]
 pub(crate) struct AnalyticsEventsQueue {
@@ -123,14 +136,19 @@ fn analytics_capture_file_from_env() -> Option<PathBuf> {
 }
 
 impl AnalyticsEventsQueue {
-    fn new(auth_manager: Arc<AuthManager>, destination: AnalyticsEventsDestination) -> Self {
+    fn new(
+        auth_manager: Arc<AuthManager>,
+        destination: AnalyticsEventsDestination,
+        http_client_factory: HttpClientFactory,
+    ) -> Self {
         let (sender, mut receiver) = mpsc::channel(ANALYTICS_EVENTS_QUEUE_SIZE);
+        let http_clients = create_client_pool(http_client_factory, ClientRouteClass::Api);
         tokio::spawn(async move {
             let mut reducer = AnalyticsReducer::default();
             while let Some(input) = receiver.recv().await {
                 let mut events = Vec::new();
                 reducer.ingest(input, &mut events).await;
-                send_track_events(&auth_manager, &destination, events).await;
+                send_track_events(&auth_manager, &destination, &http_clients, events).await;
             }
         });
         Self {
@@ -194,11 +212,17 @@ impl AnalyticsEventsClient {
         auth_manager: Arc<AuthManager>,
         base_url: String,
         analytics_enabled: Option<bool>,
+        http_client_factory: HttpClientFactory,
     ) -> Self {
         let destination = AnalyticsEventsDestination::from_base_url(base_url);
         Self {
-            queue: (analytics_enabled != Some(false))
-                .then(|| AnalyticsEventsQueue::new(Arc::clone(&auth_manager), destination)),
+            queue: (analytics_enabled != Some(false)).then(|| {
+                AnalyticsEventsQueue::new(
+                    Arc::clone(&auth_manager),
+                    destination,
+                    http_client_factory,
+                )
+            }),
         }
     }
 
@@ -505,10 +529,21 @@ impl AnalyticsEventsClient {
         });
     }
 
-    pub fn track_server_request(&self, connection_id: u64, request: ServerRequest) {
-        self.record_fact(AnalyticsFact::ServerRequest {
+    pub fn track_server_request(&self, connection_id: u64, request: &ServerRequest) {
+        let Some(queue) = self.queue.as_ref() else {
+            return;
+        };
+        if !matches!(
+            request,
+            ServerRequest::CommandExecutionRequestApproval { .. }
+                | ServerRequest::FileChangeRequestApproval { .. }
+                | ServerRequest::PermissionsRequestApproval { .. }
+        ) {
+            return;
+        }
+        queue.try_send(AnalyticsFact::ServerRequest {
             connection_id,
-            request: Box::new(request),
+            request: Box::new(request.clone()),
         });
     }
 
@@ -539,7 +574,10 @@ impl AnalyticsEventsClient {
         });
     }
 
-    pub fn track_notification(&self, notification: ServerNotification) {
+    pub fn track_notification(&self, notification: &ServerNotification) {
+        let Some(queue) = self.queue.as_ref() else {
+            return;
+        };
         if !matches!(
             notification,
             ServerNotification::TurnStarted(_)
@@ -552,13 +590,14 @@ impl AnalyticsEventsClient {
         ) {
             return;
         }
-        self.record_fact(AnalyticsFact::Notification(Box::new(notification)));
+        queue.try_send(AnalyticsFact::Notification(Box::new(notification.clone())));
     }
 }
 
 async fn send_track_events(
     auth_manager: &AuthManager,
     destination: &AnalyticsEventsDestination,
+    http_clients: &RouteAwareClientPool,
     events: Vec<TrackEventRequest>,
 ) {
     if events.is_empty() {
@@ -573,7 +612,7 @@ async fn send_track_events(
     }
 
     for events in track_event_request_batches(events) {
-        send_track_events_request(&auth, destination, events).await;
+        send_track_events_request(&auth, destination, http_clients, events).await;
     }
 }
 
@@ -603,6 +642,7 @@ fn track_event_request_batches(events: Vec<TrackEventRequest>) -> Vec<Vec<TrackE
 async fn send_track_events_request(
     auth: &CodexAuth,
     destination: &AnalyticsEventsDestination,
+    http_clients: &RouteAwareClientPool,
     events: Vec<TrackEventRequest>,
 ) {
     if events.is_empty() {
@@ -621,14 +661,7 @@ async fn send_track_events_request(
         #[cfg(debug_assertions)]
         AnalyticsEventsDestination::CaptureFile { .. } => return,
     };
-    let client = match create_client() {
-        Ok(client) => client,
-        Err(err) => {
-            tracing::warn!("failed to build events HTTP client: {err}");
-            return;
-        }
-    };
-    let response = client
+    let response = http_clients
         .post(url)
         .timeout(ANALYTICS_EVENTS_TIMEOUT)
         .headers(codex_model_provider::auth_provider_from_auth(auth).to_auth_headers())
@@ -641,8 +674,13 @@ async fn send_track_events_request(
         Ok(response) if response.status().is_success() => {}
         Ok(response) => {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            tracing::warn!("events failed with status {status}: {body}");
+            let body_bytes = response.bytes().await.map_or(0, |body| body.len());
+            let metadata = analytics_failure_log_metadata(status.as_u16(), body_bytes);
+            tracing::warn!(
+                status = metadata.status,
+                body_bytes = metadata.body_bytes,
+                "events request failed"
+            );
         }
         Err(err) => {
             tracing::warn!("failed to send events request: {err}");

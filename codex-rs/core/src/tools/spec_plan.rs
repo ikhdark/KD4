@@ -80,9 +80,13 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ToolMode;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_sandboxing::SandboxType;
+use codex_sandboxing::SandboxablePreference;
+use codex_sandboxing::select_initial;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolCall as ExtensionToolCall;
@@ -96,6 +100,7 @@ use codex_tools::collect_request_plugin_install_entries;
 use codex_tools::default_namespace_description;
 use codex_tools::request_user_input_available_modes;
 use codex_tools::shell_type_for_model_and_features;
+use codex_utils_path_uri::PathConvention;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -187,16 +192,16 @@ pub(crate) fn build_tool_router(
     step_context: &StepContext,
     params: ToolRouterParams<'_>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
-) -> ToolRouter {
+) -> Result<ToolRouter, String> {
     let exposure_identity = params.exposure_identity.clone();
     let (model_visible_specs, registry, warnings) =
-        build_tool_specs_and_registry(step_context, params, tool_search_handler_cache);
-    ToolRouter::from_parts_with_warnings_and_identity(
+        build_tool_specs_and_registry(step_context, params, tool_search_handler_cache)?;
+    Ok(ToolRouter::from_parts_with_warnings_and_identity(
         registry,
         model_visible_specs,
         warnings,
         exposure_identity,
-    )
+    ))
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -204,7 +209,7 @@ fn build_tool_specs_and_registry(
     step_context: &StepContext,
     params: ToolRouterParams<'_>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
-) -> (Vec<ToolSpec>, ToolRegistry, Vec<String>) {
+) -> Result<(Vec<ToolSpec>, ToolRegistry, Vec<String>), String> {
     let turn_context = step_context.turn.as_ref();
     let ToolRouterParams {
         mcp_tools,
@@ -233,9 +238,14 @@ fn build_tool_specs_and_registry(
     promote_undiscoverable_deferred_tools(turn_context, &mut planned_tools);
     promote_deferred_tools_without_search(turn_context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
+    retain_unique_planned_tool_names(&mut planned_tools);
+    apply_namespace_description_budget(&mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
-    prepend_code_mode_executors(&context, &mut planned_tools);
-    build_model_visible_specs_and_registry(turn_context, planned_tools)
+    prepend_code_mode_executors(&context, &mut planned_tools)?;
+    Ok(build_model_visible_specs_and_registry(
+        turn_context,
+        planned_tools,
+    ))
 }
 
 fn promote_undiscoverable_deferred_tools(
@@ -339,13 +349,7 @@ fn build_model_visible_specs_and_registry(
         let exposure = runtime.exposure();
         if exposure.is_direct() && !is_hidden_by_code_mode_only(turn_context, &tool_name, exposure)
         {
-            let spec = runtime.spec().clone();
-            specs.push(spec_for_model_request(
-                turn_context,
-                exposure,
-                &tool_name,
-                spec,
-            ));
+            specs.push(runtime.spec().clone());
         }
     }
     specs.extend(hosted_specs);
@@ -378,21 +382,68 @@ fn retain_unique_tool_name(
     false
 }
 
-fn spec_for_model_request(
-    turn_context: &TurnContext,
-    exposure: ToolExposure,
-    tool_name: &ToolName,
-    spec: ToolSpec,
-) -> ToolSpec {
-    let tool_mode = effective_tool_mode(turn_context);
-    if matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly)
-        && exposure != ToolExposure::DirectModelOnly
-        && !is_excluded_from_code_mode(turn_context, tool_name)
-        && codex_code_mode::is_code_mode_nested_tool(spec.name())
+fn retain_unique_planned_tool_names(planned_tools: &mut PlannedTools) {
+    let PlannedTools {
+        runtimes,
+        hosted_specs,
+        warnings,
+    } = planned_tools;
+    let mut seen_tool_names = HashSet::new();
+    hosted_specs.retain(|spec| {
+        retain_unique_tool_name(&mut seen_tool_names, ToolName::plain(spec.name()), warnings)
+    });
+    runtimes.retain(|runtime| {
+        retain_unique_tool_name(&mut seen_tool_names, runtime.tool_name().clone(), warnings)
+    });
+}
+
+fn apply_namespace_description_budget(planned_tools: &mut PlannedTools) {
+    let mut namespace_order = Vec::new();
+    let mut descriptions = BTreeMap::<String, String>::new();
+    for spec in planned_tools
+        .runtimes
+        .iter()
+        .map(RegisteredTool::spec)
+        .chain(planned_tools.hosted_specs.iter())
     {
-        codex_tools::augment_tool_spec_for_code_mode(spec)
-    } else {
-        spec
+        let ToolSpec::Namespace(namespace) = spec else {
+            continue;
+        };
+        if !descriptions.contains_key(&namespace.name) {
+            namespace_order.push(namespace.name.clone());
+            descriptions.insert(namespace.name.clone(), namespace.description.clone());
+        } else if descriptions
+            .get(&namespace.name)
+            .is_some_and(|description| description.trim().is_empty())
+            && !namespace.description.trim().is_empty()
+        {
+            descriptions.insert(namespace.name.clone(), namespace.description.clone());
+        }
+    }
+
+    let mut description_budget = ModelContextBudget::default();
+    for namespace_name in namespace_order {
+        let Some(description) = descriptions.get_mut(&namespace_name) else {
+            unreachable!("collected namespace description");
+        };
+        if description.trim().is_empty() {
+            *description = default_namespace_description(&namespace_name);
+        }
+        *description = description_budget.take(description).unwrap_or_default();
+    }
+
+    for spec in planned_tools
+        .runtimes
+        .iter_mut()
+        .map(RegisteredTool::spec_mut)
+        .chain(planned_tools.hosted_specs.iter_mut())
+    {
+        let ToolSpec::Namespace(namespace) = spec else {
+            continue;
+        };
+        if let Some(description) = descriptions.get(&namespace.name) {
+            namespace.description.clone_from(description);
+        }
     }
 }
 
@@ -589,10 +640,10 @@ fn is_excluded_from_code_mode(turn_context: &TurnContext, tool_name: &ToolName) 
 fn build_code_mode_executors(
     turn_context: &TurnContext,
     executors: &[RegisteredTool],
-) -> Vec<Arc<dyn CoreToolRuntime>> {
+) -> Result<Vec<Arc<dyn CoreToolRuntime>>, String> {
     let tool_mode = effective_tool_mode(turn_context);
     if !matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly) {
-        return vec![];
+        return Ok(vec![]);
     }
 
     let mut code_mode_nested_tool_specs = Vec::new();
@@ -638,9 +689,9 @@ fn build_code_mode_executors(
         ),
         code_mode_nested_tool_specs,
         deferred_code_mode_nested_tool_specs,
-    ))];
+    )?)];
     result.push(Arc::new(CodeModeWaitHandler));
-    result
+    Ok(result)
 }
 
 #[instrument(level = "trace", skip_all, fields(tool_spec_count = specs.len()))]
@@ -704,6 +755,10 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
             planned_tools.add_with_authorization_class(
                 ExecCommandHandler::new(ExecCommandHandlerOptions {
                     allow_login_shell: turn_context.config.permissions.allow_login_shell,
+                    allow_escalated_sandbox_permissions: matches!(
+                        turn_context.approval_policy.value(),
+                        AskForApproval::OnRequest
+                    ),
                     exec_permission_approvals_enabled: false,
                     include_environment_id,
                     include_shell_parameter: true,
@@ -756,6 +811,31 @@ fn tool_environment_mode(step_context: &StepContext) -> ToolEnvironmentMode {
     ToolEnvironmentMode::from_count(step_context.environments.turn_environments.len())
 }
 
+fn primary_environment_uses_foreign_cwd(step_context: &StepContext) -> bool {
+    step_context
+        .environments
+        .primary()
+        .is_some_and(|environment| {
+            environment.cwd().to_abs_path().is_err()
+                || environment.cwd().infer_path_convention() != Some(PathConvention::native())
+        })
+}
+
+fn primary_environment_supports_exec_command(step_context: &StepContext) -> bool {
+    if !primary_environment_uses_foreign_cwd(step_context) {
+        return true;
+    }
+
+    let turn_context = step_context.turn.as_ref();
+    select_initial(
+        &turn_context.file_system_sandbox_policy(),
+        turn_context.network_sandbox_policy(),
+        SandboxablePreference::Auto,
+        turn_context.windows_sandbox_level,
+        turn_context.network.is_some(),
+    ) == SandboxType::None
+}
+
 #[instrument(level = "trace", skip_all)]
 fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
     let turn_context = context.step_context.turn.as_ref();
@@ -766,23 +846,31 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
     }
 
     let allow_login_shell = turn_context.config.permissions.allow_login_shell;
+    let allow_escalated_sandbox_permissions = matches!(
+        turn_context.approval_policy.value(),
+        AskForApproval::OnRequest
+    );
     let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals);
     let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
     let shell_command_options = ShellCommandHandlerOptions {
         allow_login_shell,
+        allow_escalated_sandbox_permissions,
         exec_permission_approvals_enabled,
     };
     match shell_type_for_model_and_features(&turn_context.model_info, features) {
         ConfigShellToolType::UnifiedExec => {
-            planned_tools.add_with_authorization_class(
-                ExecCommandHandler::new(ExecCommandHandlerOptions {
-                    allow_login_shell,
-                    exec_permission_approvals_enabled,
-                    include_environment_id,
-                    include_shell_parameter: true,
-                }),
-                TypedToolClass::Shell,
-            );
+            if primary_environment_supports_exec_command(context.step_context) {
+                planned_tools.add_with_authorization_class(
+                    ExecCommandHandler::new(ExecCommandHandlerOptions {
+                        allow_login_shell,
+                        allow_escalated_sandbox_permissions,
+                        exec_permission_approvals_enabled,
+                        include_environment_id,
+                        include_shell_parameter: true,
+                    }),
+                    TypedToolClass::Shell,
+                );
+            }
             planned_tools.add_with_authorization_class(WriteStdinHandler, TypedToolClass::Shell);
 
             // Keep the legacy shell tool registered while unified exec is
@@ -838,16 +926,14 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
     planned_tools.add_with_authorization_class(ReadToolOutputHandler, TypedToolClass::ReadSearch);
-    if crate::task_evidence::is_kd4_repository(turn_context.cwd().as_path()) {
+    if turn_context.kd4_workflow_enabled {
         planned_tools
             .add_with_authorization_class(ReadTurnTimingHandler, TypedToolClass::ReadSearch);
     }
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
         planned_tools.add_with_authorization_class(
-            PlanHandler::new(crate::task_evidence::is_kd4_repository(
-                turn_context.cwd().as_path(),
-            )),
+            PlanHandler::new(turn_context.kd4_workflow_enabled),
             TypedToolClass::OwnTask,
         );
     }
@@ -955,6 +1041,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 #[instrument(level = "trace", skip_all)]
 fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
     let turn_context = context.step_context.turn.as_ref();
+    let can_spawn = !primary_environment_uses_foreign_cwd(context.step_context);
     if agent_jobs_tools_enabled(context) {
         planned_tools
             .add_with_authorization_class(SpawnAgentsOnCsvHandler, TypedToolClass::RootTaskControl);
@@ -966,7 +1053,9 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
     let agent_surface_stage = context.exposure_identity.agent_surface_stage;
     if agent_surface_stage != AgentSurfaceStage::Prohibited && collab_tools_enabled(turn_context) {
         if multi_agent_v2_enabled(turn_context) {
-            let exposure = if turn_context.config.multi_agent_v2.non_code_mode_only {
+            let exposure = if search_tool_enabled(turn_context) {
+                ToolExposure::Deferred
+            } else if turn_context.config.multi_agent_v2.non_code_mode_only {
                 ToolExposure::DirectModelOnly
             } else {
                 ToolExposure::Direct
@@ -974,22 +1063,28 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
             let tool_namespace = active_collaboration_namespace(turn_context, agent_surface_stage);
             let agent_type_description =
                 agent_type_description(turn_context, context.default_agent_type_description);
-            planned_tools.add_arc_with_exposure_and_authorization_class(
-                multi_agent_v2_handler(
-                    SpawnAgentHandlerV2::new(SpawnAgentToolOptions {
-                        available_models: turn_context.available_models.clone(),
-                        agent_type_description,
-                        hide_agent_type_model_reasoning: turn_context
-                            .config
-                            .multi_agent_v2
-                            .hide_spawn_agent_metadata,
-                        usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
-                    }),
-                    tool_namespace,
-                ),
-                exposure,
-                TypedToolClass::RootTaskControl,
-            );
+            if can_spawn {
+                planned_tools.add_arc_with_exposure_and_authorization_class(
+                    multi_agent_v2_handler(
+                        SpawnAgentHandlerV2::new(SpawnAgentToolOptions {
+                            available_models: turn_context.available_models.clone(),
+                            agent_type_description,
+                            hide_agent_type_model_reasoning: turn_context
+                                .config
+                                .multi_agent_v2
+                                .hide_spawn_agent_metadata,
+                            usage_hint_text: turn_context
+                                .config
+                                .multi_agent_v2
+                                .usage_hint_text
+                                .clone(),
+                        }),
+                        tool_namespace,
+                    ),
+                    exposure,
+                    TypedToolClass::RootTaskControl,
+                );
+            }
             if agent_surface_stage == AgentSurfaceStage::SpawnOnly {
                 return;
             }
@@ -1065,16 +1160,18 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
             } else {
                 ToolExposure::Direct
             };
-            planned_tools.add_with_exposure_and_authorization_class(
-                SpawnAgentHandler::new(SpawnAgentToolOptions {
-                    available_models: turn_context.available_models.clone(),
-                    agent_type_description,
-                    hide_agent_type_model_reasoning: false,
-                    usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
-                }),
-                exposure,
-                TypedToolClass::RootTaskControl,
-            );
+            if can_spawn {
+                planned_tools.add_with_exposure_and_authorization_class(
+                    SpawnAgentHandler::new(SpawnAgentToolOptions {
+                        available_models: turn_context.available_models.clone(),
+                        agent_type_description,
+                        hide_agent_type_model_reasoning: false,
+                        usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
+                    }),
+                    exposure,
+                    TypedToolClass::RootTaskControl,
+                );
+            }
             if agent_surface_stage == AgentSurfaceStage::SpawnOnly {
                 return;
             }
@@ -1224,15 +1321,16 @@ fn append_tool_search_executor(
 fn prepend_code_mode_executors(
     context: &CoreToolPlanContext<'_>,
     planned_tools: &mut PlannedTools,
-) {
+) -> Result<(), String> {
     let turn_context = context.step_context.turn.as_ref();
-    let code_mode_executors = build_code_mode_executors(turn_context, planned_tools.runtimes());
+    let code_mode_executors = build_code_mode_executors(turn_context, planned_tools.runtimes())?;
     planned_tools.runtimes.splice(
         0..0,
         code_mode_executors
             .into_iter()
             .map(|runtime| RegisteredTool::new(runtime, TypedToolClass::CodeModeControl)),
     );
+    Ok(())
 }
 
 fn append_extension_tool_executors(

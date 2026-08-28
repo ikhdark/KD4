@@ -13,6 +13,8 @@ use tokio_util::sync::CancellationToken;
 use super::UnifiedExecContext;
 use super::UnifiedExecError;
 pub(super) use super::head_tail_buffer::omitted_output_marker;
+use super::process::ProcessOutputChunk;
+use super::process::ProcessOutputSnapshot;
 use super::process::UnifiedExecProcess;
 use crate::exec::EXEC_OUTPUT_DELTA_CAP_NOTICE;
 use crate::exec::OutputDeltaDecision;
@@ -22,6 +24,7 @@ use crate::session::turn::reconcile_turn_progress_event;
 use crate::session::turn_context::TurnContext;
 use crate::tools::command_execution::CommandExecutionId;
 use crate::tools::command_execution::CommandExecutionLedger;
+use crate::tools::command_execution::CompletedValidation;
 use crate::tools::command_execution::CompletionApplyResult;
 use crate::tools::command_output_artifact::append_raw_output_artifact;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -34,8 +37,10 @@ use crate::tools::known_delta_store::KnownDeltaExecutionObservation;
 use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
+use codex_agent_task_store::ValidationCallStatus;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
+use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
 use codex_protocol::protocol::ExecCommandSource;
@@ -70,6 +75,8 @@ impl Drop for OutputDrainedGuard {
 /// Spawn a background task that continuously reads from the PTY, appends to the
 /// shared transcript, and emits ExecCommandOutputDelta events on UTF‑8
 /// boundaries.
+// Preserve the shared unified-exec error shape at this process boundary.
+#[allow(clippy::result_large_err)]
 pub(crate) fn start_streaming_output(
     process: &Arc<UnifiedExecProcess>,
     context: &UnifiedExecContext,
@@ -98,7 +105,7 @@ pub(crate) fn start_streaming_output(
             token: output_drained,
         };
 
-        let mut pending = Vec::<u8>::new();
+        let mut pending = PendingOutput::default();
         let emitted_deltas = OutputDeltaLimiter::default();
 
         let mut grace_sleep: Option<Pin<Box<Sleep>>> = None;
@@ -290,44 +297,87 @@ pub(crate) fn spawn_exit_watcher(
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
     tracker: Option<SharedTurnDiffTracker>,
-    validation_observation: Option<crate::validation_admission::ValidationObservationToken>,
-    validation_leader: Option<crate::validation_admission::ValidationLeaderOwnership>,
-    validation_waiter: Option<crate::validation_admission::ValidationLeader>,
-    completed_validation_route: Option<codex_protocol::plan_tool::ValidationRoute>,
     known_delta: Option<PreparedKnownDelta>,
     known_delta_executor_started_at: Option<Instant>,
     tool_dispatch_timing: Option<Arc<ToolDispatchTiming>>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_token();
-    if let Some(leader) = validation_leader.as_ref() {
-        let validation_cancellation = leader.cancellation_token();
-        let process_exit = exit_token.clone();
-        let validation_process = Arc::clone(&process);
+    let validation_timeout_terminalization = process.validation_timeout_terminalization_token();
+    let terminal_event_claimed = Arc::new(AtomicBool::new(false));
+    let terminal_event_delivered = CancellationToken::new();
+    {
+        let process = Arc::clone(&process);
+        let session_ref = Arc::clone(&session_ref);
+        let turn_ref = Arc::clone(&turn_ref);
+        let call_id = call_id.clone();
+        let command = command.clone();
+        let cwd = cwd.clone();
+        let environment_id = environment_id.clone();
+        let transcript = Arc::clone(&transcript);
+        let tracker = tracker.clone();
+        let exit_token = exit_token.clone();
+        let terminal_event_claimed = Arc::clone(&terminal_event_claimed);
+        let terminal_event_delivered = terminal_event_delivered.clone();
         tokio::spawn(async move {
             tokio::select! {
-                _ = validation_cancellation.cancelled() => {
-                    if !validation_process.has_exited()
-                        && let Err(error) = validation_process.terminate_confirmed().await
-                    {
-                        tracing::warn!(%error, "failed to terminate abandoned shared validation");
-                    }
-                }
-                _ = process_exit.cancelled() => {}
+                biased;
+                _ = exit_token.cancelled() => return,
+                _ = validation_timeout_terminalization.cancelled() => {}
             }
+            if terminal_event_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+
+            let duration = Instant::now().saturating_duration_since(started_at);
+            let message = process.failure_message().unwrap_or_else(|| {
+                "validation timed out and the process could not be terminated".to_string()
+            });
+            let completed_validation = session_ref
+                .services
+                .command_execution
+                .complete_timed_out_running_validation(process_id)
+                .await;
+            emit_failed_exec_end_for_unified_exec(
+                Arc::clone(&session_ref),
+                Arc::clone(&turn_ref),
+                call_id,
+                command,
+                cwd,
+                environment_id,
+                Some(process_id.to_string()),
+                transcript,
+                String::new(),
+                Some(process.snapshot_completion_output().await),
+                message,
+                /*timed_out*/ true,
+                duration,
+                tracker,
+                completed_validation.as_ref(),
+            )
+            .await;
+            reconcile_turn_progress_event(
+                &turn_ref.turn_timing_state,
+                0,
+                "validation timeout terminalization",
+            );
+            terminal_event_delivered.cancel();
         });
     }
-
     tokio::spawn(async move {
-        let _validation_waiter = validation_waiter;
         turn_ref.turn_timing_state.record_next_sample_block_reason(
             codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
         );
         let exit_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
         wait_for_sticky_lifecycle_signal(&exit_token).await;
         let exit_observed_at = Instant::now();
+        let owns_terminal_event = terminal_event_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
         let duration = exit_observed_at.saturating_duration_since(started_at);
-        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         let failure_message = process.failure_message();
         let exit_code = if failure_message.is_some() {
             -1
@@ -395,13 +445,6 @@ pub(crate) fn spawn_exit_watcher(
             });
         }
 
-        if let Some(observation) = validation_observation {
-            if process.termination_was_requested() {
-                observation.record_cancelled(duration_ms).await;
-            } else {
-                observation.record_completed(duration_ms).await;
-            }
-        }
         if !tracked {
             tracing::debug!(
                 process_id,
@@ -410,10 +453,11 @@ pub(crate) fn spawn_exit_watcher(
         }
 
         if let Some(known_delta) = known_delta.as_ref() {
-            record_known_delta_from_transcript(
+            let completion_output = process.snapshot_completion_output().await;
+            record_known_delta_from_process_output(
                 turn_ref.config.codex_home.as_path(),
                 known_delta,
-                &transcript,
+                &completion_output,
                 failure_message.is_none() && exit_code == 0 && !process.termination_was_requested(),
                 known_delta_executor_started_at
                     .map(|started_at| Instant::now().saturating_duration_since(started_at))
@@ -447,39 +491,55 @@ pub(crate) fn spawn_exit_watcher(
                 .update_running_artifact(process_id, finalized_artifact)
                 .await;
         }
+        let timed_out = process.timed_out();
+        if owns_terminal_event {
+            let completed_validation = session_ref
+                .services
+                .command_execution
+                .complete_running_validation(process_id, timed_out)
+                .await;
 
-        if let Some(message) = failure_message.as_ref() {
-            emit_failed_exec_end_for_unified_exec(
-                Arc::clone(&session_ref),
-                Arc::clone(&turn_ref),
-                call_id.clone(),
-                command.clone(),
-                cwd.clone(),
-                environment_id.clone(),
-                Some(process_id.to_string()),
-                Arc::clone(&transcript),
-                String::new(),
-                message.clone(),
-                duration,
-                tracker.clone(),
-            )
-            .await;
+            if let Some(message) = failure_message.as_ref() {
+                emit_failed_exec_end_for_unified_exec(
+                    Arc::clone(&session_ref),
+                    Arc::clone(&turn_ref),
+                    call_id.clone(),
+                    command.clone(),
+                    cwd.clone(),
+                    environment_id.clone(),
+                    Some(process_id.to_string()),
+                    Arc::clone(&transcript),
+                    String::new(),
+                    Some(process.snapshot_completion_output().await),
+                    message.clone(),
+                    timed_out,
+                    duration,
+                    tracker.clone(),
+                    completed_validation.as_ref(),
+                )
+                .await;
+            } else {
+                emit_exec_end_for_unified_exec(
+                    Arc::clone(&session_ref),
+                    Arc::clone(&turn_ref),
+                    call_id.clone(),
+                    command.clone(),
+                    cwd.clone(),
+                    environment_id.clone(),
+                    Some(process_id.to_string()),
+                    Arc::clone(&transcript),
+                    String::new(),
+                    Some(process.snapshot_completion_output().await),
+                    exit_code,
+                    timed_out,
+                    duration,
+                    tracker.clone(),
+                    completed_validation.as_ref(),
+                )
+                .await;
+            }
         } else {
-            emit_exec_end_for_unified_exec(
-                Arc::clone(&session_ref),
-                Arc::clone(&turn_ref),
-                call_id.clone(),
-                command.clone(),
-                cwd.clone(),
-                environment_id.clone(),
-                Some(process_id.to_string()),
-                Arc::clone(&transcript),
-                String::new(),
-                exit_code,
-                duration,
-                tracker.clone(),
-            )
-            .await;
+            wait_for_sticky_lifecycle_signal(&terminal_event_delivered).await;
         }
         let finalization = session_ref
             .services
@@ -507,37 +567,6 @@ pub(crate) fn spawn_exit_watcher(
                 .observe_repository_revision(&turn_ref.sub_id, observed_mutation_revision)
                 .await;
         }
-        if let Some(leader) = validation_leader {
-            let text = transcript.lock().await.to_bytes();
-            let completed_validation_skip_disposition =
-                completed_validation_route.as_ref().and_then(|route| {
-                    crate::tools::command_execution::completed_validation_skip_disposition(
-                        route, &text, exit_code,
-                    )
-                });
-            leader
-                .complete(crate::validation_admission::ReusableValidationResult {
-                    value: serde_json::json!({
-                        "text": String::from_utf8_lossy(&text),
-                        "success": if completed_validation_skip_disposition.is_some() {
-                            None
-                        } else {
-                            Some(failure_message.is_none() && exit_code == 0)
-                        },
-                        "execution_outcome": if completed_validation_skip_disposition.is_some() {
-                            "executed_not_applicable"
-                        } else if failure_message.is_none() && exit_code == 0 {
-                            "executed_success"
-                        } else {
-                            "executed_failure"
-                        },
-                        "command_was_executed": true,
-                        "exit_code": exit_code,
-                        "skip_disposition": completed_validation_skip_disposition,
-                    }),
-                })
-                .await;
-        }
         let delivered_at = Instant::now();
         let lifecycle = tool_dispatch_timing
             .as_ref()
@@ -548,6 +577,7 @@ pub(crate) fn spawn_exit_watcher(
             turn_id = %turn_ref.sub_id,
             call_id,
             process_id,
+            terminal_event_delivered = owns_terminal_event,
             request_to_spawn_ms = lifecycle
                 .as_ref()
                 .and_then(|snapshot| snapshot.exec_request_to_spawn_ms)
@@ -566,11 +596,12 @@ pub(crate) fn spawn_exit_watcher(
                         .saturating_duration_since(exit_observed_at)
                         .as_millis()
                 ).unwrap_or(u64::MAX)),
-            "background exec lifecycle delivered"
+            "background exec lifecycle finalized"
         );
     });
 }
 
+#[cfg(test)]
 pub(crate) async fn record_known_delta_from_transcript(
     codex_home: &std::path::Path,
     prepared: &PreparedKnownDelta,
@@ -594,10 +625,31 @@ pub(crate) async fn record_known_delta_from_transcript(
     known_delta_store::record_execution(codex_home, prepared, observation).await;
 }
 
+pub(crate) async fn record_known_delta_from_process_output(
+    codex_home: &std::path::Path,
+    prepared: &PreparedKnownDelta,
+    output: &ProcessOutputSnapshot,
+    success: bool,
+    executor_cost: Duration,
+) {
+    let exact_output = output
+        .aggregated_output_is_exact
+        .then_some(output.aggregated_output.as_slice());
+    let observation = match (exact_output, success) {
+        (Some(output), true) => KnownDeltaExecutionObservation::CompleteSuccess {
+            output,
+            executor_cost,
+        },
+        (Some(_), false) => KnownDeltaExecutionObservation::CompleteFailure,
+        (None, _) => KnownDeltaExecutionObservation::Incomplete,
+    };
+    known_delta_store::record_execution(codex_home, prepared, observation).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drain_queued_output(
-    receiver: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
-    pending: &mut Vec<u8>,
+    receiver: &mut tokio::sync::broadcast::Receiver<ProcessOutputChunk>,
+    pending: &mut PendingOutput,
     transcript: &Arc<Mutex<HeadTailBuffer>>,
     call_id: &str,
     session_ref: &Arc<Session>,
@@ -640,7 +692,7 @@ async fn drain_queued_output(
 #[allow(clippy::too_many_arguments)]
 async fn handle_lagged_output(
     skipped: u64,
-    pending: &mut Vec<u8>,
+    pending: &mut PendingOutput,
     transcript: &Arc<Mutex<HeadTailBuffer>>,
     call_id: &str,
     session_ref: &Arc<Session>,
@@ -667,48 +719,65 @@ async fn handle_lagged_output(
         session_ref,
         turn_ref,
         emitted_deltas,
+        ExecOutputStream::Stdout,
         lagged_output_marker(skipped),
     )
     .await;
 }
 
 async fn process_chunk(
-    pending: &mut Vec<u8>,
+    pending: &mut PendingOutput,
     transcript: &Arc<Mutex<HeadTailBuffer>>,
     call_id: &str,
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,
     emitted_deltas: &OutputDeltaLimiter,
-    chunk: Vec<u8>,
+    chunk: ProcessOutputChunk,
 ) {
-    pending.extend_from_slice(&chunk);
+    transcript.lock().await.push_chunk(chunk.bytes.clone());
+    let stream = chunk.stream;
+    let pending = match &stream {
+        ExecOutputStream::Stdout => &mut pending.stdout,
+        ExecOutputStream::Stderr => &mut pending.stderr,
+    };
+    pending.extend_from_slice(&chunk.bytes);
     emit_pending(
         pending,
-        transcript,
         call_id,
         session_ref,
         turn_ref,
         emitted_deltas,
+        stream.clone(),
         false,
     )
     .await;
 }
 
 async fn flush_pending(
-    pending: &mut Vec<u8>,
-    transcript: &Arc<Mutex<HeadTailBuffer>>,
+    pending: &mut PendingOutput,
+    _transcript: &Arc<Mutex<HeadTailBuffer>>,
     call_id: &str,
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,
     emitted_deltas: &OutputDeltaLimiter,
 ) {
     emit_pending(
-        pending,
-        transcript,
+        &mut pending.stdout,
         call_id,
         session_ref,
         turn_ref,
         emitted_deltas,
+        ExecOutputStream::Stdout,
+        true,
+    )
+    .await;
+    emit_pending(
+        &mut pending.stderr,
+        call_id,
+        session_ref,
+        turn_ref,
+        emitted_deltas,
+        ExecOutputStream::Stderr,
         true,
     )
     .await;
@@ -717,11 +786,11 @@ async fn flush_pending(
 #[allow(clippy::too_many_arguments)]
 async fn emit_pending(
     pending: &mut Vec<u8>,
-    transcript: &Arc<Mutex<HeadTailBuffer>>,
     call_id: &str,
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,
     emitted_deltas: &OutputDeltaLimiter,
+    stream: ExecOutputStream,
     flush_incomplete: bool,
 ) {
     while let Some(prefix) = split_valid_utf8_prefix_with_max(
@@ -729,11 +798,15 @@ async fn emit_pending(
         UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES,
         flush_incomplete,
     ) {
-        {
-            let mut guard = transcript.lock().await;
-            guard.push_chunk(prefix.clone());
-        }
-        emit_output_delta(call_id, session_ref, turn_ref, emitted_deltas, prefix).await;
+        emit_output_delta(
+            call_id,
+            session_ref,
+            turn_ref,
+            emitted_deltas,
+            stream.clone(),
+            prefix,
+        )
+        .await;
     }
 }
 
@@ -742,6 +815,7 @@ async fn emit_output_delta(
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,
     emitted_deltas: &OutputDeltaLimiter,
+    stream: ExecOutputStream,
     chunk: Vec<u8>,
 ) {
     let chunk = match emitted_deltas.claim() {
@@ -752,12 +826,19 @@ async fn emit_output_delta(
 
     let event = ExecCommandOutputDeltaEvent {
         call_id: call_id.to_string(),
-        stream: ExecOutputStream::Stdout,
+        stream,
         chunk,
     };
-    session_ref
-        .send_event(turn_ref.as_ref(), EventMsg::ExecCommandOutputDelta(event))
-        .await;
+    session_ref.try_send_live_event(Event {
+        id: turn_ref.sub_id.clone(),
+        msg: EventMsg::ExecCommandOutputDelta(event),
+    });
+}
+
+#[derive(Default)]
+struct PendingOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 /// Emit an ExecCommandEnd event for a unified exec session, using the transcript
@@ -774,25 +855,39 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     process_id: Option<String>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     fallback_output: String,
+    process_output: Option<ProcessOutputSnapshot>,
     exit_code: i32,
+    timed_out: bool,
     duration: Duration,
     tracker: Option<SharedTurnDiffTracker>,
+    completed_validation: Option<&CompletedValidation>,
 ) {
-    let aggregated_output = resolve_aggregated_output(&transcript, fallback_output).await;
+    finish_focused_validation_result(&session_ref, completed_validation).await;
+    let (aggregated_output, stdout, stderr) = if let Some(output) = process_output {
+        (
+            String::from_utf8_lossy(&output.aggregated_output).into_owned(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    } else {
+        let aggregated_output = resolve_aggregated_output(&transcript, fallback_output).await;
+        (aggregated_output.clone(), aggregated_output, String::new())
+    };
     let output = ExecToolCallOutput {
         exit_code,
-        stdout: StreamOutput::new(aggregated_output.clone()),
-        stderr: StreamOutput::new(String::new()),
+        stdout: StreamOutput::new(stdout),
+        stderr: StreamOutput::new(stderr),
         aggregated_output: StreamOutput::new(aggregated_output),
         duration,
-        timed_out: false,
+        timed_out,
     };
     let event_ctx = ToolEventCtx::new(
         session_ref.as_ref(),
         turn_ref.as_ref(),
         &call_id,
         tracker.as_ref(),
-    );
+    )
+    .with_completed_validation(completed_validation);
     let emitter = ToolEmitter::unified_exec(
         &command,
         cwd,
@@ -806,6 +901,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
             ToolEventStage::Success {
                 output,
                 applied_patch_delta: None,
+                formatted_output: None,
             },
         )
         .await;
@@ -822,38 +918,53 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     process_id: Option<String>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     fallback_output: String,
+    process_output: Option<ProcessOutputSnapshot>,
     message: String,
+    timed_out: bool,
     duration: Duration,
     tracker: Option<SharedTurnDiffTracker>,
+    completed_validation: Option<&CompletedValidation>,
 ) {
-    let stdout = if fallback_output.is_empty() {
-        resolve_aggregated_output(&transcript, fallback_output).await
+    finish_focused_validation_result(&session_ref, completed_validation).await;
+    let (stdout, process_stderr, process_aggregated_output) = if let Some(output) = process_output {
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            String::from_utf8_lossy(&output.aggregated_output).into_owned(),
+        )
     } else {
-        let guard = transcript.lock().await;
-        let omitted_bytes = guard.omitted_bytes();
-        let lagged_chunks = guard.lagged_chunks();
-        drop(guard);
-        append_output_loss_markers(fallback_output, omitted_bytes, lagged_chunks)
+        let stdout = if fallback_output.is_empty() {
+            resolve_aggregated_output(&transcript, fallback_output).await
+        } else {
+            let guard = transcript.lock().await;
+            let omitted_bytes = guard.omitted_bytes();
+            let lagged_chunks = guard.lagged_chunks();
+            drop(guard);
+            append_output_loss_markers(fallback_output, omitted_bytes, lagged_chunks)
+        };
+        (stdout.clone(), String::new(), stdout)
     };
-    let aggregated_output = if stdout.is_empty() {
-        message.clone()
+    let aggregated_output = append_failure_message(process_aggregated_output, &message);
+    let stderr = if process_stderr.is_empty() {
+        message
     } else {
-        format!("{stdout}\n{message}")
+        format!("{process_stderr}\n{message}")
     };
     let output = ExecToolCallOutput {
         exit_code: -1,
         stdout: StreamOutput::new(stdout),
-        stderr: StreamOutput::new(message),
+        stderr: StreamOutput::new(stderr),
         aggregated_output: StreamOutput::new(aggregated_output),
         duration,
-        timed_out: false,
+        timed_out,
     };
     let event_ctx = ToolEventCtx::new(
         session_ref.as_ref(),
         turn_ref.as_ref(),
         &call_id,
         tracker.as_ref(),
-    );
+    )
+    .with_completed_validation(completed_validation);
     let emitter = ToolEmitter::unified_exec(
         &command,
         cwd,
@@ -864,9 +975,56 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     emitter
         .emit(
             event_ctx,
-            ToolEventStage::Failure(ToolEventFailure::Output(output)),
+            ToolEventStage::Failure(ToolEventFailure::Output {
+                output,
+                formatted_output: None,
+            }),
         )
         .await;
+}
+
+async fn finish_focused_validation_result(
+    session: &Arc<Session>,
+    completed_validation: Option<&CompletedValidation>,
+) {
+    let Some(completed_validation) = completed_validation else {
+        return;
+    };
+    let Some(token) = completed_validation.focused_validation_token.clone() else {
+        return;
+    };
+    let result = &completed_validation.result;
+    let status = if result.status.is_success() {
+        ValidationCallStatus::Succeeded
+    } else {
+        ValidationCallStatus::Failed
+    };
+    let retained_output_ref = result.raw_artifact_ref.clone().or_else(|| {
+        Some(format!(
+            "tool-call:{}:{}",
+            session.thread_id, result.call_id
+        ))
+    });
+    let validation_result = serde_json::to_value(result).ok();
+    if let Err(error) = session
+        .services
+        .agent_control
+        .task_coordinator()
+        .finish_focused_validation_with_result(
+            token,
+            status,
+            retained_output_ref,
+            result.summary.clone(),
+            validation_result,
+        )
+        .await
+    {
+        tracing::warn!(
+            %error,
+            call_id = %result.call_id,
+            "focused unified validation result evidence could not be persisted"
+        );
+    }
 }
 
 fn split_valid_utf8_prefix_with_max(
@@ -938,6 +1096,15 @@ fn append_output_loss_markers(
             output.push_str(&marker);
         }
     }
+    output
+}
+
+fn append_failure_message(mut output: String, message: &str) -> String {
+    if output.is_empty() {
+        return message.to_string();
+    }
+    output.push('\n');
+    output.push_str(message);
     output
 }
 

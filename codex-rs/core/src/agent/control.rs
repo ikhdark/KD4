@@ -161,6 +161,7 @@ struct AgentControlTestHooks {
     before_initial_submission: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
     before_v2_cold_load: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
     after_execution_reservation: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
+    inter_agent_communication_attempts: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Debug)]
@@ -445,6 +446,10 @@ impl AgentControl {
         communication: InterAgentCommunication,
         agent_communication_context: AgentCommunicationContext,
     ) -> CodexResult<String> {
+        #[cfg(test)]
+        self.test_hooks
+            .inter_agent_communication_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let state = self.upgrade()?;
         let execution_guard = self
             .reserve_execution_capacity_for_turn_start(agent_id, communication.trigger_turn)
@@ -457,6 +462,13 @@ impl AgentControl {
             execution_guard,
         )
         .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inter_agent_communication_attempt_count(&self) -> usize {
+        self.test_hooks
+            .inter_agent_communication_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn send_inter_agent_communication_after_capacity_check(
@@ -486,8 +498,8 @@ impl AgentControl {
         execution_guard: Option<AgentExecutionGuard>,
     ) -> CodexResult<String> {
         let last_task_message = last_task_message_from_communication(&communication);
-        let communication_for_log =
-            crate::agent_communication::logging_enabled().then(|| communication.clone());
+        let communication_log_metadata = crate::agent_communication::logging_enabled()
+            .then(|| crate::agent_communication::agent_communication_log_metadata(&communication));
         let result = self
             .handle_thread_request_result(
                 agent_id,
@@ -501,13 +513,13 @@ impl AgentControl {
                     .await,
             )
             .await;
-        if let (Some(communication), Ok(communication_id)) =
-            (communication_for_log, result.as_ref())
+        if let (Some(metadata), Ok(communication_id)) =
+            (communication_log_metadata, result.as_ref())
         {
             crate::agent_communication::emit_agent_communication_send(
                 communication_id,
                 &context,
-                &communication,
+                metadata,
                 agent_id,
             );
         }

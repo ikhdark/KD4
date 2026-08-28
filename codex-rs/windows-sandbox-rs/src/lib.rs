@@ -15,6 +15,48 @@ pub enum CaptureOutputStream {
 
 pub type CaptureOutputSink = Arc<dyn Fn(CaptureOutputStream, &[u8]) + Send + Sync + 'static>;
 
+#[derive(Debug)]
+pub(crate) struct RetainedCapture {
+    bytes: Vec<u8>,
+    max_bytes: Option<usize>,
+    truncated: bool,
+}
+
+impl RetainedCapture {
+    pub(crate) fn new(max_bytes: Option<usize>) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+            truncated: false,
+        }
+    }
+
+    pub(crate) fn append(&mut self, bytes: &[u8]) {
+        let Some(max_bytes) = self.max_bytes else {
+            self.bytes.extend_from_slice(bytes);
+            return;
+        };
+        let remaining = max_bytes.saturating_sub(self.bytes.len());
+        let take = remaining.min(bytes.len());
+        self.bytes.extend_from_slice(&bytes[..take]);
+        self.truncated |= take < bytes.len();
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, bool) {
+        (self.bytes, self.truncated)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    #[cfg(test)]
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// Converts an optional millisecond timeout to the Win32 wait representation.
 /// `INFINITE` is reserved for the absence of a deadline, so finite values are
 /// clamped to the largest representable non-infinite timeout.
@@ -26,6 +68,7 @@ pub fn windows_wait_timeout(timeout_ms: Option<u64>) -> u32 {
 
 #[cfg(test)]
 mod wait_timeout_tests {
+    use super::RetainedCapture;
     use super::windows_wait_timeout;
 
     #[test]
@@ -41,6 +84,22 @@ mod wait_timeout_tests {
             u32::MAX - 1
         );
         assert_eq!(windows_wait_timeout(Some(u64::MAX)), u32::MAX - 1);
+    }
+
+    #[test]
+    fn retained_capture_marks_truncation_only_after_observing_excess_bytes() {
+        let mut capture = RetainedCapture::new(Some(4));
+        capture.append(b"abcd");
+        let (bytes, truncated) = capture.into_parts();
+        assert_eq!(bytes, b"abcd");
+        assert!(!truncated);
+
+        let mut capture = RetainedCapture::new(Some(4));
+        capture.append(b"abcd");
+        capture.append(b"e");
+        let (bytes, truncated) = capture.into_parts();
+        assert_eq!(bytes, b"abcd");
+        assert!(truncated);
     }
 }
 
@@ -419,6 +478,7 @@ pub use wrapper::run_windows_sandbox_wrapper_main;
 mod windows_impl {
     use super::CaptureOutputSink;
     use super::CaptureOutputStream;
+    use super::RetainedCapture;
     use super::WindowsSandboxCancellationToken;
     use super::legacy_restricted_token_enforces_delete_child;
     use super::logging::log_failure;
@@ -575,6 +635,8 @@ mod windows_impl {
         pub exit_code: i32,
         pub stdout: Vec<u8>,
         pub stderr: Vec<u8>,
+        pub stdout_truncated: bool,
+        pub stderr_truncated: bool,
         pub timed_out: bool,
     }
 
@@ -595,9 +657,10 @@ mod windows_impl {
         stop_rx: mpsc::Receiver<()>,
         output_sink: Option<CaptureOutputSink>,
         stream: CaptureOutputStream,
-    ) -> io::Result<Vec<u8>> {
+        retained_bytes_cap: Option<usize>,
+    ) -> io::Result<RetainedCapture> {
         let _handle = OwnedCapturePipeHandle(handle);
-        let mut output = Vec::new();
+        let mut output = RetainedCapture::new(retained_bytes_cap);
         let mut tmp = [0u8; 8192];
         let mut drain_deadline = None;
 
@@ -629,7 +692,7 @@ mod windows_impl {
                     true
                 } else {
                     let chunk = &tmp[..read_bytes as usize];
-                    output.extend_from_slice(chunk);
+                    output.append(chunk);
                     if let Some(output_sink) = output_sink.as_ref() {
                         output_sink(stream, chunk);
                     }
@@ -665,19 +728,25 @@ mod windows_impl {
 
     struct CapturePipeReader {
         stop_tx: mpsc::SyncSender<()>,
-        join: Option<std::thread::JoinHandle<io::Result<Vec<u8>>>>,
+        join: Option<std::thread::JoinHandle<io::Result<RetainedCapture>>>,
     }
 
     impl CapturePipeReader {
         #[cfg(test)]
         fn spawn_capture_pipe_reader(handle: HANDLE) -> Self {
-            Self::spawn_capture_pipe_reader_with_sink(handle, None, CaptureOutputStream::Stdout)
+            Self::spawn_capture_pipe_reader_with_sink(
+                handle,
+                None,
+                CaptureOutputStream::Stdout,
+                None,
+            )
         }
 
         fn spawn_capture_pipe_reader_with_sink(
             handle: HANDLE,
             output_sink: Option<CaptureOutputSink>,
             stream: CaptureOutputStream,
+            retained_bytes_cap: Option<usize>,
         ) -> Self {
             let (stop_tx, stop_rx) = mpsc::sync_channel(1);
             // windows-sys models HANDLE as an opaque pointer. Move its address
@@ -685,7 +754,13 @@ mod windows_impl {
             // thread that performs the reads.
             let handle_addr = handle as usize;
             let join = std::thread::spawn(move || {
-                read_capture_pipe(handle_addr as HANDLE, stop_rx, output_sink, stream)
+                read_capture_pipe(
+                    handle_addr as HANDLE,
+                    stop_rx,
+                    output_sink,
+                    stream,
+                    retained_bytes_cap,
+                )
             });
             Self {
                 stop_tx,
@@ -697,7 +772,7 @@ mod windows_impl {
             let _ = self.stop_tx.try_send(());
         }
 
-        fn join_reader(&mut self) -> io::Result<Vec<u8>> {
+        fn join_reader(&mut self) -> io::Result<RetainedCapture> {
             let Some(join) = self.join.take() else {
                 return Err(io::Error::other("capture pipe reader already joined"));
             };
@@ -707,7 +782,7 @@ mod windows_impl {
             }
         }
 
-        fn stop_and_collect(mut self) -> io::Result<Vec<u8>> {
+        fn stop_and_collect(mut self) -> io::Result<RetainedCapture> {
             self.request_stop();
             self.join_reader()
         }
@@ -776,6 +851,7 @@ mod windows_impl {
             additional_deny_write_paths,
             use_private_desktop,
             None,
+            None,
         )
     }
 
@@ -793,6 +869,7 @@ mod windows_impl {
         additional_deny_write_paths: &[AbsolutePathBuf],
         use_private_desktop: bool,
         output_sink: Option<CaptureOutputSink>,
+        retained_bytes_cap: Option<usize>,
     ) -> Result<CaptureResult> {
         super::ensure_legacy_delete_child_safety(legacy_restricted_token_enforces_delete_child())?;
         let additional_deny_read_paths = additional_deny_read_paths
@@ -896,11 +973,13 @@ mod windows_impl {
             out_r,
             output_sink.clone(),
             CaptureOutputStream::Stdout,
+            retained_bytes_cap,
         );
         let stderr_reader = CapturePipeReader::spawn_capture_pipe_reader_with_sink(
             err_r,
             output_sink,
             CaptureOutputStream::Stderr,
+            retained_bytes_cap,
         );
 
         let wait_outcome = wait_for_process(pi.hProcess, timeout_ms, cancellation.as_ref());
@@ -974,8 +1053,8 @@ mod windows_impl {
         }
         let stdout_result = stdout_reader.stop_and_collect();
         let stderr_result = stderr_reader.stop_and_collect();
-        let stdout = stdout_result?;
-        let stderr = stderr_result?;
+        let (stdout, stdout_truncated) = stdout_result?.into_parts();
+        let (stderr, stderr_truncated) = stderr_result?.into_parts();
         let exit_code = if timed_out {
             128 + 64
         } else {
@@ -992,6 +1071,8 @@ mod windows_impl {
             exit_code,
             stdout,
             stderr,
+            stdout_truncated,
+            stderr_truncated,
             timed_out,
         })
     }

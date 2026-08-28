@@ -40,6 +40,14 @@ pub enum ExperimentalFeatureStage {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub enum ExperimentalFeatureConsumer {
+    Runtime,
+    Client,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct ExperimentalFeature {
     /// Stable key used in config.toml and CLI flag toggles.
     pub name: String,
@@ -58,6 +66,9 @@ pub struct ExperimentalFeature {
     pub enabled: bool,
     /// Whether this feature is enabled by default.
     pub default_enabled: bool,
+    /// Which side of the app-server boundary consumes this flag.
+    /// Optional for clients generated before consumer metadata existed.
+    pub consumer: Option<ExperimentalFeatureConsumer>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

@@ -31,21 +31,9 @@ residualDeterministicGenerationCount: number,
  */
 ownerDrainedContinuationCount: number,
 /**
- * Validation commands that executed rather than reusing a proof.
+ * Validation commands that executed.
  */
 executedValidationCount: number,
-/**
- * Validation results served from the authoritative validation ledger.
- */
-reusedValidationCount: number,
-/**
- * Validation requests identified as duplicates and served from the ledger.
- */
-duplicateValidationCount: number,
-/**
- * Executed validation requests that explicitly bypassed reusable proof state.
- */
-forcedFreshValidationCount: number,
 /**
  * Total wall-clock nanoseconds spent in validation commands that executed.
  */

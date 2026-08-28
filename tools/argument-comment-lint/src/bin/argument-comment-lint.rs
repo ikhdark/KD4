@@ -133,11 +133,7 @@ fn append_flag_if_missing(flags: &mut String, flag: &str) {
 }
 
 fn cargo_dylint_binary_name() -> &'static str {
-    if cfg!(windows) {
-        "cargo-dylint.exe"
-    } else {
-        "cargo-dylint"
-    }
+    "cargo-dylint.exe"
 }
 
 fn infer_rustup_home() -> Result<Option<OsString>, String> {
@@ -265,9 +261,15 @@ fn exit_code_from_status(code: Option<i32>) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use super::cargo_dylint_binary_name;
     use super::normalize_nightly_library_filename;
     use super::strict_rustflags;
     use std::path::Path;
+
+    #[test]
+    fn uses_windows_cargo_dylint_binary_name() {
+        assert_eq!(cargo_dylint_binary_name(), "cargo-dylint.exe");
+    }
 
     #[test]
     fn strips_host_triple_from_nightly_filename() {

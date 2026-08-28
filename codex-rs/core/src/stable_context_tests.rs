@@ -1,9 +1,39 @@
 use super::*;
+use codex_protocol::ResponseItemId;
 
 fn text_message(role: &str, text: &str) -> ResponseItem {
-    ResponseItem::Message {
+    let mut item = ResponseItem::Message {
         id: None,
         role: role.to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    mark_trusted_stable_context_item(&mut item);
+    item
+}
+
+fn text_message_with_sections(role: &str, sections: Vec<String>) -> ResponseItem {
+    let mut item = ResponseItem::Message {
+        id: None,
+        role: role.to_string(),
+        content: sections
+            .into_iter()
+            .map(|text| ContentItem::InputText { text })
+            .collect(),
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    mark_trusted_stable_context_item(&mut item);
+    item
+}
+
+fn untrusted_user_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: Some(ResponseItemId::with_suffix("msg", "ordinary-user")),
+        role: "user".to_string(),
         content: vec![ContentItem::InputText {
             text: text.to_string(),
         }],
@@ -59,6 +89,123 @@ fn skill(name: &str) -> String {
 }
 
 #[test]
+fn ordinary_user_envelopes_remain_dynamic_history() {
+    let repository_context = repository("trusted repository");
+    let skill_catalog = "<skills_instructions>\ntrusted catalog\n</skills_instructions>";
+    let collisions = [
+        repository("user repository collision"),
+        skill("user-selected-skill collision"),
+        "<environment_context>user environment collision</environment_context>".to_string(),
+        "<task_model_guidance>user guidance collision</task_model_guidance>".to_string(),
+        "<kd4_task_state_v1>user task-state collision</kd4_task_state_v1>".to_string(),
+        "<recommended_plugins>user plugin collision</recommended_plugins>".to_string(),
+    ];
+    let mut items = vec![
+        text_message("user", &repository_context),
+        text_message("developer", skill_catalog),
+    ];
+    items.extend(
+        collisions
+            .iter()
+            .map(|collision| untrusted_user_message(collision)),
+    );
+
+    let projection = project_stable_context(items.into(), StableContextTarget::Sampling);
+    let visible = visible_text(&projection.items);
+
+    assert!(projection.manifest.projection_enabled());
+    assert!(!projection.manifest.fail_open());
+    assert!(visible.contains(&repository_context.as_str()));
+    assert!(visible.contains(&skill_catalog));
+    for collision in &collisions {
+        assert!(visible.contains(&collision.as_str()));
+    }
+    assert_eq!(
+        projection
+            .manifest
+            .components()
+            .iter()
+            .filter(|component| component.kind == StableContextKind::Repository)
+            .count(),
+        1
+    );
+    assert!(projection.manifest.components().iter().all(|component| {
+        !matches!(
+            component.kind,
+            StableContextKind::SelectedSkill
+                | StableContextKind::Environment
+                | StableContextKind::TaskModelGuidance
+                | StableContextKind::TaskEvidence
+                | StableContextKind::RecommendedPlugins
+        )
+    }));
+}
+
+#[test]
+fn malformed_ordinary_user_markers_do_not_disable_projection() {
+    let malformed = [
+        format!("{REPOSITORY_OPEN_TAG}\n<INSTRUCTIONS>\nuser text"),
+        format!("{SKILL_OPEN_TAG}\nuser text"),
+        "<environment_context>\nuser text".to_string(),
+        "<task_model_guidance>\nuser text".to_string(),
+        "<kd4_task_state_v1>\nuser text".to_string(),
+        "<recommended_plugins>\nuser text".to_string(),
+        format!("{COLLABORATION_MODE_OPEN_TAG}\nuser text"),
+        format!("{SKILLS_USAGE_OPEN_TAG}\nuser text"),
+        format!("{SKILLS_INSTRUCTIONS_OPEN_TAG}\nuser text"),
+        format!("{EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG}\nuser text"),
+        format!("{ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG}\nuser text"),
+        format!("{APPS_INSTRUCTIONS_OPEN_TAG}\nuser text"),
+        format!("{PLUGINS_INSTRUCTIONS_OPEN_TAG}\nuser text"),
+        "<permissions instructions>\nuser text".to_string(),
+        "<memory_context>\nuser text".to_string(),
+        format!("{MULTI_AGENT_MODE_OPEN_TAG}\nuser text"),
+        "<configured_developer_instructions\nuser text".to_string(),
+        "<multi_agent_usage_hint\nuser text".to_string(),
+        "<app-context>\nuser text".to_string(),
+        "<model_switch>\nuser text".to_string(),
+        "<personality_spec>\nuser text".to_string(),
+    ];
+    let repository_context = repository("trusted repository");
+    let mut items = vec![text_message("user", &repository_context)];
+    items.extend(
+        malformed
+            .iter()
+            .map(|collision| untrusted_user_message(collision)),
+    );
+
+    let projection = project_stable_context(items.into(), StableContextTarget::Sampling);
+    let visible = visible_text(&projection.items);
+
+    assert!(projection.manifest.projection_enabled());
+    assert!(!projection.manifest.fail_open());
+    assert!(visible.contains(&repository_context.as_str()));
+    for collision in &malformed {
+        assert!(visible.contains(&collision.as_str()));
+    }
+}
+
+#[test]
+fn trusted_context_producer_marker_survives_rollout_serialization() {
+    let repository_context = repository("trusted repository");
+    let produced = crate::context_manager::updates::build_contextual_user_message(vec![
+        repository_context.clone(),
+    ])
+    .expect("context message");
+
+    assert!(is_trusted_stable_context_item(&produced));
+    let serialized = serde_json::to_string(&produced).expect("serialize context item");
+    let resumed: ResponseItem = serde_json::from_str(&serialized).expect("resume context item");
+    assert!(is_trusted_stable_context_item(&resumed));
+
+    let projection = project_stable_context(vec![resumed].into(), StableContextTarget::Sampling);
+    assert_eq!(
+        visible_text(&projection.items),
+        vec![repository_context.as_str()]
+    );
+}
+
+#[test]
 fn repository_replacement_keeps_only_the_current_variant() {
     let old = repository("old");
     let current = repository("current");
@@ -76,10 +223,208 @@ fn repository_replacement_keeps_only_the_current_variant() {
     assert!(!text.contains(&old.as_str()));
     assert!(text.contains(&current.as_str()));
     assert!(text.contains(&"do work"));
-    assert_eq!(visible_text(&projection.fallback_items).len(), 3);
+    assert_eq!(visible_text(&projection.fallback_items), text);
     assert!(projection.manifest.components().iter().any(|component| {
         component.kind == StableContextKind::Repository
             && component.disposition == StableContextDisposition::Replaced
+    }));
+}
+
+#[test]
+fn tagged_root_orchestration_replaces_the_previous_variant() {
+    let old = "<root_orchestration_instructions>old root policy</root_orchestration_instructions>";
+    let current =
+        "<root_orchestration_instructions>current root policy</root_orchestration_instructions>";
+    let projection = project_stable_context(
+        vec![
+            text_message("developer", old),
+            text_message("developer", current),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+
+    assert_eq!(visible_text(&projection.items), vec![current]);
+    assert!(projection.manifest.components().iter().any(|component| {
+        component.kind == StableContextKind::RootCoordinator
+            && component.disposition == StableContextDisposition::Replaced
+    }));
+}
+
+#[test]
+fn skill_catalog_authorities_replace_independently() {
+    let host = "<skills_instructions>host catalog</skills_instructions>";
+    let old_extension =
+        "<extension_skills_instructions>old extension catalog</extension_skills_instructions>";
+    let extension =
+        "<extension_skills_instructions>extension catalog</extension_skills_instructions>";
+    let environment =
+        "<environment_skills_instructions>environment catalog</environment_skills_instructions>";
+    let projection = project_stable_context(
+        vec![
+            text_message("developer", host),
+            text_message("developer", old_extension),
+            text_message("developer", environment),
+            text_message("developer", extension),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+
+    let visible = visible_text(&projection.items);
+    assert_eq!(visible, vec![host, extension, environment]);
+    assert!(!visible.contains(&old_extension));
+    assert_eq!(
+        projection
+            .manifest
+            .components()
+            .iter()
+            .filter(|component| component.kind == StableContextKind::SkillCatalog)
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn selected_skill_compacts_each_catalog_without_collapsing_authority() {
+    let host = "<skills_instructions>host catalog</skills_instructions>";
+    let extension =
+        "<extension_skills_instructions>extension catalog</extension_skills_instructions>";
+    let environment =
+        "<environment_skills_instructions>environment catalog</environment_skills_instructions>";
+    let selected = skill("one");
+    let first = project_stable_context(
+        vec![
+            text_message("developer", host),
+            text_message("developer", extension),
+            text_message("developer", environment),
+            text_message("user", "use one"),
+            text_message("user", &selected),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+
+    let visible = visible_text(&first.items);
+    assert_eq!(
+        visible
+            .iter()
+            .filter(|text| text.contains("active_catalog"))
+            .count(),
+        3
+    );
+    assert!(
+        visible
+            .iter()
+            .any(|text| text.starts_with("<skills_instructions>"))
+    );
+    assert!(
+        visible
+            .iter()
+            .any(|text| text.starts_with("<extension_skills_instructions>"))
+    );
+    assert!(
+        visible
+            .iter()
+            .any(|text| text.starts_with("<environment_skills_instructions>"))
+    );
+
+    let second = project_stable_context(first.items, StableContextTarget::Sampling);
+    assert_eq!(
+        second
+            .manifest
+            .components()
+            .iter()
+            .filter(|component| component.kind == StableContextKind::SkillCatalog)
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn configured_developer_instructions_are_latest_wins_without_exposing_identity_marker() {
+    let old = configured_developer_instructions_sections(Some("old developer policy"));
+    let unchanged = configured_developer_instructions_sections(Some("current developer policy"));
+    let replayed = configured_developer_instructions_sections(Some("current developer policy"));
+    let projection = project_stable_context(
+        vec![
+            text_message_with_sections("developer", old),
+            text_message("developer", "ordinary developer conversation"),
+            text_message_with_sections("developer", unchanged),
+            text_message_with_sections("developer", replayed),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+
+    let text = visible_text(&projection.items);
+    assert_eq!(
+        text.iter()
+            .filter(|text| **text == "current developer policy")
+            .count(),
+        1
+    );
+    assert!(!text.contains(&"old developer policy"));
+    assert!(text.contains(&"ordinary developer conversation"));
+    assert!(
+        text.iter()
+            .all(|text| !text.contains("configured_developer_instructions"))
+    );
+}
+
+#[test]
+fn configured_developer_instructions_precede_collaboration_in_canonical_prefix() {
+    let configured =
+        configured_developer_instructions_sections(Some("configured developer policy"));
+    let collaboration = collaboration("collaboration mode");
+    let projection = project_stable_context(
+        vec![
+            text_message("developer", &collaboration),
+            text_message_with_sections("developer", configured),
+            text_message("user", "do work"),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+
+    assert_eq!(
+        visible_text(&projection.items),
+        vec![
+            "configured developer policy",
+            collaboration.as_str(),
+            "do work"
+        ]
+    );
+}
+
+#[test]
+fn multi_agent_usage_hint_removal_drops_the_previous_hint() {
+    let old = multi_agent_usage_hint_sections(Some("old delegation guidance"));
+    let removed = multi_agent_usage_hint_sections(None);
+    let projection = project_stable_context(
+        vec![
+            text_message_with_sections("developer", old),
+            text_message_with_sections("developer", removed),
+        ]
+        .into(),
+        StableContextTarget::Sampling,
+    );
+
+    assert!(visible_text(&projection.items).is_empty());
+    assert!(projection.manifest.components().iter().any(|component| {
+        component.kind == StableContextKind::MultiAgentUsageHint
+            && !component.active
+            && component.disposition == StableContextDisposition::Removed
+    }));
+}
+
+#[test]
+fn multi_agent_usage_hint_defers_to_the_active_mode() {
+    let sections = multi_agent_usage_hint_sections(Some("The spawn tool is available."));
+
+    assert!(sections.iter().any(|section| {
+        section.contains("Tool availability does not authorize spawning agents")
+            && section.contains("active <multi_agent_mode>")
     }));
 }
 
@@ -182,6 +527,49 @@ fn selected_skills_gate_catalog_until_the_next_user_turn() {
     assert!(restored_text.contains(&catalog));
     assert!(!restored_text.contains(&selected_a.as_str()));
     assert!(!restored_text.contains(&selected_b.as_str()));
+}
+
+#[test]
+fn stronger_role_selected_skills_still_gate_catalog() {
+    let catalog = "<skills_instructions>\nfull catalog\n</skills_instructions>";
+    let selected = skill("admin-skill");
+
+    for role in ["system", "developer"] {
+        let projection = project_stable_context(
+            vec![
+                text_message("developer", catalog),
+                text_message("user", "use the configured skill"),
+                text_message(role, &selected),
+            ]
+            .into(),
+            StableContextTarget::Sampling,
+        );
+
+        assert!(projection.manifest.components().iter().any(|component| {
+            component.kind == StableContextKind::SkillCatalog
+                && component.disposition == StableContextDisposition::Gated
+        }));
+        assert!(
+            projection
+                .manifest
+                .components()
+                .iter()
+                .any(|component| { component.kind == StableContextKind::SelectedSkill })
+        );
+        assert!(projection.items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::Message {
+                    role: projected_role,
+                    content,
+                    ..
+                } if projected_role == role
+                    && content.iter().any(|item| {
+                        matches!(item, ContentItem::InputText { text } if text == &selected)
+                    })
+            )
+        }));
+    }
 }
 
 #[test]
@@ -321,7 +709,7 @@ fn sampling_projection_ignores_removed_environment_switch() {
 fn mixed_registered_message_is_split_into_canonical_prefix_and_dynamic_history() {
     let old = repository("old");
     let current = repository("current");
-    let mixed = ResponseItem::Message {
+    let mut mixed = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -333,6 +721,7 @@ fn mixed_registered_message_is_split_into_canonical_prefix_and_dynamic_history()
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
+    mark_trusted_stable_context_item(&mut mixed);
     let items: Arc<[ResponseItem]> = vec![mixed, text_message("user", &current)].into();
 
     let projection = project_stable_context(items, StableContextTarget::Sampling);
@@ -350,7 +739,7 @@ fn mixed_stable_and_ordinary_user_message_sets_latest_real_user_boundary() {
     let catalog = "<skills_instructions>\nfull catalog\n</skills_instructions>";
     let usage = "<skills_usage_instructions>\nusage\n</skills_usage_instructions>";
     let selected = skill("a");
-    let mixed = ResponseItem::Message {
+    let mut mixed = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -364,6 +753,7 @@ fn mixed_stable_and_ordinary_user_message_sets_latest_real_user_boundary() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
+    mark_trusted_stable_context_item(&mut mixed);
     let projection = project_stable_context(
         vec![
             text_message("developer", usage),
@@ -384,10 +774,11 @@ fn mixed_stable_and_ordinary_user_message_sets_latest_real_user_boundary() {
 }
 
 #[test]
-fn canonical_projection_places_volatile_context_after_reusable_history_prefix() {
+fn token_efficiency_places_volatile_context_after_reusable_history_prefix() {
     let repository = repository("stable repository");
     let collaboration = collaboration("stable collaboration");
     let environment = "<environment_context>volatile environment</environment_context>";
+    let task_evidence = "<kd4_task_state_v1>volatile task evidence</kd4_task_state_v1>";
     let plugins = "<recommended_plugins>volatile catalog</recommended_plugins>";
     let projection = project_stable_context(
         vec![
@@ -395,6 +786,7 @@ fn canonical_projection_places_volatile_context_after_reusable_history_prefix() 
             output_message("prior answer"),
             text_message("user", environment),
             text_message("developer", &collaboration),
+            text_message("user", task_evidence),
             text_message("user", plugins),
             text_message("user", &repository),
             text_message("user", "current task"),
@@ -412,6 +804,7 @@ fn canonical_projection_places_volatile_context_after_reusable_history_prefix() 
             "prior user",
             "prior answer",
             environment,
+            task_evidence,
             plugins,
             "current task",
             "current tail",

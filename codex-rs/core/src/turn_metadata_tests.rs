@@ -44,6 +44,7 @@ fn test_responses_metadata_json(
         )
         .turn_metadata_json()
         .expect("turn metadata json")
+        .to_string()
 }
 
 fn test_turn_responses_metadata_json(state: &TurnMetadataState, window_id: &str) -> String {
@@ -67,6 +68,33 @@ fn test_turn_metadata_header(state: &TurnMetadataState) -> String {
         .responses_metadata_template()
         .turn_metadata_json()
         .expect("header")
+        .to_string()
+}
+
+#[test]
+fn turn_metadata_json_is_cached_across_compatibility_projections() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let cwd = temp_dir.path().abs();
+    let permission_profile = PermissionProfile::read_only();
+    let metadata = TurnMetadataState::new(
+        "session-a".to_string(),
+        "thread-a".to_string(),
+        /*forked_from_thread_id*/ None,
+        /*parent_thread_id*/ None,
+        &SessionSource::Exec,
+        /*thread_source*/ None,
+        "turn-a".to_string(),
+        cwd,
+        &permission_profile,
+        WindowsSandboxLevel::Disabled,
+        /*enforce_managed_network*/ false,
+    )
+    .responses_metadata_template();
+
+    let first = metadata.turn_metadata_json().expect("first rendering");
+    let second = metadata.turn_metadata_json().expect("cached rendering");
+
+    assert!(std::ptr::eq(first, second));
 }
 
 #[test]
@@ -138,7 +166,7 @@ async fn create_clean_git_repo(repo_name: &str) -> (TempDir, AbsolutePathBuf) {
 async fn detached_memory_responses_metadata_omits_turn_identity() {
     let (_temp_dir, repo_path) = create_clean_git_repo("repo-東京").await;
 
-    let header = detached_memory_responses_metadata(
+    let metadata = detached_memory_responses_metadata(
         String::new(),
         String::new(),
         String::new(),
@@ -147,12 +175,11 @@ async fn detached_memory_responses_metadata_omits_turn_identity() {
         &repo_path,
         Some("none"),
     )
-    .await
-    .turn_metadata_json()
-    .expect("header");
+    .await;
+    let header = metadata.turn_metadata_json().expect("header");
     assert!(header.is_ascii());
     assert!(!header.contains("東京"));
-    let parsed: Value = serde_json::from_str(&header).expect("valid json");
+    let parsed: Value = serde_json::from_str(header).expect("valid json");
     assert_eq!(parsed["request_kind"].as_str(), Some("memory"));
     assert!(parsed.get("session_id").is_none());
     assert!(parsed.get("thread_id").is_none());
@@ -184,7 +211,7 @@ async fn detached_memory_responses_metadata_omits_empty_workspace_metadata() {
     let temp_dir = TempDir::new().expect("temp dir");
     let cwd = temp_dir.path().abs();
 
-    let header = detached_memory_responses_metadata(
+    let metadata = detached_memory_responses_metadata(
         String::new(),
         String::new(),
         String::new(),
@@ -193,10 +220,11 @@ async fn detached_memory_responses_metadata_omits_empty_workspace_metadata() {
         &cwd,
         /*sandbox*/ None,
     )
-    .await
-    .turn_metadata_json()
-    .expect("detached memory should emit its request kind");
-    let parsed: Value = serde_json::from_str(&header).expect("valid json");
+    .await;
+    let header = metadata
+        .turn_metadata_json()
+        .expect("detached memory should emit its request kind");
+    let parsed: Value = serde_json::from_str(header).expect("valid json");
 
     assert_eq!(parsed, serde_json::json!({"request_kind": "memory"}));
 }

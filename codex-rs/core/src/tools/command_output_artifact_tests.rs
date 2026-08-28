@@ -1,8 +1,27 @@
 use super::*;
 
+#[tokio::test(flavor = "current_thread")]
+async fn confirmed_performance_artifact_filesystem_operations_use_blocking_pool() {
+    let runtime_thread = std::thread::current().id();
+    let worker_thread = run_blocking_artifact_io(|| Ok(std::thread::current().id()))
+        .await
+        .expect("blocking artifact operation");
+
+    assert_ne!(worker_thread, runtime_thread);
+}
+
+#[test]
+fn artifact_metadata_discloses_source_capture_truncation() {
+    let artifact = RawOutputArtifact::unavailable("test artifact");
+    let rendered = artifact.render_for_model_with_source_truncation(true);
+
+    assert!(rendered.contains("source capture truncated"));
+    assert!(rendered.contains("omitted bytes unavailable"));
+}
+
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
-async fn reduced_output_notice_defers_recovery_syntax_to_the_tool_schema() {
+async fn token_efficiency_reduced_output_notice_defers_to_tool_schema() {
     let temp = tempfile::tempdir().expect("tempdir");
     let artifact = create_raw_output_artifact(temp.path(), "thread", b"retained output").await;
 
@@ -10,9 +29,9 @@ async fn reduced_output_notice_defers_recovery_syntax_to_the_tool_schema() {
         .reduction_notice()
         .expect("stored artifact reduction notice");
 
-    assert!(notice.contains("advertised read_tool_output schema"));
-    assert!(notice.contains(&artifact.artifact_id().expect("artifact ID").to_string()));
-    assert!(notice.contains("Do not rerun the producer"));
+    assert!(notice.contains("with read_tool_output"));
+    assert!(!notice.contains(&artifact.artifact_id().expect("artifact ID").to_string()));
+    assert!(notice.contains("do not rerun the producer"));
     assert!(!notice.contains(r#""selectors""#));
     assert!(!notice.contains(r#"{"artifact_id""#));
 }
@@ -1459,6 +1478,35 @@ async fn audit_output_artifact_retention_permit_uses_interprocess_lock() {
         "a generation advanced by another process must invalidate the local index"
     );
     drop(next_permit);
+}
+
+#[test]
+#[serial_test::serial(command_output_artifact)]
+fn malformed_or_overflowed_retention_generation_is_reinitialized() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    for (name, contents) in [
+        ("malformed", "not-a-generation".to_string()),
+        ("overflowed", u64::MAX.to_string()),
+    ] {
+        let generation_path = temp.path().join(name);
+        std::fs::write(&generation_path, contents).expect("write invalid generation");
+        *retention_interprocess_generation()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(0);
+        retention_interprocess_index_stale().store(false, Ordering::Release);
+
+        advance_retention_interprocess_generation(&generation_path)
+            .expect("invalid generation should be recoverable");
+
+        assert_eq!(
+            std::fs::read_to_string(&generation_path).expect("read repaired generation"),
+            "1"
+        );
+        assert!(
+            retention_interprocess_index_stale().load(Ordering::Acquire),
+            "repairing shared generation metadata must invalidate the local index"
+        );
+    }
 }
 
 async fn create_artifacts_and_measure(count: usize) -> (RetentionDiagnostics, std::time::Duration) {

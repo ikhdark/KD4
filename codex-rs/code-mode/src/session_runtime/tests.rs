@@ -171,6 +171,46 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
     runtime.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn storage_limit_rejects_the_complete_cell_write_set() {
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    runtime.inner.stored_values.lock().await.insert(
+        "stable".to_string(),
+        JsonValue::String("preserved".to_string()),
+    );
+    let writes = (0..crate::runtime::MAX_SESSION_STORED_VALUES)
+        .map(|index| (format!("new-{index}"), JsonValue::Bool(true)))
+        .collect();
+    let cell_state = Arc::new(CellState::new(CancellationToken::new()));
+    let host = RuntimeCellHost {
+        cell_id: CellId::new("oversized-writer"),
+        parent_tool_call_id: "parent-call".to_string(),
+        inner: Arc::clone(&runtime.inner),
+        cell_permit: Mutex::new(None),
+    };
+
+    assert_eq!(
+        host.commit_completion(
+            writes,
+            CellEvent::Completed {
+                content_items: Vec::new(),
+                error_text: None,
+            },
+            /*pending_initial_yield_items*/ None,
+            cell_state,
+        )
+        .await,
+        CompletionCommit::Committed
+    );
+
+    let stored_values = runtime.inner.stored_values.lock().await;
+    assert_eq!(stored_values.len(), 1);
+    assert_eq!(
+        stored_values.get("stable"),
+        Some(&JsonValue::String("preserved".to_string()))
+    );
+}
+
 fn execute_request(source: &str) -> CreateCellRequest {
     CreateCellRequest {
         tool_call_id: "call-1".to_string(),

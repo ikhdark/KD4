@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use chrono::Duration as ChronoDuration;
@@ -34,10 +35,25 @@ struct BoundThreadListCursor {
     position: codex_rollout::Cursor,
 }
 
+struct SelectedRolloutThreads {
+    page: codex_rollout::ThreadsPage,
+    storage_path: ThreadListStoragePath,
+    state_metadata: HashMap<codex_protocol::ThreadId, codex_state::ThreadMetadata>,
+    state_db_reads: usize,
+}
+
 pub(super) async fn list_threads(
     store: &LocalThreadStore,
     params: ListThreadsParams,
 ) -> ThreadStoreResult<ThreadPage> {
+    let (page, _) = list_threads_with_state_db_read_count(store, params).await?;
+    Ok(page)
+}
+
+async fn list_threads_with_state_db_read_count(
+    store: &LocalThreadStore,
+    params: ListThreadsParams,
+) -> ThreadStoreResult<(ThreadPage, usize)> {
     let cursor = params
         .cursor
         .as_deref()
@@ -52,8 +68,13 @@ pub(super) async fn list_threads(
         model_provider_id: store.config.default_model_provider_id.clone(),
         generate_memories: false,
     };
-    let (page, storage_path) = select_rollout_threads(
-        state_db,
+    let SelectedRolloutThreads {
+        page,
+        storage_path,
+        state_metadata,
+        mut state_db_reads,
+    } = select_rollout_threads(
+        state_db.clone(),
         &rollout_config,
         store.config.default_model_provider_id.as_str(),
         &params,
@@ -77,8 +98,19 @@ pub(super) async fn list_threads(
             continue;
         };
         let relation_parent_thread_id = thread.parent_thread_id;
-        if let Some(state_db_ctx) = hydration_db.as_deref()
-            && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread.thread_id).await
+        let metadata = if storage_path == ThreadListStoragePath::StateDb {
+            state_metadata.get(&thread.thread_id).cloned()
+        } else if let Some(state_db_ctx) = hydration_db.as_deref() {
+            state_db_reads += 1;
+            state_db_ctx
+                .get_thread(thread.thread_id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        if let Some(metadata) = metadata
             && let Ok(authoritative_thread) =
                 stored_thread_from_sqlite_metadata(store, metadata).await
         {
@@ -98,8 +130,19 @@ pub(super) async fn list_threads(
         .difference(&resolved_title_ids)
         .copied()
         .collect::<HashSet<_>>();
-    if let Some(state_db_ctx) = store.state_db().await {
+    if storage_path == ThreadListStoragePath::StateDb {
         for thread_id in unresolved_thread_ids.clone() {
+            let Some(metadata) = state_metadata.get(&thread_id) else {
+                continue;
+            };
+            if let Some(title) = distinct_thread_metadata_title(metadata) {
+                unresolved_thread_ids.remove(&thread_id);
+                names.insert(thread_id, title);
+            }
+        }
+    } else if let Some(state_db_ctx) = hydration_db.as_deref() {
+        for thread_id in unresolved_thread_ids.clone() {
+            state_db_reads += 1;
             let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await else {
                 continue;
             };
@@ -131,11 +174,14 @@ pub(super) async fn list_threads(
         })
         .map(|position| bind_cursor(storage_path, &position));
 
-    Ok(ThreadPage {
-        items,
-        next_cursor,
-        backwards_cursor,
-    })
+    Ok((
+        ThreadPage {
+            items,
+            next_cursor,
+            backwards_cursor,
+        },
+        state_db_reads,
+    ))
 }
 
 async fn select_rollout_threads(
@@ -144,19 +190,16 @@ async fn select_rollout_threads(
     default_model_provider_id: &str,
     params: &ListThreadsParams,
     cursor: Option<&BoundThreadListCursor>,
-) -> ThreadStoreResult<(codex_rollout::ThreadsPage, ThreadListStoragePath)> {
+) -> ThreadStoreResult<SelectedRolloutThreads> {
     let selected_path = storage_path_for_request(params, cursor)?;
     if selected_path == Some(ThreadListStoragePath::StateDb) {
-        let page = list_rollout_threads_for_storage(
+        return list_state_threads_for_storage(
             state_db,
             config,
-            default_model_provider_id,
             params,
             cursor.map(|cursor| &cursor.position),
-            ThreadListStoragePath::StateDb,
         )
-        .await?;
-        return Ok((page, ThreadListStoragePath::StateDb));
+        .await;
     }
     if selected_path == Some(ThreadListStoragePath::ScanAndRepair) {
         let page = list_rollout_threads_for_storage(
@@ -168,20 +211,16 @@ async fn select_rollout_threads(
             ThreadListStoragePath::ScanAndRepair,
         )
         .await?;
-        return Ok((page, ThreadListStoragePath::ScanAndRepair));
+        return Ok(SelectedRolloutThreads {
+            page,
+            storage_path: ThreadListStoragePath::ScanAndRepair,
+            state_metadata: HashMap::new(),
+            state_db_reads: 0,
+        });
     }
 
-    match list_rollout_threads_for_storage(
-        state_db.clone(),
-        config,
-        default_model_provider_id,
-        params,
-        /*cursor*/ None,
-        ThreadListStoragePath::StateDb,
-    )
-    .await
-    {
-        Ok(page) => Ok((page, ThreadListStoragePath::StateDb)),
+    match list_state_threads_for_storage(state_db.clone(), config, params, /*cursor*/ None).await {
+        Ok(selected) => Ok(selected),
         Err(ThreadStoreError::Internal { .. }) => {
             let page = list_rollout_threads_for_storage(
                 state_db,
@@ -192,10 +231,66 @@ async fn select_rollout_threads(
                 ThreadListStoragePath::ScanAndRepair,
             )
             .await?;
-            Ok((page, ThreadListStoragePath::ScanAndRepair))
+            Ok(SelectedRolloutThreads {
+                page,
+                storage_path: ThreadListStoragePath::ScanAndRepair,
+                state_metadata: HashMap::new(),
+                state_db_reads: 0,
+            })
         }
         Err(err) => Err(err),
     }
+}
+
+async fn list_state_threads_for_storage(
+    state_db: Option<codex_rollout::StateDbHandle>,
+    config: &RolloutConfig,
+    params: &ListThreadsParams,
+    cursor: Option<&codex_rollout::Cursor>,
+) -> ThreadStoreResult<SelectedRolloutThreads> {
+    if params
+        .cwd_filters
+        .as_deref()
+        .is_some_and(<[std::path::PathBuf]>::is_empty)
+    {
+        return Ok(SelectedRolloutThreads {
+            page: codex_rollout::ThreadsPage::default(),
+            storage_path: ThreadListStoragePath::StateDb,
+            state_metadata: HashMap::new(),
+            state_db_reads: 0,
+        });
+    }
+
+    let state_page = codex_rollout::state_integration::list_threads_db(
+        state_db.as_deref(),
+        config.codex_home.as_path(),
+        params.page_size,
+        cursor,
+        params.sort_key,
+        params.sort_direction,
+        params.allowed_sources.as_slice(),
+        params.model_providers.as_deref(),
+        params.cwd_filters.as_deref(),
+        params.relation_filter,
+        params.archived,
+        params.search_term.as_deref(),
+    )
+    .await
+    .ok_or_else(|| ThreadStoreError::Internal {
+        message: "state DB unavailable for thread listing".to_string(),
+    })?;
+    let state_metadata = state_page
+        .items
+        .iter()
+        .map(|metadata| (metadata.id, metadata.clone()))
+        .collect();
+
+    Ok(SelectedRolloutThreads {
+        page: state_page.into(),
+        storage_path: ThreadListStoragePath::StateDb,
+        state_metadata,
+        state_db_reads: 1,
+    })
 }
 
 pub(super) async fn list_rollout_threads_for_storage(
@@ -724,8 +819,9 @@ mod tests {
         )
         .expect("session file");
 
-        let page = store
-            .list_threads(ListThreadsParams {
+        let (page, _) = list_threads_with_state_db_read_count(
+            &store,
+            ListThreadsParams {
                 page_size: 10,
                 cursor: None,
                 sort_key: ThreadSortKey::CreatedAt,
@@ -737,9 +833,10 @@ mod tests {
                 search_term: None,
                 relation_filter: None,
                 storage_mode: ThreadListStorageMode::ScanAndRepair,
-            })
-            .await
-            .expect("thread listing");
+            },
+        )
+        .await
+        .expect("thread listing");
 
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].model_provider, "test-provider");
@@ -787,8 +884,9 @@ mod tests {
             .await
             .expect("state db upsert should succeed");
 
-        let page = store
-            .list_threads(ListThreadsParams {
+        let (page, state_db_reads) = list_threads_with_state_db_read_count(
+            &store,
+            ListThreadsParams {
                 page_size: 10,
                 cursor: None,
                 sort_key: ThreadSortKey::CreatedAt,
@@ -800,9 +898,10 @@ mod tests {
                 search_term: Some("needle".to_string()),
                 relation_filter: None,
                 storage_mode: ThreadListStorageMode::StateDbOnly,
-            })
-            .await
-            .expect("thread listing");
+            },
+        )
+        .await
+        .expect("thread listing");
 
         let ids = page
             .items
@@ -818,6 +917,7 @@ mod tests {
         assert_eq!(page.items[0].thread_source, Some(ThreadSource::Subagent));
         assert_eq!(page.items[0].model.as_deref(), Some("persisted-model"));
         assert_eq!(page.items[0].reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(state_db_reads, 1);
     }
 
     #[tokio::test]

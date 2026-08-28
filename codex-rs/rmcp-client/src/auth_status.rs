@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -154,7 +155,10 @@ enum AuthStatusCheck {
 }
 
 /// Determine the authentication status for a streamable HTTP MCP server.
+// Keep this compatibility entrypoint aligned with the HTTP-client variant below.
+#[allow(clippy::too_many_arguments)]
 pub async fn determine_streamable_http_auth_status(
+    codex_home: &Path,
     server_name: &str,
     url: &str,
     bearer_token_env_var: Option<&str>,
@@ -164,6 +168,7 @@ pub async fn determine_streamable_http_auth_status(
     keyring_backend_kind: AuthKeyringBackendKind,
 ) -> Result<McpAuthState> {
     let default_headers = match auth_status_before_discovery(
+        codex_home,
         server_name,
         url,
         bearer_token_env_var,
@@ -187,6 +192,7 @@ pub async fn determine_streamable_http_auth_status(
 /// provided HTTP client.
 #[allow(clippy::too_many_arguments)]
 pub async fn determine_streamable_http_auth_status_with_http_client(
+    codex_home: &Path,
     server_name: &str,
     url: &str,
     bearer_token_env_var: Option<&str>,
@@ -197,6 +203,7 @@ pub async fn determine_streamable_http_auth_status_with_http_client(
     http_client: Arc<dyn HttpClient>,
 ) -> Result<McpAuthState> {
     let default_headers = match auth_status_before_discovery(
+        codex_home,
         server_name,
         url,
         bearer_token_env_var,
@@ -220,7 +227,11 @@ pub async fn determine_streamable_http_auth_status_with_http_client(
     )
 }
 
+// These arguments mirror the persisted MCP configuration fields and are kept
+// separate so callers do not need to construct a second public configuration type.
+#[allow(clippy::too_many_arguments)]
 fn auth_status_before_discovery(
+    codex_home: &Path,
     server_name: &str,
     url: &str,
     bearer_token_env_var: Option<&str>,
@@ -238,7 +249,13 @@ fn auth_status_before_discovery(
         return Ok(AuthStatusCheck::Complete(McpAuthState::BearerToken));
     }
 
-    match oauth_token_status(server_name, url, store_mode, keyring_backend_kind)? {
+    match oauth_token_status(
+        codex_home,
+        server_name,
+        url,
+        store_mode,
+        keyring_backend_kind,
+    )? {
         StoredOAuthTokenStatus::Usable => {
             return Ok(AuthStatusCheck::Complete(McpAuthState::OAuth));
         }
@@ -450,7 +467,9 @@ mod tests {
 
     #[tokio::test]
     async fn determine_auth_status_uses_bearer_token_when_authorization_header_present() {
+        let codex_home = tempfile::tempdir().expect("tempdir");
         let status = determine_streamable_http_auth_status(
+            codex_home.path(),
             "server",
             "not-a-url",
             /*bearer_token_env_var*/ None,
@@ -472,7 +491,9 @@ mod tests {
     #[serial(auth_status_env)]
     async fn determine_auth_status_uses_bearer_token_when_env_authorization_header_present() {
         let _guard = EnvVarGuard::set("CODEX_RMCP_CLIENT_AUTH_STATUS_TEST_TOKEN", "Bearer token");
+        let codex_home = tempfile::tempdir().expect("tempdir");
         let status = determine_streamable_http_auth_status(
+            codex_home.path(),
             "server",
             "not-a-url",
             /*bearer_token_env_var*/ None,

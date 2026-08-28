@@ -2,6 +2,7 @@ use super::super::protocol::RemoteControlPairingStatusRequest;
 use super::super::protocol::StartRemoteControlPairingRequest;
 use super::*;
 use codex_login::AuthKeyringBackendKind;
+use codex_login::default_client::create_client_without_request_logging;
 use pretty_assertions::assert_eq;
 use std::io;
 
@@ -739,8 +740,10 @@ async fn remote_control_handle_recovers_auth_before_refreshing_pairing() {
         .expect("current enrollment should exist")
         .expires_at = Some(OffsetDateTime::now_utc() + time::Duration::seconds(29));
 
+    let client = create_client_without_request_logging().expect("shared HTTP client should build");
     let response = remote_handle
-        .start_pairing(
+        .start_pairing_with_client(
+            &client,
             RemoteControlPairingStartParams::default(),
             /*app_server_client_name*/ None,
         )

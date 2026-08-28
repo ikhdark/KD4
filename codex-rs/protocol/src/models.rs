@@ -1405,7 +1405,7 @@ pub struct BaseInstructions {
 impl Default for BaseInstructions {
     fn default() -> Self {
         Self {
-            text: BASE_INSTRUCTIONS_DEFAULT.to_string(),
+            text: BASE_INSTRUCTIONS_DEFAULT.trim().to_string(),
         }
     }
 }
@@ -2291,6 +2291,14 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn default_base_instructions_have_canonical_outer_whitespace() {
+        let instructions = BaseInstructions::default();
+
+        assert_eq!(instructions.text, BASE_INSTRUCTIONS_DEFAULT.trim());
+        assert_eq!(instructions.text.trim(), instructions.text);
+    }
 
     // A tiny valid PNG (1x1) so image conversion tests don't depend on cross-crate
     // file paths or external fixture layouts.

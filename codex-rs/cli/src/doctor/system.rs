@@ -113,14 +113,14 @@ mod tests {
         let mut locale_env = BTreeMap::new();
         locale_env.insert("LANG".to_string(), "en_US.UTF-8".to_string());
         let editor_env = BTreeMap::from([
-            ("EDITOR".to_string(), "vim".to_string()),
+            ("EDITOR".to_string(), "notepad.exe".to_string()),
             ("VISUAL".to_string(), "code --wait".to_string()),
         ]);
         let pager_env = BTreeMap::from([
-            ("GH_PAGER".to_string(), "less".to_string()),
+            ("GH_PAGER".to_string(), "more.com".to_string()),
             ("GIT_PAGER".to_string(), "delta".to_string()),
-            ("LESS".to_string(), "-FRX".to_string()),
-            ("PAGER".to_string(), "less -R".to_string()),
+            ("LESS".to_string(), "FRX".to_string()),
+            ("PAGER".to_string(), "more.com".to_string()),
         ]);
         let check = system_check_from_inputs(SystemCheckInputs {
             os: "Windows 11".to_string(),
@@ -142,11 +142,11 @@ mod tests {
                 "os language: en-US",
                 "LANG: en_US.UTF-8",
                 "VISUAL: code --wait",
-                "EDITOR: vim",
-                "PAGER: less -R",
+                "EDITOR: notepad.exe",
+                "PAGER: more.com",
                 "GIT_PAGER: delta",
-                "GH_PAGER: less",
-                "LESS: -FRX",
+                "GH_PAGER: more.com",
+                "LESS: FRX",
             ]
         );
     }

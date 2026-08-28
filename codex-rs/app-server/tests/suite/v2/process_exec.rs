@@ -2,8 +2,12 @@ use anyhow::Context;
 use anyhow::Result;
 use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
+use codex_app_server_protocol::JSONRPCMessage;
+use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::ProcessExitedNotification;
 use codex_app_server_protocol::ProcessKillParams;
+use codex_app_server_protocol::ProcessOutputDeltaNotification;
+use codex_app_server_protocol::ProcessOutputStream;
 use codex_app_server_protocol::ProcessSpawnParams;
 use codex_app_server_protocol::RequestId;
 use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
@@ -19,6 +23,36 @@ use wiremock::MockServer;
 
 use super::connection_handling_websocket::DEFAULT_READ_TIMEOUT;
 use super::connection_handling_websocket::create_config_toml;
+
+async fn read_process_spawn_response_before_events(
+    mcp: &mut TestAppServer,
+    request_id: i64,
+) -> Result<JSONRPCResponse> {
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            match mcp.read_next_message().await? {
+                JSONRPCMessage::Response(response)
+                    if response.id == RequestId::Integer(request_id) =>
+                {
+                    return Ok(response);
+                }
+                JSONRPCMessage::Notification(notification)
+                    if matches!(
+                        notification.method.as_str(),
+                        "process/outputDelta" | "process/exited"
+                    ) =>
+                {
+                    anyhow::bail!(
+                        "{} arrived before process/spawn response",
+                        notification.method
+                    );
+                }
+                _ => {}
+            }
+        }
+    })
+    .await?
+}
 
 #[tokio::test]
 async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Result<()> {
@@ -90,6 +124,53 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
 }
 
 #[tokio::test]
+async fn process_spawn_response_precedes_immediate_output_and_exit_notifications() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let (_server, mut mcp) = initialized_mcp(codex_home.path()).await?;
+
+    let process_handle = "immediate-output-1".to_string();
+    let command = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        "[Console]::Out.Write('process-out')".to_string(),
+    ];
+    let spawn_request_id = mcp
+        .send_process_spawn_request(ProcessSpawnParams {
+            stream_stdout_stderr: true,
+            output_bytes_cap: Some(None),
+            timeout_ms: Some(None),
+            ..process_spawn_params(process_handle.clone(), codex_home.path(), command)?
+        })
+        .await?;
+
+    let response = read_process_spawn_response_before_events(&mut mcp, spawn_request_id).await?;
+    assert_eq!(response.result, serde_json::json!({}));
+
+    let output = mcp
+        .read_stream_until_notification_message("process/outputDelta")
+        .await?;
+    let output: ProcessOutputDeltaNotification = serde_json::from_value(
+        output
+            .params
+            .context("process/outputDelta notification should include params")?,
+    )?;
+    assert_eq!(output.process_handle, process_handle);
+    assert_eq!(output.stream, ProcessOutputStream::Stdout);
+    assert_eq!(output.delta_base64, "cHJvY2Vzcy1vdXQ=");
+    assert!(!output.cap_reached);
+
+    let exited = read_process_exited(&mut mcp).await?;
+    assert_eq!(exited.process_handle, process_handle);
+    assert_eq!(exited.exit_code, 0);
+    assert_eq!(exited.stdout, "");
+    assert_eq!(exited.stderr, "");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn process_spawn_returns_error_when_local_environment_is_disabled() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
@@ -106,7 +187,13 @@ async fn process_spawn_returns_error_when_local_environment_is_disabled() -> Res
         .send_process_spawn_request(process_spawn_params(
             "disabled-process".to_string(),
             codex_home.path(),
-            vec!["sh".to_string(), "-lc".to_string(), "true".to_string()],
+            vec![
+                "powershell.exe".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "exit 0".to_string(),
+            ],
         )?)
         .await?;
     let error = mcp

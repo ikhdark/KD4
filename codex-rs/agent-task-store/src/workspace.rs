@@ -78,33 +78,10 @@ pub(crate) async fn capture_revision(
     repo_root: &Path,
     paths: Vec<String>,
 ) -> StoreResult<WorkspaceRevision> {
-    let repository = repository_identity(repo_root)?;
-    let normalized = normalize_paths(repo_root, paths)?;
     let mut transaction = pool.begin().await?;
-    ensure_workspace_tx(&mut transaction, &repository).await?;
-    // Acquire the SQLite writer lane before observing the filesystem. Every capture for a
-    // workspace therefore scans in the same order in which its epoch can be published.
-    sqlx::query("UPDATE workspace_repositories SET epoch = epoch WHERE workspace_id = ?")
-        .bind(&repository.workspace_id)
-        .execute(&mut *transaction)
-        .await?;
-    let root = repository.canonical_root.clone();
-    let snapshot_paths = normalized.clone();
-    let mut capture =
-        tokio::task::spawn_blocking(move || collect_manifest_entries(&root, &snapshot_paths))
-            .await
-            .map_err(|error| StoreError::CorruptData(format!("manifest task failed: {error}")))??;
-    #[cfg(test)]
-    pause_test_workspace_capture().await;
-    let epoch = reconcile_entries_tx(
-        &mut transaction,
-        &repository,
-        &normalized,
-        &mut capture.entries,
-    )
-    .await?;
+    let revision = capture_revision_tx(&mut transaction, repo_root, paths).await?;
     transaction.commit().await?;
-    revision(&repository, epoch, capture)
+    Ok(revision)
 }
 
 pub(crate) async fn capture_revision_tx(
@@ -115,6 +92,8 @@ pub(crate) async fn capture_revision_tx(
     let repository = repository_identity(repo_root)?;
     let normalized = normalize_paths(repo_root, paths)?;
     ensure_workspace_tx(transaction, &repository).await?;
+    // Acquire the SQLite writer lane before observing the filesystem. Every capture for a
+    // workspace therefore scans in the same order in which its epoch can be published.
     sqlx::query("UPDATE workspace_repositories SET epoch = epoch WHERE workspace_id = ?")
         .bind(&repository.workspace_id)
         .execute(&mut **transaction)
@@ -456,29 +435,6 @@ fn revision(
     })
 }
 
-pub(crate) fn changed_manifest_paths(
-    before: &[WorkspaceManifestEntry],
-    after: &[WorkspaceManifestEntry],
-) -> Vec<String> {
-    let before = before
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let after = after
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    before
-        .keys()
-        .chain(after.keys())
-        .copied()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|path| before.get(path).copied() != after.get(path).copied())
-        .map(str::to_string)
-        .collect()
-}
-
 fn normalize_paths(repo_root: &Path, paths: Vec<String>) -> StoreResult<Vec<String>> {
     let mut normalized = paths
         .into_iter()
@@ -639,15 +595,6 @@ fn collect_repository_overlay_files_with(
     })
 }
 
-#[cfg(unix)]
-fn git_relative_path_identity(raw_path: &[u8]) -> StoreResult<String> {
-    use std::os::unix::ffi::OsStrExt;
-    Ok(relative_path_identity(Path::new(
-        std::ffi::OsStr::from_bytes(raw_path),
-    )))
-}
-
-#[cfg(windows)]
 fn git_relative_path_identity(raw_path: &[u8]) -> StoreResult<String> {
     let path = std::str::from_utf8(raw_path).map_err(|_| {
         StoreError::InvalidScope(
@@ -868,6 +815,18 @@ async fn reconcile_entries_tx(
     observed_paths: &[String],
     entries: &mut Vec<WorkspaceManifestEntry>,
 ) -> StoreResult<u64> {
+    let repository_wide = observed_paths
+        .iter()
+        .any(|path| path == REPOSITORY_WIDE_PATH);
+    let repository_wide_baseline = repository_wide
+        && sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM workspace_paths WHERE workspace_id = ? AND path = ?",
+        )
+        .bind(&repository.workspace_id)
+        .bind(REPOSITORY_WIDE_PATH)
+        .fetch_one(&mut **transaction)
+        .await?
+            != 0;
     include_missing_observed_entries_tx(
         transaction,
         &repository.workspace_id,
@@ -893,6 +852,8 @@ async fn reconcile_entries_tx(
             if hash != entry.content_hash || existed != entry.existed {
                 drift.push(entry.path.clone());
             }
+        } else if repository_wide_baseline && entry.path != REPOSITORY_WIDE_PATH {
+            drift.push(entry.path.clone());
         }
     }
     let epoch = if drift.is_empty() {

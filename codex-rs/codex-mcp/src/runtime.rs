@@ -51,6 +51,11 @@ impl McpRuntimeContext {
         self.local_stdio_fallback_cwd.clone()
     }
 
+    pub(crate) fn is_compatible_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.environment_manager, &other.environment_manager)
+            && self.local_stdio_fallback_cwd == other.local_stdio_fallback_cwd
+    }
+
     pub(crate) fn resolve_server_environment(
         &self,
         server_name: &str,

@@ -1,4 +1,7 @@
 use super::*;
+use crate::session::tests::make_session_and_context_with_rx;
+use crate::state::ActiveTurn;
+use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::SandboxAttempt;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -6,6 +9,7 @@ use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
@@ -171,13 +175,13 @@ async fn permission_request_payload_uses_apply_patch_hook_name_and_aliases() {
 }
 
 #[tokio::test]
-async fn approval_keys_include_environment_id() {
+async fn approval_keys_include_environment_id_and_approval_scope() {
     let runtime = ApplyPatchRuntime::new();
     let path = std::env::temp_dir()
         .join("apply-patch-approval-key.txt")
         .abs();
     let path_uri = PathUri::from_abs_path(&path);
-    let req = ApplyPatchRequest {
+    let mut req = ApplyPatchRequest {
         turn_environment: test_turn_environment("remote"),
         action: ApplyPatchAction::new_add_for_test(&path_uri, "hello".to_string()),
         file_paths: vec![path_uri.clone()],
@@ -191,16 +195,133 @@ async fn approval_keys_include_environment_id() {
     };
 
     let keys = runtime.approval_keys(&req);
-
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].environment_id, "remote");
+    assert_eq!(keys[0].path, path_uri);
     assert_eq!(
-        serde_json::to_value(&keys).expect("serialize approval keys"),
-        serde_json::json!([
-            {
-                "environment_id": "remote",
-                "path": path_uri,
-            }
-        ])
+        keys[0].approval_scope_id,
+        req.turn_environment.environment.approval_scope_id()
     );
+
+    req.turn_environment = test_turn_environment("remote");
+    let replacement_keys = runtime.approval_keys(&req);
+    assert_ne!(keys, replacement_keys);
+}
+
+#[tokio::test]
+async fn sandbox_retry_session_approval_is_cached_separately() {
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    let path = std::env::temp_dir()
+        .join("apply-patch-retry-approval-cache.txt")
+        .abs();
+    let path_uri = PathUri::from_abs_path(&path);
+
+    let approvals = tokio::spawn({
+        let session = session.clone();
+        let turn = turn.clone();
+        async move {
+            let req = ApplyPatchRequest {
+                turn_environment: test_turn_environment("remote"),
+                action: ApplyPatchAction::new_add_for_test(&path_uri, "hello".to_string()),
+                file_paths: vec![path_uri],
+                changes: HashMap::from([(
+                    path.to_path_buf(),
+                    FileChange::Add {
+                        content: "hello".to_string(),
+                    },
+                )]),
+                exec_approval_requirement: ExecApprovalRequirement::Skip {
+                    bypass_sandbox: false,
+                    proposed_execpolicy_amendment: None,
+                },
+                additional_permissions: None,
+                permissions_preapproved: false,
+            };
+            let mut runtime = ApplyPatchRuntime::new();
+            let retry_one_id = "retry-1".to_string();
+            let retry_one = runtime
+                .start_approval_async(
+                    &req,
+                    ApprovalCtx {
+                        session: &session,
+                        turn: &turn,
+                        call_id: &retry_one_id,
+                        guardian_review_id: None,
+                        retry_reason: Some("retry without sandbox?".to_string()),
+                        network_approval_context: None,
+                    },
+                )
+                .await;
+            let retry_two_id = "retry-2".to_string();
+            let retry_two = runtime
+                .start_approval_async(
+                    &req,
+                    ApprovalCtx {
+                        session: &session,
+                        turn: &turn,
+                        call_id: &retry_two_id,
+                        guardian_review_id: None,
+                        retry_reason: Some("retry without sandbox?".to_string()),
+                        network_approval_context: None,
+                    },
+                )
+                .await;
+            let ordinary_id = "ordinary".to_string();
+            let ordinary = runtime
+                .start_approval_async(
+                    &req,
+                    ApprovalCtx {
+                        session: &session,
+                        turn: &turn,
+                        call_id: &ordinary_id,
+                        guardian_review_id: None,
+                        retry_reason: None,
+                        network_approval_context: None,
+                    },
+                )
+                .await;
+            (retry_one, retry_two, ordinary)
+        }
+    });
+
+    let first_event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+        .await
+        .expect("first retry approval prompt")
+        .expect("approval event channel");
+    let EventMsg::ApplyPatchApprovalRequest(first_request) = first_event.msg else {
+        panic!("expected first retry approval request");
+    };
+    assert_eq!(first_request.call_id, "retry-1");
+    assert_eq!(
+        first_request.reason.as_deref(),
+        Some("retry without sandbox?")
+    );
+    session
+        .notify_approval("retry-1", ReviewDecision::ApprovedForSession)
+        .await;
+
+    let ordinary_event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+        .await
+        .expect("ordinary approval prompt")
+        .expect("approval event channel");
+    let EventMsg::ApplyPatchApprovalRequest(ordinary_request) = ordinary_event.msg else {
+        panic!("expected ordinary approval request");
+    };
+    assert_eq!(ordinary_request.call_id, "ordinary");
+    assert_eq!(ordinary_request.reason, None);
+    session
+        .notify_approval("ordinary", ReviewDecision::Denied)
+        .await;
+
+    let (retry_one, retry_two, ordinary) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), approvals)
+            .await
+            .expect("approval flow completes")
+            .expect("approval task");
+    assert_eq!(retry_one, ReviewDecision::ApprovedForSession);
+    assert_eq!(retry_two, ReviewDecision::ApprovedForSession);
+    assert_eq!(ordinary, ReviewDecision::Denied);
 }
 
 #[tokio::test]
@@ -262,6 +383,7 @@ async fn file_system_sandbox_context_uses_active_attempt() {
     );
     let sandbox_policy_cwd = PathUri::from_abs_path(&path);
     let attempt = SandboxAttempt {
+        codex_home: &path,
         sandbox: SandboxType::WindowsRestrictedToken,
         sandbox_requested: true,
         permissions: &permissions,
@@ -326,6 +448,7 @@ async fn no_sandbox_attempt_has_no_file_system_context() {
     let permissions = PermissionProfile::Disabled;
     let sandbox_policy_cwd = PathUri::from_abs_path(&path);
     let attempt = SandboxAttempt {
+        codex_home: &path,
         sandbox: SandboxType::None,
         sandbox_requested: false,
         permissions: &permissions,

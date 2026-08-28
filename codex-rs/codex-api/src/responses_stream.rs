@@ -2,8 +2,9 @@ use crate::common::ResponseEvent;
 use crate::common::SafetyBuffering;
 use crate::common::SafetyBufferingTreatment;
 use crate::error::ApiError;
+use crate::rate_limits::RateLimitEventBody;
 use crate::rate_limits::parse_all_rate_limits;
-use crate::rate_limits::parse_rate_limit_event;
+use crate::rate_limits::rate_limit_snapshot_from_event;
 use crate::safety_buffering::treatment_from_headers;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ModelVerification;
@@ -151,7 +152,7 @@ impl ResponsesEventInterpreter {
         }
 
         if event.kind() == "codex.rate_limits" {
-            return Ok(parse_rate_limit_event(payload)
+            return Ok(rate_limit_snapshot_from_event(event.rate_limit)
                 .map(ResponseEvent::RateLimits)
                 .into_iter()
                 .collect());
@@ -203,7 +204,6 @@ struct Error {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct ResponseCompleted {
     id: String,
     #[serde(default)]
@@ -264,6 +264,8 @@ pub(crate) struct ResponsesStreamEvent {
     summary_index: Option<i64>,
     content_index: Option<i64>,
     safety_buffering: Option<Value>,
+    #[serde(flatten)]
+    rate_limit: RateLimitEventBody,
 }
 
 impl ResponsesStreamEvent {
@@ -388,12 +390,8 @@ fn process_responses_event(
 ) -> Result<Option<ResponseEvent>, ResponsesEventError> {
     match event.kind.as_str() {
         "response.output_item.done" => {
-            if let Some(item_value) = event.item {
-                if let Ok(item) = serde_json::from_value::<ResponseItem>(item_value) {
-                    return Ok(Some(ResponseEvent::OutputItemDone(item)));
-                }
-                debug!("failed to parse ResponseItem from output_item.done");
-            }
+            let item = parse_required_response_item("response.output_item.done", event.item)?;
+            return Ok(Some(ResponseEvent::OutputItemDone(item)));
         }
         "response.output_text.delta" => {
             if let Some(delta) = event.delta {
@@ -508,12 +506,8 @@ fn process_responses_event(
             }
         }
         "response.output_item.added" => {
-            if let Some(item_value) = event.item {
-                if let Ok(item) = serde_json::from_value::<ResponseItem>(item_value) {
-                    return Ok(Some(ResponseEvent::OutputItemAdded(item)));
-                }
-                debug!("failed to parse ResponseItem from output_item.added");
-            }
+            let item = parse_required_response_item("response.output_item.added", event.item)?;
+            return Ok(Some(ResponseEvent::OutputItemAdded(item)));
         }
         "response.reasoning_summary_part.added" => {
             if let Some(summary_index) = event.summary_index {
@@ -525,6 +519,22 @@ fn process_responses_event(
         _ => trace!("unhandled responses event: {}", event.kind),
     }
     Ok(None)
+}
+
+fn parse_required_response_item(
+    event_kind: &str,
+    item: Option<Value>,
+) -> Result<ResponseItem, ResponsesEventError> {
+    let item = item.ok_or_else(|| {
+        let message = format!("{event_kind} event missing item");
+        debug!("{message}");
+        ResponsesEventError::Api(ApiError::Stream(message))
+    })?;
+    serde_json::from_value(item).map_err(|error| {
+        let message = format!("failed to parse ResponseItem from {event_kind}: {error}");
+        debug!("{message}");
+        ResponsesEventError::Api(ApiError::Stream(message))
+    })
 }
 
 pub(crate) fn json_headers_to_http_headers(headers: &JsonMap<String, Value>) -> HeaderMap {
@@ -694,6 +704,53 @@ mod tests {
             .expect("rate limits should be interpreted");
         assert!(
             matches!(&rate_limit_events[0], ResponseEvent::RateLimits(snapshot) if snapshot.primary.as_ref().is_some_and(|window| window.used_percent == 12.5))
+        );
+    }
+
+    #[test]
+    fn known_output_item_events_require_valid_items() {
+        for event_kind in ["response.output_item.added", "response.output_item.done"] {
+            for (case, item) in [
+                ("missing", None),
+                ("invalid", Some(json!({"type": "message"}))),
+            ] {
+                let mut payload = json!({"type": event_kind});
+                if let Some(item) = item {
+                    payload["item"] = item;
+                }
+                let mut interpreter = ResponsesEventInterpreter::new(
+                    &ResponsesStreamMetadata::default(),
+                    /*turn_state*/ None,
+                );
+
+                let error = interpreter
+                    .process_payload(&payload.to_string())
+                    .expect_err("known output-item event should reject an unusable item");
+
+                match error {
+                    ResponsesEventError::Api(ApiError::Stream(message)) => {
+                        assert!(message.contains(event_kind), "case {case}: {message}");
+                    }
+                    other => panic!("unexpected error for {event_kind} {case}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deserialized_rate_limit_event_supplies_snapshot_without_reparse() {
+        let event: ResponsesStreamEvent = serde_json::from_str(
+            r#"{"type":"codex.rate_limits","metered_limit_name":"codex-fast","rate_limits":{"primary":{"used_percent":25.0}}}"#,
+        )
+        .expect("rate-limit event should deserialize once");
+
+        let snapshot = rate_limit_snapshot_from_event(event.rate_limit)
+            .expect("deserialized rate-limit fields should convert");
+
+        assert_eq!(snapshot.limit_id.as_deref(), Some("codex_fast"));
+        assert_eq!(
+            snapshot.primary.map(|window| window.used_percent),
+            Some(25.0)
         );
     }
 

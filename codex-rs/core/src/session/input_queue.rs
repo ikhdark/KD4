@@ -3,6 +3,7 @@ use crate::state::MailboxDeliveryPhase;
 use crate::state::TurnState;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
+#[cfg(test)]
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
 use serde::Serialize;
@@ -103,7 +104,7 @@ impl InputQueue {
     ) {
         let activity_rx = self.activity_tx.subscribe();
         let has_pending_steer = if let Some(turn_state) = turn_state {
-            turn_state.lock().await.pending_input.has_user_input()
+            turn_state.lock().await.pending_input.has_steering_input()
         } else {
             false
         };
@@ -147,18 +148,28 @@ impl InputQueue {
         true
     }
 
+    #[cfg(test)]
     pub(crate) async fn seed_seen_mailbox_communication_ids(&self, items: &[RolloutItem]) {
-        let mut mailbox = self.mailbox.lock().await;
-        for item in items {
-            let id = match item {
+        let ids = items
+            .iter()
+            .filter_map(|item| match item {
                 RolloutItem::InterAgentCommunication(communication) => communication.id.as_ref(),
                 RolloutItem::ResponseItem(ResponseItem::AgentMessage { id, .. }) => id.as_ref(),
                 _ => None,
-            };
-            if let Some(id) = id
-                && mailbox.seen_communication_ids.insert(id.clone())
-            {
-                mailbox.seen_communication_id_order.push_back(id.clone());
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.seed_seen_mailbox_communication_ids_from_ids(ids).await;
+    }
+
+    pub(crate) async fn seed_seen_mailbox_communication_ids_from_ids(
+        &self,
+        ids: impl IntoIterator<Item = codex_protocol::ResponseItemId>,
+    ) {
+        let mut mailbox = self.mailbox.lock().await;
+        for id in ids {
+            if mailbox.seen_communication_ids.insert(id.clone()) {
+                mailbox.seen_communication_id_order.push_back(id);
                 compact_seen_mailbox_ids(&mut mailbox, self.max_seen_mailbox_communication_ids);
             }
         }
@@ -177,6 +188,27 @@ impl InputQueue {
         self.startup_recovery_items.lock().await.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         ) || self
+            .mailbox
+            .lock()
+            .await
+            .pending_mails
+            .iter()
+            .any(|mail| mail.trigger_turn)
+    }
+
+    /// Whether recovered input should start a new turn once the current turn releases its
+    /// terminal fence. User input was already accepted as turn work, while mailbox input still
+    /// honors its explicit `trigger_turn` policy.
+    pub(crate) async fn has_pending_turn_start_work(&self) -> bool {
+        self.startup_recovery_items.lock().await.iter().any(|item| {
+            matches!(
+                item,
+                TurnInput::UserInput { content, .. } if !content.is_empty()
+            ) || matches!(
+                item,
+                TurnInput::InterAgentCommunication(mail) if mail.trigger_turn
+            )
+        }) || self
             .mailbox
             .lock()
             .await
@@ -315,6 +347,21 @@ impl InputQueue {
             input,
         )?;
         turn_state.pending_input.items.extend_from_slice(input);
+        Ok(())
+    }
+
+    /// Admits model-visible input into an active turn and wakes consumers that
+    /// suspend until steering activity arrives.
+    pub(crate) async fn extend_pending_input_for_active_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+        input: &[TurnInput],
+    ) -> Result<(), PendingInputAdmissionError> {
+        self.extend_pending_input_for_turn_state(turn_state, input)
+            .await?;
+        if !input.is_empty() {
+            self.activity_tx.send_replace(InputQueueActivity::Steer);
+        }
         Ok(())
     }
 
@@ -465,10 +512,13 @@ impl io::Write for ByteCounter {
 }
 
 impl TurnInputQueue {
-    fn has_user_input(&self) -> bool {
-        self.items
-            .iter()
-            .any(|input| matches!(input, TurnInput::UserInput { .. }))
+    fn has_steering_input(&self) -> bool {
+        self.items.iter().any(|input| {
+            matches!(
+                input,
+                TurnInput::UserInput { .. } | TurnInput::ResponseItem(_)
+            )
+        })
     }
 }
 
@@ -773,6 +823,22 @@ mod tests {
                 max_bytes: usize::MAX,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_user_input_is_pending_turn_start_work() {
+        let input_queue = InputQueue::new();
+        input_queue
+            .restore_transferred_startup_input(vec![TurnInput::UserInput {
+                content: vec![UserInput::Text {
+                    text: "continue in a fresh turn".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            }])
+            .await;
+
+        assert!(input_queue.has_pending_turn_start_work().await);
     }
 
     #[tokio::test]

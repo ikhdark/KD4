@@ -9,6 +9,7 @@ use codex_config::permissions_toml::NetworkUnixSocketPermissionsToml;
 use codex_config::permissions_toml::PermissionProfileToml;
 use codex_config::permissions_toml::PermissionsToml;
 use codex_config::permissions_toml::WorkspaceRootsToml;
+use codex_protocol::config_types::TrustLevel;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -42,6 +43,30 @@ fn builtin_permission_descriptor_drives_identity_and_runtime_profiles() {
         assert_eq!(parsed.as_str(), id);
         assert!(is_builtin_permission_profile_name(id));
     }
+}
+
+#[test]
+fn builtin_workspace_default_only_requires_windows_sandbox_on_windows() {
+    let active_project = ProjectConfig {
+        trust_level: Some(TrustLevel::Trusted),
+    };
+
+    assert_eq!(
+        default_builtin_permission_profile_name_for_platform(
+            &active_project,
+            WindowsSandboxLevel::Disabled,
+            /*is_windows*/ false,
+        ),
+        BUILT_IN_WORKSPACE_PROFILE
+    );
+    assert_eq!(
+        default_builtin_permission_profile_name_for_platform(
+            &active_project,
+            WindowsSandboxLevel::Disabled,
+            /*is_windows*/ true,
+        ),
+        BUILT_IN_READ_ONLY_PROFILE
+    );
 }
 
 #[test]
@@ -488,6 +513,46 @@ fn unreadable_globstar_warning_is_suppressed_when_scan_depth_is_configured() {
         unbounded_unreadable_globstar_paths(&configured_filesystem),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn unreadable_globstar_startup_warning_is_windows_only() -> std::io::Result<()> {
+    let mut startup_warnings = Vec::new();
+    compile_permission_profile(
+        &PermissionsToml {
+            entries: BTreeMap::from([(
+                "workspace".to_string(),
+                PermissionProfileToml {
+                    description: None,
+                    extends: None,
+                    workspace_roots: None,
+                    filesystem: Some(FilesystemPermissionsToml {
+                        glob_scan_max_depth: None,
+                        entries: BTreeMap::from([(
+                            ":workspace_roots".to_string(),
+                            FilesystemPermissionToml::Scoped(BTreeMap::from([(
+                                "**/*.env".to_string(),
+                                FileSystemAccessMode::Deny,
+                            )])),
+                        )]),
+                    }),
+                    network: None,
+                },
+            )]),
+        },
+        "workspace",
+        &mut startup_warnings,
+    )?;
+
+    let warning = startup_warnings
+        .iter()
+        .find(|warning| warning.contains("deny-read glob"))
+        .expect("unbounded deny-read glob should emit a startup warning");
+    assert!(warning.contains("Windows sandboxing"), "{warning}");
+    for non_windows_term in ["Linux", "macOS", "POSIX"] {
+        assert!(!warning.contains(non_windows_term), "{warning}");
+    }
+    Ok(())
 }
 
 #[test]

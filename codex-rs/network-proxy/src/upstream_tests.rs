@@ -23,6 +23,60 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
+#[test]
+fn proxy_env_uses_first_present_casing_even_when_unusable() {
+    let values = HashMap::from([
+        ("HTTPS_PROXY", ""),
+        ("https_proxy", "http://lower.example:8080"),
+    ]);
+    assert_eq!(
+        read_proxy_env_with(&["HTTPS_PROXY", "https_proxy"], |key| {
+            values
+                .get(key)
+                .map(|value| (*value).to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        }),
+        None
+    );
+
+    let values = HashMap::from([
+        ("HTTPS_PROXY", "http://["),
+        ("https_proxy", "http://lower.example:8080"),
+    ]);
+    assert_eq!(
+        read_proxy_env_with(&["HTTPS_PROXY", "https_proxy"], |key| {
+            values
+                .get(key)
+                .map(|value| (*value).to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        }),
+        None
+    );
+
+    #[cfg(unix)]
+    let non_unicode = {
+        use std::os::unix::ffi::OsStringExt;
+
+        std::ffi::OsString::from_vec(vec![0xff])
+    };
+    #[cfg(windows)]
+    let non_unicode = {
+        use std::os::windows::ffi::OsStringExt;
+
+        std::ffi::OsString::from_wide(&[0xd800])
+    };
+    assert_eq!(
+        read_proxy_env_with(&["HTTPS_PROXY", "https_proxy"], |key| {
+            if key == "HTTPS_PROXY" {
+                Err(std::env::VarError::NotUnicode(non_unicode.clone()))
+            } else {
+                Ok("http://lower.example:8080".to_string())
+            }
+        }),
+        None
+    );
+}
+
 fn generate_ca(common_name: &str) -> (String, KeyPair) {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);

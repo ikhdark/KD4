@@ -262,6 +262,7 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         .clone()
         .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&cwd));
     let mut attempt = SandboxAttempt {
+        codex_home: &cwd,
         sandbox: SandboxType::None,
         sandbox_requested: true,
         permissions: &permissions,
@@ -291,7 +292,13 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         capture_policy: crate::exec::ExecCapturePolicy::ShellTool,
     };
     let request = attempt
-        .env_for_exec_server(command(), options(), /*network*/ None, Some("remote"))
+        .env_for_exec_server(
+            command(),
+            options(),
+            /*network*/ None,
+            Some("remote"),
+            /*additional_permissions_uri*/ None,
+        )
         .expect("prepare remote exec request");
 
     assert_eq!(
@@ -320,9 +327,55 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         Some(managed_network.clone())
     );
 
+    let remote_write_root =
+        PathUri::parse("file:///home/remote/workspace/granted-output").expect("remote path URI");
+    let additional_permissions_uri =
+        codex_protocol::request_permissions::UriAdditionalPermissionProfile {
+            network: None,
+            file_system: Some(
+                codex_protocol::models::FileSystemPermissions::from_read_write_roots(
+                    Some(Vec::new()),
+                    Some(vec![remote_write_root.clone()]),
+                ),
+            ),
+        };
+    let request = attempt
+        .env_for_exec_server(
+            command(),
+            options(),
+            /*network*/ None,
+            Some("remote"),
+            Some(&additional_permissions_uri),
+        )
+        .expect("prepare remote exec request with URI grant");
+    let codex_protocol::models::PermissionProfile::Managed { file_system, .. } = request
+        .exec_server_sandbox
+        .expect("remote sandbox context")
+        .permissions
+    else {
+        panic!("expected managed remote permissions");
+    };
+    let codex_protocol::models::ManagedFileSystemPermissions::Restricted { entries, .. } =
+        file_system
+    else {
+        panic!("expected restricted remote filesystem permissions");
+    };
+    assert!(entries.contains(&FileSystemSandboxEntry {
+        path: FileSystemPath::Path {
+            path: remote_write_root,
+        },
+        access: FileSystemAccessMode::Write,
+    }));
+
     attempt.sandbox_requested = false;
     let request = attempt
-        .env_for_exec_server(command(), options(), /*network*/ None, Some("remote"))
+        .env_for_exec_server(
+            command(),
+            options(),
+            /*network*/ None,
+            Some("remote"),
+            /*additional_permissions_uri*/ None,
+        )
         .expect("prepare unsandboxed remote exec request");
 
     assert_eq!(request.exec_server_sandbox, None);
@@ -362,6 +415,7 @@ fn local_env_carries_restricted_token_filesystem_overrides() {
     );
     let cwd_uri = PathUri::from_abs_path(&cwd);
     let attempt = SandboxAttempt {
+        codex_home: &cwd,
         sandbox: SandboxType::WindowsRestrictedToken,
         sandbox_requested: true,
         permissions: &permissions,
@@ -423,6 +477,7 @@ fn local_env_carries_elevated_filesystem_overrides() {
     );
     let cwd_uri = PathUri::from_abs_path(&cwd);
     let attempt = SandboxAttempt {
+        codex_home: &cwd,
         sandbox: SandboxType::WindowsRestrictedToken,
         sandbox_requested: true,
         permissions: &permissions,

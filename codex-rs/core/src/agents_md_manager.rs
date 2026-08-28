@@ -1,8 +1,10 @@
 use crate::agents_md::AgentsMdFreshness;
 use crate::agents_md::LoadedAgentsMd;
+use crate::agents_md::ProjectInstructionsSourceFingerprint;
 use crate::agents_md::RepositoryStableContextBundle;
+use crate::agents_md::discover_project_instructions_with_markers;
 use crate::agents_md::effective_project_root_markers;
-use crate::agents_md::load_project_instructions_with_markers;
+use crate::agents_md::load_project_instructions_from_discovery;
 use crate::config::Config;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
@@ -23,6 +25,7 @@ pub(crate) struct AgentsMdManager {
 #[derive(Default)]
 struct AgentsMdCache {
     key: Option<AgentsMdCacheKey>,
+    source_fingerprint: Option<ProjectInstructionsSourceFingerprint>,
     loaded: Option<Arc<LoadedAgentsMd>>,
     stable_context: Option<RepositoryStableContextBundle>,
 }
@@ -127,18 +130,28 @@ impl AgentsMdManager {
         config: &Config,
         environments: &TurnEnvironmentSnapshot,
     ) -> AgentsMdObservation {
+        let config = Arc::new(config.clone());
+        self.refresh_and_observe_shared(&config, environments).await
+    }
+
+    pub(crate) async fn refresh_and_observe_shared(
+        &self,
+        config: &Arc<Config>,
+        environments: &TurnEnvironmentSnapshot,
+    ) -> AgentsMdObservation {
         // Serialize key capture, filesystem loading, and publication so an older refresh cannot
         // finish after and overwrite a newer request. Clone the request's published value before
         // releasing the gate so a later refresh cannot replace it between refresh and capture.
         let Ok(_refresh_permit) = self.refresh_gate.acquire().await else {
             return self.get_cached_observation().await;
         };
-        self.refresh_with_gate_held(config, environments).await
+        self.refresh_with_gate_held(Arc::clone(config), environments)
+            .await
     }
 
     pub(crate) async fn refresh_for_step(
         &self,
-        config: &Config,
+        config: &Arc<Config>,
         environments: &ThreadEnvironments,
     ) -> (TurnEnvironmentSnapshot, AgentsMdObservation) {
         // Enter serialization before capturing live environments so an older snapshot cannot be
@@ -149,23 +162,42 @@ impl AgentsMdManager {
             return (environments, observation);
         };
         let environments = environments.snapshot().await;
-        let observation = self.refresh_with_gate_held(config, &environments).await;
+        let observation = self
+            .refresh_with_gate_held(Arc::clone(config), &environments)
+            .await;
         (environments, observation)
     }
 
     async fn refresh_with_gate_held(
         &self,
-        config: &Config,
+        config: Arc<Config>,
         environments: &TurnEnvironmentSnapshot,
     ) -> AgentsMdObservation {
-        let project_root_markers = effective_project_root_markers(config);
-        let key =
-            AgentsMdCacheKey::capture_with_markers(config, environments, &project_root_markers);
-        let load = load_project_instructions_with_markers(
-            config,
-            self.user_instructions.clone(),
+        let project_root_markers = effective_project_root_markers(config.as_ref());
+        let key = AgentsMdCacheKey::capture_with_markers(
+            config.as_ref(),
             environments,
             &project_root_markers,
+        );
+        let discovery = discover_project_instructions_with_markers(
+            Arc::clone(&config),
+            environments,
+            &project_root_markers,
+        )
+        .await;
+        let source_fingerprint = discovery.source_fingerprint();
+        if source_fingerprint.is_some() {
+            let cache = self.cache.lock().await;
+            if cache.key.as_ref() == Some(&key)
+                && cache.source_fingerprint.as_ref() == source_fingerprint.as_ref()
+            {
+                return cache.cached_observation(AgentsMdFreshness::Refreshed);
+            }
+        }
+        let load = load_project_instructions_from_discovery(
+            config.as_ref(),
+            self.user_instructions.clone(),
+            discovery,
         )
         .await;
         let mut cache = self.cache.lock().await;
@@ -177,6 +209,7 @@ impl AgentsMdManager {
         } else {
             AgentsMdFreshness::IncompleteRead
         };
+        let complete = load.complete;
         let loaded = load.loaded;
         let semantically_unchanged = cache.key.as_ref() == Some(&key)
             && match (cache.loaded.as_ref(), loaded.as_ref()) {
@@ -199,6 +232,7 @@ impl AgentsMdManager {
                 }
             }
             cache.key = Some(key);
+            cache.source_fingerprint = complete.then_some(source_fingerprint).flatten();
             cache.loaded = loaded;
             cache.stable_context = stable_context;
             return AgentsMdObservation {
@@ -206,6 +240,9 @@ impl AgentsMdManager {
                 stable_context: cache.stable_context.clone(),
                 freshness,
             };
+        }
+        if complete {
+            cache.source_fingerprint = source_fingerprint;
         }
         cache.cached_observation(freshness)
     }

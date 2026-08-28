@@ -1060,7 +1060,14 @@ async fn serve_environment_until_shutdown(
 ) -> Result<()> {
     let mut websocket = accept_exec_server_environment(
         listener,
-        json!({"shell": {"name": "zsh", "path": "/bin/zsh"}}),
+        json!({
+            "operatingSystem": "windows",
+            "shell": {
+                "name": "powershell",
+                "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+            },
+            "cwd": "file:///C:/workspace"
+        }),
     )
     .await?;
 

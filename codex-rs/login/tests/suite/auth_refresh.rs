@@ -1076,14 +1076,17 @@ async fn refresh_token_reloads_changed_auth_after_permanent_failure() -> Result<
 
 #[serial_test::serial(auth_env)]
 #[tokio::test]
-async fn refresh_token_returns_transient_error_on_server_failure() -> Result<()> {
+async fn logging_contract_refresh_token_failure_omits_response_message() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
-            "error": "temporary-failure"
+            "error": {
+                "code": "temporary_failure",
+                "message": "response body secret"
+            }
         })))
         .expect(1)
         .mount(&server)
@@ -1111,6 +1114,8 @@ async fn refresh_token_returns_transient_error_on_server_failure() -> Result<()>
         .context("refresh should fail")?;
     assert!(matches!(err, RefreshTokenError::Transient(_)));
     assert_eq!(err.failed_reason(), None);
+    assert!(err.to_string().contains("temporary_failure"));
+    assert!(!err.to_string().contains("response body secret"));
 
     let stored = ctx.load_auth()?;
     assert_eq!(stored, initial_auth);

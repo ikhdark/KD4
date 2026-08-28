@@ -171,7 +171,10 @@ fn store_lock_is_released_when_holder_process_exits_child() -> Result<()> {
         Some(path) => std::path::PathBuf::from(path),
         None => return Ok(()),
     };
-    let _lock = OAuthStoreLock::acquire(OAuthStore::File)?;
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .context("CODEX_HOME must be set for the lock holder child")?;
+    let _lock = OAuthStoreLock::acquire(&codex_home, OAuthStore::File)?;
     std::fs::write(ready_file, b"ready")?;
     loop {
         std::thread::sleep(Duration::from_secs(/*secs*/ 60));
@@ -192,6 +195,7 @@ fn auto_save_secrets_lock_failure_does_not_fall_back_to_file() -> Result<()> {
 
     let error = save_oauth_tokens_with_keyring_with_fallback_to_file(
         &keyring_store,
+        env.path(),
         AuthKeyringBackendKind::Secrets,
         &tokens.server_name,
         &tokens,
@@ -199,9 +203,9 @@ fn auto_save_secrets_lock_failure_does_not_fall_back_to_file() -> Result<()> {
     .expect_err("aggregate-store lock failure must abort Auto persistence");
 
     assert!(error.downcast_ref::<OAuthStoreLockFailure>().is_some());
-    assert!(!fallback_file_path()?.exists());
-    save_oauth_tokens_to_file(&tokens)?;
-    let loaded = load_oauth_tokens_from_file(&tokens.server_name, &tokens.url)?
+    assert!(!fallback_file_path(env.path()).exists());
+    save_oauth_tokens_to_file(env.path(), &tokens)?;
+    let loaded = load_oauth_tokens_from_file(env.path(), &tokens.server_name, &tokens.url)?
         .expect("fallback File should remain independently writable");
     assert_tokens_match_without_expiry(&loaded, &tokens);
     Ok(())
@@ -212,12 +216,13 @@ fn auto_load_secrets_lock_failure_does_not_fall_back_to_file() -> Result<()> {
     let env = TempCodexHome::new();
     let keyring_store = MockKeyringStore::default();
     let tokens = sample_tokens();
-    save_oauth_tokens_to_file(&tokens)?;
+    save_oauth_tokens_to_file(env.path(), &tokens)?;
 
     let lock_dir = env.path().join("mcp-oauth-locks");
     std::fs::create_dir(lock_dir.join("secrets-store.lock"))?;
     let error = load_oauth_tokens_from_keyring_with_fallback_to_file(
         &keyring_store,
+        env.path(),
         AuthKeyringBackendKind::Secrets,
         &tokens.server_name,
         &tokens.url,
@@ -225,7 +230,7 @@ fn auto_load_secrets_lock_failure_does_not_fall_back_to_file() -> Result<()> {
     .expect_err("aggregate-store lock failure must abort Auto resolution");
 
     assert!(error.downcast_ref::<OAuthStoreLockFailure>().is_some());
-    let loaded = load_oauth_tokens_from_file(&tokens.server_name, &tokens.url)?
+    let loaded = load_oauth_tokens_from_file(env.path(), &tokens.server_name, &tokens.url)?
         .expect("fallback File should remain independently readable");
     assert_tokens_match_without_expiry(&loaded, &tokens);
     Ok(())
@@ -320,23 +325,27 @@ fn file_store_lock_preserves_updates_for_different_servers() -> Result<()> {
     let (contended_tx, contended_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
     let second_for_writer = second.clone();
+    let codex_home_for_writer = env.path().to_path_buf();
     let writer = std::thread::spawn(move || {
         tracing::subscriber::with_default(LockContentionSubscriber { contended_tx }, || {
             result_tx
-                .send(save_oauth_tokens_to_file(&second_for_writer))
+                .send(save_oauth_tokens_to_file(
+                    &codex_home_for_writer,
+                    &second_for_writer,
+                ))
                 .expect("send writer result");
         });
     });
 
     contended_rx.recv_timeout(Duration::from_secs(/*secs*/ 1))?;
-    save_oauth_tokens_to_file_with_lock_held(&first)?;
+    save_oauth_tokens_to_file_with_lock_held(env.path(), &first)?;
     drop(held_lock);
     result_rx.recv_timeout(Duration::from_secs(/*secs*/ 10))??;
     writer.join().expect("file store writer should finish");
 
-    let loaded_first = load_oauth_tokens_from_file(&first.server_name, &first.url)?
+    let loaded_first = load_oauth_tokens_from_file(env.path(), &first.server_name, &first.url)?
         .expect("first server tokens should remain stored");
-    let loaded_second = load_oauth_tokens_from_file(&second.server_name, &second.url)?
+    let loaded_second = load_oauth_tokens_from_file(env.path(), &second.server_name, &second.url)?
         .expect("second server tokens should be stored");
     assert_tokens_match_without_expiry(&loaded_first, &first);
     assert_tokens_match_without_expiry(&loaded_second, &second);
@@ -347,22 +356,24 @@ fn file_store_lock_preserves_updates_for_different_servers() -> Result<()> {
 fn file_store_load_and_delete_observe_aggregate_lock() -> Result<()> {
     let env = TempCodexHome::new();
     let tokens = sample_tokens();
-    save_oauth_tokens_to_file(&tokens)?;
+    save_oauth_tokens_to_file(env.path(), &tokens)?;
 
     let server_name = tokens.server_name.clone();
     let url = tokens.url.clone();
+    let codex_home_for_load = env.path().to_path_buf();
     let loaded = complete_after_store_lock_contention(env.path(), OAuthStore::File, move || {
-        load_oauth_tokens_from_file(&server_name, &url)
+        load_oauth_tokens_from_file(&codex_home_for_load, &server_name, &url)
     })?
     .expect("file credentials should remain readable after contention");
     assert_tokens_match_without_expiry(&loaded, &tokens);
 
     let key = crate::oauth::compute_store_key(&tokens.server_name, &tokens.url)?;
+    let codex_home_for_delete = env.path().to_path_buf();
     let removed = complete_after_store_lock_contention(env.path(), OAuthStore::File, move || {
-        crate::oauth::delete_oauth_tokens_from_file(&key)
+        crate::oauth::delete_oauth_tokens_from_file(&codex_home_for_delete, &key)
     })?;
     assert!(removed);
-    assert!(load_oauth_tokens_from_file(&tokens.server_name, &tokens.url)?.is_none());
+    assert!(load_oauth_tokens_from_file(env.path(), &tokens.server_name, &tokens.url)?.is_none());
     Ok(())
 }
 
@@ -384,11 +395,13 @@ fn secrets_store_lock_preserves_updates_for_different_servers() -> Result<()> {
     let (result_tx, result_rx) = mpsc::channel();
     let store_for_writer = keyring_store.clone();
     let second_for_writer = second.clone();
+    let codex_home_for_writer = env.path().to_path_buf();
     let writer = std::thread::spawn(move || {
         tracing::subscriber::with_default(LockContentionSubscriber { contended_tx }, || {
             result_tx
                 .send(save_oauth_tokens_with_keyring(
                     &store_for_writer,
+                    &codex_home_for_writer,
                     AuthKeyringBackendKind::Secrets,
                     &second_for_writer.server_name,
                     &second_for_writer,
@@ -401,6 +414,7 @@ fn secrets_store_lock_preserves_updates_for_different_servers() -> Result<()> {
     let first_serialized = serde_json::to_string(&first)?;
     save_oauth_tokens_to_secrets_keyring_with_lock_held(
         &keyring_store,
+        env.path(),
         &first.server_name,
         &first,
         &first_serialized,
@@ -411,6 +425,7 @@ fn secrets_store_lock_preserves_updates_for_different_servers() -> Result<()> {
 
     let loaded_first = load_oauth_tokens_from_keyring(
         &keyring_store,
+        env.path(),
         AuthKeyringBackendKind::Secrets,
         &first.server_name,
         &first.url,
@@ -418,6 +433,7 @@ fn secrets_store_lock_preserves_updates_for_different_servers() -> Result<()> {
     .expect("first server tokens should remain stored");
     let loaded_second = load_oauth_tokens_from_keyring(
         &keyring_store,
+        env.path(),
         AuthKeyringBackendKind::Secrets,
         &second.server_name,
         &second.url,
@@ -435,6 +451,7 @@ fn secrets_store_load_and_delete_observe_aggregate_lock() -> Result<()> {
     let tokens = sample_tokens();
     save_oauth_tokens_with_keyring(
         &keyring_store,
+        env.path(),
         AuthKeyringBackendKind::Secrets,
         &tokens.server_name,
         &tokens,
@@ -443,10 +460,12 @@ fn secrets_store_load_and_delete_observe_aggregate_lock() -> Result<()> {
     let store_for_load = keyring_store.clone();
     let server_name = tokens.server_name.clone();
     let url = tokens.url.clone();
+    let codex_home_for_load = env.path().to_path_buf();
     let loaded =
         complete_after_store_lock_contention(env.path(), OAuthStore::Secrets, move || {
             load_oauth_tokens_from_keyring(
                 &store_for_load,
+                &codex_home_for_load,
                 AuthKeyringBackendKind::Secrets,
                 &server_name,
                 &url,
@@ -458,10 +477,12 @@ fn secrets_store_load_and_delete_observe_aggregate_lock() -> Result<()> {
     let store_for_delete = keyring_store.clone();
     let server_name = tokens.server_name.clone();
     let url = tokens.url.clone();
+    let codex_home_for_delete = env.path().to_path_buf();
     let removed =
         complete_after_store_lock_contention(env.path(), OAuthStore::Secrets, move || {
             crate::oauth::delete_oauth_tokens_from_secrets_keyring(
                 &store_for_delete,
+                &codex_home_for_delete,
                 &server_name,
                 &url,
             )
@@ -470,6 +491,7 @@ fn secrets_store_load_and_delete_observe_aggregate_lock() -> Result<()> {
     assert!(
         load_oauth_tokens_from_keyring(
             &keyring_store,
+            env.path(),
             AuthKeyringBackendKind::Secrets,
             &tokens.server_name,
             &tokens.url,

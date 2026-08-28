@@ -2,15 +2,11 @@ use std::fmt;
 use std::io;
 use std::io::stdout;
 
-use codex_terminal_detection::Multiplexer;
-use codex_terminal_detection::terminal_info;
 use crossterm::Command;
 use ratatui::crossterm::execute;
 
 #[derive(Debug)]
-pub struct Osc9Backend {
-    dcs_passthrough: bool,
-}
+pub struct Osc9Backend;
 
 impl Default for Osc9Backend {
     fn default() -> Self {
@@ -20,9 +16,7 @@ impl Default for Osc9Backend {
 
 impl Osc9Backend {
     pub fn new() -> Self {
-        Self {
-            dcs_passthrough: matches!(terminal_info().multiplexer, Some(Multiplexer::Tmux { .. })),
-        }
+        Self
     }
 
     pub fn notify(&mut self, message: &str) -> io::Result<()> {
@@ -30,7 +24,6 @@ impl Osc9Backend {
             stdout(),
             PostNotification {
                 message: message.to_string(),
-                dcs_passthrough: self.dcs_passthrough,
             }
         )
     }
@@ -40,18 +33,12 @@ impl Osc9Backend {
 #[derive(Debug, Clone)]
 pub struct PostNotification {
     pub message: String,
-    pub dcs_passthrough: bool,
 }
 
 impl Command for PostNotification {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
         let message = sanitize_osc9_message(&self.message);
-        if self.dcs_passthrough {
-            let escaped_message = escape_tmux_dcs_passthrough_payload(&message);
-            write!(f, "\x1bPtmux;\x1b\x1b]9;{escaped_message}\x07\x1b\\")
-        } else {
-            write!(f, "\x1b]9;{message}\x07")
-        }
+        write!(f, "\x1b]9;{message}\x07")
     }
 
     fn execute_winapi(&self) -> io::Result<()> {
@@ -72,17 +59,12 @@ fn sanitize_osc9_message(message: &str) -> String {
         .collect()
 }
 
-fn escape_tmux_dcs_passthrough_payload(message: &str) -> String {
-    message.replace('\u{1b}', "\u{1b}\u{1b}")
-}
-
 #[cfg(test)]
 mod tests {
     use crossterm::Command;
     use pretty_assertions::assert_eq;
 
     use super::PostNotification;
-    use super::escape_tmux_dcs_passthrough_payload;
 
     fn control_characters() -> String {
         (0_u32..=0x1f)
@@ -96,7 +78,6 @@ mod tests {
         let mut ansi = String::new();
         let command = PostNotification {
             message: "hello".to_string(),
-            dcs_passthrough: false,
         };
 
         command
@@ -107,34 +88,10 @@ mod tests {
     }
 
     #[test]
-    fn post_notification_writes_tmux_dcs_wrapped_osc9_sequence() {
-        let mut ansi = String::new();
-        let command = PostNotification {
-            message: "done".to_string(),
-            dcs_passthrough: true,
-        };
-
-        command
-            .write_ansi(&mut ansi)
-            .expect("OSC 9 command should format");
-
-        assert_eq!(ansi, "\u{1b}Ptmux;\u{1b}\u{1b}]9;done\u{7}\u{1b}\\");
-    }
-
-    #[test]
-    fn post_notification_escapes_escape_bytes_inside_tmux_payload() {
-        assert_eq!(
-            escape_tmux_dcs_passthrough_payload("danger\u{1b}[31m"),
-            "danger\u{1b}\u{1b}[31m"
-        );
-    }
-
-    #[test]
     fn post_notification_sanitizes_controls_before_plain_framing() {
         let mut ansi = String::new();
         let command = PostNotification {
             message: format!("safe λ🙂{}終", control_characters()),
-            dcs_passthrough: false,
         };
 
         command
@@ -142,20 +99,5 @@ mod tests {
             .expect("OSC 9 command should format");
 
         assert_eq!(ansi, "\u{1b}]9;safe λ🙂終\u{7}");
-    }
-
-    #[test]
-    fn post_notification_sanitizes_controls_before_tmux_framing() {
-        let mut ansi = String::new();
-        let command = PostNotification {
-            message: format!("safe λ🙂{}終", control_characters()),
-            dcs_passthrough: true,
-        };
-
-        command
-            .write_ansi(&mut ansi)
-            .expect("OSC 9 command should format");
-
-        assert_eq!(ansi, "\u{1b}Ptmux;\u{1b}\u{1b}]9;safe λ🙂終\u{7}\u{1b}\\");
     }
 }

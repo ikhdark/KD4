@@ -1,5 +1,6 @@
 use super::*;
 use codex_context_fragments::ContextualUserFragment;
+use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
@@ -53,14 +54,56 @@ fn skill_injection_renders_as_the_context_fragment() {
         name: "review".to_string(),
         path: "/tmp/review/SKILL.md".to_string(),
         contents: "Keep review comments concise.".to_string(),
+        scope: SkillScope::Admin,
     };
 
-    assert_eq!(skill.role(), "user");
+    assert_eq!(skill.role(), "developer");
     assert_eq!(skill.markers(), ("<skill>", "</skill>"));
     assert_eq!(
         skill.body(),
-        "\n<name>review</name>\n<path>/tmp/review/SKILL.md</path>\nKeep review comments concise.\n"
+        "\n<name>review</name>\n<path>/tmp/review/SKILL.md</path>\n<scope>admin</scope>\nKeep review comments concise.\n"
     );
+}
+
+#[test]
+fn skill_injection_preserves_source_scope_and_role() {
+    for (scope, role, label) in [
+        (SkillScope::System, "system", "system"),
+        (SkillScope::Admin, "developer", "admin"),
+        (SkillScope::Repo, "user", "repo"),
+        (SkillScope::User, "user", "user"),
+    ] {
+        let skill = SkillInjection {
+            name: "review".to_string(),
+            path: "/tmp/review/SKILL.md".to_string(),
+            contents: "Review carefully.".to_string(),
+            scope,
+        };
+
+        assert_eq!(skill.role(), role);
+        assert!(skill.body().contains(&format!("<scope>{label}</scope>")));
+    }
+}
+
+#[tokio::test]
+async fn planned_skill_injection_retains_declared_scope() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("SKILL.md");
+    std::fs::write(&path, "Admin-owned instructions.").expect("skill contents");
+    let mut metadata = make_skill("admin-review", "/tmp/admin-review/SKILL.md");
+    metadata.path_to_skills_md = path.abs();
+    metadata.scope = SkillScope::Admin;
+
+    let plan = plan_skill_injections(&[metadata], /*loaded_skills*/ None).await;
+    let injection = plan
+        .injections
+        .items
+        .first()
+        .expect("planned skill injection");
+
+    assert_eq!(injection.scope, SkillScope::Admin);
+    assert_eq!(injection.role(), "developer");
+    assert!(injection.body().contains("<scope>admin</scope>"));
 }
 
 fn collect_mentions(

@@ -14,7 +14,7 @@ fn completed_custom_ca_migration_has_no_fallback_terminal() {
 #[test]
 fn transport_default_client_propagates_custom_ca_failure() {
     let error = HttpClientBuilder::new()
-        .build_with_transport_default_proxy_using(|_| {
+        .build_with_transport_default_proxy_using(|_, _| {
             Err(BuildCustomCaTransportError::InvalidCaFile {
                 source_env: "TEST_CA_ENV",
                 path: PathBuf::from("invalid-test-ca.pem"),
@@ -30,6 +30,23 @@ fn transport_default_client_propagates_custom_ca_failure() {
             ..
         }
     ));
+}
+
+#[test]
+fn exclusive_tls_roots_select_explicit_root_policy() {
+    let ca_pem = include_bytes!("../tests/fixtures/test-ca.pem");
+
+    let client = HttpClientBuilder::new()
+        .tls_certs_only_pem(ca_pem)
+        .expect("valid CA certificate")
+        .build_with_transport_default_proxy_using(|builder, custom_ca_policy| {
+            assert_eq!(custom_ca_policy, CustomCaPolicy::ExplicitRootSet);
+            builder
+                .build()
+                .map_err(BuildCustomCaTransportError::BuildClientWithExplicitRoots)
+        });
+
+    assert!(client.is_ok());
 }
 
 #[test]

@@ -2,16 +2,26 @@ use super::*;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
-fn command_guidance_description() -> String {
+fn exec_command_guidance_description() -> String {
     format!(
-        "\n\n{}\n\n{}",
+        "\n\n{}\n\n{}\n\n{}",
+        KD4_VALIDATION_COMMAND_GUIDANCE,
+        rg_search_admission_guidance(),
+        filesystem_safety_guidance()
+    )
+}
+
+fn shell_command_guidance_description() -> String {
+    format!(
+        "\n\n{}\n\n{}\n\n{}",
+        KD4_VALIDATION_COMMAND_GUIDANCE,
         rg_search_admission_guidance(),
         windows_shell_guidance()
     )
 }
 
 #[test]
-fn command_tools_advertise_rg_search_admission_rule() {
+fn token_efficiency_command_tools_recommend_narrow_rg_without_rejection() {
     for tool in [
         create_exec_command_tool(CommandToolOptions {
             allow_login_shell: true,
@@ -27,8 +37,9 @@ fn command_tools_advertise_rg_search_admission_rule() {
                 .as_str()
                 .expect("command tool description")
                 .to_string();
-        assert!(description.contains("repository-wide `rg` search is rejected"));
-        assert!(description.contains("Start narrow; expand only after that miss"));
+        assert!(description.contains("Start repository `rg` searches in a likely owning path"));
+        assert!(description.contains("genuinely requires a repository-wide inventory"));
+        assert!(!description.contains("is rejected"));
     }
 }
 
@@ -48,6 +59,119 @@ fn has_parameter(tool: &ToolSpec, parameter_name: &str) -> bool {
             })
 }
 
+fn resolved_command_parameter_schema<'a>(
+    tool: &'a serde_json::Value,
+    branch: &'a serde_json::Value,
+    parameter_name: &str,
+) -> &'a serde_json::Value {
+    let schema = &branch["properties"][parameter_name];
+    let Some(schema_ref) = schema["$ref"].as_str() else {
+        return schema;
+    };
+    let pointer = schema_ref
+        .strip_prefix('#')
+        .expect("local command parameter schema reference");
+    tool["parameters"]
+        .pointer(pointer)
+        .expect("referenced command parameter schema")
+}
+
+fn inline_common_command_parameter_schemas(parameters: &serde_json::Value) -> serde_json::Value {
+    let mut inline = parameters.clone();
+    for branch in inline["oneOf"]
+        .as_array_mut()
+        .expect("command form branches")
+    {
+        for schema in branch["properties"]
+            .as_object_mut()
+            .expect("command form properties")
+            .values_mut()
+        {
+            let Some(schema_ref) = schema["$ref"].as_str() else {
+                continue;
+            };
+            let pointer = schema_ref
+                .strip_prefix('#')
+                .expect("local command parameter schema reference");
+            *schema = parameters
+                .pointer(pointer)
+                .expect("referenced command parameter schema")
+                .clone();
+        }
+    }
+    inline
+        .as_object_mut()
+        .expect("command parameters object")
+        .remove("$defs");
+    inline
+}
+
+#[test]
+fn command_validation_context_is_lean_and_strict() {
+    for tool in [
+        create_exec_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+        create_shell_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+    ] {
+        let tool = serde_json::to_value(tool).expect("serialize command tool");
+        let branches = tool["parameters"]["oneOf"]
+            .as_array()
+            .expect("command variants");
+        for branch in branches {
+            let validation = resolved_command_parameter_schema(&tool, branch, "validation");
+            assert_eq!(
+                validation["properties"]
+                    .as_object()
+                    .expect("validation properties")
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["covered_paths"]
+            );
+            assert_eq!(validation["required"], serde_json::json!(["covered_paths"]));
+            assert_eq!(validation["additionalProperties"], serde_json::json!(false));
+        }
+    }
+}
+
+#[test]
+fn token_efficiency_command_tools_explain_validation_proof_metadata() {
+    for tool in [
+        create_exec_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+        create_shell_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+    ] {
+        let tool = serde_json::to_value(tool).expect("serialize command tool");
+        let description = tool["description"]
+            .as_str()
+            .expect("command tool description");
+        assert!(description.contains("For direct validation proof"));
+        assert!(description.contains("`kind: \"argv\"`"));
+        assert!(description.contains("`validation.covered_paths`"));
+        assert!(description.contains("may run, but is not recorded as proof"));
+
+        for branch in tool["parameters"]["oneOf"]
+            .as_array()
+            .expect("command variants")
+        {
+            assert_eq!(
+                resolved_command_parameter_schema(&tool, branch, "validation")["description"],
+                KD4_VALIDATION_COMMAND_GUIDANCE
+            );
+        }
+    }
+}
+
 #[test]
 fn exec_command_tool_matches_expected_spec() {
     let tool = create_exec_command_tool(CommandToolOptions {
@@ -57,7 +181,7 @@ fn exec_command_tool_matches_expected_spec() {
 
     let description = format!(
         "Runs a command in a PTY, returning output or a session ID for ongoing interaction.{}",
-        command_guidance_description()
+        exec_command_guidance_description()
     );
 
     let mut properties = BTreeMap::from([
@@ -148,6 +272,7 @@ fn exec_command_tool_matches_expected_spec() {
     ]);
     properties.extend(create_approval_parameters(
         /*exec_permission_approvals_enabled*/ false,
+        /*allow_escalated_sandbox_permissions*/ true,
     ));
     properties.insert(
         "force_fresh".to_string(),
@@ -181,6 +306,48 @@ fn exec_command_tool_can_hide_shell_parameter() {
 
     assert!(!has_parameter(&tool, "shell"));
     assert!(has_parameter(&tool, "cmd"));
+}
+
+#[test]
+fn command_tools_only_advertise_escalation_when_the_policy_can_request_it() {
+    let options = CommandToolOptions {
+        allow_login_shell: true,
+        exec_permission_approvals_enabled: false,
+    };
+    let unavailable = [
+        create_exec_command_tool_for_policy(
+            options, /*include_environment_id*/ false, /*include_shell_parameter*/ true,
+            /*allow_escalated_sandbox_permissions*/ false,
+        ),
+        create_shell_command_tool_for_policy(
+            options, /*allow_escalated_sandbox_permissions*/ false,
+        ),
+    ];
+    for tool in unavailable {
+        let tool = serde_json::to_value(tool).expect("serialize command tool");
+        let properties = &tool["parameters"]["properties"];
+        assert_eq!(
+            properties["sandbox_permissions"]["enum"],
+            json!(["use_default"])
+        );
+        assert!(properties.get("justification").is_none());
+        assert!(properties.get("prefix_rule").is_none());
+    }
+
+    let available = serde_json::to_value(create_exec_command_tool_for_policy(
+        options, /*include_environment_id*/ false, /*include_shell_parameter*/ true,
+        /*allow_escalated_sandbox_permissions*/ true,
+    ))
+    .expect("serialize command tool");
+    assert_eq!(
+        available["parameters"]["properties"]["sandbox_permissions"]["enum"],
+        json!(["use_default", "require_escalated"])
+    );
+    assert!(
+        available["parameters"]["properties"]
+            .get("justification")
+            .is_some()
+    );
 }
 
 #[test]
@@ -295,7 +462,7 @@ Examples of valid command strings:
 - setting an env var: "$env:FOO='bar'; echo $env:FOO"
 - running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -""#
             .to_string()
-            + &command_guidance_description();
+            + &shell_command_guidance_description();
 
     let mut properties = BTreeMap::from([
         (
@@ -374,6 +541,7 @@ Examples of valid command strings:
     ]);
     properties.extend(create_approval_parameters(
         /*exec_permission_approvals_enabled*/ false,
+        /*allow_escalated_sandbox_permissions*/ true,
     ));
     properties.insert(
         "force_fresh".to_string(),
@@ -436,6 +604,142 @@ fn command_tools_advertise_only_mutually_exclusive_explicit_forms() {
                 .iter()
                 .all(|branch| branch["properties"]["kind"]["enum"] != json!(["legacy"]))
         );
+        assert!(branches.iter().all(|branch| {
+            branch["properties"]["kind"]["description"]
+                .as_str()
+                .is_some_and(|description| {
+                    description.contains("Explicit command encoding")
+                        && !description.contains("legacy")
+                })
+        }));
+    }
+}
+
+#[test]
+fn command_tools_define_common_parameters_once_and_reference_them_from_each_form() {
+    for tool in [
+        create_exec_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+        create_shell_command_tool(CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        }),
+    ] {
+        let tool = serde_json::to_value(tool).expect("serialize command tool");
+        let parameters = &tool["parameters"];
+        let definitions = parameters["$defs"]
+            .as_object()
+            .expect("common parameter definitions");
+        let branches = parameters["oneOf"].as_array().expect("command forms");
+        assert!(!definitions.is_empty());
+
+        for branch in branches {
+            let properties = branch["properties"]
+                .as_object()
+                .expect("command form properties");
+            for name in definitions.keys() {
+                assert_eq!(
+                    properties[name],
+                    json!({"$ref": format!("#/$defs/{name}")}),
+                    "common parameter `{name}` should reference its single definition"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn command_tool_schema_deduplication_preserves_validation_and_reduces_bytes() {
+    for (tool, script_field) in [
+        (
+            create_exec_command_tool(CommandToolOptions {
+                allow_login_shell: true,
+                exec_permission_approvals_enabled: false,
+            }),
+            "cmd",
+        ),
+        (
+            create_shell_command_tool(CommandToolOptions {
+                allow_login_shell: true,
+                exec_permission_approvals_enabled: false,
+            }),
+            "command",
+        ),
+    ] {
+        let tool = serde_json::to_value(tool).expect("serialize command tool");
+        let parameters = &tool["parameters"];
+        let inline = inline_common_command_parameter_schemas(parameters);
+        assert!(
+            serde_json::to_vec(parameters)
+                .expect("serialize referenced command schema")
+                .len()
+                < serde_json::to_vec(&inline)
+                    .expect("serialize inline command schema")
+                    .len()
+        );
+
+        let referenced_validator = jsonschema::validator_for(parameters)
+            .expect("referenced command schema should compile");
+        let inline_validator =
+            jsonschema::validator_for(&inline).expect("inline command schema should compile");
+
+        let mut script = json!({
+            "kind": "script",
+            "workdir": "repo",
+            "validation": {"covered_paths": ["src"]}
+        });
+        script[script_field] = json!("git status --short");
+        let mut mixed_form = script.clone();
+        mixed_form["program"] = json!("git");
+        let cases = [
+            (script, true),
+            (
+                json!({
+                    "kind": "argv",
+                    "program": "git",
+                    "args": ["status", "--short"],
+                    "force_fresh": true
+                }),
+                true,
+            ),
+            (
+                json!({"kind": "powershell_script", "script_body": "Get-ChildItem"}),
+                true,
+            ),
+            (json!({"program": "git", "args": ["status"]}), false),
+            (mixed_form, false),
+            (
+                json!({"kind": "argv", "program": "git", "unknown": true}),
+                false,
+            ),
+            (
+                json!({"kind": "argv", "program": "git", "workdir": 42}),
+                false,
+            ),
+            (
+                json!({
+                    "kind": "argv",
+                    "program": "git",
+                    "validation": {"covered_paths": "src"}
+                }),
+                false,
+            ),
+        ];
+
+        for (arguments, expected) in cases {
+            assert_eq!(
+                referenced_validator.is_valid(&arguments),
+                inline_validator.is_valid(&arguments),
+                "referenced and inline schemas disagree for {arguments}"
+            );
+            assert_eq!(
+                referenced_validator.is_valid(&arguments),
+                expected,
+                "unexpected command-schema result for {arguments}"
+            );
+        }
     }
 }
 
@@ -446,7 +750,8 @@ fn integer_arguments_expose_destination_types_and_runtime_bounds() {
         exec_permission_approvals_enabled: false,
     }))
     .expect("serialize exec tool");
-    let exec_yield = &exec["parameters"]["oneOf"][0]["properties"]["yield_time_ms"];
+    let exec_yield =
+        resolved_command_parameter_schema(&exec, &exec["parameters"]["oneOf"][0], "yield_time_ms");
     assert_eq!(exec_yield["type"], "integer");
     assert_eq!(
         exec_yield["minimum"],

@@ -350,10 +350,8 @@ pub(crate) fn clamp_bind_addrs(
         return (http_addr, socks_addr);
     }
 
-    // `x-unix-socket` is intentionally a local escape hatch. If the proxy is reachable from
-    // outside the machine, it can become a remote bridge into local daemons
-    // (e.g. docker.sock). To avoid footguns, enforce loopback binding whenever unix sockets
-    // are enabled.
+    // The compatibility-only unix-socket settings must never turn this listener into a remote
+    // bridge. Keep both proxy listeners on loopback whenever those settings are present.
     if cfg.dangerously_allow_non_loopback_proxy && !http_addr.ip().is_loopback() {
         warn!(
             "unix socket proxying is enabled; ignoring dangerously_allow_non_loopback_proxy and clamping HTTP proxy to loopback"
@@ -814,7 +812,7 @@ mod tests {
     #[test]
     fn clamp_bind_addrs_forces_loopback_when_unix_sockets_enabled() {
         let cfg = {
-            let mut settings = settings_with_unix_sockets(&["/tmp/docker.sock"]);
+            let mut settings = settings_with_unix_sockets(&[r"C:\Temp\example.sock"]);
             settings.dangerously_allow_non_loopback_proxy = true;
             settings
         };

@@ -13,6 +13,7 @@ use codex_context_fragments::ContextualUserFragment;
 use codex_exec_server::LOCAL_FS;
 use codex_otel::SessionTelemetry;
 use codex_plugin::mention_syntax::TOOL_MENTION_SIGIL;
+use codex_protocol::protocol::SkillScope;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -28,11 +29,12 @@ pub struct SkillInjection {
     pub name: String,
     pub path: String,
     pub contents: String,
+    pub scope: SkillScope,
 }
 
 impl ContextualUserFragment for SkillInjection {
     fn role(&self) -> &'static str {
-        "user"
+        crate::skill_instruction_role(self.scope)
     }
 
     fn markers(&self) -> (&'static str, &'static str) {
@@ -45,8 +47,11 @@ impl ContextualUserFragment for SkillInjection {
 
     fn body(&self) -> String {
         format!(
-            "\n<name>{}</name>\n<path>{}</path>\n{}\n",
-            self.name, self.path, self.contents
+            "\n<name>{}</name>\n<path>{}</path>\n<scope>{}</scope>\n{}\n",
+            self.name,
+            self.path,
+            crate::skill_scope_label(self.scope),
+            self.contents
         )
     }
 }
@@ -149,6 +154,7 @@ pub async fn plan_skill_injections(
                     name: skill.name.clone(),
                     path: skill.path_to_skills_md.to_string_lossy().into_owned(),
                     contents,
+                    scope: skill.scope,
                 });
             }
             Err(err) => {

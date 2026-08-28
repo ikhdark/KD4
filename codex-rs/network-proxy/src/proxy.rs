@@ -15,11 +15,13 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_home_dir::find_codex_home;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::net::TcpListener as StdTcpListener;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -106,6 +108,7 @@ pub struct NetworkProxyBuilder {
     http_addr: Option<SocketAddr>,
     socks_addr: Option<SocketAddr>,
     managed_by_codex: bool,
+    codex_home: Option<AbsolutePathBuf>,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     blocked_request_observer: Option<Arc<dyn BlockedRequestObserver>>,
 }
@@ -117,6 +120,7 @@ impl Default for NetworkProxyBuilder {
             http_addr: None,
             socks_addr: None,
             managed_by_codex: true,
+            codex_home: None,
             policy_decider: None,
             blocked_request_observer: None,
         }
@@ -141,6 +145,11 @@ impl NetworkProxyBuilder {
 
     pub fn managed_by_codex(mut self, managed_by_codex: bool) -> Self {
         self.managed_by_codex = managed_by_codex;
+        self
+    }
+
+    pub fn codex_home(mut self, codex_home: AbsolutePathBuf) -> Self {
+        self.codex_home = Some(codex_home);
         self
     }
 
@@ -183,6 +192,7 @@ impl NetworkProxyBuilder {
             .set_blocked_request_observer(self.blocked_request_observer.clone())
             .await;
         let current_cfg = state.current_cfg().await?;
+        let codex_home = self.codex_home.map_or_else(find_codex_home, Ok)?;
         let (requested_http_addr, requested_socks_addr, reserved_listeners) =
             if self.managed_by_codex {
                 let runtime = config::resolve_runtime(&current_cfg)?;
@@ -225,7 +235,9 @@ impl NetworkProxyBuilder {
             socks5_udp_enabled: current_cfg.enable_socks5_udp,
             runtime_settings: Arc::new(RwLock::new(NetworkProxyRuntimeSettings::from_config(
                 &current_cfg,
+                &codex_home,
             )?)),
+            codex_home,
             reserved_listeners,
             policy_decider: self.policy_decider,
             environment_proxies: Arc::new(Mutex::new(HashMap::new())),
@@ -304,10 +316,10 @@ struct NetworkProxyRuntimeSettings {
 }
 
 impl NetworkProxyRuntimeSettings {
-    fn from_config(config: &config::NetworkProxyConfig) -> Result<Self> {
+    fn from_config(config: &config::NetworkProxyConfig, codex_home: &Path) -> Result<Self> {
         let mitm_ca_trust_bundle = if config.mitm {
             let env = crate::certs::ca_env_from_process();
-            Some(crate::certs::managed_ca_trust_bundle(&env)?)
+            Some(crate::certs::managed_ca_trust_bundle(codex_home, &env)?)
         } else {
             None
         };
@@ -360,6 +372,7 @@ pub struct NetworkProxy {
     socks_addr: SocketAddr,
     socks_enabled: bool,
     socks5_udp_enabled: bool,
+    codex_home: AbsolutePathBuf,
     runtime_settings: Arc<RwLock<NetworkProxyRuntimeSettings>>,
     reserved_listeners: Option<Arc<ReservedListeners>>,
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
@@ -403,8 +416,6 @@ pub const PROXY_URL_ENV_KEYS: &[&str] = &[
     "BUNDLE_HTTP_PROXY",
     "BUNDLE_HTTPS_PROXY",
     "PIP_PROXY",
-    "DOCKER_HTTP_PROXY",
-    "DOCKER_HTTPS_PROXY",
 ];
 
 pub const ALL_PROXY_ENV_KEYS: &[&str] = &["ALL_PROXY", "all_proxy"];
@@ -437,8 +448,6 @@ pub const PROXY_ENV_KEYS: &[&str] = &[
     "BUNDLE_HTTP_PROXY",
     "BUNDLE_HTTPS_PROXY",
     "PIP_PROXY",
-    "DOCKER_HTTP_PROXY",
-    "DOCKER_HTTPS_PROXY",
     "WS_PROXY",
     "WSS_PROXY",
     "ws_proxy",
@@ -536,8 +545,6 @@ fn apply_proxy_env_overrides(
             "BUNDLE_HTTP_PROXY",
             "BUNDLE_HTTPS_PROXY",
             "PIP_PROXY",
-            "DOCKER_HTTP_PROXY",
-            "DOCKER_HTTPS_PROXY",
         ],
         &http_proxy_url,
     );
@@ -837,7 +844,8 @@ impl NetworkProxy {
             "cannot update network.enable_socks5_udp on a running proxy"
         );
 
-        let settings = NetworkProxyRuntimeSettings::from_config(&new_state.config)?;
+        let settings =
+            NetworkProxyRuntimeSettings::from_config(&new_state.config, &self.codex_home)?;
         self.state.replace_config_state(new_state).await?;
         let mut guard = self
             .runtime_settings
@@ -865,9 +873,12 @@ impl NetworkProxy {
             return Ok(NetworkProxyHandle::noop());
         }
 
-        if !unix_socket_permissions_supported() {
+        if !unix_socket_permissions_supported()
+            && (!current_cfg.allow_unix_sockets().is_empty()
+                || current_cfg.dangerously_allow_all_unix_sockets)
+        {
             warn!(
-                "allowUnixSockets and dangerouslyAllowAllUnixSockets are macOS-only; requests will be rejected on this platform"
+                "allowUnixSockets and dangerouslyAllowAllUnixSockets are compatibility-only on Windows; unix-socket requests will be rejected"
             );
         }
 
@@ -1322,6 +1333,8 @@ mod tests {
         assert_eq!(env.get(NODE_USE_ENV_PROXY_ENV_KEY), Some(&"1".to_string()));
 
         assert_eq!(env.get(GIT_SSH_COMMAND_ENV_KEY), None);
+        assert_eq!(env.get("DOCKER_HTTP_PROXY"), None);
+        assert_eq!(env.get("DOCKER_HTTPS_PROXY"), None);
     }
 
     #[test]

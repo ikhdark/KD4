@@ -1,9 +1,11 @@
 use super::*;
+use crate::guardian::GuardianRejection;
 use crate::sandboxing::SandboxPermissions;
 use codex_network_proxy::BlockedRequestArgs;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::GuardianAssessmentDecisionSource;
 use core_test_support::PathBufExt;
 use core_test_support::test_path_buf;
 use pretty_assertions::assert_eq;
@@ -14,6 +16,7 @@ async fn pending_approvals_are_deduped_per_host_protocol_and_port() {
     let service = NetworkApprovalService::default();
     let key = HostApprovalKey {
         environment_id: "local".to_string(),
+        approval_scope_id: "local-scope".to_string(),
         host: "example.com".to_string(),
         protocol: "http",
         port: 443,
@@ -28,16 +31,45 @@ async fn pending_approvals_are_deduped_per_host_protocol_and_port() {
 }
 
 #[tokio::test]
+async fn ownerless_guardian_denial_consumes_its_rejection_rationale() {
+    let (session, _turn) = crate::session::tests::make_session_and_context().await;
+    let review_id = "ownerless-network-denial";
+    session.services.guardian_rejections.lock().await.insert(
+        review_id.to_string(),
+        GuardianRejection {
+            rationale: "blocked by the test reviewer".to_string(),
+            source: GuardianAssessmentDecisionSource::Agent,
+        },
+    );
+
+    assert!(
+        guardian_denial_outcome(&session, review_id, /*has_owner*/ false)
+            .await
+            .is_none()
+    );
+    assert!(
+        !session
+            .services
+            .guardian_rejections
+            .lock()
+            .await
+            .contains_key(review_id)
+    );
+}
+
+#[tokio::test]
 async fn pending_approvals_do_not_dedupe_across_ports() {
     let service = NetworkApprovalService::default();
     let first_key = HostApprovalKey {
         environment_id: "local".to_string(),
+        approval_scope_id: "local-scope".to_string(),
         host: "example.com".to_string(),
         protocol: "https",
         port: 443,
     };
     let second_key = HostApprovalKey {
         environment_id: "local".to_string(),
+        approval_scope_id: "local-scope".to_string(),
         host: "example.com".to_string(),
         protocol: "https",
         port: 8443,
@@ -56,6 +88,7 @@ async fn pending_approvals_do_not_dedupe_across_environments() {
     let service = NetworkApprovalService::default();
     let first_key = HostApprovalKey {
         environment_id: "local".to_string(),
+        approval_scope_id: "local-scope".to_string(),
         host: "example.com".to_string(),
         protocol: "https",
         port: 443,
@@ -78,6 +111,7 @@ async fn session_approved_hosts_are_scoped_by_environment() {
     let service = NetworkApprovalService::default();
     let local_key = HostApprovalKey {
         environment_id: "local".to_string(),
+        approval_scope_id: "local-scope".to_string(),
         host: "example.com".to_string(),
         protocol: "https",
         port: 443,
@@ -102,6 +136,35 @@ async fn session_approved_hosts_are_scoped_by_environment() {
 }
 
 #[tokio::test]
+async fn session_approved_hosts_are_scoped_by_environment_incarnation() {
+    let service = NetworkApprovalService::default();
+    let first_key = HostApprovalKey {
+        environment_id: "remote".to_string(),
+        approval_scope_id: "remote-scope-1".to_string(),
+        host: "example.com".to_string(),
+        protocol: "https",
+        port: 443,
+    };
+    let replacement_key = HostApprovalKey {
+        approval_scope_id: "remote-scope-2".to_string(),
+        ..first_key.clone()
+    };
+    service
+        .session_approved_hosts
+        .lock()
+        .await
+        .insert(first_key);
+
+    assert!(
+        !service
+            .session_approved_hosts
+            .lock()
+            .await
+            .contains(&replacement_key)
+    );
+}
+
+#[tokio::test]
 async fn session_approved_hosts_preserve_protocol_and_port_scope() {
     let source = NetworkApprovalService::default();
     {
@@ -109,18 +172,21 @@ async fn session_approved_hosts_preserve_protocol_and_port_scope() {
         approved_hosts.extend([
             HostApprovalKey {
                 environment_id: "local".to_string(),
+                approval_scope_id: "local-scope".to_string(),
                 host: "example.com".to_string(),
                 protocol: "https",
                 port: 443,
             },
             HostApprovalKey {
                 environment_id: "local".to_string(),
+                approval_scope_id: "local-scope".to_string(),
                 host: "example.com".to_string(),
                 protocol: "https",
                 port: 8443,
             },
             HostApprovalKey {
                 environment_id: "local".to_string(),
+                approval_scope_id: "local-scope".to_string(),
                 host: "example.com".to_string(),
                 protocol: "http",
                 port: 80,
@@ -152,18 +218,21 @@ async fn session_approved_hosts_preserve_protocol_and_port_scope() {
         vec![
             HostApprovalKey {
                 environment_id: "local".to_string(),
+                approval_scope_id: "local-scope".to_string(),
                 host: "example.com".to_string(),
                 protocol: "http",
                 port: 80,
             },
             HostApprovalKey {
                 environment_id: "local".to_string(),
+                approval_scope_id: "local-scope".to_string(),
                 host: "example.com".to_string(),
                 protocol: "https",
                 port: 443,
             },
             HostApprovalKey {
                 environment_id: "local".to_string(),
+                approval_scope_id: "local-scope".to_string(),
                 host: "example.com".to_string(),
                 protocol: "https",
                 port: 8443,
@@ -179,6 +248,7 @@ async fn sync_session_approved_hosts_to_replaces_existing_target_hosts() {
         let mut approved_hosts = source.session_approved_hosts.lock().await;
         approved_hosts.insert(HostApprovalKey {
             environment_id: "local".to_string(),
+            approval_scope_id: "local-scope".to_string(),
             host: "source.example.com".to_string(),
             protocol: "https",
             port: 443,
@@ -190,6 +260,7 @@ async fn sync_session_approved_hosts_to_replaces_existing_target_hosts() {
         let mut approved_hosts = target.session_approved_hosts.lock().await;
         approved_hosts.insert(HostApprovalKey {
             environment_id: "local".to_string(),
+            approval_scope_id: "local-scope".to_string(),
             host: "stale.example.com".to_string(),
             protocol: "https",
             port: 8443,
@@ -210,6 +281,7 @@ async fn sync_session_approved_hosts_to_replaces_existing_target_hosts() {
         copied,
         vec![HostApprovalKey {
             environment_id: "local".to_string(),
+            approval_scope_id: "local-scope".to_string(),
             host: "source.example.com".to_string(),
             protocol: "https",
             port: 443,
@@ -312,6 +384,7 @@ async fn register_call_with_default_shell_trigger(
             },
             "curl https://example.com".to_string(),
             "local".to_string(),
+            "local-scope".to_string(),
             cancellation_token.clone(),
         )
         .await;
@@ -339,6 +412,7 @@ async fn active_call_preserves_triggering_command_context() {
             expected.clone(),
             "curl https://example.com".to_string(),
             "remote".to_string(),
+            "remote-scope".to_string(),
             CancellationToken::new(),
         )
         .await;
@@ -351,6 +425,7 @@ async fn active_call_preserves_triggering_command_context() {
     assert_eq!(&call.trigger, &expected);
     assert_eq!(call.command, "curl https://example.com");
     assert_eq!(call.environment_id, "remote");
+    assert_eq!(call.approval_scope_id, "remote-scope");
 }
 
 #[tokio::test]

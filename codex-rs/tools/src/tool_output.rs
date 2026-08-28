@@ -11,6 +11,8 @@ use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::ToolPayload;
 
@@ -583,13 +585,37 @@ where
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub struct JsonToolOutput {
     value: JsonValue,
     success: Option<bool>,
     outcome: Option<ToolOutputOutcome>,
     skip_disposition: Option<ToolOutputSkipDisposition>,
     contains_external_context: bool,
+    serialized: Arc<OnceLock<String>>,
+}
+
+impl std::fmt::Debug for JsonToolOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JsonToolOutput")
+            .field("value", &self.value)
+            .field("success", &self.success)
+            .field("outcome", &self.outcome)
+            .field("skip_disposition", &self.skip_disposition)
+            .field("contains_external_context", &self.contains_external_context)
+            .finish()
+    }
+}
+
+impl PartialEq for JsonToolOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+            && self.success == other.success
+            && self.outcome == other.outcome
+            && self.skip_disposition == other.skip_disposition
+            && self.contains_external_context == other.contains_external_context
+    }
 }
 
 impl JsonToolOutput {
@@ -600,6 +626,7 @@ impl JsonToolOutput {
             outcome: None,
             skip_disposition: None,
             contains_external_context: false,
+            serialized: Arc::new(OnceLock::new()),
         }
     }
 
@@ -610,6 +637,7 @@ impl JsonToolOutput {
             outcome: None,
             skip_disposition: None,
             contains_external_context: false,
+            serialized: Arc::new(OnceLock::new()),
         }
     }
 
@@ -620,6 +648,7 @@ impl JsonToolOutput {
             outcome: Some(ToolOutputOutcome::Skipped),
             skip_disposition: None,
             contains_external_context: false,
+            serialized: Arc::new(OnceLock::new()),
         }
     }
 
@@ -633,6 +662,7 @@ impl JsonToolOutput {
             outcome: Some(ToolOutputOutcome::Skipped),
             skip_disposition: Some(disposition),
             contains_external_context: false,
+            serialized: Arc::new(OnceLock::new()),
         }
     }
 
@@ -640,10 +670,30 @@ impl JsonToolOutput {
         self.contains_external_context = true;
         self
     }
+
+    fn serialized(&self) -> &str {
+        self.serialized
+            .get_or_init(|| self.value.to_string())
+            .as_str()
+    }
+
+    #[cfg(test)]
+    fn serialization_cache_is_initialized(&self) -> bool {
+        self.serialized.get().is_some()
+    }
 }
 
 impl ToolOutputProjectionMetadata {
     pub fn from_json(value: &JsonValue, success: bool, requested_limit: Option<usize>) -> Self {
+        Self::from_json_with_serialized(value, success, requested_limit, value.to_string())
+    }
+
+    fn from_json_with_serialized(
+        value: &JsonValue,
+        success: bool,
+        requested_limit: Option<usize>,
+        serialized: String,
+    ) -> Self {
         Self {
             outcome: if success {
                 ToolOutputOutcome::Success
@@ -652,7 +702,7 @@ impl ToolOutputProjectionMetadata {
             },
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
             fragments: Vec::new(),
-            spillable_text: vec![value.to_string()],
+            spillable_text: vec![serialized],
             essential_inline: essential_projection_fields(value),
             requested_limit,
             predetermined_ranges: Vec::new(),
@@ -765,7 +815,7 @@ fn is_essential_key(key: &str) -> bool {
 
 impl ToolOutput for JsonToolOutput {
     fn log_preview(&self) -> String {
-        telemetry_preview(&self.value.to_string())
+        telemetry_preview(self.serialized())
     }
 
     fn success_for_logging(&self) -> bool {
@@ -809,10 +859,11 @@ impl ToolOutput for JsonToolOutput {
     }
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
-        let mut metadata = ToolOutputProjectionMetadata::from_json(
+        let mut metadata = ToolOutputProjectionMetadata::from_json_with_serialized(
             &self.value,
             self.success.unwrap_or(true),
             None,
+            self.serialized().to_owned(),
         );
         metadata.outcome = self.outcome_for_logging();
         Some(metadata)
@@ -824,7 +875,7 @@ impl ToolOutput for JsonToolOutput {
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
         let output = FunctionCallOutputPayload {
-            body: FunctionCallOutputBody::Text(self.value.to_string()),
+            body: FunctionCallOutputBody::Text(self.serialized().to_owned()),
             success: self.success,
         };
 
@@ -1053,6 +1104,39 @@ mod canonical_tests {
     fn telemetry_preview_returns_original_within_limits() {
         let content = "short output";
         assert_eq!(telemetry_preview(content), content);
+    }
+
+    #[test]
+    fn json_tool_output_reuses_serialization_across_consumers_and_clones() {
+        let value = serde_json::json!({
+            "items": ["first", "second"],
+            "nextCursor": "cursor-1",
+        });
+        let expected = value.to_string();
+        let output = JsonToolOutput::new(value.clone());
+        let cloned = output.clone();
+
+        assert!(!output.serialization_cache_is_initialized());
+        assert!(!cloned.serialization_cache_is_initialized());
+        assert_eq!(output.log_preview(), expected);
+        assert!(output.serialization_cache_is_initialized());
+        assert!(cloned.serialization_cache_is_initialized());
+
+        let metadata = cloned
+            .projection_metadata()
+            .expect("JSON projection metadata");
+        assert_eq!(metadata.spillable_text, vec![expected.clone()]);
+        let response = output.to_response_item(
+            "json-call",
+            &ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+        );
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+            panic!("JSON function output should remain function-call shaped");
+        };
+        assert_eq!(output.body, FunctionCallOutputBody::Text(expected));
+        assert_eq!(JsonToolOutput::new(value), cloned);
     }
 
     #[test]

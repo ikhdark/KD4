@@ -394,7 +394,7 @@ fn finish_driver_spawn_keeps_stdin_open_when_requested() {
         let spawned = super::finish_driver_spawn(
             ProcessDriver {
                 writer_tx,
-                stdout_rx,
+                stdout_rx: stdout_rx.into(),
                 stderr_rx: None,
                 exit_rx,
                 terminator: None,
@@ -426,7 +426,7 @@ fn finish_driver_spawn_closes_stdin_when_not_requested() {
         let spawned = super::finish_driver_spawn(
             ProcessDriver {
                 writer_tx,
-                stdout_rx,
+                stdout_rx: stdout_rx.into(),
                 stderr_rx: None,
                 exit_rx,
                 terminator: None,
@@ -901,7 +901,10 @@ async fn assert_legacy_tty_descendant_lifecycle(
     let descendant_process = open_process_for_wait(descendant_pid);
 
     if matches!(lifecycle, LegacyTtyDescendantLifecycle::Terminate) {
-        spawned.session.request_terminate();
+        spawned
+            .session
+            .request_terminate()
+            .expect("request process termination");
     }
     let (_, exit_code) =
         collect_stdout_and_exit(spawned, codex_home.path(), Duration::from_secs(15)).await;

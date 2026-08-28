@@ -171,6 +171,7 @@ use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequest
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::HashSet;
@@ -241,11 +242,13 @@ fn sample_thread_start_response(
         model_provider: "openai".to_string(),
         service_tier: None,
         cwd: test_path_buf("/tmp").abs(),
+        selected_environment: None,
         runtime_workspace_roots: Vec::new(),
         instruction_sources: Vec::new(),
         approval_policy: AppServerAskForApproval::OnRequest,
         approvals_reviewer: AppServerApprovalsReviewer::User,
         sandbox: AppServerSandboxPolicy::DangerFullAccess,
+        permission_profile: None,
         active_permission_profile: None,
         reasoning_effort: None,
     })
@@ -264,8 +267,8 @@ fn sample_app_server_client_metadata() -> CodexAppServerClientMetadata {
 fn sample_runtime_metadata() -> CodexRuntimeMetadata {
     CodexRuntimeMetadata {
         codex_rs_version: "0.1.0".to_string(),
-        runtime_os: "macos".to_string(),
-        runtime_os_version: "15.3.1".to_string(),
+        runtime_os: "windows".to_string(),
+        runtime_os_version: "10.0.26100".to_string(),
         runtime_arch: "aarch64".to_string(),
     }
 }
@@ -305,11 +308,13 @@ fn sample_thread_resume_response_with_source(
         model_provider: "openai".to_string(),
         service_tier: None,
         cwd: test_path_buf("/tmp").abs(),
+        selected_environment: None,
         runtime_workspace_roots: Vec::new(),
         instruction_sources: Vec::new(),
         approval_policy: AppServerAskForApproval::OnRequest,
         approvals_reviewer: AppServerApprovalsReviewer::User,
         sandbox: AppServerSandboxPolicy::DangerFullAccess,
+        permission_profile: None,
         active_permission_profile: None,
         reasoning_effort: None,
         initial_turns_page: None,
@@ -810,8 +815,8 @@ fn sample_initialize_fact(connection_id: u64) -> AnalyticsFact {
         product_client_id: DEFAULT_ORIGINATOR.to_string(),
         runtime: CodexRuntimeMetadata {
             codex_rs_version: "0.99.0".to_string(),
-            runtime_os: "linux".to_string(),
-            runtime_os_version: "24.04".to_string(),
+            runtime_os: "windows".to_string(),
+            runtime_os_version: "10.0.26100".to_string(),
             runtime_arch: "x86_64".to_string(),
         },
         rpc_transport: AppServerRpcTransport::Websocket,
@@ -965,6 +970,7 @@ fn sample_permissions_approval_request(request_id: i64) -> ServerRequest {
             environment_id: None,
             started_at_ms: 1_000,
             cwd: test_path_buf("/tmp").abs(),
+            cwd_uri: PathUri::from_abs_path(&test_path_buf("/tmp").abs()),
             reason: Some("need network".to_string()),
             permissions: RequestPermissionProfile {
                 network: Some(codex_app_server_protocol::AdditionalNetworkPermissions {
@@ -1381,8 +1387,8 @@ fn compaction_event_serializes_expected_shape() {
                 },
                 "runtime": {
                     "codex_rs_version": "0.1.0",
-                    "runtime_os": "macos",
-                    "runtime_os_version": "15.3.1",
+                    "runtime_os": "windows",
+                    "runtime_os_version": "10.0.26100",
                     "runtime_arch": "aarch64"
                 },
                 "thread_source": "user",
@@ -1455,8 +1461,8 @@ fn thread_initialized_event_serializes_expected_shape() {
             },
             runtime: CodexRuntimeMetadata {
                 codex_rs_version: "0.1.0".to_string(),
-                runtime_os: "macos".to_string(),
-                runtime_os_version: "15.3.1".to_string(),
+                runtime_os: "windows".to_string(),
+                runtime_os_version: "10.0.26100".to_string(),
                 runtime_arch: "aarch64".to_string(),
             },
             model: "gpt-5".to_string(),
@@ -1488,8 +1494,8 @@ fn thread_initialized_event_serializes_expected_shape() {
                 },
                 "runtime": {
                     "codex_rs_version": "0.1.0",
-                    "runtime_os": "macos",
-                    "runtime_os_version": "15.3.1",
+                    "runtime_os": "windows",
+                    "runtime_os_version": "10.0.26100",
                     "runtime_arch": "aarch64"
                 },
                 "model": "gpt-5",
@@ -1523,8 +1529,8 @@ fn command_execution_event_serializes_expected_shape() {
                 },
                 runtime: CodexRuntimeMetadata {
                     codex_rs_version: "0.99.0".to_string(),
-                    runtime_os: "macos".to_string(),
-                    runtime_os_version: "15.3.1".to_string(),
+                    runtime_os: "windows".to_string(),
+                    runtime_os_version: "10.0.26100".to_string(),
                     runtime_arch: "aarch64".to_string(),
                 },
                 thread_source: Some(ThreadSource::User),
@@ -1572,8 +1578,8 @@ fn command_execution_event_serializes_expected_shape() {
                 },
                 "runtime": {
                     "codex_rs_version": "0.99.0",
-                    "runtime_os": "macos",
-                    "runtime_os_version": "15.3.1",
+                    "runtime_os": "windows",
+                    "runtime_os_version": "10.0.26100",
                     "runtime_arch": "aarch64"
                 },
                 "thread_source": "user",
@@ -1622,8 +1628,8 @@ fn review_event_serializes_expected_shape() {
             },
             runtime: CodexRuntimeMetadata {
                 codex_rs_version: "0.99.0".to_string(),
-                runtime_os: "macos".to_string(),
-                runtime_os_version: "15.3.1".to_string(),
+                runtime_os: "windows".to_string(),
+                runtime_os_version: "10.0.26100".to_string(),
                 runtime_arch: "aarch64".to_string(),
             },
             thread_source: Some(ThreadSource::Subagent),
@@ -1660,8 +1666,8 @@ fn review_event_serializes_expected_shape() {
                 },
                 "runtime": {
                     "codex_rs_version": "0.99.0",
-                    "runtime_os": "macos",
-                    "runtime_os_version": "15.3.1",
+                    "runtime_os": "windows",
+                    "runtime_os_version": "10.0.26100",
                     "runtime_arch": "aarch64"
                 },
                 "thread_source": "subagent",
@@ -1722,8 +1728,8 @@ async fn initialize_caches_client_and_thread_lifecycle_publishes_once_initialize
                 product_client_id: DEFAULT_ORIGINATOR.to_string(),
                 runtime: CodexRuntimeMetadata {
                     codex_rs_version: "0.99.0".to_string(),
-                    runtime_os: "linux".to_string(),
-                    runtime_os_version: "24.04".to_string(),
+                    runtime_os: "windows".to_string(),
+                    runtime_os_version: "10.0.26100".to_string(),
                     runtime_arch: "x86_64".to_string(),
                 },
                 rpc_transport: AppServerRpcTransport::Websocket,
@@ -1775,10 +1781,13 @@ async fn initialize_caches_client_and_thread_lifecycle_publishes_once_initialize
         payload[0]["event_params"]["runtime"]["codex_rs_version"],
         "0.99.0"
     );
-    assert_eq!(payload[0]["event_params"]["runtime"]["runtime_os"], "linux");
+    assert_eq!(
+        payload[0]["event_params"]["runtime"]["runtime_os"],
+        "windows"
+    );
     assert_eq!(
         payload[0]["event_params"]["runtime"]["runtime_os_version"],
-        "24.04"
+        "10.0.26100"
     );
     assert_eq!(
         payload[0]["event_params"]["runtime"]["runtime_arch"],
@@ -4266,8 +4275,8 @@ fn turn_event_serializes_expected_shape() {
                 },
                 "runtime": {
                     "codex_rs_version": "0.1.0",
-                    "runtime_os": "macos",
-                    "runtime_os_version": "15.3.1",
+                    "runtime_os": "windows",
+                    "runtime_os_version": "10.0.26100",
                     "runtime_arch": "aarch64"
                 },
                 "ephemeral": false,
@@ -4660,8 +4669,8 @@ async fn turn_lifecycle_emits_turn_event() {
         payload["event_params"]["runtime"],
         json!({
             "codex_rs_version": "0.1.0",
-            "runtime_os": "macos",
-            "runtime_os_version": "15.3.1",
+            "runtime_os": "windows",
+            "runtime_os_version": "10.0.26100",
             "runtime_arch": "aarch64",
         })
     );

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -182,6 +183,7 @@ pub fn should_retry_without_scopes(scopes: &ResolvedMcpOAuthScopes, error: &anyh
 
 pub async fn compute_auth_statuses<'a, I>(
     servers: I,
+    codex_home: &Path,
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
     auth: Option<&CodexAuth>,
@@ -192,6 +194,7 @@ where
 {
     let futures = servers.into_iter().map(|(name, server)| {
         let name = name.clone();
+        let codex_home = codex_home.to_path_buf();
         let config = server.configured_config().cloned();
         let runtime_context = runtime_context.clone();
         let has_runtime_auth = config
@@ -212,6 +215,7 @@ where
                 Some(config) => {
                     match compute_auth_status(
                         &name,
+                        &codex_home,
                         config,
                         store_mode,
                         keyring_backend_kind,
@@ -241,6 +245,7 @@ where
 
 async fn compute_auth_status(
     server_name: &str,
+    codex_home: &Path,
     config: &McpServerConfig,
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
@@ -265,6 +270,7 @@ async fn compute_auth_status(
         } => {
             if config.is_local_environment() {
                 determine_streamable_http_auth_status(
+                    codex_home,
                     server_name,
                     url,
                     bearer_token_env_var.as_deref(),
@@ -280,6 +286,7 @@ async fn compute_auth_status(
                     .resolve_http_client(server_name, config)
                     .map_err(anyhow::Error::msg)?;
                 determine_streamable_http_auth_status_with_http_client(
+                    codex_home,
                     server_name,
                     url,
                     bearer_token_env_var.as_deref(),

@@ -192,6 +192,13 @@ pub(crate) fn is_startup_contextual_user_fragment(content_item: &ContentItem) ->
         .any(|fragment| fragment.matches_text(text))
 }
 
+pub(crate) fn is_task_evidence_context_fragment(content_item: &ContentItem) -> bool {
+    let ContentItem::InputText { text } = content_item else {
+        return false;
+    };
+    TASK_EVIDENCE_STATE_REGISTRATION.matches_text(text)
+}
+
 pub(crate) fn is_legacy_compaction_warning_fragment(content_item: &ContentItem) -> bool {
     let ContentItem::InputText { text } = content_item else {
         return false;

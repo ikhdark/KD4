@@ -7,6 +7,8 @@ use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
 use codex_mcp::ToolInfo;
 use codex_mcp::codex_apps_tools_cache_key;
 use codex_mcp::tool_is_model_visible;
+use std::future::Future;
+use std::pin::Pin;
 
 mod installed;
 
@@ -223,22 +225,20 @@ impl AppsRequestProcessor {
         let plugins_manager = self.thread_manager.plugins_manager();
         let last_notified_apps = Arc::clone(&self.last_notified_apps);
         let shutdown_token = self.shutdown_token.child_token();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = shutdown_token.cancelled() => {}
-                _ = Self::apps_list_task(
-                    outgoing,
-                    last_notified_apps,
-                    request,
-                    params,
-                    config,
-                    environment_manager,
-                    mcp_manager,
-                    plugins_manager,
-                    installed_start,
-                ) => {}
-            }
-        });
+        tokio::select! {
+            _ = shutdown_token.cancelled() => {}
+            _ = Self::apps_list_task(
+                outgoing,
+                last_notified_apps,
+                request,
+                params,
+                config,
+                environment_manager,
+                mcp_manager,
+                plugins_manager,
+                installed_start,
+            ) => {}
+        }
         Ok(None)
     }
 
@@ -344,11 +344,8 @@ impl AppsRequestProcessor {
         );
         let cached_all_connectors = all_connectors.clone();
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
         let accessible_config = config.clone();
-        let accessible_tx = tx.clone();
-        tokio::spawn(async move {
+        let accessible_loader = async move {
             let result = connectors::list_accessible_connectors_from_mcp_tools_with_mcp_manager(
                 &accessible_config,
                 force_refetch,
@@ -357,12 +354,12 @@ impl AppsRequestProcessor {
             )
             .await
             .map_err(|err| format!("failed to load accessible apps: {err}"));
-            let _ = accessible_tx.send(AppListLoadResult::Accessible(result));
-        });
+            AppListLoadResult::Accessible(result)
+        };
 
         let all_config = config.clone();
         let all_plugin_apps = plugin_apps.clone();
-        tokio::spawn(async move {
+        let directory_loader = async move {
             let result = connectors::list_all_connectors_with_options(
                 &all_config,
                 force_refetch,
@@ -370,8 +367,10 @@ impl AppsRequestProcessor {
             )
             .await
             .map_err(|err| format!("failed to list apps: {err}"));
-            let _ = tx.send(AppListLoadResult::Directory(result));
-        });
+            AppListLoadResult::Directory(result)
+        };
+        tokio::pin!(accessible_loader);
+        tokio::pin!(directory_loader);
 
         let app_list_deadline = tokio::time::Instant::now() + APP_LIST_LOAD_TIMEOUT;
         let mut accessible_loaded = false;
@@ -399,18 +398,14 @@ impl AppsRequestProcessor {
         }
 
         loop {
-            let result = match tokio::time::timeout_at(app_list_deadline, rx.recv()).await {
-                Ok(Some(result)) => result,
-                Ok(None) => {
-                    return Err(internal_error("failed to load app lists"));
-                }
-                Err(_) => {
-                    let timeout_seconds = APP_LIST_LOAD_TIMEOUT.as_secs();
-                    return Err(internal_error(format!(
-                        "timed out waiting for app lists after {timeout_seconds} seconds"
-                    )));
-                }
-            };
+            let result = next_app_list_load(
+                accessible_loader.as_mut(),
+                directory_loader.as_mut(),
+                accessible_loaded,
+                all_loaded,
+                app_list_deadline,
+            )
+            .await?;
 
             match result {
                 AppListLoadResult::Accessible(Ok(status)) => {
@@ -493,6 +488,29 @@ impl AppsRequestProcessor {
             .load_latest_config(fallback_cwd)
             .await
             .map_config_load_error()
+    }
+}
+
+async fn next_app_list_load<A, D>(
+    mut accessible_loader: Pin<&mut A>,
+    mut directory_loader: Pin<&mut D>,
+    accessible_loaded: bool,
+    all_loaded: bool,
+    deadline: tokio::time::Instant,
+) -> Result<AppListLoadResult, JSONRPCErrorError>
+where
+    A: Future<Output = AppListLoadResult>,
+    D: Future<Output = AppListLoadResult>,
+{
+    tokio::select! {
+        result = &mut accessible_loader, if !accessible_loaded => Ok(result),
+        result = &mut directory_loader, if !all_loaded => Ok(result),
+        _ = tokio::time::sleep_until(deadline) => {
+            let timeout_seconds = APP_LIST_LOAD_TIMEOUT.as_secs();
+            Err(internal_error(format!(
+                "timed out waiting for app lists after {timeout_seconds} seconds"
+            )))
+        }
     }
 }
 
@@ -631,4 +649,53 @@ async fn send_app_list_updated_notification(
             },
         ))
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn app_list_timeout_drops_both_owned_loaders() {
+        let accessible_dropped = Arc::new(AtomicBool::new(false));
+        let directory_dropped = Arc::new(AtomicBool::new(false));
+
+        {
+            let accessible_flag = DropFlag(Arc::clone(&accessible_dropped));
+            let directory_flag = DropFlag(Arc::clone(&directory_dropped));
+            let accessible_loader = async move {
+                let _flag = accessible_flag;
+                std::future::pending::<AppListLoadResult>().await
+            };
+            let directory_loader = async move {
+                let _flag = directory_flag;
+                std::future::pending::<AppListLoadResult>().await
+            };
+            tokio::pin!(accessible_loader);
+            tokio::pin!(directory_loader);
+
+            let result = next_app_list_load(
+                accessible_loader.as_mut(),
+                directory_loader.as_mut(),
+                /*accessible_loaded*/ false,
+                /*all_loaded*/ false,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+            assert!(result.is_err());
+        }
+
+        assert!(accessible_dropped.load(Ordering::Acquire));
+        assert!(directory_dropped.load(Ordering::Acquire));
+    }
 }

@@ -14,6 +14,7 @@ use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
+use super::defer_trace_recording;
 use crate::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -23,6 +24,7 @@ use crate::tools::code_mode::CodeModeWaitHandler;
 use crate::tools::code_mode::WAIT_TOOL_NAME;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
+use crate::tools::context::ToolDispatchState;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::CoreToolRuntime;
@@ -41,6 +43,7 @@ fn tool_lifecycle_uses_one_clock_and_records_all_boundaries() {
         tokio::time::Instant::now(),
         false,
     );
+    timing.mark_first_poll();
     turn_timing.adjust_parallel_gate_waiters(1);
     timing.mark_parallel_gate_admitted();
     turn_timing.adjust_parallel_gate_waiters(-1);
@@ -59,6 +62,7 @@ fn tool_lifecycle_uses_one_clock_and_records_all_boundaries() {
     timing.mark_next_model_sample_start();
 
     let snapshot = timing.snapshot(tokio::time::Instant::now());
+    assert!(snapshot.first_poll_at_ms.is_some());
     let boundaries = snapshot
         .lifecycle_events
         .iter()
@@ -200,6 +204,47 @@ async fn dispatch_timing_measures_exec_spawn_from_request_acceptance() {
     assert!(exited_snapshot.exec_running_process_after_cleanup);
 }
 
+#[tokio::test(start_paused = true)]
+async fn confirmed_abort_cleanup_closes_retained_process_lifecycle_before_handler_return() {
+    let turn_timing = Arc::new(TurnTimingState::default());
+    turn_timing.mark_turn_started();
+    let timing = ToolDispatchTiming::new_with_turn_clock(
+        turn_timing,
+        tokio::time::Instant::now(),
+        /*eager*/ false,
+    );
+    timing.mark_first_poll();
+    timing.mark_parallel_gate_admitted();
+    timing.mark_handler_entry();
+    timing.mark_exec_process_spawned();
+
+    tokio::time::advance(std::time::Duration::from_millis(10)).await;
+    timing.mark_exec_process_exited();
+    timing.record_exec_cleanup_state(
+        /*background_process_expected*/ false, /*running_process_after_cleanup*/ false,
+    );
+    timing.mark_handler_exit_if_entered();
+
+    let snapshot = timing.snapshot(tokio::time::Instant::now());
+    assert!(snapshot.handler_duration_ms.is_some());
+    assert!(snapshot.exec_spawn_to_exit_ms.is_some());
+    assert!(!snapshot.exec_process_alive_at_delivery);
+    assert!(snapshot.exec_cleanup_state_observed);
+    assert!(!snapshot.exec_background_process_expected);
+    assert!(!snapshot.exec_running_process_after_cleanup);
+    let process_exit = snapshot
+        .lifecycle_events
+        .iter()
+        .position(|event| event.boundary == ToolLifecycleBoundary::ProcessExit)
+        .expect("process exit boundary");
+    let handler_return = snapshot
+        .lifecycle_events
+        .iter()
+        .position(|event| event.boundary == ToolLifecycleBoundary::HandlerReturn)
+        .expect("handler return boundary");
+    assert!(process_exit < handler_return);
+}
+
 #[test]
 fn relay_delivery_requires_enqueue_and_is_recorded_exactly_once() {
     let turn_timing = Arc::new(TurnTimingState::default());
@@ -258,6 +303,55 @@ impl ToolExecutor<ToolInvocation> for TestHandler {
 
 impl CoreToolRuntime for TestHandler {}
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_trace_recording_is_awaited_and_survives_waiter_cancellation() {
+    let terminal_tasks = tokio_util::task::TaskTracker::new();
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let completed_after_release = Arc::clone(&completed);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let tracked_tasks = terminal_tasks.clone();
+    let waiter = tokio::spawn(async move {
+        defer_trace_recording(&tracked_tasks, move || {
+            let _ = started_tx.send(());
+            release_rx
+                .recv()
+                .expect("the trace writer should be released");
+            completed_after_release.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .await;
+    });
+
+    started_rx
+        .await
+        .expect("the blocking trace writer should start");
+    assert!(
+        !waiter.is_finished(),
+        "dispatch completion must await its trace write"
+    );
+    waiter.abort();
+    assert!(
+        waiter
+            .await
+            .expect_err("the waiter should be cancelled")
+            .is_cancelled()
+    );
+    assert_eq!(
+        terminal_tasks.len(),
+        1,
+        "a cancelled waiter must leave the blocking trace write tracked for shutdown"
+    );
+
+    release_tx
+        .send(())
+        .expect("the blocked trace writer should still be tracked");
+    terminal_tasks.close();
+    tokio::time::timeout(std::time::Duration::from_secs(2), terminal_tasks.wait())
+        .await
+        .expect("shutdown should drain the tracked trace write");
+    assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+}
+
 #[tokio::test]
 async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
@@ -292,8 +386,8 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
     registry
         .dispatch_any_with_terminal_outcome(
             test_invocation(
-                session,
-                turn,
+                Arc::clone(&session),
+                Arc::clone(&turn),
                 "code-mode-call",
                 "test_tool",
                 ToolCallSource::CodeMode {
@@ -306,6 +400,10 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
             terminal_outcome_flag(),
         )
         .await?;
+    assert!(
+        session.terminal_tasks.is_empty(),
+        "completed dispatches must not leave trace writes pending"
+    );
 
     let replayed = codex_rollout_trace::replay_bundle(single_bundle_dir(temp.path())?)?;
     assert_eq!(
@@ -477,8 +575,10 @@ fn test_invocation(
     )
 }
 
-fn terminal_outcome_flag() -> Arc<std::sync::atomic::AtomicBool> {
-    Arc::new(std::sync::atomic::AtomicBool::new(false))
+fn terminal_outcome_flag() -> Arc<ToolDispatchState> {
+    let state = Arc::new(ToolDispatchState::new());
+    assert!(state.try_admit());
+    state
 }
 
 fn test_invocation_with_payload(

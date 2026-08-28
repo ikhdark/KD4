@@ -61,6 +61,9 @@
     "LegacyAppPathString": {
       "type": "string"
     },
+    "PathUri": {
+      "type": "string"
+    },
     "RequestPermissionProfile": {
       "additionalProperties": false,
       "properties": {
@@ -286,7 +289,20 @@
   },
   "properties": {
     "cwd": {
-      "$ref": "#/definitions/AbsolutePathBuf"
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      ],
+      "description": "Legacy native working directory. For foreign selected environments this is a compatibility fallback; `cwd_uri` is authoritative."
+    },
+    "cwdUri": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PathUri"
+        }
+      ],
+      "description": "URI-preserving working directory for the selected environment."
     },
     "environmentId": {
       "default": null,
@@ -321,6 +337,7 @@
   },
   "required": [
     "cwd",
+    "cwdUri",
     "itemId",
     "permissions",
     "startedAtMs",

@@ -83,10 +83,10 @@ async fn build_refresh_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extensions::ThreadExtensionDependencies;
-    use crate::extensions::guardian_agent_spawner;
     use crate::extensions::thread_extensions;
     use codex_arg0::Arg0DispatchPaths;
+    use codex_builtin_extensions::BuiltinExtensionDependencies;
+    use codex_builtin_extensions::GoalService;
     use codex_config::CloudConfigBundleLoader;
     use codex_config::LoaderOverrides;
     use codex_config::ThreadConfigContext;
@@ -219,12 +219,6 @@ mod tests {
             .expect("refresh tests require state db");
         let thread_store = thread_store_from_config(&good_config, Some(state_db.clone()));
         let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
-        let executor_skill_provider: Arc<dyn codex_skills_extension::SkillProvider> = Arc::new(
-            codex_skills_extension::ExecutorSkillProvider::new_with_restriction_product(
-                Arc::clone(&environment_manager),
-                SessionSource::Exec.restriction_product(),
-            ),
-        );
         let thread_manager = Arc::new_cyclic(|thread_manager| {
             ThreadManager::new(
                 &good_config,
@@ -232,17 +226,15 @@ mod tests {
                 SessionSource::Exec,
                 Arc::clone(&environment_manager),
                 thread_extensions(
-                    guardian_agent_spawner(thread_manager.clone()),
-                    ThreadExtensionDependencies {
-                        event_sink: Arc::new(NoopExtensionEventSink),
+                    Arc::new(NoopExtensionEventSink),
+                    BuiltinExtensionDependencies {
                         auth_manager: auth_manager.clone(),
                         state_db: Some(state_db.clone()),
-                        analytics_events_client: codex_analytics::AnalyticsEventsClient::disabled(),
+                        analytics_events_client: None,
                         thread_manager: thread_manager.clone(),
-                        goal_service: Arc::new(codex_goal_extension::GoalService::new()),
+                        goal_service: Arc::new(GoalService::new()),
                         environment_manager: Arc::clone(&environment_manager),
-                        executor_skill_provider: Arc::clone(&executor_skill_provider),
-                        thread_store: Arc::clone(&thread_store),
+                        session_source: SessionSource::Exec,
                     },
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(

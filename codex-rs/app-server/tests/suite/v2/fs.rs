@@ -23,7 +23,7 @@ use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::timeout;
 
-// macOS and Windows CI can spend tens of seconds starting app-server
+// Windows CI can spend tens of seconds starting app-server
 // subprocesses or processing test RPCs under load.
 
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);

@@ -24,6 +24,14 @@ use codex_app_server_protocol::CommandExecResponse;
 use codex_app_server_protocol::RequestId;
 use uuid::Uuid;
 
+// App-server owns the command deadline. Keep the client request alive long
+// enough for its bounded process termination and response delivery to finish.
+const COMMAND_RESPONSE_GRACE_PERIOD: Duration = Duration::from_secs(35);
+
+fn command_response_timeout(command_timeout: Duration) -> Duration {
+    command_timeout.saturating_add(COMMAND_RESPONSE_GRACE_PERIOD)
+}
+
 /// Shared handle for running workspace commands from TUI components.
 pub(crate) type WorkspaceCommandRunner = Arc<dyn WorkspaceCommandExecutor>;
 
@@ -181,6 +189,7 @@ impl WorkspaceCommandExecutor for AppServerWorkspaceCommandRunner {
     > {
         Box::pin(async move {
             let command_timeout = command.timeout;
+            let response_timeout = command_response_timeout(command_timeout);
             let timeout_ms = i64::try_from(command_timeout.as_millis()).unwrap_or(i64::MAX);
             let env = if command.env.is_empty() {
                 None
@@ -209,12 +218,13 @@ impl WorkspaceCommandExecutor for AppServerWorkspaceCommandRunner {
                         permission_profile: None,
                     },
                 });
-            let response: CommandExecResponse = tokio::time::timeout(command_timeout, request)
+            let response: CommandExecResponse = tokio::time::timeout(response_timeout, request)
                 .await
                 .map_err(|_| {
                     WorkspaceCommandError::new(format!(
-                        "workspace command request timed out after {}ms",
-                        command_timeout.as_millis()
+                        "workspace command response was not delivered within {}ms after its {}ms execution deadline",
+                        COMMAND_RESPONSE_GRACE_PERIOD.as_millis(),
+                        command_timeout.as_millis(),
                     ))
                 })?
                 .map_err(|err| WorkspaceCommandError::new(err.to_string()))?;
@@ -225,5 +235,21 @@ impl WorkspaceCommandExecutor for AppServerWorkspaceCommandRunner {
                 stderr: response.stderr,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_deadline_preserves_command_cleanup_grace() {
+        let command_timeout = Duration::from_secs(5);
+
+        assert_eq!(
+            command_response_timeout(command_timeout),
+            command_timeout + COMMAND_RESPONSE_GRACE_PERIOD
+        );
+        assert!(command_response_timeout(command_timeout) > command_timeout);
     }
 }

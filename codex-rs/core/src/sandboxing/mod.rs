@@ -46,6 +46,7 @@ pub(crate) struct ExecServerEnvConfig {
 #[derive(Debug)]
 pub struct ExecRequest {
     pub command: Vec<String>,
+    pub codex_home: AbsolutePathBuf,
     pub cwd: PathUri,
     pub env: HashMap<String, String>,
     pub(crate) exec_server_env_config: Option<ExecServerEnvConfig>,
@@ -72,6 +73,7 @@ impl ExecRequest {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         command: Vec<String>,
+        codex_home: AbsolutePathBuf,
         cwd: AbsolutePathBuf,
         env: HashMap<String, String>,
         network: Option<NetworkProxy>,
@@ -91,6 +93,7 @@ impl ExecRequest {
             permission_profile.to_runtime_permissions();
         Self {
             command,
+            codex_home,
             cwd,
             env,
             exec_server_env_config: None,
@@ -118,6 +121,7 @@ impl ExecRequest {
         request: SandboxExecRequest,
         options: ExecOptions,
         windows_sandbox_workspace_roots: Vec<AbsolutePathBuf>,
+        codex_home: AbsolutePathBuf,
     ) -> codex_protocol::error::Result<Self> {
         let SandboxExecRequest {
             command,
@@ -146,6 +150,7 @@ impl ExecRequest {
         }
         let mut request = Self {
             command,
+            codex_home,
             cwd,
             env,
             exec_server_env_config: None,

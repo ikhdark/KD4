@@ -23,10 +23,10 @@ use codex_extension_api::TurnInputContext;
 use codex_extension_api::WorldStateContributionInput;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG;
+use codex_protocol::protocol::EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
-use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillScope;
 use codex_protocol::protocol::TruncationPolicy;
@@ -99,7 +99,7 @@ async fn installed_extension_uses_host_service_snapshot() -> TestResult {
         dependencies: None,
         policy: None,
         path_to_skills_md: skill_path,
-        scope: SkillScope::User,
+        scope: SkillScope::Admin,
         plugin_id: None,
     });
     let loaded_skills = Arc::new(outcome);
@@ -125,13 +125,16 @@ async fn installed_extension_uses_host_service_snapshot() -> TestResult {
         .await;
 
     let expected_catalog = format!(
-        "{SKILLS_INSTRUCTIONS_OPEN_TAG}\n## Skills\n{SKILLS_INTRO_WITH_ABSOLUTE_PATHS}\n### Available skills\n- demo: Demo skill. (file: {skill_prompt_path})\n{SKILLS_INSTRUCTIONS_CLOSE_TAG}"
+        "{EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG}\n## Skills\n{SKILLS_INTRO_WITH_ABSOLUTE_PATHS}\n### Available skills\n- demo: Demo skill. (file: {skill_prompt_path})\n{EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG}"
     );
     let expected_skill = format!(
-        "<skill>\n<name>demo</name>\n<path>{skill_prompt_path}</path>\n{DEMO_SKILL_CONTENTS}\n</skill>"
+        "<skill>\n<name>demo</name>\n<path>{skill_prompt_path}</path>\n<scope>admin</scope>\n{DEMO_SKILL_CONTENTS}\n</skill>"
     );
     assert_eq!(
-        vec![("developer", expected_catalog), ("user", expected_skill),],
+        vec![
+            ("developer", expected_catalog),
+            ("developer", expected_skill),
+        ],
         fragments
             .iter()
             .map(|fragment| (fragment.role(), fragment.render()))
@@ -168,6 +171,11 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
     let mut builder = ExtensionRegistryBuilder::new();
     install_with_providers(&mut builder, providers, skills_extension_config);
     let registry = builder.build();
+    assert_eq!(
+        &["skills"],
+        registry.context_contributors()[0].world_state_section_ids(),
+        "the host must know which snapshot to preserve if skills discovery times out"
+    );
 
     let session_store = ExtensionData::new("session");
     let thread_store = ExtensionData::new("thread");

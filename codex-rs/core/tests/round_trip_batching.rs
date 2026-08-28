@@ -326,6 +326,108 @@ async fn post_edit_batches_validation_and_git_into_three_model_requests() -> any
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identical_parallel_tool_calls_reach_immediate_continuation() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("parallel"),
+                ev_function_call("parallel-1", "test_sync_tool", EDIT_ARGS),
+                ev_function_call("parallel-2", "test_sync_tool", EDIT_ARGS),
+                ev_function_call("parallel-3", "test_sync_tool", EDIT_ARGS),
+                ev_completed("parallel"),
+            ]),
+            sse(vec![
+                ev_assistant_message("done", "done"),
+                ev_completed("complete"),
+            ]),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            let _ = config.features.disable(Feature::TaskCompletionReviewer);
+        })
+        .build(&server)
+        .await?;
+
+    let completion = test
+        .submit_turn_and_capture_completion("run the three independent checks")
+        .await?;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    let timing = completion.timing.expect("turn timing");
+    assert_timing_reconciles(&timing);
+    assert_eq!(timing.counters.logical_generation_count, 2);
+    assert_eq!(timing.counters.model_request_count, 2);
+    assert_eq!(timing.counters.tool_call_count, 3);
+    assert_eq!(
+        timing
+            .model_requests
+            .iter()
+            .map(|request| request.tool_call_count)
+            .collect::<Vec<_>>(),
+        [3, 0]
+    );
+
+    let continuation = &requests[1];
+    assert_eq!(
+        function_call_output_ids(&continuation.input()),
+        ["parallel-1", "parallel-2", "parallel-3"]
+    );
+    assert_eq!(
+        [
+            continuation.function_call_output_text("parallel-1"),
+            continuation.function_call_output_text("parallel-2"),
+            continuation.function_call_output_text("parallel-3"),
+        ],
+        [
+            Some("ok".to_string()),
+            Some("ok".to_string()),
+            Some("ok".to_string()),
+        ]
+    );
+    let calls = continuation
+        .inputs_of_type("function_call")
+        .into_iter()
+        .map(|item| {
+            (
+                item["call_id"].as_str().expect("call id").to_string(),
+                item["name"].as_str().expect("tool name").to_string(),
+                item["arguments"].as_str().expect("arguments").to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls,
+        vec![
+            (
+                "parallel-1".to_string(),
+                "test_sync_tool".to_string(),
+                EDIT_ARGS.to_string(),
+            ),
+            (
+                "parallel-2".to_string(),
+                "test_sync_tool".to_string(),
+                EDIT_ARGS.to_string(),
+            ),
+            (
+                "parallel-3".to_string(),
+                "test_sync_tool".to_string(),
+                EDIT_ARGS.to_string(),
+            ),
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 

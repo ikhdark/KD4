@@ -117,6 +117,15 @@ pub trait ContextContributor: Send + Sync {
         })
     }
 
+    /// Stable World State section IDs owned by this contributor.
+    ///
+    /// The list must include every section the contributor may return. The host uses it to retain
+    /// the last accepted snapshots when a contribution attempt times out, while a successful empty
+    /// contribution remains an authoritative removal.
+    fn world_state_section_ids(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Read-only preview used by pre-turn context accounting. Implementations that mutate the
     /// turn store in `contribute_world_state` must override this method.
     fn estimate_world_state<'a>(
@@ -315,7 +324,8 @@ pub trait ToolLifecycleContributor: Send + Sync {
     }
 }
 
-/// Extension contribution that can claim rendered approval-review prompts.
+/// Extension contribution that can claim rendered approval-review prompts before the host's
+/// Guardian fallback runs.
 pub trait ApprovalReviewContributor: Send + Sync {
     fn contribute<'a>(
         &'a self,

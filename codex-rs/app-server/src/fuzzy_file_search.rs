@@ -11,6 +11,9 @@ use codex_app_server_protocol::FuzzyFileSearchSessionCompletedNotification;
 use codex_app_server_protocol::FuzzyFileSearchSessionUpdatedNotification;
 use codex_app_server_protocol::ServerNotification;
 use codex_file_search as file_search;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::outgoing_message::OutgoingMessageSender;
@@ -93,6 +96,7 @@ pub(crate) async fn run_fuzzy_file_search(
 pub(crate) struct FuzzyFileSearchSession {
     session: file_search::FileSearchSession,
     shared: Arc<SessionShared>,
+    delivery_relay: DeliveryRelay,
 }
 
 impl FuzzyFileSearchSession {
@@ -112,6 +116,7 @@ impl FuzzyFileSearchSession {
 impl Drop for FuzzyFileSearchSession {
     fn drop(&mut self) {
         self.shared.canceled.store(true, Ordering::Relaxed);
+        self.delivery_relay.cancel();
     }
 }
 
@@ -135,7 +140,9 @@ pub(crate) fn start_fuzzy_file_search_session(
         session_id,
         latest_query: Mutex::new(String::new()),
         outgoing,
-        runtime: tokio::runtime::Handle::current(),
+        pending_deliveries: Mutex::new(PendingDeliveries::default()),
+        delivery_ready: Notify::new(),
+        delivery_cancellation: CancellationToken::new(),
         canceled: canceled.clone(),
     });
 
@@ -153,16 +160,130 @@ pub(crate) fn start_fuzzy_file_search_session(
         reporter,
         Some(canceled),
     )?;
+    let delivery_relay = DeliveryRelay::start(shared.clone());
 
-    Ok(FuzzyFileSearchSession { session, shared })
+    Ok(FuzzyFileSearchSession {
+        session,
+        shared,
+        delivery_relay,
+    })
 }
 
 struct SessionShared {
     session_id: String,
     latest_query: Mutex<String>,
     outgoing: Arc<OutgoingMessageSender>,
-    runtime: tokio::runtime::Handle,
+    pending_deliveries: Mutex<PendingDeliveries>,
+    delivery_ready: Notify,
+    delivery_cancellation: CancellationToken,
     canceled: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy)]
+enum DeliveryKind {
+    Update,
+    Completion,
+}
+
+struct QueuedDelivery {
+    query: String,
+    notification: ServerNotification,
+}
+
+#[derive(Default)]
+struct PendingDeliveries {
+    update: Option<QueuedDelivery>,
+    completion: Option<QueuedDelivery>,
+}
+
+impl PendingDeliveries {
+    fn enqueue(&mut self, kind: DeliveryKind, delivery: QueuedDelivery) {
+        match kind {
+            DeliveryKind::Update => self.update = Some(delivery),
+            DeliveryKind::Completion => self.completion = Some(delivery),
+        }
+    }
+
+    fn take_next(&mut self) -> Option<QueuedDelivery> {
+        self.update.take().or_else(|| self.completion.take())
+    }
+}
+
+impl SessionShared {
+    fn enqueue_delivery(
+        &self,
+        kind: DeliveryKind,
+        query: String,
+        notification: ServerNotification,
+    ) {
+        if self.canceled.load(Ordering::Relaxed) {
+            return;
+        }
+        #[expect(clippy::unwrap_used)]
+        self.pending_deliveries.lock().unwrap().enqueue(
+            kind,
+            QueuedDelivery {
+                query,
+                notification,
+            },
+        );
+        self.delivery_ready.notify_one();
+    }
+
+    fn query_is_current(&self, query: &str) -> bool {
+        #[expect(clippy::unwrap_used)]
+        let latest_query = self.latest_query.lock().unwrap();
+        query == latest_query.as_str()
+    }
+}
+
+struct DeliveryRelay {
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl DeliveryRelay {
+    fn start(shared: Arc<SessionShared>) -> Self {
+        let cancellation = shared.delivery_cancellation.clone();
+        let task = tokio::spawn(run_delivery_relay(shared));
+        Self { cancellation, task }
+    }
+
+    fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+}
+
+impl Drop for DeliveryRelay {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.task.abort();
+    }
+}
+
+async fn run_delivery_relay(shared: Arc<SessionShared>) {
+    loop {
+        let notified = shared.delivery_ready.notified();
+        let delivery = {
+            #[expect(clippy::unwrap_used)]
+            shared.pending_deliveries.lock().unwrap().take_next()
+        };
+        let Some(delivery) = delivery else {
+            tokio::select! {
+                biased;
+                _ = shared.delivery_cancellation.cancelled() => return,
+                _ = notified => continue,
+            }
+        };
+        if shared.canceled.load(Ordering::Relaxed) || !shared.query_is_current(&delivery.query) {
+            continue;
+        }
+        tokio::select! {
+            biased;
+            _ = shared.delivery_cancellation.cancelled() => return,
+            _ = shared.outgoing.send_server_notification(delivery.notification) => {}
+        }
+    }
 }
 
 struct SessionReporterImpl {
@@ -192,14 +313,12 @@ impl SessionReporterImpl {
         let notification = ServerNotification::FuzzyFileSearchSessionUpdated(
             FuzzyFileSearchSessionUpdatedNotification {
                 session_id: self.shared.session_id.clone(),
-                query,
+                query: query.clone(),
                 files,
             },
         );
-        let outgoing = self.shared.outgoing.clone();
-        self.shared.runtime.spawn(async move {
-            outgoing.send_server_notification(notification).await;
-        });
+        self.shared
+            .enqueue_delivery(DeliveryKind::Update, query, notification);
     }
 
     fn send_complete(&self, query: &str) {
@@ -213,15 +332,15 @@ impl SessionReporterImpl {
                 return;
             }
         }
-        let session_id = self.shared.session_id.clone();
         let query = query.to_string();
-        let outgoing = self.shared.outgoing.clone();
-        self.shared.runtime.spawn(async move {
-            let notification = ServerNotification::FuzzyFileSearchSessionCompleted(
-                FuzzyFileSearchSessionCompletedNotification { session_id, query },
-            );
-            outgoing.send_server_notification(notification).await;
-        });
+        let notification = ServerNotification::FuzzyFileSearchSessionCompleted(
+            FuzzyFileSearchSessionCompletedNotification {
+                session_id: self.shared.session_id.clone(),
+                query: query.clone(),
+            },
+        );
+        self.shared
+            .enqueue_delivery(DeliveryKind::Completion, query, notification);
     }
 }
 
@@ -261,4 +380,79 @@ fn collect_files(snapshot: &file_search::FileSearchSnapshot) -> Vec<FuzzyFileSea
         _,
     >(|f| f.score, |f| f.path.as_str()));
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    use crate::outgoing_message::OutgoingMessageSender;
+
+    fn completion_notification(query: &str) -> ServerNotification {
+        ServerNotification::FuzzyFileSearchSessionCompleted(
+            FuzzyFileSearchSessionCompletedNotification {
+                session_id: "session".to_string(),
+                query: query.to_string(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn delivery_relay_bounds_pending_work_and_cancels_a_saturated_send() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        assert!(outgoing.try_send_server_notification(completion_notification("blocker")));
+
+        let shared = Arc::new(SessionShared {
+            session_id: "session".to_string(),
+            latest_query: Mutex::new("query".to_string()),
+            outgoing,
+            pending_deliveries: Mutex::new(PendingDeliveries::default()),
+            delivery_ready: Notify::new(),
+            delivery_cancellation: CancellationToken::new(),
+            canceled: Arc::new(AtomicBool::new(false)),
+        });
+        for _ in 0..32 {
+            shared.enqueue_delivery(
+                DeliveryKind::Update,
+                "query".to_string(),
+                completion_notification("query"),
+            );
+        }
+        shared.enqueue_delivery(
+            DeliveryKind::Completion,
+            "query".to_string(),
+            completion_notification("query"),
+        );
+        {
+            let pending = shared.pending_deliveries.lock().unwrap();
+            assert!(pending.update.is_some());
+            assert!(pending.completion.is_some());
+        }
+
+        let relay = DeliveryRelay::start(shared.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let update_pending = shared.pending_deliveries.lock().unwrap().update.is_some();
+                if !update_pending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("relay should begin the saturated send");
+
+        drop(relay);
+        rx.recv().await.expect("blocking envelope");
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
 }

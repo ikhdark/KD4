@@ -75,6 +75,8 @@ pub fn canonicalize_chatgpt_base_url(value: &str) -> String {
     };
 
     let path = url.path().trim_end_matches('/');
+    let is_backend_client_chatgpt_host =
+        matches!(url.host_str(), Some("chatgpt.com" | "chat.openai.com"));
     let is_known_chatgpt_alias = url.scheme() == "https"
         && url.username().is_empty()
         && url.password().is_none()
@@ -93,7 +95,18 @@ pub fn canonicalize_chatgpt_base_url(value: &str) -> String {
         url.set_path(&path);
     }
 
-    url.to_string().trim_end_matches('/').to_string()
+    let mut canonical = url.to_string().trim_end_matches('/').to_string();
+    if !is_backend_client_chatgpt_host
+        && (canonical.starts_with("https://chatgpt.com")
+            || canonical.starts_with("https://chat.openai.com"))
+    {
+        // backend-client is an exact upstream mirror and currently recognizes the official
+        // ChatGPT origins with a case-sensitive string prefix. Preserve a custom host's URL
+        // semantics while ensuring a suffix such as `.example` cannot be mistaken for an
+        // official origin and rewritten to `/backend-api` inside that protected crate.
+        canonical.replace_range("https://".len().."https://".len() + 1, "C");
+    }
+    canonical
 }
 
 /// Per-logical-request reasoning effort overrides. Omitted fields retain the
@@ -311,6 +324,10 @@ pub struct ConfigToml {
 
     /// Whether to inject the `<environment_context>` user block.
     pub include_environment_context: Option<bool>,
+
+    /// Explicitly enables or disables the KD4 repository workflow. When unset,
+    /// Codex continues to detect KD4 repositories from their marker file.
+    pub kd4_workflow_enabled: Option<bool>,
 
     /// Optional path to a file containing model instructions that will override
     /// the built-in instructions for the selected model. Users are STRONGLY
@@ -703,6 +720,10 @@ pub struct AgentRoleToml {
     pub nickname_candidates: Option<Vec<String>>,
 }
 
+fn is_unsandboxed_windows(windows_sandbox_level: WindowsSandboxLevel, is_windows: bool) -> bool {
+    is_windows && windows_sandbox_level == WindowsSandboxLevel::Disabled
+}
+
 impl ConfigToml {
     /// Derive the effective permission profile from legacy sandbox config.
     ///
@@ -716,6 +737,7 @@ impl ConfigToml {
         active_project: Option<&ProjectConfig>,
         permission_profile_constraint: Option<&crate::Constrained<PermissionProfile>>,
     ) -> PermissionProfile {
+        let is_unsandboxed_windows = is_unsandboxed_windows(windows_sandbox_level, cfg!(windows));
         let configured_sandbox_mode = sandbox_mode_override.or(self.sandbox_mode);
         let resolved_sandbox_mode = configured_sandbox_mode
             .or_else(|| {
@@ -725,7 +747,7 @@ impl ConfigToml {
                 active_project
                     .filter(|project| project.is_trusted() || project.is_untrusted())
                     .map(|_| {
-                        if windows_sandbox_level == WindowsSandboxLevel::Disabled {
+                        if is_unsandboxed_windows {
                             SandboxMode::ReadOnly
                         } else {
                             SandboxMode::WorkspaceWrite
@@ -733,7 +755,7 @@ impl ConfigToml {
                     })
             })
             .unwrap_or_default();
-        let effective_sandbox_mode = if windows_sandbox_level == WindowsSandboxLevel::Disabled
+        let effective_sandbox_mode = if is_unsandboxed_windows
             // If the experimental Windows sandbox is enabled, do not force a downgrade.
             && matches!(resolved_sandbox_mode, SandboxMode::WorkspaceWrite)
         {
@@ -942,6 +964,22 @@ mod tests {
     const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
 
     #[test]
+    fn disabled_windows_sandbox_only_downgrades_on_windows() {
+        assert!(is_unsandboxed_windows(
+            WindowsSandboxLevel::Disabled,
+            /*is_windows*/ true
+        ));
+        assert!(!is_unsandboxed_windows(
+            WindowsSandboxLevel::Disabled,
+            /*is_windows*/ false
+        ));
+        assert!(!is_unsandboxed_windows(
+            WindowsSandboxLevel::RestrictedToken,
+            /*is_windows*/ true
+        ));
+    }
+
+    #[test]
     fn project_lookup_precomputes_deterministic_normalized_fallbacks() {
         let lookup = ProjectLookup::new(HashMap::from([
             ("C:\\Repo".to_string(), "mixed"),
@@ -988,6 +1026,30 @@ mod tests {
             "http://localhost:8080/custom"
         );
         assert_eq!(canonicalize_chatgpt_base_url("mock-base///"), "mock-base");
+
+        for (configured, expected) in [
+            (
+                "https://chatgpt.com.example/custom/",
+                "https://Chatgpt.com.example/custom",
+            ),
+            (
+                "https://chat.openai.com.example/custom/",
+                "https://Chat.openai.com.example/custom",
+            ),
+        ] {
+            let canonical = canonicalize_chatgpt_base_url(configured);
+            assert_eq!(canonical, expected);
+            assert_eq!(
+                url::Url::parse(&canonical)
+                    .expect("canonical custom URL")
+                    .host_str(),
+                url::Url::parse(configured)
+                    .expect("configured custom URL")
+                    .host_str()
+            );
+            assert!(!canonical.starts_with("https://chatgpt.com"));
+            assert!(!canonical.starts_with("https://chat.openai.com"));
+        }
     }
 
     #[test]

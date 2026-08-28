@@ -9,6 +9,10 @@ use app_test_support::to_response;
 use app_test_support::write_mock_responses_config_toml;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadForkParams;
+use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -60,11 +64,20 @@ async fn thread_start_reports_selected_environment_metadata() -> Result<()> {
     )
     .await??;
     let ThreadStartResponse {
+        thread,
         cwd,
         runtime_workspace_roots,
         active_permission_profile,
+        selected_environment,
         ..
     } = to_response(response)?;
+    let expected_selection = app_server.auto_env()?.selection().clone();
+    let selected_environment = selected_environment.context("selected environment metadata")?;
+    assert_eq!(
+        selected_environment.environment_id,
+        expected_selection.environment_id
+    );
+    assert_eq!(selected_environment.cwd, expected_selection.cwd);
     let host_cwd = codex_home.path().to_path_buf().abs().canonicalize()?;
     let cwd = cwd.canonicalize()?;
     let runtime_workspace_roots = runtime_workspace_roots
@@ -82,6 +95,37 @@ async fn thread_start_reports_selected_environment_metadata() -> Result<()> {
             None,
         )
     );
+
+    let resume_id = app_server
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let resumed: ThreadResumeResponse = to_response(resume_response)?;
+    assert_eq!(
+        resumed.selected_environment,
+        Some(selected_environment.clone())
+    );
+
+    let fork_id = app_server
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: thread.id,
+            ..Default::default()
+        })
+        .await?;
+    let fork_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    let forked: ThreadForkResponse = to_response(fork_response)?;
+    assert_eq!(forked.selected_environment, Some(selected_environment));
 
     Ok(())
 }

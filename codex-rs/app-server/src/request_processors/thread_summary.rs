@@ -192,6 +192,7 @@ pub(crate) fn thread_settings_from_config_snapshot(
             &config_snapshot.permission_profile,
             config_snapshot.cwd().as_path(),
         ),
+        permission_profile: Some(config_snapshot.permission_profile.clone()),
         active_permission_profile: thread_response_active_permission_profile(
             config_snapshot.active_permission_profile.clone(),
         ),
@@ -226,6 +227,7 @@ pub(crate) fn thread_settings_from_core_snapshot(
     let sandbox_policy = thread_response_sandbox_policy(&permission_profile, cwd.as_path());
     ThreadSettings {
         sandbox_policy,
+        permission_profile: Some(permission_profile),
         cwd,
         approval_policy: approval_policy.into(),
         approvals_reviewer: approvals_reviewer.into(),

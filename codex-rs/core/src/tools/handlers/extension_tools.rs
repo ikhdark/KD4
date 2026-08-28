@@ -165,7 +165,7 @@ async fn to_extension_call(
         };
         let additional_permissions = apply_granted_turn_permissions(
             invocation.session.as_ref(),
-            &environment.environment_id,
+            environment.environment.approval_scope_id(),
             native_cwd.as_path(),
             SandboxPermissions::UseDefault,
             /*additional_permissions*/ None,

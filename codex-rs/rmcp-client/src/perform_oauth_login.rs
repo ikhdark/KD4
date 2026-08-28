@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
 use std::string::String;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,6 +84,7 @@ impl std::error::Error for OAuthProviderError {}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn perform_oauth_login(
+    codex_home: &Path,
     server_name: &str,
     server_url: &str,
     store_mode: OAuthCredentialsStoreMode,
@@ -95,6 +98,7 @@ pub async fn perform_oauth_login(
     callback_url: Option<&str>,
 ) -> Result<()> {
     perform_oauth_login_with_browser_output(
+        codex_home,
         server_name,
         server_url,
         store_mode,
@@ -113,6 +117,7 @@ pub async fn perform_oauth_login(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn perform_oauth_login_silent(
+    codex_home: &Path,
     server_name: &str,
     server_url: &str,
     store_mode: OAuthCredentialsStoreMode,
@@ -126,6 +131,7 @@ pub async fn perform_oauth_login_silent(
     callback_url: Option<&str>,
 ) -> Result<()> {
     perform_oauth_login_with_browser_output(
+        codex_home,
         server_name,
         server_url,
         store_mode,
@@ -144,6 +150,7 @@ pub async fn perform_oauth_login_silent(
 
 #[allow(clippy::too_many_arguments)]
 async fn perform_oauth_login_with_browser_output(
+    codex_home: &Path,
     server_name: &str,
     server_url: &str,
     store_mode: OAuthCredentialsStoreMode,
@@ -163,6 +170,7 @@ async fn perform_oauth_login_with_browser_output(
         http_client: Arc::new(ReqwestHttpClient),
     };
     OauthLoginFlow::new(
+        codex_home,
         server_name,
         server_url,
         store_mode,
@@ -183,6 +191,7 @@ async fn perform_oauth_login_with_browser_output(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn perform_oauth_login_return_url(
+    codex_home: &Path,
     server_name: &str,
     server_url: &str,
     store_mode: OAuthCredentialsStoreMode,
@@ -197,6 +206,7 @@ pub async fn perform_oauth_login_return_url(
     callback_url: Option<&str>,
 ) -> Result<OauthLoginHandle> {
     perform_oauth_login_return_url_with_http_client(
+        codex_home,
         server_name,
         server_url,
         store_mode,
@@ -216,6 +226,7 @@ pub async fn perform_oauth_login_return_url(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn perform_oauth_login_return_url_with_http_client(
+    codex_home: &Path,
     server_name: &str,
     server_url: &str,
     store_mode: OAuthCredentialsStoreMode,
@@ -236,6 +247,7 @@ pub async fn perform_oauth_login_return_url_with_http_client(
         http_client,
     };
     let flow = OauthLoginFlow::new(
+        codex_home,
         server_name,
         server_url,
         store_mode,
@@ -409,6 +421,7 @@ struct OauthLoginFlow {
     oauth_state: OAuthState,
     rx: oneshot::Receiver<CallbackResult>,
     guard: CallbackServerGuard,
+    codex_home: PathBuf,
     server_name: String,
     server_url: String,
     store_mode: OAuthCredentialsStoreMode,
@@ -503,6 +516,7 @@ fn callback_bind_host(callback_url: Option<&str>) -> &'static str {
 impl OauthLoginFlow {
     #[allow(clippy::too_many_arguments)]
     async fn new(
+        codex_home: &Path,
         server_name: &str,
         server_url: &str,
         store_mode: OAuthCredentialsStoreMode,
@@ -579,6 +593,7 @@ impl OauthLoginFlow {
             oauth_state,
             rx,
             guard,
+            codex_home: codex_home.to_path_buf(),
             server_name: server_name.to_string(),
             server_url: server_url.to_string(),
             store_mode,
@@ -651,6 +666,7 @@ impl OauthLoginFlow {
                 expires_at,
             };
             save_oauth_tokens(
+                &self.codex_home,
                 &self.server_name,
                 &stored,
                 self.store_mode,

@@ -196,14 +196,14 @@ enum CliCommand {
     },
     /// Resume a V2 thread and continuously stream notifications/events.
     ///
-    /// This command does not auto-exit; stop it with SIGINT/SIGTERM/SIGKILL.
+    /// This command does not auto-exit; stop it with Ctrl+C or terminate the process.
     ThreadResume {
         /// Existing thread id to resume.
         thread_id: String,
     },
     /// Initialize the app-server and dump all inbound messages until interrupted.
     ///
-    /// This command does not auto-exit; stop it with SIGINT/SIGTERM/SIGKILL.
+    /// This command does not auto-exit; stop it with Ctrl+C or terminate the process.
     Watch,
     /// Start a V2 turn that elicits an ExecCommand approval.
     #[command(name = "trigger-cmd-approval")]

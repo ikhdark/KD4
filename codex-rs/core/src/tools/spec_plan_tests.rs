@@ -10,7 +10,11 @@ use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
@@ -104,11 +108,13 @@ struct ToolPlanProbe {
     exposures: BTreeMap<String, ToolExposure>,
     authorization_classes: BTreeMap<String, TypedToolClass>,
     external_mutation_intents: BTreeMap<String, ExternalMutationIntent>,
+    tool_search_texts: Vec<String>,
+    tool_search_namespace_descriptions: BTreeMap<String, String>,
     warnings: Vec<String>,
 }
 
 impl ToolPlanProbe {
-    fn from_router(router: ToolRouter) -> Self {
+    fn from_router(router: ToolRouter, tool_search_cache: &ToolSearchHandlerCache) -> Self {
         let visible_specs = router.model_visible_specs();
         let warnings = router.planning_warnings().to_vec();
         let visible_names = visible_specs
@@ -163,6 +169,20 @@ impl ToolPlanProbe {
                     .map(|intent| (name.to_string(), intent))
             })
             .collect::<BTreeMap<_, _>>();
+        let search_infos = tool_search_cache.search_infos_for_test();
+        let tool_search_texts = search_infos
+            .iter()
+            .map(|info| info.entry.search_text.clone())
+            .collect();
+        let tool_search_namespace_descriptions = search_infos
+            .into_iter()
+            .filter_map(|info| match info.entry.output {
+                codex_tools::LoadableToolSpec::Namespace(namespace) => {
+                    Some((namespace.name, namespace.description))
+                }
+                codex_tools::LoadableToolSpec::Function(_) => None,
+            })
+            .collect();
 
         Self {
             visible_specs,
@@ -172,6 +192,8 @@ impl ToolPlanProbe {
             exposures,
             authorization_classes,
             external_mutation_intents,
+            tool_search_texts,
+            tool_search_namespace_descriptions,
             warnings,
         }
     }
@@ -269,6 +291,7 @@ async fn probe_with(
     configure_turn(&mut turn);
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
+    let tool_search_cache = ToolSearchHandlerCache::default();
     let router = ToolRouter::from_context(
         step_context.as_ref(),
         ToolRouterParams {
@@ -279,9 +302,9 @@ async fn probe_with(
             dynamic_tools: inputs.dynamic_tools.as_slice(),
             exposure_identity: inputs.exposure_identity,
         },
-        &Default::default(),
+        &tool_search_cache,
     );
-    ToolPlanProbe::from_router(router)
+    ToolPlanProbe::from_router(router, &tool_search_cache)
 }
 
 async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
@@ -342,7 +365,7 @@ async fn production_tool_registrations_have_explicit_authorization_classes() {
 }
 
 #[tokio::test]
-async fn read_turn_timing_is_registered_only_for_kd4_repositories() {
+async fn confirmed_performance_tool_plan_reuses_turn_kd4_classification() {
     let temp = tempdir().expect("create temp directory");
     let ordinary_cwd = temp.path().join("ordinary");
     let kd4_cwd = temp.path().join("kd4");
@@ -355,6 +378,7 @@ async fn read_turn_timing_is_registered_only_for_kd4_repositories() {
         .expect("ordinary fixture path should be absolute");
     let ordinary_plan = probe(move |turn| {
         update_config(turn, |config| config.cwd = ordinary_cwd);
+        turn.kd4_workflow_enabled = false;
     })
     .await;
     ordinary_plan.assert_visible_lacks(&["read_turn_timing"]);
@@ -364,6 +388,9 @@ async fn read_turn_timing_is_registered_only_for_kd4_repositories() {
         .expect("KD4 fixture path should be absolute");
     let kd4_plan = probe(move |turn| {
         update_config(turn, |config| config.cwd = kd4_cwd);
+        turn.kd4_workflow_enabled = true;
+        std::fs::remove_file(turn.cwd().join("kd4_features.toml"))
+            .expect("remove marker after turn classification");
     })
     .await;
     kd4_plan.assert_visible_contains(&["read_turn_timing"]);
@@ -459,7 +486,9 @@ impl ToolExecutor<ExtensionToolCall> for TestNamespaceExtensionTool {
     }
 }
 
-struct DeferredExtensionTool;
+struct DeferredExtensionTool {
+    description: &'static str,
+}
 
 impl ToolExecutor<ExtensionToolCall> for DeferredExtensionTool {
     fn tool_name(&self) -> ToolName {
@@ -469,7 +498,7 @@ impl ToolExecutor<ExtensionToolCall> for DeferredExtensionTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function(ResponsesApiTool {
             name: "extension_echo".to_string(),
-            description: "Echoes arguments through an extension tool.".to_string(),
+            description: self.description.to_string(),
             strict: true,
             defer_loading: None,
             parameters: codex_tools::JsonSchema::object(
@@ -587,6 +616,27 @@ fn duplicate_primary_environment(turn: &mut TurnContext) {
     turn.environments.turn_environments.push(second_environment);
 }
 
+fn set_foreign_primary_environment(turn: &mut TurnContext) {
+    let remote_environment = Arc::new(
+        codex_exec_server::Environment::create_for_tests(Some(
+            "ws://127.0.0.1:1/foreign-primary".to_string(),
+        ))
+        .expect("remote test environment"),
+    );
+    let foreign_cwd = if cfg!(windows) {
+        PathUri::parse("file:///tmp/codex-foreign-primary").expect("POSIX cwd URI")
+    } else {
+        PathUri::parse("file:///C:/codex-foreign-primary").expect("Windows cwd URI")
+    };
+    let shell = turn.environments.turn_environments[0].shell.clone();
+    turn.environments.turn_environments[0] = crate::session::turn_context::TurnEnvironment::new(
+        "remote-primary".to_string(),
+        remote_environment,
+        foreign_cwd,
+        shell,
+    );
+}
+
 fn mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo {
     ToolInfo {
         server_name: server.to_string(),
@@ -608,6 +658,35 @@ fn mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo {
         connector_name: None,
         plugin_display_names: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn direct_and_discovered_namespaces_share_the_budgeted_description() {
+    let long_description = "namespace context ".repeat(4_000);
+    let mut direct = mcp_tool("shared", "mcp__shared", "direct_lookup");
+    direct.namespace_description = Some(long_description.clone());
+    let mut deferred = mcp_tool("shared", "mcp__shared", "deferred_lookup");
+    deferred.namespace_description = Some(long_description.clone());
+
+    let plan = probe_with(
+        |turn| turn.model_info.supports_search_tool = true,
+        ToolPlanInputs {
+            mcp_tools: Some(vec![direct]),
+            deferred_mcp_tools: Some(vec![deferred]),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let ToolSpec::Namespace(visible) = plan.visible_spec("mcp__shared") else {
+        panic!("expected direct namespace");
+    };
+    let discovered = plan
+        .tool_search_namespace_descriptions
+        .get("mcp__shared")
+        .expect("deferred namespace description");
+    assert_eq!(&visible.description, discovered);
+    assert!(visible.description.len() < long_description.len());
 }
 
 fn invalid_mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo {
@@ -735,6 +814,52 @@ async fn wait_is_always_registered_when_code_mode_is_enabled() {
 }
 
 #[tokio::test]
+async fn code_mode_identifier_collision_fails_during_router_planning() {
+    let (_session, mut turn) = make_session_and_context().await;
+    set_feature(&mut turn, Feature::CodeMode, /*enabled*/ true);
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let tool_search_cache = ToolSearchHandlerCache::default();
+    let function = |name: &str| DynamicToolFunctionSpec {
+        name: name.to_string(),
+        description: format!("{name} dynamic tool"),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        }),
+        defer_loading: false,
+    };
+    let dynamic_tools = vec![
+        DynamicToolSpec::Function(function("acme__lookup")),
+        DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+            name: "acme".to_string(),
+            description: "Acme tools".to_string(),
+            tools: vec![DynamicToolNamespaceTool::Function(function("lookup"))],
+        }),
+    ];
+
+    let error = ToolRouter::try_from_context(
+        step_context.as_ref(),
+        ToolRouterParams {
+            mcp_tools: None,
+            deferred_mcp_tools: None,
+            tool_suggest_candidates: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: dynamic_tools.as_slice(),
+            exposure_identity: ToolExposureIdentity::default(),
+        },
+        &tool_search_cache,
+    )
+    .err()
+    .expect("colliding code-mode globals must fail before advertising the router");
+
+    assert!(error.contains("code mode tool identifier collision"));
+    assert!(error.contains("`acme__lookup`"));
+    assert!(error.contains("`acme.lookup`"));
+}
+
+#[tokio::test]
 async fn request_user_input_stays_direct_in_code_mode_only() {
     let plan = probe(|turn| {
         set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
@@ -757,6 +882,32 @@ async fn request_user_input_stays_direct_in_code_mode_only() {
     };
     assert!(exec.description.contains("direct-only tools stay outside"));
     assert!(exec.description.contains("request_user_input"));
+}
+
+#[tokio::test]
+async fn token_efficiency_code_mode_direct_tools_do_not_repeat_nested_declarations() {
+    let plan = probe_with(
+        |turn| set_feature(turn, Feature::CodeMode, /*enabled*/ true),
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(None, "lookup", /*defer_loading*/ false)],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let ToolSpec::Function(tool) = plan.visible_spec("lookup") else {
+        panic!("expected directly visible lookup tool");
+    };
+    assert_eq!(tool.description, "lookup dynamic tool");
+    assert!(!tool.description.contains("exec tool declaration"));
+    let serialized = serde_json::to_value(plan.visible_spec("lookup"))
+        .expect("direct tool schema should serialize");
+    assert_eq!(serialized["parameters"]["type"], "object");
+
+    let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
+        panic!("expected code mode exec tool");
+    };
+    assert!(exec.description.contains("lookup(args:"));
 }
 
 #[tokio::test]
@@ -790,6 +941,30 @@ async fn shell_family_follows_default_unified_exec_policy() {
         plan.assert_visible_contains(&["shell_command"]);
         plan.assert_visible_lacks(&["exec_command", "write_stdin"]);
     }
+}
+
+#[tokio::test]
+async fn foreign_primary_hides_exec_command_only_when_platform_sandboxing_is_required() {
+    let sandboxed = probe(|turn| {
+        set_foreign_primary_environment(turn);
+        turn.permission_profile = PermissionProfile::workspace_write();
+        set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
+        turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
+    })
+    .await;
+    sandboxed.assert_visible_lacks(&["exec_command"]);
+    sandboxed.assert_registered_lacks(&["exec_command"]);
+    sandboxed.assert_registered_contains(&["write_stdin", "shell_command"]);
+
+    let unsandboxed = probe(|turn| {
+        set_foreign_primary_environment(turn);
+        turn.permission_profile = PermissionProfile::Disabled;
+        set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
+        turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
+    })
+    .await;
+    unsandboxed.assert_visible_contains(&["exec_command", "write_stdin"]);
+    unsandboxed.assert_registered_contains(&["exec_command", "write_stdin", "shell_command"]);
 }
 
 #[tokio::test]
@@ -907,18 +1082,22 @@ async fn environment_tools_follow_the_step_context() {
         /*loaded_agents_md*/ None,
     ));
 
-    let plan = ToolPlanProbe::from_router(ToolRouter::from_context(
-        step_context.as_ref(),
-        ToolRouterParams {
-            mcp_tools: None,
-            deferred_mcp_tools: None,
-            tool_suggest_candidates: None,
-            extension_tool_executors: Vec::new(),
-            dynamic_tools: &[],
-            exposure_identity: Default::default(),
-        },
-        &Default::default(),
-    ));
+    let tool_search_cache = ToolSearchHandlerCache::default();
+    let plan = ToolPlanProbe::from_router(
+        ToolRouter::from_context(
+            step_context.as_ref(),
+            ToolRouterParams {
+                mcp_tools: None,
+                deferred_mcp_tools: None,
+                tool_suggest_candidates: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+                exposure_identity: Default::default(),
+            },
+            &tool_search_cache,
+        ),
+        &tool_search_cache,
+    );
 
     plan.assert_visible_contains(&["exec_command", "apply_patch", "view_image"]);
 }
@@ -950,25 +1129,43 @@ async fn host_context_gates_agent_job_tools() {
 
     let remote_agent_job = probe(|turn| {
         set_feature(turn, Feature::SpawnCsv, /*enabled*/ true);
-        let remote_environment = Arc::new(
-            codex_exec_server::Environment::create_for_tests(Some(
-                "ws://127.0.0.1:1/agent-job-routing".to_string(),
-            ))
-            .expect("remote test environment"),
-        );
-        let foreign_cwd =
-            PathUri::parse("file:///tmp/codex-agent-job-remote").expect("POSIX cwd URI");
-        let shell = turn.environments.turn_environments[0].shell.clone();
-        turn.environments.turn_environments[0] = crate::session::turn_context::TurnEnvironment::new(
-            "remote-primary".to_string(),
-            remote_environment,
-            foreign_cwd,
-            shell,
-        );
+        set_foreign_primary_environment(turn);
     })
     .await;
     remote_agent_job.assert_visible_lacks(&["spawn_agents_on_csv", "report_agent_job_result"]);
     remote_agent_job.assert_registered_lacks(&["spawn_agents_on_csv", "report_agent_job_result"]);
+}
+
+#[tokio::test]
+async fn foreign_primary_hides_spawn_but_keeps_existing_agent_lifecycle_tools() {
+    let v1 = probe(|turn| {
+        set_foreign_primary_environment(turn);
+        set_feature(turn, Feature::Collab, /*enabled*/ true);
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ false);
+    })
+    .await;
+    assert!(
+        !v1.namespace_function_names(MULTI_AGENT_V1_NAMESPACE)
+            .contains(&"spawn_agent".to_string())
+    );
+    assert!(
+        v1.namespace_function_names(MULTI_AGENT_V1_NAMESPACE)
+            .contains(&"wait_agent".to_string())
+    );
+
+    let v2 = probe(|turn| {
+        set_foreign_primary_environment(turn);
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+    })
+    .await;
+    assert!(
+        !v2.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
+            .contains(&"spawn_agent".to_string())
+    );
+    assert!(
+        v2.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
+            .contains(&"wait_agent".to_string())
+    );
 }
 
 #[tokio::test]
@@ -1141,7 +1338,9 @@ async fn deferred_extension_tools_are_discoverable_with_tool_search() {
             turn.model_info.supports_search_tool = true;
         },
         ToolPlanInputs {
-            extension_tool_executors: vec![Arc::new(DeferredExtensionTool)],
+            extension_tool_executors: vec![Arc::new(DeferredExtensionTool {
+                description: "Echoes arguments through an extension tool.",
+            })],
             ..ToolPlanInputs::default()
         },
     )
@@ -1242,11 +1441,15 @@ async fn winning_registered_runtime_owns_its_external_mutation_intent() {
 #[tokio::test]
 async fn duplicate_extension_tool_names_surface_an_actionable_warning() {
     let plan = probe_with(
-        |_| {},
+        |turn| turn.model_info.supports_search_tool = true,
         ToolPlanInputs {
             extension_tool_executors: vec![
-                Arc::new(DeferredExtensionTool),
-                Arc::new(DeferredExtensionTool),
+                Arc::new(DeferredExtensionTool {
+                    description: "winning deferred schema marker",
+                }),
+                Arc::new(DeferredExtensionTool {
+                    description: "losing deferred schema marker",
+                }),
             ],
             ..ToolPlanInputs::default()
         },
@@ -1265,6 +1468,16 @@ async fn duplicate_extension_tool_names_surface_an_actionable_warning() {
     };
     assert!(warning.contains("extension_echo"));
     assert!(warning.contains("Rename or disable"));
+    assert!(
+        plan.tool_search_texts
+            .iter()
+            .any(|text| text.contains("winning deferred schema marker"))
+    );
+    assert!(
+        plan.tool_search_texts
+            .iter()
+            .all(|text| !text.contains("losing deferred schema marker"))
+    );
 }
 
 #[tokio::test]
@@ -1374,7 +1587,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
         },
         &cache,
     );
-    let first_plan = ToolPlanProbe::from_router(first_router);
+    let first_plan = ToolPlanProbe::from_router(first_router, &cache);
 
     let (_session, mut second_turn) = make_session_and_context().await;
     second_turn.model_info.supports_search_tool = true;
@@ -1392,7 +1605,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
         },
         &cache,
     );
-    let second_plan = ToolPlanProbe::from_router(second_router);
+    let second_plan = ToolPlanProbe::from_router(second_router, &cache);
     let third_router = ToolRouter::from_context(
         first_step_context.as_ref(),
         ToolRouterParams {
@@ -1405,7 +1618,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
         },
         &cache,
     );
-    let third_plan = ToolPlanProbe::from_router(third_router);
+    let third_plan = ToolPlanProbe::from_router(third_router, &cache);
 
     let ToolSpec::ToolSearch {
         description: first_description,
@@ -2106,6 +2319,23 @@ async fn v1_multi_agent_tools_defer_when_tool_search_available() {
         panic!("expected visible tool_search spec");
     };
     assert!(description.contains("- Multi-agent tools: Spawn and manage sub-agents."));
+}
+
+#[tokio::test]
+async fn token_efficiency_v2_multi_agent_tools_defer_when_tool_search_available() {
+    let plan = probe(|turn| {
+        turn.model_info.supports_search_tool = true;
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+    })
+    .await;
+
+    plan.assert_visible_contains(&["tool_search"]);
+    plan.assert_visible_lacks(&[MULTI_AGENT_V2_NAMESPACE, "spawn_agent", "send_message"]);
+    for tool_name in ["spawn_agent", "send_message", "wait_agent", "list_agents"] {
+        let name = ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, tool_name).to_string();
+        assert!(plan.registered_names.contains(&name));
+        assert_eq!(plan.exposure(&name), ToolExposure::Deferred);
+    }
 }
 
 #[tokio::test]

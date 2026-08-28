@@ -1,6 +1,7 @@
 //! Prototype MCP server.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+use std::io::BufRead;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::sync::Arc;
@@ -17,11 +18,11 @@ use rmcp::model::ClientNotification;
 use rmcp::model::ClientRequest;
 use rmcp::model::JsonRpcMessage;
 use serde_json::Value;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
-use tokio::io::BufReader;
 use tokio::io::{self};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -56,6 +57,70 @@ const DEFAULT_ANALYTICS_ENABLED: bool = true;
 const OTEL_SERVICE_NAME: &str = "codex_mcp_server";
 
 type IncomingMessage = JsonRpcMessage<ClientRequest, Value, ClientNotification>;
+
+fn spawn_stdin_line_reader() -> mpsc::Receiver<IoResult<String>> {
+    // Tokio's stdin reader uses an uncancellable blocking read that runtime shutdown waits for.
+    // Keep that read on a detached OS thread so closing the async receiver lets this server and its
+    // runtime finish even when the client deliberately leaves stdin open.
+    let (line_tx, line_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    if let Err(err) = std::thread::Builder::new()
+        .name("codex-mcp-server-stdin".to_string())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            let mut stdin = stdin.lock();
+            loop {
+                let mut line = String::new();
+                match stdin.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        while matches!(line.as_bytes().last(), Some(b'\n' | b'\r')) {
+                            line.pop();
+                        }
+                        if line_tx.blocking_send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = line_tx.blocking_send(Err(err));
+                        break;
+                    }
+                }
+            }
+        })
+    {
+        error!("Failed to start stdin reader thread: {err}");
+    }
+    line_rx
+}
+
+async fn write_outgoing_messages<W>(
+    mut outgoing_rx: mpsc::Receiver<OutgoingMessage>,
+    mut stdout: W,
+    output_failed: CancellationToken,
+) where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(outgoing_message) = outgoing_rx.recv().await {
+        let msg: OutgoingJsonRpcMessage = outgoing_message.into();
+        match serde_json::to_string(&msg) {
+            Ok(json) => {
+                if let Err(err) = stdout.write_all(json.as_bytes()).await {
+                    error!("Failed to write to stdout: {err}");
+                    output_failed.cancel();
+                    break;
+                }
+                if let Err(err) = stdout.write_all(b"\n").await {
+                    error!("Failed to write newline to stdout: {err}");
+                    output_failed.cancel();
+                    break;
+                }
+            }
+            Err(err) => error!("Failed to serialize JSON-RPC message: {err}"),
+        }
+    }
+
+    info!("stdout writer exited (channel closed)");
+}
 
 pub async fn run_main(
     arg0_paths: Arg0DispatchPaths,
@@ -119,21 +184,39 @@ pub async fn run_main(
 
     // Set up channels.
     let (incoming_tx, mut incoming_rx) = mpsc::channel::<IncomingMessage>(CHANNEL_CAPACITY);
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<OutgoingMessage>();
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingMessage>(CHANNEL_CAPACITY);
     let installation_id = resolve_installation_id(&config.codex_home).await?;
+    let output_failed = CancellationToken::new();
 
     // Task: read from stdin, push to `incoming_tx`.
     let stdin_reader_handle = tokio::spawn({
+        let output_failed = output_failed.clone();
+        let mut stdin_lines = spawn_stdin_line_reader();
         async move {
-            let stdin = io::stdin();
-            let reader = BufReader::new(stdin);
-            let mut lines = reader.lines();
-
-            while let Some(line) = lines.next_line().await.unwrap_or_default() {
+            loop {
+                let line = tokio::select! {
+                    biased;
+                    _ = output_failed.cancelled() => break,
+                    line = stdin_lines.recv() => line,
+                };
+                let Some(line) = line else {
+                    break;
+                };
+                let line = match line {
+                    Ok(line) => line,
+                    Err(err) => {
+                        error!("Failed reading stdin: {err}");
+                        break;
+                    }
+                };
                 match serde_json::from_str::<IncomingMessage>(&line) {
                     Ok(msg) => {
-                        if incoming_tx.send(msg).await.is_err() {
-                            // Receiver gone – nothing left to do.
+                        let sent = tokio::select! {
+                            biased;
+                            _ = output_failed.cancelled() => false,
+                            result = incoming_tx.send(msg) => result.is_ok(),
+                        };
+                        if !sent {
                             break;
                         }
                     }
@@ -148,6 +231,7 @@ pub async fn run_main(
     // Task: process incoming messages.
     let processor_handle = tokio::spawn({
         let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
+        let output_failed = output_failed.clone();
         let mut processor = MessageProcessor::new(
             outgoing_message_sender,
             arg0_paths,
@@ -158,7 +242,15 @@ pub async fn run_main(
         )
         .await;
         async move {
-            while let Some(msg) = incoming_rx.recv().await {
+            loop {
+                let msg = tokio::select! {
+                    biased;
+                    _ = output_failed.cancelled() => break,
+                    msg = incoming_rx.recv() => msg,
+                };
+                let Some(msg) = msg else {
+                    break;
+                };
                 match msg {
                     JsonRpcMessage::Request(r) => processor.process_request(r).await,
                     JsonRpcMessage::Response(r) => processor.process_response(r).await,
@@ -167,32 +259,17 @@ pub async fn run_main(
                 }
             }
 
+            processor.shutdown().await;
             info!("processor task exited (channel closed)");
         }
     });
 
     // Task: write outgoing messages to stdout.
-    let stdout_writer_handle = tokio::spawn(async move {
-        let mut stdout = io::stdout();
-        while let Some(outgoing_message) = outgoing_rx.recv().await {
-            let msg: OutgoingJsonRpcMessage = outgoing_message.into();
-            match serde_json::to_string(&msg) {
-                Ok(json) => {
-                    if let Err(e) = stdout.write_all(json.as_bytes()).await {
-                        error!("Failed to write to stdout: {e}");
-                        break;
-                    }
-                    if let Err(e) = stdout.write_all(b"\n").await {
-                        error!("Failed to write newline to stdout: {e}");
-                        break;
-                    }
-                }
-                Err(e) => error!("Failed to serialize JSON-RPC message: {e}"),
-            }
-        }
-
-        info!("stdout writer exited (channel closed)");
-    });
+    let stdout_writer_handle = tokio::spawn(write_outgoing_messages(
+        outgoing_rx,
+        io::stdout(),
+        output_failed,
+    ));
 
     // Wait for all tasks to finish.  The typical exit path is the stdin reader
     // hitting EOF which, once it drops `incoming_tx`, propagates shutdown to

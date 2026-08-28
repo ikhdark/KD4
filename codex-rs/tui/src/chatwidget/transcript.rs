@@ -9,11 +9,27 @@ pub(super) struct AgentTurnMarkdown {
     pub(super) markdown: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ActiveStreamTailSyncKey {
+    Agent {
+        revision: u64,
+        tail_starts_stream: bool,
+    },
+    Plan {
+        revision: u64,
+        header_emitted: bool,
+        top_padding_emitted: bool,
+        tail_starts_stream: bool,
+    },
+}
+
 #[derive(Default)]
 pub(super) struct TranscriptState {
     pub(super) active_cell: Option<Box<dyn HistoryCell>>,
     /// Monotonic-ish counter used to invalidate transcript overlay caching.
     pub(super) active_cell_revision: u64,
+    /// Controller revision and installed active-cell revision for the current stream tail.
+    pub(super) active_stream_tail_sync: Option<(ActiveStreamTailSyncKey, u64)>,
     /// Raw markdown of the most recently completed agent response that
     /// survived any local thread rollback.
     pub(super) last_agent_markdown: Option<String>,

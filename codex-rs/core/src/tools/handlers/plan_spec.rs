@@ -425,8 +425,7 @@ fn step_evidence_schema() -> JsonSchema {
 
 fn validation_route_schema() -> JsonSchema {
     let mut timeout = JsonSchema::integer(Some(
-        "Bounded execution timeout in milliseconds; it affects proof identity only when semantic_timeout is true."
-            .to_string(),
+        "Bounded execution timeout in milliseconds.".to_string(),
     ));
     timeout.minimum = Some(1.into());
     timeout.maximum = Some(codex_protocol::plan_tool::MAX_STRUCTURED_VALIDATION_TIMEOUT_MS.into());
@@ -436,44 +435,24 @@ fn validation_route_schema() -> JsonSchema {
                 "argv".to_string(),
                 JsonSchema::array(
                     JsonSchema::string(Some("One exact direct-argv element.".to_string())),
-                    Some("Canonical direct argv using cargo, just, python, or python3; shell compounds and formatting or diff checks are not accepted.".to_string()),
+                    Some("Exact direct argv for this validation leaf.".to_string()),
                 ),
-            ),
-            (
-                "uncertainty".to_string(),
-                JsonSchema::string(Some(
-                    "Specific uncertainty this command resolves and why this coverage is sufficient."
-                        .to_string(),
-                )),
             ),
             (
                 "covered_paths".to_string(),
                 JsonSchema::array(
                     JsonSchema::string(Some("Repository-relative covered path.".to_string())),
-                    Some("Non-empty repository-relative coverage used to scope proof reuse.".to_string()),
-                ),
-            ),
-            (
-                "covered_contracts".to_string(),
-                JsonSchema::array(
-                    JsonSchema::string(Some("Explicit covered contract.".to_string())),
-                    Some("Non-empty covered validation contracts.".to_string()),
+                    Some(
+                        "Non-empty repository-relative coverage attributed to the result."
+                            .to_string(),
+                    ),
                 ),
             ),
             ("timeout_ms".to_string(), timeout),
-            (
-                "semantic_timeout".to_string(),
-                JsonSchema::boolean(Some(
-                    "True only when the validation contract makes timeout part of proof semantics."
-                        .to_string(),
-                )),
-            ),
         ]),
         Some(vec![
             "argv".to_string(),
-            "uncertainty".to_string(),
             "covered_paths".to_string(),
-            "covered_contracts".to_string(),
             "timeout_ms".to_string(),
         ]),
         Some(false.into()),

@@ -133,6 +133,21 @@ pub(super) async fn append_items(
     store: &LocalThreadStore,
     params: AppendThreadItemsParams,
 ) -> ThreadStoreResult<()> {
+    append_items_with_flush(store, params, true).await
+}
+
+pub(super) async fn append_items_ordered(
+    store: &LocalThreadStore,
+    params: AppendThreadItemsParams,
+) -> ThreadStoreResult<()> {
+    append_items_with_flush(store, params, false).await
+}
+
+async fn append_items_with_flush(
+    store: &LocalThreadStore,
+    params: AppendThreadItemsParams,
+    flush: bool,
+) -> ThreadStoreResult<()> {
     // LocalThreadStore rejects paginated threads before opening a writer.
     let persisted_items =
         persisted_rollout_items(params.items.as_slice(), ThreadHistoryMode::Legacy);
@@ -140,13 +155,24 @@ pub(super) async fn append_items(
         return Ok(());
     }
     let recorder = store.live_recorder(params.thread_id).await?;
-    recorder
-        .record_canonical_items(persisted_items.as_slice())
-        .await
-        .map_err(thread_store_io_error)?;
+    if flush {
+        recorder
+            .record_canonical_items(persisted_items.as_slice())
+            .await
+            .map_err(thread_store_io_error)?;
+    } else {
+        recorder
+            .record_canonical_items_ordered(persisted_items.as_slice())
+            .await
+            .map_err(thread_store_io_error)?;
+    }
     // LiveThread applies metadata immediately after append_items returns. Wait for the local
     // writer so SQLite never gets ahead of JSONL for accepted live appends.
-    recorder.flush().await.map_err(thread_store_io_error)
+    if flush {
+        recorder.flush().await.map_err(thread_store_io_error)
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) async fn persist_thread(

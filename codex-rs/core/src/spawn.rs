@@ -1,5 +1,9 @@
 use codex_network_proxy::NetworkProxy;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
+use codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT;
+use codex_utils_pty::configure_windows_command_args;
+use codex_utils_pty::run_windows_process_operation;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -78,11 +82,11 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
 
     let mut cmd = Command::new(&program);
     let _ = arg0;
-    cmd.args(args);
+    configure_windows_command_args(cmd.as_std_mut(), program.as_os_str(), &args);
     cmd.current_dir(cwd);
     cmd.env_clear();
     cmd.envs(env);
-    cmd.creation_flags(creation_flags);
+    cmd.creation_flags(creation_flags | WINDOWS_CREATE_SUSPENDED);
 
     // If this Codex process dies (including being killed via SIGKILL), we want
     // any child processes that were spawned as part of a `"shell"` tool call
@@ -104,7 +108,8 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
         }
     }
 
-    cmd.kill_on_drop(true).spawn()
+    cmd.kill_on_drop(true);
+    run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || cmd.spawn()).await
 }
 
 fn apply_network_sandbox_policy_to_env(

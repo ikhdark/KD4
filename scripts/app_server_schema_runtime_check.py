@@ -35,6 +35,19 @@ IGNORED_SCHEMA_ANNOTATIONS = frozenset(
 ADDITIVE_SCHEMA_MAPS = frozenset({"definitions", "properties"})
 
 
+def _is_additive_schema_map(path: str) -> bool:
+    """Return whether new keys at ``path`` are additive schema entries.
+
+    The stable bundle namespaces definitions by protocol version, so both
+    ``$/definitions`` and ``$/definitions/v2`` are definition maps.
+    """
+    parts = path.split("/")
+    parent_key = parts[-1]
+    return parent_key in ADDITIVE_SCHEMA_MAPS or (
+        len(parts) == 3 and parts[0] == "$" and parts[1] == "definitions"
+    )
+
+
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -185,9 +198,8 @@ def stable_schema_compatibility_issues(
                     child_path,
                 )
             )
-        parent_key = path.rsplit("/", 1)[-1]
         for key in current.keys() - baseline.keys():
-            if key in IGNORED_SCHEMA_ANNOTATIONS or parent_key in ADDITIVE_SCHEMA_MAPS:
+            if key in IGNORED_SCHEMA_ANNOTATIONS or _is_additive_schema_map(path):
                 continue
             issues.append(f"{path}/{key}:added")
         return issues

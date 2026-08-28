@@ -33,9 +33,10 @@ fn build_state_with_audit_metadata_threads_metadata_to_state() {
         user_account_id: Some("acct-1".to_string()),
         ..NetworkProxyAuditMetadata::default()
     };
+    let codex_home = tempfile::tempdir().expect("temporary Codex home");
 
     let state = spec
-        .build_state_with_audit_metadata(metadata.clone())
+        .build_state_with_audit_metadata(codex_home.path(), metadata.clone())
         .expect("state should build");
     assert_eq!(state.audit_metadata(), &metadata);
 }

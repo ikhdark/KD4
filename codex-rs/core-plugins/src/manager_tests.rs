@@ -43,6 +43,7 @@ use codex_core_skills::PluginSkillSnapshots;
 use codex_core_skills::SkillsLoadInput;
 use codex_core_skills::SkillsService;
 use codex_core_skills::config_rules::SkillConfigRules;
+use codex_login::AuthHeaders;
 use codex_login::CodexAuth;
 use codex_plugin::AppDeclaration;
 use codex_plugin::PluginId;
@@ -819,6 +820,49 @@ async fn load_plugins_from_config(
 
 async fn load_config(codex_home: &Path, cwd: &Path) -> PluginsConfigInput {
     load_plugins_config_input(codex_home, cwd).await
+}
+
+fn backend_header_auth(bearer_token: &'static str) -> CodexAuth {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_static(bearer_token),
+    );
+    CodexAuth::Headers(AuthHeaders::new(headers))
+}
+
+async fn wait_for_received_request_count(server: &MockServer, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let request_count = server.received_requests().await.unwrap_or_default().len();
+            if request_count >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expected plugin request should reach the server");
+}
+
+async fn wait_for_remote_installed_refresh_to_finish(manager: &PluginsManager) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let refresh_finished = {
+                let state = match manager.remote_installed_plugins_cache_refresh_state.read() {
+                    Ok(state) => state,
+                    Err(err) => err.into_inner(),
+                };
+                !state.in_flight && state.requested.is_none()
+            };
+            if refresh_finished {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("remote installed plugin refresh should finish");
 }
 
 fn remote_installed_linear_plugin() -> RemoteInstalledPlugin {
@@ -2726,6 +2770,62 @@ async fn install_plugin_updates_config_with_relative_path_and_plugin_key() {
 }
 
 #[tokio::test]
+async fn install_plugin_restores_previous_cache_when_config_update_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().join("repo");
+    fs::create_dir_all(repo_root.join(".git")).unwrap();
+    fs::create_dir_all(repo_root.join(".agents/plugins")).unwrap();
+    write_plugin(&repo_root, "sample-plugin", "sample-plugin");
+    fs::write(
+        repo_root.join("sample-plugin/new-version-marker"),
+        "new version",
+    )
+    .unwrap();
+    fs::write(
+        repo_root.join(".agents/plugins/marketplace.json"),
+        r#"{
+  "name": "debug",
+  "plugins": [
+    {
+      "name": "sample-plugin",
+      "source": {"source": "local", "path": "./sample-plugin"}
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+    let installed_root = tmp.path().join("plugins/cache/debug/sample-plugin/local");
+    write_plugin(
+        &tmp.path().join("plugins/cache/debug"),
+        "sample-plugin/local",
+        "sample-plugin",
+    );
+    fs::write(
+        installed_root.join("previous-version-marker"),
+        "previous version",
+    )
+    .unwrap();
+    fs::create_dir_all(tmp.path().join(CONFIG_TOML_FILE)).unwrap();
+
+    PluginsManager::new(tmp.path().to_path_buf())
+        .install_plugin(
+            &unrestricted_config_layer_stack(),
+            PluginInstallRequest {
+                plugin_name: "sample-plugin".to_string(),
+                marketplace_path: AbsolutePathBuf::try_from(
+                    repo_root.join(".agents/plugins/marketplace.json"),
+                )
+                .unwrap(),
+            },
+        )
+        .await
+        .expect_err("config update should fail");
+
+    assert!(installed_root.join("previous-version-marker").is_file());
+    assert!(!installed_root.join("new-version-marker").exists());
+}
+
+#[tokio::test]
 async fn strict_install_requires_allowed_local_marketplace_to_be_added_first() {
     let codex_home = TempDir::new().expect("create Codex home");
     let marketplace_root = codex_home.path().join("company-marketplace");
@@ -3143,6 +3243,26 @@ enabled = true
     );
     let config = fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).unwrap();
     assert!(!config.contains(r#"[plugins."sample-plugin@debug"]"#));
+}
+
+#[tokio::test]
+async fn uninstall_plugin_restores_cache_when_config_update_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let installed_root = tmp.path().join("plugins/cache/debug/sample-plugin/local");
+    write_plugin(
+        &tmp.path().join("plugins/cache/debug"),
+        "sample-plugin/local",
+        "sample-plugin",
+    );
+    fs::write(installed_root.join("installed-marker"), "installed").unwrap();
+    fs::create_dir_all(tmp.path().join(CONFIG_TOML_FILE)).unwrap();
+
+    PluginsManager::new(tmp.path().to_path_buf())
+        .uninstall_plugin("sample-plugin@debug".to_string())
+        .await
+        .expect_err("config update should fail");
+
+    assert!(installed_root.join("installed-marker").is_file());
 }
 
 #[tokio::test]
@@ -4934,6 +5054,69 @@ plugins = true
 }
 
 #[tokio::test]
+async fn account_cache_invalidation_rejects_in_flight_remote_installed_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(
+        &tmp.path().join(CONFIG_TOML_FILE),
+        r#"[features]
+plugins = true
+"#,
+    );
+
+    let server = MockServer::start().await;
+    let empty_installed_response = serde_json::json!({
+        "plugins": [],
+        "pagination": {"next_page_token": null}
+    });
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .and(header("authorization", "Bearer account-a"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(empty_installed_response)
+                .set_delay(Duration::from_millis(200)),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .and(header("authorization", "Bearer account-b"))
+        .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_millis(20)))
+        .mount(&server)
+        .await;
+
+    let mut config = load_config(tmp.path(), tmp.path()).await;
+    config.chatgpt_base_url = server.uri();
+    let manager = Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
+    let auth_a = backend_header_auth("Bearer account-a");
+    let auth_b = backend_header_auth("Bearer account-b");
+
+    manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
+        &config,
+        Some(auth_a),
+        /*on_effective_plugins_changed*/ None,
+    );
+    wait_for_received_request_count(&server, 1).await;
+
+    manager.invalidate_account_scoped_remote_plugin_caches();
+    manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
+        &config,
+        Some(auth_b),
+        /*on_effective_plugins_changed*/ None,
+    );
+    wait_for_remote_installed_refresh_to_finish(&manager).await;
+
+    assert!(server.received_requests().await.unwrap_or_default().len() > 3);
+    assert_eq!(
+        manager.build_remote_installed_plugin_marketplaces_from_cache(&[
+            REMOTE_GLOBAL_MARKETPLACE_NAME
+        ]),
+        None
+    );
+}
+
+#[tokio::test]
 async fn remote_plugin_caches_refresh_warms_recommended_plugins_cache() {
     let tmp = tempfile::tempdir().unwrap();
     write_file(
@@ -4959,7 +5142,13 @@ plugins = true
     config.chatgpt_base_url = server.uri();
     let manager = std::sync::Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let cache_key = recommended_plugins_cache_key(&config);
+    let cache_key = recommended_plugins_cache_key(
+        &config,
+        Some(&auth),
+        manager
+            .recommended_plugins_cache_generation
+            .load(Ordering::Acquire),
+    );
 
     manager.maybe_start_remote_plugin_caches_refresh(
         &config,
@@ -4991,6 +5180,94 @@ plugins = true
     );
     manager.clear_recommended_plugins_cache();
     assert_eq!(manager.cached_recommended_plugins_mode(&cache_key), None);
+}
+
+#[tokio::test]
+async fn account_cache_invalidation_rejects_in_flight_recommendation_publication() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(
+        &tmp.path().join(CONFIG_TOML_FILE),
+        r#"[features]
+plugins = true
+"#,
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/suggested"))
+        .and(header("authorization", "Bearer account-a"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "enabled": true,
+                    "plugins": [{
+                        "id": "plugin-a",
+                        "name": "plugin-a",
+                        "release": {"display_name": "Account A Plugin"}
+                    }]
+                }))
+                .set_delay(Duration::from_millis(200)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/suggested"))
+        .and(header("authorization", "Bearer account-b"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "enabled": true,
+            "plugins": [{
+                "id": "plugin-b",
+                "name": "plugin-b",
+                "release": {"display_name": "Account B Plugin"}
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut config = load_config(tmp.path(), tmp.path()).await;
+    config.chatgpt_base_url = server.uri();
+    let manager = Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
+    let auth_a = backend_header_auth("Bearer account-a");
+    let auth_b = backend_header_auth("Bearer account-b");
+    let expected_b = RecommendedPluginsMode::Endpoint {
+        plugins: vec![RecommendedPlugin {
+            config_id: "plugin-b@openai-curated-remote".to_string(),
+            remote_plugin_id: "plugin-b".to_string(),
+            display_name: "Account B Plugin".to_string(),
+            app_connector_ids: Vec::new(),
+        }],
+    };
+
+    let request_a = {
+        let manager = Arc::clone(&manager);
+        let config = config.clone();
+        tokio::spawn(async move {
+            manager
+                .recommended_plugins_mode_for_config(&config, Some(&auth_a))
+                .await
+        })
+    };
+    wait_for_received_request_count(&server, 1).await;
+
+    manager.invalidate_account_scoped_remote_plugin_caches();
+    assert_eq!(
+        manager
+            .recommended_plugins_mode_for_config(&config, Some(&auth_b))
+            .await,
+        expected_b
+    );
+    assert_eq!(
+        request_a.await.expect("account A recommendation task"),
+        RecommendedPluginsMode::Legacy
+    );
+    assert_eq!(
+        manager
+            .recommended_plugins_mode_for_config(&config, Some(&auth_b))
+            .await,
+        expected_b
+    );
 }
 
 #[tokio::test]

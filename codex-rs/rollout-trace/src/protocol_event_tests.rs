@@ -14,15 +14,29 @@ use codex_protocol::protocol::ReasoningPolicySource;
 use codex_protocol::protocol::ReasoningPolicyTrigger;
 use codex_protocol::protocol::SubAgentActivityEvent;
 use codex_protocol::protocol::SubAgentActivityKind;
+use codex_protocol::protocol::TurnAbortReason;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::time::Duration;
 
 use super::ToolRuntimeTraceEvent;
 use super::codex_turn_trace_event;
+use super::execution_status_for_abort_reason;
 use super::tool_runtime_trace_event;
 use super::wrapped_protocol_event_type;
 use crate::ExecutionStatus;
+
+#[test]
+fn internal_error_abort_projects_failed_execution_status() {
+    assert_eq!(
+        execution_status_for_abort_reason(&TurnAbortReason::InternalError),
+        ExecutionStatus::Failed
+    );
+    assert_eq!(
+        execution_status_for_abort_reason(&TurnAbortReason::Interrupted),
+        ExecutionStatus::Cancelled
+    );
+}
 
 #[test]
 fn sub_agent_activity_is_a_terminal_tool_runtime_event() -> anyhow::Result<()> {

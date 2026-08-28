@@ -29,12 +29,17 @@ pub(crate) struct OutgoingMessageSender {
     next_request_id: AtomicI64,
     supports_form_elicitation: AtomicBool,
     supports_url_elicitation: AtomicBool,
-    sender: mpsc::UnboundedSender<OutgoingMessage>,
+    sender: mpsc::Sender<OutgoingMessage>,
     request_id_to_callback: Mutex<HashMap<RequestId, oneshot::Sender<Value>>>,
 }
 
+pub(crate) struct PendingRequest {
+    pub(crate) id: RequestId,
+    pub(crate) receiver: oneshot::Receiver<Value>,
+}
+
 impl OutgoingMessageSender {
-    pub(crate) fn new(sender: mpsc::UnboundedSender<OutgoingMessage>) -> Self {
+    pub(crate) fn new(sender: mpsc::Sender<OutgoingMessage>) -> Self {
         Self {
             next_request_id: AtomicI64::new(0),
             supports_form_elicitation: AtomicBool::new(false),
@@ -69,28 +74,37 @@ impl OutgoingMessageSender {
         &self,
         method: &str,
         params: Option<serde_json::Value>,
-    ) -> oneshot::Receiver<Value> {
+    ) -> PendingRequest {
         let id = RequestId::Number(self.next_request_id.fetch_add(1, Ordering::Relaxed));
-        let callback_id = id.clone();
-        let outgoing_message_id = id.clone();
         let (tx_approve, rx_approve) = oneshot::channel();
+        let Ok(permit) = self.sender.clone().reserve_owned().await else {
+            return PendingRequest {
+                id,
+                receiver: rx_approve,
+            };
+        };
         {
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
-            request_id_to_callback.insert(id, tx_approve);
+            request_id_to_callback.insert(id.clone(), tx_approve);
         }
 
-        let outgoing_message = OutgoingMessage::Request(OutgoingRequest {
-            id: outgoing_message_id,
+        permit.send(OutgoingMessage::Request(OutgoingRequest {
+            id: id.clone(),
             method: method.to_string(),
             params,
-        });
-        if self.sender.send(outgoing_message).is_err() {
-            self.request_id_to_callback
-                .lock()
-                .await
-                .remove(&callback_id);
+        }));
+        PendingRequest {
+            id,
+            receiver: rx_approve,
         }
-        rx_approve
+    }
+
+    pub(crate) async fn cancel_request(&self, id: &RequestId) -> bool {
+        self.request_id_to_callback
+            .lock()
+            .await
+            .remove(id)
+            .is_some()
     }
 
     pub(crate) async fn notify_client_response(&self, id: RequestId, result: Value) {
@@ -125,7 +139,7 @@ impl OutgoingMessageSender {
         };
 
         let outgoing_message = OutgoingMessage::Response(OutgoingResponse { id, result });
-        let _ = self.sender.send(outgoing_message);
+        let _ = self.sender.send(outgoing_message).await;
     }
 
     /// This is used with the MCP server, but not the more general JSON-RPC app
@@ -158,12 +172,12 @@ impl OutgoingMessageSender {
 
     pub(crate) async fn send_notification(&self, notification: OutgoingNotification) {
         let outgoing_message = OutgoingMessage::Notification(notification);
-        let _ = self.sender.send(outgoing_message);
+        let _ = self.sender.send(outgoing_message).await;
     }
 
     pub(crate) async fn send_error(&self, id: RequestId, error: ErrorData) {
         let outgoing_message = OutgoingMessage::Error(OutgoingError { id, error });
-        let _ = self.sender.send(outgoing_message);
+        let _ = self.sender.send(outgoing_message).await;
     }
 }
 
@@ -320,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_event_as_notification() -> Result<()> {
-        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<OutgoingMessage>();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
         let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
 
         let thread_id = ThreadId::new();
@@ -368,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_event_as_notification_with_meta() -> Result<()> {
-        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<OutgoingMessage>();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
         let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
 
         let thread_id = ThreadId::new();
@@ -436,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_event_as_notification_with_meta_and_thread_id() -> Result<()> {
-        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<OutgoingMessage>();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
         let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
 
         let thread_id = ThreadId::new();
@@ -501,5 +515,40 @@ mod tests {
         });
         assert_eq!(params.unwrap(), expected_params);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_outgoing_channel_backpressures_producers() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
+        let outgoing = OutgoingMessageSender::new(outgoing_tx);
+        let notification = || OutgoingNotification {
+            method: "test/event".to_string(),
+            params: None,
+        };
+
+        outgoing.send_notification(notification()).await;
+        let mut blocked_send = Box::pin(outgoing.send_notification(notification()));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut blocked_send)
+                .await
+                .is_err(),
+            "a full stdout queue must backpressure its producer"
+        );
+
+        assert!(outgoing_rx.recv().await.is_some());
+        blocked_send.await;
+        assert!(outgoing_rx.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_elicitation_removes_its_callback() {
+        let (outgoing_tx, _outgoing_rx) = mpsc::channel::<OutgoingMessage>(1);
+        let outgoing = OutgoingMessageSender::new(outgoing_tx);
+        let pending = outgoing.send_request("elicitation/create", None).await;
+
+        assert_eq!(outgoing.request_id_to_callback.lock().await.len(), 1);
+        assert!(outgoing.cancel_request(&pending.id).await);
+        assert!(outgoing.request_id_to_callback.lock().await.is_empty());
+        assert!(pending.receiver.await.is_err());
     }
 }

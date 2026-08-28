@@ -8,6 +8,7 @@ use bytes::Bytes;
 use codex_api::ApiError;
 use codex_api::AuthError;
 use codex_api::AuthProvider;
+use codex_api::CompactClient;
 use codex_api::Compression;
 use codex_api::Provider;
 use codex_api::ResponsesApiRequest;
@@ -93,6 +94,43 @@ impl HttpTransport for RecordingTransport {
             headers: HeaderMap::new(),
             bytes: Box::pin(stream),
         })
+    }
+}
+
+#[derive(Clone, Default)]
+struct FailsOnceExecuteTransport {
+    requests: Arc<Mutex<Vec<Request>>>,
+}
+
+impl FailsOnceExecuteTransport {
+    fn requests(&self) -> Vec<Request> {
+        self.requests
+            .lock()
+            .expect("execute requests mutex should not be poisoned")
+            .clone()
+    }
+}
+
+impl HttpTransport for FailsOnceExecuteTransport {
+    async fn execute(&self, req: Request) -> Result<Response, TransportError> {
+        let mut requests = self
+            .requests
+            .lock()
+            .expect("execute requests mutex should not be poisoned");
+        requests.push(req);
+        if requests.len() == 1 {
+            return Err(TransportError::Network("first attempt fails".to_string()));
+        }
+
+        Ok(Response {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(br#"{"output":[]}"#),
+        })
+    }
+
+    async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError> {
+        Err(TransportError::Build("stream should not run".to_string()))
     }
 }
 
@@ -298,6 +336,34 @@ async fn responses_client_uses_responses_path() -> Result<()> {
 
     let requests = state.take_stream_requests();
     assert_path_ends_with(&requests, "/responses");
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_streaming_retries_reuse_one_prepared_body() -> Result<()> {
+    let transport = FailsOnceExecuteTransport::default();
+    let client = CompactClient::new(transport.clone(), provider("openai"), Arc::new(NoAuth));
+
+    let output = client
+        .compact(
+            serde_json::json!({"model": "gpt-test", "input": ["hello"]}),
+            HeaderMap::new(),
+            Duration::from_secs(1),
+            None,
+        )
+        .await?;
+
+    assert!(output.is_empty());
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2);
+    let first = request_body_bytes(&requests[0]);
+    let second = request_body_bytes(&requests[1]);
+    assert_eq!(first, second);
+    assert_eq!(first.as_ptr(), second.as_ptr());
+    assert_eq!(
+        requests[0].headers.get(http::header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("application/json"))
+    );
     Ok(())
 }
 

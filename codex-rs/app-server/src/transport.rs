@@ -35,6 +35,7 @@ pub(crate) use codex_app_server_transport::start_remote_control;
 pub(crate) use codex_app_server_transport::start_stdio_connection;
 pub(crate) use codex_app_server_transport::start_websocket_acceptor;
 pub use codex_app_server_transport::take_remote_control_disabled_env;
+pub(crate) use codex_app_server_transport::validate_websocket_listener;
 
 pub(crate) struct ConnectionState {
     pub(crate) outbound_initialized: Arc<AtomicBool>,

@@ -9,6 +9,7 @@ use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::TurnAbortReason;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -201,12 +202,13 @@ impl ThreadWatchManager {
         .await;
     }
 
-    pub(crate) async fn note_turn_completed(&self, thread_id: &str, _failed: bool) {
-        self.clear_active_state(thread_id).await;
+    pub(crate) async fn note_turn_completed(&self, thread_id: &str, failed: bool) {
+        self.clear_active_state(thread_id, Some(failed)).await;
     }
 
-    pub(crate) async fn note_turn_interrupted(&self, thread_id: &str) {
-        self.clear_active_state(thread_id).await;
+    pub(crate) async fn note_turn_aborted(&self, thread_id: &str, reason: &TurnAbortReason) {
+        let failed = (reason == &TurnAbortReason::InternalError).then_some(true);
+        self.clear_active_state(thread_id, failed).await;
     }
 
     pub(crate) async fn note_thread_shutdown(&self, thread_id: &str) {
@@ -229,11 +231,14 @@ impl ThreadWatchManager {
         .await;
     }
 
-    async fn clear_active_state(&self, thread_id: &str) {
+    async fn clear_active_state(&self, thread_id: &str, failed: Option<bool>) {
         self.update_runtime_for_thread(thread_id, move |runtime| {
             runtime.running = false;
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
+            if let Some(failed) = failed {
+                runtime.has_system_error = failed;
+            }
         })
         .await;
     }
@@ -695,6 +700,50 @@ mod tests {
             ThreadStatus::Active {
                 active_flags: vec![],
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_failures_set_system_error_without_standalone_error() {
+        let manager = ThreadWatchManager::new();
+        manager
+            .upsert_thread(test_thread(
+                INTERACTIVE_THREAD_ID,
+                codex_app_server_protocol::SessionSource::Cli,
+            ))
+            .await;
+
+        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager
+            .note_turn_completed(INTERACTIVE_THREAD_ID, /*failed*/ true)
+            .await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::SystemError,
+        );
+
+        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager
+            .note_turn_aborted(INTERACTIVE_THREAD_ID, &TurnAbortReason::InternalError)
+            .await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::SystemError,
+        );
+
+        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager
+            .note_turn_aborted(INTERACTIVE_THREAD_ID, &TurnAbortReason::Interrupted)
+            .await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Idle,
         );
     }
 

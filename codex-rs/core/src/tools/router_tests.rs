@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -7,6 +8,7 @@ use crate::config::Config;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnEnvironment;
+use crate::tools::context::ToolDispatchState;
 use crate::tools::context::ToolPayload;
 use crate::tools::exposure::GoalSurfaceState;
 use crate::tools::exposure::ToolExposureIdentity;
@@ -43,6 +45,12 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+fn admitted_tool_dispatch_state() -> Arc<ToolDispatchState> {
+    let state = Arc::new(ToolDispatchState::new());
+    assert!(state.try_admit());
+    state
+}
+
 use super::ExternalMutationIntent;
 use super::ToolCall;
 use super::ToolCallBuildError;
@@ -50,7 +58,6 @@ use super::ToolCallSource;
 use super::ToolRouter;
 use super::ToolRouterParams;
 use super::authorize_independent_review_tool_call;
-use super::collect_proven_read_only_external_tools;
 use super::extension_tool_executors;
 
 #[tokio::test]
@@ -79,6 +86,51 @@ async fn serialized_tool_manifest_fingerprint_includes_exposure_identity() {
 }
 
 #[tokio::test]
+async fn deferred_capability_revision_depends_only_on_provenance_and_schema() {
+    let (_session, mut turn) = make_session_and_context().await;
+    turn.model_info.supports_search_tool = true;
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let dynamic_tools = vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+        name: "stable_deferred_revision".to_string(),
+        description: "A deferred tool with a stable schema.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        }),
+        defer_loading: true,
+    })];
+    let router = |identity| {
+        ToolRouter::from_context(
+            step_context.as_ref(),
+            ToolRouterParams {
+                tool_suggest_candidates: None,
+                deferred_mcp_tools: None,
+                mcp_tools: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &dynamic_tools,
+                exposure_identity: identity,
+            },
+            &Default::default(),
+        )
+    };
+    let first = router(ToolExposureIdentity {
+        goal_surface_state: GoalSurfaceState::Disabled,
+        ..ToolExposureIdentity::default()
+    })
+    .deferred_tool_capability_revisions();
+    let second = router(ToolExposureIdentity {
+        goal_surface_state: GoalSurfaceState::Inactive,
+        ..ToolExposureIdentity::default()
+    })
+    .deferred_tool_capability_revisions();
+
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 1);
+}
+
+#[tokio::test]
 async fn serialized_tool_manifest_cache_invalidates_on_activation_revision() {
     let (_session, turn) = make_session_and_context().await;
     let router = ToolRouter::from_parts_with_warnings_and_identity(
@@ -92,6 +144,160 @@ async fn serialized_tool_manifest_cache_invalidates_on_activation_revision() {
     let second = router.tool_manifest(&turn);
     assert_eq!(first, second);
     assert_eq!(turn.deferred_tool_activation_revision(), 0);
+}
+
+#[tokio::test]
+async fn unchanged_rollout_tool_manifest_uses_a_compact_reference() {
+    let (_session, turn) = make_session_and_context().await;
+    let router = ToolRouter::from_parts_with_warnings_and_identity(
+        ToolRegistry::empty_for_test(),
+        Vec::new(),
+        Vec::new(),
+        ToolExposureIdentity::default(),
+    );
+
+    let definition = router.tool_manifest_for_rollout(&turn, None);
+    let reference = router.tool_manifest_for_rollout(&turn, Some(definition.hash.as_str()));
+
+    assert!(definition.manifest.is_some());
+    assert!(reference.is_reference());
+    assert_eq!(reference.hash, definition.hash);
+}
+
+#[tokio::test]
+async fn model_visible_schema_lookup_does_not_materialize_rollout_manifest() -> anyhow::Result<()> {
+    let (_, mut turn) = make_session_and_context().await;
+    turn.model_info.supports_search_tool = true;
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let hidden_tool = "hidden_manifest_counter_tool";
+    let visible_tool = "visible_manifest_counter_tool";
+    let dynamic_tools = vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        name: "codex_app".to_string(),
+        description: "Codex app tools.".to_string(),
+        tools: vec![
+            DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
+                name: hidden_tool.to_string(),
+                description: "Hidden until discovered.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                defer_loading: true,
+            }),
+            DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
+                name: visible_tool.to_string(),
+                description: "Visible immediately.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                defer_loading: false,
+            }),
+        ],
+    })];
+    let router = ToolRouter::from_context(
+        step_context.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            deferred_mcp_tools: None,
+            mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &dynamic_tools,
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    );
+
+    let base_schemas = router.model_visible_schemas_for_turn(turn.as_ref());
+    assert_eq!(router.schema_snapshot_build_count(), 1);
+    assert_eq!(router.manifest_snapshot_build_count(), 0);
+
+    let definition = router.tool_manifest_for_rollout(turn.as_ref(), None);
+    assert_eq!(router.schema_snapshot_build_count(), 1);
+    assert_eq!(router.manifest_snapshot_build_count(), 1);
+    assert_eq!(
+        definition
+            .manifest
+            .as_ref()
+            .expect("the first rollout item must define the manifest")["model_visible"],
+        serde_json::to_value(base_schemas.specs())?
+    );
+    let reference = router.tool_manifest_for_rollout(turn.as_ref(), Some(definition.hash.as_str()));
+    assert!(reference.is_reference());
+    assert_eq!(router.manifest_snapshot_build_count(), 1);
+
+    let hidden_name = router
+        .registered_tool_names_for_test()
+        .into_iter()
+        .find(|name| name.to_string().contains(hidden_tool))
+        .expect("registered deferred dynamic tool name");
+    let first_capability_revisions = router.deferred_tool_capability_revisions();
+    let second_capability_revisions = router.deferred_tool_capability_revisions();
+    assert!(Arc::ptr_eq(
+        &first_capability_revisions,
+        &second_capability_revisions
+    ));
+    assert_eq!(router.deferred_tool_capability_revision_build_count(), 1);
+    turn.refresh_deferred_tool_capabilities(first_capability_revisions);
+    turn.activate_deferred_tools([hidden_name.clone()]);
+    let activated_schemas = router.model_visible_schemas_for_turn(turn.as_ref());
+    assert_eq!(router.schema_snapshot_build_count(), 2);
+    assert_eq!(router.manifest_snapshot_build_count(), 1);
+    assert!(
+        namespace_function_names(activated_schemas.specs(), "codex_app")
+            .iter()
+            .any(|name| name == hidden_tool)
+    );
+
+    let activated_definition =
+        router.tool_manifest_for_rollout(turn.as_ref(), Some(definition.hash.as_str()));
+    assert!(!activated_definition.is_reference());
+    assert_ne!(activated_definition.hash, definition.hash);
+    assert_eq!(router.schema_snapshot_build_count(), 2);
+    assert_eq!(router.manifest_snapshot_build_count(), 2);
+    assert_eq!(
+        activated_definition
+            .manifest
+            .as_ref()
+            .expect("the activated surface must define its manifest")["model_visible"],
+        serde_json::to_value(activated_schemas.specs())?
+    );
+
+    turn.release_advertised_deferred_tools(&HashSet::from([hidden_name]));
+    let base_again =
+        router.tool_manifest_for_rollout(turn.as_ref(), Some(activated_definition.hash.as_str()));
+    assert!(!base_again.is_reference());
+    assert_eq!(base_again.hash, definition.hash);
+    assert_eq!(router.schema_snapshot_build_count(), 2);
+    assert_eq!(router.manifest_snapshot_build_count(), 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn serialized_tool_surface_cache_reuses_identical_activation_sets_across_turns() {
+    let (_first_session, first_turn) = make_session_and_context().await;
+    let (_second_session, mut second_turn) = make_session_and_context().await;
+    second_turn.sub_id = "second-turn".to_string();
+    assert_ne!(first_turn.sub_id, second_turn.sub_id);
+    let router = ToolRouter::from_parts_with_warnings_and_identity(
+        ToolRegistry::empty_for_test(),
+        Vec::new(),
+        Vec::new(),
+        ToolExposureIdentity::default(),
+    );
+
+    let first = router.model_visible_schemas_for_turn(&first_turn);
+    let second = router.model_visible_schemas_for_turn(&second_turn);
+
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(
+        router.tool_manifest(&first_turn),
+        router.tool_manifest(&second_turn)
+    );
 }
 
 struct ExtensionEchoContributor;
@@ -614,52 +820,6 @@ fn mcp_tool_info(
 }
 
 #[test]
-fn mcp_read_only_intent_requires_consistent_metadata() {
-    let mut read_only = mcp_tool_info("reader", false, "mcp__reader", "lookup");
-    read_only.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
-    let read_only_tools = [read_only];
-    let callable_name = ToolName::namespaced("mcp__reader", "lookup");
-    assert!(
-        collect_proven_read_only_external_tools(Some(&read_only_tools), None)
-            .contains(&callable_name)
-    );
-
-    let mut conflicting = mcp_tool_info("reader", false, "mcp__reader", "lookup");
-    conflicting.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(false));
-    let conflicting_tools = [conflicting];
-    assert!(
-        !collect_proven_read_only_external_tools(Some(&read_only_tools), Some(&conflicting_tools),)
-            .contains(&callable_name)
-    );
-}
-
-#[test]
-fn repository_inspection_allowlist_fills_missing_mcp_annotations() {
-    let repo_atlas = mcp_tool_info("repo_atlas", false, "mcp__repo_atlas", "context_for");
-    let github = mcp_tool_info("github", false, "mcp__codex_apps__github", "fetch_file");
-    let mut explicitly_mutating =
-        mcp_tool_info("repo_atlas", false, "mcp__repo_atlas", "context_for");
-    explicitly_mutating.tool.annotations =
-        Some(rmcp::model::ToolAnnotations::new().read_only(false));
-    let tools = [repo_atlas, github];
-    let collected = collect_proven_read_only_external_tools(Some(&tools), None);
-    assert!(collected.contains(&ToolName::namespaced("mcp__repo_atlas", "context_for")));
-    assert!(collected.contains(&ToolName::namespaced(
-        "mcp__codex_apps__github",
-        "fetch_file"
-    )));
-
-    let mutating_tools = [
-        mcp_tool_info("repo_atlas", false, "mcp__repo_atlas", "write_file"),
-        mcp_tool_info("github", false, "mcp__codex_apps__github", "create_branch"),
-        mcp_tool_info("spoof", false, "mcp__other", "context_for"),
-        explicitly_mutating,
-    ];
-    let collected = collect_proven_read_only_external_tools(Some(&mutating_tools), None);
-    assert!(collected.is_empty());
-}
-
-#[test]
 fn independent_review_policy_allows_inspection_and_denies_mutation() {
     let sources = [
         SessionSource::SubAgent(SubAgentSource::Review),
@@ -765,6 +925,23 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
     turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
     let (attempt_id, store) =
         enable_typed_router_task(&mut session, &mut turn, &repo, "tracked.txt").await;
+    let assignment_id = session
+        .services
+        .agent_control
+        .task_coordinator()
+        .binding_for_source(&turn.session_source)
+        .expect("typed task binding")
+        .assignment_id;
+    let capsule_dir = repo
+        .join(".typed-task-home")
+        .join("agent-task-coordination")
+        .join("task_capsules");
+    std::fs::create_dir_all(&capsule_dir).expect("create capsule directory");
+    std::fs::write(
+        capsule_dir.join(format!("{assignment_id}.json")),
+        "{not-json",
+    )
+    .expect("write corrupt task capsule");
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
     let router = ToolRouter::from_context(
@@ -797,7 +974,7 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
         internal_chat_message_metadata_passthrough: None,
     })?
     .expect("custom tool call");
-    let terminal_outcome_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let terminal_outcome_reached = admitted_tool_dispatch_state();
     router
         .dispatch_tool_call_with_terminal_outcome(
             Arc::new(session),
@@ -809,7 +986,7 @@ async fn router_apply_patch_finalizes_typed_mutation_evidence() -> anyhow::Resul
             Arc::clone(&terminal_outcome_reached),
         )
         .await?;
-    assert!(terminal_outcome_reached.load(std::sync::atomic::Ordering::Acquire));
+    assert!(terminal_outcome_reached.is_terminal());
     assert_eq!(
         std::fs::read_to_string(repo.join("tracked.txt")).expect("read patched file"),
         "after\n"
@@ -886,7 +1063,7 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
         internal_chat_message_metadata_passthrough: None,
     })?
     .expect("function_call should produce a tool call");
-    let terminal_outcome_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let terminal_outcome_reached = admitted_tool_dispatch_state();
     let result = router
         .dispatch_tool_call_with_terminal_outcome(
             Arc::new(session),
@@ -898,7 +1075,7 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
             Arc::clone(&terminal_outcome_reached),
         )
         .await?;
-    assert!(terminal_outcome_reached.load(std::sync::atomic::Ordering::Acquire));
+    assert!(terminal_outcome_reached.is_terminal());
 
     let response = result.into_response();
     match response {

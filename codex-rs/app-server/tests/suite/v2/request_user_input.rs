@@ -1,8 +1,10 @@
+use anyhow::Context;
 use anyhow::Result;
 use app_test_support::TestAppServer;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::to_response;
+use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
@@ -10,8 +12,10 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestResolvedNotification;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -162,6 +166,144 @@ async fn request_user_input_round_trip() -> Result<()> {
 
     Ok(())
 }
+
+#[derive(Clone, Copy)]
+enum FailedUserInputClientResponse {
+    ClientError,
+    MalformedResponse,
+}
+
+async fn assert_failed_user_input_response_interrupts_turn(
+    failed_response: FailedUserInputClientResponse,
+) -> Result<()> {
+    let codex_home = tempfile::TempDir::new()?;
+    let responses = vec![
+        create_request_user_input_sse_response_with_auto_resolution(
+            "call1", /*auto_resolution_ms*/ 60_000,
+        )?,
+        create_final_assistant_message_sse_response("must not be requested")?,
+    ];
+    let server = create_mock_responses_server_sequence(responses).await;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response(thread_start_resp)?;
+
+    let turn_start_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            input: vec![V2UserInput::Text {
+                text: "ask something".to_string(),
+                text_elements: Vec::new(),
+            }],
+            model: Some("mock-model".to_string()),
+            effort: Some(ReasoningEffort::Medium),
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Plan,
+                settings: Settings {
+                    model: "mock-model".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    developer_instructions: None,
+                },
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let turn_start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
+    )
+    .await??;
+    let TurnStartResponse { turn, .. } = to_response(turn_start_resp)?;
+
+    let server_req = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_request_message(),
+    )
+    .await??;
+    let ServerRequest::ToolRequestUserInput { request_id, .. } = server_req else {
+        panic!("expected ToolRequestUserInput request, got: {server_req:?}");
+    };
+
+    match failed_response {
+        FailedUserInputClientResponse::ClientError => {
+            mcp.send_error(
+                request_id,
+                JSONRPCErrorError {
+                    code: -32_000,
+                    message: "client could not collect an answer".to_string(),
+                    data: None,
+                },
+            )
+            .await?;
+        }
+        FailedUserInputClientResponse::MalformedResponse => {
+            mcp.send_response(request_id, json!({ "answers": "not-an-answer-map" }))
+                .await?;
+        }
+    }
+
+    let completed = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let completed: TurnCompletedNotification = serde_json::from_value(
+        completed
+            .params
+            .expect("turn/completed params must be present"),
+    )?;
+    assert_eq!(completed.thread_id, thread.id);
+    assert_eq!(completed.turn.id, turn.id);
+    assert_eq!(completed.turn.status, TurnStatus::Interrupted);
+
+    let requests = server
+        .received_requests()
+        .await
+        .context("failed to fetch received requests")?;
+    let response_request_count = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .count();
+    assert_eq!(
+        response_request_count, 1,
+        "a failed client response must not trigger follow-up sampling"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_user_input_client_error_interrupts_turn() -> Result<()> {
+    assert_failed_user_input_response_interrupts_turn(FailedUserInputClientResponse::ClientError)
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_user_input_malformed_response_interrupts_turn() -> Result<()> {
+    assert_failed_user_input_response_interrupts_turn(
+        FailedUserInputClientResponse::MalformedResponse,
+    )
+    .await
+}
+
 fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io::Result<()> {
     let config_toml = codex_home.join("config.toml");
     std::fs::write(

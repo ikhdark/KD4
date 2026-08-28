@@ -615,6 +615,7 @@ async fn handle_exec_approval(
         environment_id,
         command,
         cwd,
+        cwd_uri,
         reason,
         network_approval_context,
         proposed_execpolicy_amendment,
@@ -631,7 +632,7 @@ async fn handle_exec_approval(
             GuardianApprovalRequest::Shell {
                 id: call_id.clone(),
                 command,
-                cwd,
+                cwd: cwd.clone(),
                 sandbox_permissions: if additional_permissions.is_some() {
                     crate::sandboxing::SandboxPermissions::WithAdditionalPermissions
                 } else {
@@ -645,7 +646,7 @@ async fn handle_exec_approval(
             review_cancel.clone(),
         );
         await_approval_with_cancel(
-            async move { review_rx.await.unwrap_or_default() },
+            review_rx,
             parent_session,
             &approval_id_for_op,
             cancel_token,
@@ -660,7 +661,7 @@ async fn handle_exec_approval(
                 approval_id,
                 environment_id,
                 command,
-                cwd,
+                cwd_uri.unwrap_or_else(|| PathUri::from_abs_path(&cwd)),
                 reason,
                 network_approval_context,
                 proposed_execpolicy_amendment,
@@ -750,7 +751,7 @@ async fn handle_patch_approval(
         );
         Some(
             await_approval_with_cancel(
-                async move { review_rx.await.unwrap_or_default() },
+                review_rx,
                 parent_session,
                 &approval_id,
                 cancel_token,
@@ -982,7 +983,7 @@ async fn maybe_auto_review_mcp_request_user_input(
         review_cancel.clone(),
     );
     let decision = await_approval_with_cancel(
-        async move { review_rx.await.unwrap_or_default() },
+        review_rx,
         parent_session,
         &event.call_id,
         cancel_token,

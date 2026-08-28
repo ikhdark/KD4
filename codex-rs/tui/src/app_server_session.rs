@@ -844,7 +844,7 @@ impl AppServerSession {
         output_schema: Option<serde_json::Value>,
     ) -> Result<TurnStartResponse> {
         let request_id = self.next_request_id();
-        let (sandbox_policy, permissions) =
+        let (sandbox_policy, permission_profile, permissions) =
             turn_permissions_overrides(permissions_override, cwd.as_path());
         self.client
             .request_typed(ClientRequest::TurnStart {
@@ -862,6 +862,7 @@ impl AppServerSession {
                     approval_policy: Some(approval_policy),
                     approvals_reviewer: Some(approvals_reviewer.into()),
                     sandbox_policy,
+                    permission_profile,
                     permissions,
                     model: Some(model),
                     service_tier,
@@ -1331,11 +1332,13 @@ fn turn_permissions_overrides(
     cwd: &std::path::Path,
 ) -> (
     Option<codex_app_server_protocol::SandboxPolicy>,
+    Option<PermissionProfile>,
     Option<String>,
 ) {
     match permissions_override {
-        TurnPermissionsOverride::Preserve => (None, None),
+        TurnPermissionsOverride::Preserve => (None, None, None),
         TurnPermissionsOverride::ActiveProfile(active_permission_profile) => (
+            None,
             None,
             Some(permission_profile_id_from_active_profile(
                 active_permission_profile,
@@ -1350,7 +1353,7 @@ fn turn_permissions_overrides(
                         "legacy-compatible permissions must project to legacy policy: {err}"
                     )
                 });
-            (Some(policy.into()), None)
+            (Some(policy.into()), Some(permission_profile), None)
         }
     }
 }
@@ -1503,6 +1506,7 @@ async fn thread_session_state_from_thread_start_response(
     thread_params_mode: ThreadParamsMode,
 ) -> Result<ThreadSessionState, String> {
     let permission_profile = display_permission_profile_from_thread_response(
+        response.permission_profile.as_ref(),
         &response.sandbox,
         response.cwd.as_path(),
         config,
@@ -1534,7 +1538,10 @@ async fn thread_session_state_from_thread_resume_response(
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> Result<ThreadSessionState, String> {
-    let permission_profile = if matches!(thread_params_mode, ThreadParamsMode::Embedded)
+    let permission_profile = if let Some(permission_profile) = response.permission_profile.as_ref()
+    {
+        permission_profile.clone()
+    } else if matches!(thread_params_mode, ThreadParamsMode::Embedded)
         && response.active_permission_profile.is_none()
     {
         PermissionProfile::from_legacy_sandbox_policy_for_cwd(
@@ -1543,6 +1550,7 @@ async fn thread_session_state_from_thread_resume_response(
         )
     } else {
         display_permission_profile_from_thread_response(
+            None,
             &response.sandbox,
             response.cwd.as_path(),
             config,
@@ -1576,6 +1584,7 @@ async fn thread_session_state_from_thread_fork_response(
     thread_params_mode: ThreadParamsMode,
 ) -> Result<ThreadSessionState, String> {
     let permission_profile = display_permission_profile_from_thread_response(
+        response.permission_profile.as_ref(),
         &response.sandbox,
         response.cwd.as_path(),
         config,
@@ -1603,11 +1612,15 @@ async fn thread_session_state_from_thread_fork_response(
 }
 
 fn display_permission_profile_from_thread_response(
+    permission_profile: Option<&PermissionProfile>,
     sandbox: &codex_app_server_protocol::SandboxPolicy,
     cwd: &std::path::Path,
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> PermissionProfile {
+    if let Some(permission_profile) = permission_profile {
+        return permission_profile.clone();
+    }
     match thread_params_mode {
         ThreadParamsMode::Embedded => config.permissions.effective_permission_profile(),
         ThreadParamsMode::Remote => {
@@ -1859,12 +1872,13 @@ mod tests {
         let expected_permissions =
             permission_profile_id_from_active_profile(active_permission_profile.clone());
 
-        let (sandbox_policy, permissions) = turn_permissions_overrides(
+        let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
             TurnPermissionsOverride::ActiveProfile(active_permission_profile),
             cwd.as_path(),
         );
 
         assert_eq!(sandbox_policy, None);
+        assert_eq!(permission_profile, None);
         assert_eq!(permissions, Some(expected_permissions));
     }
 
@@ -1874,12 +1888,13 @@ mod tests {
         let active_permission_profile =
             ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE);
 
-        let (sandbox_policy, permissions) = turn_permissions_overrides(
+        let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
             TurnPermissionsOverride::ActiveProfile(active_permission_profile),
             cwd.as_path(),
         );
 
         assert_eq!(sandbox_policy, None);
+        assert_eq!(permission_profile, None);
         assert_eq!(
             permissions,
             Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string())
@@ -1890,10 +1905,11 @@ mod tests {
     fn turn_permissions_preserve_thread_permissions_without_override() {
         let cwd = test_path_buf("/workspace/project").abs();
 
-        let (sandbox_policy, permissions) =
+        let (sandbox_policy, permission_profile, permissions) =
             turn_permissions_overrides(TurnPermissionsOverride::Preserve, cwd.as_path());
 
         assert_eq!(sandbox_policy, None);
+        assert_eq!(permission_profile, None);
         assert_eq!(permissions, None);
     }
 
@@ -1901,8 +1917,9 @@ mod tests {
     fn legacy_turn_permissions_project_to_sandbox_when_explicitly_overridden() {
         let cwd = test_path_buf("/workspace/project").abs();
 
-        let (sandbox_policy, permissions) = turn_permissions_overrides(
-            TurnPermissionsOverride::LegacySandbox(PermissionProfile::read_only()),
+        let requested_profile = PermissionProfile::read_only();
+        let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
+            TurnPermissionsOverride::LegacySandbox(requested_profile.clone()),
             cwd.as_path(),
         );
 
@@ -1912,6 +1929,7 @@ mod tests {
                 network_access: false
             })
         );
+        assert_eq!(permission_profile, Some(requested_profile));
         assert_eq!(permissions, None);
     }
 
@@ -1922,12 +1940,13 @@ mod tests {
         let expected_permissions =
             permission_profile_id_from_active_profile(active_permission_profile.clone());
 
-        let (sandbox_policy, permissions) = turn_permissions_overrides(
+        let (sandbox_policy, permission_profile, permissions) = turn_permissions_overrides(
             TurnPermissionsOverride::ActiveProfile(active_permission_profile),
             cwd.as_path(),
         );
 
         assert_eq!(sandbox_policy, None);
+        assert_eq!(permission_profile, None);
         assert_eq!(permissions, Some(expected_permissions));
     }
 
@@ -2275,6 +2294,7 @@ mod tests {
             model_provider: "openai".to_string(),
             service_tier: None,
             cwd: test_path_buf("/tmp/project").abs(),
+            selected_environment: None,
             runtime_workspace_roots: vec![
                 test_path_buf("/tmp/project").abs(),
                 test_path_buf("/tmp/project/extra").abs(),
@@ -2288,6 +2308,7 @@ mod tests {
                 .to_legacy_sandbox_policy(test_path_buf("/tmp/project").as_path())
                 .expect("read-only profile must be legacy-compatible")
                 .into(),
+            permission_profile: Some(read_only_profile.clone()),
             active_permission_profile: None,
             reasoning_effort: None,
             initial_turns_page: None,
@@ -2355,12 +2376,35 @@ mod tests {
 
         assert_eq!(
             display_permission_profile_from_thread_response(
+                None,
                 &sandbox,
                 cwd.as_path(),
                 &config,
                 ThreadParamsMode::Remote,
             ),
             PermissionProfile::read_only()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_thread_response_prefers_canonical_permission_profile() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let cwd = test_path_buf("/tmp/project").abs();
+        let sandbox = PermissionProfile::read_only()
+            .to_legacy_sandbox_policy(cwd.as_path())
+            .expect("read-only profile must be legacy-compatible")
+            .into();
+
+        assert_eq!(
+            display_permission_profile_from_thread_response(
+                Some(&PermissionProfile::Disabled),
+                &sandbox,
+                cwd.as_path(),
+                &config,
+                ThreadParamsMode::Remote,
+            ),
+            PermissionProfile::Disabled
         );
     }
 
@@ -2380,6 +2424,7 @@ mod tests {
 
         assert_eq!(
             display_permission_profile_from_thread_response(
+                None,
                 &codex_app_server_protocol::SandboxPolicy::DangerFullAccess,
                 cwd.as_path(),
                 &config,

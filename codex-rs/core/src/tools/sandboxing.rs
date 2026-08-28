@@ -20,11 +20,12 @@ use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::request_permissions::UriAdditionalPermissionProfile;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
-use codex_sandboxing::policy_transforms::effective_permission_profile;
+use codex_sandboxing::policy_transforms::effective_permission_profile_uri;
 use codex_sandboxing::transform;
 use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -400,6 +401,15 @@ pub(crate) trait Sandboxable {
     fn escalate_on_failure(&self) -> bool {
         true
     }
+
+    /// Whether a completed sandbox-denial result is proven safe to replay.
+    ///
+    /// Sandbox denials can be inferred from output after a process or patch has
+    /// already produced side effects. Runtimes must opt in only when they can
+    /// prove the denied attempt was not dispatched.
+    fn sandbox_denial_replay_is_safe(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct ToolCtx {
@@ -437,6 +447,7 @@ pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
 }
 
 pub(crate) struct SandboxAttempt<'a> {
+    pub(crate) codex_home: &'a AbsolutePathBuf,
     pub sandbox: SandboxType,
     /// Whether policy requested sandboxing, independent of this host's concrete wrapper.
     pub sandbox_requested: bool,
@@ -484,6 +495,7 @@ impl<'a> SandboxAttempt<'a> {
             request,
             options,
             self.workspace_roots.to_vec(),
+            self.codex_home.clone(),
         )
     }
 
@@ -493,12 +505,13 @@ impl<'a> SandboxAttempt<'a> {
         options: ExecOptions,
         network: Option<&NetworkProxy>,
         environment_id: Option<&str>,
+        additional_permissions_uri: Option<&UriAdditionalPermissionProfile>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
         let network = self.network_proxy(network);
         let managed_network = command.managed_network.clone();
-        let exec_server_permissions = effective_permission_profile(
+        let exec_server_permissions = effective_permission_profile_uri(
             self.exec_server_permissions,
-            command.additional_permissions.as_ref(),
+            additional_permissions_uri,
         );
         let request = transform(SandboxTransformRequest {
             command,
@@ -517,11 +530,12 @@ impl<'a> SandboxAttempt<'a> {
             request,
             options,
             self.workspace_roots.to_vec(),
+            self.codex_home.clone(),
         )?;
         exec_request.exec_server_managed_network = managed_network;
         if self.sandbox_requested {
             exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {
-                permissions: exec_server_permissions.into(),
+                permissions: exec_server_permissions,
                 cwd: Some(exec_request.windows_sandbox_policy_cwd.clone()),
                 workspace_roots: Vec::new(),
                 windows_sandbox_level: self.windows_sandbox_level,

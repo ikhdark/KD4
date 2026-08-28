@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::shell::ShellType;
 use crate::tools::handlers::command_shape::CommandInvocation;
+use codex_shell_command::quote_powershell_single_quoted;
 
 #[cfg(test)]
 use super::command_search::RgSearchBreadth;
@@ -49,6 +50,7 @@ struct CommandPreflightIssue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandPreflightOutcome {
     pub(crate) invocation: CommandInvocation,
+    pub(crate) validation_invocations: Vec<CommandInvocation>,
     pub(crate) repair_notice: Option<String>,
 }
 
@@ -156,13 +158,15 @@ pub(crate) fn preflight_command(
     command: &[String],
     shell_type: Option<ShellType>,
 ) -> Result<(), String> {
-    preflight_command_issue(command, shell_type).map_err(|issue| issue.render_for_model())
+    preflight_command_issue(command, shell_type)
+        .map(|_| ())
+        .map_err(|issue| issue.render_for_model())
 }
 
 fn preflight_command_issue(
     command: &[String],
     shell_type: Option<ShellType>,
-) -> Result<(), CommandPreflightIssue> {
+) -> Result<Vec<Vec<String>>, CommandPreflightIssue> {
     let preflight_shell_type = shell_type.or_else(|| infer_direct_shell_type(command));
     let Some(argv_commands) = argv_commands(command, preflight_shell_type) else {
         let rejected = shell_script(command, preflight_shell_type)
@@ -189,16 +193,17 @@ fn preflight_command_issue(
         lint_windows_path_shape(script, preflight_shell_type, &argv_commands)?;
     }
 
-    for argv in argv_commands {
-        lint_direct_argv_powershell_cmdlet(&argv, preflight_shell_type)?;
-        lint_known_flag_typos(&argv)?;
-        lint_rg_glob_path_separators(&argv)?;
-        lint_rg_literal_glob_paths(&argv, preflight_shell_type)?;
+    for argv in &argv_commands {
+        lint_direct_argv_powershell_cmdlet(argv, preflight_shell_type)?;
+        lint_known_flag_typos(argv)?;
+        lint_rg_glob_path_separators(argv)?;
+        lint_rg_literal_glob_paths(argv, preflight_shell_type)?;
     }
 
-    Ok(())
+    Ok(argv_commands)
 }
 
+#[cfg(test)]
 pub(crate) fn preflight_invocation_with_equivalent_repair(
     invocation: &CommandInvocation,
     command: &[String],
@@ -208,32 +213,54 @@ pub(crate) fn preflight_invocation_with_equivalent_repair(
         .map_err(|issue| issue.render_for_model())
 }
 
+pub(crate) async fn preflight_invocation_with_equivalent_repair_async(
+    invocation: &CommandInvocation,
+    command: &[String],
+    shell_type: Option<ShellType>,
+) -> Result<CommandPreflightOutcome, String> {
+    let invocation = invocation.clone();
+    let command = command.to_vec();
+    crate::tools::run_blocking_command_analysis(move || {
+        preflight_invocation_with_equivalent_repair_detailed(&invocation, &command, shell_type)
+            .map_err(|issue| issue.render_for_model())
+    })
+    .await
+    .map_err(|error| format!("command preflight worker failed: {error}"))?
+}
+
 fn preflight_invocation_with_equivalent_repair_detailed(
     invocation: &CommandInvocation,
     command: &[String],
     shell_type: Option<ShellType>,
 ) -> Result<CommandPreflightOutcome, CommandPreflightIssue> {
     let issue = match preflight_command_issue(command, shell_type) {
-        Ok(()) => {
+        Ok(argv_commands) => {
             if let Some(repaired) = git_status_read_only_equivalent(invocation) {
                 let Some(repaired_command) = repaired.to_direct_argv() else {
                     return Ok(CommandPreflightOutcome {
                         invocation: invocation.clone(),
+                        validation_invocations: validation_invocations(argv_commands, invocation),
                         repair_notice: None,
                     });
                 };
-                preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
+                let repaired_argv_commands =
+                    preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
                 return Ok(CommandPreflightOutcome {
                     repair_notice: Some(read_only_repair_notice(
                         CommandPreflightIssueCode::GitStatusOptionalLocks,
                         invocation,
                         &repaired,
                     )),
+                    validation_invocations: validation_invocations(
+                        repaired_argv_commands,
+                        &repaired,
+                    ),
                     invocation: repaired,
                 });
             }
             return Ok(CommandPreflightOutcome {
                 invocation: invocation.clone(),
+                validation_invocations: validation_invocations(argv_commands, invocation),
                 repair_notice: None,
             });
         }
@@ -273,13 +300,37 @@ fn preflight_invocation_with_equivalent_repair_detailed(
     };
     // One repair is the hard limit. If the repaired command has another issue,
     // reject it rather than chaining mechanical transformations.
-    preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
+    let repaired_argv_commands =
+        preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
 
     let repair_notice = read_only_repair_notice(issue.code, invocation, &repaired);
     Ok(CommandPreflightOutcome {
+        validation_invocations: validation_invocations(repaired_argv_commands, &repaired),
         invocation: repaired,
         repair_notice: Some(repair_notice),
     })
+}
+
+fn validation_invocations(
+    argv_commands: Vec<Vec<String>>,
+    fallback: &CommandInvocation,
+) -> Vec<CommandInvocation> {
+    let invocations = argv_commands
+        .into_iter()
+        .filter_map(|argv| {
+            let mut arguments = argv.into_iter();
+            let program = arguments.next()?;
+            Some(CommandInvocation::Argv {
+                program,
+                args: arguments.collect(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if invocations.is_empty() {
+        vec![fallback.clone()]
+    } else {
+        invocations
+    }
 }
 
 fn git_status_read_only_equivalent(invocation: &CommandInvocation) -> Option<CommandInvocation> {
@@ -319,7 +370,7 @@ fn json_string(value: &str) -> String {
 }
 
 pub(crate) fn powershell_single_quoted_literal(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+    quote_powershell_single_quoted(&path.to_string_lossy())
 }
 
 pub(crate) fn powershell_literal_path_arg(path: &Path) -> Vec<String> {
@@ -331,10 +382,6 @@ pub(crate) fn powershell_literal_path_arg(path: &Path) -> Vec<String> {
 
 pub(crate) fn cmd_quoted_path(path: &Path) -> String {
     format!("\"{}\"", path.to_string_lossy().replace('"', "\"\""))
-}
-
-pub(crate) fn posix_single_quoted(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
 fn shell_script(command: &[String], shell_type: Option<ShellType>) -> Option<Cow<'_, str>> {
@@ -657,7 +704,7 @@ fn lint_shell_mismatch(
                 CommandPreflightRejected::Script(script.to_string()),
                 "this looks like POSIX shell syntax, but the target shell is PowerShell."
                     .to_string(),
-                Some("rewrite the command for PowerShell or select a POSIX shell.".to_string()),
+                Some("rewrite the command for PowerShell.".to_string()),
                 None,
             ))
         }
@@ -721,9 +768,8 @@ fn lint_windows_path_shape(
             "PowerShell filesystem paths with spaces or wildcard characters should use `-LiteralPath`."
                 .to_string(),
             Some(format!(
-                "pass the path as `{powershell_example}`.\nPath quoting examples: cmd {}, POSIX {}.",
+                "pass the path as `{powershell_example}`.\ncmd quoting example: {}.",
                 cmd_quoted_path(example_path),
-                posix_single_quoted(Path::new("/path with spaces/[name]")),
             )),
             None,
         ));

@@ -3,7 +3,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
-use anyhow::anyhow;
 use codex_exec_server::ExecServerError;
 use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
@@ -16,6 +15,7 @@ use crate::http_client_adapter::StreamableHttpClientAdapterError;
 use crate::http_client_adapter::is_retryable_http_status;
 use crate::oauth::OAuthPersistor;
 
+use super::InitializeTimeoutError;
 use super::PendingTransport;
 use super::RmcpClient;
 
@@ -86,9 +86,7 @@ impl RmcpClient {
                     );
                     if !sleep_with_retry_deadline(delay, retry_deadline).await {
                         let duration = timeout.unwrap_or(delay);
-                        return Err(anyhow!(
-                            "timed out handshaking with MCP server after {duration:?}"
-                        ));
+                        return Err(anyhow::Error::new(InitializeTimeoutError { duration }));
                     }
                 }
                 Err(error) => return Err(error),
@@ -183,7 +181,7 @@ fn remaining_initialize_timeout(
 
 fn initialize_timeout_error(timeout: Option<Duration>, fallback: Duration) -> anyhow::Error {
     let duration = timeout.unwrap_or(fallback);
-    anyhow!("timed out handshaking with MCP server after {duration:?}")
+    anyhow::Error::new(InitializeTimeoutError { duration })
 }
 
 pub(super) async fn sleep_with_retry_deadline(delay: Duration, deadline: Option<Instant>) -> bool {

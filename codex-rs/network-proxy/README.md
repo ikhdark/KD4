@@ -43,8 +43,8 @@ mode = "full" # default when unset; use "limited" for read-only mode
 # Hostnames that resolve to local/private IPs are still blocked even if allowlisted.
 allow_local_binding = false
 
-# DANGEROUS (macOS-only): bypasses unix socket allowlisting and permits any
-# absolute socket path from `x-unix-socket`.
+# Compatibility-only on Windows. The field remains readable, but Windows rejects
+# `x-unix-socket` requests before opening a socket.
 dangerously_allow_all_unix_sockets = false
 
 # Hosts must match the allowlist (unless denied).
@@ -69,14 +69,14 @@ action = ["strip_auth"]
 [permissions.workspace.network.mitm.actions.strip_auth]
 strip_request_headers = ["authorization"]
 
-# macOS-only: allows proxying to a unix socket when request includes `x-unix-socket: /path`.
+# Compatibility-only persisted shape. Windows does not execute unix-socket requests.
 [permissions.workspace.network.unix_sockets]
-"/tmp/example.sock" = "allow"
+"C:\\Temp\\example.sock" = "allow"
 ```
 
 ### 2) Run the proxy
 
-```bash
+```powershell
 cargo run -p codex-network-proxy --
 ```
 
@@ -196,8 +196,9 @@ Audit events intentionally avoid logging full URL/path/query data.
 
 ## Platform notes
 
-- Unix socket proxying via the `x-unix-socket` header is **macOS-only**; other platforms will
-  reject unix socket requests.
+- This proxy runs on Windows only.
+- Legacy unix-socket configuration and `x-unix-socket` request shapes remain readable for
+  compatibility, but Windows rejects those requests before filesystem or socket access.
 - HTTPS tunneling uses rustls via Rama's `rama-tls-rustls`; this avoids BoringSSL/OpenSSL symbol
   collisions in mixed TLS dependency graphs.
 
@@ -222,8 +223,8 @@ what it can reasonably guarantee.
     `dangerously_allow_non_loopback_proxy`
 - when unix socket proxying is enabled, all proxy listeners are forced to loopback to avoid turning the
     proxy into a remote bridge into local daemons.
-- `dangerously_allow_all_unix_sockets = true` bypasses the unix socket allowlist entirely (still
-  macOS-only and absolute-path-only). Use only in tightly controlled environments.
+- `dangerously_allow_all_unix_sockets` remains a compatibility field and does not enable
+  unix-socket access on Windows.
 - `enabled` is enforced at runtime; when false the proxy no-ops and does not bind listeners.
 Limitations:
 

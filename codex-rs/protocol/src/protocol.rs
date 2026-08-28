@@ -115,6 +115,10 @@ pub const APPS_INSTRUCTIONS_OPEN_TAG: &str = "<apps_instructions>";
 pub const APPS_INSTRUCTIONS_CLOSE_TAG: &str = "</apps_instructions>";
 pub const SKILLS_INSTRUCTIONS_OPEN_TAG: &str = "<skills_instructions>";
 pub const SKILLS_INSTRUCTIONS_CLOSE_TAG: &str = "</skills_instructions>";
+pub const EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG: &str = "<extension_skills_instructions>";
+pub const EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG: &str = "</extension_skills_instructions>";
+pub const ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG: &str = "<environment_skills_instructions>";
+pub const ENVIRONMENT_SKILLS_INSTRUCTIONS_CLOSE_TAG: &str = "</environment_skills_instructions>";
 pub const PLUGINS_INSTRUCTIONS_OPEN_TAG: &str = "<plugins_instructions>";
 pub const PLUGINS_INSTRUCTIONS_CLOSE_TAG: &str = "</plugins_instructions>";
 pub const COLLABORATION_MODE_OPEN_TAG: &str = "<collaboration_mode>";
@@ -805,8 +809,8 @@ pub enum SandboxPolicy {
         #[serde(default)]
         exclude_tmpdir_env_var: bool,
 
-        /// When set to `true`, will NOT include the `/tmp` among the default
-        /// writable roots on UNIX. Defaults to `false`.
+        /// Legacy persisted-data field for the retired `/tmp` writable root.
+        /// It is accepted but has no effect on Windows. Defaults to `false`.
         #[serde(default)]
         exclude_slash_tmp: bool,
     },
@@ -899,8 +903,8 @@ impl SandboxPolicy {
     }
 
     /// Returns a policy that can read the entire disk, but can only write to
-    /// the current working directory and the per-user tmp dir on macOS. It does
-    /// not allow network access.
+    /// the current working directory and configured Windows temporary roots.
+    /// It does not allow network access.
     pub fn new_workspace_write_policy() -> Self {
         SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
@@ -949,8 +953,8 @@ impl SandboxPolicy {
                 // Start from explicitly configured writable roots.
                 let mut roots: Vec<AbsolutePathBuf> = writable_roots.clone();
 
-                // Always include defaults: cwd, /tmp (if present on Unix), and
-                // on macOS, the per-user TMPDIR unless explicitly excluded.
+                // Always include the Windows working directory. The legacy
+                // exclusion fields remain readable for persisted policy data.
                 // TODO(mbolin): cwd param should be AbsolutePathBuf.
                 let cwd_absolute = AbsolutePathBuf::from_absolute_path(cwd);
                 match cwd_absolute {
@@ -968,10 +972,8 @@ impl SandboxPolicy {
                 let _ = exclude_slash_tmp;
 
                 // Include the configured temporary directory unless explicitly excluded.
-                // By comparison, TMPDIR is not guaranteed to be defined on
-                // Linux or Windows, but supporting it here gives users a way to
-                // provide the model with their own temporary directory without
-                // having to hardcode it in the config.
+                // TMPDIR is not guaranteed to be defined on Windows, but
+                // supporting it gives users a configurable temporary root.
                 if !exclude_tmpdir_env_var
                     && let Some(tmpdir) = std::env::var_os("TMPDIR")
                     && !tmpdir.is_empty()
@@ -1910,6 +1912,11 @@ pub struct TurnTiming {
     pub tool_calls: Vec<TurnTimingToolCall>,
     #[serde(default)]
     pub tool_call_timing_overflow: u32,
+    /// Exact accepted-call closure ledger. A terminal event is publishable only
+    /// when every accepted direct and nested execution has timing, a terminal
+    /// outcome, and exactly one persisted projection.
+    #[serde(default)]
+    pub tool_closure: TurnTimingToolClosure,
     /// Provider usage observed on generations where neither relevant
     /// structured state nor the next-correct-action changed. This is a
     /// diagnostic and is never treated as measured avoidable savings.
@@ -1959,6 +1966,84 @@ pub enum TurnTimingToolCallSource {
 #[serde(transparent)]
 #[ts(type = "string")]
 pub struct ToolExecutionId(pub String);
+
+/// Payload-free identity for one accepted tool execution in the terminal
+/// closure ledger.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingToolCallIdentity {
+    pub call_id: String,
+    pub execution_id: ToolExecutionId,
+    #[serde(default)]
+    pub source: TurnTimingToolCallSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub parent_call_id: Option<String>,
+    #[serde(default)]
+    pub sampling_generation_id: SamplingGenerationId,
+}
+
+/// Reconciliation summary for all accepted tool executions in a turn.
+///
+/// `complete` is true for a turn with no accepted calls. Otherwise it requires
+/// every accepted execution to have a timing record, terminal outcome, and
+/// exactly-once persisted projection, with no orphan or duplicate lifecycle
+/// records and no ledger overflow.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingToolClosure {
+    #[serde(default)]
+    pub accepted_count: u32,
+    #[serde(default)]
+    pub timing_paired_count: u32,
+    #[serde(default)]
+    pub terminal_count: u32,
+    #[serde(default)]
+    pub persisted_count: u32,
+    #[serde(default)]
+    pub duplicate_call_id_count: u32,
+    #[serde(default)]
+    pub duplicate_acceptance_count: u32,
+    #[serde(default)]
+    pub duplicate_timing_count: u32,
+    #[serde(default)]
+    pub duplicate_persistence_count: u32,
+    #[serde(default)]
+    pub orphan_timing_count: u32,
+    #[serde(default)]
+    pub orphan_persistence_count: u32,
+    #[serde(default)]
+    pub overflow_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_calls: Vec<TurnTimingToolCallIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orphan_calls: Vec<TurnTimingToolCallIdentity>,
+    #[serde(default)]
+    pub complete: bool,
+}
+
+impl Default for TurnTimingToolClosure {
+    fn default() -> Self {
+        Self {
+            accepted_count: 0,
+            timing_paired_count: 0,
+            terminal_count: 0,
+            persisted_count: 0,
+            duplicate_call_id_count: 0,
+            duplicate_acceptance_count: 0,
+            duplicate_timing_count: 0,
+            duplicate_persistence_count: 0,
+            orphan_timing_count: 0,
+            orphan_persistence_count: 0,
+            overflow_count: 0,
+            unresolved_calls: Vec::new(),
+            orphan_calls: Vec::new(),
+            complete: true,
+        }
+    }
+}
 
 /// Opaque identity for the sampling generation that emitted a tool call.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, Hash, JsonSchema, TS)]
@@ -2128,10 +2213,9 @@ pub struct TurnTimingToolCall {
     #[ts(type = "number | null")]
     pub delivered_at_ms: Option<u64>,
     /// The direct tool output was committed to model-visible conversation
-    /// history and the best-effort rollout persistence attempt returned.
-    /// This does not prove that a rollout recorder existed, that its append
-    /// succeeded, or that storage was flushed. Nested code-mode calls are
-    /// represented by the outer direct tool output and leave this absent.
+    /// history. Durable rollout persistence is tracked independently by the
+    /// tool-closure ledger. Nested code-mode calls are represented by the outer
+    /// direct tool output and leave this absent.
     #[serde(default)]
     #[ts(type = "number | null")]
     pub output_model_visible_at_ms: Option<u64>,
@@ -2235,10 +2319,6 @@ pub struct TurnTimingTerminalization {
     pub checkpoint_tokens: u64,
     #[serde(default)]
     pub validation_launch_count: u32,
-    #[serde(default)]
-    pub proof_reuse_count: u32,
-    #[serde(default)]
-    pub conservative_rerun_count: u32,
     #[serde(default)]
     pub validation_aggregate_count: u32,
     #[serde(default)]
@@ -3076,18 +3156,9 @@ pub struct TurnTimingCounters {
     /// Continuations drained and recorded by their code-mode owner.
     #[serde(default)]
     pub owner_drained_continuation_count: u32,
-    /// Validation commands that executed rather than reusing a proof.
+    /// Validation commands that executed.
     #[serde(default)]
     pub executed_validation_count: u32,
-    /// Validation results served from the authoritative validation ledger.
-    #[serde(default)]
-    pub reused_validation_count: u32,
-    /// Validation requests identified as duplicates and served from the ledger.
-    #[serde(default)]
-    pub duplicate_validation_count: u32,
-    /// Executed validation requests that explicitly bypassed reusable proof state.
-    #[serde(default)]
-    pub forced_fresh_validation_count: u32,
     /// Total wall-clock nanoseconds spent in validation commands that executed.
     #[serde(default)]
     pub executed_validation_duration_ns: u64,
@@ -5714,6 +5785,7 @@ pub enum TurnAbortReason {
     Replaced,
     ReviewEnded,
     BudgetLimited,
+    InternalError,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -6025,7 +6097,6 @@ mod tests {
             "internallyDrainedWaitCount",
             "residualDeterministicGenerationCount",
             "ownerDrainedContinuationCount",
-            "reusedValidationCount",
             "suppressedValidationOutputCount",
             "readyStartupPrewarmCount",
             "completionReviewReadyPhaseCount",
@@ -6088,7 +6159,6 @@ mod tests {
         assert_eq!(decoded.counters.internally_drained_wait_count, 0);
         assert_eq!(decoded.counters.residual_deterministic_generation_count, 0);
         assert_eq!(decoded.counters.owner_drained_continuation_count, 0);
-        assert_eq!(decoded.counters.reused_validation_count, 0);
         assert_eq!(decoded.counters.suppressed_validation_output_count, 0);
         assert_eq!(decoded.counters.ready_startup_prewarm_count, 0);
         assert_eq!(decoded.counters.completion_review_ready_phase_count, 0);
@@ -7430,6 +7500,17 @@ mod tests {
     }
 
     #[test]
+    fn internal_error_abort_reason_has_stable_wire_value() -> Result<()> {
+        let value = serde_json::to_value(TurnAbortReason::InternalError)?;
+        assert_eq!(value, json!("internal_error"));
+        assert_eq!(
+            serde_json::from_value::<TurnAbortReason>(value)?,
+            TurnAbortReason::InternalError
+        );
+        Ok(())
+    }
+
+    #[test]
     fn user_input_text_serializes_empty_text_elements() -> Result<()> {
         let input = UserInput::Text {
             text: "hello".to_string(),
@@ -8212,9 +8293,6 @@ mod tests {
         );
         assert_eq!(counters["suppressedDeterministicContinuationCount"], 0);
         assert_eq!(counters["executedValidationCount"], 0);
-        assert_eq!(counters["reusedValidationCount"], 0);
-        assert_eq!(counters["duplicateValidationCount"], 0);
-        assert_eq!(counters["forcedFreshValidationCount"], 0);
         assert_eq!(counters["executedValidationDurationNs"], 0);
         for removed in [
             "continuationsByDisposition",
@@ -8228,6 +8306,25 @@ mod tests {
             .expect("generation purpose counts");
         for removed in ["postEditInspection", "validationSelection"] {
             assert!(purpose_counts.get(removed).is_none());
+        }
+    }
+
+    #[test]
+    fn removed_validation_timing_fields_are_absent() {
+        let counters = serde_json::to_value(TurnTimingCounters::default())
+            .expect("turn timing counters serialization");
+        for removed in [
+            "reusedValidationCount",
+            "duplicateValidationCount",
+            "forcedFreshValidationCount",
+        ] {
+            assert!(counters.get(removed).is_none(), "{removed}");
+        }
+
+        let terminalization = serde_json::to_value(TurnTimingTerminalization::default())
+            .expect("turn timing terminalization serialization");
+        for removed in ["proofReuseCount", "conservativeRerunCount"] {
+            assert!(terminalization.get(removed).is_none(), "{removed}");
         }
     }
 

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ use super::InteractiveWaitKind;
 use super::MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS;
 use super::MAX_MODEL_REQUEST_PROGRESS_KINDS;
 use super::MAX_MODEL_REQUEST_TIMINGS;
+use super::MAX_TOOL_CALL_TIMINGS;
 use super::NextSampleBlockReason;
 use super::RESERVED_TOOL_OUTPUT_RECURSIVE_SPILL_COUNT;
 use super::TimeSample;
@@ -81,6 +83,113 @@ impl TurnClock for FakeClock {
     fn sample(&self) -> ClockSample {
         ClockSample {
             time: *self.sample.lock().expect("fake clock lock"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AdvancingClock {
+    next: Mutex<TimeSample>,
+    step_ns: u128,
+}
+
+impl AdvancingClock {
+    fn every_ms(step_ms: u128) -> Self {
+        Self {
+            next: Mutex::new(TimeSample {
+                monotonic_ns: 0,
+                wall_unix_ms: 0,
+            }),
+            step_ns: step_ms.saturating_mul(NS_PER_MS),
+        }
+    }
+}
+
+impl TurnClock for AdvancingClock {
+    fn sample(&self) -> ClockSample {
+        let mut next = self.next.lock().expect("advancing clock lock");
+        let sample = *next;
+        next.monotonic_ns = next.monotonic_ns.saturating_add(self.step_ns);
+        next.wall_unix_ms = next
+            .wall_unix_ms
+            .saturating_add(i64::try_from(self.step_ns / NS_PER_MS).unwrap_or(i64::MAX));
+        ClockSample { time: sample }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CoordinatedClockState {
+    sample_count: u8,
+    first_parallel_sample_waiting: bool,
+    release_first_parallel_sample: bool,
+    second_parallel_sample_observed: bool,
+}
+
+#[derive(Debug, Default)]
+struct CoordinatedClock {
+    state: Mutex<CoordinatedClockState>,
+    changed: Condvar,
+}
+
+impl CoordinatedClock {
+    fn wait_for_first_parallel_sample(&self) {
+        let state = self.state.lock().expect("coordinated clock lock");
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(1), |state| {
+                !state.first_parallel_sample_waiting
+            })
+            .expect("coordinated clock wait");
+        assert!(!timeout.timed_out());
+        assert!(state.first_parallel_sample_waiting);
+    }
+
+    fn second_parallel_sample_before_release(&self) -> bool {
+        let state = self.state.lock().expect("coordinated clock lock");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_millis(50), |state| {
+                !state.second_parallel_sample_observed
+            })
+            .expect("coordinated clock wait");
+        state.second_parallel_sample_observed
+    }
+
+    fn release_first_parallel_sample(&self) {
+        let mut state = self.state.lock().expect("coordinated clock lock");
+        state.release_first_parallel_sample = true;
+        self.changed.notify_all();
+    }
+}
+
+impl TurnClock for CoordinatedClock {
+    fn sample(&self) -> ClockSample {
+        let mut state = self.state.lock().expect("coordinated clock lock");
+        let sample_index = state.sample_count;
+        state.sample_count = state.sample_count.saturating_add(1);
+        let monotonic_ms = match sample_index {
+            0 => 0,
+            1 => {
+                state.first_parallel_sample_waiting = true;
+                self.changed.notify_all();
+                let _state = self
+                    .changed
+                    .wait_while(state, |state| !state.release_first_parallel_sample)
+                    .expect("coordinated clock wait");
+                10
+            }
+            2 => {
+                state.second_parallel_sample_observed = true;
+                self.changed.notify_all();
+                20
+            }
+            _ => 30,
+        };
+        ClockSample {
+            time: TimeSample {
+                monotonic_ns: monotonic_ms * NS_PER_MS,
+                wall_unix_ms: i64::try_from(monotonic_ms).expect("clock sample fits i64"),
+            },
         }
     }
 }
@@ -487,7 +596,10 @@ fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
                 lifecycle_event(ToolLifecycleBoundary::RelayDelivery, 100),
             ],
             outcome: Some("failure"),
-            item_to_first_poll_ms: Some(10),
+            first_poll_at_ms: Some(30),
+            // The independently rounded duration would reconstruct 40 ms.
+            // The exact turn-clock offset must remain authoritative.
+            item_to_first_poll_ms: Some(20),
             parallel_gate_wait_ms: Some(5),
             authorization_state_coordination_ms: Some(2),
             first_poll_to_handler_entry_ms: Some(10),
@@ -760,6 +872,413 @@ fn model_visible_output_consumes_duplicate_call_ids_in_recorded_order() {
     let timing = state.complete_snapshot().protocol_timing();
     assert_eq!(timing.tool_calls[0].output_model_visible_at_ms, Some(10));
     assert_eq!(timing.tool_calls[1].output_model_visible_at_ms, Some(20));
+}
+
+#[test]
+fn exact_tool_closure_pairs_and_persists_direct_and_nested_calls() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    let outer_execution = ToolExecutionId("outer-execution".to_string());
+    state.record_accepted_tool_call(
+        "outer-call",
+        &outer_execution,
+        TurnTimingToolCallSource::Direct,
+        None,
+    );
+    state.record_tool_dispatch_timing(
+        "outer-call",
+        "code_mode",
+        TurnTimingToolCallSource::Direct,
+        ToolCallTimingLineage::default(),
+        ToolDispatchTimingSnapshot {
+            execution_id: outer_execution,
+            outcome: Some("success"),
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+    for index in 0..2 {
+        let call_id = format!("nested-call-{index}");
+        let execution_id = ToolExecutionId(format!("nested-execution-{index}"));
+        state.record_accepted_tool_call(
+            &call_id,
+            &execution_id,
+            TurnTimingToolCallSource::CodeMode,
+            Some("outer-call"),
+        );
+        state.record_tool_dispatch_timing(
+            &call_id,
+            "exec_command",
+            TurnTimingToolCallSource::CodeMode,
+            ToolCallTimingLineage {
+                parent_call_id: Some("outer-call"),
+                ..ToolCallTimingLineage::default()
+            },
+            ToolDispatchTimingSnapshot {
+                execution_id,
+                outcome: Some("success"),
+                ..ToolDispatchTimingSnapshot::default()
+            },
+        );
+    }
+
+    state.record_tool_output_model_visible("outer-call");
+    state.record_tool_result_persisted("outer-call");
+
+    let closure = state.tool_closure_snapshot();
+    assert_eq!(closure.accepted_count, 3);
+    assert_eq!(closure.timing_paired_count, 3);
+    assert_eq!(closure.terminal_count, 3);
+    assert_eq!(closure.persisted_count, 3);
+    assert!(closure.unresolved_calls.is_empty());
+    assert!(closure.orphan_calls.is_empty());
+    assert!(closure.complete);
+}
+
+#[tokio::test(start_paused = true)]
+async fn sealed_tool_closure_waits_for_terminal_timing_and_persistence() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    let execution_id = ToolExecutionId("sealed-execution".to_string());
+    assert!(state.try_record_accepted_tool_call(
+        "sealed-call",
+        &execution_id,
+        TurnTimingToolCallSource::Direct,
+        None,
+    ));
+    state.record_tool_call_acceptance_closed();
+
+    let waiter_state = Arc::clone(&state);
+    let waiter = tokio::spawn(async move { waiter_state.wait_for_tool_closure_after_seal().await });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    state.record_tool_dispatch_timing(
+        "sealed-call",
+        "exec_command",
+        TurnTimingToolCallSource::Direct,
+        ToolCallTimingLineage::default(),
+        ToolDispatchTimingSnapshot {
+            execution_id: execution_id.clone(),
+            outcome: Some("success"),
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    state.record_tool_output_model_visible("sealed-call");
+    assert!(!waiter.is_finished());
+    state.record_tool_result_persisted("sealed-call");
+    let closure = waiter.await.expect("closure waiter should finish");
+    assert_eq!(closure.accepted_count, 1);
+    assert_eq!(closure.timing_paired_count, 1);
+    assert_eq!(closure.terminal_count, 1);
+    assert_eq!(closure.persisted_count, 1);
+    assert!(closure.complete);
+}
+
+#[tokio::test]
+async fn durable_terminal_projection_repairs_only_missing_timing_attestation() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    let execution_id = ToolExecutionId("repairable-execution".to_string());
+    state.record_accepted_tool_call(
+        "repairable-call",
+        &execution_id,
+        TurnTimingToolCallSource::Direct,
+        None,
+    );
+    state.record_tool_result_persisted("repairable-call");
+
+    let before_seal = state.tool_closure_snapshot();
+    assert_eq!(before_seal.terminal_count, 1);
+    assert_eq!(before_seal.persisted_count, 1);
+    assert_eq!(before_seal.timing_paired_count, 0);
+    assert!(!before_seal.complete);
+    assert_eq!(
+        state.repair_terminal_tool_timing_after_durable_projection(),
+        0,
+        "repair is forbidden while new tool calls can still be accepted"
+    );
+
+    state.record_tool_call_acceptance_closed();
+    assert_eq!(
+        state.repair_terminal_tool_timing_after_durable_projection(),
+        1
+    );
+    assert_eq!(
+        state.repair_terminal_tool_timing_after_durable_projection(),
+        0,
+        "repair is idempotent"
+    );
+    let closure = state.wait_for_tool_closure_after_seal().await;
+    assert_eq!(closure.accepted_count, 1);
+    assert_eq!(closure.timing_paired_count, 1);
+    assert_eq!(closure.terminal_count, 1);
+    assert_eq!(closure.persisted_count, 1);
+    assert!(closure.complete);
+}
+
+#[tokio::test]
+async fn exact_tool_closure_is_not_limited_by_diagnostic_history_cap() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+
+    let exact_call_count = MAX_TOOL_CALL_TIMINGS + 1;
+    for index in 0..exact_call_count {
+        let call_id = format!("call-{index}");
+        let execution_id = ToolExecutionId(format!("execution-{index}"));
+        assert!(state.try_record_accepted_tool_call(
+            &call_id,
+            &execution_id,
+            TurnTimingToolCallSource::Direct,
+            None,
+        ));
+        state.record_tool_dispatch_timing(
+            &call_id,
+            "exec_command",
+            TurnTimingToolCallSource::Direct,
+            ToolCallTimingLineage::default(),
+            ToolDispatchTimingSnapshot {
+                execution_id,
+                outcome: Some("success"),
+                ..ToolDispatchTimingSnapshot::default()
+            },
+        );
+        state.record_tool_output_model_visible(&call_id);
+        state.record_tool_result_persisted(&call_id);
+    }
+    state.record_tool_call_acceptance_closed();
+
+    let closure = state.wait_for_tool_closure_after_seal().await;
+    assert_eq!(closure.accepted_count as usize, exact_call_count);
+    assert_eq!(closure.timing_paired_count as usize, exact_call_count);
+    assert_eq!(closure.terminal_count as usize, exact_call_count);
+    assert_eq!(closure.persisted_count as usize, exact_call_count);
+    assert_eq!(closure.overflow_count, 0);
+    assert!(closure.unresolved_calls.is_empty());
+    assert!(closure.orphan_calls.is_empty());
+    assert!(closure.complete);
+}
+
+#[test]
+fn durably_persisted_outer_output_closes_canceled_direct_and_nested_calls() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    let outer_execution = ToolExecutionId("outer-canceled-execution".to_string());
+    state.record_accepted_tool_call(
+        "outer-canceled-call",
+        &outer_execution,
+        TurnTimingToolCallSource::Direct,
+        None,
+    );
+    state.record_tool_dispatch_timing(
+        "outer-canceled-call",
+        "code_mode",
+        TurnTimingToolCallSource::Direct,
+        ToolCallTimingLineage::default(),
+        ToolDispatchTimingSnapshot {
+            execution_id: outer_execution,
+            outcome: None,
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+    let nested_execution = ToolExecutionId("nested-canceled-execution".to_string());
+    state.record_accepted_tool_call(
+        "nested-canceled-call",
+        &nested_execution,
+        TurnTimingToolCallSource::CodeMode,
+        Some("outer-canceled-call"),
+    );
+    state.record_tool_dispatch_timing(
+        "nested-canceled-call",
+        "exec_command",
+        TurnTimingToolCallSource::CodeMode,
+        ToolCallTimingLineage {
+            parent_call_id: Some("outer-canceled-call"),
+            ..ToolCallTimingLineage::default()
+        },
+        ToolDispatchTimingSnapshot {
+            execution_id: nested_execution,
+            outcome: None,
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+
+    state.record_tool_output_model_visible("outer-canceled-call");
+    let visible_only = state.tool_closure_snapshot();
+    assert_eq!(visible_only.persisted_count, 0);
+    assert!(!visible_only.complete);
+
+    state.record_tool_result_persisted("outer-canceled-call");
+
+    let closure = state.tool_closure_snapshot();
+    assert_eq!(closure.accepted_count, 2);
+    assert_eq!(closure.timing_paired_count, 2);
+    assert_eq!(closure.terminal_count, 2);
+    assert_eq!(closure.persisted_count, 2);
+    assert!(closure.complete);
+}
+
+#[test]
+fn model_visibility_does_not_attest_tool_result_persistence() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    let execution_id = ToolExecutionId("visibility-only-execution".to_string());
+    state.record_accepted_tool_call(
+        "visibility-only-call",
+        &execution_id,
+        TurnTimingToolCallSource::Direct,
+        None,
+    );
+    state.record_tool_dispatch_timing(
+        "visibility-only-call",
+        "exec_command",
+        TurnTimingToolCallSource::Direct,
+        ToolCallTimingLineage::default(),
+        ToolDispatchTimingSnapshot {
+            execution_id,
+            outcome: Some("success"),
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+
+    state.record_tool_output_model_visible("visibility-only-call");
+
+    let visible_only = state.tool_closure_snapshot();
+    assert_eq!(visible_only.accepted_count, 1);
+    assert_eq!(visible_only.timing_paired_count, 1);
+    assert_eq!(visible_only.terminal_count, 1);
+    assert_eq!(visible_only.persisted_count, 0);
+    assert_eq!(visible_only.unresolved_calls.len(), 1);
+    assert_eq!(
+        visible_only.unresolved_calls[0].call_id,
+        "visibility-only-call"
+    );
+    assert!(!visible_only.complete);
+
+    state.record_tool_result_persisted("visibility-only-call");
+    let persisted = state.tool_closure_snapshot();
+    assert_eq!(persisted.persisted_count, 1);
+    assert!(persisted.unresolved_calls.is_empty());
+    assert!(persisted.complete);
+}
+
+#[test]
+fn ordered_tool_result_requires_successful_barrier_before_persistence_attestation() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    let execution_id = ToolExecutionId("queued-persistence-execution".to_string());
+    state.record_accepted_tool_call(
+        "queued-persistence-call",
+        &execution_id,
+        TurnTimingToolCallSource::Direct,
+        None,
+    );
+    state.record_tool_dispatch_timing(
+        "queued-persistence-call",
+        "exec_command",
+        TurnTimingToolCallSource::Direct,
+        ToolCallTimingLineage::default(),
+        ToolDispatchTimingSnapshot {
+            execution_id,
+            outcome: Some("success"),
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+    state.record_tool_output_model_visible("queued-persistence-call");
+    state.record_tool_result_persistence_queued("queued-persistence-call");
+
+    let queued = state.tool_closure_snapshot();
+    assert_eq!(queued.persisted_count, 0);
+    assert!(!queued.complete);
+
+    state.record_queued_tool_results_persisted();
+    let persisted = state.tool_closure_snapshot();
+    assert_eq!(persisted.persisted_count, 1);
+    assert!(persisted.complete);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_persistence_barrier_releases_waiter_without_attesting_durability() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    let execution_id = ToolExecutionId("failed-persistence-execution".to_string());
+    state.record_accepted_tool_call(
+        "failed-persistence-call",
+        &execution_id,
+        TurnTimingToolCallSource::Direct,
+        None,
+    );
+    state.record_tool_dispatch_timing(
+        "failed-persistence-call",
+        "exec_command",
+        TurnTimingToolCallSource::Direct,
+        ToolCallTimingLineage::default(),
+        ToolDispatchTimingSnapshot {
+            execution_id,
+            outcome: Some("success"),
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+    state.record_tool_output_model_visible("failed-persistence-call");
+    state.record_tool_result_persistence_queued("failed-persistence-call");
+    state.record_tool_call_acceptance_closed();
+
+    let waiter_state = Arc::clone(&state);
+    let waiter = tokio::spawn(async move { waiter_state.wait_for_tool_closure_after_seal().await });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    state.record_tool_result_persistence_barrier_failed();
+    let closure = waiter.await.expect("failed barrier should release waiter");
+    assert_eq!(closure.accepted_count, 1);
+    assert_eq!(closure.timing_paired_count, 1);
+    assert_eq!(closure.terminal_count, 1);
+    assert_eq!(closure.persisted_count, 0);
+    assert_eq!(closure.unresolved_calls.len(), 1);
+    assert!(closure.orphan_calls.is_empty());
+    assert!(!closure.complete);
+}
+
+#[test]
+fn exact_tool_closure_rejects_unresolved_duplicate_and_orphan_lifecycle_records() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    let unresolved_execution = ToolExecutionId("unresolved-execution".to_string());
+    state.record_accepted_tool_call(
+        "unresolved-call",
+        &unresolved_execution,
+        TurnTimingToolCallSource::Direct,
+        None,
+    );
+    state.record_accepted_tool_call(
+        "unresolved-call",
+        &unresolved_execution,
+        TurnTimingToolCallSource::Direct,
+        None,
+    );
+    state.record_tool_dispatch_timing(
+        "orphan-call",
+        "exec_command",
+        TurnTimingToolCallSource::Direct,
+        ToolCallTimingLineage::default(),
+        ToolDispatchTimingSnapshot {
+            execution_id: ToolExecutionId("orphan-execution".to_string()),
+            outcome: Some("failure"),
+            ..ToolDispatchTimingSnapshot::default()
+        },
+    );
+
+    let closure = state.tool_closure_snapshot();
+    assert_eq!(closure.accepted_count, 1);
+    assert_eq!(closure.duplicate_acceptance_count, 1);
+    assert_eq!(closure.orphan_timing_count, 1);
+    assert_eq!(closure.unresolved_calls.len(), 1);
+    assert_eq!(closure.unresolved_calls[0].call_id, "unresolved-call");
+    assert_eq!(closure.orphan_calls.len(), 1);
+    assert_eq!(closure.orphan_calls[0].call_id, "orphan-call");
+    assert!(!closure.complete);
 }
 
 #[test]
@@ -1761,6 +2280,32 @@ fn backward_monotonic_sample_is_clamped_and_invalidates_profile() {
 }
 
 #[test]
+fn concurrent_timing_updates_serialize_clock_sampling_with_state_updates() {
+    let clock = Arc::new(CoordinatedClock::default());
+    let state = Arc::new(TurnTimingState::with_clock(clock.clone()));
+    state.mark_turn_started();
+
+    let first_state = state.clone();
+    let first = std::thread::spawn(move || first_state.record_tool_gate_admitted("first"));
+    clock.wait_for_first_parallel_sample();
+
+    let second_state = state.clone();
+    let second = std::thread::spawn(move || second_state.record_tool_gate_admitted("second"));
+    assert!(
+        !clock.second_parallel_sample_before_release(),
+        "a second caller sampled the clock before the first caller committed its sample"
+    );
+
+    clock.release_first_parallel_sample();
+    first.join().expect("first timing update");
+    second.join().expect("second timing update");
+
+    let profile = state.complete_snapshot().profile;
+    assert!(profile.profile_valid);
+    assert_eq!(profile.counters.clock_regression_count, 0);
+}
+
+#[test]
 fn completion_snapshot_is_immutable() {
     let (clock, state) = timing();
     state.mark_turn_started();
@@ -1809,8 +2354,7 @@ fn wait_and_tool_output_counters_are_additive() {
     state.record_internally_drained_waits(7);
     state.record_residual_deterministic_generation();
     state.record_owner_drained_continuation();
-    state.record_executed_validation(125, true);
-    state.record_reused_validation();
+    state.record_executed_validation(125);
     state.record_suppressed_validation_output();
     state.record_ready_startup_prewarm();
     state.record_completion_review_ready_phase();
@@ -1829,9 +2373,6 @@ fn wait_and_tool_output_counters_are_additive() {
     assert_eq!(counters.residual_deterministic_generation_count, 1);
     assert_eq!(counters.owner_drained_continuation_count, 1);
     assert_eq!(counters.executed_validation_count, 1);
-    assert_eq!(counters.reused_validation_count, 1);
-    assert_eq!(counters.duplicate_validation_count, 1);
-    assert_eq!(counters.forced_fresh_validation_count, 1);
     assert_eq!(counters.executed_validation_duration_ns, 125_000_000);
     assert_eq!(counters.suppressed_validation_output_count, 1);
     assert_eq!(counters.ready_startup_prewarm_count, 1);
@@ -1937,6 +2478,120 @@ fn named_local_phases_record_union_time_without_disturbing_partition() {
     assert_eq!(profile.local.persistence_ns, 20 * NS_PER_MS);
     assert_eq!(profile.exclusive.orchestration_ns, 50 * NS_PER_MS);
     assert_eq!(profile.exclusive.total_ns(), profile.inclusive_duration_ns);
+}
+
+#[test]
+fn ordered_persistence_pause_is_excluded_from_request_preparation() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let mut preparation = Some(state.begin_local_phase(TurnLocalPhase::Preparation));
+
+    clock.set_ms(10);
+    let persistence = state.begin_persistence_outside_preparation(&mut preparation);
+    clock.set_ms(40);
+    drop(persistence);
+    clock.set_ms(50);
+    drop(preparation.take());
+
+    let profile = state.complete_snapshot().profile;
+    assert_eq!(profile.local.preparation_ns, 20 * NS_PER_MS);
+    assert_eq!(profile.local.persistence_ns, 30 * NS_PER_MS);
+    assert_eq!(profile.exclusive.orchestration_ns, 50 * NS_PER_MS);
+    assert_eq!(profile.exclusive.total_ns(), profile.inclusive_duration_ns);
+}
+
+#[test]
+fn startup_prewarm_wait_is_excluded_from_request_preparation() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let mut preparation = Some(state.begin_local_phase(TurnLocalPhase::Preparation));
+
+    clock.set_ms(10);
+    let startup_wait = state.begin_startup_prewarm_wait_outside_preparation(&mut preparation);
+    clock.set_ms(40);
+    drop(startup_wait);
+    clock.set_ms(50);
+    drop(preparation.take());
+
+    let profile = state.complete_snapshot().profile;
+    assert_eq!(profile.local.preparation_ns, 20 * NS_PER_MS);
+    assert_eq!(profile.local.startup_prewarm_wait_ns, 30 * NS_PER_MS);
+    assert_eq!(profile.exclusive.orchestration_ns, 50 * NS_PER_MS);
+    assert_eq!(profile.exclusive.total_ns(), profile.inclusive_duration_ns);
+}
+
+#[test]
+fn request_preparation_begins_after_planning_and_restarts_for_each_generation() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let mut preparation = None;
+
+    let planning = state.begin_local_phase(TurnLocalPhase::Planning);
+    clock.set_ms(5);
+    drop(planning);
+
+    state.begin_request_preparation(&mut preparation);
+    clock.set_ms(10);
+    state.finish_request_preparation(&mut preparation);
+
+    clock.set_ms(20);
+    state.begin_request_preparation(&mut preparation);
+    clock.set_ms(25);
+    state.finish_request_preparation(&mut preparation);
+
+    let profile = state.complete_snapshot().profile;
+    assert_eq!(profile.local.planning_ns, 5 * NS_PER_MS);
+    assert_eq!(profile.local.preparation_ns, 10 * NS_PER_MS);
+    assert_eq!(profile.exclusive.orchestration_ns, 25 * NS_PER_MS);
+    assert_eq!(profile.exclusive.total_ns(), profile.inclusive_duration_ns);
+}
+
+#[test]
+fn predispatch_failure_closes_request_preparation_before_error_lifecycle() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let mut preparation = None;
+
+    state.begin_request_preparation(&mut preparation);
+    clock.set_ms(5);
+    state.finish_request_preparation(&mut preparation);
+
+    state.begin_finalization();
+    clock.set_ms(20);
+
+    let profile = state.complete_snapshot().profile;
+    assert_eq!(profile.local.preparation_ns, 5 * NS_PER_MS);
+    assert_eq!(profile.exclusive.finalization_ns, 15 * NS_PER_MS);
+    assert_eq!(profile.exclusive.total_ns(), profile.inclusive_duration_ns);
+}
+
+#[test]
+fn ordered_persistence_transitions_have_no_unattributed_gap() {
+    let clock = Arc::new(AdvancingClock::every_ms(1));
+    let state = Arc::new(TurnTimingState::with_clock(clock));
+    state.mark_turn_started();
+    let mut preparation = Some(state.begin_local_phase(TurnLocalPhase::Preparation));
+
+    let persistence = state.begin_persistence_outside_preparation(&mut preparation);
+    drop(persistence);
+    drop(preparation.take());
+    state.mark_model_request_dispatched();
+    assert_eq!(
+        state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("ready".into())),
+        Some(Duration::from_millis(6))
+    );
+
+    let profile = state.complete_snapshot().profile;
+    let pre_output = profile
+        .pre_first_model_output
+        .expect("model output freezes pre-output attribution");
+    assert_eq!(profile.local.preparation_ns, 2 * NS_PER_MS);
+    assert_eq!(profile.local.persistence_ns, NS_PER_MS);
+    // One millisecond precedes the outer preparation guard and one follows it.
+    // Switching preparation to persistence and back adds no unattributed interval.
+    assert_eq!(pre_output.unattributed_pre_output_ns, 2 * NS_PER_MS);
+    assert_eq!(pre_output.attributed_client_union_ns, 3 * NS_PER_MS);
+    assert_eq!(pre_output.client_critical_path_ns, 5 * NS_PER_MS);
 }
 
 #[test]

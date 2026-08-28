@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -219,10 +221,14 @@ url = "{mcp_server_url}/mcp"
 #[derive(Clone)]
 struct McpStatusServer {
     tool_name: Arc<String>,
+    initialization_count: Option<Arc<AtomicUsize>>,
 }
 
 impl ServerHandler for McpStatusServer {
     fn get_info(&self) -> ServerInfo {
+        if let Some(initialization_count) = &self.initialization_count {
+            initialization_count.fetch_add(1, Ordering::SeqCst);
+        }
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
             Implementation::new("lookup-server", "1.0.0").with_title("Lookup Server"),
         )
@@ -319,6 +325,111 @@ impl ServerHandler for SlowInventoryServer {
             meta: None,
         })
     }
+}
+
+#[tokio::test]
+async fn mcp_server_status_list_applies_page_before_starting_servers() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let (first_server_url, first_server_handle, first_initializations) =
+        start_counting_mcp_server("first_lookup").await?;
+    let (second_server_url, second_server_handle, second_initializations) =
+        start_counting_mcp_server("second_lookup").await?;
+    let codex_home = TempDir::new()?;
+    write_mock_responses_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        &BTreeMap::new(),
+        /*auto_compact_limit*/ 1024,
+        /*requires_openai_auth*/ None,
+        "mock_provider",
+        "compact",
+    )?;
+
+    let config_path = codex_home.path().join("config.toml");
+    let mut config_toml = std::fs::read_to_string(&config_path)?;
+    config_toml.push_str(&format!(
+        r#"
+[mcp_servers.a-first]
+url = "{first_server_url}/mcp"
+
+[mcp_servers.b-second]
+url = "{second_server_url}/mcp"
+"#
+    ));
+    std::fs::write(config_path, config_toml)?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let malformed_cursor_request_id = mcp
+        .send_list_mcp_server_status_request(ListMcpServerStatusParams {
+            cursor: Some("not-a-cursor".to_string()),
+            limit: Some(1),
+            detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+            thread_id: None,
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(malformed_cursor_request_id)),
+    )
+    .await??;
+    assert_eq!(first_initializations.load(Ordering::SeqCst), 0);
+    assert_eq!(second_initializations.load(Ordering::SeqCst), 0);
+
+    let out_of_range_cursor_request_id = mcp
+        .send_list_mcp_server_status_request(ListMcpServerStatusParams {
+            cursor: Some("3".to_string()),
+            limit: Some(1),
+            detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+            thread_id: None,
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(out_of_range_cursor_request_id)),
+    )
+    .await??;
+    assert_eq!(first_initializations.load(Ordering::SeqCst), 0);
+    assert_eq!(second_initializations.load(Ordering::SeqCst), 0);
+
+    let request_id = mcp
+        .send_list_mcp_server_status_request(ListMcpServerStatusParams {
+            cursor: None,
+            limit: Some(1),
+            detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
+            thread_id: None,
+        })
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let response: ListMcpServerStatusResponse = to_response(response)?;
+
+    assert_eq!(response.next_cursor.as_deref(), Some("1"));
+    assert_eq!(
+        response
+            .data
+            .iter()
+            .map(|status| status.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a-first"]
+    );
+    assert!(first_initializations.load(Ordering::SeqCst) > 0);
+    assert_eq!(second_initializations.load(Ordering::SeqCst), 0);
+
+    first_server_handle.abort();
+    let _ = first_server_handle.await;
+    second_server_handle.abort();
+    let _ = second_server_handle.await;
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -476,6 +587,7 @@ async fn start_mcp_server(tool_name: &str) -> Result<(String, JoinHandle<()>)> {
         move || {
             Ok(McpStatusServer {
                 tool_name: Arc::clone(&tool_name),
+                initialization_count: None,
             })
         },
         Arc::new(LocalSessionManager::default()),
@@ -488,6 +600,33 @@ async fn start_mcp_server(tool_name: &str) -> Result<(String, JoinHandle<()>)> {
     });
 
     Ok((format!("http://{addr}"), handle))
+}
+
+async fn start_counting_mcp_server(
+    tool_name: &str,
+) -> Result<(String, JoinHandle<()>, Arc<AtomicUsize>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let tool_name = Arc::new(tool_name.to_string());
+    let initialization_count = Arc::new(AtomicUsize::new(0));
+    let service_initialization_count = Arc::clone(&initialization_count);
+    let mcp_service = StreamableHttpService::new(
+        move || {
+            Ok(McpStatusServer {
+                tool_name: Arc::clone(&tool_name),
+                initialization_count: Some(Arc::clone(&service_initialization_count)),
+            })
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let router = Router::new().nest_service("/mcp", mcp_service);
+
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    Ok((format!("http://{addr}"), handle, initialization_count))
 }
 
 async fn start_slow_inventory_mcp_server(tool_name: &str) -> Result<(String, JoinHandle<()>)> {

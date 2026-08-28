@@ -141,7 +141,6 @@ winsplit = "0.1"
 app_test_support = { workspace = true }
 codex-cli = { workspace = true }
 codex-mcp = { workspace = true }
-core_test_support = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 assert_matches = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }

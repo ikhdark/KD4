@@ -99,7 +99,7 @@ async fn status_command_uses_catalog_default_reasoning_when_config_empty() {
 async fn status_command_renders_native_and_foreign_instruction_sources() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let (foreign_source, foreign_display) = (
-        PathUri::parse("file:///remote/AGENTS.md").expect("POSIX instruction source"),
+        PathUri::parse("file:///remote/AGENTS.md").expect("legacy foreign instruction source"),
         "/remote/AGENTS.md",
     );
     chat.instruction_source_paths = vec![

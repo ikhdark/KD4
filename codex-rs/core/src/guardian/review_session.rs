@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -32,6 +33,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::warn;
 
 use crate::codex_delegate::run_codex_thread_interactive;
@@ -95,6 +97,90 @@ pub(crate) struct GuardianReviewSessionParams {
 pub(crate) struct GuardianReviewSessionManager {
     state: Arc<Mutex<GuardianReviewSessionState>>,
     cancellation_token: CancellationToken,
+    background_shutdowns: GuardianBackgroundShutdowns,
+}
+
+#[derive(Clone)]
+struct GuardianBackgroundShutdowns {
+    inner: Arc<GuardianBackgroundShutdownsInner>,
+}
+
+struct GuardianBackgroundShutdownsInner {
+    tasks: TaskTracker,
+    accepting: StdMutex<bool>,
+}
+
+impl Default for GuardianBackgroundShutdowns {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(GuardianBackgroundShutdownsInner {
+                tasks: TaskTracker::new(),
+                accepting: StdMutex::new(true),
+            }),
+        }
+    }
+}
+
+impl GuardianBackgroundShutdowns {
+    fn shutdown_session(
+        &self,
+        review_session: Arc<GuardianReviewSession>,
+    ) -> Option<Arc<GuardianReviewSession>> {
+        let accepting = self
+            .inner
+            .accepting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*accepting {
+            return Some(review_session);
+        }
+        drop(self.inner.tasks.spawn(async move {
+            review_session.shutdown().await;
+        }));
+        None
+    }
+
+    fn cleanup_ephemeral(
+        &self,
+        state: Arc<Mutex<GuardianReviewSessionState>>,
+        review_session: Arc<GuardianReviewSession>,
+    ) {
+        let accepting = self
+            .inner
+            .accepting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*accepting {
+            return;
+        }
+        drop(self.inner.tasks.spawn(async move {
+            let review_session = {
+                let mut state = state.lock().await;
+                state
+                    .ephemeral_reviews
+                    .iter()
+                    .position(|active_review| Arc::ptr_eq(active_review, &review_session))
+                    .map(|index| state.ephemeral_reviews.swap_remove(index))
+            };
+            if let Some(review_session) = review_session {
+                review_session.shutdown().await;
+            }
+        }));
+    }
+
+    fn close(&self) {
+        let mut accepting = self
+            .inner
+            .accepting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *accepting = false;
+        self.inner.tasks.close();
+    }
+
+    async fn wait(&self) {
+        self.inner.tasks.wait().await;
+    }
 }
 
 #[derive(Default)]
@@ -134,6 +220,7 @@ fn token_usage_delta(start: &TokenUsage, end: &TokenUsage) -> TokenUsage {
 
 struct EphemeralReviewCleanup {
     state: Arc<Mutex<GuardianReviewSessionState>>,
+    background_shutdowns: GuardianBackgroundShutdowns,
     review_session: Option<Arc<GuardianReviewSession>>,
 }
 
@@ -165,7 +252,6 @@ struct GuardianReviewSessionReuseKey {
     cwd: AbsolutePathBuf,
     mcp_servers: Constrained<HashMap<String, McpServerConfig>>,
     features: ManagedFeatures,
-    unified_exec_enabled: bool,
 }
 
 impl GuardianReviewSessionReuseKey {
@@ -190,7 +276,6 @@ impl GuardianReviewSessionReuseKey {
             cwd: spawn_config.cwd.clone(),
             mcp_servers: spawn_config.mcp_servers.clone(),
             features: spawn_config.features.clone(),
-            unified_exec_enabled: spawn_config.unified_exec_enabled,
         }
     }
 }
@@ -213,13 +298,6 @@ impl GuardianReviewSession {
     async fn shutdown(&self) {
         self.cancel_token.cancel();
         let _ = self.codex.shutdown_and_wait().await;
-    }
-
-    fn shutdown_in_background(self: &Arc<Self>) {
-        let review_session = Arc::clone(self);
-        drop(tokio::spawn(async move {
-            review_session.shutdown().await;
-        }));
     }
 
     async fn fork_snapshot(&self) -> Option<GuardianReviewForkSnapshot> {
@@ -250,10 +328,12 @@ impl GuardianReviewSession {
 impl EphemeralReviewCleanup {
     fn new(
         state: Arc<Mutex<GuardianReviewSessionState>>,
+        background_shutdowns: GuardianBackgroundShutdowns,
         review_session: Arc<GuardianReviewSession>,
     ) -> Self {
         Self {
             state,
+            background_shutdowns,
             review_session: Some(review_session),
         }
     }
@@ -268,20 +348,8 @@ impl Drop for EphemeralReviewCleanup {
         let Some(review_session) = self.review_session.take() else {
             return;
         };
-        let state = Arc::clone(&self.state);
-        drop(tokio::spawn(async move {
-            let review_session = {
-                let mut state = state.lock().await;
-                state
-                    .ephemeral_reviews
-                    .iter()
-                    .position(|active_review| Arc::ptr_eq(active_review, &review_session))
-                    .map(|index| state.ephemeral_reviews.swap_remove(index))
-            };
-            if let Some(review_session) = review_session {
-                review_session.shutdown().await;
-            }
-        }));
+        self.background_shutdowns
+            .cleanup_ephemeral(Arc::clone(&self.state), review_session);
     }
 }
 
@@ -338,6 +406,7 @@ impl GuardianReviewSessionManager {
         self.cancellation_token.cancel();
         let (review_session, ephemeral_reviews) = {
             let mut state = self.state.lock().await;
+            self.background_shutdowns.close();
             (
                 state.trunk.take(),
                 std::mem::take(&mut state.ephemeral_reviews),
@@ -349,6 +418,7 @@ impl GuardianReviewSessionManager {
         for review_session in ephemeral_reviews {
             review_session.shutdown().await;
         }
+        self.background_shutdowns.wait().await;
     }
 
     #[expect(
@@ -378,7 +448,9 @@ impl GuardianReviewSessionManager {
                     && trunk.reuse_key != next_reuse_key
                     && trunk.review_lock.try_acquire().is_ok()
                 {
-                    stale_trunk_to_shutdown = state.trunk.take();
+                    stale_trunk_to_shutdown = state.trunk.take().and_then(|review_session| {
+                        self.background_shutdowns.shutdown_session(review_session)
+                    });
                 }
 
                 if state.trunk.is_none() {
@@ -421,7 +493,7 @@ impl GuardianReviewSessionManager {
         };
 
         if let Some(review_session) = stale_trunk_to_shutdown {
-            review_session.shutdown_in_background();
+            review_session.shutdown().await;
         }
 
         let Some(trunk) = trunk_candidate else {
@@ -477,7 +549,7 @@ impl GuardianReviewSessionManager {
             (outcome, analytics_result)
         } else {
             if let Some(review_session) = self.remove_trunk_if_current(&trunk).await {
-                review_session.shutdown_in_background();
+                review_session.shutdown().await;
             }
             (outcome, analytics_result)
         }
@@ -500,6 +572,19 @@ impl GuardianReviewSessionManager {
                 last_committed_fork_snapshot: None,
             }),
         }));
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retire_trunk_for_test(&self) {
+        let rejected = {
+            let mut state = self.state.lock().await;
+            state.trunk.take().and_then(|review_session| {
+                self.background_shutdowns.shutdown_session(review_session)
+            })
+        };
+        if let Some(review_session) = rejected {
+            review_session.shutdown().await;
+        }
     }
 
     #[cfg(test)]
@@ -558,7 +643,9 @@ impl GuardianReviewSessionManager {
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, trunk))
         {
-            state.trunk.take()
+            state.trunk.take().and_then(|review_session| {
+                self.background_shutdowns.shutdown_session(review_session)
+            })
         } else {
             None
         }
@@ -575,13 +662,18 @@ impl GuardianReviewSessionManager {
     async fn take_active_ephemeral(
         &self,
         review_session: &Arc<GuardianReviewSession>,
-    ) -> Option<Arc<GuardianReviewSession>> {
+    ) -> (bool, Option<Arc<GuardianReviewSession>>) {
         let mut state = self.state.lock().await;
-        let ephemeral_review_index = state
+        let Some(ephemeral_review_index) = state
             .ephemeral_reviews
             .iter()
-            .position(|active_review| Arc::ptr_eq(active_review, review_session))?;
-        Some(state.ephemeral_reviews.swap_remove(ephemeral_review_index))
+            .position(|active_review| Arc::ptr_eq(active_review, review_session))
+        else {
+            return (false, None);
+        };
+        let review_session = state.ephemeral_reviews.swap_remove(ephemeral_review_index);
+        let rejected = self.background_shutdowns.shutdown_session(review_session);
+        (true, rejected)
     }
 
     async fn run_ephemeral_review(
@@ -622,8 +714,11 @@ impl GuardianReviewSessionManager {
         };
         self.register_active_ephemeral(Arc::clone(&review_session))
             .await;
-        let mut cleanup =
-            EphemeralReviewCleanup::new(Arc::clone(&self.state), Arc::clone(&review_session));
+        let mut cleanup = EphemeralReviewCleanup::new(
+            Arc::clone(&self.state),
+            self.background_shutdowns.clone(),
+            Arc::clone(&review_session),
+        );
 
         let (outcome, _, analytics_result) = Box::pin(run_review_on_session(
             review_session.as_ref(),
@@ -632,9 +727,12 @@ impl GuardianReviewSessionManager {
             deadline,
         ))
         .await;
-        if let Some(review_session) = self.take_active_ephemeral(&review_session).await {
+        let (removed, rejected) = self.take_active_ephemeral(&review_session).await;
+        if removed {
             cleanup.disarm();
-            review_session.shutdown_in_background();
+        }
+        if let Some(review_session) = rejected {
+            review_session.shutdown().await;
         }
         (outcome, analytics_result)
     }

@@ -4,10 +4,11 @@ use crate::AuthProvider;
 use bytes::Bytes;
 use codex_http_client::BuildRouteAwareHttpClientError;
 use codex_http_client::ClientRouteClass;
-use codex_http_client::HttpClient;
 use codex_http_client::HttpClientFactory;
-use codex_http_client::HttpError;
-use codex_http_client::RequestBuilder;
+use codex_http_client::RouteAwareClientPool;
+use codex_http_client::RouteAwareClientPoolError;
+use codex_http_client::RouteAwareRequestBuilder;
+use codex_http_client::RouteAwareRequestError;
 use futures::Stream;
 use http::Method;
 use http::StatusCode;
@@ -47,7 +48,7 @@ pub enum OpenAiFileError {
     Request {
         url: String,
         #[source]
-        source: HttpError,
+        source: RouteAwareRequestError,
     },
     #[error("OpenAI file request to {url} failed with status {status}: {body}")]
     UnexpectedStatus {
@@ -112,15 +113,22 @@ pub async fn delete_openai_file(
     http_client_factory: &HttpClientFactory,
     file_id: &str,
 ) -> Result<(), OpenAiFileError> {
+    let http_clients = openai_file_http_client_pool(http_client_factory);
+    delete_openai_file_with_pool(base_url, auth, &http_clients, file_id).await
+}
+
+pub async fn delete_openai_file_with_pool(
+    base_url: &str,
+    auth: &dyn AuthProvider,
+    http_clients: &RouteAwareClientPool,
+    file_id: &str,
+) -> Result<(), OpenAiFileError> {
     let encoded_file_id = percent_encode_path_segment(file_id);
     let delete_url = format!("{}/files/{encoded_file_id}", base_url.trim_end_matches('/'));
-    let response = authorized_request(http_client_factory, auth, Method::DELETE, &delete_url)?
+    let response = authorized_request(http_clients, auth, Method::DELETE, &delete_url)
         .send()
         .await
-        .map_err(|source| OpenAiFileError::Request {
-            url: delete_url.clone(),
-            source,
-        })?;
+        .map_err(|source| request_error(&delete_url, source))?;
     let status = response.status();
     if status.is_success() || status == StatusCode::NOT_FOUND {
         return Ok(());
@@ -154,6 +162,47 @@ pub async fn upload_openai_file(
     file_size_bytes: u64,
     contents: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 ) -> Result<UploadedOpenAiFile, OpenAiFileError> {
+    let http_clients = openai_file_http_client_pool(http_client_factory);
+    upload_openai_file_with_pool(
+        base_url,
+        auth,
+        &http_clients,
+        file_name,
+        file_size_bytes,
+        contents,
+    )
+    .await
+}
+
+pub async fn upload_openai_file_with_pool(
+    base_url: &str,
+    auth: &dyn AuthProvider,
+    http_clients: &RouteAwareClientPool,
+    file_name: String,
+    file_size_bytes: u64,
+    contents: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+) -> Result<UploadedOpenAiFile, OpenAiFileError> {
+    upload_openai_file_with_pool_and_finalize_timeout(
+        base_url,
+        auth,
+        http_clients,
+        file_name,
+        file_size_bytes,
+        contents,
+        OPENAI_FILE_FINALIZE_TIMEOUT,
+    )
+    .await
+}
+
+async fn upload_openai_file_with_pool_and_finalize_timeout(
+    base_url: &str,
+    auth: &dyn AuthProvider,
+    http_clients: &RouteAwareClientPool,
+    file_name: String,
+    file_size_bytes: u64,
+    contents: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+    finalize_timeout: Duration,
+) -> Result<UploadedOpenAiFile, OpenAiFileError> {
     if file_size_bytes > OPENAI_FILE_UPLOAD_LIMIT_BYTES {
         return Err(OpenAiFileError::FileTooLarge {
             file_name,
@@ -163,7 +212,7 @@ pub async fn upload_openai_file(
     }
 
     let create_url = format!("{}/files", base_url.trim_end_matches('/'));
-    let create_response = authorized_request(http_client_factory, auth, Method::POST, &create_url)?
+    let create_response = authorized_request(http_clients, auth, Method::POST, &create_url)
         .json(&serde_json::json!({
             "file_name": file_name.as_str(),
             "file_size": file_size_bytes,
@@ -171,10 +220,7 @@ pub async fn upload_openai_file(
         }))
         .send()
         .await
-        .map_err(|source| OpenAiFileError::Request {
-            url: create_url.clone(),
-            source,
-        })?;
+        .map_err(|source| request_error(&create_url, source))?;
     let create_status = create_response.status();
     let create_body = create_response.text().await.unwrap_or_default();
     if !create_status.is_success() {
@@ -191,7 +237,7 @@ pub async fn upload_openai_file(
         })?;
     let file_id = create_payload.file_id.clone();
     let upload_result: Result<UploadedOpenAiFile, OpenAiFileError> = async {
-        let upload_response = build_http_client(http_client_factory, &create_payload.upload_url)?
+        let upload_response = http_clients
             .request(Method::PUT, &create_payload.upload_url)
             .timeout(OPENAI_FILE_REQUEST_TIMEOUT)
             .header("x-ms-blob-type", "BlockBlob")
@@ -199,10 +245,7 @@ pub async fn upload_openai_file(
             .body_stream(contents)
             .send()
             .await
-            .map_err(|source| OpenAiFileError::Request {
-                url: create_payload.upload_url.clone(),
-                source,
-            })?;
+            .map_err(|source| request_error(&create_payload.upload_url, source.without_url()))?;
         let upload_status = upload_response.status();
         let upload_body = upload_response.text().await.unwrap_or_default();
         if !upload_status.is_success() {
@@ -218,19 +261,41 @@ pub async fn upload_openai_file(
             base_url.trim_end_matches('/'),
             create_payload.file_id,
         );
-        let finalize_started_at = Instant::now();
+        let finalize_deadline = Instant::now() + finalize_timeout;
         loop {
-            let finalize_response =
-                authorized_request(http_client_factory, auth, Method::POST, &finalize_url)?
+            let remaining = finalize_deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| OpenAiFileError::UploadNotReady {
+                    file_id: create_payload.file_id.clone(),
+                })?;
+            let finalize_attempt = async {
+                let response = authorized_request(http_clients, auth, Method::POST, &finalize_url)
+                    .timeout(remaining)
                     .json(&serde_json::json!({}))
                     .send()
                     .await
-                    .map_err(|source| OpenAiFileError::Request {
-                        url: finalize_url.clone(),
-                        source,
-                    })?;
-            let finalize_status = finalize_response.status();
-            let finalize_body = finalize_response.text().await.unwrap_or_default();
+                    .map_err(|source| request_error(&finalize_url, source))?;
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                Ok::<_, OpenAiFileError>((status, body))
+            };
+            let (finalize_status, finalize_body) =
+                match tokio::time::timeout_at(finalize_deadline, finalize_attempt).await {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(OpenAiFileError::Request { source, .. }))
+                        if source.is_timeout() && Instant::now() >= finalize_deadline =>
+                    {
+                        return Err(OpenAiFileError::UploadNotReady {
+                            file_id: create_payload.file_id.clone(),
+                        });
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(OpenAiFileError::UploadNotReady {
+                            file_id: create_payload.file_id.clone(),
+                        });
+                    }
+                };
             if !finalize_status.is_success() {
                 return Err(OpenAiFileError::UnexpectedStatus {
                     url: finalize_url.clone(),
@@ -261,12 +326,14 @@ pub async fn upload_openai_file(
                     });
                 }
                 "retry" => {
-                    if finalize_started_at.elapsed() >= OPENAI_FILE_FINALIZE_TIMEOUT {
+                    let retry_deadline =
+                        (Instant::now() + OPENAI_FILE_FINALIZE_RETRY_DELAY).min(finalize_deadline);
+                    tokio::time::sleep_until(retry_deadline).await;
+                    if Instant::now() >= finalize_deadline {
                         return Err(OpenAiFileError::UploadNotReady {
                             file_id: create_payload.file_id.clone(),
                         });
                     }
-                    tokio::time::sleep(OPENAI_FILE_FINALIZE_RETRY_DELAY).await;
                 }
                 _ => {
                     return Err(OpenAiFileError::UploadFailed {
@@ -284,7 +351,7 @@ pub async fn upload_openai_file(
     match upload_result {
         Ok(uploaded) => Ok(uploaded),
         Err(source) => {
-            match delete_openai_file(base_url, auth, http_client_factory, &file_id).await {
+            match delete_openai_file_with_pool(base_url, auth, http_clients, &file_id).await {
                 Ok(()) => Err(source),
                 Err(rollback) => Err(OpenAiFileError::RollbackFailed {
                     file_id,
@@ -297,31 +364,42 @@ pub async fn upload_openai_file(
 }
 
 fn authorized_request(
-    http_client_factory: &HttpClientFactory,
+    http_clients: &RouteAwareClientPool,
     auth: &dyn AuthProvider,
     method: Method,
     url: &str,
-) -> Result<RequestBuilder, OpenAiFileError> {
+) -> RouteAwareRequestBuilder {
     let mut headers = http::HeaderMap::new();
     auth.add_auth_headers(&mut headers);
 
-    let client = build_http_client(http_client_factory, url)?;
-    Ok(client
+    http_clients
         .request(method, url)
         .timeout(OPENAI_FILE_REQUEST_TIMEOUT)
-        .headers(headers))
+        .headers(headers)
 }
 
-fn build_http_client(
+pub fn openai_file_http_client_pool(
     http_client_factory: &HttpClientFactory,
-    url: &str,
-) -> Result<HttpClient, OpenAiFileError> {
-    http_client_factory
-        .build_client(url, ClientRouteClass::Api)
-        .map_err(|source| OpenAiFileError::ClientBuild {
+) -> RouteAwareClientPool {
+    RouteAwareClientPool::new_without_request_logging(
+        http_client_factory.clone(),
+        ClientRouteClass::Api,
+    )
+}
+
+fn request_error(url: &str, source: RouteAwareRequestError) -> OpenAiFileError {
+    match source {
+        RouteAwareRequestError::Route(RouteAwareClientPoolError::Build(source)) => {
+            OpenAiFileError::ClientBuild {
+                url: url.to_string(),
+                source,
+            }
+        }
+        source => OpenAiFileError::Request {
             url: url.to_string(),
             source,
-        })
+        },
+    }
 }
 
 #[cfg(test)]
@@ -367,8 +445,8 @@ mod tests {
         format!("{}/backend-api", server.uri())
     }
 
-    #[test]
-    fn invalid_custom_ca_is_rejected_for_every_proxy_policy() {
+    #[tokio::test]
+    async fn invalid_custom_ca_is_rejected_for_every_proxy_policy() {
         const CHILD_POLICY_ENV: &str = "CODEX_API_FILES_INVALID_CA_TEST_POLICY";
 
         let Ok(policy_name) = std::env::var(CHILD_POLICY_ENV) else {
@@ -415,11 +493,14 @@ mod tests {
             "respect-system-proxy" => OutboundProxyPolicy::RespectSystemProxy,
             _ => panic!("unexpected test proxy policy: {policy_name}"),
         };
-        let error = build_http_client(
-            &HttpClientFactory::new(outbound_proxy_policy),
-            "https://example.com/upload",
-        )
-        .expect_err("file uploads should reject invalid custom CAs");
+        let http_clients =
+            openai_file_http_client_pool(&HttpClientFactory::new(outbound_proxy_policy));
+        let error = http_clients
+            .get("https://example.com/upload")
+            .send()
+            .await
+            .expect_err("file uploads should reject invalid custom CAs");
+        let error = request_error("https://example.com/upload", error);
 
         assert!(matches!(error, OpenAiFileError::ClientBuild { .. }));
     }
@@ -446,7 +527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_openai_file_returns_canonical_uri() {
+    async fn upload_openai_file_reuses_operation_pool_across_finalize_retries() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/backend-api/files"))
@@ -494,10 +575,11 @@ mod tests {
         let base_url = base_url_for(&server);
         let contents =
             futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"hello"))]);
-        let uploaded = upload_openai_file(
+        let http_clients = openai_file_http_client_pool(&default_http_client_factory());
+        let uploaded = upload_openai_file_with_pool(
             &base_url,
             &chatgpt_auth(),
-            &default_http_client_factory(),
+            &http_clients,
             "hello.txt".to_string(),
             /*file_size_bytes*/ 5,
             contents,
@@ -514,6 +596,72 @@ mod tests {
         assert_eq!(uploaded.file_name, "hello.txt");
         assert_eq!(uploaded.mime_type, Some("text/plain".to_string()));
         assert_eq!(finalize_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            http_clients.cached_route_count(),
+            1,
+            "create, upload, and finalize should share one resolved-route client"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_in_flight_request_is_bounded_by_the_overall_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "file_id": "file_deadline",
+                "upload_url": format!("{}/upload/file_deadline", server.uri()),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/upload/file_deadline"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let finalize_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_finalize_attempts = Arc::clone(&finalize_attempts);
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files/file_deadline/uploaded"))
+            .respond_with(move |_request: &Request| {
+                observed_finalize_attempts.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_delay(OPENAI_FILE_REQUEST_TIMEOUT)
+                    .set_body_json(serde_json::json!({"status": "retry"}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/backend-api/files/file_deadline"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http_clients = openai_file_http_client_pool(&default_http_client_factory());
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            upload_openai_file_with_pool_and_finalize_timeout(
+                &base_url_for(&server),
+                &chatgpt_auth(),
+                &http_clients,
+                "deadline.txt".to_string(),
+                5,
+                futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"hello"))]),
+                Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("the overall finalization deadline should bound the in-flight request")
+        .expect_err("finalization should hit the overall deadline");
+        assert!(
+            matches!(error, OpenAiFileError::UploadNotReady { .. }),
+            "unexpected finalization error: {error:?}"
+        );
+        assert_eq!(finalize_attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -65,6 +65,7 @@ const RETAINED_OUTPUT_BYTES_PER_PROCESS: usize = 1024 * 1024;
 const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const RETAINED_STDIN_WRITE_IDS_PER_PROCESS: usize = 4096;
+const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);
 static NEXT_LOCAL_STDIN_WRITE_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
 const EXITED_PROCESS_RETENTION: Duration = Duration::from_millis(25);
@@ -215,7 +216,7 @@ impl LocalProcess {
             if let Some(metrics) = process.metrics.take() {
                 metrics.finish("terminated");
             }
-            process.session.terminate();
+            let _ = process.session.terminate();
         }
     }
 
@@ -279,7 +280,7 @@ impl LocalProcess {
                 Some(ProcessEntry::Starting(current)) if Arc::ptr_eq(current, &start)
             ) {
                 drop(process_map);
-                spawned.session.terminate();
+                let _ = spawned.session.terminate();
                 return Err(invalid_request(format!(
                     "process {process_id} start was cancelled"
                 )));
@@ -525,8 +526,10 @@ impl LocalProcess {
                     if process.exit_code.is_some() {
                         return Ok(TerminateResponse { running: false });
                     }
+                    process.session.request_terminate().map_err(|err| {
+                        internal_error(format!("failed to terminate process: {err}"))
+                    })?;
                     process.termination_requested = true;
-                    process.session.terminate();
                     true
                 }
                 Some(ProcessEntry::Starting(_)) => {
@@ -704,12 +707,26 @@ impl LocalProcess {
     }
 
     async fn terminate(&self, process_id: &ProcessId) -> Result<(), ExecServerError> {
-        self.terminate_process(TerminateParams {
-            process_id: process_id.clone(),
+        tokio::time::timeout(PROCESS_TERMINATION_TIMEOUT, async {
+            loop {
+                let response = self
+                    .terminate_process(TerminateParams {
+                        process_id: process_id.clone(),
+                    })
+                    .await
+                    .map_err(map_handler_error)?;
+                if !response.running {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         })
         .await
-        .map_err(map_handler_error)?;
-        Ok(())
+        .map_err(|_| {
+            ExecServerError::Protocol(format!(
+                "timed out confirming local process termination after {PROCESS_TERMINATION_TIMEOUT:?}"
+            ))
+        })?
     }
 }
 
@@ -791,7 +808,7 @@ async fn watch_exit(
     output_notify: Arc<Notify>,
 ) {
     let exit_code = exit_rx.await.unwrap_or(-1);
-    let sandboxed = {
+    let (sandboxed, tty) = {
         let mut processes = inner.processes.lock().await;
         match processes.get_mut(&process_id) {
             Some(ProcessEntry::Running(process)) => {
@@ -805,11 +822,17 @@ async fn watch_exit(
                         "error"
                     });
                 }
-                sandboxed
+                (sandboxed, process.tty)
             }
-            Some(ProcessEntry::Starting(_)) | None => false,
+            Some(ProcessEntry::Starting(_)) | None => (false, false),
         }
     };
+    if tty {
+        let processes = inner.processes.lock().await;
+        if let Some(ProcessEntry::Running(process)) = processes.get(&process_id) {
+            process.session.release_pty_after_exit();
+        }
+    }
     if sandboxed {
         let _ = tokio::time::timeout(Duration::from_millis(20), output_notify.notified()).await;
     }
@@ -1111,11 +1134,44 @@ mod tests {
                 .expect("terminate process"),
             TerminateResponse { running: true },
         );
+        let process_id = process.process_id.clone();
+        let mut confirmed_termination = Box::pin(backend.terminate(&process_id));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut confirmed_termination)
+                .await
+                .is_err(),
+            "termination should not be confirmed while the process is still running"
+        );
         process.exit(/*exit_code*/ 0);
+        tokio::time::timeout(Duration::from_secs(1), confirmed_termination)
+            .await
+            .expect("termination should be confirmed after exit")
+            .expect("confirmed termination should succeed");
         let _ = read_process_until_change(&backend, &process.process_id, /*after_seq*/ None).await;
         backend.shutdown().await;
 
         assert_finished_process_result(metrics, &exporter, "terminated");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn confirmed_termination_has_a_total_deadline() {
+        let backend = LocalProcess::default();
+        let mut process = spawn_test_process(&backend, "termination-deadline").await;
+
+        let error = backend
+            .terminate(&process.process_id)
+            .await
+            .expect_err("a process that never exits should time out");
+        assert!(
+            error
+                .to_string()
+                .contains("timed out confirming local process termination"),
+            "unexpected error: {error}"
+        );
+
+        process.exit(/*exit_code*/ 0);
+        let _ = read_process_until_change(&backend, &process.process_id, /*after_seq*/ None).await;
+        backend.shutdown().await;
     }
 
     #[tokio::test]
@@ -1317,8 +1373,8 @@ mod tests {
 
         codex_utils_pty::spawn_from_driver(ProcessDriver {
             writer_tx,
-            stdout_rx,
-            stderr_rx: Some(stderr_rx),
+            stdout_rx: stdout_rx.into(),
+            stderr_rx: Some(stderr_rx.into()),
             exit_rx,
             terminator: None,
             writer_handle: None,

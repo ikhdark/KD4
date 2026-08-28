@@ -204,6 +204,67 @@ fn context_pressure_estimate_uses_the_prepared_plan_projection() {
 }
 
 #[test]
+fn prepared_token_estimates_cache_existing_items_and_only_measure_appends() {
+    let mut first = user_input_text_msg("first instruction");
+    first.set_id(Some(ResponseItemId::with_suffix("msg", "first")));
+    let mut history = create_history_with_items(vec![first.clone()]);
+    let base = BaseInstructions {
+        text: "base instructions".to_string(),
+    };
+
+    history
+        .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
+        .expect("first estimate");
+    assert_eq!(history.cached_item_token_estimate_count(), 1);
+    history
+        .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
+        .expect("cached estimate");
+    assert_eq!(history.cached_item_token_estimate_count(), 1);
+    assert_eq!(history.cached_item_token_estimate_namespace_count(), 1);
+
+    let mut second = assistant_msg("new response");
+    second.set_id(Some(ResponseItemId::with_suffix("msg", "second")));
+    history.record_items([&second], TruncationPolicy::Tokens(10_000));
+    history
+        .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
+        .expect("estimate after append");
+    assert_eq!(history.cached_item_token_estimate_count(), 2);
+
+    let mut third = assistant_msg("another response");
+    third.set_id(Some(ResponseItemId::with_suffix("msg", "third")));
+    history.record_items([&third], TruncationPolicy::Tokens(10_000));
+    history
+        .estimate_prepared_token_count_with_base_instructions(&default_input_modalities(), &base)
+        .expect("estimate after second append");
+    assert_eq!(history.cached_item_token_estimate_count(), 3);
+
+    history.replace(vec![first, second, third]);
+    assert_eq!(history.cached_item_token_estimate_count(), 0);
+}
+
+#[test]
+fn cloning_history_shares_realized_context_and_world_state_baselines() {
+    let mut history = ContextManager::new();
+    history.set_reference_context_item(Some(reference_context_item()));
+    let mut world_state = WorldState::default();
+    world_state.add_section(TestWorldStateSection);
+    let (_, rollout_item) = history.update_world_state(&world_state);
+    assert!(rollout_item.is_some());
+
+    let cloned = history.clone();
+
+    assert!(history.baselines_share_storage_with(&cloned));
+    assert_eq!(
+        history.reference_context_item(),
+        cloned.reference_context_item()
+    );
+    assert_eq!(
+        history.world_state_baseline(),
+        cloned.world_state_baseline()
+    );
+}
+
+#[test]
 fn plan_history_projection_fails_open_for_legacy_outputs() {
     let mut items = update_plan_pair(
         "plan-1",
@@ -932,10 +993,41 @@ fn pending_user_boundary_estimate_excludes_current_group_reasoning() {
         .estimate_token_count_with_base_instructions(&base_instructions)
         .unwrap();
     let after_pending_boundary = history
-        .estimate_token_count_after_pending_user_boundary(&base_instructions)
+        .estimate_token_count_after_pending_user_boundary(
+            &[InputModality::Text],
+            &base_instructions,
+        )
         .unwrap();
 
     assert!(after_pending_boundary < active);
+}
+
+#[test]
+fn pending_user_boundary_estimate_uses_sampling_projection() {
+    let repeated_guidance = format!(
+        "<task_model_guidance>\n{}\n</task_model_guidance>",
+        "stable guidance ".repeat(400)
+    );
+    let history = create_history_with_items(vec![
+        user_input_text_msg(&repeated_guidance),
+        user_input_text_msg(&repeated_guidance),
+        user_input_text_msg("current instruction"),
+    ]);
+    let base_instructions = BaseInstructions {
+        text: "base instructions".to_string(),
+    };
+
+    let raw = history
+        .estimate_token_count_with_base_instructions(&base_instructions)
+        .unwrap();
+    let projected = history
+        .estimate_token_count_after_pending_user_boundary(
+            &[InputModality::Text],
+            &base_instructions,
+        )
+        .unwrap();
+
+    assert!(projected < raw);
 }
 
 #[test]
@@ -2222,6 +2314,42 @@ fn prepared_prompt_cache_reuses_shared_items_across_non_history_changes() {
 }
 
 #[test]
+fn unchanged_tool_projection_preserves_prepared_sidecars() {
+    let prepared = create_history_with_items(vec![agent_message("hello")])
+        .prepare_for_prompt(&default_input_modalities());
+    let _ = prepared.compacted_tool_search_outputs(std::convert::identity);
+    let compacted_cache = Arc::clone(&prepared.compacted_tool_search_outputs);
+    let provenance = prepared.prompt_provenance.clone();
+    let projection = ToolHistoryProjection {
+        items: prepared.shared_items(),
+        unreplaced_items: prepared.shared_unreplaced_items(),
+        substitutions: prepared.tool_history_substitutions(),
+    };
+    let fallback_projection = ToolHistoryProjection {
+        items: prepared.shared_fallback_items(),
+        unreplaced_items: prepared.shared_unreplaced_fallback_items(),
+        substitutions: prepared.fallback_tool_history_substitutions(),
+    };
+
+    let projected = apply_tool_history_projection(prepared, projection, fallback_projection);
+
+    assert!(Arc::ptr_eq(
+        &projected.compacted_tool_search_outputs,
+        &compacted_cache
+    ));
+    assert!(
+        projected
+            .prompt_provenance
+            .shares_contributions_with(&provenance)
+    );
+    assert!(
+        projected
+            .compacted_tool_search_outputs_are_materialized()
+            .is_some()
+    );
+}
+
+#[test]
 fn sampling_preparation_projects_stable_context_but_generic_preparation_fails_open() {
     let old_repository =
         "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>";
@@ -2331,13 +2459,32 @@ fn prepared_prompt_cache_does_not_extend_a_sibling_reasoning_branch() {
 }
 
 #[test]
+fn record_items_without_a_prepared_cache_keeps_unique_history_storage() {
+    let mut history = create_history_with_items(vec![agent_message("shared")]);
+    let storage_before = Arc::as_ptr(&history.items);
+
+    history.record_items(
+        [&reasoning_msg("reconstructed suffix")],
+        TruncationPolicy::Tokens(10_000),
+    );
+
+    assert_eq!(Arc::as_ptr(&history.items), storage_before);
+}
+
+#[test]
 fn prepared_prompt_cache_updates_only_for_safe_reasoning_append() {
     let mut history = create_history_with_items(vec![agent_message("hello")]);
     let first = history
         .clone()
         .prepare_for_prompt(&default_input_modalities());
+    let storage_before = Arc::as_ptr(&history.items);
     let reasoning = reasoning_msg("next");
     history.record_items([&reasoning], TruncationPolicy::Tokens(10_000));
+    assert_eq!(
+        Arc::as_ptr(&history.items),
+        storage_before,
+        "the prepared cache must not force copy-on-write of raw history",
+    );
 
     let cached = history
         .prepared_history
@@ -2346,11 +2493,44 @@ fn prepared_prompt_cache_updates_only_for_safe_reasoning_append() {
         .clone()
         .expect("safe reasoning append should update the existing cache");
     assert_eq!(cached.projection_revision, history.projection_revision);
+    assert!(
+        !cached.prepared.items.is_materialized(),
+        "a safe append must remain segmented until a consumer reads it",
+    );
     assert_eq!(
         &cached.prepared.items()[..first.items().len()],
         first.items()
     );
     assert_ne!(cached.prepared.fingerprint(), first.fingerprint());
+    assert_eq!(
+        cached
+            .prepared
+            .fingerprint
+            .as_ref()
+            .expect("prepared fingerprint")
+            .last_update_item_count,
+        1,
+        "safe append should hash only the appended suffix",
+    );
+    assert!(
+        cached
+            .prepared
+            .items
+            .shares_storage_with(&cached.prepared.unreplaced_items)
+    );
+    assert!(
+        cached
+            .prepared
+            .fallback_items
+            .shares_storage_with(&cached.prepared.unreplaced_fallback_items)
+    );
+    assert!(
+        cached
+            .prepared
+            .prompt_provenance
+            .shares_contributions_with(first.prompt_provenance()),
+        "reasoning-only appends cannot change message provenance",
+    );
 
     let invalidating_item = ResponseItem::Message {
         id: None,
@@ -2432,6 +2612,115 @@ fn tool_history_mutation_advances_projection_revision_once() {
     history.set_tool_history_state(ToolHistoryState::default());
 
     assert_eq!(history.projection_revision, initial_revision + 1);
+}
+
+#[test]
+fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projection() {
+    let call_id = "call-cached-tool-history";
+    let bounded_output =
+        "bounded model-visible tool output with enough material for a smaller receipt\n"
+            .repeat(700);
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "functions.exec".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: call_id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text(bounded_output.clone()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = create_history_with_items(vec![call, output]);
+    let prepared = history
+        .clone()
+        .prepare_for_prompt(&default_input_modalities());
+    let prepared_base = prepared.shared_items();
+    let initial_revision = history.projection_revision;
+    let candidate = ToolHistoryCandidate {
+        call_id: call_id.to_string(),
+        tool_identity: "functions.exec".to_string(),
+        semantic_class: "tool_output".to_string(),
+        source_dependencies: BTreeSet::new(),
+        source_dependencies_current: true,
+        artifact_id: "artifact-cached-tool-history".to_string(),
+        artifact_bytes: 96_000,
+        artifact_sha256: crate::tool_history::sha256(b"canonical artifact"),
+        original_output_sha256: crate::tool_history::sha256(bounded_output.as_bytes()),
+        original_tokens: 24_000,
+        preserved_non_text_tokens: 0,
+        bounded_model_output: bounded_output,
+        complete: true,
+        projection_eligible: true,
+        proof_identity: None,
+        supersession_identity: None,
+        consumed_by_generation: None,
+        derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
+    };
+
+    history.register_tool_history_candidate(candidate);
+    let mut delta_history = history.clone();
+    assert_eq!(history.projection_revision, initial_revision);
+    let cached_after_registration = history
+        .prepared_history
+        .lock()
+        .expect("prepared history lock")
+        .as_ref()
+        .expect("candidate registration must preserve the prepared base")
+        .prepared
+        .shared_items();
+    assert!(Arc::ptr_eq(&cached_after_registration, &prepared_base));
+
+    let prompt_input = history.raw_items().to_vec();
+    assert!(history.mark_tool_history_consumed(
+        &prompt_input,
+        ModelGenerationId {
+            turn_id: "turn-cached-tool-history".to_string(),
+            ordinal: 1,
+        },
+    ));
+    assert_eq!(history.projection_revision, initial_revision);
+    let cached_after_consumption = history
+        .prepared_history
+        .lock()
+        .expect("prepared history lock")
+        .as_ref()
+        .expect("candidate consumption must preserve the prepared base")
+        .prepared
+        .shared_items();
+    assert!(Arc::ptr_eq(&cached_after_consumption, &prepared_base));
+
+    assert_eq!(
+        delta_history.mark_tool_history_consumed_with_delta(
+            &prompt_input,
+            ModelGenerationId {
+                turn_id: "turn-cached-tool-history-delta".to_string(),
+                ordinal: 2,
+            },
+        ),
+        BTreeSet::from([call_id.to_string()])
+    );
+    assert_eq!(delta_history.projection_revision, initial_revision);
+    let cached_after_delta_consumption = delta_history
+        .prepared_history
+        .lock()
+        .expect("prepared history lock")
+        .as_ref()
+        .expect("delta consumption must preserve the prepared base")
+        .prepared
+        .shared_items();
+    assert!(Arc::ptr_eq(&cached_after_delta_consumption, &prepared_base));
+
+    let projected = delta_history
+        .for_compaction_prompt_with_completed_tool_projection(&default_input_modalities(), None);
+    assert!(
+        projected
+            .iter()
+            .any(crate::tool_history::response_item_has_valid_tool_history_receipt)
+    );
 }
 
 #[test]
@@ -2813,6 +3102,30 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
         + estimate_encrypted_function_output_length(encrypted_content.len()) as i64;
 
     assert_eq!(estimated, expected);
+}
+
+#[test]
+fn serialized_json_len_matches_compact_response_item_encoding() {
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "streamed-length".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(vec![
+                FunctionCallOutputContentItem::EncryptedContent {
+                    encrypted_content: "A".repeat(32_000),
+                },
+            ]),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    assert_eq!(
+        serialized_json_len(&item).expect("count serialized bytes"),
+        serde_json::to_vec(&item)
+            .expect("serialize comparison value")
+            .len(),
+    );
 }
 
 #[test]

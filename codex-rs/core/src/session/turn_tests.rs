@@ -32,6 +32,7 @@ use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
@@ -60,6 +61,104 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
+#[derive(Debug)]
+struct ContendedCatalogModelsManager {
+    inner: codex_models_manager::manager::SharedModelsManager,
+    catalog_gate: Arc<tokio::sync::RwLock<()>>,
+    read_attempted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl codex_models_manager::manager::ModelsManager for ContendedCatalogModelsManager {
+    fn model_catalog_activity(&self) -> Arc<codex_models_manager::manager::ModelCatalogActivity> {
+        self.inner.model_catalog_activity()
+    }
+
+    fn refresh_models_for_background(
+        &self,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<'_, codex_protocol::error::Result<()>>
+    {
+        self.inner
+            .refresh_models_for_background(http_client_factory)
+    }
+
+    fn list_models_shared(
+        &self,
+        refresh_strategy: codex_models_manager::manager::RefreshStrategy,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<
+        '_,
+        codex_protocol::error::Result<Arc<Vec<codex_protocol::openai_models::ModelPreset>>>,
+    > {
+        let inner = Arc::clone(&self.inner);
+        let catalog_gate = Arc::clone(&self.catalog_gate);
+        let read_attempted = Arc::clone(&self.read_attempted);
+        Box::pin(async move {
+            read_attempted.store(true, Ordering::Release);
+            let catalog_read = catalog_gate.read().await;
+            drop(catalog_read);
+            inner
+                .list_models_shared(refresh_strategy, http_client_factory)
+                .await
+        })
+    }
+
+    fn raw_model_catalog(
+        &self,
+        refresh_strategy: codex_models_manager::manager::RefreshStrategy,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<
+        '_,
+        codex_protocol::error::Result<ModelsResponse>,
+    > {
+        self.inner
+            .raw_model_catalog(refresh_strategy, http_client_factory)
+    }
+
+    fn get_remote_models(
+        &self,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<
+        '_,
+        Vec<codex_protocol::openai_models::ModelInfo>,
+    > {
+        self.inner.get_remote_models()
+    }
+
+    fn try_get_remote_models(
+        &self,
+    ) -> std::result::Result<Vec<codex_protocol::openai_models::ModelInfo>, tokio::sync::TryLockError>
+    {
+        self.inner.try_get_remote_models()
+    }
+
+    fn auth_manager(&self) -> Option<&AuthManager> {
+        self.inner.auth_manager()
+    }
+
+    fn list_collaboration_modes(&self) -> Vec<codex_protocol::config_types::CollaborationModeMask> {
+        self.inner.list_collaboration_modes()
+    }
+
+    fn try_list_models_shared(
+        &self,
+    ) -> std::result::Result<
+        Arc<Vec<codex_protocol::openai_models::ModelPreset>>,
+        tokio::sync::TryLockError,
+    > {
+        self.read_attempted.store(true, Ordering::Release);
+        let _catalog_read = self.catalog_gate.try_read()?;
+        self.inner.try_list_models_shared()
+    }
+
+    fn notify_etag(
+        self: Arc<Self>,
+        etag: String,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<'static, ()> {
+        Arc::clone(&self.inner).notify_etag(etag, http_client_factory)
+    }
+}
+
 #[test]
 fn turn_submission_type_distinguishes_queued_continuations() {
     assert!(matches!(
@@ -78,6 +177,29 @@ fn turn_submission_type_distinguishes_queued_continuations() {
 }
 
 #[tokio::test]
+async fn stopped_session_start_restores_input_and_requests_a_fresh_turn() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let input = vec![TurnInput::UserInput {
+        content: vec![UserInput::Text {
+            text: "retry after session-start stop".to_string(),
+            text_elements: Vec::new(),
+        }],
+        client_id: None,
+    }];
+
+    let result = finish_stopped_session_start(&session, input.clone()).await;
+
+    assert!(result.defer_pending_input);
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await,
+        input
+    );
+}
+
+#[tokio::test]
 async fn consecutive_turn_contexts_share_the_unchanged_picker_snapshot() {
     let (session, first_turn) = crate::session::tests::make_session_and_context().await;
 
@@ -89,6 +211,784 @@ async fn consecutive_turn_contexts_share_the_unchanged_picker_snapshot() {
         &first_turn.available_models,
         &second_turn.available_models
     ));
+}
+
+#[tokio::test]
+// This test intentionally keeps the writer guard while awaiting the blocked reader.
+#[allow(clippy::await_holding_invalid_type, clippy::await_holding_lock)]
+async fn turn_context_waits_for_a_contended_picker_snapshot() {
+    let (mut session, first_turn) = crate::session::tests::make_session_and_context().await;
+    let expected_models = Arc::clone(&first_turn.available_models);
+    let catalog_gate = Arc::new(tokio::sync::RwLock::new(()));
+    let read_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    session.services.models_manager = Arc::new(ContendedCatalogModelsManager {
+        inner: Arc::clone(&session.services.models_manager),
+        catalog_gate: Arc::clone(&catalog_gate),
+        read_attempted: Arc::clone(&read_attempted),
+    });
+    let catalog_write = catalog_gate.write().await;
+    let session = Arc::new(session);
+    let mut next_turn = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .new_default_turn_with_sub_id("contended-picker-snapshot".to_string())
+                .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !read_attempted.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("turn construction should attempt to read the picker catalog");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut next_turn)
+            .await
+            .is_err(),
+        "turn construction must wait for a contended catalog instead of publishing an empty one"
+    );
+
+    drop(catalog_write);
+    let next_turn = tokio::time::timeout(Duration::from_secs(1), next_turn)
+        .await
+        .expect("turn construction should resume after the catalog writer exits")
+        .expect("turn construction task should succeed");
+    assert_eq!(
+        next_turn.available_models.as_ref(),
+        expected_models.as_ref()
+    );
+}
+
+#[test]
+fn projected_prompt_compaction_reuses_equal_and_incrementally_appended_projections() {
+    fn message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn tool_search_output() -> ResponseItem {
+        ResponseItem::ToolSearchOutput {
+            id: None,
+            call_id: None,
+            status: "completed".to_string(),
+            execution: "server".to_string(),
+            tools: vec![serde_json::json!({
+                "type": "function",
+                "name": "search_repository",
+                "description": "large acknowledged schema",
+                "parameters": {"type": "object"}
+            })],
+            omitted_result_count: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn prepare(items: Vec<ResponseItem>) -> PreparedPromptInput {
+        let mut history = ContextManager::new();
+        history.record_items(
+            items.iter(),
+            codex_utils_output_truncation::TruncationPolicy::Tokens(10_000),
+        );
+        history.prepare_for_sampling_prompt(&[], StableContextTarget::Sampling)
+    }
+
+    fn assert_matches_independent_compaction(
+        prepared: &PreparedPromptInput,
+        compacted: &CompactedProjectedPromptInputs,
+    ) {
+        assert_eq!(
+            compacted.input,
+            compact_acknowledged_tool_search_outputs(prepared.shared_items())
+        );
+        assert_eq!(
+            compacted.stable_context_fallback_input,
+            compact_acknowledged_tool_search_outputs(prepared.shared_fallback_items())
+        );
+        assert_eq!(
+            compacted.tool_history_fallback_input,
+            compact_acknowledged_tool_search_outputs(prepared.shared_unreplaced_items())
+        );
+        assert_eq!(
+            compacted.stable_context_tool_history_fallback_input,
+            compact_acknowledged_tool_search_outputs(prepared.shared_unreplaced_fallback_items())
+        );
+    }
+
+    let equal_prepared = prepare(vec![tool_search_output(), message("continue")]);
+    let equal = compact_projected_prompt_inputs(&equal_prepared);
+    assert_eq!(equal.pass_count, 1);
+    assert!(Arc::ptr_eq(
+        &equal.input,
+        &equal.stable_context_fallback_input
+    ));
+    assert!(Arc::ptr_eq(
+        &equal.input,
+        &equal.tool_history_fallback_input
+    ));
+    assert!(Arc::ptr_eq(
+        &equal.input,
+        &equal.stable_context_tool_history_fallback_input
+    ));
+    let ResponseItem::ToolSearchOutput { tools, .. } = &equal.input[0] else {
+        panic!("expected historical tool-search output");
+    };
+    assert_eq!(
+        tools,
+        &[serde_json::json!({
+            "type": "function",
+            "name": "search_repository"
+        })]
+    );
+    let equal_reused = compact_projected_prompt_inputs(&equal_prepared);
+    assert!(
+        Arc::ptr_eq(&equal.input, &equal_reused.input),
+        "later generations must reuse the compacted projection",
+    );
+    assert_matches_independent_compaction(&equal_prepared, &equal);
+
+    let old_repository =
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>";
+    let current_repository =
+        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>";
+    let split_prepared = prepare(vec![
+        message(old_repository),
+        tool_search_output(),
+        message("continue"),
+        message(current_repository),
+    ]);
+    let split = compact_projected_prompt_inputs(&split_prepared);
+    assert_eq!(split.pass_count, 2);
+    assert!(Arc::ptr_eq(
+        &split.input,
+        &split.tool_history_fallback_input
+    ));
+    assert!(Arc::ptr_eq(
+        &split.stable_context_fallback_input,
+        &split.stable_context_tool_history_fallback_input
+    ));
+    assert!(!Arc::ptr_eq(
+        &split.input,
+        &split.stable_context_fallback_input
+    ));
+    assert_ne!(split.input, split.stable_context_fallback_input);
+    assert_matches_independent_compaction(&split_prepared, &split);
+
+    let mut advancing_history = ContextManager::new();
+    let initial_items = [message("before"), tool_search_output()];
+    advancing_history.record_items(initial_items.iter(), TruncationPolicy::Tokens(10_000));
+    let before_append = advancing_history
+        .clone()
+        .prepare_for_sampling_prompt(&[], StableContextTarget::Sampling);
+    let before_append_compacted = compact_projected_prompt_inputs(&before_append);
+    let ResponseItem::ToolSearchOutput { tools, .. } = &before_append_compacted.input[1] else {
+        panic!("expected final tool-search output");
+    };
+    assert_eq!(tools[0]["description"], "large acknowledged schema");
+
+    let reasoning = ResponseItem::Reasoning {
+        id: None,
+        summary: Vec::new(),
+        content: None,
+        encrypted_content: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    advancing_history.record_items([&reasoning], TruncationPolicy::Tokens(10_000));
+    let after_append = advancing_history
+        .clone()
+        .prepare_for_sampling_prompt(&[], StableContextTarget::Sampling);
+    assert_eq!(
+        after_append.compacted_tool_search_outputs_are_materialized(),
+        Some([false; 4]),
+        "a safe append must advance the cached model projections without flattening them",
+    );
+
+    let after_append_compacted = compact_projected_prompt_inputs(&after_append);
+    assert_eq!(after_append_compacted.pass_count, 1);
+    let ResponseItem::ToolSearchOutput { tools, .. } = &after_append_compacted.input[1] else {
+        panic!("expected historical tool-search output");
+    };
+    assert_eq!(
+        tools,
+        &[serde_json::json!({
+            "type": "function",
+            "name": "search_repository"
+        })]
+    );
+    assert_eq!(&after_append_compacted.input[2], &reasoning);
+    assert_matches_independent_compaction(&after_append, &after_append_compacted);
+}
+
+#[test]
+fn arc_identity_short_circuits_equivalence_check() {
+    let comparison_count = AtomicUsize::new(0);
+    let shared = Arc::new([1_u8, 2, 3]);
+    let shared_alias = Arc::clone(&shared);
+
+    assert!(arc_identity_or_equivalent(
+        &shared,
+        &shared_alias,
+        |left, right| {
+            comparison_count.fetch_add(1, Ordering::Relaxed);
+            left == right
+        }
+    ));
+    assert_eq!(comparison_count.load(Ordering::Relaxed), 0);
+
+    let equal_but_distinct = Arc::new([1_u8, 2, 3]);
+    assert!(arc_identity_or_equivalent(
+        &shared,
+        &equal_but_distinct,
+        |left, right| {
+            comparison_count.fetch_add(1, Ordering::Relaxed);
+            left == right
+        }
+    ));
+    assert_eq!(comparison_count.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn request_scaffold_reuses_stable_preparation_and_invalidates_only_owner_changes() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    let equivalent_turn_context = session
+        .new_default_turn_with_sub_id("equivalent-scaffold-owner".to_string())
+        .await;
+    assert!(
+        Arc::ptr_eq(&turn_context.config, &equivalent_turn_context.config),
+        "value-equivalent consecutive turns should share the interned config allocation"
+    );
+    assert_eq!(
+        turn_context.config.as_ref(),
+        equivalent_turn_context.config.as_ref(),
+        "the cross-turn test requires value-equivalent config owners"
+    );
+    let equivalent_step_context = session.capture_step_context(equivalent_turn_context).await;
+    let router = ToolRouter::from_parts(
+        ToolRegistry::from_tools(std::iter::empty::<
+            Arc<dyn crate::tools::registry::CoreToolRuntime>,
+        >()),
+        Vec::new(),
+    );
+    let base_instructions = session.get_base_instructions().await;
+    let mut history = ContextManager::new();
+    let first_user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "first dynamic request".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_items(
+        [&first_user_message],
+        turn_context.model_info.truncation_policy.into(),
+    );
+    let first_prepared = history.clone().prepare_for_sampling_prompt(
+        &turn_context.model_info.input_modalities,
+        StableContextTarget::Sampling,
+    );
+    let second_user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "second dynamic request".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_items(
+        [&second_user_message],
+        turn_context.model_info.truncation_policy.into(),
+    );
+    let second_prepared = history.prepare_for_sampling_prompt(
+        &turn_context.model_info.input_modalities,
+        StableContextTarget::Sampling,
+    );
+    assert_ne!(first_prepared.fingerprint(), second_prepared.fingerprint());
+    assert!(stable_context_owner_matches(
+        first_prepared.stable_context_manifest(),
+        second_prepared.stable_context_manifest(),
+    ));
+
+    let mut cache = session
+        .request_scaffold_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let first = cache.resolve(
+        &first_prepared,
+        session.as_ref(),
+        &router,
+        step_context.as_ref(),
+        &base_instructions,
+        /*terminal_completion_only*/ false,
+    );
+    let first_scaffold = Arc::clone(&first.scaffold);
+    let first_prompt = build_projected_prompt_from_scaffold(
+        session.as_ref(),
+        &first_prepared,
+        step_context.as_ref(),
+        &first,
+    );
+    drop(cache);
+    let mut cache = session
+        .request_scaffold_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let second = cache.resolve(
+        &second_prepared,
+        session.as_ref(),
+        &router,
+        step_context.as_ref(),
+        &base_instructions,
+        /*terminal_completion_only*/ false,
+    );
+    assert!(second.locally_reused);
+    assert!(Arc::ptr_eq(&first_scaffold, &second.scaffold));
+    assert_eq!(cache.build_count(), 1);
+    let second_prompt = build_projected_prompt_from_scaffold(
+        session.as_ref(),
+        &second_prepared,
+        step_context.as_ref(),
+        &second,
+    );
+    assert_ne!(first_prompt.input, second_prompt.input);
+    assert_eq!(
+        first_prompt.digests.instructions,
+        second_prompt.digests.instructions
+    );
+    assert_eq!(first_prompt.digests.tools, second_prompt.digests.tools);
+    assert_ne!(first_prompt.digests.history, second_prompt.digests.history);
+    assert!(Arc::ptr_eq(&first_prompt.tools, &second_prompt.tools));
+
+    let equivalent_turn = cache.resolve(
+        &second_prepared,
+        session.as_ref(),
+        &router,
+        equivalent_step_context.as_ref(),
+        &base_instructions,
+        /*terminal_completion_only*/ false,
+    );
+    assert!(equivalent_turn.locally_reused);
+    assert!(Arc::ptr_eq(&second.scaffold, &equivalent_turn.scaffold));
+    assert_eq!(
+        cache.build_count(),
+        1,
+        "value-equivalent per-turn config owners must not rebuild stable request scaffolding"
+    );
+
+    let cold_second_prompt = build_projected_prompt(
+        session.as_ref(),
+        &second_prepared,
+        &router,
+        step_context.as_ref(),
+        base_instructions.clone(),
+    );
+    assert_eq!(second_prompt.input, cold_second_prompt.input);
+    assert_eq!(
+        second_prompt.stable_context_fallback_input,
+        cold_second_prompt.stable_context_fallback_input
+    );
+    assert_eq!(
+        second_prompt.tool_history_fallback_input,
+        cold_second_prompt.tool_history_fallback_input
+    );
+    assert_eq!(
+        second_prompt.stable_context_tool_history_fallback_input,
+        cold_second_prompt.stable_context_tool_history_fallback_input
+    );
+    assert_eq!(
+        second_prompt.tool_history_substitutions,
+        cold_second_prompt.tool_history_substitutions
+    );
+    assert_eq!(
+        second_prompt.stable_context_fallback_tool_history_substitutions,
+        cold_second_prompt.stable_context_fallback_tool_history_substitutions
+    );
+    assert_eq!(second_prompt.digests, cold_second_prompt.digests);
+    assert_eq!(
+        second_prompt.stable_context_manifest.projected_bytes(),
+        cold_second_prompt.stable_context_manifest.projected_bytes()
+    );
+    assert_eq!(
+        second_prompt.stable_context_manifest.projected_tokens(),
+        cold_second_prompt
+            .stable_context_manifest
+            .projected_tokens()
+    );
+    assert!(stable_context_owner_matches(
+        &second_prompt.stable_context_manifest,
+        &cold_second_prompt.stable_context_manifest,
+    ));
+    assert_eq!(
+        second_prompt.base_instructions,
+        cold_second_prompt.base_instructions
+    );
+    assert_eq!(
+        second_prompt.tools.serialized(),
+        cold_second_prompt.tools.serialized()
+    );
+    assert_eq!(
+        second_prompt.parallel_tool_calls,
+        cold_second_prompt.parallel_tool_calls
+    );
+    assert_eq!(
+        second_prompt.output_schema,
+        cold_second_prompt.output_schema
+    );
+    assert_eq!(
+        second_prompt.output_schema_strict,
+        cold_second_prompt.output_schema_strict
+    );
+    let scaffold_measurements = crate::context::PromptContextBreakdown::from_response_items(
+        &second_prompt.input,
+        &second_prompt.prompt_provenance,
+    )
+    .expect("scaffold prompt provenance should measure")
+    .measurements();
+    let cold_measurements = crate::context::PromptContextBreakdown::from_response_items(
+        &cold_second_prompt.input,
+        &cold_second_prompt.prompt_provenance,
+    )
+    .expect("cold prompt provenance should measure")
+    .measurements();
+    assert_eq!(scaffold_measurements, cold_measurements);
+
+    // Reconstructing an identical router does not change its model-visible
+    // surface and must retain the same physical scaffold.
+    let replacement_router = ToolRouter::from_parts(
+        ToolRegistry::from_tools(std::iter::empty::<
+            Arc<dyn crate::tools::registry::CoreToolRuntime>,
+        >()),
+        Vec::new(),
+    );
+    let replaced_surface = cache.resolve(
+        &second_prepared,
+        session.as_ref(),
+        &replacement_router,
+        step_context.as_ref(),
+        &base_instructions,
+        /*terminal_completion_only*/ false,
+    );
+    assert!(Arc::ptr_eq(&second.scaffold, &replaced_surface.scaffold));
+    assert_eq!(cache.build_count(), 1);
+    assert_eq!(
+        second.scaffold.tools.serialized(),
+        replaced_surface.scaffold.tools.serialized()
+    );
+
+    let changed_router = ToolRouter::from_parts(
+        ToolRegistry::from_tools(std::iter::empty::<
+            Arc<dyn crate::tools::registry::CoreToolRuntime>,
+        >()),
+        vec![codex_tools::ToolSpec::Function(
+            codex_tools::ResponsesApiTool {
+                name: "changed_surface".to_string(),
+                description: "genuinely changed tool schema".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::object(
+                    Default::default(),
+                    None,
+                    Some(false.into()),
+                ),
+                output_schema: None,
+            },
+        )],
+    );
+    let changed_surface = cache.resolve(
+        &second_prepared,
+        session.as_ref(),
+        &changed_router,
+        step_context.as_ref(),
+        &base_instructions,
+        /*terminal_completion_only*/ false,
+    );
+    assert!(!Arc::ptr_eq(
+        &replaced_surface.scaffold,
+        &changed_surface.scaffold
+    ));
+    assert_eq!(cache.build_count(), 2);
+
+    let changed_instructions = BaseInstructions {
+        text: format!("{}\nchanged owner", base_instructions.text),
+    };
+    let replaced_instructions = cache.resolve(
+        &second_prepared,
+        session.as_ref(),
+        &changed_router,
+        step_context.as_ref(),
+        &changed_instructions,
+        /*terminal_completion_only*/ false,
+    );
+    assert!(!Arc::ptr_eq(
+        &changed_surface.scaffold,
+        &replaced_instructions.scaffold
+    ));
+    assert_eq!(cache.build_count(), 3);
+}
+
+#[tokio::test]
+async fn request_scaffold_separates_terminal_and_ordinary_tool_surfaces() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    let router = ToolRouter::from_parts(
+        ToolRegistry::from_tools(std::iter::empty::<
+            Arc<dyn crate::tools::registry::CoreToolRuntime>,
+        >()),
+        vec![codex_tools::ToolSpec::Function(
+            codex_tools::ResponsesApiTool {
+                name: "ordinary_surface".to_string(),
+                description: "Visible only on ordinary generations.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            },
+        )],
+    );
+    let mut history = ContextManager::new();
+    let user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "finish without tools when requested".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_items(
+        [&user_message],
+        turn_context.model_info.truncation_policy.into(),
+    );
+    let prepared = history.prepare_for_sampling_prompt(
+        &turn_context.model_info.input_modalities,
+        StableContextTarget::Sampling,
+    );
+    let base_instructions = session.get_base_instructions().await;
+    let mut cache = RequestScaffoldCache::default();
+
+    let ordinary = cache.resolve(
+        &prepared,
+        session.as_ref(),
+        &router,
+        step_context.as_ref(),
+        &base_instructions,
+        /*terminal_completion_only*/ false,
+    );
+    assert!(!ordinary.scaffold.tools.specs().is_empty());
+    assert_eq!(
+        ordinary.scaffold.digests.tools,
+        Some(ordinary.scaffold.tools.digest())
+    );
+
+    let terminal = cache.resolve(
+        &prepared,
+        session.as_ref(),
+        &router,
+        step_context.as_ref(),
+        &base_instructions,
+        /*terminal_completion_only*/ true,
+    );
+    assert!(!terminal.locally_reused);
+    assert!(terminal.scaffold.tools.specs().is_empty());
+    assert_eq!(
+        terminal.scaffold.digests.tools,
+        Some(terminal.scaffold.tools.digest())
+    );
+    let mut terminal_prompt =
+        build_projected_prompt_from_scaffold(&session, &prepared, step_context.as_ref(), &terminal);
+    enforce_terminal_prompt_contract(&mut terminal_prompt, true);
+    assert!(terminal_prompt.tools.specs().is_empty());
+    assert_eq!(
+        terminal_prompt.digests.tools,
+        Some(terminal_prompt.tools.digest())
+    );
+
+    let ordinary_again = cache.resolve(
+        &prepared,
+        session.as_ref(),
+        &router,
+        step_context.as_ref(),
+        &base_instructions,
+        /*terminal_completion_only*/ false,
+    );
+    assert!(!ordinary_again.locally_reused);
+    assert!(!ordinary_again.scaffold.tools.specs().is_empty());
+    assert_eq!(cache.build_count(), 3);
+}
+
+#[tokio::test]
+async fn projected_prompt_defers_dynamic_history_measurement_across_retries() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    let router = ToolRouter::from_parts(
+        ToolRegistry::from_tools(std::iter::empty::<
+            Arc<dyn crate::tools::registry::CoreToolRuntime>,
+        >()),
+        Vec::new(),
+    );
+    let mut history = ContextManager::new();
+    let user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "dynamic history is measured after dispatch".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    history.record_items(
+        [&user_message],
+        turn_context.model_info.truncation_policy.into(),
+    );
+    let prepared = history.prepare_for_sampling_prompt(
+        &turn_context.model_info.input_modalities,
+        StableContextTarget::Sampling,
+    );
+    let prompt = build_projected_prompt(
+        &session,
+        &prepared,
+        &router,
+        step_context.as_ref(),
+        session.get_base_instructions().await,
+    );
+    let retry_prompt = prompt.clone();
+
+    assert_eq!(prompt.dynamic_history_measurement_count(), 0);
+    assert!(
+        prompt
+            .stable_context_manifest
+            .components()
+            .iter()
+            .all(|component| component.kind != StableContextKind::DynamicHistory)
+    );
+
+    let measured = prompt.measured_stable_context_manifest();
+    assert_eq!(prompt.dynamic_history_measurement_count(), 1);
+    assert!(
+        measured
+            .components()
+            .iter()
+            .any(|component| component.kind == StableContextKind::DynamicHistory)
+    );
+    let measured_retry = retry_prompt.measured_stable_context_manifest();
+    assert_eq!(retry_prompt.dynamic_history_measurement_count(), 1);
+    assert_eq!(measured.projected_bytes(), measured_retry.projected_bytes());
+    assert_eq!(
+        measured.projected_tokens(),
+        measured_retry.projected_tokens()
+    );
+}
+
+#[tokio::test]
+async fn pending_turn_router_reuses_session_cache_until_planning_changes() -> Result<()> {
+    let (session, turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let planning_generation = session.services.planning_generation();
+    let first_step = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    let first = built_tools_for_pending_turn(
+        session.as_ref(),
+        first_step.as_ref(),
+        &[],
+        planning_generation,
+        &CancellationToken::new(),
+    )
+    .await?;
+    let second_step = session
+        .capture_step_context(Arc::clone(&turn_context))
+        .await;
+    let second = built_tools_for_pending_turn(
+        session.as_ref(),
+        second_step.as_ref(),
+        &[],
+        planning_generation,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert!(Arc::ptr_eq(&first, &second));
+
+    let changed_generation = {
+        let mut state_owner = session.state.lock().await;
+        session
+            .services
+            .advance_planning_generation(&mut state_owner)
+    };
+    let changed_step = session.capture_step_context(turn_context).await;
+    let changed = built_tools_for_pending_turn(
+        session.as_ref(),
+        changed_step.as_ref(),
+        &[],
+        changed_generation,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert!(!Arc::ptr_eq(&second, &changed));
+    let counters = changed_step
+        .turn
+        .turn_timing_state
+        .complete_snapshot()
+        .protocol_timing()
+        .counters;
+    assert_eq!(
+        counters.tool_router_reuse_count, 0,
+        "pending-turn planning reuse is not a model-generation router decision",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn built_tools_uses_the_revision_tagged_on_the_step_mcp_snapshot() -> Result<()> {
+    let (session, turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let step_context = session.capture_step_context(turn_context).await;
+    let snapshot_revision = step_context
+        .mcp
+        .manager()
+        .tool_catalog_revision()
+        .saturating_add(7);
+    step_context
+        .seed_mcp_tool_snapshot_for_test(snapshot_revision, Vec::new(), true)
+        .await;
+
+    let router = built_tools(
+        session.as_ref(),
+        step_context.as_ref(),
+        &[],
+        &CancellationToken::new(),
+    )
+    .await?;
+
+    assert_eq!(
+        router.exposure_identity().mcp_tool_catalog_revision,
+        snapshot_revision
+    );
+    assert!(router.exposure_identity().mcp_resources_available);
+    Ok(())
 }
 
 #[tokio::test]
@@ -180,10 +1080,10 @@ async fn kd4_latency_deferred_tool_schema_lease_releases_only_advertised_tools()
     let (_, turn_context) = crate::session::tests::make_session_and_context().await;
     let advertised = codex_tools::ToolName::plain("advertised_deferred");
     let discovered_during_request = codex_tools::ToolName::plain("newly_discovered_deferred");
-    turn_context.refresh_deferred_tool_capabilities(HashMap::from([
+    turn_context.refresh_deferred_tool_capabilities(Arc::new(HashMap::from([
         (advertised.clone(), "revision-a".to_string()),
         (discovered_during_request.clone(), "revision-b".to_string()),
-    ]));
+    ])));
     turn_context.activate_deferred_tools(std::iter::once(advertised.clone()));
     let advertised_for_request = turn_context.activated_deferred_tools();
 
@@ -202,10 +1102,10 @@ async fn deferred_tool_schema_lease_releases_on_sampling_error_exit() {
     let (_, turn_context, _) = crate::session::tests::make_session_and_context_with_rx().await;
     let advertised = codex_tools::ToolName::plain("advertised_deferred");
     let discovered_during_request = codex_tools::ToolName::plain("discovered_during_request");
-    turn_context.refresh_deferred_tool_capabilities(HashMap::from([
+    turn_context.refresh_deferred_tool_capabilities(Arc::new(HashMap::from([
         (advertised.clone(), "revision-a".to_string()),
         (discovered_during_request.clone(), "revision-b".to_string()),
-    ]));
+    ])));
     turn_context.activate_deferred_tools(std::iter::once(advertised.clone()));
 
     {
@@ -228,6 +1128,22 @@ fn sampling_retry_rebuilds_after_accepted_output() {
     progress.accepted_output = true;
 
     assert!(progress.requires_authoritative_retry_input());
+}
+
+#[test]
+fn sampling_success_retains_the_shared_accepted_input() {
+    let accepted: Arc<[ResponseItem]> = Arc::from([ResponseItem::FunctionCall {
+        id: None,
+        name: "accepted".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "accepted-call".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    }]);
+
+    let retained = retain_accepted_sampling_input(Arc::clone(&accepted));
+
+    assert!(Arc::ptr_eq(&retained, &accepted));
 }
 
 #[test]
@@ -342,6 +1258,280 @@ async fn kd4_latency_continuation_prefetch_preserves_workspace_evidence_read() {
         .expect("continuation workspace prefetch should join");
 
     assert_eq!(git_workspace.workspace_evidence_capture_count(), 1);
+}
+
+#[tokio::test]
+async fn workspace_evidence_coalesces_mutating_calls_at_generation_boundary() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let batch = Arc::new(crate::tools::parallel::WorkspaceEvidenceGenerationBatch::new());
+    let repo_root = codex_git_utils::get_git_repo_root(turn_context.config.cwd.as_path())
+        .expect("turn workspace should belong to a Git repository");
+    let dependency_paths = [
+        repo_root.join("workspace-evidence-test/dependency-a.rs"),
+        repo_root.join("workspace-evidence-test/dependency-b.rs"),
+    ];
+    let classifications = dependency_paths.clone().map(|dependency_path| {
+        crate::tool_history::WorkspaceCallClassification {
+            observes_workspace: true,
+            workspace_cwd: turn_context.config.cwd.clone().to_path_buf(),
+            source_dependencies: std::collections::BTreeSet::from([
+                crate::tool_history::SourceDependencyV1::new(&dependency_path, false),
+            ]),
+        }
+    });
+    let mutation_paths = [
+        dependency_paths[0].clone(),
+        repo_root.join("workspace-evidence-test/mutation-b.rs"),
+    ];
+    let call_ids = ["generation-mutation-a", "generation-mutation-b"];
+    let calls = call_ids.map(|call_id| ResponseItem::FunctionCall {
+        id: None,
+        name: "exec_command".to_string(),
+        namespace: None,
+        arguments: format!(r#"{{"cmd":"mutate {call_id}"}}"#),
+        call_id: call_id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let responses = call_ids.map(|call_id| ResponseInputItem::FunctionCallOutput {
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text(format!("completed {call_id}")),
+    });
+    let outputs = responses.clone().map(ResponseItem::from);
+    session
+        .record_conversation_items(
+            &turn_context,
+            &[
+                calls[0].clone(),
+                calls[1].clone(),
+                outputs[0].clone(),
+                outputs[1].clone(),
+            ],
+        )
+        .await;
+
+    for (index, (call_id, response)) in call_ids.iter().zip(&responses).enumerate() {
+        let classification = &classifications[index];
+        assert!(batch.register_call(call_id));
+        tracker
+            .lock()
+            .await
+            .activate_workspace_evidence_generation_batch(&batch);
+        let source_path_observations = classification
+            .source_dependencies
+            .iter()
+            .filter_map(|dependency| {
+                session
+                    .services
+                    .git_workspace
+                    .begin_source_path_change_observation(
+                        &repo_root,
+                        Path::new(&dependency.path),
+                        dependency.recursive,
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(source_path_observations.len(), 1);
+        assert!(
+            session
+                .services
+                .git_workspace
+                .source_path_change_observation_is_current(&source_path_observations[0])
+        );
+        session
+            .services
+            .git_workspace
+            .note_host_workspace_mutation_paths(
+                &repo_root,
+                &[mutation_paths[index].to_string_lossy().into_owned()],
+            );
+        assert_eq!(
+            session
+                .services
+                .git_workspace
+                .source_path_change_observation_is_current(&source_path_observations[0]),
+            index != 0,
+            "only the dependency changed by its batched call should lose its pre-tool proof",
+        );
+        tracker.lock().await.record_unknown_mutation();
+        assert!(batch.record_mutation(
+            call_id,
+            turn_context.config.cwd.clone().to_path_buf(),
+            Some(std::collections::BTreeSet::from([
+                mutation_paths[index].clone(),
+            ])),
+            /*observe_command_ledger*/ false,
+        ));
+        assert!(batch.queue_mutating_response_for_test(
+            response,
+            classification,
+            source_path_observations,
+        ));
+    }
+
+    let captures_before = session
+        .services
+        .git_workspace
+        .workspace_evidence_capture_count();
+    let flush = batch.flush(&session, &turn_context, &tracker).await;
+    let final_identity = flush
+        .prefetched_workspace_identity
+        .expect("the generation flush should capture the primary workspace")
+        .expect("the primary workspace should have a Git identity");
+
+    assert_eq!(flush.authoritative_capture_count, 1);
+    assert_eq!(
+        flush.registered_call_ids,
+        vec![call_ids[0].to_string(), call_ids[1].to_string()],
+    );
+    assert_eq!(
+        session
+            .services
+            .git_workspace
+            .workspace_evidence_capture_count()
+            - captures_before,
+        1,
+    );
+
+    let history = session.clone_history().await;
+    let tool_history = history.tool_history_state();
+    for call_id in call_ids {
+        assert_eq!(
+            tool_history.workspace_evidence_revision_for_test(call_id),
+            Some(Some(final_identity.clone())),
+        );
+    }
+
+    let captures_before_continuation = session
+        .services
+        .git_workspace
+        .workspace_evidence_capture_count();
+    let prepared = prepare_sampling_prompt_with_workspace_identity(
+        history,
+        &turn_context,
+        Some(&final_identity),
+        session.services.git_workspace.as_ref(),
+    );
+    assert_eq!(
+        session
+            .services
+            .git_workspace
+            .workspace_evidence_capture_count(),
+        captures_before_continuation,
+    );
+    for call_id in call_ids {
+        let output = prepared
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                ResponseItem::FunctionCallOutput {
+                    call_id: item_call_id,
+                    output,
+                    ..
+                } if item_call_id == call_id => output.text_content(),
+                _ => None,
+            })
+            .expect("the current batched output should remain in the projected history");
+        assert_eq!(output, format!("completed {call_id}"));
+    }
+
+    session
+        .services
+        .git_workspace
+        .note_host_workspace_mutation_paths(
+            &repo_root,
+            &[repo_root
+                .join("workspace-evidence-test/later-disjoint.rs")
+                .to_string_lossy()
+                .into_owned()],
+        );
+    let mut later_identity = final_identity.clone();
+    later_identity.worktree_identity = Some(format!(
+        "{}:later-disjoint",
+        final_identity
+            .worktree_identity
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    let later_prepared = prepare_sampling_prompt_with_workspace_identity(
+        session.clone_history().await,
+        &turn_context,
+        Some(&later_identity),
+        session.services.git_workspace.as_ref(),
+    );
+    let stale_output = later_prepared
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } if call_id == call_ids[0] => output.text_content(),
+            _ => None,
+        })
+        .expect("the changed dependency output should remain in the projected history");
+    assert!(stale_output.contains("stale_workspace_evidence"));
+    let disjoint_output = later_prepared
+        .items()
+        .iter()
+        .find_map(|item| match item {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } if call_id == call_ids[1] => output.text_content(),
+            _ => None,
+        })
+        .expect("the disjoint dependency output should remain in the projected history");
+    assert_eq!(disjoint_output, format!("completed {}", call_ids[1]));
+}
+
+#[tokio::test]
+async fn workspace_evidence_flush_preserves_authoritative_non_git_identity() {
+    let (session, mut turn_context) = crate::session::tests::make_session_and_context().await;
+    let non_git_workspace = tempfile::tempdir().expect("create non-Git workspace");
+    assert!(codex_git_utils::get_git_repo_root(non_git_workspace.path()).is_none());
+    let mut config = (*turn_context.config).clone();
+    config.cwd = non_git_workspace
+        .path()
+        .to_path_buf()
+        .try_into()
+        .expect("temporary workspace path should be absolute");
+    turn_context.config = Arc::new(config);
+
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let batch = Arc::new(crate::tools::parallel::WorkspaceEvidenceGenerationBatch::new());
+    let call_id = "non-git-mutation";
+    let classification = crate::tool_history::WorkspaceCallClassification {
+        observes_workspace: true,
+        workspace_cwd: turn_context.config.cwd.clone().to_path_buf(),
+        source_dependencies: std::collections::BTreeSet::new(),
+    };
+    let response = ResponseInputItem::FunctionCallOutput {
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text("completed non-Git mutation".to_string()),
+    };
+
+    assert!(batch.register_call(call_id));
+    tracker
+        .lock()
+        .await
+        .activate_workspace_evidence_generation_batch(&batch);
+    tracker.lock().await.record_unknown_mutation();
+    assert!(batch.record_mutation(
+        call_id,
+        classification.workspace_cwd.clone(),
+        None,
+        /*observe_command_ledger*/ false,
+    ));
+    assert!(batch.queue_mutating_response_for_test(&response, &classification, Vec::new(),));
+
+    let flush = batch.flush(&session, &turn_context, &tracker).await;
+
+    assert_eq!(
+        flush.prefetched_workspace_identity,
+        Some(None),
+        "an authoritative non-Git capture must not look like a missing primary capture",
+    );
+    assert_eq!(flush.authoritative_capture_count, 1);
+    assert_eq!(flush.registered_call_ids, vec![call_id.to_string()]);
 }
 
 #[test]
@@ -477,49 +1667,102 @@ fn proven_loop_terminal_generation_ends_unless_new_input_arrives() {
 }
 
 #[test]
-fn passed_evidence_forces_the_next_parent_generation_tool_free() {
-    let ordinary_request = GenerationRequestDisposition {
-        purpose: Some(TurnTimingGenerationPurpose::ArtifactContinuation),
-        sampling: SamplingGenerationDisposition::DecisionBearing,
-        relevant_state_fingerprint: "current-state".to_string(),
-        failure_fingerprint: Some("current-failure".to_string()),
-        terminal_completion_only: false,
-    };
+fn completion_review_retry_clears_stale_finalizer_diff_and_generation_request() {
+    let mut pending_generation_request = Some("repair request");
+    let mut mutating_finalizer_candidate_diff = Some("stale finalizer diff".to_string());
 
-    let (terminal_request, fallback) = evidence_driven_terminal_request(
-        ordinary_request.clone(),
-        1,
-        /*has_pending_input*/ false,
-        /*completion_proved*/ true,
+    prepare_completion_review_retry(
+        &mut pending_generation_request,
+        &mut mutating_finalizer_candidate_diff,
     );
-    assert!(terminal_request.terminal_completion_only);
-    assert_eq!(
-        terminal_request.purpose,
-        Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning)
-    );
-    assert_eq!(fallback, Some(ordinary_request.clone()));
-    assert!(!generation_needs_follow_up(
-        &terminal_request,
-        /*model_needs_follow_up*/ true,
-        /*has_pending_input*/ false,
-    ));
 
-    for (generation_ordinal, has_pending_input, completion_proved) in
-        [(0, false, true), (1, true, true), (1, false, false)]
-    {
-        let (request, fallback) = evidence_driven_terminal_request(
-            ordinary_request.clone(),
-            generation_ordinal,
-            has_pending_input,
-            completion_proved,
-        );
-        assert_eq!(request, ordinary_request);
-        assert_eq!(fallback, None);
-    }
+    assert_eq!(pending_generation_request, None);
+    assert_eq!(mutating_finalizer_candidate_diff, None);
 }
 
 #[test]
-fn logical_generation_budget_allows_eight_regular_and_one_terminal_generation() {
+fn convergence_directive_is_consumed_before_compaction_can_replace_the_request() {
+    let mut decision = SamplingConvergenceDecision {
+        continuation: ContinuationDisposition::ModelRequired,
+        directive: Some("change strategy before continuing".to_string()),
+        proven_loop_activated: true,
+        authoritative_wait: None,
+    };
+
+    assert_eq!(
+        take_convergence_observation(Some(&mut decision)),
+        (true, Some("change strategy before continuing".to_string()))
+    );
+    assert_eq!(
+        take_convergence_observation(Some(&mut decision)),
+        (false, None)
+    );
+}
+
+#[test]
+fn compaction_rebases_but_preserves_a_terminal_completion_request() {
+    let request = GenerationRequestDisposition {
+        purpose: Some(TurnTimingGenerationPurpose::ValidationInterpretation),
+        sampling: SamplingGenerationDisposition::DecisionBearing,
+        relevant_state_fingerprint: "before-compaction".to_string(),
+        failure_fingerprint: Some("failure".to_string()),
+        terminal_completion_only: true,
+    };
+
+    let rebased =
+        rebase_generation_request_after_compaction(request, "after-compaction".to_string());
+
+    assert_eq!(
+        rebased.purpose,
+        Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning)
+    );
+    assert_eq!(
+        rebased.sampling,
+        SamplingGenerationDisposition::DecisionBearing
+    );
+    assert_eq!(rebased.relevant_state_fingerprint, "after-compaction");
+    assert_eq!(rebased.failure_fingerprint.as_deref(), Some("failure"));
+    assert!(rebased.terminal_completion_only);
+}
+
+#[test]
+fn server_end_turn_false_is_honored_once_before_host_completion() {
+    assert!(!protocol_resample_completion_allowed(
+        /*server_resample_eligible*/ true, /*consecutive_server_resample_honored*/ false,
+    ));
+    assert!(protocol_resample_completion_allowed(
+        /*server_resample_eligible*/ true, /*consecutive_server_resample_honored*/ true,
+    ));
+    assert!(!protocol_resample_completion_allowed(
+        /*server_resample_eligible*/ false, /*consecutive_server_resample_honored*/ true,
+    ));
+}
+
+#[test]
+fn verified_turn_contract_after_agent_abort_preserves_completed_output_metadata() {
+    let surfaced_result = SurfacedToolResult {
+        adapter: "code_mode_cell".to_string(),
+        value: serde_json::json!({"answer": 42}),
+        canonical_message: Some("completed answer".to_string()),
+    };
+
+    let result = after_agent_abort_result(
+        Some("completed answer".to_string()),
+        Some(surfaced_result.clone()),
+        true,
+    );
+
+    assert_eq!(
+        result.last_agent_message.as_deref(),
+        Some("completed answer")
+    );
+    assert_eq!(result.surfaced_result, Some(surfaced_result));
+    assert!(result.required_tool_terminal.is_none());
+    assert!(result.defer_pending_input);
+}
+
+#[test]
+fn logical_generation_budget_allows_thirty_two_regular_and_one_terminal_generation() {
     let mut budget = LogicalGenerationBudget::default();
     for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
         assert_eq!(
@@ -531,9 +1774,75 @@ fn logical_generation_budget_allows_eight_regular_and_one_terminal_generation() 
         budget.admit(/*terminal_requested*/ false),
         LogicalGenerationAdmission::Terminal { forced: true }
     );
+    assert!(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE.contains("final tool-free"));
+    assert!(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_REASON.contains("forced terminal"));
     assert_eq!(
         budget.admit(/*terminal_requested*/ false),
         LogicalGenerationAdmission::Exhausted
+    );
+}
+
+#[tokio::test]
+async fn forced_terminal_budget_boundary_is_visible_in_history_and_events() {
+    let (session, turn_context, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+
+    record_forced_terminal_budget_boundary(session.as_ref(), turn_context.as_ref()).await;
+
+    let history = session.clone_history().await;
+    assert!(history.raw_items().iter().any(|item| {
+        matches!(
+            item,
+            ResponseItem::Message { role, content, .. }
+                if role == "developer"
+                    && content.iter().any(|item| matches!(
+                        item,
+                        ContentItem::InputText { text }
+                            if text == LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE
+                    ))
+        )
+    }));
+    let warning = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("forced-terminal event channel remains open");
+            if let EventMsg::Warning(warning) = event.msg {
+                break warning;
+            }
+        }
+    })
+    .await
+    .expect("forced-terminal boundary emits a warning");
+    assert_eq!(
+        warning.message,
+        LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE
+    );
+}
+
+#[test]
+fn completion_pending_input_stays_in_the_sampling_loop_when_capacity_remains() {
+    let available = LogicalGenerationBudget::default();
+    assert_eq!(
+        completion_pending_input_disposition(&available, true),
+        CompletionPendingInputDisposition::Continue
+    );
+    assert_eq!(
+        completion_pending_input_disposition(&available, false),
+        CompletionPendingInputDisposition::None
+    );
+
+    let mut no_regular_capacity = LogicalGenerationBudget::default();
+    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
+        assert_eq!(
+            no_regular_capacity.admit(/*terminal_requested*/ false),
+            LogicalGenerationAdmission::Regular
+        );
+    }
+    assert_eq!(
+        completion_pending_input_disposition(&no_regular_capacity, true),
+        CompletionPendingInputDisposition::Defer
     );
 }
 
@@ -548,6 +1857,248 @@ fn logical_generation_budget_terminal_attempt_is_exactly_once() {
         budget.admit(/*terminal_requested*/ true),
         LogicalGenerationAdmission::Exhausted
     );
+}
+
+#[test]
+fn orchestration_audit_regular_follow_up_admission_has_one_budget_precedence_table() {
+    let available = LogicalGenerationBudget::default();
+    assert_eq!(
+        regular_follow_up_admission(&available, false),
+        RegularFollowUpAdmission::Admit
+    );
+    assert_eq!(
+        regular_follow_up_admission(&available, true),
+        RegularFollowUpAdmission::Exhausted
+    );
+
+    let mut exhausted = LogicalGenerationBudget::default();
+    assert_eq!(
+        exhausted.admit(/*terminal_requested*/ true),
+        LogicalGenerationAdmission::Terminal { forced: false }
+    );
+    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
+        assert_eq!(
+            exhausted.admit(/*terminal_requested*/ false),
+            LogicalGenerationAdmission::Regular
+        );
+    }
+    assert_eq!(
+        regular_follow_up_admission(&exhausted, false),
+        RegularFollowUpAdmission::Exhausted
+    );
+}
+
+#[test]
+fn used_terminal_then_regular_generation_limit_blocks_follow_up_before_input_drain() {
+    let mut budget = LogicalGenerationBudget::default();
+    assert_eq!(
+        budget.admit(/*terminal_requested*/ true),
+        LogicalGenerationAdmission::Terminal { forced: false }
+    );
+    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
+        assert_eq!(
+            budget.admit(/*terminal_requested*/ false),
+            LogicalGenerationAdmission::Regular
+        );
+    }
+    let next_request = GenerationRequestDisposition {
+        purpose: Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning),
+        sampling: SamplingGenerationDisposition::DecisionBearing,
+        relevant_state_fingerprint: "budget-exhausted".to_string(),
+        failure_fingerprint: None,
+        terminal_completion_only: false,
+    };
+
+    assert!(budget.is_exhausted());
+    assert!(generation_budget_blocks_follow_up(
+        &budget,
+        Some(&next_request)
+    ));
+}
+
+#[tokio::test]
+async fn terminal_generation_boundary_does_not_poll_or_drain_pending_input() {
+    let mut budget = LogicalGenerationBudget::default();
+    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
+        assert_eq!(
+            budget.admit(/*terminal_requested*/ false),
+            LogicalGenerationAdmission::Regular
+        );
+    }
+    assert!(!budget.is_exhausted());
+
+    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let future_polled = Arc::clone(&polled);
+    let drained = drain_pending_input_if_generation_available(&budget, async move {
+        future_polled.store(true, Ordering::Release);
+        vec![TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "must remain queued for a fresh turn".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        }]
+    })
+    .await;
+
+    assert_eq!(drained, Some(Vec::new()));
+    assert!(!polled.load(Ordering::Acquire));
+    assert_eq!(
+        budget.admit(/*terminal_requested*/ false),
+        LogicalGenerationAdmission::Terminal { forced: true }
+    );
+}
+
+#[tokio::test]
+async fn exhausted_generation_budget_does_not_poll_or_drain_pending_input() {
+    let mut budget = LogicalGenerationBudget::default();
+    for _ in 0..MAX_REGULAR_LOGICAL_GENERATIONS {
+        assert_eq!(
+            budget.admit(/*terminal_requested*/ false),
+            LogicalGenerationAdmission::Regular
+        );
+    }
+    assert_eq!(
+        budget.admit(/*terminal_requested*/ false),
+        LogicalGenerationAdmission::Terminal { forced: true }
+    );
+    assert!(budget.is_exhausted());
+
+    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let future_polled = Arc::clone(&polled);
+    let drained = drain_pending_input_if_generation_available(&budget, async move {
+        future_polled.store(true, Ordering::Release);
+        vec![TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: "must remain queued".to_string(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        }]
+    })
+    .await;
+
+    assert!(drained.is_none());
+    assert!(!polled.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn untyped_status_affecting_error_is_recorded_as_terminal() {
+    let (session, turn_context, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let error = ErrorEvent {
+        message: "untyped terminal error".to_string(),
+        codex_error_info: None,
+    };
+    assert!(error.affects_turn_status());
+
+    session
+        .send_event(turn_context.as_ref(), EventMsg::Error(error.clone()))
+        .await;
+
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("untyped terminal error emits an event")
+        .expect("event channel remains open");
+    let EventMsg::Error(emitted_error) = event.msg else {
+        panic!("expected untyped terminal error event");
+    };
+    assert_eq!(emitted_error, error);
+    assert_eq!(
+        turn_context.terminal_error.lock().await.as_ref(),
+        Some(&error)
+    );
+}
+
+#[tokio::test]
+async fn generation_budget_exhaustion_emits_one_status_affecting_error() {
+    let (session, turn_context, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let mut reported = false;
+
+    report_logical_generation_budget_exhausted(
+        session.as_ref(),
+        turn_context.as_ref(),
+        &mut reported,
+    )
+    .await;
+    report_logical_generation_budget_exhausted(
+        session.as_ref(),
+        turn_context.as_ref(),
+        &mut reported,
+    )
+    .await;
+
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("generation budget exhaustion emits an error event")
+        .expect("event channel remains open");
+    let EventMsg::Error(error) = event.msg else {
+        panic!("expected generation budget error event");
+    };
+    assert_eq!(error.message, LOGICAL_GENERATION_BUDGET_EXHAUSTED_MESSAGE);
+    assert!(error.affects_turn_status());
+    assert_eq!(
+        turn_context.terminal_error.lock().await.as_ref(),
+        Some(&error)
+    );
+    assert!(events.try_recv().is_err(), "error must be reported once");
+}
+
+#[tokio::test]
+async fn planning_failure_records_initial_input_and_emits_status_affecting_error() {
+    let (session, turn_context, events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let input = vec![TurnInput::UserInput {
+        content: vec![UserInput::Text {
+            text: "preserve this initial prompt".to_string(),
+            text_elements: Vec::new(),
+        }],
+        client_id: Some("planning-failure-input".to_string()),
+    }];
+
+    finish_pending_turn_planning_failure(
+        &session,
+        &turn_context,
+        &input,
+        planning_failure("injected test failure"),
+    )
+    .await
+    .expect("planning failure is surfaced as a terminal turn result");
+
+    let error = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("planning failure event channel remains open");
+            if let EventMsg::Error(error) = event.msg {
+                break error;
+            }
+        }
+    })
+    .await
+    .expect("planning failure emits an error event");
+    assert!(error.message.contains("pending-turn planning failure"));
+    assert!(error.affects_turn_status());
+    assert_eq!(
+        turn_context.terminal_error.lock().await.as_ref(),
+        Some(&error)
+    );
+
+    let history = session.clone_history().await;
+    assert!(history.raw_items().iter().any(|item| {
+        matches!(
+            item,
+            ResponseItem::Message { role, content, .. }
+                if role == "user"
+                    && content.iter().any(|item| matches!(
+                        item,
+                        ContentItem::InputText { text }
+                            if text == "preserve this initial prompt"
+                    ))
+        )
+    }));
 }
 
 #[tokio::test]
@@ -906,6 +2457,15 @@ fn finalized_router_reuse_requires_identical_coarse_exposure_identity() {
         &ready_environment
     ));
 
+    let refreshed_mcp_catalog = ToolExposureIdentity {
+        mcp_tool_catalog_revision: disabled.mcp_tool_catalog_revision + 1,
+        ..disabled.clone()
+    };
+    assert!(!finalized_router_matches_exposure(
+        &router,
+        &refreshed_mcp_catalog
+    ));
+
     let starting_environment = ToolExposureIdentity {
         environment_starting: true,
         ..disabled
@@ -914,6 +2474,71 @@ fn finalized_router_reuse_requires_identical_coarse_exposure_identity() {
         &router,
         &starting_environment
     ));
+}
+
+#[tokio::test]
+async fn finalized_router_reuse_rejects_stale_request_user_input_eligibility() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let current = current_dynamic_tool_exposure_identity(&session, step_context.as_ref()).await;
+    let matching_identity = ToolExposureIdentity {
+        agent_surface_stage: current.agent_surface_stage,
+        extension_tool_surface_revision: current.extension_tool_surface_revision,
+        mcp_tool_catalog_revision: current.mcp_tool_catalog_revision,
+        mcp_resources_available: current.mcp_resources_available,
+        request_user_input_eligible: current.request_user_input_eligible,
+        collaboration_mode: current.collaboration_mode,
+        environment_mode: current.environment_mode,
+        environment_starting: current.environment_starting,
+        ..ToolExposureIdentity::default()
+    };
+    let matching_router = ToolRouter::from_parts_with_warnings_and_identity(
+        ToolRegistry::empty_for_test(),
+        Vec::new(),
+        Vec::new(),
+        matching_identity.clone(),
+    );
+    assert!(
+        finalized_router_matches_current_exposure(
+            &session,
+            step_context.as_ref(),
+            &matching_router,
+        )
+        .await
+    );
+
+    let stale_router = ToolRouter::from_parts_with_warnings_and_identity(
+        ToolRegistry::empty_for_test(),
+        Vec::new(),
+        Vec::new(),
+        ToolExposureIdentity {
+            request_user_input_eligible: !matching_identity.request_user_input_eligible,
+            ..matching_identity.clone()
+        },
+    );
+    assert!(
+        !finalized_router_matches_current_exposure(&session, step_context.as_ref(), &stale_router,)
+            .await
+    );
+
+    let stale_collaboration_mode_router = ToolRouter::from_parts_with_warnings_and_identity(
+        ToolRegistry::empty_for_test(),
+        Vec::new(),
+        Vec::new(),
+        ToolExposureIdentity {
+            collaboration_mode: ModeKind::Plan,
+            ..matching_identity
+        },
+    );
+    assert!(
+        !finalized_router_matches_current_exposure(
+            &session,
+            step_context.as_ref(),
+            &stale_collaboration_mode_router,
+        )
+        .await
+    );
 }
 
 #[test]
@@ -995,7 +2620,7 @@ fn response_input_texts(items: &[ResponseItem]) -> Vec<&str> {
 }
 
 #[test]
-fn reasoning_governor_resets_only_for_non_empty_user_input() {
+fn reasoning_governor_resets_for_every_accepted_context_change() {
     let user_input = TurnInput::UserInput {
         content: vec![UserInput::Text {
             text: "new instruction".to_string(),
@@ -1018,8 +2643,8 @@ fn reasoning_governor_resets_only_for_non_empty_user_input() {
 
     assert!(resets_reasoning_governor(&user_input));
     assert!(!resets_reasoning_governor(&empty_user_input));
-    assert!(!resets_reasoning_governor(&response_item));
-    assert!(!resets_reasoning_governor(&mailbox_item));
+    assert!(resets_reasoning_governor(&response_item));
+    assert!(resets_reasoning_governor(&mailbox_item));
 }
 
 #[test]
@@ -1233,6 +2858,7 @@ else:
 #[tokio::test]
 async fn drain_in_flight_returns_first_error_after_draining_remaining_futures() {
     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
     let remaining_future_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let remaining_future_polled_clone = Arc::clone(&remaining_future_polled);
     let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
@@ -1255,7 +2881,7 @@ async fn drain_in_flight_returns_first_error_after_draining_remaining_futures() 
         .into_future(),
     ));
 
-    let error = drain_in_flight(&mut in_flight, Arc::new(session), Arc::new(turn_context))
+    let error = drain_in_flight(&mut in_flight, Arc::clone(&session), Arc::new(turn_context))
         .await
         .expect_err("the first in-flight tool error should be returned");
 
@@ -1264,6 +2890,246 @@ async fn drain_in_flight_returns_first_error_after_draining_remaining_futures() 
         error,
         CodexErr::Fatal(message) if message == "first tool failure"
     ));
+    let history = session.clone_history().await;
+    let failure_outputs = history
+        .raw_items()
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } if call_id == "first" || call_id == "second" => {
+                Some((call_id.as_str(), output.success))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failure_outputs,
+        vec![("first", Some(false)), ("second", Some(false))],
+        "every accepted failed call must persist one ordered terminal output before the error escapes"
+    );
+}
+
+#[tokio::test]
+async fn drain_in_flight_persists_each_ordered_output_before_later_tools_finish() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let (release_second_tx, release_second_rx) = tokio::sync::oneshot::channel();
+    let drain_session = Arc::clone(&session);
+    let drain_turn_context = Arc::clone(&turn_context);
+    let drain = tokio::spawn(async move {
+        let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
+            FuturesOrdered::new();
+        in_flight.push_back(Box::pin(
+            InFlightToolCall::from_test_future(
+                "first",
+                Box::pin(async { Ok(synthetic_tool_result("first")) }),
+            )
+            .into_future(),
+        ));
+        in_flight.push_back(Box::pin(
+            InFlightToolCall::from_test_future(
+                "second",
+                Box::pin(async move {
+                    let _ = release_second_rx.await;
+                    Ok(synthetic_tool_result("second"))
+                }),
+            )
+            .into_future(),
+        ));
+        drain_in_flight(&mut in_flight, drain_session, drain_turn_context).await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let history = session.clone_history().await;
+            if history.raw_items().iter().any(|item| {
+                matches!(
+                    item,
+                    ResponseItem::ToolSearchOutput { call_id, .. } if call_id.as_deref() == Some("first")
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first ordered output should be durable while a later tool is still running");
+
+    release_second_tx
+        .send(())
+        .expect("the second tool should still be waiting");
+    drain
+        .await
+        .expect("the drain task should join")
+        .expect("both tool outputs should be delivered");
+}
+
+#[tokio::test]
+async fn drain_in_flight_commits_post_tool_context_after_its_output() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    turn_context
+        .queue_post_tool_contexts(
+            "annotated",
+            vec![ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "post-tool context".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }],
+        )
+        .await;
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
+        FuturesOrdered::new();
+    in_flight.push_back(Box::pin(
+        InFlightToolCall::from_test_future(
+            "annotated",
+            Box::pin(async { Ok(synthetic_tool_result("annotated")) }),
+        )
+        .into_future(),
+    ));
+
+    drain_in_flight(
+        &mut in_flight,
+        Arc::clone(&session),
+        Arc::clone(&turn_context),
+    )
+    .await
+    .expect("the annotated output should be delivered");
+
+    let history = session.clone_history().await;
+    let ordered = history
+        .raw_items()
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::ToolSearchOutput { call_id, .. }
+                if call_id.as_deref() == Some("annotated") =>
+            {
+                Some("output")
+            }
+            ResponseItem::Message { role, content, .. }
+                if role == "developer"
+                    && content.iter().any(|item| {
+                        matches!(item, ContentItem::InputText { text } if text == "post-tool context")
+                    }) =>
+            {
+                Some("context")
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ordered, vec!["output", "context"]);
+}
+
+#[test]
+fn function_calls_select_argument_diff_consumers() {
+    let item = ResponseItem::FunctionCall {
+        id: None,
+        name: "apply_patch".to_string(),
+        namespace: Some("workspace".to_string()),
+        arguments: String::new(),
+        call_id: "function-diff".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let (call_id, tool_name) = tool_argument_diff_target(&item)
+        .expect("function tools should be eligible for argument diff streaming");
+
+    assert_eq!(call_id, "function-diff");
+    assert_eq!(
+        tool_name,
+        ToolName::new(Some("workspace".to_string()), "apply_patch")
+    );
+}
+
+#[tokio::test]
+async fn drain_in_flight_returns_earliest_required_terminal_after_persisting_all_outputs() {
+    use crate::tools::context::RequiredToolTerminal;
+    use crate::tools::context::RequiredToolTerminalCause;
+    use crate::tools::parallel::ToolCallCompletion;
+
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let mut first = InFlightToolCall::from_test_future(
+        "first-terminal",
+        Box::pin(async { Ok(synthetic_tool_result("first-terminal")) }),
+    )
+    .into_future()
+    .await;
+    first.result = Ok(ToolCallCompletion {
+        response: synthetic_tool_result("first-terminal"),
+        required_terminal: Some(RequiredToolTerminal {
+            call_id: "first-terminal".to_string(),
+            cause: RequiredToolTerminalCause::Failure,
+            message: "first required failure".to_string(),
+        }),
+    });
+    let mut second = InFlightToolCall::from_test_future(
+        "second-terminal",
+        Box::pin(async { Ok(synthetic_tool_result("second-terminal")) }),
+    )
+    .into_future()
+    .await;
+    second.result = Ok(ToolCallCompletion {
+        response: synthetic_tool_result("second-terminal"),
+        required_terminal: Some(RequiredToolTerminal {
+            call_id: "second-terminal".to_string(),
+            cause: RequiredToolTerminalCause::TimedOut,
+            message: "second required timeout".to_string(),
+        }),
+    });
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
+        FuturesOrdered::new();
+    in_flight.push_back(Box::pin(async move { first }));
+    in_flight.push_back(Box::pin(async move { second }));
+
+    let terminal = drain_in_flight(
+        &mut in_flight,
+        Arc::clone(&session),
+        Arc::clone(&turn_context),
+    )
+    .await
+    .expect("semantic failures are terminal results, not relay errors")
+    .expect("a required terminal result should be returned");
+
+    assert_eq!(terminal.call_id, "first-terminal");
+    let history = session.clone_history().await;
+    let persisted_call_ids = history
+        .raw_items()
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::ToolSearchOutput { call_id, .. }
+                if matches!(
+                    call_id.as_deref(),
+                    Some("first-terminal" | "second-terminal")
+                ) =>
+            {
+                call_id.as_deref()
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        persisted_call_ids,
+        vec!["first-terminal", "second-terminal"]
+    );
+    assert_eq!(
+        turn_context
+            .durable_history_completed_commits
+            .lock()
+            .await
+            .len(),
+        2,
+        "each completed tool must commit its ordered output without waiting for later tools"
+    );
 }
 
 #[tokio::test]
@@ -1282,6 +3148,116 @@ async fn drain_in_flight_keeps_successful_delivery_independent_of_telemetry_stat
     drain_in_flight(&mut in_flight, Arc::new(session), Arc::new(turn_context))
         .await
         .expect("successful tool delivery must not depend on telemetry-only state");
+}
+
+#[tokio::test]
+async fn drain_in_flight_rollout_failure_does_not_attest_persistence_or_mutate_history() {
+    let (mut session, turn_context) = crate::session::tests::make_session_and_context().await;
+    crate::session::tests::attach_thread_persistence(&mut session).await;
+    session
+        .live_thread()
+        .expect("test session should have live persistence")
+        .shutdown()
+        .await
+        .expect("test thread store should shut down");
+
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let call_id = "durability-failure";
+    let call = InFlightToolCall::from_test_future(
+        call_id,
+        Box::pin(async move { Ok(synthetic_tool_result(call_id)) }),
+    );
+    let execution_id = call.execution_id.clone();
+    call.timing.record_outcome("success");
+    turn_context.turn_timing_state.mark_turn_started();
+    turn_context.turn_timing_state.record_accepted_tool_call(
+        call_id,
+        &execution_id,
+        codex_protocol::protocol::TurnTimingToolCallSource::Direct,
+        None,
+    );
+    turn_context.turn_timing_state.record_tool_dispatch_timing(
+        call_id,
+        "test_tool",
+        codex_protocol::protocol::TurnTimingToolCallSource::Direct,
+        crate::turn_timing::ToolCallTimingLineage::default(),
+        call.timing.snapshot(tokio::time::Instant::now()),
+    );
+    let history_before = session.clone_history().await.raw_items().to_vec();
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
+        FuturesOrdered::new();
+    in_flight.push_back(Box::pin(call.into_future()));
+
+    let error = drain_in_flight(
+        &mut in_flight,
+        Arc::clone(&session),
+        Arc::clone(&turn_context),
+    )
+    .await
+    .expect_err("rollout append failure must fail the relay before history mutation");
+
+    assert!(matches!(
+        error,
+        CodexErr::Fatal(message) if message.contains("failed to durably append tool output")
+    ));
+    let history_after = session.clone_history().await;
+    assert_eq!(history_after.raw_items(), history_before.as_slice());
+    let closure = turn_context.turn_timing_state.tool_closure_snapshot();
+    assert_eq!(
+        (
+            closure.accepted_count,
+            closure.timing_paired_count,
+            closure.terminal_count,
+            closure.persisted_count,
+        ),
+        (1, 1, 1, 0)
+    );
+    assert_eq!(closure.unresolved_calls.len(), 1);
+    assert_eq!(closure.unresolved_calls[0].call_id, call_id);
+    assert_eq!(closure.unresolved_calls[0].execution_id, execution_id);
+    assert!(!closure.complete);
+}
+
+#[tokio::test]
+async fn drain_in_flight_persists_stale_relay_as_terminal_failure() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let mut stale = InFlightToolCall::from_test_future(
+        "stale",
+        Box::pin(async { Ok(synthetic_tool_result("stale")) }),
+    )
+    .into_future()
+    .await;
+    stale.execution_id = codex_protocol::protocol::ToolExecutionId("stale-execution".to_string());
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
+        FuturesOrdered::new();
+    in_flight.push_back(Box::pin(async move { stale }));
+
+    let error = drain_in_flight(&mut in_flight, Arc::clone(&session), Arc::new(turn_context))
+        .await
+        .expect_err("a stale relay must fail the turn after closing its accepted call");
+
+    assert!(matches!(
+        error,
+        CodexErr::Fatal(message) if message.contains("stale tool relay completion for stale")
+    ));
+    let history = session.clone_history().await;
+    let stale_outputs = history
+        .raw_items()
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } if call_id == "stale" => Some(output.success),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stale_outputs,
+        vec![Some(false)],
+        "a stale accepted call must persist exactly one terminal output"
+    );
 }
 
 #[tokio::test]
@@ -2134,6 +4110,37 @@ fn pending_token_estimate_excludes_stable_startup_injections_from_body_growth() 
 }
 
 #[test]
+fn pending_injection_byte_count_serializes_each_item_once_with_array_overhead() {
+    let stable = ContextualUserFragment::into(TaskModelGuidance);
+    let dynamic = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: "dynamic injection".repeat(256),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let items = [stable, dynamic.clone()];
+
+    let (total, body) =
+        injection_serialized_lengths(&items).expect("count injection serialization");
+
+    assert_eq!(
+        total,
+        serde_json::to_vec(&items)
+            .expect("serialize comparison injection")
+            .len(),
+    );
+    assert_eq!(
+        body,
+        serde_json::to_vec(&dynamic)
+            .expect("serialize comparison body item")
+            .len(),
+    );
+}
+
+#[test]
 fn stop_hook_continuation_preserves_finalization_warning_for_the_final_response() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
         "stop_hook_continuation_preserves_finalization_warning_for_the_final_response",
@@ -2469,6 +4476,46 @@ fn controlled_tool_call(
     )
 }
 
+#[tokio::test]
+async fn non_eager_tool_future_waits_for_the_response_tail_to_close() {
+    let response_tail_closed = CancellationToken::new();
+    let (first_poll_tx, mut first_poll_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
+        FuturesOrdered::new();
+    in_flight.push_back(defer_tool_future_until_response_tail(
+        controlled_tool_call("deferred", first_poll_tx, release_rx),
+        response_tail_closed.clone(),
+    ));
+
+    let result_task = tokio::spawn(async move {
+        in_flight
+            .next()
+            .await
+            .expect("deferred tool result should exist")
+    });
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        first_poll_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+
+    response_tail_closed.cancel();
+    first_poll_rx
+        .await
+        .expect("tool execution should start after the response tail closes");
+    release_tx
+        .send(())
+        .expect("deferred tool should still be attached");
+    let result = result_task
+        .await
+        .expect("deferred tool task should finish")
+        .result
+        .expect("deferred tool should succeed")
+        .response;
+    assert_eq!(result, synthetic_tool_result("deferred"));
+}
+
 #[tokio::test(start_paused = true)]
 async fn eligible_direct_tool_calls_overlap_a_response_tail_without_changing_results() {
     const RESPONSE_TAIL: Duration = Duration::from_millis(250);
@@ -2549,7 +4596,8 @@ async fn eligible_direct_tool_calls_overlap_a_response_tail_without_changing_res
             .await
             .expect("eager result should exist")
             .result
-            .expect("eager tool should succeed");
+            .expect("eager tool should succeed")
+            .response;
         next_sampling_started_after_drain.store(true, Ordering::SeqCst);
         result
     });
@@ -2600,13 +4648,15 @@ async fn eager_tool_results_remain_in_call_order_after_reverse_completion() {
         .await
         .expect("first result")
         .result
-        .expect("success");
+        .expect("success")
+        .response;
     let second = in_flight
         .next()
         .await
         .expect("second result")
         .result
-        .expect("success");
+        .expect("success")
+        .response;
     assert_eq!(first, synthetic_tool_result("first"));
     assert_eq!(second, synthetic_tool_result("second"));
 }

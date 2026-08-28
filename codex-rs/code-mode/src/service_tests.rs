@@ -1,15 +1,22 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::CellId;
+use super::FallbackCodeModeSessionProvider;
 use super::InProcessCodeModeSession;
+use super::InProcessCodeModeSessionProvider;
 use super::RuntimeResponse;
 use super::WaitOutcome;
 use super::WaitRequest;
 use super::runtime_request;
+use crate::CodeModeSessionProvider;
 use crate::CodeModeToolKind;
 use crate::ExecuteRequest;
 use crate::FunctionCallOutputContentItem;
+use crate::NoopCodeModeSessionDelegate;
+use crate::ProcessOwnedCodeModeSessionProvider;
 use crate::ToolDefinition;
+use crate::runtime::MAX_SESSION_STORED_VALUE_BYTES;
 use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
 
@@ -25,6 +32,39 @@ fn execute_request(source: &str) -> ExecuteRequest {
 
 fn cell_id(value: &str) -> CellId {
     CellId::new(value.to_string())
+}
+
+#[tokio::test]
+async fn fallback_provider_uses_in_process_session_when_host_is_missing() {
+    let provider = FallbackCodeModeSessionProvider::new(
+        Arc::new(ProcessOwnedCodeModeSessionProvider::with_host_program(
+            "codex-code-mode-host-does-not-exist".into(),
+        )),
+        Arc::new(InProcessCodeModeSessionProvider),
+    );
+
+    let session = provider
+        .create_session(Arc::new(NoopCodeModeSessionDelegate))
+        .await
+        .expect("missing process host should fall back to an in-process session");
+    let response = session
+        .execute(execute_request("text('fallback-ready');"))
+        .await
+        .expect("fallback execution should start")
+        .initial_response()
+        .await
+        .expect("fallback execution should finish");
+
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "fallback-ready".to_string(),
+            }],
+            error_text: None,
+        }
+    );
 }
 
 #[test]
@@ -162,6 +202,52 @@ async fn stored_values_are_shared_between_cells_but_not_sessions() {
         other_session,
         RuntimeResponse::Result {
             cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "undefined".to_string(),
+            }],
+            error_text: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn oversized_store_rejects_all_writes_from_the_cell() {
+    let session = InProcessCodeModeSession::new();
+    let response = execute(
+        &session,
+        ExecuteRequest {
+            source: format!(
+                r#"store("partial", "must-not-commit"); store("oversized", "x".repeat({}));"#,
+                MAX_SESSION_STORED_VALUE_BYTES + 1
+            ),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    let RuntimeResponse::Result { error_text, .. } = response else {
+        panic!("oversized store should complete with an error");
+    };
+    assert!(
+        error_text
+            .as_deref()
+            .is_some_and(|error| error.contains("code mode session storage exceeds its limit"))
+    );
+
+    let read_response = execute(
+        &session,
+        ExecuteRequest {
+            source: r#"text(String(load("partial")));"#.to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+    assert_eq!(
+        read_response,
+        RuntimeResponse::Result {
+            cell_id: cell_id("2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "undefined".to_string(),
             }],

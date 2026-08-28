@@ -28,7 +28,7 @@ use codex_network_proxy::NetworkProxyConfig;
 use codex_network_proxy::NetworkProxyConstraintError;
 use codex_network_proxy::NetworkProxyConstraints;
 use codex_network_proxy::NetworkProxyState;
-use codex_network_proxy::build_config_state;
+use codex_network_proxy::build_config_state_with_codex_home;
 use codex_network_proxy::normalize_host;
 use codex_network_proxy::validate_policy_against_constraints;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -44,17 +44,19 @@ pub async fn build_network_proxy_state() -> Result<NetworkProxyState> {
 
 pub async fn build_network_proxy_state_and_reloader() -> Result<(ConfigState, MtimeConfigReloader)>
 {
-    let (state, layer_mtimes) = build_config_state_with_mtimes().await?;
-    Ok((state, MtimeConfigReloader::new(layer_mtimes)))
+    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let (state, layer_mtimes) = build_config_state_with_mtimes(&codex_home).await?;
+    Ok((state, MtimeConfigReloader::new(layer_mtimes, codex_home)))
 }
 
-async fn build_config_state_with_mtimes() -> Result<(ConfigState, Vec<LayerMtime>)> {
-    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+async fn build_config_state_with_mtimes(
+    codex_home: &AbsolutePathBuf,
+) -> Result<(ConfigState, Vec<LayerMtime>)> {
     let cli_overrides = Vec::new();
     let overrides = LoaderOverrides::default();
     let config_layer_stack = load_config_layers_state(
         LOCAL_FS.as_ref(),
-        &codex_home,
+        codex_home,
         /*cwd*/ None,
         &cli_overrides,
         overrides,
@@ -64,12 +66,13 @@ async fn build_config_state_with_mtimes() -> Result<(ConfigState, Vec<LayerMtime
     .context("failed to load Codex config")?;
 
     let layer_mtimes = collect_layer_mtimes(&config_layer_stack);
-    let state = build_config_state_from_layers(&config_layer_stack).await?;
+    let state = build_config_state_from_layers(&config_layer_stack, codex_home).await?;
     Ok((state, layer_mtimes))
 }
 
 async fn build_config_state_from_layers(
     config_layer_stack: &ConfigLayerStack,
+    codex_home: &std::path::Path,
 ) -> Result<ConfigState> {
     let (exec_policy, warning) = load_exec_policy_with_warning(config_layer_stack).await?;
     if let Some(err) = warning.as_ref() {
@@ -82,7 +85,7 @@ async fn build_config_state_from_layers(
     let config = config_from_layers(config_layer_stack, &exec_policy)?;
 
     let constraints = enforce_trusted_constraints(config_layer_stack, &config)?;
-    build_config_state(config, constraints)
+    build_config_state_with_codex_home(config, constraints, codex_home)
 }
 
 fn collect_layer_mtimes(stack: &ConfigLayerStack) -> Vec<LayerMtime> {
@@ -337,26 +340,27 @@ impl LayerMtime {
 
 pub struct MtimeConfigReloader {
     layer_mtimes: RwLock<Vec<LayerMtime>>,
+    codex_home: AbsolutePathBuf,
 }
 
 impl MtimeConfigReloader {
-    fn new(layer_mtimes: Vec<LayerMtime>) -> Self {
+    fn new(layer_mtimes: Vec<LayerMtime>, codex_home: AbsolutePathBuf) -> Self {
         Self {
             layer_mtimes: RwLock::new(layer_mtimes),
+            codex_home,
         }
     }
 
     async fn needs_reload(&self) -> bool {
-        let guard = self.layer_mtimes.read().await;
-        guard.iter().any(|layer| {
-            let metadata = std::fs::metadata(&layer.path).ok();
-            match (metadata.and_then(|m| m.modified().ok()), layer.mtime) {
-                (Some(new_mtime), Some(old_mtime)) => new_mtime > old_mtime,
-                (Some(_), None) => true,
-                (None, Some(_)) => true,
-                (None, None) => false,
+        let layers = self.layer_mtimes.read().await.clone();
+        match run_blocking_config_probe(move || layer_mtimes_changed(&layers)).await {
+            Ok(changed) => changed,
+            Err(err) => {
+                tracing::warn!("network config metadata probe failed: {err}");
+                // A failed probe must not silently suppress a live configuration change.
+                true
             }
-        })
+        }
     }
 
     async fn maybe_reload(&self) -> Result<Option<ConfigState>> {
@@ -364,18 +368,38 @@ impl MtimeConfigReloader {
             return Ok(None);
         }
 
-        let (state, layer_mtimes) = build_config_state_with_mtimes().await?;
+        let (state, layer_mtimes) = build_config_state_with_mtimes(&self.codex_home).await?;
         let mut guard = self.layer_mtimes.write().await;
         *guard = layer_mtimes;
         Ok(Some(state))
     }
 
     async fn reload_now(&self) -> Result<ConfigState> {
-        let (state, layer_mtimes) = build_config_state_with_mtimes().await?;
+        let (state, layer_mtimes) = build_config_state_with_mtimes(&self.codex_home).await?;
         let mut guard = self.layer_mtimes.write().await;
         *guard = layer_mtimes;
         Ok(state)
     }
+}
+
+fn layer_mtimes_changed(layers: &[LayerMtime]) -> bool {
+    layers.iter().any(|layer| {
+        let metadata = std::fs::metadata(&layer.path).ok();
+        match (metadata.and_then(|m| m.modified().ok()), layer.mtime) {
+            (Some(new_mtime), Some(old_mtime)) => new_mtime > old_mtime,
+            (Some(_), None) => true,
+            (None, Some(_)) => true,
+            (None, None) => false,
+        }
+    })
+}
+
+async fn run_blocking_config_probe<T, F>(operation: F) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation).await
 }
 
 impl ConfigReloader for MtimeConfigReloader {

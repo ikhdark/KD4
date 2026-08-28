@@ -11,6 +11,8 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use codex_exec_server_protocol::JSONRPCNotification;
 use codex_http_client::HttpError;
+use codex_utils_absolute_path::is_windows_absolute_path;
+use codex_utils_path_uri::PathConvention;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -20,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
 
+use tokio::time::Instant;
 use tokio::time::timeout;
 use tracing::Instrument;
 use tracing::debug;
@@ -112,6 +115,8 @@ mod recovery;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const ENVIRONMENT_INFO_TIMEOUT: Duration = Duration::from_secs(30);
+const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(30);
+const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const PROCESS_EVENT_RETAINED_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_PROCESS_EVENTS: usize = 256;
@@ -208,6 +213,7 @@ struct Inner {
     http_body_streams_write_lock: Mutex<()>,
     http_body_stream_next_id: AtomicU64,
     session_id: OnceLock<String>,
+    environment_info: OnceLock<EnvironmentInfo>,
     reconnect_strategy: Option<ExecServerReconnectStrategy>,
 }
 
@@ -251,7 +257,7 @@ type ConnectionAttempt = OnceCell<ConnectionResult>;
 pub(crate) struct LazyRemoteExecServerClient {
     transport_params: ExecServerTransportParams,
     recovery_policy: RecoveryPolicy,
-    // Saves the first startup result so callers share it and failures remain final.
+    // Saves the first startup result so callers share it. Retryable failures reconnect.
     startup: Arc<ConnectionAttempt>,
     // The latest successful client, replaced whenever reconnecting succeeds.
     current_client: Arc<StdMutex<Option<ExecServerClient>>>,
@@ -349,6 +355,14 @@ impl LazyRemoteExecServerClient {
 
     async fn initial_client(&self) -> Result<ExecServerClient, ExecServerError> {
         // The first caller starts the work; every other caller waits for that same result.
+        // A transient failure remains recorded for observability, but recoverable transports may
+        // use the reconnect lane for later attempts instead of burning the environment forever.
+        if let Some(Err(error)) = self.startup.get()
+            && self.can_reconnect()
+            && recovery::is_retryable_recovery_error(error)
+        {
+            return Box::pin(self.reconnect()).await;
+        }
         let result = self
             .startup
             .get_or_init(|| connect_once(self.transport_params.clone()))
@@ -430,9 +444,70 @@ impl LazyRemoteExecServerClient {
 }
 
 async fn connect_once(transport_params: ExecServerTransportParams) -> ConnectionResult {
-    ExecServerClient::connect_for_transport(transport_params)
+    let client = ExecServerClient::connect_for_transport(transport_params)
         .await
-        .map_err(Arc::new)
+        .map_err(Arc::new)?;
+    let info = client.environment_info().await.map_err(Arc::new)?;
+    validate_windows_environment_info(&info).map_err(Arc::new)?;
+    let _ = client.inner.environment_info.set(info);
+    Ok(client)
+}
+
+fn validate_windows_environment_info(info: &EnvironmentInfo) -> Result<(), ExecServerError> {
+    if info
+        .operating_system
+        .as_deref()
+        .is_some_and(|operating_system| operating_system != "windows")
+    {
+        return Err(ExecServerError::Protocol(format!(
+            "remote environment reported unsupported operating system `{}`",
+            info.operating_system.as_deref().unwrap_or_default()
+        )));
+    }
+    if !matches!(info.shell.name.as_str(), "powershell" | "cmd") {
+        return Err(ExecServerError::Protocol(format!(
+            "remote environment reported unsupported Windows shell `{}`",
+            info.shell.name
+        )));
+    }
+    if !windows_shell_path_matches_name(&info.shell.name, &info.shell.path) {
+        return Err(ExecServerError::Protocol(format!(
+            "remote environment reported shell/path mismatch: Windows shell `{}` cannot use executable `{}`",
+            info.shell.name, info.shell.path
+        )));
+    }
+    if let Some(cwd) = &info.cwd
+        && cwd.infer_path_convention() != Some(PathConvention::Windows)
+    {
+        return Err(ExecServerError::Protocol(format!(
+            "remote environment reported non-Windows working directory `{cwd}`"
+        )));
+    }
+    Ok(())
+}
+
+fn windows_shell_path_matches_name(shell_name: &str, shell_path: &str) -> bool {
+    let shell_path = shell_path.trim();
+    if shell_path.is_empty() || (shell_path.contains('/') && !is_windows_absolute_path(shell_path))
+    {
+        return false;
+    }
+
+    let executable_name = shell_path.rsplit(['/', '\\']).next().unwrap_or(shell_path);
+    match shell_name {
+        "powershell" => matches_ignore_ascii_case(
+            executable_name,
+            &["powershell", "powershell.exe", "pwsh", "pwsh.exe"],
+        ),
+        "cmd" => matches_ignore_ascii_case(executable_name, &["cmd", "cmd.exe"]),
+        _ => false,
+    }
+}
+
+fn matches_ignore_ascii_case(value: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
 }
 
 impl HttpClient for LazyRemoteExecServerClient {
@@ -592,12 +667,16 @@ impl ExecServerClient {
     }
 
     pub async fn environment_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
+        if let Some(info) = self.inner.environment_info.get() {
+            return Ok(info.clone());
+        }
         let rpc_client = self.rpc_client().await?;
-        map_rpc_call_result(
+        let info = map_rpc_call_result(
             rpc_client
                 .call_with_timeout(ENVIRONMENT_INFO_METHOD, &(), ENVIRONMENT_INFO_TIMEOUT)
                 .await,
-        )
+        )?;
+        Ok(self.inner.environment_info.get_or_init(|| info).clone())
     }
 
     pub async fn read(&self, params: ReadParams) -> Result<ReadResponse, ExecServerError> {
@@ -642,11 +721,21 @@ impl ExecServerClient {
         &self,
         process_id: &ProcessId,
     ) -> Result<TerminateResponse, ExecServerError> {
-        self.call_for_cleanup(
+        self.terminate_before(process_id, Instant::now() + PROCESS_TERMINATION_TIMEOUT)
+            .await
+    }
+
+    async fn terminate_before(
+        &self,
+        process_id: &ProcessId,
+        deadline: Instant,
+    ) -> Result<TerminateResponse, ExecServerError> {
+        self.call_for_cleanup_before(
             EXEC_TERMINATE_METHOD,
             &TerminateParams {
                 process_id: process_id.clone(),
             },
+            deadline,
         )
         .await
     }
@@ -746,14 +835,24 @@ impl ExecServerClient {
                 inner: Arc::clone(&self.inner),
             };
             let client = self.clone();
-            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let (mut result_tx, result_rx) = tokio::sync::oneshot::channel();
             let process_start_task = async move {
                 let _active_start = active_start;
-                match client
-                    .call_rpc::<_, ExecResponse>(&rpc_client, EXEC_METHOD, &params)
-                    .await
-                {
-                    Ok(_) => {
+                let start_result = tokio::select! {
+                    biased;
+                    result = client.call_rpc_with_timeout::<_, ExecResponse>(
+                        &rpc_client,
+                        EXEC_METHOD,
+                        &params,
+                        PROCESS_START_TIMEOUT,
+                    ) => Some(result),
+                    _ = result_tx.closed() => None,
+                };
+                match start_result {
+                    None => {
+                        cleanup_process_start(&client, &process_id, &state).await;
+                    }
+                    Some(Ok(_)) => {
                         state.recoverable.store(true, Ordering::Release);
                         let session = Session {
                             client: client.clone(),
@@ -762,19 +861,11 @@ impl ExecServerClient {
                         };
                         if result_tx.send(Ok(session)).is_err() {
                             state.recoverable.store(false, Ordering::Release);
-                            tokio::spawn(async move {
-                                cleanup_process_start(&client, &process_id, &state).await;
-                            });
+                            cleanup_process_start(&client, &process_id, &state).await;
                         }
                     }
-                    Err(error) => {
-                        if is_transport_closed_error(&error) {
-                            tokio::spawn(async move {
-                                cleanup_process_start(&client, &process_id, &state).await;
-                            });
-                        } else {
-                            client.inner.remove_session_if(&process_id, &state);
-                        }
+                    Some(Err(error)) => {
+                        cleanup_process_start(&client, &process_id, &state).await;
                         let _ = result_tx.send(Err(error));
                     }
                 }
@@ -854,6 +945,7 @@ impl ExecServerClient {
             http_body_streams_write_lock: Mutex::new(()),
             http_body_stream_next_id: AtomicU64::new(1),
             session_id,
+            environment_info: OnceLock::new(),
             reconnect_strategy,
         });
         let client = Self {
@@ -890,13 +982,61 @@ impl ExecServerClient {
         map_rpc_call_result(rpc_client.call(method, params).await)
     }
 
+    async fn call_rpc_with_timeout<P, T>(
+        &self,
+        rpc_client: &Arc<RpcClient>,
+        method: &str,
+        params: &P,
+        call_timeout: Duration,
+    ) -> Result<T, ExecServerError>
+    where
+        P: serde::Serialize,
+        T: serde::de::DeserializeOwned,
+    {
+        map_rpc_call_result(
+            rpc_client
+                .call_with_timeout(method, params, call_timeout)
+                .await,
+        )
+    }
+
     async fn call_for_cleanup<P, T>(&self, method: &str, params: &P) -> Result<T, ExecServerError>
     where
         P: serde::Serialize,
         T: serde::de::DeserializeOwned,
     {
-        let rpc_client = self.inner.rpc_client().await?;
-        map_rpc_call_result(rpc_client.call_for_cleanup(method, params).await)
+        self.call_for_cleanup_before(method, params, Instant::now() + PROCESS_TERMINATION_TIMEOUT)
+            .await
+    }
+
+    async fn call_for_cleanup_before<P, T>(
+        &self,
+        method: &str,
+        params: &P,
+        deadline: Instant,
+    ) -> Result<T, ExecServerError>
+    where
+        P: serde::Serialize,
+        T: serde::de::DeserializeOwned,
+    {
+        let rpc_client = tokio::time::timeout_at(deadline, self.inner.rpc_client())
+            .await
+            .map_err(|_| {
+                ExecServerError::Protocol(format!(
+                    "timed out waiting for exec-server `{method}` cleanup after {PROCESS_TERMINATION_TIMEOUT:?}"
+                ))
+            })??;
+        let call_timeout = deadline.saturating_duration_since(Instant::now());
+        if call_timeout.is_zero() {
+            return Err(ExecServerError::Protocol(format!(
+                "timed out waiting for exec-server `{method}` response after {PROCESS_TERMINATION_TIMEOUT:?}"
+            )));
+        }
+        map_rpc_call_result(
+            rpc_client
+                .call_for_cleanup(method, params, call_timeout)
+                .await,
+        )
     }
 }
 
@@ -916,9 +1056,18 @@ async fn cleanup_process_start(
     process_id: &ProcessId,
     state: &Arc<SessionState>,
 ) {
+    let deadline = Instant::now() + PROCESS_TERMINATION_TIMEOUT;
     loop {
-        match client.terminate(process_id).await {
-            Ok(_) => break,
+        match client.terminate_before(process_id, deadline).await {
+            Ok(response) if !response.running => break,
+            Ok(_) => {
+                if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(10)))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Err(error) if is_transport_closed_error(&error) && !client.inner.is_failed() => {
                 continue;
             }
@@ -1210,8 +1359,34 @@ impl Session {
     }
 
     pub(crate) async fn terminate(&self) -> Result<(), ExecServerError> {
-        self.client.terminate(&self.process_id).await?;
-        Ok(())
+        let deadline = Instant::now() + PROCESS_TERMINATION_TIMEOUT;
+        loop {
+            match self
+                .client
+                .terminate_before(&self.process_id, deadline)
+                .await
+            {
+                Ok(response) if !response.running => return Ok(()),
+                Ok(_) => {
+                    tokio::time::timeout_at(
+                        deadline,
+                        tokio::time::sleep(Duration::from_millis(10)),
+                    )
+                    .await
+                    .map_err(|_| {
+                        ExecServerError::Protocol(format!(
+                            "timed out confirming process termination after {PROCESS_TERMINATION_TIMEOUT:?}"
+                        ))
+                    })?;
+                }
+                Err(error)
+                    if is_transport_closed_error(&error) && !self.client.inner.is_failed() =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub(crate) async fn unregister(&self) {
@@ -1419,6 +1594,7 @@ mod tests {
     use super::ExecServerClient;
     use super::ExecServerClientConnectOptions;
     use super::LazyRemoteExecServerClient;
+    use super::validate_windows_environment_info;
     use crate::ProcessId;
 
     use crate::client_api::ExecServerTransportParams;
@@ -1427,12 +1603,15 @@ mod tests {
     use crate::client_api::StdioExecServerConnectArgs;
     use crate::connection::JsonRpcConnection;
     use crate::process::ExecProcessEvent;
+    use crate::protocol::ENVIRONMENT_INFO_METHOD;
     use crate::protocol::EXEC_CLOSED_METHOD;
     use crate::protocol::EXEC_EXITED_METHOD;
     use crate::protocol::EXEC_METHOD;
     use crate::protocol::EXEC_OUTPUT_DELTA_METHOD;
     use crate::protocol::EXEC_READ_METHOD;
+    use crate::protocol::EXEC_TERMINATE_METHOD;
     use crate::protocol::EXEC_WRITE_METHOD;
+    use crate::protocol::EnvironmentInfo;
     use crate::protocol::ExecClosedNotification;
     use crate::protocol::ExecExitedNotification;
     use crate::protocol::ExecOutputDeltaNotification;
@@ -1444,9 +1623,90 @@ mod tests {
     use crate::protocol::InitializeResponse;
     use crate::protocol::ProcessOutputChunk;
     use crate::protocol::ReadResponse;
+    use crate::protocol::ShellInfo;
+    use crate::protocol::TerminateResponse;
     use crate::protocol::WriteParams;
     use crate::protocol::WriteResponse;
     use crate::protocol::WriteStatus;
+
+    fn environment_info(
+        operating_system: Option<&str>,
+        shell: &str,
+        cwd: Option<&str>,
+    ) -> EnvironmentInfo {
+        EnvironmentInfo {
+            operating_system: operating_system.map(str::to_string),
+            shell: ShellInfo {
+                name: shell.to_string(),
+                path: match shell {
+                    "cmd" => r"C:\Windows\System32\cmd.exe".to_string(),
+                    _ => r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+                },
+            },
+            cwd: cwd.map(|cwd| PathUri::parse(cwd).expect("valid test path URI")),
+        }
+    }
+
+    #[test]
+    fn accepts_explicit_and_legacy_windows_environment_info() {
+        let mut uppercase_powershell =
+            environment_info(Some("windows"), "powershell", Some("file:///C:/workspace"));
+        uppercase_powershell.shell.path = "C:/Program Files/PowerShell/7/PWSH.EXE".to_string();
+        let mut bare_cmd = environment_info(None, "cmd", None);
+        bare_cmd.shell.path = "CMD.EXE".to_string();
+
+        for info in [
+            environment_info(Some("windows"), "powershell", Some("file:///C:/workspace")),
+            environment_info(None, "cmd", Some("file://server/share/workspace")),
+            environment_info(None, "powershell", None),
+            uppercase_powershell,
+            bare_cmd,
+        ] {
+            validate_windows_environment_info(&info).expect("Windows environment should be valid");
+        }
+    }
+
+    #[test]
+    fn rejects_non_windows_operating_system_shell_and_working_directory() {
+        let mut powershell_with_posix_path =
+            environment_info(Some("windows"), "powershell", Some("file:///C:/workspace"));
+        powershell_with_posix_path.shell.path = "/usr/bin/pwsh".to_string();
+        let mut cmd_with_powershell_path =
+            environment_info(Some("windows"), "cmd", Some("file:///C:/workspace"));
+        cmd_with_powershell_path.shell.path = r"C:\Windows\System32\powershell.exe".to_string();
+        let mut empty_shell_path = environment_info(None, "powershell", None);
+        empty_shell_path.shell.path.clear();
+
+        for (info, expected) in [
+            (
+                environment_info(Some("linux"), "powershell", Some("file:///C:/workspace")),
+                "unsupported operating system `linux`",
+            ),
+            (
+                environment_info(Some("Windows"), "powershell", Some("file:///C:/workspace")),
+                "unsupported operating system `Windows`",
+            ),
+            (
+                environment_info(Some("windows"), "bash", Some("file:///C:/workspace")),
+                "unsupported Windows shell `bash`",
+            ),
+            (
+                environment_info(None, "zsh", Some("file:///C:/workspace")),
+                "unsupported Windows shell `zsh`",
+            ),
+            (
+                environment_info(Some("windows"), "cmd", Some("file:///home/codex")),
+                "non-Windows working directory",
+            ),
+            (powershell_with_posix_path, "shell/path mismatch"),
+            (cmd_with_powershell_path, "shell/path mismatch"),
+            (empty_shell_path, "shell/path mismatch"),
+        ] {
+            let error = validate_windows_environment_info(&info)
+                .expect_err("non-Windows environment must be rejected");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
 
     async fn read_jsonrpc_line<R>(lines: &mut tokio::io::Lines<BufReader<R>>) -> JSONRPCMessage
     where
@@ -1587,6 +1847,133 @@ mod tests {
         assert_eq!(trace.tracestate, expected_trace.tracestate);
     }
 
+    #[tokio::test]
+    async fn cancelling_process_start_sends_cleanup_and_releases_provisional_state() {
+        let (client_stdin, server_reader) = duplex(1 << 20);
+        let (mut server_writer, client_stdout) = duplex(1 << 20);
+        let (start_observed_tx, start_observed_rx) = oneshot::channel();
+        let (cleanup_observed_tx, cleanup_observed_rx) = oneshot::channel();
+        let (release_server_tx, release_server_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_reader).lines();
+            let initialize = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request) if request.method == INITIALIZE_METHOD => request,
+                other => panic!("expected initialize request, got {other:?}"),
+            };
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: initialize.id,
+                    result: serde_json::to_value(InitializeResponse {
+                        session_id: "cancelled-start".to_string(),
+                    })
+                    .expect("initialize response should serialize"),
+                }),
+            )
+            .await;
+            assert!(matches!(
+                read_jsonrpc_line(&mut lines).await,
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == INITIALIZED_METHOD
+            ));
+
+            let start = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request) if request.method == EXEC_METHOD => request,
+                other => panic!("expected process start request, got {other:?}"),
+            };
+            let start_params: ExecParams =
+                serde_json::from_value(start.params.expect("process start params should exist"))
+                    .expect("process start params should deserialize");
+            start_observed_tx
+                .send(())
+                .expect("start observer should remain open");
+            let terminate = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request) if request.method == EXEC_TERMINATE_METHOD => {
+                    request
+                }
+                other => panic!("expected cleanup terminate request, got {other:?}"),
+            };
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: terminate.id,
+                    result: serde_json::to_value(TerminateResponse { running: false })
+                        .expect("terminate response should serialize"),
+                }),
+            )
+            .await;
+            cleanup_observed_tx
+                .send(start_params.process_id)
+                .expect("cleanup observer should remain open");
+            let _ = release_server_rx.await;
+        });
+
+        let client = ExecServerClient::connect(
+            JsonRpcConnection::from_stdio(
+                client_stdout,
+                client_stdin,
+                "cancelled-start-client".to_string(),
+            ),
+            ExecServerClientConnectOptions::default(),
+        )
+        .await
+        .expect("client should connect");
+        let process_id = ProcessId::from("cancelled-start-process");
+        let start_client = client.clone();
+        let start_process_id = process_id.clone();
+        let start_task = tokio::spawn(async move {
+            start_client
+                .start_process(ExecParams {
+                    process_id: start_process_id,
+                    argv: vec!["true".to_string()],
+                    cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
+                        .expect("cwd URI"),
+                    env_policy: None,
+                    env: HashMap::new(),
+                    tty: false,
+                    pipe_stdin: false,
+                    arg0: None,
+                    sandbox: None,
+                    enforce_managed_network: false,
+                    managed_network: None,
+                })
+                .await
+        });
+
+        timeout(Duration::from_secs(1), start_observed_rx)
+            .await
+            .expect("process start request should be sent")
+            .expect("start observer should remain open");
+        start_task.abort();
+        let _ = start_task.await;
+        assert_eq!(
+            timeout(Duration::from_secs(1), cleanup_observed_rx)
+                .await
+                .expect("cancelled start cleanup should not hang")
+                .expect("cleanup observer should receive the process id"),
+            process_id
+        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let active_process_starts = client
+                    .inner
+                    .connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active_process_starts;
+                if active_process_starts == 0 && client.inner.get_session(&process_id).is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled start should release provisional state");
+
+        let _ = release_server_tx.send(());
+        server.await.expect("server task should finish");
+    }
+
     async fn accept_websocket(listener: &TcpListener) -> WebSocketStream<TcpStream> {
         let (stream, _) = listener.accept().await.expect("listener should accept");
         accept_async(stream)
@@ -1662,6 +2049,27 @@ mod tests {
                 if notification.method == INITIALIZED_METHOD => {}
             other => panic!("expected initialized notification, got {other:?}"),
         }
+
+        let environment_info_request = read_jsonrpc_websocket(websocket).await;
+        let request = match environment_info_request {
+            JSONRPCMessage::Request(request) if request.method == ENVIRONMENT_INFO_METHOD => {
+                request
+            }
+            other => panic!("expected environment/info request, got {other:?}"),
+        };
+        write_jsonrpc_websocket(
+            websocket,
+            JSONRPCMessage::Response(JSONRPCResponse {
+                id: request.id,
+                result: serde_json::to_value(environment_info(
+                    Some("windows"),
+                    "powershell",
+                    Some("file:///C:/workspace"),
+                ))
+                .expect("environment info should serialize"),
+            }),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -2249,6 +2657,70 @@ mod tests {
             panic!("expected saved connection failures");
         };
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn retryable_startup_failure_does_not_burn_environment() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let websocket_url = format!(
+            "ws://{}",
+            listener.local_addr().expect("listener should have address")
+        );
+        let (replacement_initialized_tx, replacement_initialized_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut failed_startup, _) = listener.accept().await.expect("startup should arrive");
+            failed_startup
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("failed handshake response should write");
+
+            let mut replacement = accept_websocket(&listener).await;
+            complete_websocket_initialize(
+                &mut replacement,
+                "replacement-session",
+                /*expected_resume_session_id*/ None,
+            )
+            .await;
+            replacement_initialized_tx
+                .send(())
+                .expect("replacement initialization should be observed");
+            timeout(Duration::from_secs(1), replacement.next())
+                .await
+                .expect("client should close after the test");
+        });
+        let client = LazyRemoteExecServerClient::new(ExecServerTransportParams::WebSocketUrl {
+            websocket_url,
+            connect_timeout: Duration::from_secs(1),
+            initialize_timeout: Duration::from_secs(1),
+        });
+
+        let failed_startup = match client.get().await {
+            Ok(_) => panic!("initial startup should fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            failed_startup,
+            super::ExecServerError::ConnectionAttempt(_)
+        ));
+        assert!(client.startup_finished());
+
+        let (ready, first, second) =
+            tokio::join!(client.wait_until_ready(), client.get(), client.get());
+        ready.expect("later startup should recover");
+        let first = first.expect("first waiter should receive the replacement client");
+        let second = second.expect("second waiter should receive the replacement client");
+        assert_eq!(first.session_id().as_deref(), Some("replacement-session"));
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
+        replacement_initialized_rx
+            .await
+            .expect("server should observe replacement initialization");
+
+        drop(first);
+        drop(second);
+        drop(client);
+        server.await.expect("server task should finish");
     }
 
     #[tokio::test]

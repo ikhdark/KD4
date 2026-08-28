@@ -210,6 +210,16 @@ SET
     updated_at_ms = ?
 WHERE thread_id = ?
   AND (? IS NULL OR goal_id = ?)
+RETURNING
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
             "#,
                 )
                 .bind(objective)
@@ -227,7 +237,7 @@ WHERE thread_id = ?
                 .bind(thread_id.to_string())
                 .bind(expected_goal_id)
                 .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
+                .fetch_optional(self.pool.as_ref())
                 .await?
             }
             (Some(status), None) => {
@@ -244,6 +254,16 @@ SET
     updated_at_ms = ?
 WHERE thread_id = ?
   AND (? IS NULL OR goal_id = ?)
+RETURNING
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
             "#,
                 )
                 .bind(objective)
@@ -258,7 +278,7 @@ WHERE thread_id = ?
                 .bind(thread_id.to_string())
                 .bind(expected_goal_id)
                 .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
+                .fetch_optional(self.pool.as_ref())
                 .await?
             }
             (None, Some(token_budget)) => {
@@ -275,6 +295,16 @@ SET
     updated_at_ms = ?
 WHERE thread_id = ?
   AND (? IS NULL OR goal_id = ?)
+RETURNING
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
             "#,
                 )
                 .bind(objective)
@@ -286,7 +316,7 @@ WHERE thread_id = ?
                 .bind(thread_id.to_string())
                 .bind(expected_goal_id)
                 .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
+                .fetch_optional(self.pool.as_ref())
                 .await?
             }
             (None, None) => {
@@ -299,6 +329,16 @@ SET
     updated_at_ms = ?
 WHERE thread_id = ?
   AND (? IS NULL OR goal_id = ?)
+RETURNING
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
             "#,
                     )
                     .bind(objective)
@@ -306,7 +346,7 @@ WHERE thread_id = ?
                     .bind(thread_id.to_string())
                     .bind(expected_goal_id)
                     .bind(expected_goal_id)
-                    .execute(self.pool.as_ref())
+                    .fetch_optional(self.pool.as_ref())
                     .await?
                 } else {
                     let goal = self.get_thread_goal(thread_id).await?;
@@ -322,11 +362,7 @@ WHERE thread_id = ?
             }
         };
 
-        if result.rows_affected() == 0 {
-            return Ok(None);
-        }
-
-        self.get_thread_goal(thread_id).await
+        result.map(|row| thread_goal_from_row(&row)).transpose()
     }
 
     pub async fn pause_active_thread_goal(
@@ -365,20 +401,26 @@ WHERE thread_id = ?
           AND status = 'budget_limited'
       )
   )
+RETURNING
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
             "#,
         )
         .bind(status.as_str())
         .bind(now_ms)
         .bind(thread_id.to_string())
         .bind(status.as_str())
-        .execute(self.pool.as_ref())
+        .fetch_optional(self.pool.as_ref())
         .await?;
 
-        if result.rows_affected() == 0 {
-            return Ok(None);
-        }
-
-        self.get_thread_goal(thread_id).await
+        result.map(|row| thread_goal_from_row(&row)).transpose()
     }
 
     pub async fn delete_thread_goal(
@@ -818,6 +860,62 @@ mod tests {
             .expect("goal update should succeed")
             .expect("fresh update should match the replacement goal");
         assert_eq!(crate::ThreadGoalStatus::Complete, fresh_update.status);
+    }
+
+    #[tokio::test]
+    async fn update_thread_goal_returns_the_row_updated_by_its_statement() {
+        let runtime = test_runtime().await;
+        let thread_id = test_thread_id();
+        upsert_test_thread(&runtime, thread_id).await;
+
+        let original = runtime
+            .thread_goals()
+            .replace_thread_goal(
+                thread_id,
+                "original objective",
+                crate::ThreadGoalStatus::Active,
+                /*token_budget*/ None,
+            )
+            .await
+            .expect("goal replacement should succeed");
+        sqlx::query(
+            r#"
+CREATE TRIGGER replace_goal_after_status_update
+AFTER UPDATE OF status ON thread_goals
+BEGIN
+    UPDATE thread_goals
+    SET goal_id = 'replacement-goal-id'
+    WHERE thread_id = NEW.thread_id;
+END
+            "#,
+        )
+        .execute(runtime.pool.as_ref())
+        .await
+        .expect("test trigger should be created");
+
+        let updated = runtime
+            .thread_goals()
+            .update_thread_goal(
+                thread_id,
+                GoalUpdate {
+                    objective: None,
+                    status: Some(crate::ThreadGoalStatus::Paused),
+                    token_budget: None,
+                    expected_goal_id: Some(original.goal_id.clone()),
+                },
+            )
+            .await
+            .expect("goal update should succeed")
+            .expect("goal should be updated");
+
+        assert_eq!(updated.goal_id, original.goal_id);
+        let stored = runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await
+            .expect("goal read should succeed")
+            .expect("goal should exist");
+        assert_eq!(stored.goal_id, "replacement-goal-id");
     }
 
     #[tokio::test]

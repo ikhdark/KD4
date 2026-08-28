@@ -14,6 +14,7 @@ use crate::policy::is_global_wildcard_domain_pattern;
 use crate::runtime::ConfigState;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 
 pub use crate::runtime::BlockedRequest;
@@ -61,6 +62,16 @@ pub fn build_config_state(
     config: NetworkProxyConfig,
     constraints: NetworkProxyConstraints,
 ) -> anyhow::Result<ConfigState> {
+    let codex_home = codex_utils_home_dir::find_codex_home()
+        .map_err(|err| anyhow::anyhow!("failed to resolve CODEX_HOME: {err}"))?;
+    build_config_state_with_codex_home(config, constraints, &codex_home)
+}
+
+pub fn build_config_state_with_codex_home(
+    config: NetworkProxyConfig,
+    constraints: NetworkProxyConstraints,
+    codex_home: &Path,
+) -> anyhow::Result<ConfigState> {
     crate::config::validate_unix_socket_allowlist_paths(&config)?;
     anyhow::ensure!(
         !config.credential_broker || config.mitm,
@@ -74,10 +85,13 @@ pub fn build_config_state(
     let allow_set = compile_allowlist_globset(&allowed_domains)?;
     let mitm_hooks = compile_mitm_hooks(&config)?;
     let mitm = if config.mitm {
-        Some(Arc::new(MitmState::new(MitmUpstreamConfig {
-            allow_upstream_proxy: config.allow_upstream_proxy,
-            allow_local_binding: config.allow_local_binding,
-        })?))
+        Some(Arc::new(MitmState::new(
+            MitmUpstreamConfig {
+                allow_upstream_proxy: config.allow_upstream_proxy,
+                allow_local_binding: config.allow_local_binding,
+            },
+            codex_home,
+        )?))
     } else {
         None
     };

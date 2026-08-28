@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::process::ExitStatus;
 use std::process::Stdio;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
@@ -40,7 +41,7 @@ pub struct McpProcess {
     #[allow(dead_code)]
     process: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: Option<BufReader<ChildStdout>>,
 }
 
 impl McpProcess {
@@ -106,8 +107,20 @@ impl McpProcess {
             next_request_id: AtomicI64::new(0),
             process,
             stdin,
-            stdout,
+            stdout: Some(stdout),
         })
+    }
+
+    pub fn close_stdout(&mut self) {
+        drop(self.stdout.take());
+    }
+
+    pub async fn send_ping_request(&mut self) -> anyhow::Result<i64> {
+        self.send_request("ping", None).await
+    }
+
+    pub async fn wait_for_exit(&mut self) -> std::io::Result<ExitStatus> {
+        self.process.wait().await
     }
 
     /// Performs the initialization handshake with the MCP server.
@@ -248,7 +261,11 @@ impl McpProcess {
         &mut self,
     ) -> anyhow::Result<JsonRpcMessage<CustomRequest, serde_json::Value, CustomNotification>> {
         let mut line = String::new();
-        self.stdout.read_line(&mut line).await?;
+        self.stdout
+            .as_mut()
+            .context("MCP stdout is closed")?
+            .read_line(&mut line)
+            .await?;
         let message = serde_json::from_str::<
             JsonRpcMessage<CustomRequest, serde_json::Value, CustomNotification>,
         >(&line)?;

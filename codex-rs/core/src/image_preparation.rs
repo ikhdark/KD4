@@ -75,6 +75,36 @@ pub(crate) fn prepare_response_items(items: &mut [ResponseItem]) {
     }
 }
 
+pub(crate) fn response_items_need_preparation(items: &[ResponseItem]) -> bool {
+    items.iter().any(|item| match item {
+        ResponseItem::Message { content, .. } => content
+            .iter()
+            .any(|item| matches!(item, ContentItem::InputImage { .. })),
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => {
+            output.content_items().is_some_and(|content| {
+                content
+                    .iter()
+                    .any(|item| matches!(item, FunctionCallOutputContentItem::InputImage { .. }))
+            })
+        }
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::Reasoning { .. }
+        | ResponseItem::AgentMessage { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::ContextCompaction { .. }
+        | ResponseItem::Other => false,
+    })
+}
+
 fn prepare_message_content(items: &mut [ContentItem]) {
     for item in items {
         if let ContentItem::InputImage { image_url, detail } = item

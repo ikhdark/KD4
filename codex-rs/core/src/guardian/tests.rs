@@ -90,6 +90,87 @@ const GUARDIAN_MEMORY_CONTEXT_PROBE: &str = "guardian memory context probe";
 const GUARDIAN_SKILL_NAME: &str = "guardian-context-probe";
 const GUARDIAN_SKILL_BODY_PROBE: &str = "guardian skill body probe";
 
+#[derive(Debug, PartialEq, Eq)]
+struct ExtensionApprovalReviewCall {
+    session_id: String,
+    thread_id: String,
+    prompt: String,
+}
+
+struct ClaimingApprovalReviewContributor {
+    calls: Arc<std::sync::Mutex<Vec<ExtensionApprovalReviewCall>>>,
+}
+
+impl codex_extension_api::ApprovalReviewContributor for ClaimingApprovalReviewContributor {
+    fn contribute<'a>(
+        &'a self,
+        session_store: &'a codex_extension_api::ExtensionData,
+        thread_store: &'a codex_extension_api::ExtensionData,
+        prompt: &'a str,
+    ) -> codex_extension_api::ExtensionFuture<'a, Option<ReviewDecision>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .expect("extension approval review calls lock")
+                .push(ExtensionApprovalReviewCall {
+                    session_id: session_store.level_id().to_string(),
+                    thread_id: thread_store.level_id().to_string(),
+                    prompt: prompt.to_string(),
+                });
+            Some(ReviewDecision::ApprovedForSession)
+        })
+    }
+}
+
+#[tokio::test]
+async fn extension_can_claim_guardian_review_before_model_fallback() {
+    let (mut session, turn) = crate::session::tests::make_session_and_context().await;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
+    extensions.approval_review_contributor(Arc::new(ClaimingApprovalReviewContributor {
+        calls: Arc::clone(&calls),
+    }));
+    session.services.extensions = Arc::new(extensions.build());
+    let expected_session_id = session
+        .services
+        .session_extension_data
+        .level_id()
+        .to_string();
+    let expected_thread_id = session
+        .services
+        .thread_extension_data
+        .level_id()
+        .to_string();
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let decision = review_approval_request_with_cancel(
+        &session,
+        &turn,
+        "extension-review".to_string(),
+        GuardianApprovalRequest::Shell {
+            id: "extension-shell".to_string(),
+            command: vec!["git".to_string(), "status".to_string()],
+            cwd: test_path_buf("/repo/codex-rs/core").abs(),
+            sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+            additional_permissions: None,
+            justification: Some("Inspect the working tree.".to_string()),
+        },
+        /*retry_reason*/ None,
+        GuardianApprovalRequestSource::MainTurn,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(decision, ReviewDecision::ApprovedForSession);
+    let calls = calls.lock().expect("extension approval review calls lock");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].session_id, expected_session_id);
+    assert_eq!(calls[0].thread_id, expected_thread_id);
+    assert!(calls[0].prompt.contains("\"git\""));
+    assert!(calls[0].prompt.contains("\"status\""));
+}
+
 #[test]
 fn guardian_policy_is_bounded_without_repeating_structured_schema() {
     let prompt = guardian_policy_prompt();
@@ -279,6 +360,63 @@ fn guardian_shell_request(id: &str) -> GuardianApprovalRequest {
         additional_permissions: None,
         justification: Some("Need to push the reviewed docs fix.".to_string()),
     }
+}
+
+#[tokio::test]
+async fn guardian_runtime_initialization_failure_is_reported_failed_closed() {
+    let (session, turn, rx) = crate::session::tests::make_session_and_context_with_rx().await;
+    let review_id = "review-runtime-initialization-failure".to_string();
+    let runtime_error = "synthetic runtime construction failure";
+
+    let decision = spawn_approval_request_review_with_runtime_error_for_test(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        review_id.clone(),
+        guardian_shell_request("shell-runtime-initialization-failure"),
+        /*retry_reason*/ None,
+        GuardianApprovalRequestSource::MainTurn,
+        CancellationToken::new(),
+        runtime_error.to_string(),
+    )
+    .await;
+
+    assert_eq!(decision, ReviewDecision::Denied);
+
+    let mut statuses = Vec::new();
+    let mut warnings = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event.msg {
+            EventMsg::GuardianAssessment(event) => statuses.push(event.status),
+            EventMsg::GuardianWarning(event) => warnings.push(event.message),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        statuses,
+        vec![
+            GuardianAssessmentStatus::InProgress,
+            GuardianAssessmentStatus::Denied,
+        ]
+    );
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.contains("failed to initialize guardian review runtime")
+                && warning.contains(runtime_error)
+        }),
+        "guardian warning should identify the runtime initialization failure"
+    );
+
+    let rejection_message = guardian_rejection_message(session.as_ref(), &review_id).await;
+    assert!(
+        rejection_message.contains("Automatic approval review failed:")
+            && rejection_message.contains("failed to initialize guardian review runtime")
+            && rejection_message.contains(runtime_error),
+        "guardian rejection should preserve infrastructure failure provenance: {rejection_message}"
+    );
+    assert!(
+        !rejection_message.contains("without a specific rationale"),
+        "guardian rejection must not masquerade as an unexplained reviewer denial"
+    );
 }
 
 async fn guardian_test_session_and_turn_with_base_url(

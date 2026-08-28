@@ -386,7 +386,7 @@ use codex_login::run_login_server;
 use codex_mcp::McpRuntimeContext;
 use codex_mcp::McpServerStatusSnapshot;
 use codex_mcp::McpSnapshotDetail;
-use codex_mcp::collect_mcp_server_status_snapshot_with_detail;
+use codex_mcp::collect_mcp_server_status_snapshot_for_servers_with_detail;
 use codex_mcp::discover_supported_scopes_with_http_client;
 use codex_mcp::read_mcp_resource as read_mcp_resource_without_thread;
 use codex_mcp::resolve_oauth_scopes;
@@ -438,12 +438,14 @@ use codex_thread_store::DeleteThreadParams as StoreDeleteThreadParams;
 use codex_thread_store::GitInfoPatch as StoreGitInfoPatch;
 use codex_thread_store::ListItemsParams as StoreListItemsParams;
 use codex_thread_store::ListThreadsParams as StoreListThreadsParams;
-use codex_thread_store::LocalThreadStore;
+use codex_thread_store::ListTurnsParams as StoreListTurnsParams;
 use codex_thread_store::ReadThreadByRolloutPathParams as StoreReadThreadByRolloutPathParams;
 use codex_thread_store::ReadThreadParams as StoreReadThreadParams;
 use codex_thread_store::SearchThreadsParams as StoreSearchThreadsParams;
 use codex_thread_store::SortDirection as StoreSortDirection;
 use codex_thread_store::StoredThread;
+use codex_thread_store::StoredTurnItemsView as StoreStoredTurnItemsView;
+use codex_thread_store::StoredTurnStatus as StoreStoredTurnStatus;
 use codex_thread_store::ThreadListStorageMode as StoreThreadListStorageMode;
 use codex_thread_store::ThreadMetadataPatch as StoreThreadMetadataPatch;
 use codex_thread_store::ThreadRelationFilter as StoreThreadRelationFilter;
@@ -561,7 +563,7 @@ fn resolve_turn_environment_selections(
             .to_inferred_path_uri()
             .ok_or_else(|| {
                 invalid_request(format!(
-                    "invalid cwd for environment `{environment_id}`: path `{}` does not use absolute POSIX or Windows path syntax",
+                    "invalid cwd for environment `{environment_id}`: path `{}` does not use absolute Windows drive or UNC path syntax",
                     environment.cwd
                 ))
             })?;

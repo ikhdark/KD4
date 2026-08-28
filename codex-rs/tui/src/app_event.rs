@@ -484,9 +484,7 @@ pub(crate) enum AppEvent {
     OpenMarketplaceAddPrompt,
 
     /// Replace the plugins popup with a marketplace-add loading state.
-    OpenMarketplaceAddLoading {
-        source: String,
-    },
+    OpenMarketplaceAddLoading,
 
     /// Add a marketplace from the provided source.
     FetchMarketplaceAdd {
@@ -497,7 +495,6 @@ pub(crate) enum AppEvent {
     /// Result of adding a marketplace.
     MarketplaceAddLoaded {
         cwd: PathBuf,
-        source: String,
         result: Result<MarketplaceAddResponse, String>,
     },
 

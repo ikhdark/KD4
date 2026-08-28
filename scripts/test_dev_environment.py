@@ -573,6 +573,24 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
         self.assertIn("$/definitions/Request/properties/name:removed", issues)
         self.assertIn("$/definitions/Request/required:changed", issues)
 
+    def test_stable_schema_compatibility_allows_namespaced_definitions(self) -> None:
+        baseline = {"definitions": {"v2": {"Existing": {"type": "object"}}}}
+        additive = {
+            "definitions": {
+                "v2": {
+                    **baseline["definitions"]["v2"],
+                    "Added": {"type": "object"},
+                }
+            }
+        }
+
+        self.assertEqual(
+            app_server_schema_runtime_check.stable_schema_compatibility_issues(
+                baseline, additive
+            ),
+            [],
+        )
+
     def test_schema_gate_composes_protocol_compatibility_and_python_consumer(
         self,
     ) -> None:

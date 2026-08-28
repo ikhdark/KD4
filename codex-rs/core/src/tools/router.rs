@@ -7,6 +7,7 @@ use crate::client_common::ToolSchemaArtifact;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolDispatchState;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::exposure::ToolExposureIdentity;
@@ -36,7 +37,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -60,13 +65,42 @@ pub struct ToolRouter {
     registry: ToolRegistry,
     planning_warnings: Vec<String>,
     exposure_identity: ToolExposureIdentity,
-    surface_cache: Mutex<Option<(String, u64, ToolSurfaceSnapshot)>>,
+    schema_cache: Mutex<Option<(HashSet<ToolName>, Arc<ToolSchemaArtifact>)>>,
+    manifest_cache: Mutex<ToolManifestCache>,
+    deferred_tool_capability_revisions: OnceLock<Arc<HashMap<ToolName, String>>>,
+    #[cfg(test)]
+    schema_snapshot_build_count: AtomicUsize,
+    #[cfg(test)]
+    manifest_snapshot_build_count: AtomicUsize,
+    #[cfg(test)]
+    deferred_tool_capability_revision_build_count: AtomicUsize,
 }
 
-#[derive(Clone)]
-struct ToolSurfaceSnapshot {
-    schemas: Arc<ToolSchemaArtifact>,
-    manifest: ToolManifestItem,
+#[derive(Default)]
+struct ToolManifestCache {
+    base: Option<ToolManifestItem>,
+    activated: Option<(HashSet<ToolName>, ToolManifestItem)>,
+}
+
+impl ToolManifestCache {
+    fn get(&self, activated: &HashSet<ToolName>) -> Option<&ToolManifestItem> {
+        if activated.is_empty() {
+            self.base.as_ref()
+        } else {
+            self.activated
+                .as_ref()
+                .filter(|(cached_activated, _)| cached_activated == activated)
+                .map(|(_, manifest)| manifest)
+        }
+    }
+
+    fn insert(&mut self, activated: HashSet<ToolName>, manifest: ToolManifestItem) {
+        if activated.is_empty() {
+            self.base = Some(manifest);
+        } else {
+            self.activated = Some((activated, manifest));
+        }
+    }
 }
 
 pub(crate) struct ToolRouterParams<'a> {
@@ -76,6 +110,16 @@ pub(crate) struct ToolRouterParams<'a> {
     pub(crate) extension_tool_executors: Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>,
     pub(crate) dynamic_tools: &'a [DynamicToolSpec],
     pub(crate) exposure_identity: ToolExposureIdentity,
+}
+
+/// Completes an admitted dispatch even when router-side validation returns
+/// before the registry can transfer terminal ownership to a handler.
+struct ToolDispatchCompletionGuard(Arc<ToolDispatchState>);
+
+impl Drop for ToolDispatchCompletionGuard {
+    fn drop(&mut self) {
+        let _ = self.0.try_complete();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,11 +135,21 @@ pub(crate) struct ToolSuggestCandidates {
 }
 
 impl ToolRouter {
+    #[cfg(test)]
     pub(crate) fn from_context(
         step_context: &StepContext,
         params: ToolRouterParams<'_>,
         tool_search_handler_cache: &ToolSearchHandlerCache,
     ) -> Self {
+        Self::try_from_context(step_context, params, tool_search_handler_cache)
+            .unwrap_or_else(|error| panic!("failed to build tool router: {error}"))
+    }
+
+    pub(crate) fn try_from_context(
+        step_context: &StepContext,
+        params: ToolRouterParams<'_>,
+        tool_search_handler_cache: &ToolSearchHandlerCache,
+    ) -> Result<Self, String> {
         build_tool_router(step_context, params, tool_search_handler_cache)
     }
 
@@ -129,7 +183,15 @@ impl ToolRouter {
             registry,
             planning_warnings,
             exposure_identity,
-            surface_cache: Mutex::new(None),
+            schema_cache: Mutex::new(None),
+            manifest_cache: Mutex::new(ToolManifestCache::default()),
+            deferred_tool_capability_revisions: OnceLock::new(),
+            #[cfg(test)]
+            schema_snapshot_build_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            manifest_snapshot_build_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            deferred_tool_capability_revision_build_count: AtomicUsize::new(0),
         }
     }
 
@@ -159,74 +221,126 @@ impl ToolRouter {
         &self,
         turn: &crate::session::turn_context::TurnContext,
     ) -> Arc<ToolSchemaArtifact> {
-        self.tool_surface_snapshot(turn).schemas
+        let (_, activated) = turn.deferred_tool_activation_snapshot();
+        self.tool_schema_snapshot(&activated)
     }
 
-    pub(crate) fn deferred_tool_capability_revisions(&self) -> HashMap<ToolName, String> {
-        let exposure_identity = serde_json::to_value(&self.exposure_identity).unwrap_or_default();
-        self.registry
-            .manifest_entries()
-            .into_iter()
-            .filter(|(_, exposure, _)| *exposure == crate::tools::registry::ToolExposure::Deferred)
-            .map(|(name, _, spec)| {
-                let encoded = serde_json::to_vec(&serde_json::json!({
-                    "tool_exposure_identity": exposure_identity,
-                    "provenance": name.to_string(),
-                    "spec": spec,
-                }))
-                .unwrap_or_default();
-                (name, format!("{:x}", Sha256::digest(encoded)))
-            })
-            .collect()
+    pub(crate) fn deferred_tool_capability_revisions(&self) -> Arc<HashMap<ToolName, String>> {
+        Arc::clone(self.deferred_tool_capability_revisions.get_or_init(|| {
+            #[cfg(test)]
+            self.deferred_tool_capability_revision_build_count
+                .fetch_add(1, Ordering::Relaxed);
+            Arc::new(
+                self.registry
+                    .manifest_entries()
+                    .into_iter()
+                    .filter(|tool| {
+                        tool.exposure() == crate::tools::registry::ToolExposure::Deferred
+                    })
+                    .map(|tool| {
+                        let name = tool.tool_name();
+                        let encoded = serde_json::to_vec(&serde_json::json!({
+                            "provenance": name.to_string(),
+                            "spec_sha256": tool.canonical_spec_sha256(),
+                        }))
+                        .unwrap_or_default();
+                        (name.clone(), format!("{:x}", Sha256::digest(encoded)))
+                    })
+                    .collect(),
+            )
+        }))
     }
 
+    #[cfg(test)]
     pub(crate) fn tool_manifest(
         &self,
         turn: &crate::session::turn_context::TurnContext,
     ) -> ToolManifestItem {
-        self.tool_surface_snapshot(turn).manifest
+        let (_, activated) = turn.deferred_tool_activation_snapshot();
+        self.tool_manifest_snapshot(&activated)
     }
 
-    fn tool_surface_snapshot(
+    /// Return the manifest record for this request without cloning the full schema tree when the
+    /// same hash was already queued for this rollout. The recorder still owns canonical
+    /// definition/delta encoding; this only avoids repeatedly moving an unchanged definition
+    /// through the request-preparation path.
+    pub(crate) fn tool_manifest_for_rollout(
         &self,
         turn: &crate::session::turn_context::TurnContext,
-    ) -> ToolSurfaceSnapshot {
-        let (activation_revision, activated) = turn.deferred_tool_activation_snapshot();
-        let turn_id = turn.sub_id.clone();
-        let mut cache = self
-            .surface_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((_, _, snapshot)) =
-            cache.as_ref().filter(|(cached_turn, cached_revision, _)| {
-                cached_turn == &turn_id && *cached_revision == activation_revision
-            })
+        previous_hash: Option<&str>,
+    ) -> ToolManifestItem {
+        let (_, activated) = turn.deferred_tool_activation_snapshot();
         {
-            return snapshot.clone();
+            let cache = self
+                .manifest_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(manifest) = cache.get(&activated)
+                && previous_hash == Some(manifest.hash.as_str())
+            {
+                return ToolManifestItem::reference(manifest.hash.clone());
+            }
         }
 
-        let mut visible = self.model_visible_specs();
-        for (_, exposure, spec) in self.registry.manifest_entries() {
-            if exposure != crate::tools::registry::ToolExposure::Deferred {
-                continue;
-            }
-            let Some(spec) = filter_activated_deferred_spec(&spec, &activated) else {
-                continue;
-            };
-            merge_visible_tool_spec(&mut visible, spec);
+        let manifest = self.tool_manifest_snapshot(&activated);
+        if previous_hash == Some(manifest.hash.as_str()) {
+            ToolManifestItem::reference(manifest.hash)
+        } else {
+            manifest
         }
-        let schemas = Arc::new(ToolSchemaArtifact::new(visible));
+    }
+
+    fn tool_schema_snapshot(&self, activated: &HashSet<ToolName>) -> Arc<ToolSchemaArtifact> {
+        let mut cache = self
+            .schema_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, schemas)) = cache
+            .as_ref()
+            .filter(|(cached_activated, _)| cached_activated == activated)
+        {
+            return Arc::clone(schemas);
+        }
+
+        let schemas = if activated.is_empty() {
+            self.registry.model_visible_schemas()
+        } else {
+            let mut visible = self.model_visible_specs();
+            for tool in self.registry.manifest_entries() {
+                if tool.exposure() != crate::tools::registry::ToolExposure::Deferred {
+                    continue;
+                }
+                let Some(spec) = filter_activated_deferred_spec(tool.spec(), activated) else {
+                    continue;
+                };
+                merge_visible_tool_spec(&mut visible, spec);
+            }
+            Arc::new(ToolSchemaArtifact::new(visible))
+        };
+        #[cfg(test)]
+        self.schema_snapshot_build_count
+            .fetch_add(1, Ordering::Relaxed);
+        *cache = Some((activated.clone(), Arc::clone(&schemas)));
+        schemas
+    }
+
+    fn tool_manifest_snapshot(&self, activated: &HashSet<ToolName>) -> ToolManifestItem {
+        let mut cache = self
+            .manifest_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(manifest) = cache.get(activated) {
+            return manifest.clone();
+        }
+
+        let schemas = self.tool_schema_snapshot(activated);
         let registered = self
             .registry
             .manifest_entries()
             .into_iter()
-            .map(|(name, exposure, spec)| {
-                let canonical_spec =
-                    canonicalize_json(&serde_json::to_value(spec).unwrap_or_default());
-                let spec_sha256 = format!(
-                    "{:x}",
-                    Sha256::digest(serde_json::to_vec(&canonical_spec).unwrap_or_default())
-                );
+            .map(|tool| {
+                let name = tool.tool_name();
+                let exposure = tool.exposure();
                 let exposure_name = match exposure {
                     crate::tools::registry::ToolExposure::Direct => "direct",
                     crate::tools::registry::ToolExposure::Deferred => "deferred",
@@ -237,11 +351,11 @@ impl ToolRouter {
                     "name": name.to_string(),
                     "exposure": exposure_name,
                     "activated": exposure != crate::tools::registry::ToolExposure::Deferred
-                        || activated.contains(&name),
+                        || activated.contains(name),
                     // Full schemas already live in `model_visible` or the deferred
                     // discovery index. Persist only their canonical identity here so
                     // the rollout manifest does not scale with every registered schema.
-                    "spec_sha256": spec_sha256,
+                    "spec_sha256": tool.canonical_spec_sha256(),
                 })
             })
             .collect::<Vec<_>>();
@@ -254,12 +368,28 @@ impl ToolRouter {
             "tool_exposure_identity": &self.exposure_identity,
         });
         let encoded = serde_json::to_vec(&fingerprint_input).unwrap_or_default();
-        let snapshot = ToolSurfaceSnapshot {
-            schemas,
-            manifest: ToolManifestItem::full(format!("{:x}", Sha256::digest(encoded)), manifest),
-        };
-        *cache = Some((turn_id, activation_revision, snapshot.clone()));
-        snapshot
+        let manifest = ToolManifestItem::full(format!("{:x}", Sha256::digest(encoded)), manifest);
+        #[cfg(test)]
+        self.manifest_snapshot_build_count
+            .fetch_add(1, Ordering::Relaxed);
+        cache.insert(activated.clone(), manifest.clone());
+        manifest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn schema_snapshot_build_count(&self) -> usize {
+        self.schema_snapshot_build_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manifest_snapshot_build_count(&self) -> usize {
+        self.manifest_snapshot_build_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deferred_tool_capability_revision_build_count(&self) -> usize {
+        self.deferred_tool_capability_revision_build_count
+            .load(Ordering::Relaxed)
     }
 
     pub(crate) fn planning_warnings(&self) -> &[String] {
@@ -378,8 +508,9 @@ impl ToolRouter {
         tracker: SharedTurnDiffTracker,
         call: ToolCall,
         source: ToolCallSource,
-        terminal_outcome_reached: Arc<AtomicBool>,
+        dispatch_state: Arc<ToolDispatchState>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        let _completion_guard = ToolDispatchCompletionGuard(Arc::clone(&dispatch_state));
         if self.registry.tool_exposure(&call.tool_name)
             == Some(crate::tools::registry::ToolExposure::Deferred)
             && !step_context
@@ -443,7 +574,7 @@ impl ToolRouter {
         };
 
         self.registry
-            .dispatch_any_with_terminal_outcome(invocation, terminal_outcome_reached)
+            .dispatch_any_with_terminal_outcome(invocation, Arc::clone(&dispatch_state))
             .await
     }
 }
@@ -508,81 +639,6 @@ fn merge_visible_tool_spec(visible: &mut Vec<ToolSpec>, spec: ToolSpec) {
     }
 }
 
-#[cfg(test)]
-fn collect_proven_read_only_external_tools(
-    mcp_tools: Option<&[ToolInfo]>,
-    deferred_mcp_tools: Option<&[ToolInfo]>,
-) -> HashSet<ToolName> {
-    let mut external_tool_read_only = HashMap::new();
-    for tool in mcp_tools
-        .into_iter()
-        .flatten()
-        .chain(deferred_mcp_tools.into_iter().flatten())
-    {
-        let name = ToolName::new(
-            Some(tool.callable_namespace.clone()),
-            tool.callable_name.clone(),
-        );
-        let read_only = tool
-            .tool
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.read_only_hint)
-            .unwrap_or_else(|| is_allowlisted_read_only_external_tool(&name));
-        external_tool_read_only
-            .entry(name)
-            .and_modify(|all_read_only| *all_read_only &= read_only)
-            .or_insert(read_only);
-    }
-    external_tool_read_only
-        .into_iter()
-        .filter_map(|(name, read_only)| read_only.then_some(name))
-        .collect()
-}
-
-#[cfg(test)]
-fn is_allowlisted_read_only_external_tool(name: &ToolName) -> bool {
-    matches!(
-        (name.namespace.as_deref(), name.name.as_str()),
-        (
-            Some("mcp__repo_atlas"),
-            "batch"
-                | "cochange"
-                | "context_for"
-                | "contract"
-                | "crate_graph"
-                | "crate_summary"
-                | "find_def"
-                | "find_refs"
-                | "impact"
-                | "index_status"
-                | "outline"
-                | "repo_facts"
-                | "select_root"
-                | "slice"
-                | "trace"
-                | "where_belongs",
-        ) | (
-            Some("mcp__codex_apps__github"),
-            "fetch"
-                | "fetch_blob"
-                | "fetch_commit"
-                | "fetch_commit_workflow_runs"
-                | "fetch_file"
-                | "fetch_issue"
-                | "fetch_issue_comments"
-                | "fetch_pr"
-                | "fetch_pr_comments"
-                | "fetch_pr_file_patch"
-                | "fetch_pr_patch"
-                | "fetch_workflow_job_logs"
-                | "fetch_workflow_job_steps"
-                | "fetch_workflow_run_artifacts"
-                | "fetch_workflow_run_jobs",
-        )
-    )
-}
-
 fn authorize_independent_review_tool_call(
     session_source: &SessionSource,
     class: TypedToolClass,
@@ -622,8 +678,8 @@ async fn authorize_bound_typed_tool_call(
     let Some(binding) = coordinator.binding_for_source(&step_context.turn.session_source) else {
         return Ok(());
     };
-    let task = coordinator
-        .get_agent_task(binding.assignment_id, Some(0))
+    let authorization = coordinator
+        .get_agent_task_authorization(binding.assignment_id)
         .await
         .map_err(|error| {
             FunctionCallError::RespondToModel(format!(
@@ -631,8 +687,8 @@ async fn authorize_bound_typed_tool_call(
                 call.tool_name.name
             ))
         })?;
-    if task.current_attempt.attempt_id != binding.attempt_id
-        || task.current_attempt.state != AttemptState::Active
+    if authorization.current_attempt.attempt_id != binding.attempt_id
+        || authorization.current_attempt.state != AttemptState::Active
     {
         return Err(FunctionCallError::RespondToModel(format!(
             "{}: the bound typed assignment attempt is no longer active",
@@ -643,7 +699,7 @@ async fn authorize_bound_typed_tool_call(
     let is_legacy_nested_spawn = class == TypedToolClass::RootTaskControl
         && call.tool_name.name == "spawn_agent"
         && matches!(
-            task.assignment.admission_origin,
+            authorization.admission_origin,
             AssignmentAdmissionOrigin::LegacyMessage { .. }
         );
     if !is_legacy_nested_spawn {

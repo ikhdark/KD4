@@ -39,6 +39,7 @@ use super::GuardianAssessment;
 use super::GuardianAssessmentOutcome;
 use super::GuardianRejection;
 use super::GuardianRejectionCircuitBreakerAction;
+use super::approval_request::format_guardian_action_pretty;
 use super::approval_request::guardian_assessment_action;
 use super::approval_request::guardian_request_target_item_id;
 use super::approval_request::guardian_request_turn_id;
@@ -272,6 +273,29 @@ async fn record_guardian_denial(session: &Arc<Session>, turn: &Arc<TurnContext>,
     });
 }
 
+async fn review_approval_with_extensions(
+    session: &Session,
+    request: &GuardianApprovalRequest,
+) -> Option<ReviewDecision> {
+    let prompt = match format_guardian_action_pretty(request) {
+        Ok(action) => action.text,
+        Err(err) => {
+            warn!(%err, "failed to render approval action for extension review");
+            return None;
+        }
+    };
+
+    session
+        .services
+        .extensions
+        .approval_review(
+            &session.services.session_extension_data,
+            &session.services.thread_extension_data,
+            &prompt,
+        )
+        .await
+}
+
 #[cfg(test)]
 pub(crate) async fn record_guardian_denial_for_test(
     session: &Arc<Session>,
@@ -284,6 +308,7 @@ pub(crate) async fn record_guardian_denial_for_test(
 /// This function always fails closed: timeouts, review-session failures, and
 /// parse failures all block execution, but timeouts are still surfaced to the
 /// caller as distinct from explicit guardian denials.
+#[allow(clippy::too_many_arguments)]
 async fn run_guardian_review(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
@@ -292,7 +317,16 @@ async fn run_guardian_review(
     retry_reason: Option<String>,
     approval_request_source: GuardianApprovalRequestSource,
     external_cancel: Option<CancellationToken>,
+    initial_error: Option<GuardianReviewError>,
 ) -> ReviewDecision {
+    if !external_cancel
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+        && let Some(decision) = review_approval_with_extensions(&session, &request).await
+    {
+        return decision;
+    }
+
     let target_item_id = guardian_request_target_item_id(&request).map(str::to_string);
     let assessment_turn_id = guardian_request_turn_id(&request, &turn.sub_id).to_string();
     let action_summary = guardian_assessment_action(&request);
@@ -366,18 +400,26 @@ async fn run_guardian_review(
         return ReviewDecision::Abort;
     }
 
-    let schema = guardian_output_schema();
     let terminal_action = action_summary.clone();
-    let (outcome, analytics_result) = Box::pin(run_guardian_review_session_with_retry(
-        session.clone(),
-        turn.clone(),
-        request,
-        retry_reason.clone(),
-        schema,
-        external_cancel,
-        GUARDIAN_REVIEW_MAX_ATTEMPTS,
-    ))
-    .await;
+    let (outcome, analytics_result) = match initial_error {
+        Some(error) => (
+            GuardianReviewOutcome::Error(error),
+            GuardianReviewAnalyticsResult::without_session(),
+        ),
+        None => {
+            let schema = guardian_output_schema();
+            Box::pin(run_guardian_review_session_with_retry(
+                session.clone(),
+                turn.clone(),
+                request,
+                retry_reason.clone(),
+                schema,
+                external_cancel,
+                GUARDIAN_REVIEW_MAX_ATTEMPTS,
+            ))
+            .await
+        }
+    };
 
     let completed_at_ms = now_unix_timestamp_ms();
     let (assessment, count_denial_for_circuit_breaker) = match outcome {
@@ -621,7 +663,7 @@ pub(crate) async fn review_approval_request(
         GuardianApprovalRequestSource::MainTurn,
         cancel_token,
     );
-    let decision = review_rx.await.unwrap_or_default();
+    let decision = review_rx.await;
     drop(cancel_guard);
     decision
 }
@@ -643,6 +685,7 @@ pub(crate) async fn review_approval_request_with_cancel(
         retry_reason,
         approval_request_source,
         Some(cancel_token),
+        /*initial_error*/ None,
     )
     .await
 }
@@ -655,9 +698,42 @@ pub(crate) fn spawn_approval_request_review(
     retry_reason: Option<String>,
     approval_request_source: GuardianApprovalRequestSource,
     cancel_token: CancellationToken,
-) -> oneshot::Receiver<ReviewDecision> {
+) -> impl std::future::Future<Output = ReviewDecision> + Send + 'static {
+    spawn_approval_request_review_with_runtime(
+        GUARDIAN_REVIEW_RUNTIME
+            .as_ref()
+            .map(|runtime| runtime.handle().clone())
+            .map_err(std::string::ToString::to_string),
+        session,
+        turn,
+        review_id,
+        request,
+        retry_reason,
+        approval_request_source,
+        cancel_token,
+    )
+}
+
+// Keep the runtime handoff aligned with the public guardian request wrapper.
+#[allow(clippy::too_many_arguments)]
+fn spawn_approval_request_review_with_runtime(
+    review_runtime: Result<tokio::runtime::Handle, String>,
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    review_id: String,
+    request: GuardianApprovalRequest,
+    retry_reason: Option<String>,
+    approval_request_source: GuardianApprovalRequestSource,
+    cancel_token: CancellationToken,
+) -> impl std::future::Future<Output = ReviewDecision> + Send + 'static {
+    let fallback_session = Arc::clone(&session);
+    let fallback_turn = Arc::clone(&turn);
+    let fallback_review_id = review_id.clone();
+    let fallback_request = request.clone();
+    let fallback_retry_reason = retry_reason.clone();
+    let fallback_cancel_token = cancel_token.clone();
     let (tx, rx) = oneshot::channel();
-    match &*GUARDIAN_REVIEW_RUNTIME {
+    let runtime_initialization_error = match review_runtime {
         Ok(runtime) => {
             std::mem::drop(runtime.spawn(async move {
                 let decision = review_approval_request_with_cancel(
@@ -672,12 +748,62 @@ pub(crate) fn spawn_approval_request_review(
                 .await;
                 let _ = tx.send(decision);
             }));
+            None
         }
         Err(err) => {
             warn!(%err, "failed to initialize guardian review runtime");
+            Some(format!(
+                "failed to initialize guardian review runtime: {err}"
+            ))
+        }
+    };
+
+    async move {
+        match rx.await {
+            Ok(decision) => decision,
+            Err(err) => {
+                let message = runtime_initialization_error.unwrap_or_else(|| {
+                    format!("guardian review task ended without a decision: {err}")
+                });
+                warn!(%message, "guardian review failed before producing a decision");
+                run_guardian_review(
+                    fallback_session,
+                    fallback_turn,
+                    fallback_review_id,
+                    fallback_request,
+                    fallback_retry_reason,
+                    approval_request_source,
+                    Some(fallback_cancel_token),
+                    Some(GuardianReviewError::session(anyhow::anyhow!(message))),
+                )
+                .await
+            }
         }
     }
-    rx
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_approval_request_review_with_runtime_error_for_test(
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    review_id: String,
+    request: GuardianApprovalRequest,
+    retry_reason: Option<String>,
+    approval_request_source: GuardianApprovalRequestSource,
+    cancel_token: CancellationToken,
+    error: String,
+) -> impl std::future::Future<Output = ReviewDecision> + Send + 'static {
+    spawn_approval_request_review_with_runtime(
+        Err(error),
+        session,
+        turn,
+        review_id,
+        request,
+        retry_reason,
+        approval_request_source,
+        cancel_token,
+    )
 }
 
 pub(super) struct GuardianReviewSessionConfig {

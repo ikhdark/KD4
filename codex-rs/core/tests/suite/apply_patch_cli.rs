@@ -2,15 +2,11 @@ use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
-use core_test_support::responses::ev_apply_patch_shell_command_call_via_heredoc;
-use core_test_support::responses::ev_shell_command_call;
-use core_test_support::test_codex::ApplyPatchModelOutput;
 use pretty_assertions::assert_eq;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use codex_exec_server::CreateDirectoryOptions;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
@@ -29,14 +25,11 @@ use codex_utils_path_uri::PathUri;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_shell_command_call_with_args;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
-use core_test_support::skip_if_remote;
-use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::test_codex;
@@ -156,26 +149,6 @@ pub async fn mount_apply_patch(
             assistant_msg,
             ev_apply_patch_custom_tool_call,
         ),
-    )
-    .await;
-}
-
-async fn mount_apply_patch_model_output(
-    harness: &TestCodexHarness,
-    call_id: &str,
-    patch: &str,
-    assistant_msg: &str,
-    model_output: ApplyPatchModelOutput,
-) {
-    let apply_patch_call = match model_output {
-        ApplyPatchModelOutput::ShellCommandViaHeredoc => {
-            ev_apply_patch_shell_command_call_via_heredoc
-        }
-    };
-
-    mount_sse_sequence(
-        harness.server(),
-        apply_patch_responses(call_id, patch, assistant_msg, apply_patch_call),
     )
     .await;
 }
@@ -562,8 +535,6 @@ async fn apply_patch_cli_delete_directory_reports_verification_error() -> Result
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_rejects_path_traversal_outside_workspace() -> Result<()> {
-    // TODO(anp): Remove after apply_patch path handling supports target-native Windows paths.
-    skip_if_wine_exec!(Ok(()), "asserts POSIX path traversal behavior");
     skip_if_no_network!(Ok(()));
 
     let harness = apply_patch_harness().await?;
@@ -605,10 +576,6 @@ async fn apply_patch_cli_rejects_path_traversal_outside_workspace() -> Result<()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_does_not_write_through_symlink_escape_outside_workspace() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    skip_if_remote!(
-        Ok(()),
-        "link escape setup needs local filesystem link creation"
-    );
 
     let test_root = tempfile::tempdir_in(std::env::current_dir()?)?;
     let work_dir = AbsolutePathBuf::try_from(test_root.path().join("work"))?;
@@ -669,10 +636,6 @@ async fn apply_patch_cli_does_not_write_through_symlink_escape_outside_workspace
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_preserves_existing_hard_link_outside_workspace() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    skip_if_remote!(
-        Ok(()),
-        "link setup needs local filesystem hard link creation"
-    );
 
     let test_root = tempfile::tempdir_in(std::env::current_dir()?)?;
     let work_dir = AbsolutePathBuf::try_from(test_root.path().join("work"))?;
@@ -713,55 +676,27 @@ async fn apply_patch_cli_preserves_existing_hard_link_outside_workspace() -> Res
         .await?;
 
     let out = harness.apply_patch_output(call_id).await;
-    #[cfg(windows)]
-    {
-        assert!(
-            out.contains("patch rejected: writing outside of the project"),
-            "Windows sandboxing intentionally rejects writes through existing hard links to files outside the workspace; tool output: {out}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&outside_file)?,
-            "original outside content\n",
-            "Windows rejection must leave the outside hard-link target unchanged"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&link_path)?,
-            "original outside content\n",
-            "Windows rejection must leave the workspace hard-link path unchanged"
-        );
+    assert!(
+        out.contains("patch rejected: writing outside of the project"),
+        "Windows sandboxing intentionally rejects writes through existing hard links to files outside the workspace; tool output: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside_file)?,
+        "original outside content\n",
+        "Windows rejection must leave the outside hard-link target unchanged"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&link_path)?,
+        "original outside content\n",
+        "Windows rejection must leave the workspace hard-link path unchanged"
+    );
 
-        std::fs::write(&outside_file, "post-reject outside write\n")?;
-        assert_eq!(
-            std::fs::read_to_string(&link_path)?,
-            "post-reject outside write\n",
-            "Windows rejection must not unlink or replace an existing hard link"
-        );
-    }
-
-    #[cfg(not(windows))]
-    {
-        assert!(
-            out.contains("Success. Updated the following files:"),
-            "apply_patch should intentionally allow updates through existing hard links; tool output: {out}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&outside_file)?,
-            "updated through existing hard link\n",
-            "apply_patch intentionally preserves existing hard-link semantics; the outside path observes the shared inode update"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&link_path)?,
-            "updated through existing hard link\n",
-            "apply_patch intentionally preserves existing hard-link semantics; the workspace path observes the same update"
-        );
-
-        std::fs::write(&outside_file, "post-apply outside write\n")?;
-        assert_eq!(
-            std::fs::read_to_string(&link_path)?,
-            "post-apply outside write\n",
-            "apply_patch must not unlink or replace an existing hard link; later writes through either path should still be visible"
-        );
-    }
+    std::fs::write(&outside_file, "post-reject outside write\n")?;
+    assert_eq!(
+        std::fs::read_to_string(&link_path)?,
+        "post-reject outside write\n",
+        "Windows rejection must not unlink or replace an existing hard link"
+    );
 
     Ok(())
 }
@@ -788,49 +723,8 @@ async fn apply_patch_cli_verification_failure_has_no_side_effects() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_shell_command_heredoc_with_cd_updates_relative_workdir() -> Result<()> {
-    // TODO(anp): Remove after apply_patch shell fixtures use target-native commands.
-    skip_if_wine_exec!(Ok(()), "uses a POSIX shell heredoc and cd command");
-    skip_if_no_network!(Ok(()));
-
-    let harness = apply_patch_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
-
-    // Prepare a file inside a subdir; update it via cd && apply_patch heredoc form.
-    harness.write_file("sub/in_sub.txt", "before\n").await?;
-
-    let script = "cd sub && apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: in_sub.txt\n@@\n-before\n+after\n*** End Patch\nEOF\n";
-    let call_id = "shell-heredoc-cd";
-    let bodies = vec![
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_shell_command_call(call_id, script),
-            ev_completed("resp-1"),
-        ]),
-        sse(vec![
-            ev_assistant_message("msg-1", "ok"),
-            ev_completed("resp-2"),
-        ]),
-    ];
-    mount_sse_sequence(harness.server(), bodies).await;
-
-    harness.submit("apply via shell heredoc with cd").await?;
-
-    let out = harness.function_call_stdout(call_id).await;
-    assert!(
-        out.contains("Success."),
-        "expected successful apply_patch invocation via shell_command: {out}"
-    );
-    assert_eq!(harness.read_file_text("sub/in_sub.txt").await?, "after\n");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_can_use_shell_command_output_as_patch_input() -> Result<()> {
     skip_if_no_network!(Ok(()));
-    skip_if_remote!(
-        Ok(()),
-        "shell_command output producer runs in the test runner, not in the remote apply_patch workspace",
-    );
 
     let harness =
         apply_patch_harness_with(|builder| builder.with_model("gpt-5.4").with_windows_cmd_shell())
@@ -1070,242 +964,6 @@ async fn apply_patch_custom_tool_streaming_emits_updated_changes() -> Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_shell_command_heredoc_with_cd_emits_turn_diff() -> Result<()> {
-    // TODO(anp): Remove after apply_patch shell fixtures use target-native commands.
-    skip_if_wine_exec!(Ok(()), "uses a POSIX shell heredoc and cd command");
-    skip_if_no_network!(Ok(()));
-
-    let harness = apply_patch_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
-    let test = harness.test();
-    let codex = test.codex.clone();
-
-    // Prepare a file inside a subdir; update it via cd && apply_patch heredoc form.
-    harness.write_file("sub/in_sub.txt", "before\n").await?;
-
-    let script = "cd sub && apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: in_sub.txt\n@@\n-before\n+after\n*** End Patch\nEOF\n";
-    let call_id = "shell-heredoc-cd";
-    let args = json!({ "command": script, "timeout_ms": 30_000 });
-    let bodies = vec![
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
-            ev_completed("resp-1"),
-        ]),
-        sse(vec![
-            ev_assistant_message("msg-1", "ok"),
-            ev_completed("resp-2"),
-        ]),
-    ];
-    mount_sse_sequence(harness.server(), bodies).await;
-
-    submit_without_wait(&harness, "apply via shell heredoc with cd").await?;
-
-    let mut saw_turn_diff = None;
-    let mut saw_patch_begin = false;
-    let mut patch_end_success = None;
-    wait_for_event(&codex, |event| match event {
-        EventMsg::PatchApplyBegin(begin) => {
-            saw_patch_begin = true;
-            assert_eq!(begin.call_id, call_id);
-            false
-        }
-        EventMsg::PatchApplyEnd(end) => {
-            assert_eq!(end.call_id, call_id);
-            patch_end_success = Some(end.success);
-            false
-        }
-        EventMsg::TurnDiff(ev) => {
-            saw_turn_diff = Some(ev.unified_diff.clone());
-            false
-        }
-        EventMsg::TurnComplete(_) => true,
-        _ => false,
-    })
-    .await;
-
-    assert!(saw_patch_begin, "expected PatchApplyBegin event");
-    let patch_end_success =
-        patch_end_success.expect("expected PatchApplyEnd event to capture success flag");
-    assert!(patch_end_success);
-
-    let diff = saw_turn_diff.expect("expected TurnDiff event");
-    assert!(diff.contains("diff --git"), "diff header missing: {diff:?}");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_turn_diff_paths_stay_repo_relative_when_session_cwd_is_nested() -> Result<()> {
-    // TODO(anp): Remove after apply_patch diff fixtures use target-native paths.
-    skip_if_wine_exec!(Ok(()), "asserts POSIX repository paths");
-    skip_if_no_network!(Ok(()));
-
-    let harness = apply_patch_harness_with(|builder| {
-        builder
-            .with_model("gpt-5.4")
-            .with_config(|config| {
-                config.cwd = config.cwd.join("subdir");
-            })
-            .with_workspace_setup(|cwd, fs| async move {
-                let cwd_uri = PathUri::from_host_native_path(&cwd)?;
-                fs.create_directory(
-                    &cwd_uri,
-                    CreateDirectoryOptions { recursive: true },
-                    /*sandbox*/ None,
-                )
-                .await?;
-                let repo_root = cwd.parent().expect("nested cwd should have parent");
-                let git_uri = PathUri::from_host_native_path(repo_root.join(".git"))?;
-                let repo_file_uri = PathUri::from_host_native_path(repo_root.join("repo.txt"))?;
-                fs.write_file(
-                    &git_uri,
-                    b"gitdir: /tmp/fake-worktree\n".to_vec(),
-                    /*sandbox*/ None,
-                )
-                .await?;
-                fs.write_file(&repo_file_uri, b"before\n".to_vec(), /*sandbox*/ None)
-                    .await?;
-                Ok(())
-            })
-    })
-    .await?;
-    let test = harness.test();
-    let codex = test.codex.clone();
-    let repo_root = harness
-        .test()
-        .config
-        .cwd
-        .parent()
-        .expect("nested cwd should have parent");
-
-    let call_id = "apply-nested-cwd-repo-relative";
-    let patch = "*** Begin Patch\n*** Update File: ../repo.txt\n@@\n-before\n+after\n*** End Patch";
-    mount_apply_patch(&harness, call_id, patch, "updated repo-relative path").await;
-
-    submit_without_wait(&harness, "update file outside nested cwd but inside repo").await?;
-
-    let mut last_diff: Option<String> = None;
-    wait_for_event(&codex, |event| match event {
-        EventMsg::TurnDiff(ev) => {
-            last_diff = Some(ev.unified_diff.clone());
-            false
-        }
-        EventMsg::TurnComplete(_) => true,
-        _ => false,
-    })
-    .await;
-
-    let diff = last_diff.expect("expected TurnDiff event after update");
-    assert!(
-        diff.contains("diff --git a/repo.txt b/repo.txt"),
-        "diff should stay repo-relative: {diff:?}"
-    );
-    assert!(
-        !diff.contains(repo_root.as_path().to_string_lossy().as_ref()),
-        "diff should not leak absolute repo paths: {diff:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_shell_command_failure_propagates_error_and_skips_diff() -> Result<()> {
-    // TODO(anp): Remove after apply_patch shell fixtures use target-native commands.
-    skip_if_wine_exec!(Ok(()), "uses a POSIX shell heredoc");
-    skip_if_no_network!(Ok(()));
-
-    let harness = apply_patch_harness_with(|builder| builder.with_model("gpt-5.4")).await?;
-    let test = harness.test();
-    let codex = test.codex.clone();
-
-    harness.write_file("invalid.txt", "ok\n").await?;
-
-    let script = "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: invalid.txt\n@@\n-nope\n+changed\n*** End Patch\nEOF\n";
-    let call_id = "shell-apply-failure";
-    let args = json!({ "command": script, "timeout_ms": 5_000 });
-    let bodies = vec![
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
-            ev_completed("resp-1"),
-        ]),
-        sse(vec![
-            ev_assistant_message("msg-1", "fail"),
-            ev_completed("resp-2"),
-        ]),
-    ];
-    mount_sse_sequence(harness.server(), bodies).await;
-
-    submit_without_wait(&harness, "apply patch via shell").await?;
-
-    let mut saw_turn_diff = false;
-    wait_for_event(&codex, |event| match event {
-        EventMsg::TurnDiff(_) => {
-            saw_turn_diff = true;
-            false
-        }
-        EventMsg::TurnComplete(_) => true,
-        _ => false,
-    })
-    .await;
-
-    assert!(
-        !saw_turn_diff,
-        "turn diff should not be emitted when shell apply_patch fails verification"
-    );
-
-    let out = harness.function_call_stdout(call_id).await;
-    assert!(
-        out.contains("Failed to find expected lines in"),
-        "expected failure diagnostics: {out}"
-    );
-    assert!(
-        out.contains("invalid.txt"),
-        "expected file path in output: {out}"
-    );
-    assert_eq!(harness.read_file_text("invalid.txt").await?, "ok\n");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn apply_patch_shell_accepts_lenient_heredoc_wrapped_patch() -> Result<()> {
-    // TODO(anp): Remove after apply_patch shell fixtures use target-native commands.
-    skip_if_wine_exec!(Ok(()), "uses a POSIX shell heredoc");
-    skip_if_no_network!(Ok(()));
-
-    let harness = apply_patch_harness().await?;
-
-    let file_name = "lenient.txt";
-    let patch_inner =
-        format!("*** Begin Patch\n*** Add File: {file_name}\n+lenient\n*** End Patch\n");
-    let call_id = "apply-lenient";
-    mount_apply_patch_model_output(
-        &harness,
-        call_id,
-        patch_inner.as_str(),
-        "ok",
-        ApplyPatchModelOutput::ShellCommandViaHeredoc,
-    )
-    .await;
-
-    harness.submit("apply lenient heredoc patch").await?;
-
-    let out = harness.function_call_stdout(call_id).await;
-    assert!(
-        serde_json::from_str::<serde_json::Value>(&out).is_err(),
-        "expected heredoc apply_patch output to be plain text, got: {out}"
-    );
-    assert!(
-        out.contains("Success. Updated the following files:"),
-        "expected successful apply_patch output: {out}"
-    );
-    assert!(
-        out.contains(&format!("A {file_name}")),
-        "expected created file in apply_patch output: {out}"
-    );
-    assert_eq!(harness.read_file_text(file_name).await?, "lenient\n");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_end_of_file_anchor() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1367,10 +1025,10 @@ async fn apply_patch_emits_turn_diff_event_with_unified_diff() -> Result<()> {
 
     submit_without_wait(&harness, "emit diff").await?;
 
-    let mut saw_turn_diff = None;
+    let mut turn_diffs = Vec::new();
     wait_for_event(&codex, |event| match event {
         EventMsg::TurnDiff(ev) => {
-            saw_turn_diff = Some(ev.unified_diff.clone());
+            turn_diffs.push(ev.unified_diff.clone());
             false
         }
         EventMsg::TurnComplete(_) => true,
@@ -1378,7 +1036,12 @@ async fn apply_patch_emits_turn_diff_event_with_unified_diff() -> Result<()> {
     })
     .await;
 
-    let diff = saw_turn_diff.expect("expected TurnDiff event");
+    assert_eq!(
+        turn_diffs.len(),
+        1,
+        "one workspace change must emit one TurnDiff update"
+    );
+    let diff = &turn_diffs[0];
     // Basic markers of a unified diff with file addition
     assert!(diff.contains("diff --git"), "diff header missing: {diff:?}");
     assert!(diff.contains("--- /dev/null") || diff.contains("--- a/"));
@@ -1417,10 +1080,10 @@ async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> 
 
     submit_without_wait(&harness, "aggregate diffs").await?;
 
-    let mut last_diff: Option<String> = None;
+    let mut turn_diffs = Vec::new();
     wait_for_event(&codex, |event| match event {
         EventMsg::TurnDiff(ev) => {
-            last_diff = Some(ev.unified_diff.clone());
+            turn_diffs.push(ev.unified_diff.clone());
             false
         }
         EventMsg::TurnComplete(_) => true,
@@ -1428,7 +1091,16 @@ async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> 
     })
     .await;
 
-    let diff = last_diff.expect("expected TurnDiff after two patches");
+    assert_eq!(
+        turn_diffs.len(),
+        2,
+        "two workspace mutations must emit exactly two changed projections"
+    );
+    assert!(
+        !turn_diffs[0].contains("agg/b.txt"),
+        "the first projection must precede the second mutation"
+    );
+    let diff = &turn_diffs[1];
     assert!(diff.contains("agg/a.txt"), "diff missing a.txt");
     assert!(diff.contains("agg/b.txt"), "diff missing b.txt");
     // Final content reflects v2 for a.txt

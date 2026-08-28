@@ -351,6 +351,23 @@ async fn load_rollout_items_defaults_legacy_session_id() -> std::io::Result<()> 
 }
 
 #[tokio::test]
+async fn for_each_rollout_item_streams_items_and_reports_identity() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::new_v4();
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let rollout_path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
+    let mut visited = Vec::new();
+
+    let (loaded_thread_id, parse_errors) =
+        RolloutRecorder::for_each_rollout_item(&rollout_path, |item| visited.push(item)).await?;
+
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert!(matches!(visited.first(), Some(RolloutItem::SessionMeta(_))));
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_rollout_items_ignores_unknown_fork_source_history_mode() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::new_v4();
@@ -780,6 +797,7 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
             file: tokio::fs::File::from_std(read_only_file),
             _append_lock: append_lock,
             write_fault: None,
+            append_transaction_count: 0,
         }),
         /*deferred_log_file_info*/ None,
         /*meta*/ None,
@@ -876,6 +894,62 @@ fn writer_state_defines_manifests_once_then_references_them() {
         RolloutItem::EventMsg(EventMsg::TurnStarted(_))
     ));
     assert!(state.pending_token_count.is_none());
+}
+
+#[tokio::test]
+async fn replay_reconstructs_full_tool_surface_from_compact_references() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    File::create(&rollout_path)?;
+    let writer = open_log_file(&rollout_path)?.into_jsonl_writer();
+    let mut state = RolloutWriterState::new(
+        Some(writer),
+        /*deferred_log_file_info*/ None,
+        /*meta*/ None,
+        home.path().to_path_buf(),
+        /*known_repository_context*/ None,
+        rollout_path.clone(),
+        ToolManifestDictionary::default(),
+    );
+    let surface = serde_json::json!({
+        "model_visible": [
+            {"type": "function", "name": "shell", "schema": {"type": "object"}},
+            {"type": "function", "name": "read", "schema": {"type": "object"}}
+        ],
+        "registered": [
+            {"name": "shell", "exposure": "direct", "activated": true},
+            {"name": "read", "exposure": "direct", "activated": true}
+        ]
+    });
+    let hash = "stable-surface";
+
+    state.add_items(vec![
+        RolloutItem::ToolManifest(ToolManifestItem::full(hash.to_string(), surface.clone())),
+        RolloutItem::ToolManifest(ToolManifestItem::reference(hash.to_string())),
+        RolloutItem::ToolManifest(ToolManifestItem::reference(hash.to_string())),
+    ]);
+    state.flush().await?;
+
+    let persisted = fs::read_to_string(&rollout_path)?
+        .lines()
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let persisted_manifests = persisted
+        .iter()
+        .filter_map(|line| match &line.item {
+            RolloutItem::ToolManifest(manifest) => Some(manifest),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(persisted_manifests.len(), 3);
+    assert_eq!(persisted_manifests[0].manifest.as_ref(), Some(&surface));
+    assert!(persisted_manifests[1].is_reference());
+    assert!(persisted_manifests[2].is_reference());
+
+    let replayed = RolloutRecorder::existing_tool_manifests(&rollout_path).await?;
+    assert_eq!(replayed.manifest(hash), Some(&surface));
+    assert_eq!(replayed.current_hash(), Some(hash));
+    Ok(())
 }
 
 #[tokio::test]
@@ -1027,6 +1101,109 @@ async fn writer_state_rolls_back_a_partial_record_before_retry() -> std::io::Res
         "partial-write-record",
     )
     .await
+}
+
+#[tokio::test]
+async fn ordered_append_waits_for_in_memory_acceptance_without_materializing() -> std::io::Result<()>
+{
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::new(
+            ThreadId::new(),
+            None,
+            None,
+            SessionSource::Exec,
+            None,
+            "test_originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        ),
+    )
+    .await?;
+    let rollout_path = recorder.rollout_path().to_path_buf();
+
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    recorder
+        .tx
+        .send(RolloutCmd::Pause {
+            entered: entered_tx,
+            resume: resume_rx,
+        })
+        .await
+        .expect("writer command channel should be open");
+    entered_rx.await.expect("writer should enter pause");
+
+    let item = RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+        message: "accepted-in-memory".to_string(),
+        phase: None,
+        memory_citation: None,
+    }));
+    let items = [item];
+    let append = recorder.record_canonical_items_ordered(&items);
+    tokio::pin!(append);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), append.as_mut())
+            .await
+            .is_err(),
+        "ordered append must wait until the writer accepts the item"
+    );
+
+    resume_tx
+        .send(())
+        .expect("writer pause receiver should remain open");
+    append.await?;
+    assert!(
+        !rollout_path.exists(),
+        "in-memory acceptance must not materialize or flush the rollout"
+    );
+
+    recorder.shutdown().await
+}
+
+#[tokio::test]
+async fn writer_state_flushes_multi_item_batch_in_one_transaction() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    File::create(&rollout_path)?;
+    let writer = open_log_file(&rollout_path)?.into_jsonl_writer();
+    let mut state = RolloutWriterState::new(
+        Some(writer),
+        /*deferred_log_file_info*/ None,
+        /*meta*/ None,
+        home.path().to_path_buf(),
+        /*known_repository_context*/ None,
+        rollout_path.clone(),
+        Default::default(),
+    );
+    state.add_items(
+        ["first", "second", "third"]
+            .into_iter()
+            .map(|message| {
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: message.to_string(),
+                    phase: None,
+                    memory_citation: None,
+                }))
+            })
+            .collect(),
+    );
+
+    state.flush().await?;
+
+    assert_eq!(
+        state
+            .writer
+            .as_ref()
+            .expect("writer remains open")
+            .append_transaction_count,
+        1,
+        "one durability barrier should use one append lock, write, and flush"
+    );
+    assert_eq!(fs::read_to_string(&rollout_path)?.lines().count(), 3);
+    Ok(())
 }
 
 #[test]

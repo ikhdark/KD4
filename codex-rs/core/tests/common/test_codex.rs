@@ -3,16 +3,13 @@ use std::io::ErrorKind;
 use std::mem::swap;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
-use anyhow::anyhow;
 use codex_config::CloudConfigBundleLoader;
 use codex_core::CodexThread;
 use codex_core::StartThreadOptions;
@@ -58,14 +55,12 @@ use tempfile::TempDir;
 use wiremock::MockServer;
 
 use crate::TempDirExt;
-use crate::TestEnvironment;
 use crate::load_default_config_for_test;
 use crate::load_default_config_for_test_with_cloud_config_bundle;
 use crate::responses::WebSocketTestServer;
 use crate::responses::output_value_to_text;
 use crate::responses::start_mock_server;
 use crate::streaming_sse::StreamingSseServer;
-use crate::test_environment;
 use crate::wait_for_event_match;
 use crate::wait_for_event_with_timeout;
 use wiremock::Match;
@@ -76,8 +71,6 @@ type PreBuildHook = dyn FnOnce(&Path) + Send + 'static;
 type WorkspaceSetup = dyn FnOnce(AbsolutePathBuf, Arc<dyn ExecutorFileSystem>) -> BoxFuture<'static, Result<()>>
     + Send;
 const TEST_MODEL_WITH_EXPERIMENTAL_TOOLS: &str = "test-gpt-5.1-codex";
-const REMOTE_EXEC_SERVER_URL_ENV_VAR: &str = "CODEX_TEST_REMOTE_EXEC_SERVER_URL";
-static REMOTE_TEST_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SUBMIT_TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct RecordingUserInstructionsProvider {
@@ -123,7 +116,6 @@ pub struct TestEnv {
     cwd: AbsolutePathBuf,
     selection: TurnEnvironmentSelection,
     local_cwd_temp_dir: Option<Arc<TempDir>>,
-    remote_container_name: Option<String>,
 }
 
 impl TestEnv {
@@ -151,7 +143,6 @@ impl TestEnv {
             cwd,
             selection,
             local_cwd_temp_dir: Some(local_cwd_temp_dir),
-            remote_container_name: None,
         })
     }
 
@@ -173,102 +164,8 @@ impl TestEnv {
     }
 }
 
-impl Drop for TestEnv {
-    fn drop(&mut self) {
-        if let Some(container_name) = &self.remote_container_name {
-            let script = format!("rm -rf {}", self.cwd.as_path().display());
-            let _ = docker_command_capture_stdout(["exec", container_name, "sh", "-lc", &script]);
-        }
-    }
-}
-
 pub async fn test_env() -> Result<TestEnv> {
-    match test_environment() {
-        remote_env @ (TestEnvironment::Docker { .. } | TestEnvironment::WineExec) => {
-            let websocket_url = remote_exec_server_url()?;
-            let environment =
-                codex_exec_server::Environment::create_for_tests(Some(websocket_url.clone()))?;
-            let cwd = remote_env
-                .remote_cwd(&remote_test_instance_id())?
-                .context("remote test environment should define a cwd")?;
-            let cwd_uri = cwd.to_path_uri(remote_env.path_convention())?;
-            environment
-                .get_filesystem()
-                .create_directory(
-                    &cwd_uri,
-                    CreateDirectoryOptions { recursive: true },
-                    /*sandbox*/ None,
-                )
-                .await?;
-            let selection = TurnEnvironmentSelection {
-                environment_id: codex_exec_server::REMOTE_ENVIRONMENT_ID.to_string(),
-                cwd: cwd_uri.clone(),
-            };
-            let cwd = if remote_env == TestEnvironment::WineExec {
-                // TODO(anp): Convert `Config::cwd` to `LegacyAppPathString` and remove this
-                // compatibility projection.
-                // `Config::cwd` still requires `AbsolutePathBuf`. Preserve the test harness's
-                // Linux-absolute `/C:/...` compatibility spelling so converting it back to a
-                // `PathUri` recovers the remote Windows convention. Production conversions stay
-                // strict: `PathUri::to_abs_path` intentionally rejects foreign paths.
-                let path = cwd_uri.to_url().to_file_path().map_err(|()| {
-                    anyhow!("remote test cwd URI cannot be projected onto the host: {cwd_uri}")
-                })?;
-                AbsolutePathBuf::try_from(path)?
-            } else {
-                cwd_uri.to_abs_path()?
-            };
-            Ok(TestEnv {
-                environment,
-                exec_server_url: Some(websocket_url),
-                cwd,
-                selection,
-                local_cwd_temp_dir: None,
-                remote_container_name: remote_env.docker_container_name().map(str::to_owned),
-            })
-        }
-        TestEnvironment::Local => TestEnv::local().await,
-    }
-}
-
-fn remote_exec_server_url() -> Result<String> {
-    let listen_url = std::env::var(REMOTE_EXEC_SERVER_URL_ENV_VAR).with_context(|| {
-        format!("{REMOTE_EXEC_SERVER_URL_ENV_VAR} must be set for remote tests")
-    })?;
-    let listen_url = listen_url.trim();
-    if listen_url.is_empty() {
-        return Err(anyhow!(
-            "{REMOTE_EXEC_SERVER_URL_ENV_VAR} must not be empty"
-        ));
-    }
-    Ok(listen_url.to_string())
-}
-
-fn remote_test_instance_id() -> String {
-    let instance = REMOTE_TEST_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{instance}", std::process::id())
-}
-
-fn docker_command_capture_stdout<const N: usize>(args: [&str; N]) -> Result<String> {
-    let output = Command::new("docker")
-        .args(args)
-        .output()
-        .with_context(|| format!("run docker {args:?}"))?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "docker {:?} failed: stdout={} stderr={}",
-            args,
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    String::from_utf8(output.stdout).context("docker stdout must be utf-8")
-}
-
-/// Non-default apply_patch model output shapes used by compatibility tests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ApplyPatchModelOutput {
-    ShellCommandViaHeredoc,
+    TestEnv::local().await
 }
 
 /// A collection of different ways the model can output an apply_patch call
@@ -441,15 +338,7 @@ impl TestCodexBuilder {
         .await
     }
 
-    /// Builds a test runtime using the execution environment selected by the test process.
-    ///
-    /// With no remote test configuration, or with `CODEX_TEST_ENVIRONMENT=local`, this uses a
-    /// temporary local environment just like [`Self::build`]. `CODEX_TEST_ENVIRONMENT=docker` or
-    /// `CODEX_TEST_ENVIRONMENT=wine-exec` selects the remote exec server configured by
-    /// `CODEX_TEST_REMOTE_EXEC_SERVER_URL`; the legacy `CODEX_TEST_REMOTE_ENV` Docker-container
-    /// configuration does the same. Only the automatically selected environment is registered.
-    /// Use [`Self::build_with_remote_and_local_env`] when a remote test also needs the local
-    /// environment to be selectable explicitly.
+    /// Builds a test runtime using a temporary native Windows environment.
     pub async fn build_with_auto_env(
         &mut self,
         server: &wiremock::MockServer,
@@ -463,23 +352,6 @@ impl TestCodexBuilder {
         Box::pin(self.build_with_home_and_base_url(
             base_url, home, /*resume_from*/ None, test_env,
             /*include_local_environment*/ false,
-        ))
-        .await
-    }
-
-    pub async fn build_with_remote_and_local_env(
-        &mut self,
-        server: &wiremock::MockServer,
-    ) -> anyhow::Result<TestCodex> {
-        let home = match self.home.clone() {
-            Some(home) => home,
-            None => Arc::new(TempDir::new()?),
-        };
-        let base_url = format!("{}/v1", server.uri());
-        let test_env = test_env().await?;
-        Box::pin(self.build_with_home_and_base_url(
-            base_url, home, /*resume_from*/ None, test_env,
-            /*include_local_environment*/ true,
         ))
         .await
     }
@@ -913,6 +785,21 @@ impl TestCodex {
             prompt,
             AskForApproval::Never,
             permission_profile,
+        )
+        .await
+    }
+
+    pub async fn submit_turn_with_permission_profile_and_capture_completion(
+        &self,
+        prompt: &str,
+        permission_profile: PermissionProfile,
+    ) -> Result<TurnCompleteEvent> {
+        self.submit_turn_with_context_and_capture_completion(
+            prompt,
+            AskForApproval::Never,
+            permission_profile,
+            /*service_tier*/ None,
+            /*environments*/ None,
         )
         .await
     }

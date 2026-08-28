@@ -1,25 +1,26 @@
-use chrono::Utc;
 use codex_agent_task_store::ValidationCallStatus;
 use codex_agent_task_store::ValidationEvidence;
 use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
+use codex_protocol::validation::ValidationResult;
 use serde::Deserialize;
-use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 
 use crate::FunctionCallError;
 use crate::agent::task_capabilities::validate_independent_review_shell;
-use crate::exec::ExecExpiration;
+use crate::agent::task_coordinator::AgentTaskCoordinator;
+use crate::agent::task_coordinator::FocusedValidationToken;
 use crate::exec::ExecParams;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::session::session::Session;
@@ -29,10 +30,11 @@ use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
-use crate::tools::handlers::EffectiveAdditionalPermissions;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::command_shape::CommandInvocation;
@@ -44,6 +46,7 @@ use crate::tools::handlers::resolve_repository_root;
 use crate::tools::known_delta_store;
 use crate::tools::known_delta_store::KnownDeltaExecutionObservation;
 use crate::tools::orchestrator::ToolOrchestrator;
+use crate::tools::runtimes::prove_noprofile_powershell_direct_argv_async;
 use crate::tools::runtimes::shell::ShellRequest;
 use crate::tools::runtimes::shell::ShellRuntime;
 use crate::tools::sandboxing::ToolCtx;
@@ -51,17 +54,12 @@ use crate::tools::sandboxing::ToolError;
 
 use crate::tools::sandboxing::same_exec_authorization_envelope;
 use crate::validation_admission::ValidationLaunchPlan;
-use crate::validation_admission::ValidationRegistration;
-use crate::validation_admission::register_if_absent;
-use crate::validation_admission::scoped_validation_configuration_identity;
-use crate::validation_admission::validation_identity;
-use crate::validation_admission::validation_identity_with_scope;
+use crate::validation_admission::ValidationSkippedToolOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::plan_tool::ValidationRouteLeaf;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 
-use codex_shell_command::powershell::prove_noprofile_powershell_command_as_direct_argv;
 use codex_tools::CanonicalToolResult;
 use codex_tools::ToolName;
 use codex_tools::ToolOutputProjectionFragment;
@@ -75,46 +73,10 @@ mod shell_command;
 pub use shell_command::ShellCommandHandler;
 pub(crate) use shell_command::ShellCommandHandlerOptions;
 
-const MAX_FOCUSED_VALIDATION_TIMEOUT_MS: u64 =
+const MAX_VALIDATION_TIMEOUT_MS: u64 =
     codex_protocol::plan_tool::MAX_STRUCTURED_VALIDATION_TIMEOUT_MS;
-
-#[derive(Debug, Serialize)]
-struct FocusedValidationViolation {
-    code: &'static str,
-    message: String,
-    constraint: JsonValue,
-}
-
-#[derive(Debug, Serialize)]
-struct FocusedValidationCapabilityDenied {
-    kind: &'static str,
-    violations: Vec<FocusedValidationViolation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    canonical_permitted_command: Option<String>,
-}
-
-impl FocusedValidationCapabilityDenied {
-    fn render(self) -> String {
-        match serde_json::to_string(&self) {
-            Ok(encoded) => format!("FocusedValidationCapabilityDenied: {encoded}"),
-            Err(error) => format!(
-                "FocusedValidationCapabilityDenied: failed to encode structured denial: {error}"
-            ),
-        }
-    }
-}
-
-fn focused_validation_violation(
-    code: &'static str,
-    message: impl Into<String>,
-    constraint: JsonValue,
-) -> FocusedValidationViolation {
-    FocusedValidationViolation {
-        code,
-        message: message.into(),
-        constraint,
-    }
-}
+const FOCUSED_VALIDATION_HEARTBEAT_INTERVAL: Duration =
+    Duration::from_secs(codex_agent_task_store::MAX_VALIDATION_LEASE_SECONDS as u64 / 4);
 
 #[derive(Debug, Deserialize)]
 struct ShellCommandHookArgs {
@@ -145,25 +107,15 @@ fn parse_shell_command_hook_invocation(
     )
 }
 
-fn shell_command_payload_command(payload: &ToolPayload) -> Option<String> {
-    let ToolPayload::Function { arguments } = payload else {
-        return None;
-    };
-
-    parse_shell_command_hook_invocation(arguments)
-        .ok()
-        .map(|command| command.display_command())
-}
-
 pub(super) struct RunExecLikeArgs {
     pub(super) tool_name: ToolName,
     pub(super) exec_params: ExecParams,
-    pub(super) environment_hash: String,
     pub(super) stall_timeout_ms: Option<u64>,
     pub(super) cancellation_token: CancellationToken,
     pub(super) hook_command: String,
     pub(super) safety_command: Vec<String>,
     pub(super) shell_type: Option<ShellType>,
+    pub(super) shell_wrapper_is_owned: bool,
     pub(super) is_powershell_script: bool,
     pub(super) additional_permissions: Option<AdditionalPermissionProfile>,
     pub(super) prefix_rule: Option<Vec<String>>,
@@ -172,13 +124,12 @@ pub(super) struct RunExecLikeArgs {
     pub(super) turn_environment: TurnEnvironment,
     pub(super) tracker: crate::tools::context::SharedTurnDiffTracker,
     pub(super) call_id: String,
-    pub(super) track_validation_freshness: bool,
+    pub(super) track_command_mutations: bool,
     pub(super) attempt_key: Option<CommandAttemptKey>,
     pub(super) repair_notice: Option<String>,
+    pub(super) command_repaired: bool,
     pub(super) force_fresh: bool,
     pub(super) validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
-    pub(super) validation_leader: Option<crate::validation_admission::ValidationLeaderOwnership>,
-    pub(super) validation_waiter: Option<crate::validation_admission::ValidationLeader>,
 }
 
 pub(super) struct RunExecLikeResult {
@@ -233,25 +184,38 @@ pub(super) fn shell_sampling_signal(
 pub(super) enum ValidationExecutionOutcome {
     ExecutedSuccess,
     ExecutedFailure,
-    ExecutedNotApplicable,
     NotExecuted,
 }
 
-impl ValidationExecutionOutcome {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Self::ExecutedSuccess => "executed_success",
-            Self::ExecutedFailure => "executed_failure",
-            Self::ExecutedNotApplicable => "executed_not_applicable",
-            Self::NotExecuted => "not_executed",
-        }
+fn focused_validation_status(
+    result: &Result<RunExecLikeResult, FunctionCallError>,
+    cancellation_requested: bool,
+    has_structured_validation_result: bool,
+) -> ValidationCallStatus {
+    if cancellation_requested {
+        return ValidationCallStatus::Cancelled;
     }
+    match result {
+        Ok(result) => match result.validation_execution_outcome() {
+            ValidationExecutionOutcome::ExecutedSuccess => ValidationCallStatus::Succeeded,
+            ValidationExecutionOutcome::ExecutedFailure => ValidationCallStatus::Failed,
+            ValidationExecutionOutcome::NotExecuted => ValidationCallStatus::NotExecuted,
+        },
+        Err(FunctionCallError::DeniedToModel(_)) => ValidationCallStatus::Cancelled,
+        Err(FunctionCallError::RespondToModel(message)) if message.contains("rejected by user") => {
+            ValidationCallStatus::Cancelled
+        }
+        Err(_) if has_structured_validation_result => ValidationCallStatus::Failed,
+        Err(_) => ValidationCallStatus::NotExecuted,
+    }
+}
 
+impl ValidationExecutionOutcome {
     pub(super) fn success(self) -> Option<bool> {
         match self {
             Self::ExecutedSuccess => Some(true),
             Self::ExecutedFailure => Some(false),
-            Self::ExecutedNotApplicable | Self::NotExecuted => None,
+            Self::NotExecuted => None,
         }
     }
 
@@ -259,29 +223,16 @@ impl ValidationExecutionOutcome {
         match value.get("execution_outcome")?.as_str()? {
             "executed_success" => Some(Self::ExecutedSuccess),
             "executed_failure" => Some(Self::ExecutedFailure),
-            "executed_not_applicable" => Some(Self::ExecutedNotApplicable),
             "not_executed" => Some(Self::NotExecuted),
             _ => None,
         }
-    }
-
-    pub(super) fn from_value_or_legacy_success(value: &serde_json::Value) -> Self {
-        Self::from_value(value).unwrap_or_else(|| {
-            match value.get("success").and_then(serde_json::Value::as_bool) {
-                Some(true) => Self::ExecutedSuccess,
-                Some(false) => Self::ExecutedFailure,
-                None => Self::NotExecuted,
-            }
-        })
     }
 
     pub(super) fn tool_outcome(self) -> codex_tools::ToolOutputOutcome {
         match self {
             Self::ExecutedSuccess => codex_tools::ToolOutputOutcome::Success,
             Self::ExecutedFailure => codex_tools::ToolOutputOutcome::Failure,
-            Self::ExecutedNotApplicable | Self::NotExecuted => {
-                codex_tools::ToolOutputOutcome::Skipped
-            }
+            Self::NotExecuted => codex_tools::ToolOutputOutcome::Skipped,
         }
     }
 }
@@ -292,7 +243,8 @@ pub(super) fn validation_structured_output(value: serde_json::Value) -> Function
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| value.to_string());
-    let execution_outcome = ValidationExecutionOutcome::from_value_or_legacy_success(&value);
+    let execution_outcome = ValidationExecutionOutcome::from_value(&value)
+        .unwrap_or(ValidationExecutionOutcome::NotExecuted);
     let skip_disposition = value
         .get("skip_disposition")
         .cloned()
@@ -312,146 +264,52 @@ pub(super) fn validation_structured_output(value: serde_json::Value) -> Function
     output
 }
 
-pub(super) fn joined_validation_structured_output(
-    mut value: serde_json::Value,
-    call_id: &str,
-    shared_from_call_id: &str,
-) -> FunctionToolOutput {
-    if let Some(object) = value.as_object_mut() {
-        object.insert("call_id".to_string(), call_id.into());
-        object.insert("admission_disposition".to_string(), "joined".into());
-        object.insert(
-            "shared_from_call_id".to_string(),
-            shared_from_call_id.into(),
-        );
-    }
-    validation_structured_output(value)
-}
-
-pub(super) struct ValidationProofPreparationArgs<'a> {
+pub(super) struct ValidationLaunchPreparationArgs<'a> {
     pub(super) session: &'a Session,
-    pub(super) turn: &'a TurnContext,
     pub(super) validation_launch: &'a mut Option<ValidationLaunchPlan>,
     pub(super) direct_validation_route: Option<&'a DirectValidationRoute>,
-    pub(super) repository_key: &'a [u8],
-    pub(super) cwd: &'a str,
-    pub(super) command_invocation: &'a CommandInvocation,
-    pub(super) environment: &'a HashMap<String, String>,
-    pub(super) environment_hash: &'a str,
-    pub(super) execution_context: &'a str,
-    pub(super) repository_epoch: u64,
     pub(super) call_id: &'a str,
-    pub(super) cancellation_token: &'a CancellationToken,
-    pub(super) force_fresh: bool,
 }
 
-pub(super) enum ValidationProofPreparation {
-    NotValidation,
-    Reused(FunctionToolOutput),
-    Registered(ValidationRegistration),
+const UNATTRIBUTED_VALIDATION_ADVISORY: &str = "Validation metadata was omitted; this invocation is treated as an ordinary command and cannot be recorded as direct validation proof.";
+
+pub(super) fn downgrade_unattributed_validation(
+    validation_launch: &mut Option<ValidationLaunchPlan>,
+    validation_metadata_present: bool,
+    repair_notice: &mut Option<String>,
+) {
+    if validation_launch.is_none() || validation_metadata_present {
+        return;
+    }
+
+    *validation_launch = None;
+    *repair_notice = Some(match repair_notice.take() {
+        Some(existing) => format!("{existing}\n\n{UNATTRIBUTED_VALIDATION_ADVISORY}"),
+        None => UNATTRIBUTED_VALIDATION_ADVISORY.to_string(),
+    });
 }
 
-pub(super) async fn prepare_validation_proof(
-    args: ValidationProofPreparationArgs<'_>,
-) -> Result<ValidationProofPreparation, FunctionCallError> {
-    if args.validation_launch.is_none() {
-        return Ok(ValidationProofPreparation::NotValidation);
-    }
-
-    let environment =
-        validation_execution_environment_hash(args.environment_hash, args.execution_context);
-    let toolchain = child_env_value(args.environment, "RUSTUP_TOOLCHAIN")
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let identity = if let Some(route) = args.direct_validation_route {
-        let leaf = route.leaf();
-        let (implementation_identity, bound_plan_step) = args
-            .session
-            .services
-            .task_evidence
-            .direct_validation_implementation_binding_for_leaf(leaf)
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
-        if let Some(launch) = args.validation_launch.as_mut() {
-            launch.bound_plan_step = bound_plan_step;
-        }
-        validation_identity_with_scope(
-            args.repository_key,
-            args.cwd,
-            args.command_invocation,
-            environment,
-            toolchain,
-            scoped_validation_configuration_identity(args.turn.config.features.get()),
-            implementation_identity,
-            &leaf.uncertainty,
-            &leaf.covered_paths,
-            &leaf.covered_contracts,
-        )
-    } else {
-        validation_identity(
-            args.repository_key,
-            args.cwd,
-            args.command_invocation,
-            environment,
-            toolchain,
-            args.repository_epoch,
-        )
-    };
-
-    if !args.force_fresh
-        && let Some(result) = args
-            .session
-            .services
-            .command_execution
-            .reusable_validation(&identity)
-            .await
-    {
-        tracing::info!(
-            disposition = "reused",
-            duplicate_of_call_id = %result.call_id,
-            coverage_identity = %result.proof_key.coverage_identity,
-            implementation_identity = %result.proof_key.implementation_identity,
-            "validation proof reused without process execution"
-        );
-        args.turn.turn_timing_state.record_reused_validation();
-        return Ok(ValidationProofPreparation::Reused(
-            validation_structured_output(serde_json::json!({
-                "success": true,
-                "admission_disposition": "reused",
-                "validation_result": result,
-            })),
-        ));
-    }
-
+pub(super) async fn prepare_validation_launch(
+    args: ValidationLaunchPreparationArgs<'_>,
+) -> Result<(), FunctionCallError> {
     if let (Some(launch), Some(route)) = (
         args.validation_launch.as_mut(),
         args.direct_validation_route,
     ) {
-        launch.proof_key = Some(identity.clone());
+        let leaf = route.leaf();
+        let (bound_plan_step, bound_work_unit) = args
+            .session
+            .services
+            .task_evidence
+            .direct_validation_bindings_for_leaf(leaf)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
+        launch.bound_plan_step = bound_plan_step;
+        launch.bound_work_unit = bound_work_unit;
         launch.structured_route = Some(route.route().clone());
         launch.validation_call_id = Some(args.call_id.to_string());
     }
-
-    Ok(ValidationProofPreparation::Registered(
-        register_if_absent(
-            &args.turn.validation_singleflight,
-            identity,
-            args.call_id,
-            args.cancellation_token,
-        )
-        .await,
-    ))
-}
-
-fn validation_execution_environment_hash(
-    environment_hash: &str,
-    execution_context: &str,
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(environment_hash.as_bytes());
-    digest.update([0]);
-    digest.update(execution_context.as_bytes());
-    format!("{:x}", digest.finalize())
+    Ok(())
 }
 
 pub(super) struct LegacyShellToolOutput {
@@ -566,56 +424,6 @@ impl ToolOutput for LegacyShellToolOutput {
     }
 }
 
-/// RAII ownership for one admitted bounded operation.
-///
-/// The durable validation call owns cross-turn state; this guard owns only the local cancellation
-/// handle and hard deadline. Dropping it before a terminal durable update invokes the command's
-/// existing cancellation path and never extends the underlying timeout.
-struct OwnedOperationLease {
-    call_id: String,
-    cancellation: CancellationToken,
-    hard_deadline: chrono::DateTime<Utc>,
-    progress_revision: u64,
-    terminal: bool,
-}
-
-impl OwnedOperationLease {
-    fn new(
-        call_id: String,
-        cancellation: CancellationToken,
-        hard_deadline: chrono::DateTime<Utc>,
-    ) -> Self {
-        Self {
-            call_id,
-            cancellation,
-            hard_deadline,
-            progress_revision: 0,
-            terminal: false,
-        }
-    }
-
-    fn record_progress(&mut self) -> bool {
-        if Utc::now() > self.hard_deadline {
-            return false;
-        }
-        self.progress_revision = self.progress_revision.saturating_add(1);
-        true
-    }
-
-    fn complete(&mut self) {
-        let _ = (&self.call_id, self.progress_revision);
-        self.terminal = true;
-    }
-}
-
-impl Drop for OwnedOperationLease {
-    fn drop(&mut self) {
-        if !self.terminal {
-            self.cancellation.cancel();
-        }
-    }
-}
-
 impl RunExecLikeResult {
     pub(super) fn validation_execution_outcome(&self) -> ValidationExecutionOutcome {
         self.validation_execution_outcome
@@ -662,15 +470,8 @@ fn validation_diagnostic_range(
     })
 }
 
-fn operation_lease_deadline(hard_deadline: Option<chrono::DateTime<Utc>>) -> chrono::DateTime<Utc> {
-    hard_deadline.unwrap_or_else(|| {
-        Utc::now()
-            + chrono::Duration::seconds(codex_agent_task_store::DEFAULT_WORKSPACE_LEASE_SECONDS)
-    })
-}
-
 pub(super) async fn run_exec_like_with_exit_code(
-    mut args: RunExecLikeArgs,
+    args: RunExecLikeArgs,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let coordinator = args
         .session
@@ -678,7 +479,6 @@ pub(super) async fn run_exec_like_with_exit_code(
         .agent_control
         .task_coordinator()
         .clone();
-    let validation_session = args.session.clone();
     let session_source = args.turn.session_source.clone();
     let inspection_command = is_known_safe_command(&args.safety_command);
     validate_independent_review_shell(
@@ -701,7 +501,7 @@ pub(super) async fn run_exec_like_with_exit_code(
     {
         let effective_permissions = apply_granted_turn_permissions(
             args.session.as_ref(),
-            &args.turn_environment.environment_id,
+            args.turn_environment.environment.approval_scope_id(),
             args.exec_params.cwd.as_path(),
             args.exec_params.sandbox_permissions,
             args.additional_permissions.clone(),
@@ -714,470 +514,120 @@ pub(super) async fn run_exec_like_with_exit_code(
             )));
         }
     }
-    let repo_root = resolve_repository_root(args.exec_params.cwd.as_path());
-    let focused_validation_admission = (!inspection_command).then(|| {
-        focused_validation_command_summary(
-            &args.safety_command,
-            &args.hook_command,
-            args.shell_type.is_none() && !args.is_powershell_script,
-            args.exec_params.cwd.as_path(),
-            repo_root.as_path(),
-            &args.exec_params.expiration,
-            args.exec_params
-                .sandbox_permissions
-                .requests_sandbox_override(),
-            args.additional_permissions.is_some(),
-            args.prefix_rule.is_some(),
-        )
-    });
-    let focused_validation_command =
-        focused_validation_admission
-            .and_then(Result::ok)
-            .and_then(|command_summary| {
-                pin_focused_validation_executable(
-                    &mut args.exec_params.command,
-                    &args.safety_command,
-                    &args.exec_params.env,
-                    args.exec_params.cwd.as_path(),
-                    repo_root.as_path(),
-                )
-                .ok()
-                .map(|resolved_executable| (command_summary, resolved_executable))
-            });
+
+    let repository_root = resolve_repository_root(args.exec_params.cwd.as_path());
     let call_id = args.call_id.clone();
+    let cancellation_token = args.cancellation_token.clone();
     let retained_output_ref = format!("tool-call:{}:{call_id}", args.session.thread_id);
-    let operation_hard_deadline = match &args.exec_params.expiration {
-        crate::exec::ExecExpiration::Timeout(timeout) => chrono::Duration::from_std(*timeout)
-            .ok()
-            .map(|timeout| Utc::now() + timeout),
-        _ => None,
-    };
-    let mut owned_operation = None;
-    let mut focused_validation = if let Some((command_summary, resolved_executable)) =
-        focused_validation_command
-    {
-        let lease_expires_at = operation_lease_deadline(operation_hard_deadline);
-        let toolchain = child_env_value(&args.exec_params.env, "RUSTUP_TOOLCHAIN")
-            .map(|value| value.to_string_lossy().into_owned())
-            .or_else(|| args.safety_command.first().cloned());
-        let token = coordinator
+    let is_validation = args.validation_launch.is_some();
+    let focused_validation = if is_validation {
+        let command_summary = args.hook_command.clone();
+        match coordinator
             .begin_focused_validation_for_source_with_evidence(
                 &session_source,
                 call_id.clone(),
                 command_summary,
-                resolved_executable,
                 ValidationEvidence {
-                    cwd: Some(args.exec_params.cwd.to_string_lossy().into_owned()),
-                    environment_hash: Some(args.environment_hash.clone()),
-                    toolchain,
                     retained_output_ref: Some(retained_output_ref.clone()),
-                    lease_expires_at: Some(lease_expires_at),
                     ..ValidationEvidence::default()
                 },
             )
             .await
-            .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "focused validation start could not be persisted: {error}"
-                ))
-            })?;
-        let Some(token) = token else {
-            return Err(FunctionCallError::RespondToModel(
-                "focused validation lost its typed assignment binding before execution".to_string(),
-            ));
-        };
-        owned_operation = operation_hard_deadline.map(|hard_deadline| {
-            OwnedOperationLease::new(
-                call_id.clone(),
-                args.cancellation_token.clone(),
-                hard_deadline,
-            )
-        });
-        if let Some(leader_call_id) = token.shared_from_call_id().map(str::to_string) {
-            let leader = loop {
-                if args.cancellation_token.is_cancelled() {
-                    coordinator
-                        .finish_focused_validation_with_output(
-                            token,
-                            ValidationCallStatus::Cancelled,
-                            Some(retained_output_ref),
-                            None,
-                        )
-                        .await
-                        .map_err(|error| {
-                            FunctionCallError::RespondToModel(format!(
-                                "shared validation cancellation could not be persisted: {error}"
-                            ))
-                        })?;
-                    return Err(FunctionCallError::RespondToModel(
-                        "shared validation wait was cancelled".to_string(),
-                    ));
-                }
-                let leader = coordinator
-                    .get_validation_call(leader_call_id.clone())
-                    .await
-                    .map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "shared validation leader could not be read: {error}"
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        FunctionCallError::RespondToModel(format!(
-                            "shared validation leader {leader_call_id} disappeared"
-                        ))
-                    })?;
-                if leader.status.is_terminal() {
-                    break leader;
-                }
-                let deadline = leader
-                    .evidence
-                    .lease_expires_at
-                    .or_else(|| token.lease_expires_at())
-                    .unwrap_or_else(|| operation_lease_deadline(operation_hard_deadline));
-                if deadline <= Utc::now() {
-                    let mut expired = leader;
-                    expired.status = ValidationCallStatus::Cancelled;
-                    expired.recorded_at = Utc::now();
-                    let recovery = coordinator
-                        .store()
-                        .ok_or_else(|| {
-                            FunctionCallError::RespondToModel(
-                                "shared validation store became unavailable".to_string(),
-                            )
-                        })?
-                        .record_validation_call(expired)
-                        .await;
-                    match recovery {
-                        Ok(()) => coordinator.notify_validation_call(&leader_call_id),
-                        Err(codex_agent_task_store::StoreError::ValidationCallImmutable(_)) => {
-                            let refreshed = coordinator
-                                .get_validation_call(leader_call_id.clone())
-                                .await
-                                .map_err(|error| {
-                                    FunctionCallError::RespondToModel(format!(
-                                        "shared validation leader could not be reread after a recovery race: {error}"
-                                    ))
-                                })?
-                                .ok_or_else(|| {
-                                    FunctionCallError::RespondToModel(format!(
-                                        "shared validation leader {leader_call_id} disappeared during recovery"
-                                    ))
-                                })?;
-                            if refreshed.status.is_terminal() {
-                                break refreshed;
-                            }
-                        }
-                        Err(error) => {
-                            return Err(FunctionCallError::RespondToModel(format!(
-                                "expired shared validation lease could not be recovered: {error}"
-                            )));
-                        }
-                    }
-                    continue;
-                }
-                match coordinator
-                    .wait_for_validation_call_terminal(
-                        &leader_call_id,
-                        &args.cancellation_token,
-                        deadline,
-                    )
-                    .await
-                    .map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "shared validation leader could not be awaited: {error}"
-                        ))
-                    })? {
-                    Some(settled) if settled.status.is_terminal() => break settled,
-                    Some(_) | None => continue,
-                }
-            };
-            let status = leader.status;
-            let leader_output_ref = leader.evidence.retained_output_ref.clone();
-            let leader_output_summary = leader.evidence.output_summary.clone();
-            let leader_validation_result = leader.evidence.validation_result.clone();
-            coordinator
-                .finish_focused_validation_with_result(
-                    token,
-                    status,
-                    leader_output_ref.clone(),
-                    leader_output_summary.clone(),
-                    leader_validation_result,
-                )
-                .await
-                .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "shared validation result could not be persisted: {error}"
-                    ))
-                })?;
-            if let Some(operation) = owned_operation.as_mut() {
-                operation.record_progress();
-                operation.complete();
+        {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::warn!(%error, %call_id, "focused validation start evidence could not be persisted");
+                None
             }
-            args.turn.session_telemetry.counter(
-                "codex.multi_agent.validation_proof",
-                1,
-                &[(
-                    "disposition",
-                    if status.is_success() {
-                        "fresh_reuse"
-                    } else {
-                        "shared_non_success"
-                    },
-                )],
-            );
-            let output_reference = leader_output_ref
-                .as_deref()
-                .unwrap_or("no retained output reference");
-            let output_summary = leader_output_summary
-                .as_deref()
-                .unwrap_or("no retained output summary");
-            return Ok(RunExecLikeResult {
-                output: FunctionToolOutput {
-                    body: vec![
-                        codex_protocol::models::FunctionCallOutputContentItem::InputText {
-                            text: format!(
-                                "Validation singleflight reused leader {leader_call_id}; status: {status:?}; output: {output_reference}\n\n{output_summary}"
-                            ),
-                        },
-                    ],
-                    success: Some(status.is_success()),
-                    outcome: Some(if status.is_success() {
-                        codex_tools::ToolOutputOutcome::Success
-                    } else {
-                        codex_tools::ToolOutputOutcome::Failure
-                    }),
-                    post_tool_use_response: None,
-                    sampling_request_signal: None,
-                    deterministic_continuation_receipts: Vec::new(),
-                    deterministic_continuation_owner_key: None,
-                    skip_disposition: None,
-                },
-                exit_code: Some(if status.is_success() { 0 } else { 1 }),
-                validation_execution_outcome: if status.is_success() {
-                    ValidationExecutionOutcome::ExecutedSuccess
-                } else {
-                    ValidationExecutionOutcome::ExecutedFailure
-                },
-                canonical_output: None,
-            });
         }
-        Some(token)
     } else {
         None
     };
-    if args.validation_leader.is_none()
-        && let Some(waiter) = args.validation_waiter.take()
-    {
-        let shared_from_call_id = waiter.shared_from_call_id().to_string();
-        let joined = tokio::select! {
-            result = waiter.join() => result,
-            _ = args.cancellation_token.cancelled() => {
-                return Err(FunctionCallError::RespondToModel(
-                    "shared validation wait was cancelled".to_string(),
-                ));
-            }
-        };
-        let result = joined.ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "shared validation execution ended without a reusable result".to_string(),
+
+    let mut terminal_validation_result = None;
+    let operation = run_exec_like_with_exit_code_inner(
+        args,
+        is_validation,
+        inspection_command,
+        repository_root,
+        &mut terminal_validation_result,
+    );
+    let result = if let Some(token) = focused_validation.as_ref() {
+        run_with_focused_validation_heartbeat(&coordinator, token, &call_id, operation).await
+    } else {
+        operation.await
+    };
+
+    if let Some(token) = focused_validation {
+        let status = focused_validation_status(
+            &result,
+            cancellation_token.is_cancelled(),
+            terminal_validation_result.is_some(),
+        );
+        let output_summary = validation_output_summary(&result);
+        let structured_validation_result =
+            terminal_validation_result.and_then(|result| serde_json::to_value(result).ok());
+        if let Err(error) = coordinator
+            .finish_focused_validation_with_result(
+                token,
+                status,
+                Some(retained_output_ref),
+                output_summary,
+                structured_validation_result,
             )
-        })?;
-        let execution_outcome =
-            ValidationExecutionOutcome::from_value_or_legacy_success(&result.value);
-        let text = result.value.get("text").cloned().unwrap_or_default();
-        let validation_result = result
-            .value
-            .get("validation_result")
-            .cloned()
-            .and_then(|value| {
-                serde_json::from_value::<codex_protocol::validation::ValidationResult>(value).ok()
-            })
-            .map(|mut result| {
-                result.freshness = codex_protocol::validation::ValidationFreshness::Joined;
-                result
-            });
-        if let Some(token) = focused_validation.take() {
-            let status = match execution_outcome {
-                ValidationExecutionOutcome::ExecutedSuccess => ValidationCallStatus::Succeeded,
-                ValidationExecutionOutcome::ExecutedFailure => ValidationCallStatus::Failed,
-                ValidationExecutionOutcome::ExecutedNotApplicable
-                | ValidationExecutionOutcome::NotExecuted => ValidationCallStatus::NotExecuted,
-            };
-            coordinator
-                .finish_focused_validation_with_result(
-                    token,
-                    status,
-                    Some(retained_output_ref),
-                    None,
-                    validation_result
-                        .as_ref()
-                        .and_then(|result| serde_json::to_value(result).ok()),
-                )
-                .await
-                .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "joined validation result could not be persisted: {error}"
-                    ))
-                })?;
-            if let Some(operation) = owned_operation.as_mut() {
-                operation.record_progress();
-                operation.complete();
-            }
-            args.turn.session_telemetry.counter(
-                "codex.multi_agent.validation_proof",
-                1,
-                &[("disposition", "fresh_reuse")],
-            );
-        }
-        return Ok(RunExecLikeResult {
-            output: joined_validation_structured_output(
-                serde_json::json!({
-                    "text": text,
-                    "success": execution_outcome.success(),
-                    "execution_outcome": execution_outcome.as_str(),
-                    "command_was_executed": execution_outcome != ValidationExecutionOutcome::NotExecuted,
-                    "skip_disposition": result.value.get("skip_disposition").cloned(),
-                    "validation_result": validation_result,
-                }),
-                &args.call_id,
-                &shared_from_call_id,
-            ),
-            exit_code: match execution_outcome {
-                ValidationExecutionOutcome::ExecutedSuccess => Some(0),
-                ValidationExecutionOutcome::ExecutedFailure => Some(1),
-                ValidationExecutionOutcome::ExecutedNotApplicable => Some(0),
-                ValidationExecutionOutcome::NotExecuted => None,
-            },
-            validation_execution_outcome: execution_outcome,
-            canonical_output: None,
-        });
-    }
-    let heartbeat_stop = CancellationToken::new();
-    let heartbeat_task = focused_validation.as_ref().map(|token| {
-        let coordinator = coordinator.clone();
-        let call_id = token.call_id().to_string();
-        let heartbeat_stop = heartbeat_stop.clone();
-        AbortOnDropHandle::new(tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = heartbeat_stop.cancelled() => break,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                        let lease_expires_at = operation_lease_deadline(operation_hard_deadline);
-                        match coordinator
-                            .heartbeat_validation_call(call_id.clone(), lease_expires_at)
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => break,
-                            Err(error) => {
-                                tracing::warn!(%error, %call_id, "validation heartbeat failed");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }))
-    });
-    let cancellation_token = args.cancellation_token.clone();
-    if focused_validation.is_some() {
-        args.turn.session_telemetry.counter(
-            "codex.multi_agent.validation_proof",
-            1,
-            &[("disposition", "stale_or_unknown_rerun")],
-        );
-    }
-    let validation_leader = args.validation_leader.take();
-    let result =
-        run_exec_like_with_exit_code_inner(args, focused_validation.is_some(), repo_root).await;
-    if let Some(operation) = owned_operation.as_mut() {
-        operation.record_progress();
-    }
-    let terminal_validation_result = validation_session
-        .services
-        .command_execution
-        .validation_result_for_call(&call_id)
-        .await;
-    if let Some(leader) = validation_leader {
-        match &result {
-            Ok(result) => {
-                let execution_outcome = result.validation_execution_outcome();
-                leader
-                    .complete(crate::validation_admission::ReusableValidationResult {
-                        value: serde_json::json!({
-                            "text": result.output.body.iter().filter_map(|item| match item {
-                                codex_protocol::models::FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
-                                _ => None,
-                            }).collect::<Vec<_>>().join("\n"),
-                            "success": execution_outcome.success(),
-                            "execution_outcome": execution_outcome.as_str(),
-                            "command_was_executed": execution_outcome != ValidationExecutionOutcome::NotExecuted,
-                            "skip_disposition": result.output.skip_disposition,
-                            "validation_result": terminal_validation_result.clone(),
-                        }),
-                    })
-                    .await;
-            }
-            Err(_) => leader.abandon().await,
-        }
-    }
-    heartbeat_stop.cancel();
-    if let Some(heartbeat_task) = heartbeat_task
-        && let Err(error) = heartbeat_task.await
-    {
-        tracing::warn!(%error, "validation heartbeat task failed");
-    }
-    let Some(token) = focused_validation else {
-        return result;
-    };
-    let status = match (&result, cancellation_token.is_cancelled()) {
-        (_, true) => ValidationCallStatus::Cancelled,
-        (Ok(result), false) => match result.validation_execution_outcome() {
-            ValidationExecutionOutcome::ExecutedSuccess => ValidationCallStatus::Succeeded,
-            ValidationExecutionOutcome::ExecutedFailure => ValidationCallStatus::Failed,
-            ValidationExecutionOutcome::ExecutedNotApplicable
-            | ValidationExecutionOutcome::NotExecuted => ValidationCallStatus::NotExecuted,
-        },
-        (Err(FunctionCallError::RespondToModel(message)), false)
-            if message.contains("rejected by user") =>
+            .await
         {
-            ValidationCallStatus::Cancelled
+            tracing::warn!(%error, %call_id, "focused validation result evidence could not be persisted");
         }
-        (Err(_), false) => ValidationCallStatus::Failed,
-    };
-    let output_summary = validation_output_summary(&result);
-    let structured_validation_result =
-        terminal_validation_result.and_then(|result| serde_json::to_value(result).ok());
-    let record_result = coordinator
-        .finish_focused_validation_with_result(
-            token,
-            status,
-            Some(retained_output_ref),
-            output_summary,
-            structured_validation_result,
-        )
-        .await;
-    if record_result.is_ok()
-        && let Some(operation) = owned_operation.as_mut()
-    {
-        operation.complete();
     }
-    if status == ValidationCallStatus::Cancelled {
-        validation_session.services.session_telemetry.counter(
-            "codex.multi_agent.bounded_operation",
-            1,
-            &[("outcome", "cancelled")],
-        );
-    }
-    match (result, record_result) {
-        (Ok(result), Ok(())) => Ok(result),
-        (Ok(_), Err(error)) => Err(FunctionCallError::RespondToModel(format!(
-            "shell validation result could not be persisted for the typed assignment: {error}"
-        ))),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(record_error)) => {
-            tracing::warn!(%record_error, "failed to persist typed shell validation result");
-            Err(error)
+
+    result
+}
+
+async fn run_with_focused_validation_heartbeat<F>(
+    coordinator: &AgentTaskCoordinator,
+    token: &FocusedValidationToken,
+    call_id: &str,
+    operation: F,
+) -> F::Output
+where
+    F: Future,
+{
+    run_with_periodic_heartbeat(operation, FOCUSED_VALIDATION_HEARTBEAT_INTERVAL, || async {
+        match coordinator.heartbeat_focused_validation(token).await {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                %call_id,
+                "focused validation heartbeat was rejected"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                %call_id,
+                "focused validation heartbeat could not be persisted"
+            ),
+        }
+    })
+    .await
+}
+
+async fn run_with_periodic_heartbeat<F, H, HFut>(
+    operation: F,
+    heartbeat_interval: Duration,
+    mut heartbeat: H,
+) -> F::Output
+where
+    F: Future,
+    H: FnMut() -> HFut,
+    HFut: Future<Output = ()>,
+{
+    tokio::pin!(operation);
+    let mut ticker = tokio::time::interval(heartbeat_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = ticker.tick() => heartbeat().await,
         }
     }
 }
@@ -1229,289 +679,47 @@ fn validation_output_summary(
     })
 }
 
-fn pin_focused_validation_executable(
-    execution_command: &mut [String],
-    nominal_command: &[String],
-    child_env: &HashMap<String, String>,
-    cwd: &Path,
-    repo_root: &Path,
-) -> Result<String, String> {
-    if execution_command != nominal_command {
-        return Err("execution argv does not match the admitted nominal argv".to_string());
-    }
-    let program = nominal_command
-        .first()
-        .ok_or_else(|| "validation command argv cannot be empty".to_string())?;
-    let resolved = resolve_focused_validation_executable(program, child_env, cwd, repo_root)?;
-    let resolved_text = resolved
-        .to_str()
-        .ok_or_else(|| "resolved executable path is not valid UTF-8".to_string())?
-        .to_string();
-    execution_command[0] = resolved_text.clone();
-    Ok(resolved_text)
-}
-
-fn resolve_focused_validation_executable(
-    program: &str,
-    child_env: &HashMap<String, String>,
-    cwd: &Path,
-    repo_root: &Path,
-) -> Result<std::path::PathBuf, String> {
-    let path_value = child_env_value(child_env, "PATH")
-        .ok_or_else(|| "child PATH is unavailable".to_string())?;
-    for path_entry in std::env::split_paths(path_value) {
-        let Ok(resolved) = which::which_in(program, Some(path_entry.as_os_str()), cwd) else {
-            continue;
-        };
-        if !path_entry.is_absolute() {
-            return Err(format!(
-                "executable {program} resolves through a relative PATH entry: {}",
-                path_entry.display()
-            ));
-        }
-        if !resolved.is_absolute() {
-            return Err(format!(
-                "executable {program} resolved to a relative path: {}",
-                resolved.display()
-            ));
-        }
-        let canonical_executable = std::fs::canonicalize(&resolved).map_err(|error| {
-            format!(
-                "executable {program} could not be canonicalized ({}): {error}",
-                resolved.display()
-            )
-        })?;
-        let canonical_repo_root = std::fs::canonicalize(repo_root)
-            .map_err(|error| format!("repository root could not be canonicalized: {error}"))?;
-        if canonical_executable.starts_with(&canonical_repo_root) {
-            return Err(format!(
-                "executable {program} resolves inside the repository: {}",
-                canonical_executable.display()
-            ));
-        }
-        return Ok(canonical_executable);
-    }
-    Err(format!(
-        "executable {program} could not be resolved from child PATH"
-    ))
-}
-
-pub(in crate::tools::handlers) fn child_env_value<'a>(
-    env: &'a HashMap<String, String>,
-    name: &str,
-) -> Option<&'a std::ffi::OsStr> {
-    env.iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| std::ffi::OsStr::new(value))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn focused_validation_command_summary(
-    command: &[String],
-    command_summary: &str,
-    direct_argv: bool,
-    cwd: &Path,
-    repo_root: &Path,
-    expiration: &ExecExpiration,
-    sandbox_override: bool,
-    additional_permissions: bool,
-    prefix_rule: bool,
-) -> Result<String, String> {
-    let mut violations = Vec::new();
-    if !direct_argv {
-        violations.push(focused_validation_violation(
-            "direct_argv_required",
-            "the command must use direct argv mode",
-            json!({"mode": "direct_argv"}),
-        ));
-    }
-    if cwd != repo_root {
-        violations.push(focused_validation_violation(
-            "repository_root_cwd_required",
-            "the command cwd must be the repository root",
-            json!({"cwd": "repository_root"}),
-        ));
-    }
-    match expiration {
-        ExecExpiration::Timeout(timeout) => match u64::try_from(timeout.as_millis()) {
-            Ok(timeout_ms) if timeout_ms == 0 || timeout_ms > MAX_FOCUSED_VALIDATION_TIMEOUT_MS => {
-                violations.push(focused_validation_violation(
-                    "bounded_timeout_required",
-                    format!("timeout_ms must be between 1 and {MAX_FOCUSED_VALIDATION_TIMEOUT_MS}"),
-                    json!({"minimum_ms": 1, "maximum_ms": MAX_FOCUSED_VALIDATION_TIMEOUT_MS}),
-                ));
-            }
-            Ok(_) => {}
-            Err(_) => violations.push(focused_validation_violation(
-                "bounded_timeout_required",
-                "timeout is too large",
-                json!({"minimum_ms": 1, "maximum_ms": MAX_FOCUSED_VALIDATION_TIMEOUT_MS}),
-            )),
-        },
-        ExecExpiration::DefaultTimeout => violations.push(focused_validation_violation(
-            "explicit_timeout_required",
-            "timeout_ms must be supplied explicitly",
-            json!({"explicit": true}),
-        )),
-        ExecExpiration::Cancellation(_) | ExecExpiration::TimeoutOrCancellation { .. } => {
-            violations.push(focused_validation_violation(
-                "bounded_timeout_required",
-                "focused validation requires an explicit bounded timeout",
-                json!({"explicit": true, "bounded": true}),
-            ));
-        }
-    }
-    if sandbox_override || additional_permissions || prefix_rule {
-        violations.push(focused_validation_violation(
-            "default_permissions_required",
-            "sandbox overrides, additional permissions, and prefix rules are not allowed",
-            json!({
-                "sandbox_override": false,
-                "additional_permissions": false,
-                "prefix_rule": false
-            }),
-        ));
-    }
-    let Some((program, args)) = command.split_first() else {
-        violations.push(focused_validation_violation(
-            "nonempty_argv_required",
-            "the command argv cannot be empty",
-            json!({"minimum_items": 1}),
-        ));
-        return Err(FocusedValidationCapabilityDenied {
-            kind: "focused_validation_capability_denied",
-            violations,
-            canonical_permitted_command: None,
-        }
-        .render());
-    };
-    focused_validation_argv_summary(
-        program,
-        args,
-        command_summary,
-        direct_argv,
-        repo_root,
-        violations,
-    )
-}
-
-fn focused_validation_argv_summary(
-    program: &str,
-    args: &[String],
-    command_summary: &str,
-    direct_argv: bool,
-    repo_root: &Path,
-    mut violations: Vec<FocusedValidationViolation>,
-) -> Result<String, String> {
-    let argv_violations = collect_focused_validation_argv_violations(program, args, repo_root);
-    let argv_is_permitted = argv_violations.is_empty();
-    violations.extend(argv_violations);
-    let canonical = CommandInvocation::Argv {
-        program: program.to_owned(),
-        args: args.to_vec(),
-    }
-    .display_command();
-    if canonical != command_summary {
-        violations.push(focused_validation_violation(
-            "canonical_summary_required",
-            "command summary is not the canonical direct-argv rendering",
-            json!({"rendering": "canonical_direct_argv"}),
-        ));
-    }
-    if !violations.is_empty() {
-        return Err(FocusedValidationCapabilityDenied {
-            kind: "focused_validation_capability_denied",
-            violations,
-            canonical_permitted_command: (direct_argv && argv_is_permitted).then_some(canonical),
-        }
-        .render());
-    }
-    Ok(canonical)
-}
-
-/// Admits the repository-specific semantics of a structured validation leaf.
-///
-/// Wire deserialization owns the non-empty argv and bounded-timeout invariants;
-/// the direct-command producer establishes the same invariants when constructing
-/// its leaf. This boundary therefore checks only command capability, coverage,
-/// and repository semantics.
+/// Enforces the repository boundary shared by planned and directly tagged
+/// validation commands. Runner flags are left to the ordinary command preflight.
+#[cfg(test)]
 pub(crate) fn validate_structured_validation_leaf(
     leaf: &ValidationRouteLeaf,
     repo_root: &Path,
 ) -> Result<String, String> {
-    if leaf.uncertainty.trim().is_empty() {
-        return Err("auto-validation must state the uncertainty this command resolves".to_string());
-    }
-    if leaf.covered_paths.is_empty() {
-        return Err("auto-validation must declare non-empty covered_paths".to_string());
-    }
-    if leaf.covered_contracts.is_empty() {
-        return Err("auto-validation must declare non-empty covered_contracts".to_string());
-    }
-    for covered_path in &leaf.covered_paths {
-        require_safe_repo_relative_path(covered_path, "auto-validation covered path", repo_root)?;
-    }
+    let leaf = normalize_structured_validation_leaf(leaf.clone(), repo_root)?;
     let program = &leaf.argv[0];
     let args = &leaf.argv[1..];
     let invocation = CommandInvocation::Argv {
         program: program.clone(),
         args: args.to_vec(),
     };
-    let canonical = invocation.display_command();
-    focused_validation_argv_summary(program, args, &canonical, true, repo_root, Vec::new())?;
-    if program == "cargo"
-        && cargo_command_args(args)
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "--workspace" | "--all" | "--all-targets"))
-    {
-        return Err("auto-validation cargo routes must remain focused".to_string());
+    Ok(invocation.display_command())
+}
+
+pub(crate) fn normalize_structured_validation_leaf(
+    mut leaf: ValidationRouteLeaf,
+    repo_root: &Path,
+) -> Result<ValidationRouteLeaf, String> {
+    if leaf.argv.is_empty() || leaf.argv.iter().any(|arg| arg.trim().is_empty()) {
+        return Err("validation argv must contain non-empty direct arguments".to_string());
     }
-    if program == "cargo"
-        && args.first().is_some_and(|arg| arg == "test")
-        && !cargo_test_has_package_and_filter(args)
-    {
-        return Err(
-            "auto-validation cargo test routes must name a package, one exact test ID, and pass `-- --exact`"
-                .to_string(),
-        );
+    leaf.covered_paths = normalize_covered_paths(&leaf.covered_paths, repo_root)?;
+    if leaf.timeout_ms == 0 || leaf.timeout_ms > MAX_VALIDATION_TIMEOUT_MS {
+        return Err(format!(
+            "validation timeout_ms must be between 1 and {MAX_VALIDATION_TIMEOUT_MS}"
+        ));
     }
-    if program == "cargo"
-        && args.first().is_some_and(|arg| arg == "check")
-        && !cargo_args_have_package(args)
-    {
-        return Err("auto-validation cargo check routes must name a package".to_string());
+    Ok(leaf)
+}
+
+pub(crate) fn normalize_structured_validation_route(
+    route: &mut codex_protocol::plan_tool::ValidationRoute,
+    repo_root: &Path,
+) -> Result<(), String> {
+    for leaf in &mut route.leaves {
+        *leaf = normalize_structured_validation_leaf(leaf.clone(), repo_root)?;
     }
-    if program == "just" {
-        match args.first().map(String::as_str) {
-            Some("test-fast") if !nextest_args_have_package_and_filter(&args[1..]) => {
-                return Err(
-                    "auto-validation just test-fast routes must name a package and use an exact `-E test(=...)` selector"
-                        .to_string(),
-                );
-            }
-            Some("test-compile" | "test-lane-main") => {
-                return Err(
-                    "auto-validation just routes must name a focused lane or package".to_string(),
-                );
-            }
-            Some("test-lane" | "test-lane-fast")
-                if !nextest_args_have_package_and_filter(&args[2..]) =>
-            {
-                return Err(
-                    "auto-validation just test lanes must name a package and use an exact `-E test(=...)` selector"
-                        .to_string(),
-                );
-            }
-            Some("test-lane-package") if !nextest_args_have_filter(&args[2..]) => {
-                return Err(
-                    "auto-validation just package lanes must name a test filter using an exact `-E test(=...)` selector"
-                        .to_string(),
-                );
-            }
-            _ => {}
-        }
-    }
-    Ok(canonical)
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1538,24 +746,24 @@ pub(crate) fn direct_validation_route(
 ) -> Result<DirectValidationRoute, String> {
     let CommandInvocation::Argv { program, args } = invocation else {
         return Err(
-            "validation commands must use direct argv mode so coverage and proof identity are unambiguous"
-                .to_string(),
+            "validation commands must use direct argv mode and provide covered_paths".to_string(),
         );
     };
-    let leaf = ValidationRouteLeaf {
-        argv: std::iter::once(program.clone())
-            .chain(args.iter().cloned())
-            .collect(),
-        uncertainty: context.uncertainty.clone(),
-        covered_paths: context.covered_paths.clone(),
-        covered_contracts: context.covered_contracts.clone(),
-        timeout_ms: timeout_ms.clamp(
-            1,
-            codex_protocol::plan_tool::MAX_STRUCTURED_VALIDATION_TIMEOUT_MS,
-        ),
-        semantic_timeout: false,
-    };
-    validate_structured_validation_leaf(&leaf, repo_root)?;
+    if timeout_ms == 0 || timeout_ms > MAX_VALIDATION_TIMEOUT_MS {
+        return Err(format!(
+            "validation timeout_ms must be between 1 and {MAX_VALIDATION_TIMEOUT_MS}"
+        ));
+    }
+    let leaf = normalize_structured_validation_leaf(
+        ValidationRouteLeaf {
+            argv: std::iter::once(program.clone())
+                .chain(args.iter().cloned())
+                .collect(),
+            covered_paths: context.covered_paths.clone(),
+            timeout_ms,
+        },
+        repo_root,
+    )?;
     let route = codex_protocol::plan_tool::ValidationRoute {
         leaves: vec![leaf.clone()],
         ordering: codex_protocol::plan_tool::ValidationRouteOrdering::StopOnFailure,
@@ -1563,687 +771,64 @@ pub(crate) fn direct_validation_route(
     Ok(DirectValidationRoute { leaf, route })
 }
 
-fn cargo_args_have_package(args: &[String]) -> bool {
-    let args = cargo_command_args(args);
-    args.windows(2)
-        .any(|pair| matches!(pair[0].as_str(), "-p" | "--package") && !pair[1].starts_with('-'))
-        || args.iter().any(|arg| {
-            arg.strip_prefix("--package=")
-                .is_some_and(|value| !value.is_empty())
-        })
-}
-
-fn cargo_command_args(args: &[String]) -> &[String] {
-    &args[..args
-        .iter()
-        .position(|arg| arg == "--")
-        .unwrap_or(args.len())]
-}
-
-fn cargo_test_has_package_and_filter(args: &[String]) -> bool {
-    let has_package = cargo_args_have_package(args);
-    let mut filters = Vec::new();
-    let mut harness_exact = false;
-    let mut index = 1;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == "--" {
-            harness_exact = args[index + 1..]
-                .iter()
-                .any(|argument| argument == "--exact");
-            break;
-        }
-        if matches!(arg.as_str(), "-p" | "--package") {
-            index += 2;
-            continue;
-        }
-        if cargo_option_takes_value(arg) {
-            index += 2;
-            continue;
-        }
-        if !arg.starts_with("--package=") && !arg.starts_with('-') {
-            filters.push(arg.as_str());
-        }
-        index += 1;
-    }
-    has_package
-        && harness_exact
-        && filters.len() == 1
-        && filters.first().is_some_and(|filter| exact_test_id(filter))
-}
-
-fn nextest_args_have_package_and_filter(args: &[String]) -> bool {
-    let has_package = args
-        .windows(2)
-        .any(|pair| matches!(pair[0].as_str(), "-p" | "--package") && !pair[1].starts_with('-'))
-        || args.iter().any(|arg| {
-            arg.strip_prefix("--package=")
-                .is_some_and(|value| !value.is_empty())
-        });
-    has_package && nextest_args_have_filter(args)
-}
-
-fn nextest_args_have_filter(args: &[String]) -> bool {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        let (option, inline_value) = split_option(arg);
-        match option {
-            "-E" | "--filterset" | "--filter-expr" => {
-                if inline_value.is_some_and(exact_nextest_test_expression)
-                    || args
-                        .get(index + 1)
-                        .is_some_and(|value| exact_nextest_test_expression(value))
-                {
-                    return true;
-                }
-                index += 1;
-            }
-            "-p" | "--package" | "--features" => index += usize::from(inline_value.is_none()),
-            _ => {}
-        }
-        index += 1;
-    }
-    false
-}
-
-fn exact_nextest_test_expression(value: &str) -> bool {
-    let Some(test_id) = value
-        .strip_prefix("test(=")
-        .and_then(|value| value.strip_suffix(')'))
-    else {
-        return false;
-    };
-    exact_test_id(test_id)
-}
-
-fn exact_test_id(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
-}
-
-fn cargo_option_takes_value(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--test"
-            | "--bin"
-            | "--example"
-            | "--bench"
-            | "--features"
-            | "--manifest-path"
-            | "--target"
-            | "--target-dir"
-            | "--profile"
-            | "--jobs"
-            | "-j"
-            | "--color"
-            | "--config"
-    )
-}
-
-fn collect_focused_validation_argv_violations(
-    program: &str,
-    args: &[String],
+pub(crate) fn normalize_covered_paths(
+    covered_paths: &[String],
     repo_root: &Path,
-) -> Vec<FocusedValidationViolation> {
-    let mut violations = Vec::new();
-    if args.iter().any(|arg| forbidden_control_argument(arg)) {
-        violations.push(focused_validation_violation(
-            "shell_control_argument_forbidden",
-            "shell chaining, wrappers, and redirection are not allowed",
-            json!({"shell_control_arguments": false}),
-        ));
+) -> Result<Vec<String>, String> {
+    #[cfg(test)]
+    VALIDATION_PATH_NORMALIZATION_COUNT.with(|count| count.set(count.get() + 1));
+    if covered_paths.is_empty() {
+        return Err("validation must declare non-empty covered_paths".to_string());
     }
-    let program_result = match program {
-        "cargo" => validate_cargo_validation(args).map_err(|message| {
-            focused_validation_violation(
-                "cargo_validation_shape_required",
-                message,
-                json!({"program": "cargo", "subcommands": ["check", "test"]}),
-            )
-        }),
-        "just" => validate_just_validation(args).map_err(|message| {
-            focused_validation_violation(
-                "just_validation_shape_required",
-                message,
-                json!({"program": "just", "recipe_class": "admitted_nonmutating_validation"}),
-            )
-        }),
-        "python" | "python3" => validate_python_validation(args, repo_root).map_err(|message| {
-            focused_validation_violation(
-                "python_validation_shape_required",
-                message,
-                json!({"program": ["python", "python3"], "module_mode": true}),
-            )
-        }),
-        _ => Err(focused_validation_violation(
-            "validation_program_required",
-            "only direct cargo, just, or python validation is allowed",
-            json!({"program": ["cargo", "just", "python", "python3"]}),
-        )),
-    };
-    if let Err(violation) = program_result {
-        violations.push(violation);
-    }
-    violations
-}
-
-fn validate_cargo_validation(args: &[String]) -> Result<(), String> {
-    if !matches!(args.first().map(String::as_str), Some("check" | "test")) {
-        return Err("cargo validation is limited to check or test subcommands".to_string());
-    }
-    if args
+    #[cfg(test)]
+    VALIDATION_ROOT_CANONICALIZATION_COUNT.with(|count| count.set(count.get() + 1));
+    let canonical_root = std::fs::canonicalize(repo_root)
+        .map_err(|error| format!("repository root could not be canonicalized: {error}"))?;
+    let mut normalized = covered_paths
         .iter()
-        .skip(1)
-        .any(|arg| cargo_path_or_config_override(arg))
-    {
-        return Err(
-            "cargo path, configuration, and unstable overrides are not allowed".to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn validate_just_validation(args: &[String]) -> Result<(), String> {
-    let Some(recipe) = args.first().map(String::as_str) else {
-        return Err("just validation requires an explicit recipe".to_string());
-    };
-    match recipe {
-        "source-map-check" | "fmt-check" if args.len() == 1 => Ok(()),
-        "source-map-check" | "fmt-check" => Err(format!("just {recipe} does not accept arguments")),
-        "test-fast" | "test-compile" | "test-lane-main" => {
-            validate_nextest_forwarded_args(&args[1..])
+        .map(|path| normalize_repo_relative_path(path, "validation covered path", &canonical_root))
+        .collect::<Result<Vec<_>, _>>()?;
+    normalized.sort_by_key(|path| {
+        if cfg!(windows) {
+            path.to_ascii_lowercase()
+        } else {
+            path.clone()
         }
-        "test-lane" | "test-lane-fast" | "test-lane-package" => {
-            let Some(identifier) = args.get(1) else {
-                return Err(format!(
-                    "just {recipe} requires a lane or package identifier"
-                ));
-            };
-            if !safe_just_identifier(identifier) {
-                return Err(
-                    "just lane and package identifiers must be simple safe names".to_string(),
-                );
-            }
-            validate_nextest_forwarded_args(&args[2..])
+    });
+    normalized.dedup_by(|left, right| {
+        if cfg!(windows) {
+            left.eq_ignore_ascii_case(right)
+        } else {
+            left == right
         }
-        "check-lane" => {
-            let Some(identifier) = args.get(1) else {
-                return Err("just check-lane requires a package identifier".to_string());
-            };
-            if !safe_just_identifier(identifier) {
-                return Err(
-                    "just lane and package identifiers must be simple safe names".to_string(),
-                );
-            }
-            validate_cargo_check_forwarded_args(&args[2..])
-        }
-        _ => Err("just recipe is not an admitted nonmutating validation recipe".to_string()),
-    }
+    });
+    Ok(normalized)
 }
 
-fn validate_nextest_forwarded_args(args: &[String]) -> Result<(), String> {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        let (option, inline_value) = split_option(arg);
-        match option {
-            "-p" | "--package" => {
-                let value = take_option_value(args, &mut index, inline_value, option)?;
-                if !safe_just_identifier(value) {
-                    return Err(format!("nextest {option} requires a simple package name"));
-                }
-            }
-            "-E" | "--filterset" | "--filter-expr" => {
-                let value = take_option_value(args, &mut index, inline_value, option)?;
-                if !exact_nextest_test_expression(value) {
-                    return Err(format!(
-                        "nextest {option} must select one exact test with `test(=...)`"
-                    ));
-                }
-            }
-            "--features" => {
-                let value = take_option_value(args, &mut index, inline_value, option)?;
-                if !safe_feature_list(value) {
-                    return Err("nextest --features value is not admitted".to_string());
-                }
-            }
-            "--lib"
-            | "--bins"
-            | "--tests"
-            | "--benches"
-            | "--no-fail-fast"
-            | "--fail-fast"
-            | "--no-capture"
-            | "--nocapture"
-            | "--locked"
-            | "--offline"
-            | "--frozen"
-            | "--release"
-            | "--all-features"
-            | "--no-default-features"
-                if inline_value.is_none() => {}
-            _ if arg.starts_with('-') => {
-                return Err(format!("nextest forwarded option is not admitted: {arg}"));
-            }
-            _ => {
-                return Err(format!(
-                    "unrecognized raw nextest module path `{arg}`; use an exact `-E test(=...)` selector"
-                ));
-            }
-        }
-        index += 1;
-    }
-    Ok(())
-}
-
-fn validate_cargo_check_forwarded_args(args: &[String]) -> Result<(), String> {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        let (option, inline_value) = split_option(arg);
-        match option {
-            "--features" => {
-                let value = take_option_value(args, &mut index, inline_value, option)?;
-                if !safe_feature_list(value) {
-                    return Err("cargo check --features value is not admitted".to_string());
-                }
-            }
-            "--lib"
-            | "--bins"
-            | "--tests"
-            | "--benches"
-            | "--examples"
-            | "--locked"
-            | "--offline"
-            | "--frozen"
-            | "--release"
-            | "--all-features"
-            | "--no-default-features"
-                if inline_value.is_none() => {}
-            _ => {
-                return Err(format!(
-                    "cargo check forwarded option is not admitted: {arg}"
-                ));
-            }
-        }
-        index += 1;
-    }
-    Ok(())
-}
-
-fn safe_feature_list(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b',' | b'/')
-        })
-}
-
-fn validate_python_validation(args: &[String], repo_root: &Path) -> Result<(), String> {
-    let module = match args {
-        [module_flag, module, ..] if module_flag == "-m" => module.as_str(),
-        _ => {
-            return Err(
-                "python validation must be a direct `python -m unittest` or `python -m pytest` invocation"
-                    .to_string(),
-            );
-        }
-    };
-    if !matches!(module, "unittest" | "pytest") {
-        return Err("python validation module must be unittest or pytest".to_string());
-    }
-    match module {
-        "unittest" => validate_unittest_args(&args[2..], repo_root),
-        "pytest" => validate_pytest_args(&args[2..], repo_root),
-        _ => unreachable!("module allowlist checked above"),
-    }
-}
-
-fn validate_unittest_args(args: &[String], repo_root: &Path) -> Result<(), String> {
-    let discovery = args.first().is_some_and(|arg| arg == "discover");
-    let mut has_selector = false;
-    let mut has_discovery_directory = false;
-    let mut has_discovery_pattern = false;
-    let mut index = if discovery { 1 } else { 0 };
-    while index < args.len() {
-        let arg = &args[index];
-        let (option, inline_value) = split_option(arg);
-        match option {
-            "-v" | "--verbose" | "-q" | "--quiet" | "--locals" | "-f" | "--failfast" | "-b"
-            | "--buffer"
-                if inline_value.is_none() => {}
-            "--durations" => {
-                let value = take_option_value(args, &mut index, inline_value, option)?;
-                value
-                    .parse::<u64>()
-                    .map_err(|_| "unittest --durations requires an integer".to_string())?;
-            }
-            "-k" => {
-                require_nonempty_option_value(args, &mut index, inline_value, option)?;
-            }
-            "-s" | "--start-directory" | "-t" | "--top-level-directory" if discovery => {
-                let value = take_option_value(args, &mut index, inline_value, option)?;
-                require_safe_repo_relative_path(value, option, repo_root)?;
-                if matches!(option, "-s" | "--start-directory") {
-                    has_discovery_directory = true;
-                }
-            }
-            "-p" | "--pattern" if discovery => {
-                require_nonempty_option_value(args, &mut index, inline_value, option)?;
-                has_discovery_pattern = true;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(format!("unittest option is not admitted: {arg}"));
-            }
-            _ if discovery => {
-                return Err(format!(
-                    "unittest discover positional is not admitted: {arg}"
-                ));
-            }
-            _ => {
-                require_safe_unittest_selector(selector_path(arg), repo_root)?;
-                has_selector = true;
-            }
-        }
-        index += 1;
-    }
-    if discovery && !(has_discovery_directory && has_discovery_pattern) {
-        return Err(
-            "unittest discovery must name both a start directory and a pattern".to_string(),
-        );
-    }
-    if !discovery && !has_selector {
-        return Err("unittest validation must name a focused test selector".to_string());
-    }
-    Ok(())
-}
-
-fn validate_pytest_args(args: &[String], repo_root: &Path) -> Result<(), String> {
-    let mut index = 0;
-    let mut has_selector = false;
-    while index < args.len() {
-        let arg = &args[index];
-        let (option, inline_value) = split_option(arg);
-        match option {
-            "-q"
-            | "--quiet"
-            | "-v"
-            | "--verbose"
-            | "-s"
-            | "-x"
-            | "--exitfirst"
-            | "--collect-only"
-            | "--co"
-            | "--fixtures"
-            | "--fixtures-per-test"
-            | "--lf"
-            | "--last-failed"
-            | "--ff"
-            | "--failed-first"
-            | "--nf"
-            | "--new-first"
-            | "--sw"
-            | "--stepwise"
-            | "--stepwise-skip"
-            | "--strict-config"
-            | "--strict-markers"
-            | "--strict"
-            | "--disable-warnings"
-            | "--showlocals"
-            | "--no-showlocals"
-            | "--full-trace"
-            | "--no-header"
-            | "--no-summary"
-            | "--setup-only"
-            | "--setup-show"
-            | "--setup-plan"
-                if inline_value.is_none() => {}
-            _ if admitted_pytest_short_cluster(arg) => {}
-            "-k" | "-m" => {
-                require_nonempty_option_value(args, &mut index, inline_value, option)?;
-            }
-            "--maxfail" | "--durations" => {
-                let value = take_option_value(args, &mut index, inline_value, option)?;
-                value
-                    .parse::<u64>()
-                    .map_err(|_| format!("pytest {option} requires an integer"))?;
-            }
-            "--durations-min" => {
-                let value = take_option_value(args, &mut index, inline_value, option)?;
-                value
-                    .parse::<f64>()
-                    .map_err(|_| "pytest --durations-min requires a number".to_string())?;
-            }
-            "--verbosity" => {
-                let value = take_option_value(args, &mut index, inline_value, option)?;
-                value
-                    .parse::<i64>()
-                    .map_err(|_| "pytest --verbosity requires an integer".to_string())?;
-            }
-            "--tb" => {
-                require_option_choice(
-                    args,
-                    &mut index,
-                    inline_value,
-                    option,
-                    &["auto", "long", "short", "line", "native", "no"],
-                )?;
-            }
-            "--capture" => {
-                require_option_choice(
-                    args,
-                    &mut index,
-                    inline_value,
-                    option,
-                    &["fd", "sys", "no", "tee-sys"],
-                )?;
-            }
-            "--color" => {
-                require_option_choice(
-                    args,
-                    &mut index,
-                    inline_value,
-                    option,
-                    &["yes", "no", "auto"],
-                )?;
-            }
-            "--code-highlight" => {
-                require_option_choice(args, &mut index, inline_value, option, &["yes", "no"])?;
-            }
-            "--show-capture" => {
-                require_option_choice(
-                    args,
-                    &mut index,
-                    inline_value,
-                    option,
-                    &["no", "stdout", "stderr", "log", "all"],
-                )?;
-            }
-            "--ignore" | "--ignore-glob" => {
-                let value = take_option_value(args, &mut index, inline_value, option)?;
-                require_safe_repo_relative_path(value, option, repo_root)?;
-            }
-            "--deselect" => {
-                let value = take_option_value(args, &mut index, inline_value, option)?;
-                require_safe_repo_relative_path(selector_path(value), option, repo_root)?;
-            }
-            _ if arg.starts_with('-') => {
-                return Err(format!("pytest option is not admitted: {arg}"));
-            }
-            _ if arg.starts_with('@') => {
-                return Err("pytest argument files are not admitted".to_string());
-            }
-            _ => {
-                require_focused_pytest_selector(arg, repo_root)?;
-                has_selector = true;
-            }
-        }
-        index += 1;
-    }
-    if !has_selector {
-        return Err("pytest validation must name a focused test selector".to_string());
-    }
-    Ok(())
-}
-
-fn split_option(arg: &str) -> (&str, Option<&str>) {
-    arg.split_once('=')
-        .map_or((arg, None), |(option, value)| (option, Some(value)))
-}
-
-fn take_option_value<'a>(
-    args: &'a [String],
-    index: &mut usize,
-    inline_value: Option<&'a str>,
-    option: &str,
-) -> Result<&'a str, String> {
-    if let Some(value) = inline_value {
-        return (!value.is_empty())
-            .then_some(value)
-            .ok_or_else(|| format!("{option} requires a value"));
-    }
-    *index += 1;
-    args.get(*index)
-        .map(String::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("{option} requires a value"))
-}
-
-fn require_nonempty_option_value<'a>(
-    args: &'a [String],
-    index: &mut usize,
-    inline_value: Option<&'a str>,
-    option: &str,
-) -> Result<(), String> {
-    take_option_value(args, index, inline_value, option).map(|_| ())
-}
-
-fn require_option_choice<'a>(
-    args: &'a [String],
-    index: &mut usize,
-    inline_value: Option<&'a str>,
-    option: &str,
-    choices: &[&str],
-) -> Result<(), String> {
-    let value = take_option_value(args, index, inline_value, option)?;
-    choices
-        .contains(&value)
-        .then_some(())
-        .ok_or_else(|| format!("pytest {option} value is not admitted: {value}"))
-}
-
-fn admitted_pytest_short_cluster(arg: &str) -> bool {
-    arg.len() > 2
-        && arg.starts_with('-')
-        && !arg.starts_with("--")
-        && (arg[1..]
-            .bytes()
-            .all(|byte| matches!(byte, b'q' | b'v' | b's' | b'x'))
-            || arg
-                .strip_prefix("-r")
-                .is_some_and(|flags| flags.bytes().all(|byte| b"fEsxXwPpA".contains(&byte))))
-}
-
-fn safe_just_identifier(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && !value.contains("..")
-        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes
-            .iter()
-            .copied()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-}
-
-fn selector_path(value: &str) -> &str {
-    value.split("::").next().unwrap_or(value)
-}
-
-fn require_focused_pytest_selector(value: &str, repo_root: &Path) -> Result<(), String> {
-    let path = selector_path(value);
-    require_safe_repo_relative_path(path, "pytest selector", repo_root)?;
-    let candidate = repo_root.join(path);
-    match std::fs::symlink_metadata(&candidate) {
-        Ok(metadata) if metadata.is_dir() => Err(format!(
-            "pytest validation must name a test file or node, not a directory: {value}"
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (std::path::Path::new(path)
-            .extension()
-            .and_then(|value| value.to_str())
-            == Some("py"))
-        .then_some(())
-        .ok_or_else(|| {
-            format!("pytest validation must name a test file or node, not a directory: {value}")
-        }),
-        Err(error) => Err(format!(
-            "pytest selector could not be inspected safely ({value}): {error}"
-        )),
-    }
-}
-
-fn require_safe_unittest_selector(value: &str, repo_root: &Path) -> Result<(), String> {
-    require_safe_repo_relative_path(value, "unittest selector", repo_root)?;
-    if value.contains(['/', '\\']) || value.ends_with(".py") {
-        return Ok(());
-    }
-
-    let components = value.split('.').collect::<Vec<_>>();
-    for end in (1..=components.len()).rev() {
-        let module_path = components[..end]
-            .iter()
-            .fold(repo_root.to_path_buf(), |path, component| {
-                path.join(component)
-            });
-        for candidate in [module_path.clone(), module_path.with_extension("py")] {
-            match std::fs::symlink_metadata(&candidate) {
-                Ok(_) => {
-                    return require_canonical_repo_containment(
-                        repo_root,
-                        &candidate,
-                        "unittest selector",
-                        value,
-                    );
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "unittest selector could not be inspected safely ({value}): {error}"
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn require_safe_repo_relative_path(
+fn normalize_repo_relative_path(
     value: &str,
     label: &str,
     repo_root: &Path,
-) -> Result<(), String> {
+) -> Result<String, String> {
+    let value = value.trim();
     if !safe_repo_relative_path(value) {
         return Err(format!("{label} must stay within the repository: {value}"));
     }
 
-    let candidate = repo_root.join(value);
+    let canonical_root = repo_root;
+    let candidate = canonical_root.join(value);
     let mut existing_ancestor = candidate.as_path();
+    let mut missing_suffix = Vec::new();
     loop {
         match std::fs::symlink_metadata(existing_ancestor) {
             Ok(_) => {
-                return require_canonical_repo_containment(
-                    repo_root,
-                    existing_ancestor,
-                    label,
-                    value,
-                );
+                break;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = existing_ancestor.file_name().ok_or_else(|| {
+                    format!("{label} has no inspectable repository ancestor: {value}")
+                })?;
+                missing_suffix.push(component.to_os_string());
                 existing_ancestor = existing_ancestor.parent().ok_or_else(|| {
                     format!("{label} has no inspectable repository ancestor: {value}")
                 })?;
@@ -2255,25 +840,190 @@ fn require_safe_repo_relative_path(
             }
         }
     }
+    let canonical_candidate = std::fs::canonicalize(existing_ancestor)
+        .map_err(|error| format!("{label} could not be canonicalized safely ({value}): {error}"))?;
+    if !path_has_component_prefix(&canonical_candidate, canonical_root) {
+        return Err(format!("{label} resolves outside the repository: {value}"));
+    }
+
+    let root_component_count = canonical_root.components().count();
+    let mut relative_components = canonical_candidate
+        .components()
+        .skip(root_component_count)
+        .filter_map(|component| match component {
+            std::path::Component::Normal(component) => Some(component.to_os_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    relative_components.extend(missing_suffix.into_iter().rev());
+    if relative_components.is_empty() {
+        return Ok(".".to_string());
+    }
+    Ok(relative_components
+        .iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/"))
 }
 
-fn require_canonical_repo_containment(
-    repo_root: &Path,
-    existing_candidate: &Path,
-    label: &str,
-    display_value: &str,
-) -> Result<(), String> {
-    let canonical_root = std::fs::canonicalize(repo_root)
-        .map_err(|error| format!("repository root could not be canonicalized: {error}"))?;
-    let canonical_candidate = std::fs::canonicalize(existing_candidate).map_err(|error| {
-        format!("{label} could not be canonicalized safely ({display_value}): {error}")
-    })?;
-    if !canonical_candidate.starts_with(&canonical_root) {
-        return Err(format!(
-            "{label} resolves outside the repository: {display_value}"
-        ));
+fn path_has_component_prefix(path: &Path, prefix: &Path) -> bool {
+    let mut path_components = path.components();
+    prefix.components().all(|expected| {
+        let Some(actual) = path_components.next() else {
+            return false;
+        };
+        if cfg!(windows) {
+            actual
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
+        } else {
+            actual == expected
+        }
+    })
+}
+
+async fn finish_validation_skip_after_begin(
+    emitter: &ToolEmitter,
+    session: &Arc<Session>,
+    turn: &Arc<TurnContext>,
+    call_id: &str,
+    event_tracker: Option<&SharedTurnDiffTracker>,
+    skipped: ValidationSkippedToolOutput,
+) -> Result<RunExecLikeResult, FunctionCallError> {
+    let skip_disposition = skipped.skip_disposition;
+    if matches!(
+        skip_disposition,
+        codex_tools::ToolOutputSkipDisposition::Suppressed
+    ) {
+        turn.turn_timing_state.record_suppressed_validation_output();
     }
-    Ok(())
+    let value = serde_json::to_value(&skipped).unwrap_or_default();
+    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), call_id, event_tracker);
+    let content = emitter
+        .finish(event_ctx, Err(ToolError::ValidationSkipped(skipped)), None)
+        .await?;
+    let mut output =
+        FunctionToolOutput::from_text(content, None).with_skip_disposition(skip_disposition);
+    output.post_tool_use_response = Some(value);
+    Ok(RunExecLikeResult {
+        output,
+        exit_code: None,
+        validation_execution_outcome: ValidationExecutionOutcome::NotExecuted,
+        canonical_output: None,
+    })
+}
+
+fn unexecuted_validation_skip(
+    out: &Result<ExecToolCallOutput, ToolError>,
+    validation_attempt_started: bool,
+) -> Option<&ValidationSkippedToolOutput> {
+    if validation_attempt_started {
+        return None;
+    }
+    match out {
+        Err(ToolError::ValidationSkipped(skipped)) => Some(skipped),
+        Ok(_) | Err(_) => None,
+    }
+}
+
+fn restore_retained_validation_attempt(
+    out: Result<ExecToolCallOutput, ToolError>,
+    retained_validation_attempt: Option<&ExecToolCallOutput>,
+) -> Result<ExecToolCallOutput, ToolError> {
+    match (&out, retained_validation_attempt) {
+        (
+            Err(ToolError::Denied(_) | ToolError::ValidationSkipped(_)),
+            Some(retained_validation_attempt),
+        ) => Ok(retained_validation_attempt.clone()),
+        _ => out,
+    }
+}
+
+fn record_retained_validation_skip(
+    turn_timing_state: &crate::turn_timing::TurnTimingState,
+    out: &Result<ExecToolCallOutput, ToolError>,
+    retained_validation_attempt: Option<&ExecToolCallOutput>,
+) {
+    if retained_validation_attempt.is_some()
+        && let Err(ToolError::ValidationSkipped(skipped)) = out
+        && matches!(
+            skipped.skip_disposition,
+            codex_tools::ToolOutputSkipDisposition::Suppressed
+        )
+    {
+        turn_timing_state.record_suppressed_validation_output();
+    }
+}
+
+pub(crate) fn validation_repository_root(
+    effective_cwd: &Path,
+    repository_anchor: &Path,
+) -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    VALIDATION_REPOSITORY_DISCOVERY_COUNT.with(|count| count.set(count.get() + 1));
+    let canonical_anchor = std::fs::canonicalize(repository_anchor).ok()?;
+    let canonical_root = std::fs::canonicalize(codex_git_utils::get_git_repo_root(
+        canonical_anchor.as_path(),
+    )?)
+    .ok()?;
+    let canonical_cwd = std::fs::canonicalize(effective_cwd).ok()?;
+    path_has_component_prefix(&canonical_cwd, &canonical_root).then_some(canonical_root)
+}
+
+pub(crate) fn validation_repository_root_if_needed(
+    validation_requested: bool,
+    effective_cwd: &Path,
+    repository_anchor: &Path,
+) -> Option<std::path::PathBuf> {
+    validation_requested
+        .then(|| validation_repository_root(effective_cwd, repository_anchor))
+        .flatten()
+}
+
+pub(crate) fn workspace_operation_root_if_needed(
+    focused_validation: bool,
+    inspection_command: bool,
+    repository_root: std::path::PathBuf,
+) -> Option<std::path::PathBuf> {
+    (focused_validation || !inspection_command).then_some(repository_root)
+}
+
+#[cfg(test)]
+thread_local! {
+    static VALIDATION_PATH_NORMALIZATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static VALIDATION_ROOT_CANONICALIZATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static VALIDATION_REPOSITORY_DISCOVERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_validation_path_normalization_count() {
+    VALIDATION_PATH_NORMALIZATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn validation_path_normalization_count() -> usize {
+    VALIDATION_PATH_NORMALIZATION_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_validation_root_canonicalization_count() {
+    VALIDATION_ROOT_CANONICALIZATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn validation_root_canonicalization_count() -> usize {
+    VALIDATION_ROOT_CANONICALIZATION_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_validation_repository_discovery_count() {
+    VALIDATION_REPOSITORY_DISCOVERY_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn validation_repository_discovery_count() -> usize {
+    VALIDATION_REPOSITORY_DISCOVERY_COUNT.with(std::cell::Cell::get)
 }
 
 fn safe_repo_relative_path(value: &str) -> bool {
@@ -2290,62 +1040,22 @@ fn safe_repo_relative_path(value: &str) -> bool {
     !value.split(['/', '\\']).any(|component| component == "..")
 }
 
-fn cargo_path_or_config_override(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--manifest-path"
-            | "--config"
-            | "--target-dir"
-            | "--artifact-dir"
-            | "--lockfile-path"
-            | "-Z"
-    ) || arg.starts_with("--manifest-path=")
-        || arg.starts_with("--config=")
-        || arg.starts_with("--target-dir=")
-        || arg.starts_with("--artifact-dir=")
-        || arg.starts_with("--lockfile-path=")
-        || arg.starts_with("-Z")
-}
-
-fn forbidden_control_argument(arg: &str) -> bool {
-    arg.contains(['\r', '\n', '\0'])
-        || matches!(
-            arg,
-            "|" | "||" | "&&" | "&" | ";" | ">" | ">>" | "<" | "2>" | "2>>"
-        )
-}
-
-fn reject_focused_effective_permissions(
-    focused_validation: bool,
-    effective_permissions: &EffectiveAdditionalPermissions,
-) -> Result<(), String> {
-    if focused_validation
-        && (effective_permissions
-            .sandbox_permissions
-            .requests_sandbox_override()
-            || effective_permissions.additional_permissions.is_some())
-    {
-        return Err(
-            "focused validation cannot use inherited session or turn permission grants".to_string(),
-        );
-    }
-    Ok(())
-}
-
 async fn run_exec_like_with_exit_code_inner(
     args: RunExecLikeArgs,
     focused_validation: bool,
+    inspection_command: bool,
     repository_root: std::path::PathBuf,
+    terminal_validation_result: &mut Option<ValidationResult>,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
         tool_name,
         exec_params,
-        environment_hash: _,
         stall_timeout_ms,
         cancellation_token,
         hook_command,
         safety_command,
         shell_type,
+        shell_wrapper_is_owned,
         is_powershell_script,
         additional_permissions,
         prefix_rule,
@@ -2354,13 +1064,12 @@ async fn run_exec_like_with_exit_code_inner(
         turn_environment,
         tracker,
         call_id,
-        track_validation_freshness,
+        track_command_mutations,
         attempt_key,
         repair_notice,
+        command_repaired,
         force_fresh,
         validation_launch,
-        validation_leader: _,
-        validation_waiter: _,
     } = args;
 
     let fs = turn_environment.environment.get_filesystem();
@@ -2376,14 +1085,12 @@ async fn run_exec_like_with_exit_code_inner(
     let requested_additional_permissions = additional_permissions.clone();
     let effective_additional_permissions = apply_granted_turn_permissions(
         session.as_ref(),
-        &turn_environment.environment_id,
+        turn_environment.environment.approval_scope_id(),
         exec_params.cwd.as_path(),
         exec_params.sandbox_permissions,
         additional_permissions,
     )
     .await;
-    reject_focused_effective_permissions(focused_validation, &effective_additional_permissions)
-        .map_err(FunctionCallError::RespondToModel)?;
     let additional_permissions_allowed = exec_permission_approvals_enabled
         || (session.features().enabled(Feature::RequestPermissionsTool)
             && effective_additional_permissions.permissions_preapproved);
@@ -2425,6 +1132,13 @@ async fn run_exec_like_with_exit_code_inner(
         && known_delta_store::is_immutable_git_show_candidate(
             &exec_params.command[0],
             &exec_params.command[1..],
+        )
+        && let Some(authorization_scope) = known_delta_store::authorization_scope_fingerprint(
+            &turn.file_system_sandbox_context(
+                normalized_additional_permissions.clone(),
+                &PathUri::from_abs_path(&exec_params.cwd),
+            ),
+            effective_additional_permissions.sandbox_permissions,
         ) {
         let metadata_source = turn
             .turn_metadata_state
@@ -2438,13 +1152,14 @@ async fn run_exec_like_with_exit_code_inner(
             .map_or(known_delta_store::ProjectNamespaceHint::Discover, |_| {
                 known_delta_store::ProjectNamespaceHint::Resolved(project_namespace.as_deref())
             });
-        known_delta_store::prepare_immutable_git_show(
+        known_delta_store::prepare_immutable_git_show_with_authorization_scope(
             turn.config.codex_home.as_path(),
             &session.thread_id.to_string(),
             &exec_params.cwd,
             &exec_params.command[0],
             &exec_params.command[1..],
             project_namespace_hint,
+            &authorization_scope,
             force_fresh,
         )
         .await
@@ -2477,7 +1192,7 @@ async fn run_exec_like_with_exit_code_inner(
         session
             .services
             .command_execution
-            .begin_attempt_with_freshness(attempt_key, repair_notice.is_some(), force_fresh)
+            .begin_attempt_with_freshness(attempt_key, command_repaired, force_fresh)
             .await
             .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
     }
@@ -2485,6 +1200,7 @@ async fn run_exec_like_with_exit_code_inner(
     // Intercept apply_patch if present.
     let apply_patch_cwd = PathUri::from_abs_path(&exec_params.cwd);
     let intercepted = intercept_apply_patch(
+        validation_launch.is_some(),
         &exec_params.command,
         &apply_patch_cwd,
         fs.as_ref(),
@@ -2534,26 +1250,26 @@ async fn run_exec_like_with_exit_code_inner(
         exec_params.cwd.clone(),
         source,
         turn_environment.environment_id.clone(),
-    );
-    let event_tracker = track_validation_freshness.then_some(&tracker);
+    )
+    .with_model_command_text(hook_command.clone());
+    let event_tracker = track_command_mutations.then_some(&tracker);
     let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
     emitter.begin(event_ctx).await;
 
     // This is a preliminary resolution used only for the policy compatibility check. The runtime
-    // re-proves the exact command against its final cwd and child environment immediately before
-    // constructing the sandbox request. A safety/execution mismatch fails closed.
+    // re-proves the inspectable safety projection against its final cwd and child environment
+    // immediately before constructing the sandbox request.
 
-    let proven_direct_argv = (is_powershell_script
-        && !turn_environment.environment.is_remote()
-        && exec_params.command == safety_command)
-        .then(|| {
-            prove_noprofile_powershell_command_as_direct_argv(
-                &exec_params.command,
-                exec_params.cwd.as_path(),
-                &exec_params.env,
-            )
-        })
-        .flatten();
+    let proven_direct_argv = if is_powershell_script && !turn_environment.environment.is_remote() {
+        prove_noprofile_powershell_direct_argv_async(
+            &safety_command,
+            exec_params.cwd.as_path(),
+            &exec_params.env,
+        )
+        .await
+    } else {
+        None
+    };
 
     let canonical_exec_approval_requirement = if let Some(proof) = proven_direct_argv.as_ref() {
         Some(
@@ -2580,29 +1296,38 @@ async fn run_exec_like_with_exit_code_inner(
         None
     };
 
-    let exec_approval_requirement = session
-        .services
-        .exec_policy
-        .create_exec_approval_requirement_for_command(ExecApprovalRequest {
-            command: &exec_params.command,
-            command_for_safety: Some(&safety_command),
-            approval_policy: turn.approval_policy.value(),
-            permission_profile: turn.permission_profile(),
-            windows_sandbox_level: turn.windows_sandbox_level,
-            sandbox_permissions: if effective_additional_permissions.permissions_preapproved {
-                codex_protocol::models::SandboxPermissions::UseDefault
-            } else {
-                effective_additional_permissions.sandbox_permissions
-            },
-            prefix_rule,
-        })
-        .await;
+    let exec_approval_request = ExecApprovalRequest {
+        command: &exec_params.command,
+        command_for_safety: Some(&safety_command),
+        approval_policy: turn.approval_policy.value(),
+        permission_profile: turn.permission_profile(),
+        windows_sandbox_level: turn.windows_sandbox_level,
+        sandbox_permissions: if effective_additional_permissions.permissions_preapproved {
+            codex_protocol::models::SandboxPermissions::UseDefault
+        } else {
+            effective_additional_permissions.sandbox_permissions
+        },
+        prefix_rule,
+    };
+    let exec_approval_requirement = if shell_wrapper_is_owned {
+        session
+            .services
+            .exec_policy
+            .create_exec_approval_requirement_for_command(exec_approval_request)
+            .await
+    } else {
+        session
+            .services
+            .exec_policy
+            .create_exec_approval_requirement_for_direct_argv(exec_approval_request)
+            .await
+    };
 
     let approved_powershell_direct_argv = if let (Some(proof), Some(canonical_requirement)) =
         (proven_direct_argv, canonical_exec_approval_requirement)
         && same_exec_authorization_envelope(&exec_approval_requirement, &canonical_requirement)
         && let Some(command) = proof.into_command_for_state(
-            &exec_params.command,
+            &safety_command,
             exec_params.cwd.as_path(),
             &exec_params.env,
         ) {
@@ -2612,7 +1337,7 @@ async fn run_exec_like_with_exit_code_inner(
     };
 
     let workspace_operation_root =
-        (focused_validation || !is_known_safe_command(&safety_command)).then_some(repository_root);
+        workspace_operation_root_if_needed(focused_validation, inspection_command, repository_root);
     let req = ShellRequest {
         command: exec_params.command.clone(),
         command_for_approval: safety_command,
@@ -2645,7 +1370,7 @@ async fn run_exec_like_with_exit_code_inner(
         call_id: call_id.clone(),
         tool_name,
     };
-    let out = match orchestrator
+    let out = orchestrator
         .run(
             &mut runtime,
             &req,
@@ -2654,23 +1379,27 @@ async fn run_exec_like_with_exit_code_inner(
             turn.approval_policy.value(),
         )
         .await
-    {
-        Ok(result) => Ok(result.output),
-        Err(ToolError::ValidationSkipped(skipped)) => {
-            let skip_disposition = skipped.skip_disposition;
-            let value = serde_json::to_value(skipped).unwrap_or_default();
-            let mut output = FunctionToolOutput::from_text(value.to_string(), None)
-                .with_skip_disposition(skip_disposition);
-            output.post_tool_use_response = Some(value);
-            return Ok(RunExecLikeResult {
-                output,
-                exit_code: None,
-                validation_execution_outcome: ValidationExecutionOutcome::NotExecuted,
-                canonical_output: None,
-            });
-        }
-        Err(error) => Err(error),
-    };
+        .map(|result| result.output);
+    let retained_validation_attempt = runtime.take_last_validation_attempt_output();
+    let validation_attempt_started =
+        retained_validation_attempt.is_some() || runtime.take_last_validation_attempt_started();
+    if let Some(skipped) = unexecuted_validation_skip(&out, validation_attempt_started) {
+        return finish_validation_skip_after_begin(
+            &emitter,
+            &session,
+            &turn,
+            &call_id,
+            event_tracker,
+            skipped.clone(),
+        )
+        .await;
+    }
+    record_retained_validation_skip(
+        turn.turn_timing_state.as_ref(),
+        &out,
+        retained_validation_attempt.as_ref(),
+    );
+    let out = restore_retained_validation_attempt(out, retained_validation_attempt.as_ref());
     if !known_delta_hit && let Some(known_delta) = known_delta.as_ref() {
         let observation = match &out {
             Ok(output) if is_complete_success(output) => {
@@ -2679,7 +1408,10 @@ async fn run_exec_like_with_exit_code_inner(
                     executor_cost: output.duration,
                 }
             }
-            Ok(output) if output.aggregated_output.truncated_after_lines.is_some() => {
+            Ok(output)
+                if output.aggregated_output.truncated_after_lines.is_some()
+                    || output.aggregated_output.truncated =>
+            {
                 KnownDeltaExecutionObservation::Incomplete
             }
             Err(_) | Ok(_) => KnownDeltaExecutionObservation::CompleteFailure,
@@ -2691,6 +1423,14 @@ async fn run_exec_like_with_exit_code_inner(
         )
         .await;
     }
+    let source_capture_truncated = match &out {
+        Ok(output) => output.aggregated_output.truncated,
+        Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output })))
+        | Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. }))) => {
+            output.aggregated_output.truncated
+        }
+        Err(_) => false,
+    };
     let exit_code = out.as_ref().ok().map(|output| output.exit_code);
     let retry_exit_code = retry_exit_code(&out);
     if !known_delta_hit
@@ -2702,8 +1442,8 @@ async fn run_exec_like_with_exit_code_inner(
             .record_exit(attempt_key, retry_exit_code)
             .await;
     }
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
-    let model_projection = out.as_ref().ok().map(|output| {
+    let execution_output = shell_validation_execution_output(&out, None);
+    let model_projection = execution_output.map(|output| {
         crate::tools::project_exec_output_text_with_budget(
             output,
             turn.model_info.truncation_policy.into(),
@@ -2714,7 +1454,7 @@ async fn run_exec_like_with_exit_code_inner(
     let post_tool_use_response = model_projection
         .as_ref()
         .map(|projection| JsonValue::String(projection.text.clone()));
-    let advisory = out.as_ref().ok().and_then(|output| {
+    let advisory = execution_output.and_then(|output| {
         powershell_script_failure_advisory(
             shell_type,
             Some(output.exit_code),
@@ -2722,44 +1462,50 @@ async fn run_exec_like_with_exit_code_inner(
             &output.aggregated_output.text,
         )
     });
-    let raw_output_artifact =
-        if !known_delta_hit && let (Some(_attempt_key), Ok(output)) = (&attempt_key, &out) {
-            Some(
-                create_raw_output_artifact(
-                    turn.config.codex_home.as_path(),
-                    &session.thread_id.to_string(),
-                    output.aggregated_output.text.as_bytes(),
-                )
-                .await,
+    let raw_output_artifact = if !known_delta_hit
+        && let (Some(_attempt_key), Some(output)) = (&attempt_key, execution_output)
+    {
+        Some(
+            create_raw_output_artifact(
+                turn.config.codex_home.as_path(),
+                &session.thread_id.to_string(),
+                output.aggregated_output.text.as_bytes(),
             )
-        } else {
-            None
-        };
-    let completed_validation_skip_disposition = req
-        .validation_launch
-        .as_ref()
-        .and_then(|launch| launch.structured_route.as_ref())
-        .and_then(|route| {
-            out.as_ref().ok().and_then(|output| {
-                crate::tools::command_execution::completed_validation_skip_disposition(
-                    route,
-                    output.aggregated_output.text.as_bytes(),
-                    output.exit_code,
-                )
-            })
-        });
-    if let (Some(launch), Some(artifact), Some(exit_code)) = (
-        req.validation_launch.as_ref(),
-        raw_output_artifact.as_ref(),
-        exit_code,
-    ) {
+            .await,
+        )
+    } else {
+        None
+    };
+    let validation_attempt_output =
+        shell_validation_execution_output(&out, retained_validation_attempt.as_ref());
+    let completed_validation = if let Some(launch) = req.validation_launch.as_ref()
+        && shell_validation_was_executed(&out, validation_attempt_started)
+    {
+        let validation_exit_code = validation_attempt_output.map(|output| output.exit_code);
+        let timed_out = validation_attempt_output.is_some_and(|output| output.timed_out);
         session
             .services
             .command_execution
-            .publish_inline_validation(launch, artifact.clone(), validation_started_at, exit_code)
-            .await;
-    }
+            .complete_inline_validation(
+                launch,
+                raw_output_artifact.clone(),
+                validation_started_at,
+                validation_exit_code,
+                timed_out,
+                None,
+            )
+            .await
+    } else {
+        None
+    };
+    *terminal_validation_result = completed_validation
+        .as_ref()
+        .map(|completed| completed.result.clone());
     let canonical_output = canonical_exec_output_bytes(&out);
+    let output_bearing_result = shell_result_has_execution_output(&out);
+    let tool_outcome = shell_tool_outcome(&out);
+    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
+        .with_completed_validation(completed_validation.as_ref());
     let finish_result = emitter
         .finish(event_ctx, out, /*applied_patch_delta*/ None)
         .await;
@@ -2769,7 +1515,7 @@ async fn run_exec_like_with_exit_code_inner(
         .command_execution
         .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
         .await;
-    let mut content = finish_result?;
+    let mut content = recover_output_bearing_shell_content(finish_result, output_bearing_result)?;
     if let Some(advisory) = advisory {
         content.push_str("\n\n");
         content.push_str(advisory);
@@ -2779,7 +1525,10 @@ async fn run_exec_like_with_exit_code_inner(
         content.push_str(&repair_notice);
     }
     if let Some(raw_output_artifact) = raw_output_artifact {
-        insert_metadata_before_output(&mut content, &raw_output_artifact.render_for_model());
+        insert_metadata_before_output(
+            &mut content,
+            &raw_output_artifact.render_for_model_with_source_truncation(source_capture_truncated),
+        );
         if model_projection.is_some_and(|projection| projection.reduced)
             && let Some(notice) = raw_output_artifact.reduction_notice()
         {
@@ -2787,52 +1536,77 @@ async fn run_exec_like_with_exit_code_inner(
             content.push_str(&notice);
         }
     }
-    let validation_execution_outcome = if completed_validation_skip_disposition.is_some() {
-        ValidationExecutionOutcome::ExecutedNotApplicable
-    } else {
-        match exit_code {
-            Some(0) => ValidationExecutionOutcome::ExecutedSuccess,
-            Some(_) | None => ValidationExecutionOutcome::ExecutedFailure,
-        }
+    if source_capture_truncated {
+        content.push_str(
+            "\n\n[output capture truncated at execution retained-byte limit; omitted bytes are unavailable]",
+        );
+    }
+    let validation_execution_outcome = match exit_code {
+        Some(0) => ValidationExecutionOutcome::ExecutedSuccess,
+        Some(_) | None => ValidationExecutionOutcome::ExecutedFailure,
     };
-    let mut output = FunctionToolOutput {
+    let output = FunctionToolOutput {
         body: vec![
             codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },
         ],
-        success: Some(true),
-        outcome: Some(if completed_validation_skip_disposition.is_some() {
-            codex_tools::ToolOutputOutcome::Skipped
-        } else {
-            match exit_code {
-                Some(0) => codex_tools::ToolOutputOutcome::Success,
-                Some(_) => codex_tools::ToolOutputOutcome::Failure,
-                None => codex_tools::ToolOutputOutcome::TimedOut,
-            }
-        }),
+        success: Some(tool_outcome == codex_tools::ToolOutputOutcome::Success),
+        outcome: Some(tool_outcome),
         post_tool_use_response,
-        sampling_request_signal: (completed_validation_skip_disposition.is_none())
-            .then(|| {
-                shell_sampling_signal(
-                    attempt_key.as_ref(),
-                    req.hook_command.as_str(),
-                    exit_code,
-                    canonical_output.as_deref(),
-                )
-            })
-            .flatten(),
+        sampling_request_signal: shell_sampling_signal(
+            attempt_key.as_ref(),
+            req.hook_command.as_str(),
+            exit_code,
+            canonical_output.as_deref(),
+        ),
         deterministic_continuation_receipts: Vec::new(),
         deterministic_continuation_owner_key: None,
         skip_disposition: None,
     };
-    if let Some(skip_disposition) = completed_validation_skip_disposition {
-        output = output.with_skip_disposition(skip_disposition);
-    }
     Ok(RunExecLikeResult {
         output,
         exit_code,
         validation_execution_outcome,
         canonical_output,
     })
+}
+
+fn recover_output_bearing_shell_content(
+    finish_result: Result<String, FunctionCallError>,
+    output_bearing_result: bool,
+) -> Result<String, FunctionCallError> {
+    match finish_result {
+        Err(FunctionCallError::RespondToModel(content)) if output_bearing_result => Ok(content),
+        other => other,
+    }
+}
+
+fn shell_result_has_execution_output(out: &Result<ExecToolCallOutput, ToolError>) -> bool {
+    matches!(
+        out,
+        Ok(_)
+            | Err(ToolError::Codex(CodexErr::Sandbox(
+                SandboxErr::Timeout { .. }
+            )))
+            | Err(ToolError::Codex(CodexErr::Sandbox(
+                SandboxErr::Denied { .. }
+            )))
+    )
+}
+
+fn shell_tool_outcome(
+    out: &Result<ExecToolCallOutput, ToolError>,
+) -> codex_tools::ToolOutputOutcome {
+    match out {
+        Ok(output) if output.exit_code == 0 => codex_tools::ToolOutputOutcome::Success,
+        Ok(_) | Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { .. }))) => {
+            codex_tools::ToolOutputOutcome::Failure
+        }
+        Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { .. }))) => {
+            codex_tools::ToolOutputOutcome::TimedOut
+        }
+        Err(ToolError::ValidationSkipped(_)) => codex_tools::ToolOutputOutcome::Skipped,
+        Err(_) => codex_tools::ToolOutputOutcome::Failure,
+    }
 }
 
 fn retry_exit_code(out: &Result<ExecToolCallOutput, ToolError>) -> Option<i32> {
@@ -2846,6 +1620,27 @@ fn retry_exit_code(out: &Result<ExecToolCallOutput, ToolError>) -> Option<i32> {
         Err(ToolError::Denied(_)) => None,
         Err(ToolError::Rejected(_)) => Some(-1),
         Err(ToolError::ValidationSkipped(_)) => None,
+    }
+}
+
+fn shell_validation_was_executed(
+    out: &Result<ExecToolCallOutput, ToolError>,
+    retained_validation_attempt: bool,
+) -> bool {
+    retained_validation_attempt || shell_validation_execution_output(out, None).is_some()
+}
+
+fn shell_validation_execution_output<'a>(
+    out: &'a Result<ExecToolCallOutput, ToolError>,
+    retained_validation_attempt: Option<&'a ExecToolCallOutput>,
+) -> Option<&'a ExecToolCallOutput> {
+    match out {
+        Ok(output) => Some(output),
+        Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output })))
+        | Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. }))) => {
+            Some(output.as_ref())
+        }
+        Err(_) => retained_validation_attempt,
     }
 }
 
@@ -2864,6 +1659,7 @@ fn is_complete_success(output: &ExecToolCallOutput) -> bool {
     output.exit_code == 0
         && !output.timed_out
         && output.aggregated_output.truncated_after_lines.is_none()
+        && !output.aggregated_output.truncated
 }
 
 fn insert_metadata_before_output(content: &mut String, metadata: &str) {

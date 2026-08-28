@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use codex_http_client::BuildCustomCaTransportError;
 use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
+use codex_utils_pty::ManagedRootProcess;
+use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
@@ -337,12 +339,7 @@ impl ExecServerClient {
     pub(crate) async fn connect_stdio_command(
         args: StdioExecServerConnectArgs,
     ) -> Result<Self, ExecServerError> {
-        let mut child = stdio_command_process(&args.command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(ExecServerError::Spawn)?;
+        let (mut child, managed_root) = spawn_stdio_command(&args.command).await?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
             ExecServerError::Protocol("spawned exec-server command has no stdin".to_string())
@@ -368,7 +365,7 @@ impl ExecServerClient {
 
         Self::connect(
             JsonRpcConnection::from_stdio(stdout, stdin, "exec-server stdio command".to_string())
-                .with_child_process(child),
+                .with_managed_child_process(child, managed_root),
             args.into(),
         )
         .await
@@ -392,13 +389,47 @@ fn is_rendezvous_harness_url(websocket_url: &str) -> bool {
 
 fn stdio_command_process(stdio_command: &StdioExecServerCommand) -> Command {
     let mut command = Command::new(&stdio_command.program);
+    command.kill_on_drop(true);
     command.args(&stdio_command.args);
+    command.env_clear();
     command.envs(&stdio_command.env);
+    command.creation_flags(WINDOWS_CREATE_SUSPENDED);
     if let Some(cwd) = &stdio_command.cwd {
         command.current_dir(cwd);
     }
 
     command
+}
+
+async fn spawn_stdio_command(
+    stdio_command: &StdioExecServerCommand,
+) -> Result<(tokio::process::Child, Arc<ManagedRootProcess>), ExecServerError> {
+    let managed_root = Arc::new(
+        ManagedRootProcess::reserve_with_reclaim()
+            .await
+            .map_err(ExecServerError::Spawn)?,
+    );
+    let mut child = stdio_command_process(stdio_command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(ExecServerError::Spawn)?;
+    let Some(process_id) = child.id() else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(ExecServerError::Spawn(std::io::Error::other(
+            "spawned exec-server command has no process id",
+        )));
+    };
+    if let Err(error) = managed_root.attach_and_resume(process_id) {
+        let _ = managed_root.terminate();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(ExecServerError::Spawn(error));
+    }
+
+    Ok((child, managed_root))
 }
 
 #[cfg(test)]

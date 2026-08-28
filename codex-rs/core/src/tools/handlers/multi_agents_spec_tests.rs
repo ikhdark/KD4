@@ -434,6 +434,21 @@ fn wait_agent_tool_v1_advertises_first_and_all() {
             "Explicit caller deadline in milliseconds. Omit to wait without a caller deadline until the requested target condition or input activity. Explicit values must be between 10000 and 3600000. Completed targets return immediately."
         )
     );
+    let timeout = parameters
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("timeout_ms"))
+        .expect("timeout_ms schema");
+    assert_eq!(
+        timeout.schema_type,
+        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Integer))
+    );
+    assert_eq!(timeout.minimum, Some(serde_json::Number::from(10_000_i64)));
+    assert_eq!(
+        timeout.maximum,
+        Some(serde_json::Number::from(3_600_000_i64))
+    );
+    assert_wait_timeout_schema_matches_runtime_bounds(parameters);
 }
 
 #[test]
@@ -472,11 +487,31 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
             "Explicit caller deadline in milliseconds. Omit to keep waiting; the default 30000 ms interval is internal maintenance cadence only and does not return an unchanged result. Explicit values must be between 10000 and 3600000. Use list_agents or get_agent_task for an immediate status snapshot."
         )
     );
+    let timeout = properties.get("timeout_ms").expect("timeout_ms schema");
+    assert_eq!(
+        timeout.schema_type,
+        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Integer))
+    );
+    assert_eq!(timeout.minimum, Some(serde_json::Number::from(10_000_i64)));
+    assert_eq!(
+        timeout.maximum,
+        Some(serde_json::Number::from(3_600_000_i64))
+    );
+    assert_wait_timeout_schema_matches_runtime_bounds(&parameters);
     assert_eq!(parameters.required.as_ref(), None);
     assert_eq!(
         output_schema.expect("wait output schema")["properties"]["message"]["description"],
         json!("Brief wait summary without the agent's final content.")
     );
+}
+
+fn assert_wait_timeout_schema_matches_runtime_bounds(parameters: &JsonSchema) {
+    let schema = serde_json::to_value(parameters).expect("serialize wait_agent schema");
+    let validator = jsonschema::validator_for(&schema).expect("compile wait_agent schema");
+    assert!(validator.is_valid(&json!({ "timeout_ms": 10_000 })));
+    assert!(!validator.is_valid(&json!({ "timeout_ms": 3_600_001 })));
+    assert!(!validator.is_valid(&json!({ "timeout_ms": 9_999 })));
+    assert!(!validator.is_valid(&json!({ "timeout_ms": 10_000.5 })));
 }
 
 #[test]

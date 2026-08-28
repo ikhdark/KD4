@@ -1,5 +1,4 @@
 use super::*;
-
 #[test]
 fn source_dependency_normalization_preserves_case_on_case_sensitive_filesystems() {
     let upper = normalized_source_path_with_case_sensitivity(Path::new("src/Owner.rs"), true);
@@ -10,6 +9,24 @@ fn source_dependency_normalization_preserves_case_on_case_sensitive_filesystems(
         normalized_source_path_with_case_sensitivity(Path::new("src/Owner.rs"), false),
         normalized_source_path_with_case_sensitivity(Path::new("src/owner.rs"), false),
     );
+}
+
+#[test]
+fn identity_projection_reuses_shared_response_items() {
+    let canonical: Arc<[ResponseItem]> = Arc::from([ResponseItem::FunctionCall {
+        id: None,
+        name: "non_workspace_operation".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "identity-call".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    }]);
+
+    let projection =
+        ToolHistoryState::default().project_with_workspace_identity(Arc::clone(&canonical), None);
+
+    assert!(Arc::ptr_eq(&projection.items, &canonical));
+    assert!(Arc::ptr_eq(&projection.unreplaced_items, &canonical));
 }
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
 use crate::tools::command_output_artifact::protect_active_tool_history_artifact;
@@ -368,6 +385,54 @@ fn workspace_evidence_invalidates_only_overlapping_source_dependencies() {
 }
 
 #[test]
+fn generation_batch_invalidation_excludes_its_own_completed_calls() {
+    let current_call_id = "current-generation-call";
+    let older_call_id = "older-call";
+    let dependency = PathBuf::from("/repo/src/foo.rs");
+    let captured = workspace_identity("captured");
+    let current_output = text_output(current_call_id, "current result".to_string());
+    let older_output = text_output(older_call_id, "older result".to_string());
+    let source_dependencies = BTreeSet::from([SourceDependencyV1::new(&dependency, false)]);
+    let mut state = ToolHistoryState::default();
+
+    for (call_id, output) in [
+        (current_call_id, &current_output),
+        (older_call_id, &older_output),
+    ] {
+        let mut registered = candidate(
+            call_id,
+            textual_output_identity(output)
+                .expect("textual output")
+                .1
+                .to_string(),
+        );
+        registered.tool_identity = "exec_command".to_string();
+        registered.source_dependencies = source_dependencies.clone();
+        registered.refresh_derived();
+        state.register(registered);
+        state.register_workspace_evidence(
+            WorkspaceEvidenceObservation::from_response_item(
+                Some(captured.clone()),
+                output,
+                source_dependencies.clone(),
+            )
+            .expect("workspace observation"),
+        );
+    }
+
+    assert!(state.invalidate_source_dependencies_excluding_call_ids(
+        Some(&BTreeSet::from([dependency])),
+        Some(&workspace_identity("after-mutation")),
+        &BTreeSet::from([current_call_id.to_string()]),
+    ));
+
+    assert!(state.candidates[current_call_id].source_dependencies_current);
+    assert!(!state.candidates[older_call_id].source_dependencies_current);
+    assert!(state.workspace_evidence[current_call_id].source_dependencies_current);
+    assert!(!state.workspace_evidence[older_call_id].source_dependencies_current);
+}
+
+#[test]
 fn watcher_proof_retains_dependency_scoped_evidence_after_external_disjoint_edit() {
     let root = tempfile::tempdir().expect("workspace root");
     let source = root.path().join("src/foo.rs");
@@ -656,6 +721,32 @@ fn workspace_call_classification_derives_all_evidence_inputs_once() {
 }
 
 #[test]
+fn confirmed_performance_workspace_classification_runs_inline_without_runtime_handoff() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({"package": "app", "workdir": temp.path()}).to_string(),
+    };
+    std::fs::write(
+        temp.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n",
+    )
+    .expect("workspace manifest");
+    std::fs::create_dir_all(temp.path().join("app/src")).expect("app source");
+    std::fs::write(
+        temp.path().join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("app manifest");
+
+    let classification = classify_workspace_tool_call("cargo_test", &payload, temp.path());
+    assert!(
+        classification
+            .source_dependencies
+            .contains(&SourceDependencyV1::new(&temp.path().join("app"), true,))
+    );
+}
+
+#[test]
 fn mutation_boundary_repository_history_reads_and_writers_skip_full_workspace_evidence() {
     for args in [
         serde_json::json!(["-C", ".", "log", "-1"]),
@@ -756,7 +847,63 @@ fn completed_tool_history_receipt_does_not_expose_source_dependency_paths() {
     let projection = state.project(canonical);
     let (_, receipt) = textual_output_identity(&projection.items[0]).expect("receipt output");
     assert!(!receipt.contains("/private/workspace"));
-    assert!(serde_json::from_str::<ToolHistoryReceiptV1>(receipt).is_ok());
+    assert!(serde_json::from_str::<ToolHistoryReceiptV2>(receipt).is_ok());
+}
+
+#[test]
+fn token_efficiency_compact_v2_receipt_retains_integrity_and_accepts_legacy_v1() {
+    let call_id = "call-1";
+    let tracked = candidate(call_id, bounded_output());
+    let rendered = tracked
+        .derived
+        .receipt
+        .as_deref()
+        .expect("eligible candidate receipt");
+    let receipt: ToolHistoryReceiptV2 = serde_json::from_str(rendered).expect("compact v2 receipt");
+    let value: serde_json::Value = serde_json::from_str(rendered).expect("receipt JSON");
+
+    assert_eq!(receipt.version, RECEIPT_VERSION);
+    assert_eq!(receipt.sha256, tracked.artifact_sha256);
+    assert_eq!(receipt.sha256.len(), 64);
+    assert!(value.get("artifact").is_none());
+    assert!(value.get("original").is_none());
+    assert!(value.get("retrieval").is_none());
+    assert!(response_item_has_valid_tool_history_receipt(&text_output(
+        call_id,
+        rendered.to_string(),
+    )));
+
+    let legacy = ToolHistoryReceiptV1 {
+        version: LEGACY_RECEIPT_VERSION,
+        receipt_id: tracked.derived.receipt_id.clone(),
+        call_id: call_id.to_string(),
+        tool_identity: tracked.tool_identity.clone(),
+        semantic_class: tracked.semantic_class.clone(),
+        source_dependencies_current: true,
+        digest: receipt.digest,
+        artifact: ReceiptArtifact {
+            artifact_id: tracked.artifact_id.clone(),
+            byte_start: 0,
+            byte_end: tracked.artifact_bytes,
+            sha256: tracked.artifact_sha256.clone(),
+            complete: true,
+        },
+        original: ReceiptOriginalSize {
+            bytes: tracked.artifact_bytes,
+            approximate_tokens: tracked.original_tokens,
+        },
+        retrieval: ReceiptRetrieval {
+            tool: "read_tool_output".to_string(),
+            instruction: "Recover the exact artifact.".to_string(),
+        },
+    };
+    let legacy = serde_json::to_string(&legacy).expect("legacy receipt JSON");
+
+    assert!(response_item_has_valid_tool_history_receipt(&text_output(
+        call_id,
+        legacy.clone(),
+    )));
+    assert!(approx_token_count(rendered) < approx_token_count(&legacy));
 }
 
 #[test]
@@ -835,6 +982,48 @@ fn tool_history_admission_bounds_aggregate_first_exposure_and_consumes_receipts(
     ));
     assert_eq!(state.consumed_outputs_for_tool("functions.exec").len(), 2);
     assert_eq!(state.project(canonical).substitutions.len(), 2);
+}
+
+#[test]
+fn tool_history_admission_reserves_competing_results_before_spending_the_shared_budget() {
+    let older = "older ".repeat(1_000);
+    let newest = "x ".repeat(MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+    assert_eq!(
+        approx_token_count(&newest),
+        MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET
+    );
+    let mut state = ToolHistoryState::default();
+    state.register(candidate("older-call", older.clone()));
+    state.register(candidate("newest-call", newest.clone()));
+
+    let projection = state.project(Arc::from([
+        function_call("older-call"),
+        text_output("older-call", older),
+        function_call("newest-call"),
+        text_output("newest-call", newest),
+    ]));
+
+    for call_id in ["older-call", "newest-call"] {
+        assert!(projection.items.iter().any(|item| {
+            matches!(item, ResponseItem::FunctionCall { call_id: projected, .. } if projected == call_id)
+        }));
+        assert!(
+            projection
+                .items
+                .iter()
+                .filter_map(textual_output_identity)
+                .any(|(projected, _)| projected == call_id)
+        );
+    }
+    assert!(
+        projection
+            .items
+            .iter()
+            .filter_map(textual_output_identity)
+            .map(|(_, output)| approx_token_count(output))
+            .sum::<usize>()
+            <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET
+    );
 }
 
 #[test]
@@ -926,6 +1115,39 @@ fn tool_history_admission_keeps_small_consumed_raw_output_when_receipt_costs_mor
 }
 
 #[test]
+fn tool_history_admission_keeps_in_budget_consumed_output_below_savings_thresholds() {
+    let call_id = "threshold-call";
+    let output = "x ".repeat(MINIMUM_RAW_TOKENS as usize);
+    let raw_tokens = approx_token_count(&output);
+    assert_eq!(raw_tokens, MINIMUM_RAW_TOKENS as usize);
+    assert!(raw_tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+
+    let canonical: Arc<[ResponseItem]> =
+        Arc::from([function_call(call_id), text_output(call_id, output.clone())]);
+    let mut state = ToolHistoryState::default();
+    state.register(candidate(call_id, output));
+    assert!(state.mark_consumed(
+        &canonical,
+        ModelGenerationId {
+            turn_id: "turn-1".to_string(),
+            ordinal: 1,
+        },
+    ));
+
+    let stored = &state.candidates[call_id];
+    let (_, _, admission_receipt_tokens) = stored
+        .admission_receipt()
+        .expect("complete candidate has an admission receipt");
+    assert!(admission_receipt_tokens <= raw_tokens as u64);
+    assert!(stored.receipt().is_none());
+
+    let projection = state.project(Arc::clone(&canonical));
+
+    assert_eq!(projection.items, canonical);
+    assert!(projection.substitutions.is_empty());
+}
+
+#[test]
 fn tool_history_admission_prioritizes_plain_failure_outputs() {
     let failure = "failure evidence ".repeat(1_800);
     let success = "ordinary success ".repeat(1_800);
@@ -949,7 +1171,7 @@ fn tool_history_admission_prioritizes_plain_failure_outputs() {
     assert!(projection.items.iter().any(|item| {
         textual_output_identity(item).is_some_and(|(call_id, output)| {
             call_id == "success-call"
-                && serde_json::from_str::<ToolHistoryReceiptV1>(output).is_ok()
+                && serde_json::from_str::<ToolHistoryReceiptV2>(output).is_ok()
         })
     }));
 }
@@ -1093,6 +1315,10 @@ fn tool_history_admission_supersedes_identical_results_with_latest_pair() {
         sha256(b"same action"),
         sha256(b"same result")
     ));
+    first.consumed_by_generation = Some(ModelGenerationId {
+        turn_id: "turn-1".to_string(),
+        ordinal: 0,
+    });
     let mut second = candidate("call-2", bounded.clone());
     second.supersession_identity = first.supersession_identity.clone();
     let canonical: Arc<[ResponseItem]> = Arc::from([
@@ -1115,6 +1341,45 @@ fn tool_history_admission_supersedes_identical_results_with_latest_pair() {
             .iter()
             .all(|item| { item_call_id(item).is_some_and(|call_id| call_id == "call-2") })
     );
+}
+
+#[test]
+fn tool_history_admission_preserves_unconsumed_identical_parallel_pairs() {
+    let bounded = bounded_output();
+    let supersession_identity = format!(
+        "functions.exec:{}:{}",
+        sha256(b"same action"),
+        sha256(b"same result")
+    );
+    let canonical: Arc<[ResponseItem]> = Arc::from([
+        function_call("call-1"),
+        text_output("call-1", bounded.clone()),
+        function_call("call-2"),
+        text_output("call-2", bounded.clone()),
+        function_call("call-3"),
+        text_output("call-3", bounded.clone()),
+    ]);
+    let mut state = ToolHistoryState::default();
+    for call_id in ["call-1", "call-2", "call-3"] {
+        let mut candidate = candidate(call_id, bounded.clone());
+        candidate.supersession_identity = Some(supersession_identity.clone());
+        state.register(candidate);
+    }
+
+    let projection = state.project(canonical);
+
+    assert_eq!(projection.items.len(), 6);
+    for call_id in ["call-1", "call-2", "call-3"] {
+        assert_eq!(
+            projection
+                .items
+                .iter()
+                .filter(|item| item_call_id(item).is_some_and(|id| id == call_id))
+                .count(),
+            2,
+            "call/output pair should remain visible for {call_id}"
+        );
+    }
 }
 
 #[test]
@@ -1192,7 +1457,7 @@ fn mcp_content_item_receipt_preserves_non_text_modalities() {
     assert!(matches!(
         &items[0],
         FunctionCallOutputContentItem::InputText { text }
-            if serde_json::from_str::<ToolHistoryReceiptV1>(text).is_ok()
+            if serde_json::from_str::<ToolHistoryReceiptV2>(text).is_ok()
     ));
     assert!(matches!(
         &items[1],
@@ -1255,7 +1520,7 @@ fn mcp_multi_text_content_is_canonicalized_and_receipted_without_losing_modaliti
     assert!(items.iter().any(|item| matches!(
         item,
         FunctionCallOutputContentItem::InputText { text }
-            if serde_json::from_str::<ToolHistoryReceiptV1>(text).is_ok()
+            if serde_json::from_str::<ToolHistoryReceiptV2>(text).is_ok()
     )));
     assert!(items.iter().any(|item| matches!(
         item,
@@ -1302,6 +1567,13 @@ fn structural_receipt_validation_rejects_receipt_like_text_and_tampering() {
         call_id,
         serde_json::to_string(&tampered).expect("serialize tampered receipt"),
     )));
+    let mut sha_tampered: serde_json::Value =
+        serde_json::from_str(receipt).expect("valid receipt JSON");
+    sha_tampered["sha256"] = serde_json::Value::String("b".repeat(64));
+    assert!(!response_item_has_valid_tool_history_receipt(&text_output(
+        call_id,
+        serde_json::to_string(&sha_tampered).expect("serialize SHA-tampered receipt"),
+    )));
 }
 
 #[test]
@@ -1345,6 +1617,29 @@ fn compaction_artifact_reference_survives_history_replacement() {
     state.retain_for_history(&[compacted_summary]);
 
     assert!(state.candidates.contains_key(call_id));
+}
+
+#[test]
+fn confirmed_performance_artifact_reference_walker_matches_borrowed_receipt_and_pin_objects() {
+    let candidate = candidate("call-1", bounded_output());
+    let (_, receipt, _) = candidate
+        .admission_receipt()
+        .expect("complete candidate has an admission receipt");
+    let receipt: serde_json::Value = serde_json::from_str(receipt).expect("receipt JSON");
+    let pin = serde_json::json!({
+        "version": 1,
+        "kind": "tool_history_artifact_pin",
+        "artifact_id": candidate.artifact_id,
+        "bytes": candidate.artifact_bytes,
+        "sha256": candidate.artifact_sha256,
+    });
+
+    assert!(json_value_contains_artifact_reference(&receipt, &candidate));
+    assert!(json_value_contains_artifact_reference(&pin, &candidate));
+    assert!(!json_value_contains_artifact_reference(
+        &serde_json::json!({ "artifact_id": "artifact-1" }),
+        &candidate,
+    ));
 }
 
 #[test]
@@ -1443,16 +1738,117 @@ async fn corrupt_own_thread_ledger_is_quarantined_but_fork_read_is_non_mutating(
 }
 
 #[tokio::test]
-async fn persist_tool_history_state_attempts_parent_directory_sync() {
+async fn persist_empty_tool_history_state_skips_absent_checkpoint_and_journal() {
     let temp = tempfile::tempdir().expect("tempdir");
+    let thread_id = "empty-thread";
+
+    persist_tool_history_state(temp.path(), thread_id, &ToolHistoryState::default())
+        .await
+        .expect("skip absent empty state");
+
+    assert!(!ledger_path(temp.path(), thread_id).exists());
+    assert!(!journal_path(temp.path(), thread_id).exists());
+}
+
+#[tokio::test]
+async fn persist_empty_tool_history_state_clears_existing_checkpoint() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let thread_id = "thread";
+    let mut stale_state = ToolHistoryState::default();
+    stale_state.register_non_workspace_code_mode_call("stale-call".to_string());
+    persist_tool_history_state(temp.path(), thread_id, &stale_state)
+        .await
+        .expect("persist stale ledger");
     let before = TOOL_HISTORY_DIRECTORY_SYNC_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
 
-    persist_tool_history_state(temp.path(), "thread", &ToolHistoryState::default())
+    persist_tool_history_state(temp.path(), thread_id, &ToolHistoryState::default())
         .await
-        .expect("persist ledger");
+        .expect("clear stale ledger");
 
     let after = TOOL_HISTORY_DIRECTORY_SYNC_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
     assert!(after > before);
+    let restored =
+        expect_loaded_tool_history(load_tool_history_state(temp.path(), thread_id).await);
+    assert!(restored.non_workspace_code_mode_calls.is_empty());
+}
+
+#[tokio::test]
+async fn persist_empty_tool_history_state_compacts_existing_journal() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let thread_id = "journal-thread";
+    let mutations = [(
+        1,
+        ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+            call_id: "stale-call".to_string(),
+        },
+    )];
+    persist_tool_history_mutations(temp.path(), thread_id, "writer", &mutations)
+        .await
+        .expect("persist stale journal");
+    assert!(!ledger_path(temp.path(), thread_id).exists());
+    assert!(journal_path(temp.path(), thread_id).exists());
+
+    persist_tool_history_state(temp.path(), thread_id, &ToolHistoryState::default())
+        .await
+        .expect("compact stale journal");
+
+    assert!(ledger_path(temp.path(), thread_id).exists());
+    assert!(!journal_path(temp.path(), thread_id).exists());
+    let restored =
+        expect_loaded_tool_history(load_tool_history_state(temp.path(), thread_id).await);
+    assert!(restored.non_workspace_code_mode_calls.is_empty());
+}
+
+#[tokio::test]
+async fn mutation_journal_repairs_an_incomplete_tail_before_appending() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let thread_id = "journal-tail-thread";
+    persist_tool_history_mutations(
+        temp.path(),
+        thread_id,
+        "writer",
+        &[(
+            1,
+            ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "first-call".to_string(),
+            },
+        )],
+    )
+    .await
+    .expect("persist first mutation");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(journal_path(temp.path(), thread_id))
+        .expect("open journal tail")
+        .write_all(b"{incomplete")
+        .expect("append incomplete journal tail");
+
+    persist_tool_history_mutations(
+        temp.path(),
+        thread_id,
+        "writer",
+        &[(
+            2,
+            ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "second-call".to_string(),
+            },
+        )],
+    )
+    .await
+    .expect("append after incomplete tail");
+
+    let restored =
+        expect_loaded_tool_history(load_tool_history_state_for_fork(temp.path(), thread_id).await);
+    assert!(
+        restored
+            .non_workspace_code_mode_calls
+            .contains("first-call")
+    );
+    assert!(
+        restored
+            .non_workspace_code_mode_calls
+            .contains("second-call")
+    );
 }
 
 #[tokio::test]
@@ -1517,8 +1913,8 @@ async fn fork_remints_receipt_artifact_into_child_namespace() {
     let FunctionCallOutputBody::Text(receipt) = &output.body else {
         panic!("expected receipt text");
     };
-    let receipt: ToolHistoryReceiptV1 = serde_json::from_str(receipt).expect("receipt JSON");
-    assert_eq!(receipt.artifact.artifact_id, target_artifact_id);
+    let receipt: ToolHistoryReceiptV2 = serde_json::from_str(receipt).expect("receipt JSON");
+    assert_eq!(receipt.artifact_id, target_artifact_id);
     assert_eq!(
         read_exact_tool_output_artifact(temp.path(), target_thread_id, &target_artifact_id)
             .await
@@ -1761,6 +2157,32 @@ fn artifact_index_is_deterministic_and_rebuilt_after_retention() {
         state
             .artifact_call_ids
             .get("artifact-1")
+            .map(String::as_str),
+        Some("call-1")
+    );
+}
+
+#[test]
+fn replacing_selected_candidate_repairs_only_affected_artifact_mappings() {
+    let mut state = ToolHistoryState::default();
+    state.register(candidate("call-2", bounded_output()));
+    state.register(candidate("call-1", bounded_output()));
+
+    let mut replacement = candidate("call-1", bounded_output());
+    replacement.artifact_id = "artifact-2".to_string();
+    state.register(replacement);
+
+    assert_eq!(
+        state
+            .artifact_call_ids
+            .get("artifact-1")
+            .map(String::as_str),
+        Some("call-2")
+    );
+    assert_eq!(
+        state
+            .artifact_call_ids
+            .get("artifact-2")
             .map(String::as_str),
         Some("call-1")
     );

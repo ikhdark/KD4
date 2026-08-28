@@ -120,6 +120,215 @@
       ],
       "type": "object"
     },
+    "FileSystemAccessMode": {
+      "description": "Access mode for a filesystem entry.\n\nWhen two equally specific entries target the same path, we compare these by conflict precedence rather than by capability breadth: `deny` beats `write`, and `write` beats `read`.",
+      "oneOf": [
+        {
+          "enum": [
+            "read",
+            "write"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`none` is a legacy input alias retained temporarily for compatibility.",
+          "enum": [
+            "deny"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "FileSystemPath_for_AbsolutePathBuf": {
+      "oneOf": [
+        {
+          "properties": {
+            "path": {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            },
+            "type": {
+              "enum": [
+                "path"
+              ],
+              "title": "PathFileSystemPath_for_AbsolutePathBufType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "type"
+          ],
+          "title": "PathFileSystemPath_for_AbsolutePathBuf",
+          "type": "object"
+        },
+        {
+          "description": "A git-style glob pattern. Pattern entries currently support FileSystemAccessMode::Deny only.",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "glob_pattern"
+              ],
+              "title": "GlobPatternFileSystemPath_for_AbsolutePathBufType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern",
+            "type"
+          ],
+          "title": "GlobPatternFileSystemPath_for_AbsolutePathBuf",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "special"
+              ],
+              "title": "SpecialFileSystemPath_for_AbsolutePathBufType",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/definitions/FileSystemSpecialPath"
+            }
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "title": "SpecialFileSystemPath_for_AbsolutePathBuf",
+          "type": "object"
+        }
+      ]
+    },
+    "FileSystemSandboxEntry_for_AbsolutePathBuf": {
+      "properties": {
+        "access": {
+          "$ref": "#/definitions/FileSystemAccessMode"
+        },
+        "path": {
+          "$ref": "#/definitions/FileSystemPath_for_AbsolutePathBuf"
+        }
+      },
+      "required": [
+        "access",
+        "path"
+      ],
+      "type": "object"
+    },
+    "FileSystemSpecialPath": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "root"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "RootFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "minimal"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "MinimalFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "project_roots"
+              ],
+              "type": "string"
+            },
+            "subpath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "KindFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "tmpdir"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "TmpdirFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "slash_tmp"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "title": "SlashTmpFileSystemSpecialPath",
+          "type": "object"
+        },
+        {
+          "description": "WARNING: `:special_path` tokens are part of config compatibility. Do not make older runtimes reject newly introduced tokens. New parser support should be additive, while unknown values must stay representable so config from a newer Codex degrades to warn-and-ignore instead of failing to load. Codex 0.112.0 rejected unknown values here, which broke forward compatibility for newer config. Preserves future special-path tokens so older runtimes can ignore them without rejecting config authored by a newer release.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "unknown"
+              ],
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "subpath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ImageDetail": {
       "enum": [
         "auto",
@@ -131,6 +340,60 @@
     },
     "LegacyAppPathString": {
       "type": "string"
+    },
+    "ManagedFileSystemPermissions_for_AbsolutePathBuf": {
+      "description": "Filesystem permissions for profiles where Codex owns sandbox construction.",
+      "oneOf": [
+        {
+          "description": "Apply a managed filesystem sandbox from the listed entries.",
+          "properties": {
+            "entries": {
+              "items": {
+                "$ref": "#/definitions/FileSystemSandboxEntry_for_AbsolutePathBuf"
+              },
+              "type": "array"
+            },
+            "glob_scan_max_depth": {
+              "format": "uint",
+              "minimum": 1.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "restricted"
+              ],
+              "title": "RestrictedManagedFileSystemPermissions_for_AbsolutePathBufType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "entries",
+            "type"
+          ],
+          "title": "RestrictedManagedFileSystemPermissions_for_AbsolutePathBuf",
+          "type": "object"
+        },
+        {
+          "description": "Apply a managed sandbox that allows all filesystem access.",
+          "properties": {
+            "type": {
+              "enum": [
+                "unrestricted"
+              ],
+              "title": "UnrestrictedManagedFileSystemPermissions_for_AbsolutePathBufType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "UnrestrictedManagedFileSystemPermissions_for_AbsolutePathBuf",
+          "type": "object"
+        }
+      ]
     },
     "ModeKind": {
       "description": "Initial collaboration mode to use when the TUI starts.",
@@ -146,6 +409,81 @@
         "enabled"
       ],
       "type": "string"
+    },
+    "NetworkSandboxPolicy": {
+      "enum": [
+        "restricted",
+        "enabled"
+      ],
+      "type": "string"
+    },
+    "PermissionProfile_for_AbsolutePathBuf": {
+      "description": "Canonical active runtime permissions for a conversation, turn, or command.",
+      "oneOf": [
+        {
+          "description": "Codex owns sandbox construction for this profile.",
+          "properties": {
+            "file_system": {
+              "$ref": "#/definitions/ManagedFileSystemPermissions_for_AbsolutePathBuf"
+            },
+            "network": {
+              "$ref": "#/definitions/NetworkSandboxPolicy"
+            },
+            "type": {
+              "enum": [
+                "managed"
+              ],
+              "title": "ManagedPermissionProfile_for_AbsolutePathBufType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "file_system",
+            "network",
+            "type"
+          ],
+          "title": "ManagedPermissionProfile_for_AbsolutePathBuf",
+          "type": "object"
+        },
+        {
+          "description": "Do not apply an outer sandbox.",
+          "properties": {
+            "type": {
+              "enum": [
+                "disabled"
+              ],
+              "title": "DisabledPermissionProfile_for_AbsolutePathBufType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "DisabledPermissionProfile_for_AbsolutePathBuf",
+          "type": "object"
+        },
+        {
+          "description": "Filesystem isolation is enforced by an external caller.",
+          "properties": {
+            "network": {
+              "$ref": "#/definitions/NetworkSandboxPolicy"
+            },
+            "type": {
+              "enum": [
+                "external"
+              ],
+              "title": "ExternalPermissionProfile_for_AbsolutePathBufType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "network",
+            "type"
+          ],
+          "title": "ExternalPermissionProfile_for_AbsolutePathBuf",
+          "type": "object"
+        }
+      ]
     },
     "Personality": {
       "enum": [

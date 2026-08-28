@@ -289,7 +289,6 @@ mod tests {
                 next_action: None,
                 architecture_contract: None,
                 evidence_epoch: 0,
-                evidence_manifest_hash: String::new(),
                 sealed_at: now,
             }),
             validation_calls: Vec::new(),

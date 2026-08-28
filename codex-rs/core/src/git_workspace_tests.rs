@@ -548,6 +548,7 @@ async fn namespace_dependencies_refresh_head_and_root_history() {
     };
     let namespace_before = source.project_namespace().await.expect("namespace");
     let dependencies_before = StableMetadataDependencies::capture_project_namespace(&source)
+        .await
         .expect("namespace dependencies");
 
     run_git(
@@ -557,6 +558,7 @@ async fn namespace_dependencies_refresh_head_and_root_history() {
     .await;
 
     let dependencies_after = StableMetadataDependencies::capture_project_namespace(&source)
+        .await
         .expect("namespace dependencies");
     assert_ne!(dependencies_before, dependencies_after);
     assert_eq!(
@@ -577,6 +579,16 @@ async fn namespace_dependencies_refresh_head_and_root_history() {
 
     let unrelated_namespace = source.project_namespace().await.expect("namespace");
     assert_ne!(namespace_before, unrelated_namespace);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn confirmed_performance_git_dependency_fingerprints_use_blocking_pool() {
+    let runtime_thread = std::thread::current().id();
+    let worker_thread = run_blocking_git_metadata(|| Some(std::thread::current().id()))
+        .await
+        .expect("blocking metadata result");
+
+    assert_ne!(worker_thread, runtime_thread);
 }
 
 #[tokio::test]
@@ -644,6 +656,53 @@ async fn watcher_generation_rejects_stable_identity_caches() {
         }
     );
     assert_eq!(source.project_namespace().await, Some(expected_namespace));
+}
+
+#[tokio::test]
+async fn source_watcher_generation_preserves_git_identity_caches() {
+    let (_temp_dir, repo) = create_clean_git_repo().await;
+    let environments = local_snapshot(repo.clone(), 12).await;
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+    let source = GitWorkspaceMetadataSource {
+        cwd: repo.clone(),
+        repo_root: repo.clone(),
+        cache: Arc::clone(&cache),
+    };
+
+    cache.snapshot(&environments).await;
+    source.metadata().await;
+    source.project_namespace().await.expect("namespace");
+    assert_eq!(cache.root_resolution_count(), 1);
+    {
+        let mut state = cache.state.lock().await;
+        state
+            .metadata
+            .get_mut(repo.as_path())
+            .expect("metadata cache entry")
+            .metadata = StableGitMetadata::default();
+        state
+            .project_namespaces
+            .get_mut(repo.as_path())
+            .expect("namespace cache entry")
+            .namespace = Some("source-event-cache-sentinel".to_string());
+    }
+
+    cache.record_source_change_event(Some(vec![repo.as_path().join("src").join("lib.rs")]));
+
+    cache.snapshot(&environments).await;
+    assert_eq!(cache.root_resolution_count(), 1);
+    assert_eq!(
+        source.metadata().await,
+        GitWorkspaceMetadata {
+            associated_remote_urls: None,
+            latest_git_commit_hash: None,
+            has_changes: Some(false),
+        }
+    );
+    assert_eq!(
+        source.project_namespace().await.as_deref(),
+        Some("source-event-cache-sentinel")
+    );
 }
 
 #[test]
@@ -867,6 +926,72 @@ async fn source_path_observation_ignores_unrelated_changes_and_fails_open() {
         cache.note_host_workspace_mutation_paths(root.path(), &[format!("unrelated/{index}.txt")]);
     }
     assert!(!cache.source_path_change_observation_is_current(&overflowed));
+}
+
+#[test]
+fn source_path_freshness_uses_the_generation_index() {
+    let root = TempDir::new().expect("source observation root");
+    let source = root.path().join("src").join("lib.rs");
+    std::fs::create_dir_all(source.parent().expect("source parent")).expect("create src");
+    std::fs::write(&source, "fn owner() {}\n").expect("write source");
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+    let observation = cache
+        .begin_source_path_change_observation(root.path(), &source, false)
+        .expect("path observation");
+    let unrelated_paths = (0..1_024)
+        .map(|index| root.path().join("unrelated").join(format!("{index}.txt")))
+        .collect();
+
+    cache.record_source_change_event(Some(unrelated_paths));
+
+    assert!(cache.source_path_change_observation_is_current(&observation));
+    assert!(cache.take_source_change_freshness_lookup_count_for_test() < 32);
+}
+
+#[test]
+fn repository_retention_eviction_invalidates_source_observation_and_cached_evidence() {
+    let root = TempDir::new().expect("repository retention root");
+    let first_repo = root.path().join("repo-0");
+    std::fs::create_dir(&first_repo).expect("create first repository");
+    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
+    let observation = cache
+        .begin_source_path_change_observation(&first_repo, &first_repo, true)
+        .expect("first repository observation");
+    {
+        let mut retention = cache
+            .repository_retention
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retention.latest_workspace_evidence.insert(
+            dunce::canonicalize(&first_repo).expect("canonical first repository"),
+            CachedWorkspaceEvidenceIdentity {
+                capture_sequence: 1,
+                identity: None,
+            },
+        );
+    }
+    assert!(cache.source_path_change_observation_is_current(&observation));
+
+    for index in 1..=RETAINED_REPOSITORY_CAPACITY {
+        let repo = root.path().join(format!("repo-{index}"));
+        std::fs::create_dir(&repo).expect("create retained repository");
+        cache
+            .begin_source_path_change_observation(&repo, &repo, true)
+            .expect("retained repository observation");
+    }
+
+    assert!(!cache.source_path_change_observation_is_current(&observation));
+    let retention = cache
+        .repository_retention
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let first_repo = dunce::canonicalize(first_repo).expect("canonical first repository");
+    assert!(retention.source_watch_registrations.len() <= RETAINED_REPOSITORY_CAPACITY);
+    assert!(
+        !retention
+            .latest_workspace_evidence
+            .contains_key(&first_repo)
+    );
 }
 
 #[test]

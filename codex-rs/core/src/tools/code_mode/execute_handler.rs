@@ -8,6 +8,7 @@ use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::ExecContext;
@@ -31,18 +32,36 @@ impl CodeModeExecuteHandler {
         spec: ToolSpec,
         direct_nested_tool_specs: Vec<ToolSpec>,
         deferred_nested_tool_specs: Vec<ToolSpec>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let mut nested_tool_specs = direct_nested_tool_specs;
         // Deferred tools stay out of the model-visible `exec` description, but
         // code running inside the isolate can discover and invoke them through
         // `ALL_TOOLS`. Cache the complete runtime registry once per handler so
         // every cell does not rebuild it from cloned tool specs.
         nested_tool_specs.extend(deferred_nested_tool_specs);
-        let enabled_tools = codex_tools::collect_code_mode_tool_definitions(&nested_tool_specs);
-        Self {
+        let mut enabled_tools = codex_tools::collect_code_mode_tool_definitions(&nested_tool_specs);
+        let mut by_global_name = HashMap::<String, ToolName>::with_capacity(enabled_tools.len());
+        for definition in &enabled_tools {
+            let global_name = codex_code_mode::normalize_code_mode_identifier(&definition.name);
+            if let Some(existing) = by_global_name.get(&global_name) {
+                return Err(format!(
+                    "code mode tool identifier collision: `{existing}` and `{}` both normalize to `{global_name}`",
+                    definition.tool_name
+                ));
+            }
+            by_global_name.insert(global_name, definition.tool_name.clone());
+        }
+        // The rendered descriptions already contain the schema-derived TypeScript
+        // declarations. The isolate consumes only callable metadata, so do not
+        // clone and transport the original JSON schema trees for every cell.
+        for definition in &mut enabled_tools {
+            definition.input_schema = None;
+            definition.output_schema = None;
+        }
+        Ok(Self {
             spec,
             enabled_tools,
-        }
+        })
     }
 
     async fn execute(
@@ -242,5 +261,23 @@ impl CoreToolRuntime for CodeModeExecuteHandler {
 
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Custom { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_runtime_catalog_drops_schema_trees_after_rendering_descriptions() {
+        let nested = crate::tools::handlers::shell_spec::create_write_stdin_tool();
+        let handler = CodeModeExecuteHandler::new(nested.clone(), vec![nested], Vec::new())
+            .expect("build code mode handler");
+
+        assert_eq!(handler.enabled_tools.len(), 1);
+        let definition = &handler.enabled_tools[0];
+        assert!(definition.input_schema.is_none());
+        assert!(definition.output_schema.is_none());
+        assert!(definition.description.contains("exec tool declaration:"));
     }
 }

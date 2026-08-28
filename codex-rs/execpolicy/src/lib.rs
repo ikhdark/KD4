@@ -25,6 +25,5 @@ pub use rule::NetworkRuleProtocol;
 pub use rule::PatternToken;
 pub use rule::PrefixPattern;
 pub use rule::PrefixRule;
-pub use rule::Rule;
 pub use rule::RuleMatch;
 pub use rule::RuleRef;

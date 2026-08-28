@@ -198,6 +198,29 @@ def _timing(*, valid: bool = True, complete: bool = True) -> dict:
 
 
 class Kd4TurnLatencyAuditTest(unittest.TestCase):
+    def test_population_report_omits_retired_validation_counters(self) -> None:
+        timing = _timing()
+        timing["counters"].update(
+            {
+                "executedValidationCount": 2,
+                "reusedValidationCount": 3,
+                "duplicateValidationCount": 4,
+                "forcedFreshValidationCount": 5,
+            }
+        )
+
+        report = kd4_turn_latency_audit._population_report(
+            [{"timing": timing, "status": "completed", "turn_id": "turn-1"}]
+        )
+
+        self.assertEqual(report["executedValidationCount"], 2)
+        for retired in (
+            "reusedValidationCount",
+            "duplicateValidationCount",
+            "forcedFreshValidationCount",
+        ):
+            self.assertNotIn(retired, report)
+
     def test_orchestration_evidence_counts_turns_not_slow_tool_calls(self) -> None:
         records = []
         for turn_id, orchestration_ns in (("first", 700), ("second", 800)):

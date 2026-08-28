@@ -164,7 +164,7 @@ async fn user_turn_personality_none_does_not_add_update_message() -> anyhow::Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_personality_some_sets_instructions_template() -> anyhow::Result<()> {
+async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -193,17 +193,16 @@ async fn config_personality_some_sets_instructions_template() -> anyhow::Result<
     let instructions_text = request.instructions_text();
 
     assert!(
-        instructions_text.contains(LOCAL_FRIENDLY_TEMPLATE),
-        "expected personality update to include the local friendly template, got: {instructions_text:?}"
+        !instructions_text.contains(LOCAL_FRIENDLY_TEMPLATE),
+        "base instructions must remain personality-neutral, got: {instructions_text:?}"
     );
 
     let developer_texts = request.message_input_texts("developer");
-    for text in developer_texts {
-        assert!(
-            !text.contains("<personality_spec>"),
-            "expected no personality update message in developer input"
-        );
-    }
+    let personality_text = developer_texts
+        .iter()
+        .find(|text| text.contains("<personality_spec>"))
+        .expect("expected personality message in developer input");
+    assert!(personality_text.contains(LOCAL_FRIENDLY_TEMPLATE));
 
     Ok(())
 }
@@ -288,9 +287,15 @@ async fn default_personality_is_pragmatic_without_config_toml() -> anyhow::Resul
     let request = resp_mock.single_request();
     let instructions_text = request.instructions_text();
     assert!(
-        instructions_text.contains(LOCAL_PRAGMATIC_TEMPLATE),
-        "expected default friendly template, got: {instructions_text:?}"
+        !instructions_text.contains(LOCAL_PRAGMATIC_TEMPLATE),
+        "base instructions must remain personality-neutral, got: {instructions_text:?}"
     );
+    let developer_texts = request.message_input_texts("developer");
+    let personality_text = developer_texts
+        .iter()
+        .find(|text| text.contains("<personality_spec>"))
+        .expect("expected default personality message in developer input");
+    assert!(personality_text.contains(LOCAL_PRAGMATIC_TEMPLATE));
 
     Ok(())
 }
@@ -730,13 +735,20 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
     let instructions_text = request.instructions_text();
 
     assert!(
-        instructions_text.contains(friendly_personality_message),
-        "expected instructions to include the remote friendly personality template, got: {instructions_text:?}"
+        !instructions_text.contains(friendly_personality_message),
+        "base instructions must remain personality-neutral, got: {instructions_text:?}"
     );
     assert!(
         !instructions_text.contains(default_personality_message),
         "expected instructions to skip the remote default personality template, got: {instructions_text:?}"
     );
+    let developer_texts = request.message_input_texts("developer");
+    let personality_text = developer_texts
+        .iter()
+        .find(|text| text.contains("<personality_spec>"))
+        .expect("expected remote personality message in developer input");
+    assert!(personality_text.contains(friendly_personality_message));
+    assert!(!personality_text.contains(default_personality_message));
 
     Ok(())
 }

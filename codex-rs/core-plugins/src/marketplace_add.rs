@@ -163,7 +163,7 @@ where
             staging_root.display()
         ))
     })?;
-    let staged_root = Builder::new()
+    let staged_dir = Builder::new()
         .prefix("marketplace-add-")
         .tempdir_in(&staging_root)
         .map_err(|err| {
@@ -172,7 +172,7 @@ where
                 staging_root.display()
             ))
         })?;
-    let staged_root = staged_root.keep();
+    let staged_root = staged_dir.path().to_path_buf();
 
     stage_marketplace_source(&source, &sparse_paths, &staged_root, clone_source)?;
 
@@ -314,6 +314,39 @@ url = "https://github.com/example/allowed.git"
                 .path()
                 .join(codex_config::CONFIG_TOML_FILE)
                 .exists()
+        );
+    }
+
+    #[test]
+    fn failed_git_clone_removes_partial_staging_directory() {
+        let codex_home = TempDir::new().expect("create Codex home");
+
+        let err = add_marketplace_sync_with_cloner(
+            codex_home.path(),
+            &ConfigRequirements::default(),
+            MarketplaceAddRequest {
+                source: "https://github.com/owner/repo.git".to_string(),
+                ref_name: None,
+                sparse_paths: Vec::new(),
+            },
+            |_url, _ref_name, _sparse_paths, destination| {
+                fs::write(destination.join("partial-clone"), "partial").map_err(|err| {
+                    MarketplaceAddError::Internal(format!("failed to seed partial clone: {err}"))
+                })?;
+                Err(MarketplaceAddError::Internal(
+                    "forced clone failure".to_string(),
+                ))
+            },
+        )
+        .expect_err("clone failure should be reported");
+
+        assert!(err.to_string().contains("forced clone failure"));
+        let staging_root = marketplace_staging_root(&marketplace_install_root(codex_home.path()));
+        assert_eq!(
+            fs::read_dir(staging_root)
+                .expect("staging root should exist")
+                .count(),
+            0
         );
     }
 

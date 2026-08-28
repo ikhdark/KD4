@@ -10,6 +10,7 @@ use chrono::Utc;
 use codex_protocol::auth::PlanType;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::ConnectionFailedError;
+use codex_protocol::error::ResponseStreamFailed;
 use codex_protocol::error::RetryLimitReachedError;
 use codex_protocol::error::UnexpectedResponseError;
 use codex_protocol::error::UsageLimitReachedError;
@@ -23,11 +24,15 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
         ApiError::Retryable { message, delay } => CodexErr::Stream(message, delay),
-        ApiError::Stream(msg) => CodexErr::Stream(msg, None),
+        ApiError::Stream(message) => CodexErr::ResponseStreamFailed(ResponseStreamFailed {
+            message,
+            status: None,
+            request_id: None,
+        }),
         ApiError::ServerOverloaded => CodexErr::ServerOverloaded,
         ApiError::Api { status, message } => {
             let user_message = api_error_user_message(status, &message);
-            CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            map_unexpected_response(UnexpectedResponseError {
                 status,
                 body: message,
                 user_message,
@@ -115,7 +120,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                         request_id: extract_request_tracking_id(headers.as_ref()),
                     })
                 } else {
-                    CodexErr::UnexpectedStatus(UnexpectedResponseError {
+                    map_unexpected_response(UnexpectedResponseError {
                         status,
                         user_message: api_error_user_message(status, &body_text),
                         body: body_text,
@@ -142,9 +147,15 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     status,
                 })
             }
-            TransportError::Network(msg)
-            | TransportError::PreDispatch(msg)
-            | TransportError::Build(msg) => CodexErr::Stream(msg, None),
+            TransportError::PreDispatch(msg) => CodexErr::PreDispatchRetryExhausted(msg),
+            TransportError::Network(message) => {
+                CodexErr::ResponseStreamFailed(ResponseStreamFailed {
+                    message,
+                    status: None,
+                    request_id: None,
+                })
+            }
+            TransportError::Build(msg) => CodexErr::Stream(msg, None),
         },
         ApiError::RateLimit(msg) => CodexErr::Stream(msg, None),
     }
@@ -170,14 +181,23 @@ fn extract_request_tracking_id(headers: Option<&HeaderMap>) -> Option<String> {
 }
 
 fn api_error_user_message(status: http::StatusCode, body: &str) -> Option<String> {
-    if status == http::StatusCode::FORBIDDEN
-        && body.contains("Cloudflare")
-        && body.contains("blocked")
-    {
+    if is_cloudflare_region_block(status, body) {
         Some(format!("{CLOUDFLARE_BLOCKED_MESSAGE} (status {status})"))
     } else {
         None
     }
+}
+
+fn map_unexpected_response(error: UnexpectedResponseError) -> CodexErr {
+    if is_cloudflare_region_block(error.status, &error.body) {
+        CodexErr::RegionRestricted(error)
+    } else {
+        CodexErr::UnexpectedStatus(error)
+    }
+}
+
+fn is_cloudflare_region_block(status: http::StatusCode, body: &str) -> bool {
+    status == http::StatusCode::FORBIDDEN && body.contains("Cloudflare") && body.contains("blocked")
 }
 
 fn extract_request_id(headers: Option<&HeaderMap>) -> Option<String> {

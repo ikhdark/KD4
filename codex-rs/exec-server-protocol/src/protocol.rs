@@ -75,6 +75,10 @@ pub struct InitializeResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentInfo {
+    /// Operating system reported by the exec server. New servers emit `windows`.
+    /// Missing values are retained for compatibility with legacy Windows servers.
+    #[serde(default)]
+    pub operating_system: Option<String>,
     pub shell: ShellInfo,
     /// Working directory inherited by the exec-server process.
     #[serde(default)]
@@ -85,6 +89,7 @@ impl EnvironmentInfo {
     /// Returns information about the current local exec-server process.
     pub fn local() -> Self {
         Self {
+            operating_system: Some("windows".to_string()),
             shell: codex_shell_command::shell_detect::default_user_shell().into(),
             cwd: std::env::current_dir()
                 .ok()
@@ -623,7 +628,15 @@ mod tests {
     }
 
     #[test]
-    fn environment_info_accepts_legacy_response_without_cwd() {
+    fn environment_info_serializes_windows_operating_system() {
+        let info = EnvironmentInfo::local();
+        let serialized = serde_json::to_value(&info).expect("serialize environment info");
+
+        assert_eq!(serialized["operatingSystem"], "windows");
+    }
+
+    #[test]
+    fn environment_info_accepts_legacy_response_without_operating_system_or_cwd() {
         let info: EnvironmentInfo = serde_json::from_value(serde_json::json!({
             "shell": { "name": "zsh", "path": "/bin/zsh" }
         }))
@@ -632,6 +645,7 @@ mod tests {
         assert_eq!(
             info,
             EnvironmentInfo {
+                operating_system: None,
                 shell: ShellInfo {
                     name: "zsh".to_string(),
                     path: "/bin/zsh".to_string(),

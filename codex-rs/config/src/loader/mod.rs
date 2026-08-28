@@ -77,8 +77,7 @@ async fn first_layer_config_error_from_entries(layers: &[ConfigLayerEntry]) -> O
 /// composed with config-style TOML merging plus field-specific handling for
 /// hooks, rules, deny-read permissions, and remote sandbox config:
 ///
-/// - system    `/etc/codex/requirements.toml` (Unix) or
-///   `%ProgramData%\OpenAI\Codex\requirements.toml` (Windows)
+/// - system    `%ProgramData%\OpenAI\Codex\requirements.toml`
 /// - cloud:    enterprise-managed cloud config bundle requirements
 /// - legacy:   managed_config.toml reinterpreted as requirements.toml
 /// - admin:    managed preferences (*)
@@ -523,7 +522,7 @@ const LEGACY_FEATURE_ALIASES: &[(&str, &str)] = &[
     ("web_search", "web_search_request"),
     ("imagegenext", "image_generation"),
     ("collab", "multi_agent"),
-    ("memory_tool", "memory_tool"),
+    ("memory_tool", "memories"),
     ("codex_hooks", "hooks"),
 ];
 
@@ -768,7 +767,7 @@ fn validate_cli_overrides_strictly(
     Ok(())
 }
 
-/// If available, load requirements from the platform's system `requirements.toml`
+/// If available, load requirements from the Windows system `requirements.toml`
 /// location as a requirements layer.
 pub async fn load_requirements_toml(
     fs: &dyn ExecutorFileSystem,
@@ -1557,7 +1556,7 @@ async fn merge_root_checkout_project_hooks(
     Ok(config)
 }
 /// The legacy mechanism for specifying admin-enforced configuration is to read
-/// from a file like `/etc/codex/managed_config.toml` that has the same
+/// from `%ProgramData%\OpenAI\Codex\managed_config.toml`, which has the same
 /// structure as `config.toml` where fields like `approval_policy` can specify
 /// exactly one value rather than a list of allowed values.
 ///

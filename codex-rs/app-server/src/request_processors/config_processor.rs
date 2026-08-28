@@ -56,6 +56,21 @@ const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
     "tool_suggest",
 ];
 
+fn runtime_refreshable_features_for_batch(params: &ConfigBatchWriteParams) -> Vec<Feature> {
+    let refresh_all = params.edits.iter().any(|edit| edit.key_path == "features");
+    SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT
+        .iter()
+        .filter(|feature_key| {
+            refresh_all
+                || params
+                    .edits
+                    .iter()
+                    .any(|edit| edit.key_path.strip_prefix("features.") == Some(**feature_key))
+        })
+        .filter_map(|feature_key| user_settable_feature_for_key(feature_key))
+        .collect()
+}
+
 #[derive(Clone)]
 pub(crate) struct ConfigRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
@@ -210,6 +225,7 @@ impl ConfigRequestProcessor {
         params: ConfigBatchWriteParams,
     ) -> Result<ConfigWriteResponse, JSONRPCErrorError> {
         let reload_user_config = params.reload_user_config;
+        let refreshed_features = runtime_refreshable_features_for_batch(&params);
         let pending_changes = codex_core_plugins::toggles::collect_plugin_enabled_candidates(
             params
                 .edits
@@ -223,7 +239,7 @@ impl ConfigRequestProcessor {
             .map_err(map_error)?;
         self.emit_plugin_toggle_events(pending_changes).await;
         if reload_user_config {
-            self.reload_user_config(&[]).await;
+            self.reload_user_config(&refreshed_features).await;
         }
         Ok(response)
     }

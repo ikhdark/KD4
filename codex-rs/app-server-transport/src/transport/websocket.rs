@@ -132,14 +132,7 @@ pub async fn start_websocket_acceptor(
     shutdown_token: CancellationToken,
     auth_policy: WebsocketAuthPolicy,
 ) -> IoResult<JoinHandle<()>> {
-    if is_unauthenticated_non_loopback_listener(bind_address, &auth_policy) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "refusing to start non-loopback websocket listener {bind_address} without auth; configure `--ws-auth capability-token` or `--ws-auth signed-bearer-token`"
-            ),
-        ));
-    }
+    validate_websocket_listener(bind_address, &auth_policy)?;
     let listener = TcpListener::bind(bind_address).await?;
     let local_addr = listener.local_addr()?;
     print_websocket_startup_banner(local_addr);
@@ -167,6 +160,21 @@ pub async fn start_websocket_acceptor(
         }
         info!("websocket acceptor shutting down");
     }))
+}
+
+pub fn validate_websocket_listener(
+    bind_address: SocketAddr,
+    auth_policy: &WebsocketAuthPolicy,
+) -> IoResult<()> {
+    if is_unauthenticated_non_loopback_listener(bind_address, auth_policy) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to start non-loopback websocket listener {bind_address} without auth; configure `--ws-auth capability-token` or `--ws-auth signed-bearer-token`"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(

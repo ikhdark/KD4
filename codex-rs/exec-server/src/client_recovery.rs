@@ -481,15 +481,24 @@ impl Inner {
                 Ok(true) => self.remove_session_if(process_id, session),
                 Ok(false) => {}
                 Err(error) => {
-                    let terminated: Result<TerminateResponse, ExecServerError> = rpc_client
-                        .call_for_cleanup(
-                            EXEC_TERMINATE_METHOD,
-                            &TerminateParams {
-                                process_id: process_id.clone(),
-                            },
-                        )
-                        .await
-                        .map_err(ExecServerError::from);
+                    let terminated: Result<TerminateResponse, ExecServerError> = loop {
+                        let result: Result<TerminateResponse, ExecServerError> = rpc_client
+                            .call_for_cleanup(
+                                EXEC_TERMINATE_METHOD,
+                                &TerminateParams {
+                                    process_id: process_id.clone(),
+                                },
+                                SESSION_RECOVERY_TIMEOUT,
+                            )
+                            .await
+                            .map_err(ExecServerError::from);
+                        match result {
+                            Ok(response) if response.running => {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            result => break result,
+                        }
+                    };
                     if let Err(terminate_error) = terminated
                         && is_transport_closed_error(&terminate_error)
                     {
@@ -559,7 +568,7 @@ impl ExecServerClient {
     }
 }
 
-fn is_retryable_recovery_error(error: &ExecServerError) -> bool {
+pub(super) fn is_retryable_recovery_error(error: &ExecServerError) -> bool {
     is_transport_closed_error(error)
         || matches!(
             error,

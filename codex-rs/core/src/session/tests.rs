@@ -15,6 +15,7 @@ use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillRenderSideEffects;
 use crate::skills::render::SkillMetadataBudget;
 use crate::test_support::models_manager_with_provider;
+use crate::tools::context::ToolDispatchState;
 use crate::tools::format_exec_output_str;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
@@ -32,6 +33,16 @@ use codex_config::types::ToolSuggestDisabledTool;
 use codex_core_skills::HostSkillsSnapshot;
 use core_test_support::test_codex::local_selections;
 
+use codex_agent_task_store::AcceptanceCriterion;
+use codex_agent_task_store::AgentRole;
+use codex_agent_task_store::AgentTaskBindingDraft;
+use codex_agent_task_store::AssignmentAdmissionOrigin;
+use codex_agent_task_store::AssignmentDraft;
+use codex_agent_task_store::AssignmentId;
+use codex_agent_task_store::AttemptId;
+use codex_agent_task_store::CapabilityProfile;
+use codex_agent_task_store::ValidationCallStatus;
+use codex_agent_task_store::WorkspaceStrategy;
 use codex_features::Feature;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
@@ -73,6 +84,47 @@ use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_utils_path_uri::PathUri;
 use tracing::Span;
+
+#[tokio::test]
+async fn session_event_channel_applies_ordered_backpressure() {
+    let (tx, rx) = event_channel();
+    for index in 0..EVENT_CHANNEL_CAPACITY {
+        tx.try_send(Event {
+            id: index.to_string(),
+            msg: EventMsg::Warning(WarningEvent {
+                message: index.to_string(),
+            }),
+        })
+        .expect("event channel should accept events up to its capacity");
+    }
+
+    let blocked_sender = tokio::spawn(async move {
+        tx.send(Event {
+            id: "overflow".to_string(),
+            msg: EventMsg::Warning(WarningEvent {
+                message: "overflow".to_string(),
+            }),
+        })
+        .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !blocked_sender.is_finished(),
+        "producer should wait once the finite event channel is full"
+    );
+
+    assert_eq!(rx.recv().await.expect("first event").id, "0");
+    blocked_sender
+        .await
+        .expect("blocked sender task")
+        .expect("event receiver should remain open");
+
+    let mut last_id = String::new();
+    for _ in 0..EVENT_CHANNEL_CAPACITY {
+        last_id = rx.recv().await.expect("queued event").id;
+    }
+    assert_eq!(last_id, "overflow");
+}
 
 #[test]
 fn model_prefetch_only_runs_for_an_explicit_model_that_needs_refresh() {
@@ -277,40 +329,70 @@ async fn session_persistent_ledgers_load_concurrently() {
 }
 
 #[tokio::test]
-async fn tool_history_persistence_queue_coalesces_superseded_snapshots_before_flush() {
+async fn tool_history_persistence_queue_batches_mutations_without_dropping_them() {
     let codex_home = tempfile::tempdir().expect("create codex home");
     let thread_id = ThreadId::new();
     let io_gate = Arc::new(Semaphore::new(/*permits*/ 1));
     let held_io_gate = io_gate.acquire().await.expect("acquire I/O gate");
-    let queue = super::session::ToolHistoryPersistenceQueue::new(Arc::clone(&io_gate));
+    let queue = super::session::ToolHistoryPersistenceQueue::new(
+        Arc::clone(&io_gate),
+        codex_home.path().to_path_buf(),
+        thread_id,
+        crate::tool_history::ToolHistoryState::default(),
+    );
 
     for index in 0..32 {
-        let mut snapshot = crate::tool_history::ToolHistoryState::default();
-        snapshot.register_non_workspace_code_mode_call(format!("snapshot-{index}"));
-        queue.enqueue(
-            codex_home.path(),
-            &thread_id,
-            snapshot,
+        queue.enqueue_mutation(
+            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: format!("snapshot-{index}"),
+            },
             "test completed-tool history metadata",
         );
     }
 
     drop(held_io_gate);
-    queue.flush().await;
+    queue.drain().await;
 
-    let persisted = std::fs::read_to_string(
-        codex_home
-            .path()
-            .join("tool-history")
-            .join(format!("{thread_id}.json")),
-    )
-    .expect("read persisted tool-history ledger");
-    assert!(persisted.contains("snapshot-31"));
-    assert!(!persisted.contains("snapshot-30"));
+    let persisted =
+        crate::tool_history::load_tool_history_state(codex_home.path(), &thread_id.to_string())
+            .await;
+    let (persisted, warning) = persisted.into_state_and_warning();
+    assert_eq!(warning, None);
+    let persisted = serde_json::to_string(&persisted).expect("serialize persisted history");
+    for index in 0..32 {
+        assert!(persisted.contains(&format!("snapshot-{index}")));
+    }
     assert!(
-        queue.persisted_snapshot_count() <= 2,
-        "the worker may persist one in-flight snapshot and the newest replacement"
+        queue.persisted_batch_count() <= 2,
+        "the worker may persist one in-flight mutation and one accumulated batch"
     );
+}
+
+#[tokio::test]
+async fn prepare_conversation_items_keeps_normalized_text_items_borrowed() {
+    let (session, turn_context) = make_session_and_context().await;
+    let mut response_item = user_message("hello");
+    response_item.set_id(Some(ResponseItemId::new("msg")));
+    response_item.set_turn_id_if_missing(&turn_context.sub_id);
+
+    let items = session.prepare_conversation_items_for_history(
+        &turn_context,
+        std::slice::from_ref(&response_item),
+    );
+
+    assert!(matches!(items, Cow::Borrowed(_)));
+}
+
+#[test]
+fn raw_response_event_needs_no_post_dispatch_copy() {
+    let source = EventMsg::RawResponseItem(RawResponseItemEvent {
+        item: user_message("large transient item"),
+    });
+
+    let prepared = PreparedEventDispatch::new(&source, /*show_raw_agent_reasoning*/ false);
+
+    assert!(prepared.terminal_source.is_none());
+    assert!(prepared.legacy_events.is_empty());
 }
 
 #[test]
@@ -347,6 +429,24 @@ impl StepContext {
         );
         self
     }
+}
+
+#[tokio::test]
+async fn raw_response_item_delivery_does_not_append_a_transient_rollout_event() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    let before = store.calls().await.append_items_requests;
+
+    session
+        .record_conversation_items(&turn_context, &[user_message("persist once")])
+        .await;
+
+    let event = rx.recv().await.expect("raw response item event");
+    assert!(matches!(event.msg, EventMsg::RawResponseItem(_)));
+    assert_eq!(store.calls().await.append_items_requests, before + 1);
 }
 
 fn accepted_context(mut item: TurnContextItem) -> TurnContextItem {
@@ -991,6 +1091,13 @@ fn developer_message_texts(items: &[ResponseItem]) -> Vec<Vec<&str>> {
         .collect()
 }
 
+fn multi_agent_usage_hint_payloads(items: &[ResponseItem]) -> Vec<&str> {
+    items
+        .iter()
+        .filter_map(crate::stable_context::multi_agent_usage_hint_payload)
+        .collect()
+}
+
 fn user_input_texts(items: &[ResponseItem]) -> Vec<&str> {
     items
         .iter()
@@ -1217,6 +1324,7 @@ fn validated_network_policy_amendment_host_rejects_mismatch() {
 
 #[tokio::test]
 async fn start_managed_network_proxy_applies_execpolicy_network_rules() -> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
     let permission_profile = PermissionProfile::workspace_write();
     let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
         NetworkProxyConfig::default(),
@@ -1233,6 +1341,7 @@ async fn start_managed_network_proxy_applies_execpolicy_network_rules() -> anyho
 
     let (started_proxy, _) = Session::start_managed_network_proxy(
         &spec,
+        codex_home.path(),
         &exec_policy,
         &permission_profile,
         /*network_policy_decider*/ None,
@@ -1253,6 +1362,7 @@ async fn start_managed_network_proxy_applies_execpolicy_network_rules() -> anyho
 #[tokio::test]
 async fn start_managed_network_proxy_ignores_invalid_execpolicy_network_rules() -> anyhow::Result<()>
 {
+    let codex_home = tempfile::tempdir()?;
     let permission_profile = PermissionProfile::workspace_write();
     let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
         NetworkProxyConfig::default(),
@@ -1278,6 +1388,7 @@ async fn start_managed_network_proxy_ignores_invalid_execpolicy_network_rules() 
 
     let (started_proxy, _) = Session::start_managed_network_proxy(
         &spec,
+        codex_home.path(),
         &exec_policy,
         &permission_profile,
         /*network_policy_decider*/ None,
@@ -1297,6 +1408,7 @@ async fn start_managed_network_proxy_ignores_invalid_execpolicy_network_rules() 
 
 #[tokio::test]
 async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
     let full_access_permission_profile = PermissionProfile::Disabled;
     let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
         NetworkProxyConfig::default(),
@@ -1318,6 +1430,7 @@ async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::R
 
     let (started_proxy, _) = Session::start_managed_network_proxy(
         &spec,
+        codex_home.path(),
         &exec_policy,
         &full_access_permission_profile,
         Some(network_policy_decider),
@@ -1365,7 +1478,7 @@ async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::R
 
 #[tokio::test]
 async fn new_turn_refreshes_managed_network_proxy_for_sandbox_change() -> anyhow::Result<()> {
-    let (session, _turn_context) = make_session_and_context().await;
+    let (session, turn_context) = make_session_and_context().await;
     let initial_permission_profile = PermissionProfile::workspace_write();
 
     let mut network_config = NetworkProxyConfig::default();
@@ -1386,6 +1499,7 @@ async fn new_turn_refreshes_managed_network_proxy_for_sandbox_change() -> anyhow
     )?;
     let (started_proxy, _) = Session::start_managed_network_proxy(
         &spec,
+        turn_context.config.codex_home.as_path(),
         &Policy::empty(),
         &initial_permission_profile,
         /*network_policy_decider*/ None,
@@ -2827,6 +2941,65 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
     assert_eq!(actual, Some(info2));
 }
 
+#[test]
+fn startup_rollout_facts_reduce_startup_consumers_in_one_pass() {
+    let info = TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 10,
+            output_tokens: 20,
+            reasoning_output_tokens: 5,
+            total_tokens: 125,
+        },
+        last_token_usage: TokenUsage {
+            input_tokens: 10,
+            cached_input_tokens: 1,
+            output_tokens: 2,
+            reasoning_output_tokens: 0,
+            total_tokens: 12,
+        },
+        model_context_window: Some(2_000),
+    };
+    let mut communication = InterAgentCommunication::new(
+        AgentPath::root().join("worker").expect("worker path"),
+        AgentPath::root(),
+        Vec::new(),
+        "child done".to_string(),
+        /*trigger_turn*/ false,
+    );
+    communication.id = Some(ResponseItemId::from_server("mail-1".to_string()));
+    let history = InitialHistory::Forked(vec![
+        RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+            info: Some(info.clone()),
+            rate_limits: None,
+        })),
+        RolloutItem::InterAgentCommunication(communication),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-open".to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        })),
+    ]);
+
+    let facts = StartupRolloutFacts::reduce(ThreadId::default(), &history);
+
+    assert_eq!(facts.initial_messages.as_ref().map(Vec::len), Some(2));
+    assert_eq!(
+        facts.terminal_recovery_turn_id.as_deref(),
+        Some("turn-open")
+    );
+    assert_eq!(
+        facts.mailbox_communication_ids,
+        vec![codex_protocol::ResponseItemId::from_server(
+            "mail-1".to_string()
+        )]
+    );
+    assert!(facts.has_prior_user_turns);
+    assert_eq!(facts.last_token_info, Some(info));
+}
+
 #[tokio::test]
 async fn recompute_token_usage_uses_session_base_instructions() {
     let (session, turn_context) = make_session_and_context().await;
@@ -2865,6 +3038,46 @@ async fn recompute_token_usage_uses_session_base_instructions() {
         .last_token_usage
         .total_tokens;
     assert_eq!(actual_tokens, expected_tokens.max(0));
+}
+
+#[tokio::test]
+async fn token_estimate_reuses_turn_owned_base_instructions() {
+    let (session, mut turn_context) = make_session_and_context().await;
+    let turn_instructions = BaseInstructions {
+        text: "TURN_OWNED_INSTRUCTIONS_ONLY".repeat(120),
+    };
+    turn_context.base_instructions = Arc::new(turn_instructions.clone());
+
+    let item = user_message("hello");
+    session
+        .record_conversation_items(&turn_context, std::slice::from_ref(&item))
+        .await;
+
+    let history = session.clone_history().await;
+    let expected_tokens = history
+        .estimate_token_count_with_base_instructions(&turn_instructions)
+        .expect("estimate with turn-owned instructions");
+    assert_eq!(
+        history.estimate_token_count(&turn_context),
+        Some(expected_tokens)
+    );
+}
+
+#[tokio::test]
+async fn new_turn_uses_active_model_base_instead_of_persisted_session_base() {
+    let (session, _turn_context) = make_session_and_context().await;
+    {
+        let mut state = session.state.lock().await;
+        state.session_configuration.base_instructions = "stale persisted base".to_string();
+    }
+
+    let next = session.new_default_turn().await;
+
+    assert_eq!(
+        next.base_instructions.text,
+        next.model_info.base_instructions
+    );
+    assert_ne!(next.base_instructions.text, "stale persisted base");
 }
 
 #[tokio::test]
@@ -4315,7 +4528,7 @@ async fn set_rate_limits_retains_previous_credits() {
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| model_info.base_instructions.clone()),
         compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
@@ -4425,7 +4638,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| model_info.base_instructions.clone()),
         compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
@@ -4561,6 +4774,9 @@ async fn turn_context_with_model_updates_model_fields() {
     let (session, mut turn_context) = make_session_and_context().await;
     turn_context.configured_reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     turn_context.reasoning_effort = Some(ReasoningEffortConfig::Minimal);
+    turn_context.kd4_workflow_enabled = true;
+    let durable_history_completed_commits =
+        Arc::clone(&turn_context.durable_history_completed_commits);
     let updated = turn_context
         .with_model("gpt-5.4".to_string(), &session.services.models_manager)
         .await;
@@ -4576,6 +4792,11 @@ async fn turn_context_with_model_updates_model_fields() {
     assert_eq!(updated.config.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(updated.collaboration_mode.model(), "gpt-5.4");
     assert_eq!(updated.model_info, expected_model_info);
+    assert!(updated.kd4_workflow_enabled);
+    assert!(Arc::ptr_eq(
+        &updated.durable_history_completed_commits,
+        &durable_history_completed_commits,
+    ));
     assert_eq!(
         updated.configured_reasoning_effort,
         Some(ReasoningEffortConfig::Minimal)
@@ -4972,7 +5193,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| model_info.base_instructions.clone()),
         compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
@@ -5018,6 +5239,7 @@ async fn emit_subagent_session_started_includes_fork_lineage_and_originator() {
         auth_manager,
         server.uri(),
         /*analytics_enabled*/ Some(true),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     );
 
     let parent_thread_id = ThreadId::new();
@@ -5947,6 +6169,7 @@ async fn notify_request_permissions_response_ignores_unmatched_call_id() {
 #[tokio::test]
 async fn record_granted_request_permissions_for_turn_uses_originating_turn() {
     let (session, _turn_context) = make_session_and_context().await;
+    let approval_scope_id = "local-scope";
     let originating_active_turn = ActiveTurn::default();
     let originating_turn_state = Arc::clone(&originating_active_turn.turn_state);
     *session.active_turn.lock().await = Some(originating_active_turn);
@@ -5968,7 +6191,7 @@ async fn record_granted_request_permissions_for_turn_uses_originating_turn() {
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
             },
-            codex_exec_server::LOCAL_ENVIRONMENT_ID,
+            approval_scope_id,
             Some(&originating_turn_state),
         )
         .await;
@@ -5977,26 +6200,24 @@ async fn record_granted_request_permissions_for_turn_uses_originating_turn() {
         originating_turn_state
             .lock()
             .await
-            .granted_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID),
+            .granted_permissions(approval_scope_id),
         Some(requested_permissions.into())
     );
     assert_eq!(
         current_turn_state
             .lock()
             .await
-            .granted_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID),
+            .granted_permissions(approval_scope_id),
         None
     );
     assert_eq!(
-        session
-            .granted_turn_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
-            .await,
+        session.granted_turn_permissions(approval_scope_id).await,
         None
     );
 }
 
 #[tokio::test]
-async fn request_permission_grants_are_environment_keyed() {
+async fn request_permission_grants_are_approval_scope_keyed() {
     let (session, _turn_context) = make_session_and_context().await;
     let originating_active_turn = ActiveTurn::default();
     let originating_turn_state = Arc::clone(&originating_active_turn.turn_state);
@@ -6015,7 +6236,7 @@ async fn request_permission_grants_are_environment_keyed() {
                 scope: PermissionGrantScope::Turn,
                 strict_auto_review: false,
             },
-            "remote",
+            "remote-scope",
             Some(&originating_turn_state),
         )
         .await;
@@ -6023,10 +6244,10 @@ async fn request_permission_grants_are_environment_keyed() {
     {
         let turn_state = originating_turn_state.lock().await;
         assert_eq!(
-            turn_state.granted_permissions("remote"),
+            turn_state.granted_permissions("remote-scope"),
             Some(requested_permissions.clone().into())
         );
-        assert_eq!(turn_state.granted_permissions("local"), None);
+        assert_eq!(turn_state.granted_permissions("local-scope"), None);
     }
 
     session
@@ -6036,16 +6257,19 @@ async fn request_permission_grants_are_environment_keyed() {
                 scope: PermissionGrantScope::Session,
                 strict_auto_review: false,
             },
-            "remote",
+            "remote-scope",
             /*originating_turn_state*/ None,
         )
         .await;
 
     assert_eq!(
-        session.granted_session_permissions("remote").await,
+        session.granted_session_permissions("remote-scope").await,
         Some(requested_permissions.into())
     );
-    assert_eq!(session.granted_session_permissions("local").await, None);
+    assert_eq!(
+        session.granted_session_permissions("local-scope").await,
+        None
+    );
 }
 
 #[tokio::test]
@@ -6097,7 +6321,7 @@ fn strict_auto_review_session_scope_grants_no_permissions() {
             scope: PermissionGrantScope::Session,
             strict_auto_review: true,
         },
-        Some(std::path::Path::new("/tmp")),
+        &PathUri::parse("file:///tmp").expect("valid cwd URI"),
     );
 
     assert_eq!(
@@ -6199,7 +6423,7 @@ async fn request_permissions_emits_event_when_granular_policy_allows_requests() 
 }
 
 #[tokio::test]
-async fn request_permissions_supports_network_grants_for_foreign_environments() {
+async fn request_permissions_preserves_filesystem_grants_for_foreign_environments() {
     let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
     *session.active_turn.lock().await = Some(ActiveTurn::default());
     Arc::get_mut(&mut turn_context)
@@ -6217,10 +6441,31 @@ async fn request_permissions_supports_network_grants_for_foreign_environments() 
     let foreign_cwd = PathUri::parse("file:///home/remote/project").expect("foreign POSIX cwd");
 
     assert!(foreign_cwd.to_abs_path().is_err());
+    let remote_environment = Arc::new(codex_exec_server::Environment::default_for_tests());
+    let approval_scope_id = remote_environment.approval_scope_id().to_string();
+    let shell = turn_context
+        .environments
+        .primary()
+        .expect("primary environment")
+        .shell
+        .clone();
+    Arc::get_mut(&mut turn_context)
+        .expect("single thread settings ref")
+        .environments
+        .turn_environments[0] = TurnEnvironment::new(
+        "remote-environment".to_string(),
+        remote_environment,
+        foreign_cwd.clone(),
+        shell,
+    );
+    let granted_path = foreign_cwd
+        .join("granted-output")
+        .expect("foreign grant path");
     let requested_permissions = RequestPermissionProfile {
-        network: Some(codex_protocol::models::NetworkPermissions {
-            enabled: Some(true),
-        }),
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(Vec::new()),
+            Some(vec![granted_path]),
+        )),
         ..RequestPermissionProfile::default()
     };
     let expected_response = codex_protocol::request_permissions::RequestPermissionsResponse {
@@ -6230,29 +6475,26 @@ async fn request_permissions_supports_network_grants_for_foreign_environments() 
     };
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
-    let call_id = "remote-network-permission".to_string();
+    let call_id = "remote-filesystem-permission".to_string();
 
     let handle = tokio::spawn({
         let session = Arc::clone(&session);
         let turn_context = Arc::clone(&turn_context);
         let call_id = call_id.clone();
         let requested_permissions = requested_permissions.clone();
-        let foreign_cwd = foreign_cwd.clone();
         async move {
-            let mut environment = turn_context
+            let environment = turn_context
                 .environments
                 .primary()
                 .expect("primary environment")
                 .selection();
-            environment.environment_id = "remote-environment".to_string();
-            environment.cwd = foreign_cwd;
             session
                 .request_permissions_for_environment(
                     &turn_context,
                     call_id,
                     RequestPermissionsArgs {
                         environment_id: Some("remote-environment".to_string()),
-                        reason: Some("need remote network".to_string()),
+                        reason: Some("need a remote output directory".to_string()),
                         permissions: requested_permissions,
                     },
                     environment,
@@ -6275,6 +6517,7 @@ async fn request_permissions_supports_network_grants_for_foreign_environments() 
         Some("remote-environment")
     );
     assert_eq!(request.cwd, None);
+    assert_eq!(request.cwd_uri, Some(foreign_cwd));
 
     session
         .notify_request_permissions_response(&request.call_id, expected_response.clone())
@@ -6287,9 +6530,16 @@ async fn request_permissions_supports_network_grants_for_foreign_environments() 
     assert_eq!(response, Some(expected_response));
     assert_eq!(
         session
-            .granted_session_permissions("remote-environment")
+            .granted_session_permissions(&approval_scope_id)
             .await,
         Some(requested_permissions.into())
+    );
+    let replacement_environment = codex_exec_server::Environment::default_for_tests();
+    assert_eq!(
+        session
+            .granted_session_permissions(replacement_environment.approval_scope_id())
+            .await,
+        None
     );
 }
 
@@ -6374,7 +6624,7 @@ async fn request_permissions_tool_resolves_relative_paths_against_selected_envir
         file_system: Some(FileSystemPermissions {
             entries: vec![FileSystemSandboxEntry {
                 path: FileSystemPath::Path {
-                    path: environment_cwd.join("relative.txt"),
+                    path: PathUri::from_abs_path(&environment_cwd.join("relative.txt")),
                 },
                 access: FileSystemAccessMode::Write,
             }],
@@ -6454,6 +6704,13 @@ async fn request_permissions_response_materializes_session_cwd_grants_before_rec
 
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
+    let approval_scope_id = turn_context
+        .environments
+        .primary()
+        .expect("primary environment")
+        .environment
+        .approval_scope_id()
+        .to_string();
     let call_id = "call-1".to_string();
     let requested_permissions = RequestPermissionProfile {
         file_system: Some(FileSystemPermissions {
@@ -6506,7 +6763,7 @@ async fn request_permissions_response_materializes_session_cwd_grants_before_rec
         request.environment_id.as_deref(),
         Some(codex_exec_server::LOCAL_ENVIRONMENT_ID)
     );
-    let request_cwd = request.cwd.clone().expect("request cwd");
+    let request_cwd = request.cwd_uri.clone().expect("request cwd URI");
 
     session
         .notify_request_permissions_response(
@@ -6540,7 +6797,7 @@ async fn request_permissions_response_materializes_session_cwd_grants_before_rec
     assert_eq!(response, Some(expected_response));
     assert_eq!(
         session
-            .granted_session_permissions(codex_exec_server::LOCAL_ENVIRONMENT_ID)
+            .granted_session_permissions(&approval_scope_id)
             .await,
         Some(expected_permissions.into())
     );
@@ -7142,6 +7399,30 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
 }
 
 #[tokio::test]
+async fn shutdown_continues_when_tool_history_persistence_stalls() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let persistence_pause = crate::tool_history::pause_next_tool_history_persistence_for_test(
+        &session.thread_id.to_string(),
+    );
+    let codex_home = session.get_config().await.codex_home.clone();
+    session
+        .register_non_workspace_code_mode_call(&codex_home, "stalled-call".to_string())
+        .await;
+    persistence_pause.wait_until_reached().await;
+
+    let shutdown_completed = tokio::time::timeout(
+        super::handlers::TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT + Duration::from_secs(2),
+        handlers::shutdown(&session, "sub-stalled-history".to_string()),
+    )
+    .await
+    .expect("shutdown should continue through runtime cleanup after the bounded history flush");
+
+    assert!(shutdown_completed);
+    persistence_pause.release();
+}
+
+#[tokio::test]
 async fn submission_loop_channel_close_runs_full_thread_teardown() {
     struct SessionStopMarker;
     struct ThreadStopMarker;
@@ -7451,6 +7732,64 @@ async fn shutdown_and_wait_shuts_down_cached_guardian_subagent() {
 }
 
 #[tokio::test]
+async fn guardian_shutdown_waits_for_background_retired_session_cleanup() {
+    let (parent_session, _parent_turn_context) = make_session_and_context().await;
+    let parent_session = Arc::new(parent_session);
+
+    let (child_session, _child_turn_context) = make_session_and_context().await;
+    let (child_tx_sub, child_rx_sub) = async_channel::bounded(4);
+    let (_child_tx_event, child_rx_event) = async_channel::unbounded();
+    let (_child_status_tx, child_agent_status) = watch::channel(AgentStatus::PendingInit);
+    let (child_shutdown_started_tx, child_shutdown_started_rx) = tokio::sync::oneshot::channel();
+    let (release_child_shutdown_tx, release_child_shutdown_rx) = tokio::sync::oneshot::channel();
+    let child_session_loop_handle = tokio::spawn(async move {
+        let shutdown: Submission = child_rx_sub
+            .recv()
+            .await
+            .expect("child shutdown submission");
+        assert_eq!(shutdown.op, Op::Shutdown);
+        child_shutdown_started_tx
+            .send(())
+            .expect("child shutdown start should be observed");
+        release_child_shutdown_rx
+            .await
+            .expect("child shutdown should be released");
+    });
+    let child_codex = Codex {
+        tx_sub: child_tx_sub,
+        rx_event: child_rx_event,
+        agent_status: child_agent_status,
+        session: Arc::new(child_session),
+        session_loop_termination: session_loop_termination_from_handle(child_session_loop_handle),
+    };
+    parent_session
+        .guardian_review_session
+        .cache_for_test(child_codex)
+        .await;
+    parent_session
+        .guardian_review_session
+        .retire_trunk_for_test()
+        .await;
+    child_shutdown_started_rx
+        .await
+        .expect("background cleanup should start child shutdown");
+
+    let shutdown = parent_session.guardian_review_session.shutdown();
+    tokio::pin!(shutdown);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err(),
+        "manager shutdown must wait for the retired session cleanup"
+    );
+
+    release_child_shutdown_tx
+        .send(())
+        .expect("background child shutdown should still be waiting");
+    shutdown.await;
+}
+
+#[tokio::test]
 async fn cached_guardian_subagent_exposes_its_rollout_path() {
     let (parent_session, _parent_turn_context) = make_session_and_context().await;
     let parent_session = Arc::new(parent_session);
@@ -7661,7 +8000,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| model_info.base_instructions.clone()),
         compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
@@ -7812,7 +8151,7 @@ where
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| model_info.base_instructions.clone()),
         compact_prompt: config.compact_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         approvals_reviewer: config.approvals_reviewer,
@@ -7875,6 +8214,7 @@ where
         Some(
             Session::start_managed_network_proxy(
                 spec,
+                config.codex_home.as_path(),
                 exec_policy.current().as_ref(),
                 config.permissions.permission_profile(),
                 /*network_policy_decider*/ None,
@@ -7902,11 +8242,15 @@ where
         command_execution: crate::tools::command_execution::CommandExecutionLedger::default(),
         plan_store: crate::plan_store::PlanStore::default(),
         task_evidence: crate::task_evidence::TaskEvidenceLedger::disabled(),
+        kd4_repository_context: std::sync::RwLock::new(
+            crate::task_evidence::Kd4RepositoryContext::default(),
+        ),
         elicitations: crate::elicitation::ElicitationService::new(),
         analytics_events_client: AnalyticsEventsClient::new(
             Arc::clone(&auth_manager),
             config.chatgpt_base_url.clone(),
             config.analytics_enabled,
+            config.http_client_factory(),
         ),
         hooks: arc_swap::ArcSwap::from_pointee(Hooks::new(HooksConfig {
             legacy_notify_argv: config.notify.clone(),
@@ -7996,6 +8340,13 @@ where
         .snapshot(&resolved_turn_environments)
         .await
         .primary_local_metadata_source();
+    let available_models = models_manager
+        .list_models_shared(
+            RefreshStrategy::Offline,
+            per_turn_config.http_client_factory(),
+        )
+        .await
+        .expect("test model catalog should load");
     let turn_context = Arc::new(Session::make_turn_context(
         thread_id,
         SessionId::from(thread_id),
@@ -8006,17 +8357,22 @@ where
         config.multi_agent_version_from_features(),
         per_turn_config,
         model_info,
-        &models_manager,
+        available_models,
         /*network*/ None,
         resolved_turn_environments,
         git_metadata_source,
+        /*kd4_workflow_enabled*/ false,
         "turn_id".to_string(),
         skills_snapshot,
     ));
     let startup_timing = crate::startup_timing::StartupTimingState::new(thread_id.to_string());
     let tool_history_io_gate = Arc::new(Semaphore::new(/*permits*/ 1));
-    let tool_history_persistence =
-        super::session::ToolHistoryPersistenceQueue::new(Arc::clone(&tool_history_io_gate));
+    let tool_history_persistence = super::session::ToolHistoryPersistenceQueue::new(
+        Arc::clone(&tool_history_io_gate),
+        config.codex_home.to_path_buf(),
+        thread_id,
+        state.tool_history_state(),
+    );
     let session = Arc::new(Session {
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -8024,18 +8380,26 @@ where
         agent_status: agent_status_tx,
         state: Mutex::new(state),
         durable_history_commit_gate: Semaphore::new(1),
-        durable_history_completed_commits: Mutex::new(HashSet::new()),
+        durable_history_commits_in_flight: std::sync::atomic::AtomicUsize::new(0),
+        durable_history_commits_changed: tokio::sync::Notify::new(),
+        tool_history_reconciliation_gate: Semaphore::new(/*permits*/ 1),
         tool_history_io_gate,
         tool_history_persistence,
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
+        task_start_gate: Semaphore::new(/*permits*/ 1),
+        task_start_state: Mutex::new(super::session::TaskStartState::default()),
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
         startup_prepared_router: Default::default(),
+        prepared_tool_router: Default::default(),
+        request_scaffold_cache: Default::default(),
+        turn_config_cache: Default::default(),
+        queued_tool_manifest_hash: Default::default(),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
-        terminal_delivery_registry: Mutex::new(super::session::TerminalDeliveryRegistry::default()),
+        terminal_delivery_cache: Mutex::new(super::session::TerminalDeliveryCache::default()),
         terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
@@ -8072,6 +8436,203 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
     async_channel::Receiver<Event>,
 ) {
     make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await
+}
+
+struct TypedTerminalNotificationFixture {
+    session: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    assignment_id: AssignmentId,
+    attempt_id: AttemptId,
+    _state_home: tempfile::TempDir,
+    _repository: tempfile::TempDir,
+}
+
+async fn typed_terminal_notification_fixture(
+    required_evidence: Vec<String>,
+) -> TypedTerminalNotificationFixture {
+    let (session, mut turn_context, _events) = make_session_and_context_with_rx().await;
+    let state_home = tempfile::tempdir().expect("create task-state home");
+    let repository = tempfile::tempdir().expect("create task repository");
+    let coordinator = session.services.agent_control.task_coordinator();
+    let state_runtime = codex_state::StateRuntime::init(
+        state_home.path().to_path_buf(),
+        "test-provider".to_string(),
+    )
+    .await
+    .expect("task state initializes");
+    coordinator
+        .initialize(state_runtime, "notification-root".to_string())
+        .await
+        .expect("task coordinator initializes");
+    let (assignment, attempt) = coordinator
+        .create_assignment(
+            repository.path(),
+            AssignmentDraft {
+                root_session_id: "notification-root".to_string(),
+                admission_origin: AssignmentAdmissionOrigin::Typed,
+                role: AgentRole::Worker,
+                capability_profile: CapabilityProfile::ScopedSourceWrite,
+                objective: "complete the typed task".to_string(),
+                acceptance_criteria: vec![AcceptanceCriterion {
+                    id: "criterion".to_string(),
+                    text: "the terminal outcome is durable".to_string(),
+                }],
+                read_scope: Vec::new(),
+                write_scope: Vec::new(),
+                stop_condition: "stop after the terminal outcome".to_string(),
+                dependencies: Vec::new(),
+                risk_hints: Vec::new(),
+                required_evidence,
+                prohibited_changes: Vec::new(),
+                contract_claims: Vec::new(),
+                workspace_strategy: WorkspaceStrategy::Auto,
+                relation: None,
+                architecture_contract_ref: None,
+            },
+        )
+        .await
+        .expect("typed assignment creates");
+    let child_agent_path = AgentPath::try_from("/root/worker").expect("valid child path");
+    coordinator
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: child_agent_path.to_string(),
+            task_name: "worker".to_string(),
+            thread_id: Some(session.thread_id.to_string()),
+        })
+        .await
+        .expect("typed assignment binds");
+    {
+        let turn_context_mut =
+            Arc::get_mut(&mut turn_context).expect("turn context is uniquely owned");
+        turn_context_mut.multi_agent_version = MultiAgentVersion::V2;
+        turn_context_mut.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: Some(child_agent_path),
+            agent_nickname: Some("worker".to_string()),
+            agent_role: Some("worker".to_string()),
+        });
+    }
+
+    TypedTerminalNotificationFixture {
+        session,
+        turn_context: Arc::clone(&turn_context),
+        assignment_id: assignment.assignment_id,
+        attempt_id: attempt.attempt_id,
+        _state_home: state_home,
+        _repository: repository,
+    }
+}
+
+fn typed_terminal_event(turn_context: &TurnContext) -> EventMsg {
+    EventMsg::TurnAborted(TurnAbortedEvent {
+        turn_id: Some(turn_context.sub_id.clone()),
+        reason: TurnAbortReason::InternalError,
+        completed_at: None,
+        duration_ms: None,
+        timing: None,
+    })
+}
+
+#[tokio::test]
+async fn typed_terminal_notification_retries_when_missing_receipt_cannot_seal() {
+    let command = "cargo test -p typed-terminal".to_string();
+    let fixture = typed_terminal_notification_fixture(vec![command.clone()]).await;
+    let coordinator = fixture.session.services.agent_control.task_coordinator();
+    let validation = coordinator
+        .begin_focused_validation_for_source(
+            &fixture.turn_context.session_source,
+            "typed-terminal-running".to_string(),
+            command,
+        )
+        .await
+        .expect("validation begins")
+        .expect("typed source is bound");
+    let sends_before = fixture
+        .session
+        .services
+        .agent_control
+        .inter_agent_communication_attempt_count();
+
+    assert!(
+        !fixture
+            .session
+            .maybe_notify_parent_of_terminal_turn(
+                &fixture.turn_context,
+                &typed_terminal_event(&fixture.turn_context),
+            )
+            .await
+    );
+    assert_eq!(
+        fixture
+            .session
+            .services
+            .agent_control
+            .inter_agent_communication_attempt_count(),
+        sends_before,
+        "parent delivery must not run before receipt sealing succeeds"
+    );
+    assert!(
+        coordinator
+            .get_agent_task(fixture.assignment_id, Some(0))
+            .await
+            .expect("unsealed task reads")
+            .receipt
+            .is_none()
+    );
+    coordinator
+        .finish_focused_validation(validation, ValidationCallStatus::Succeeded)
+        .await
+        .expect("validation cleanup succeeds");
+}
+
+#[tokio::test]
+async fn typed_terminal_notification_retries_when_durable_readback_fails() {
+    let fixture = typed_terminal_notification_fixture(Vec::new()).await;
+    let coordinator = fixture.session.services.agent_control.task_coordinator();
+    coordinator.fail_next_agent_task_read_for_test();
+    let sends_before = fixture
+        .session
+        .services
+        .agent_control
+        .inter_agent_communication_attempt_count();
+
+    assert!(
+        !fixture
+            .session
+            .maybe_notify_parent_of_terminal_turn(
+                &fixture.turn_context,
+                &typed_terminal_event(&fixture.turn_context),
+            )
+            .await
+    );
+    assert_eq!(
+        fixture
+            .session
+            .services
+            .agent_control
+            .inter_agent_communication_attempt_count(),
+        sends_before,
+        "parent delivery must not run before durable readback succeeds"
+    );
+    assert!(
+        coordinator
+            .get_agent_task(fixture.assignment_id, Some(0))
+            .await
+            .expect("sealed task reads after injected failure")
+            .receipt
+            .is_some(),
+        "receipt sealing succeeds before the injected readback failure"
+    );
+    assert_eq!(
+        coordinator
+            .binding_for_assignment(fixture.assignment_id)
+            .expect("binding remains durable")
+            .attempt_id,
+        fixture.attempt_id
+    );
 }
 
 #[tokio::test]
@@ -8695,6 +9256,22 @@ struct ConcurrentContextTestContributor {
 }
 struct StalledTurnContextTestContributor;
 struct ReadyTurnContextTestContributor;
+const TIMEOUT_WORLD_STATE_ID: &str = "timeout_test";
+const TIMEOUT_WORLD_STATE_BODY: &str = "last accepted extension state";
+const TIMEOUT_WORLD_STATE_OPEN_TAG: &str = "<timeout_test>";
+const TIMEOUT_WORLD_STATE_CLOSE_TAG: &str = "</timeout_test>";
+
+struct TimeoutWorldStateTestContributor {
+    stalled: Arc<std::sync::atomic::AtomicBool>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+const MUTABLE_CONTEXT_WORLD_STATE_ID: &str = "mutable_context_world_state_test";
+
+struct MutableContextWorldStateTestContributor {
+    prompt_calls: Arc<std::sync::atomic::AtomicUsize>,
+    world_revision: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 impl ConcurrentContextTestContributor {
     fn contribute<'a>(
@@ -8750,6 +9327,108 @@ impl codex_extension_api::ContextContributor for ReadyTurnContextTestContributor
         Box::pin(async {
             vec![codex_extension_api::PromptFragment::developer_policy(
                 "ready turn context",
+            )]
+        })
+    }
+}
+
+impl codex_extension_api::ContextContributor for TimeoutWorldStateTestContributor {
+    fn world_state_section_ids(&self) -> &'static [&'static str] {
+        &[TIMEOUT_WORLD_STATE_ID]
+    }
+
+    fn contribute_world_state<'a>(
+        &'a self,
+        _input: codex_extension_api::WorldStateContributionInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<
+        'a,
+        Vec<codex_extension_api::WorldStateSectionContribution>,
+    > {
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.stalled.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+
+            vec![
+                codex_extension_api::WorldStateSectionContribution::new(
+                    TIMEOUT_WORLD_STATE_ID,
+                    json!({ "body": TIMEOUT_WORLD_STATE_BODY }),
+                    |previous| {
+                        if matches!(
+                            previous,
+                            codex_extension_api::PreviousWorldStateSection::Known(previous)
+                                if previous.get("body").and_then(serde_json::Value::as_str)
+                                    == Some(TIMEOUT_WORLD_STATE_BODY)
+                        ) {
+                            return None;
+                        }
+                        Some(codex_extension_api::RenderedWorldStateFragment::new(
+                            "developer",
+                            (TIMEOUT_WORLD_STATE_OPEN_TAG, TIMEOUT_WORLD_STATE_CLOSE_TAG),
+                            TIMEOUT_WORLD_STATE_BODY,
+                        ))
+                    },
+                )
+                .with_retained_fragment_matcher(|role, text| {
+                    role == "developer" && text.contains(TIMEOUT_WORLD_STATE_OPEN_TAG)
+                }),
+            ]
+        })
+    }
+}
+
+impl codex_extension_api::ContextContributor for MutableContextWorldStateTestContributor {
+    fn contribute_turn_context<'a>(
+        &'a self,
+        _input: codex_extension_api::TurnContextContributionInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        self.prompt_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let revision = self
+            .world_revision
+            .load(std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            vec![codex_extension_api::PromptFragment::developer_policy(
+                format!("mutable prompt revision {revision}"),
+            )]
+        })
+    }
+
+    fn world_state_section_ids(&self) -> &'static [&'static str] {
+        &[MUTABLE_CONTEXT_WORLD_STATE_ID]
+    }
+
+    fn contribute_world_state<'a>(
+        &'a self,
+        _input: codex_extension_api::WorldStateContributionInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<
+        'a,
+        Vec<codex_extension_api::WorldStateSectionContribution>,
+    > {
+        let revision = self
+            .world_revision
+            .load(std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            let body = format!("world revision {revision}");
+            vec![codex_extension_api::WorldStateSectionContribution::new(
+                MUTABLE_CONTEXT_WORLD_STATE_ID,
+                json!({ "revision": revision }),
+                move |previous| {
+                    if matches!(
+                        previous,
+                        codex_extension_api::PreviousWorldStateSection::Known(previous)
+                            if previous.get("revision").and_then(serde_json::Value::as_u64)
+                                == Some(revision as u64)
+                    ) {
+                        return None;
+                    }
+                    Some(codex_extension_api::RenderedWorldStateFragment::new(
+                        "developer",
+                        ("<mutable_world>", "</mutable_world>"),
+                        body.clone(),
+                    ))
+                },
             )]
         })
     }
@@ -9010,6 +9689,190 @@ async fn turn_context_refresh_omits_stalled_contributors_after_shared_deadline()
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn world_state_timeout_preserves_last_success_and_unchanged_recovery_is_silent() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(TimeoutWorldStateTestContributor {
+        stalled: Arc::clone(&stalled),
+        calls: Arc::clone(&calls),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+
+    let initial_world_state = session.build_world_state_for_step(&step_context).await;
+    let (initial_fragments, initial_snapshot) = initial_world_state.render_full_with_snapshot();
+    let expected_snapshot = json!({ "body": TIMEOUT_WORLD_STATE_BODY });
+    assert_eq!(
+        initial_snapshot.section(TIMEOUT_WORLD_STATE_ID),
+        Some(&expected_snapshot)
+    );
+    let initial_items =
+        crate::context_manager::updates::merge_contextual_fragments(initial_fragments);
+    {
+        let mut state = session.state.lock().await;
+        state.history.record_items(
+            initial_items.iter(),
+            turn_context.model_info.truncation_policy.into(),
+        );
+        state
+            .history
+            .set_world_state_baseline(initial_snapshot.clone());
+    }
+
+    stalled.store(true, std::sync::atomic::Ordering::SeqCst);
+    let timeout_session = Arc::clone(&session);
+    let timeout_step_context = Arc::clone(&step_context);
+    let timeout_build = tokio::spawn(async move {
+        timeout_session
+            .build_world_state_for_step(&timeout_step_context)
+            .await
+    });
+    for _ in 0..100 {
+        if calls.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(2, calls.load(std::sync::atomic::Ordering::SeqCst));
+    tokio::time::advance(EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT + Duration::from_millis(1)).await;
+    let timed_out_world_state = timeout_build.await.expect("world-state build task");
+    assert_eq!(
+        timed_out_world_state
+            .snapshot()
+            .section(TIMEOUT_WORLD_STATE_ID),
+        Some(&expected_snapshot)
+    );
+    {
+        let mut state = session.state.lock().await;
+        let (fragments, rollout_item) = state.history.update_world_state(&timed_out_world_state);
+        assert!(fragments.is_empty());
+        assert!(rollout_item.is_none());
+    }
+
+    stalled.store(false, std::sync::atomic::Ordering::SeqCst);
+    let recovered_world_state = session.build_world_state_for_step(&step_context).await;
+    {
+        let mut state = session.state.lock().await;
+        let (fragments, rollout_item) = state.history.update_world_state(&recovered_world_state);
+        assert!(fragments.is_empty());
+        assert!(rollout_item.is_none());
+    }
+}
+
+#[tokio::test]
+async fn world_state_delta_preserves_realized_fragment_receipts_without_rebuilding_context() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let prompt_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let world_revision = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(MutableContextWorldStateTestContributor {
+        prompt_calls: Arc::clone(&prompt_calls),
+        world_revision: Arc::clone(&world_revision),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let initial_world_state = Arc::new(session.build_world_state_for_step(&step_context).await);
+    let initial_context = session
+        .build_initial_context_with_world_state_and_mcp(
+            turn_context.as_ref(),
+            initial_world_state.as_ref(),
+            false,
+        )
+        .await;
+    let realized_fragment_digests = initial_context.fragment_digests.clone();
+    assert_eq!(prompt_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    {
+        let mut state = session.state.lock().await;
+        state
+            .history
+            .set_world_state_baseline(initial_world_state.snapshot());
+        state.stage_context_baseline(ContextBaselineCandidate {
+            turn_context_item: turn_context.to_turn_context_item(),
+            world_state_snapshot: initial_world_state.snapshot(),
+            world_state_item: None,
+            fragment_digests: realized_fragment_digests.clone(),
+            bound_sampling_request_id: None,
+            bound_physical_attempt_id: None,
+        });
+    }
+
+    world_revision.store(2, std::sync::atomic::Ordering::SeqCst);
+    let updated_world_state = session
+        .record_step_world_state_if_changed(&initial_world_state, &step_context)
+        .await;
+
+    assert_ne!(
+        updated_world_state.snapshot(),
+        initial_world_state.snapshot()
+    );
+    assert_eq!(
+        prompt_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "recording a world-state delta must not rerun prompt contributors"
+    );
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .pending_context_baseline()
+            .expect("updated context baseline")
+            .fragment_digests,
+        realized_fragment_digests
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn staged_compaction_baseline_prevents_duplicate_full_context_before_sampling() {
+    let (session, turn_context) = make_session_and_context().await;
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let world_state = session.build_world_state_for_step(&step_context).await;
+    let complete_context = session
+        .build_initial_context_with_world_state_and_mcp(turn_context.as_ref(), &world_state, false)
+        .await;
+    let snapshot = complete_context.world_state_snapshot.clone();
+    let fragment_digests = complete_context.fragment_digests.clone();
+    let initial_item_count = complete_context.items.len();
+    {
+        let mut state = session.state.lock().await;
+        state.history.record_items(
+            complete_context.items.iter(),
+            turn_context.model_info.truncation_policy.into(),
+        );
+        state.stage_context_baseline(ContextBaselineCandidate {
+            turn_context_item: turn_context.to_turn_context_item(),
+            world_state_snapshot: snapshot.clone(),
+            world_state_item: Some(WorldStateItem::full(snapshot.into_value())),
+            fragment_digests,
+            bound_sampling_request_id: None,
+            bound_physical_attempt_id: None,
+        });
+    }
+
+    session
+        .record_context_updates_and_set_reference_context_item(&step_context)
+        .await;
+
+    let state = session.state.lock().await;
+    assert_eq!(state.history.raw_items().len(), initial_item_count);
+    assert!(state.reference_context_item().is_none());
+    assert!(
+        state
+            .pending_context_baseline()
+            .and_then(|candidate| candidate.world_state_item)
+            .is_some(),
+        "the unaccepted full world-state receipt must survive local diffing"
+    );
+}
+
 #[tokio::test]
 async fn record_context_updates_includes_turn_context_fragments_on_steady_state_turns() {
     let (mut session, mut turn_context) = make_session_and_context().await;
@@ -9076,19 +9939,8 @@ async fn build_initial_context_adds_multi_agent_v2_root_usage_hint_as_developer_
 
     let initial_context = build_initial_context(&session, &turn_context).await;
 
-    let developer_messages = developer_message_texts(&initial_context);
-    assert!(
-        developer_messages
-            .iter()
-            .any(|message| message.as_slice() == ["Root guidance."]),
-        "expected standalone root usage hint developer message, got {developer_messages:?}"
-    );
-    assert!(
-        !developer_messages
-            .iter()
-            .any(|message| message.as_slice() == ["Subagent guidance."]),
-        "did not expect subagent usage hint for root thread, got {developer_messages:?}"
-    );
+    let usage_hints = multi_agent_usage_hint_payloads(&initial_context);
+    assert_eq!(usage_hints, ["Root guidance."]);
 }
 
 #[tokio::test]
@@ -9114,19 +9966,8 @@ async fn build_initial_context_adds_multi_agent_v2_subagent_usage_hint_as_develo
 
     let initial_context = build_initial_context(&session, &turn_context).await;
 
-    let developer_messages = developer_message_texts(&initial_context);
-    assert!(
-        developer_messages
-            .iter()
-            .any(|message| message.as_slice() == ["Subagent guidance."]),
-        "expected standalone subagent usage hint developer message, got {developer_messages:?}"
-    );
-    assert!(
-        !developer_messages
-            .iter()
-            .any(|message| message.as_slice() == ["Root guidance."]),
-        "did not expect root usage hint for subagent thread, got {developer_messages:?}"
-    );
+    let usage_hints = multi_agent_usage_hint_payloads(&initial_context);
+    assert_eq!(usage_hints, ["Subagent guidance."]);
 }
 
 #[tokio::test]
@@ -9136,16 +9977,7 @@ async fn build_initial_context_omits_multi_agent_v2_usage_hints_when_feature_dis
 
     let initial_context = build_initial_context(&session, &turn_context).await;
 
-    let developer_messages = developer_message_texts(&initial_context);
-    assert!(
-        !developer_messages.iter().any(|message| {
-            matches!(
-                message.as_slice(),
-                ["Root guidance."] | ["Subagent guidance."]
-            )
-        }),
-        "did not expect multi-agent v2 usage hint developer messages, got {developer_messages:?}"
-    );
+    assert!(multi_agent_usage_hint_payloads(&initial_context).is_empty());
 }
 
 #[tokio::test]
@@ -9163,16 +9995,7 @@ async fn build_initial_context_omits_multi_agent_v2_usage_hints_when_hint_is_emp
 
     let initial_context = build_initial_context(&session, &turn_context).await;
 
-    let developer_messages = developer_message_texts(&initial_context);
-    assert!(
-        !developer_messages.iter().any(|message| {
-            matches!(
-                message.as_slice(),
-                ["Root guidance."] | ["Subagent guidance."]
-            )
-        }),
-        "did not expect multi-agent v2 usage hint developer messages, got {developer_messages:?}"
-    );
+    assert!(multi_agent_usage_hint_payloads(&initial_context).is_empty());
 }
 
 #[tokio::test]
@@ -9581,7 +10404,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
 
 #[tokio::test]
 async fn record_context_updates_reinjects_full_context_when_model_visible_fragments_change() {
-    let (session, turn_context) = make_session_and_context().await;
+    let (session, mut turn_context) = make_session_and_context().await;
+    turn_context.developer_instructions = Some("old model-visible instructions".to_string());
     let previous_context = Arc::new(turn_context);
     let previous_step = StepContext::for_test(Arc::clone(&previous_context));
     session
@@ -9613,6 +10437,100 @@ async fn record_context_updates_reinjects_full_context_when_model_visible_fragme
         strip_response_item_ids(&history.raw_items()[previous_history_len..]),
         expected_reinjection,
         "changed model-visible context fragments should invalidate the accepted baseline"
+    );
+    let projection = crate::stable_context::project_stable_context(
+        history.raw_items().to_vec().into(),
+        crate::stable_context::StableContextTarget::Sampling,
+    );
+    let projected_text = developer_input_texts(&projection.items);
+    assert!(!projected_text.contains(&"old model-visible instructions"));
+    assert_eq!(
+        projected_text
+            .iter()
+            .filter(|text| **text == "new model-visible instructions")
+            .count(),
+        1,
+        "the final sampling prompt should contain only the authoritative developer instructions"
+    );
+}
+
+#[tokio::test]
+async fn record_context_updates_reinjects_full_context_when_multi_agent_usage_hint_changes_or_is_removed()
+ {
+    let (session, previous_context) =
+        make_multi_agent_v2_usage_hint_test_session(/*enable_multi_agent_v2*/ true).await;
+    let previous_step = StepContext::for_test(Arc::clone(&previous_context));
+    session
+        .record_context_updates_and_set_reference_context_item(&previous_step)
+        .await;
+    commit_test_context_baseline(&session, "previous-multi-agent-usage-hint").await;
+    let previous_history_len = session.clone_history().await.raw_items().len();
+
+    drop(previous_step);
+    let mut changed_context = Arc::try_unwrap(previous_context)
+        .unwrap_or_else(|_| panic!("previous turn context should have no remaining references"));
+    Arc::make_mut(&mut changed_context.config)
+        .multi_agent_v2
+        .root_agent_usage_hint_text = Some("Changed root guidance.".to_string());
+    changed_context.sub_id = format!("{}-changed", changed_context.sub_id);
+    let changed_context = Arc::new(changed_context);
+    let expected_changed_reinjection = build_initial_context(&session, &changed_context).await;
+    let changed_step = StepContext::for_test(Arc::clone(&changed_context));
+
+    assert_eq!(
+        session.estimate_context_update_items(&changed_step).await,
+        expected_changed_reinjection,
+        "changing the usage hint should invalidate the accepted fragment baseline"
+    );
+    session
+        .record_context_updates_and_set_reference_context_item(&changed_step)
+        .await;
+    commit_test_context_baseline(&session, "changed-multi-agent-usage-hint").await;
+    let changed_history = session.clone_history().await;
+    assert_eq!(
+        strip_response_item_ids(&changed_history.raw_items()[previous_history_len..]),
+        expected_changed_reinjection,
+        "changing the usage hint should reinject authoritative full context"
+    );
+    let changed_history_len = changed_history.raw_items().len();
+    drop(changed_history);
+
+    drop(changed_step);
+    let mut removed_context = Arc::try_unwrap(changed_context)
+        .unwrap_or_else(|_| panic!("changed turn context should have no remaining references"));
+    Arc::make_mut(&mut removed_context.config)
+        .multi_agent_v2
+        .root_agent_usage_hint_text = None;
+    removed_context.sub_id = format!("{}-removed", removed_context.sub_id);
+    let removed_context = Arc::new(removed_context);
+    let expected_removed_reinjection = build_initial_context(&session, &removed_context).await;
+    let removed_step = StepContext::for_test(Arc::clone(&removed_context));
+
+    assert_eq!(
+        session.estimate_context_update_items(&removed_step).await,
+        expected_removed_reinjection,
+        "removing the usage hint should invalidate the accepted fragment baseline"
+    );
+    session
+        .record_context_updates_and_set_reference_context_item(&removed_step)
+        .await;
+    let removed_history = session.clone_history().await;
+    assert_eq!(
+        strip_response_item_ids(&removed_history.raw_items()[changed_history_len..]),
+        expected_removed_reinjection,
+        "removing the usage hint should reinject authoritative full context"
+    );
+    assert!(
+        !developer_input_texts(&expected_removed_reinjection).contains(&"Changed root guidance."),
+        "authoritative reinjection after removal must omit the stale usage hint"
+    );
+    let projection = crate::stable_context::project_stable_context(
+        removed_history.raw_items().to_vec().into(),
+        crate::stable_context::StableContextTarget::Sampling,
+    );
+    assert!(
+        !developer_input_texts(&projection.items).contains(&"Changed root guidance."),
+        "the final sampling prompt must not retain removed multi-agent guidance"
     );
 }
 
@@ -9675,6 +10593,29 @@ async fn build_initial_context_prepends_model_switch_message() {
         panic!("expected developer text");
     };
     assert!(text.contains("<model_switch>"));
+}
+
+#[test]
+fn previous_turn_model_is_retargeted_when_provider_identity_changes() {
+    let mut previous_turn_settings = Some(PreviousTurnSettings {
+        model: "old-provider-model".to_string(),
+        comp_hash: Some("old-provider-comp-hash".to_string()),
+    });
+
+    retarget_previous_turn_settings_for_provider(
+        &mut previous_turn_settings,
+        Some("old-provider"),
+        "new-provider",
+        "new-provider-model",
+    );
+
+    assert_eq!(
+        previous_turn_settings,
+        Some(PreviousTurnSettings {
+            model: "new-provider-model".to_string(),
+            comp_hash: Some("old-provider-comp-hash".to_string()),
+        })
+    );
 }
 
 #[tokio::test]
@@ -10610,6 +11551,558 @@ async fn durable_conversation_commit_survives_caller_cancellation_and_is_idempot
     assert_eq!(store.calls().await.flush_thread, initial_flushes + 1);
 }
 
+#[test]
+fn durable_history_commit_key_matches_the_existing_compact_json_identity() {
+    let items = [ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "hash-without-buffer".to_string(),
+        output: FunctionCallOutputPayload::from_text("multibyte µ payload".repeat(1024)),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let expected = format!(
+        "turn-id:{:x}",
+        Sha256::digest(serde_json::to_vec(&items).expect("serialize comparison history"))
+    );
+
+    assert_eq!(
+        durable_history_commit_key("turn-id", &items).expect("stream history into digest"),
+        expected,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordered_conversation_commit_defers_flush_to_terminal_barrier_and_is_idempotent() {
+    let (mut sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+    let initial_calls = store.calls().await;
+    let call_id = "ordered-before-terminal-flush".to_string();
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.clone(),
+        output: FunctionCallOutputPayload::from_text("ordered".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    sess.record_conversation_items_ordered(&tc, std::slice::from_ref(&output))
+        .await
+        .expect("ordered tool output append should succeed");
+    let after_append = store.calls().await;
+    assert_eq!(after_append.append_items, initial_calls.append_items + 1);
+    assert_eq!(after_append.flush_thread, initial_calls.flush_thread);
+    assert_eq!(
+        tc.turn_timing_state.tool_closure_snapshot().persisted_count,
+        0,
+        "an ordered append must not attest durability before the terminal barrier"
+    );
+
+    sess.flush_rollout_after_ordered_commits(&tc)
+        .await
+        .expect("terminal durability barrier should flush ordered output");
+    let after_terminal_flush = store.calls().await;
+    assert_eq!(
+        after_terminal_flush.flush_thread,
+        initial_calls.flush_thread + 1
+    );
+    assert_eq!(
+        tc.turn_timing_state.tool_closure_snapshot().persisted_count,
+        0,
+        "the synthetic output is not an accepted tool call"
+    );
+
+    sess.record_conversation_items_ordered(&tc, &[output])
+        .await
+        .expect("retrying an ordered commit should succeed");
+    let final_calls = store.calls().await;
+    assert_eq!(final_calls.append_items, after_terminal_flush.append_items);
+    assert_eq!(final_calls.flush_thread, after_terminal_flush.flush_thread);
+    let history = sess.clone_history().await;
+    assert_eq!(
+        history
+            .raw_items()
+            .iter()
+            .filter(|item| matches!(
+                item,
+                ResponseItem::FunctionCallOutput {
+                    call_id: item_call_id,
+                    ..
+                } if item_call_id == &call_id
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        tc.durable_history_completed_commits.lock().await.len(),
+        1,
+        "the retry ledger should retain this turn's completed commit"
+    );
+    let next_turn = sess
+        .new_turn_with_sub_id(
+            "ordered-commit-next-turn".to_string(),
+            SessionSettingsUpdate::default(),
+        )
+        .await
+        .expect("the next turn context should be constructed");
+    assert!(
+        next_turn
+            .durable_history_completed_commits
+            .lock()
+            .await
+            .is_empty(),
+        "completed commit retry keys must not survive into the next turn"
+    );
+}
+
+#[tokio::test]
+async fn accepted_context_commit_defers_flush_to_terminal_barrier() {
+    let (mut sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+    let step_context = sess.capture_step_context(Arc::clone(&tc)).await;
+    sess.record_context_updates_and_set_reference_context_item(step_context.as_ref())
+        .await;
+    assert!(
+        sess.bind_context_baseline_candidate("request-1", "attempt-1")
+            .await
+    );
+    let before_commit = store.calls().await;
+
+    assert!(
+        sess.commit_context_baseline_candidate("request-1", "attempt-1")
+            .await
+            .expect("matching attempt should commit its accepted context")
+    );
+    let after_commit = store.calls().await;
+    assert!(after_commit.append_items > before_commit.append_items);
+    assert_eq!(
+        after_commit.flush_thread, before_commit.flush_thread,
+        "accepted context should join the ordered turn batch without stalling stream processing"
+    );
+    let realized = sess
+        .reference_context_item()
+        .await
+        .expect("accepted context should become the in-memory baseline immediately");
+    let provenance = realized
+        .context_provenance
+        .expect("accepted context should retain physical-attempt provenance");
+    assert_eq!(provenance.accepted_attempt.sampling_request_id, "request-1");
+    assert_eq!(provenance.accepted_attempt.physical_attempt_id, "attempt-1");
+
+    sess.flush_rollout_after_ordered_commits(&tc)
+        .await
+        .expect("terminal durability barrier should flush accepted context");
+    assert_eq!(
+        store.calls().await.flush_thread,
+        before_commit.flush_thread + 1
+    );
+}
+
+#[tokio::test]
+async fn turn_started_delivers_live_and_defers_flush_until_terminal_event() {
+    let (mut sess, tc, rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+    let before_start = store.calls().await;
+    let started = EventMsg::TurnStarted(TurnStartedEvent {
+        turn_id: tc.sub_id.clone(),
+        trace_id: tc.trace_id.clone(),
+        started_at: tc.turn_timing_state.started_at_unix_secs().await,
+        model_context_window: tc.model_context_window(),
+        collaboration_mode_kind: tc.collaboration_mode.mode,
+    });
+
+    sess.send_event(tc.as_ref(), started).await;
+    let delivered = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("turn start should be delivered without waiting for disk")
+        .expect("event receiver should remain open");
+    assert!(matches!(
+        delivered.msg,
+        EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) if turn_id == tc.sub_id
+    ));
+    let after_start = store.calls().await;
+    assert_eq!(after_start.append_items, before_start.append_items + 1);
+    assert_eq!(after_start.flush_thread, before_start.flush_thread);
+
+    let completed = EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: tc.sub_id.clone(),
+        last_agent_message: Some("done".to_string()),
+        surfaced_result: None,
+        error: None,
+        completion: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+        timing: None,
+    });
+    sess.flush_rollout_after_ordered_commits(tc.as_ref())
+        .await
+        .expect("pre-terminal barrier should flush the ordered turn prefix");
+    let after_prefix = store.calls().await;
+    assert_eq!(after_prefix.flush_thread, before_start.flush_thread + 1);
+
+    sess.persist_terminal_event_for_dispatch(&completed, Duration::from_secs(2))
+        .await
+        .expect("terminal persistence should append after the ordered turn prefix");
+    sess.flush_rollout()
+        .await
+        .expect("post-terminal barrier should make the terminal event durable");
+    let after_terminal = store.calls().await;
+    assert_eq!(after_terminal.flush_thread, before_start.flush_thread + 2);
+
+    let stored = codex_thread_store::ThreadStore::load_history(
+        store.as_ref(),
+        codex_thread_store::LoadThreadHistoryParams {
+            thread_id: sess.thread_id,
+            include_archived: false,
+        },
+    )
+    .await
+    .expect("flushed turn history should be readable");
+    let lifecycle = stored
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::TurnStarted(_)) => Some("started"),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(_)) => Some("completed"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lifecycle, vec!["started", "completed"]);
+}
+
+#[tokio::test]
+async fn initial_input_and_sampling_boundary_share_the_terminal_durability_barrier() {
+    let (mut sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+    let before_input = store.calls().await;
+
+    sess.record_user_prompt_and_emit_turn_item(
+        tc.as_ref(),
+        &[UserInput::Text {
+            text: "measure one ordered request prefix".to_string(),
+            text_elements: Vec::new(),
+        }],
+        None,
+    )
+    .await;
+    let after_input = store.calls().await;
+    assert!(after_input.append_items > before_input.append_items);
+    assert_eq!(after_input.persist_thread, before_input.persist_thread);
+    assert_eq!(after_input.flush_thread, before_input.flush_thread);
+
+    sess.persist_sampling_boundary_ordered(codex_protocol::protocol::SamplingBoundaryItem {
+        sampling_request_id: "request-1".to_string(),
+        physical_attempt_id: "attempt-1".to_string(),
+        turn_id: Some(tc.sub_id.clone()),
+        unresolved_context: true,
+    })
+    .await
+    .expect("sampling boundary should join the ordered request prefix");
+    let after_boundary = store.calls().await;
+    assert_eq!(after_boundary.persist_thread, before_input.persist_thread);
+    assert_eq!(after_boundary.flush_thread, before_input.flush_thread);
+
+    sess.flush_rollout_after_ordered_commits(tc.as_ref())
+        .await
+        .expect("terminal barrier should make the complete request prefix durable");
+    assert_eq!(
+        store.calls().await.flush_thread,
+        before_input.flush_thread + 1
+    );
+    let stored = codex_thread_store::ThreadStore::load_history(
+        store.as_ref(),
+        codex_thread_store::LoadThreadHistoryParams {
+            thread_id: sess.thread_id,
+            include_archived: false,
+        },
+    )
+    .await
+    .expect("flushed request prefix should be readable");
+    let user_index = stored
+        .items
+        .iter()
+        .position(|item| matches!(item, RolloutItem::ResponseItem(ResponseItem::Message { role, .. }) if role == "user"))
+        .expect("user input should be persisted");
+    let boundary_index = stored
+        .items
+        .iter()
+        .position(|item| matches!(item, RolloutItem::SamplingBoundary(boundary) if boundary.sampling_request_id == "request-1"))
+        .expect("sampling boundary should be persisted");
+    assert!(user_index < boundary_index);
+}
+
+#[tokio::test]
+async fn tool_manifest_persistence_failure_stops_ordered_request_prefix() {
+    let (mut sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_thread_persistence(
+        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+    let rollout_before = tokio::fs::read(&rollout_path)
+        .await
+        .expect("attached rollout should be readable");
+    sess.live_thread()
+        .expect("test session should have live persistence")
+        .shutdown()
+        .await
+        .expect("test thread store should shut down");
+    let provider_setup_started = std::sync::atomic::AtomicBool::new(false);
+
+    let result: CodexResult<()> = async {
+        super::turn::persist_tool_manifest_before_sampling(
+            sess.as_ref(),
+            codex_protocol::protocol::ToolManifestItem::full(
+                "manifest-before-dispatch".to_string(),
+                serde_json::json!([]),
+            ),
+        )
+        .await?;
+        provider_setup_started.store(true, std::sync::atomic::Ordering::SeqCst);
+        sess.persist_sampling_boundary_ordered(codex_protocol::protocol::SamplingBoundaryItem {
+            sampling_request_id: "request-after-failed-manifest".to_string(),
+            physical_attempt_id: "attempt-after-failed-manifest".to_string(),
+            turn_id: Some(tc.sub_id.clone()),
+            unresolved_context: true,
+        })
+        .await
+        .map_err(|err| CodexErr::Fatal(err.to_string()))
+    }
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(CodexErr::Fatal(message))
+            if message.contains("failed to order tool manifest before provider dispatch")
+    ));
+    assert!(
+        !provider_setup_started.load(std::sync::atomic::Ordering::SeqCst),
+        "provider setup must not start after manifest persistence fails"
+    );
+    assert!(
+        sess.queued_tool_manifest_hash
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none(),
+        "a failed manifest append must not become the queued reference baseline"
+    );
+    assert_eq!(
+        tokio::fs::read(&rollout_path)
+            .await
+            .expect("rollout should remain readable after injected append failure"),
+        rollout_before,
+        "neither the failed manifest nor a later sampling boundary may change the rollout"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_rollout_items_join_the_terminal_batch_when_stage3_is_enabled() {
+    let (mut sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+    let before = store.calls().await;
+
+    sess.persist_rollout_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
+        UserMessageEvent {
+            client_id: None,
+            message: "batch this ordinary turn record".to_string(),
+            images: None,
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+            ..Default::default()
+        },
+    ))])
+    .await;
+
+    let after = store.calls().await;
+    assert_eq!(after.append_items, before.append_items + 1);
+    assert_eq!(
+        after.append_items_ordered,
+        before.append_items_ordered + 1,
+        "ordinary turn records should use the non-flushing ordered append"
+    );
+    assert_eq!(after.persist_thread, before.persist_thread);
+    assert_eq!(
+        after.flush_thread, before.flush_thread,
+        "the terminal finalizer owns the durability barrier"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_barrier_waits_for_cancellation_shielded_ordered_commit() {
+    let (mut sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+    let commit_blocker = sess
+        .durable_history_commit_gate
+        .acquire()
+        .await
+        .expect("commit gate should be open");
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "shielded-before-terminal".to_string(),
+        output: FunctionCallOutputPayload::from_text("ordered".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let commit_session = Arc::clone(&sess);
+    let commit_context = Arc::clone(&tc);
+    let commit = tokio::spawn(async move {
+        commit_session
+            .record_conversation_items_ordered(&commit_context, &[output])
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    let flush_session = Arc::clone(&sess);
+    let flush_context = Arc::clone(&tc);
+    let terminal_flush = tokio::spawn(async move {
+        flush_session
+            .flush_rollout_after_ordered_commits(&flush_context)
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !terminal_flush.is_finished(),
+        "terminal flush must not overtake an accepted shielded commit"
+    );
+
+    drop(commit_blocker);
+    commit
+        .await
+        .expect("commit task should join")
+        .expect("ordered commit should succeed");
+    terminal_flush
+        .await
+        .expect("flush task should join")
+        .expect("terminal flush should succeed");
+
+    assert_eq!(store.calls().await.flush_thread, 1);
+    assert!(sess.clone_history().await.raw_items().iter().any(|item| {
+        matches!(
+            item,
+            ResponseItem::FunctionCallOutput { call_id, .. }
+                if call_id == "shielded-before-terminal"
+        )
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_and_ordered_history_commits_share_rollout_order() {
+    let (mut sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+    let commit_blocker = sess
+        .durable_history_commit_gate
+        .acquire()
+        .await
+        .expect("commit gate should be open");
+    let (ordinary_polled_tx, ordinary_polled_rx) = tokio::sync::oneshot::channel();
+    let ordinary_session = Arc::clone(&sess);
+    let ordinary_context = Arc::clone(&tc);
+    let ordinary = tokio::spawn(async move {
+        let items = [assistant_message("ordinary-first")];
+        let mut record =
+            Box::pin(ordinary_session.record_conversation_items(&ordinary_context, &items));
+        let mut ordinary_polled_tx = Some(ordinary_polled_tx);
+        std::future::poll_fn(|cx| {
+            let result = record.as_mut().poll(cx);
+            if let Some(sender) = ordinary_polled_tx.take() {
+                let _ = sender.send(());
+            }
+            result
+        })
+        .await;
+    });
+    ordinary_polled_rx
+        .await
+        .expect("ordinary commit should queue on the shared gate");
+
+    let ordered_session = Arc::clone(&sess);
+    let ordered_context = Arc::clone(&tc);
+    let ordered = tokio::spawn(async move {
+        ordered_session
+            .record_conversation_items_ordered(
+                &ordered_context,
+                &[assistant_message("ordered-second")],
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    drop(commit_blocker);
+
+    ordinary.await.expect("ordinary commit should finish");
+    ordered
+        .await
+        .expect("ordered commit task should join")
+        .expect("ordered commit should finish");
+    sess.flush_rollout()
+        .await
+        .expect("committed history should be readable");
+
+    let stored = codex_thread_store::ThreadStore::load_history(
+        store.as_ref(),
+        codex_thread_store::LoadThreadHistoryParams {
+            thread_id: sess.thread_id,
+            include_archived: false,
+        },
+    )
+    .await
+    .expect("stored history should load");
+    let stored_order = stored
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ResponseItem::Message { content, .. }) => {
+                content.iter().find_map(|content| match content {
+                    ContentItem::OutputText { text }
+                        if matches!(text.as_str(), "ordinary-first" | "ordered-second") =>
+                    {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let live_history = sess.clone_history().await;
+    let live_order = live_history
+        .raw_items()
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { content, .. } => {
+                content.iter().find_map(|content| match content {
+                    ContentItem::OutputText { text }
+                        if matches!(text.as_str(), "ordinary-first" | "ordered-second") =>
+                    {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(stored_order, vec!["ordinary-first", "ordered-second"]);
+    assert_eq!(live_order, stored_order);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[test_log::test]
 async fn abort_regular_task_emits_marker_before_turn_aborted() {
@@ -11024,7 +12517,7 @@ async fn terminal_task_tracker_waits_for_receipt_persistence_and_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input() {
+async fn task_finish_restarts_leftover_pending_input_after_terminal_boundary() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let finish = CancellationToken::new();
     let input = vec![TurnInput::UserInput {
@@ -11063,15 +12556,42 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     .await
     .expect("steer pending input into active turn");
 
-    let terminal = sess
-        .active_turn
-        .lock()
-        .await
-        .as_ref()
-        .and_then(|active_turn| active_turn.terminal.clone())
-        .expect("active turn should expose its terminal coordinator");
     finish.cancel();
-    terminal.wait_completed().await;
+
+    let (original_terminal_seen, fresh_turn_id) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        async {
+            let mut original_terminal_seen = false;
+            loop {
+                let event = rx.recv().await.expect("event channel should remain open");
+                match event.msg {
+                    EventMsg::TurnComplete(TurnCompleteEvent { turn_id, .. })
+                        if turn_id == tc.sub_id =>
+                    {
+                        original_terminal_seen = true;
+                    }
+                    EventMsg::ItemStarted(ItemStartedEvent {
+                        turn_id,
+                        item: TurnItem::UserMessage(UserMessageItem { content, .. }),
+                        ..
+                    }) if content == pending_user_input => {
+                        assert!(
+                            original_terminal_seen,
+                            "late input must not be consumed before the closing turn publishes its terminal"
+                        );
+                        assert_ne!(turn_id, tc.sub_id);
+                        break (original_terminal_seen, turn_id);
+                    }
+                    _ => {}
+                }
+            }
+        },
+    )
+    .await
+    .expect("late input should start a fresh turn after the terminal boundary");
+
+    assert!(original_terminal_seen);
+    assert_ne!(fresh_turn_id, tc.sub_id);
 
     let history = sess.clone_history().await;
     let expected = ResponseItem::Message {
@@ -11086,73 +12606,9 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     assert!(
         strip_response_item_ids(&strip_metadata_from_items(history.raw_items()))
             .contains(&expected),
-        "expected pending input to be persisted into history on turn completion"
+        "expected pending input to be persisted when the fresh turn starts"
     );
-
-    let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-        .await
-        .expect("expected raw response item event")
-        .expect("channel open");
-    assert!(matches!(first.msg, EventMsg::RawResponseItem(_)));
-
-    let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-        .await
-        .expect("expected item started event")
-        .expect("channel open");
-    assert!(matches!(
-        second.msg,
-        EventMsg::ItemStarted(ItemStartedEvent {
-            item: TurnItem::UserMessage(UserMessageItem { content, .. }),
-            ..
-        }) if content == pending_user_input
-    ));
-
-    let third = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-        .await
-        .expect("expected item completed event")
-        .expect("channel open");
-    assert!(matches!(
-        third.msg,
-        EventMsg::ItemCompleted(ItemCompletedEvent {
-            item: TurnItem::UserMessage(UserMessageItem { content, .. }),
-            ..
-        }) if content == pending_user_input
-    ));
-
-    let fourth = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-        .await
-        .expect("expected legacy user message event")
-        .expect("channel open");
-    assert!(matches!(
-        fourth.msg,
-        EventMsg::UserMessage(UserMessageEvent {
-                client_id: None,
-            message,
-            images,
-            text_elements,
-            local_images,
-            ..
-        }) if message == "late pending input"
-            && images == Some(Vec::new())
-            && text_elements == vec![text_element]
-            && local_images.is_empty()
-    ));
-
-    let fifth = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-        .await
-        .expect("expected turn complete event")
-        .expect("channel open");
-    assert!(matches!(
-        fifth.msg,
-        EventMsg::TurnComplete(TurnCompleteEvent {
-            surfaced_result: None,
-            turn_id,
-            last_agent_message: None,
-            error: None,
-            time_to_first_token_ms: None,
-            ..
-        }) if turn_id == tc.sub_id
-    ));
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11204,11 +12660,11 @@ async fn task_finish_emits_thread_idle_lifecycle_after_active_turn_clears() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kd4_latency_cancelled_task_start_preserves_input_and_clears_placeholder_once() {
+async fn turn_start_lifecycle_runs_after_task_and_terminal_installation() {
     struct BlockingTurnStart {
         started_tx: async_channel::Sender<()>,
+        stopped_tx: async_channel::Sender<()>,
         release: CancellationToken,
-        idle_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl codex_extension_api::TurnLifecycleContributor for BlockingTurnStart {
@@ -11224,136 +12680,59 @@ async fn kd4_latency_cancelled_task_start_preserves_input_and_clears_placeholder
                 self.release.cancelled().await;
             })
         }
-    }
 
-    impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config> for BlockingTurnStart {
-        fn on_thread_idle<'a>(
+        fn on_turn_stop<'a>(
             &'a self,
-            _input: codex_extension_api::ThreadIdleInput<'a>,
+            _input: codex_extension_api::TurnStopInput<'a>,
         ) -> codex_extension_api::ExtensionFuture<'a, ()> {
             Box::pin(async move {
-                self.idle_calls
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.stopped_tx
+                    .send(())
+                    .await
+                    .expect("turn-stop receiver should remain open");
             })
         }
     }
 
     let (mut session, turn_context) = make_session_and_context().await;
     let (started_tx, started_rx) = async_channel::bounded(1);
-    let idle_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (stopped_tx, stopped_rx) = async_channel::bounded(1);
+    let release = CancellationToken::new();
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
-    let contributor = Arc::new(BlockingTurnStart {
+    builder.turn_lifecycle_contributor(Arc::new(BlockingTurnStart {
         started_tx,
-        release: CancellationToken::new(),
-        idle_calls: Arc::clone(&idle_calls),
-    });
-    builder.turn_lifecycle_contributor(contributor.clone());
-    builder.thread_lifecycle_contributor(contributor);
+        stopped_tx,
+        release: release.clone(),
+    }));
     session.services.extensions = Arc::new(builder.build());
     let session = Arc::new(session);
 
-    let response_item = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: "startup-response".to_string(),
-        output: FunctionCallOutputPayload::from_text("preserve me".to_string()),
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let mailbox_item = InterAgentCommunication::new(
-        AgentPath::root(),
-        AgentPath::try_from("/root/worker").expect("worker agent path"),
-        Vec::new(),
-        "preserve mailbox work".to_string(),
-        /*trigger_turn*/ true,
-    );
-    let expected_input = vec![
-        TurnInput::ResponseItem(response_item.clone()),
-        TurnInput::InterAgentCommunication(mailbox_item.clone()),
-    ];
-    let turn_state = {
-        let mut active_turn = session.active_turn.lock().await;
-        *active_turn = Some(ActiveTurn::default());
-        Arc::clone(
-            &active_turn
-                .as_ref()
-                .expect("startup placeholder")
-                .turn_state,
-        )
-    };
-    session
-        .input_queue
-        .extend_pending_input_for_turn_state(turn_state.as_ref(), &expected_input)
-        .await
-        .expect("pending input should fit");
-
-    let start = tokio::spawn({
+    timeout(StdDuration::from_secs(2), {
         let session = Arc::clone(&session);
         async move {
             session
                 .start_task(Arc::new(turn_context), Vec::new(), CompletingTask)
                 .await;
         }
-    });
+    })
+    .await
+    .expect("task installation must not wait for the turn-start callback");
     timeout(StdDuration::from_secs(2), started_rx.recv())
         .await
-        .expect("turn start should reach the controlled lifecycle callback")
+        .expect("turn-start callback should run")
         .expect("turn-start receiver should remain open");
     {
         let active_turn = session.active_turn.lock().await;
-        let active_turn = active_turn
-            .as_ref()
-            .expect("startup placeholder should exist");
-        assert!(active_turn.task.is_none());
-        assert!(active_turn.terminal.is_none());
+        let active_turn = active_turn.as_ref().expect("running turn is installed");
+        assert!(active_turn.task.is_some());
+        assert!(active_turn.terminal.is_some());
     }
 
-    start.abort();
-    assert!(
-        start
-            .await
-            .expect_err("controlled task start should be cancelled")
-            .is_cancelled()
-    );
-    timeout(StdDuration::from_secs(2), async {
-        loop {
-            if session.active_turn.lock().await.is_none()
-                && session.input_queue.has_trigger_turn_mailbox_items().await
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("cancelled startup should restore input and clear its placeholder");
-
-    assert!(session.active_turn.lock().await.is_none());
-    assert!(
-        !session
-            .terminal_interaction_pending
-            .load(std::sync::atomic::Ordering::Acquire)
-    );
-    assert!(session.input_queue.has_trigger_turn_mailbox_items().await);
-    assert_eq!(
-        expected_input,
-        session
-            .input_queue
-            .get_pending_input(&session.active_turn)
-            .await,
-        "the next startup must consume every accepted item in FIFO order"
-    );
-    assert_eq!(
-        Vec::<TurnInput>::new(),
-        session
-            .input_queue
-            .get_pending_input(&session.active_turn)
-            .await,
-        "recovered startup input must be delivered exactly once"
-    );
-    assert_eq!(
-        0,
-        idle_calls.load(std::sync::atomic::Ordering::SeqCst),
-        "restored trigger-turn mailbox work must suppress thread idle"
-    );
+    release.cancel();
+    timeout(StdDuration::from_secs(2), stopped_rx.recv())
+        .await
+        .expect("installed turn-start callback must have a paired turn-stop callback")
+        .expect("turn-stop receiver should remain open");
 }
 
 #[tokio::test]
@@ -11409,11 +12788,61 @@ async fn shutdown_latch_prevents_pending_mailbox_turn_restart() {
         ))
         .await;
 
-    sess.begin_shutdown();
+    sess.begin_shutdown().await;
     sess.maybe_start_turn_for_pending_work().await;
 
     assert!(sess.active_turn.lock().await.is_none());
     assert!(sess.input_queue.has_trigger_turn_mailbox_items().await);
+}
+
+#[tokio::test]
+async fn orchestration_audit_pending_mailbox_start_reserves_only_inside_shared_start_admission() {
+    let (sess, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    sess.input_queue
+        .enqueue_mailbox_communication(InterAgentCommunication::new(
+            AgentPath::root(),
+            AgentPath::root(),
+            Vec::new(),
+            "pending behind another admitted start".to_string(),
+            /*trigger_turn*/ true,
+        ))
+        .await;
+
+    let admission = sess
+        .task_start_gate
+        .acquire()
+        .await
+        .expect("task start gate open");
+    let pending_session = Arc::clone(&sess);
+    let pending_start = tokio::spawn(async move {
+        pending_session
+            .maybe_start_turn_for_pending_work_with_sub_id("pending-admission-turn".to_string())
+            .await;
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        sess.active_turn.lock().await.is_none(),
+        "a pending-work start must not publish a placeholder before it owns admission"
+    );
+
+    drop(admission);
+    timeout(StdDuration::from_secs(2), pending_start)
+        .await
+        .expect("pending start should acquire admission")
+        .expect("pending start task should not panic");
+    assert_eq!(
+        Some("pending-admission-turn".to_string()),
+        sess.active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|active| active.terminal.as_ref())
+            .map(|terminal| terminal.turn_id().to_string())
+    );
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 #[tokio::test]
@@ -11715,10 +13144,15 @@ async fn abort_empty_active_turn_preserves_pending_input() {
 
     assert!(sess.active_turn.lock().await.is_none());
     assert_eq!(
-        sess.input_queue
-            .take_pending_input_for_turn_state(turn_state.as_ref())
-            .await,
+        sess.input_queue.get_pending_input(&sess.active_turn).await,
         vec![TurnInput::ResponseItem(pending_item)]
+    );
+    assert!(
+        sess.input_queue
+            .get_pending_input(&sess.active_turn)
+            .await
+            .is_empty(),
+        "recovered placeholder input is delivered exactly once"
     );
 }
 
@@ -11964,6 +13398,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
         turn_store: Arc::new(codex_extension_api::ExtensionData::new(tc.sub_id.clone())),
         tool_runtime: test_tool_runtime(Arc::clone(&sess), Arc::clone(&tc)),
         cancellation_token: CancellationToken::new(),
+        response_item_recorder: OrderedResponseItemRecorder::default(),
     };
 
     let output = handle_output_item_done(
@@ -12104,6 +13539,8 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
         .expect("build tool call")
         .expect("tool call present");
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let dispatch_state = Arc::new(ToolDispatchState::new());
+    assert!(dispatch_state.try_admit());
     let err = router
         .dispatch_tool_call_with_terminal_outcome(
             Arc::clone(&session),
@@ -12112,7 +13549,7 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
             tracker,
             call,
             ToolCallSource::Direct,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dispatch_state,
         )
         .await
         .err()
@@ -12378,10 +13815,13 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
     let turn_context_mut = Arc::get_mut(&mut turn_context).expect("unique thread settings Arc");
     turn_context_mut.permission_profile = PermissionProfile::Disabled;
 
-    let command = session.user_shell().derive_exec_args(
-        command_script,
-        turn_context.config.permissions.allow_login_shell,
-    );
+    let command = session
+        .user_shell()
+        .derive_exec_args(
+            command_script,
+            turn_context.config.permissions.allow_login_shell,
+        )
+        .expect("default Windows shell must derive execution arguments");
     let exec_approval_requirement = session
         .services
         .exec_policy

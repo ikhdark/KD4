@@ -5,6 +5,8 @@
 
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
+use codex_file_system::FileSystemSandboxContext;
+use codex_protocol::models::SandboxPermissions;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -116,14 +118,70 @@ pub(crate) mod test_observation {
     }
 }
 
-pub(crate) const EVIDENCE_SCHEMA_VERSION: u32 = 1;
+pub(crate) const EVIDENCE_SCHEMA_VERSION: u32 = 2;
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const STORE_DIRECTORY: &str = "known-delta";
+#[cfg(test)]
+const TEST_AUTHORIZATION_SCOPE: &str = "known-delta-test-authorization-scope";
+
+#[derive(Serialize)]
+struct AuthorizationScope<'a> {
+    schema_version: u32,
+    file_system: &'a FileSystemSandboxContext,
+    sandbox_permissions: SandboxPermissions,
+}
+
+/// Stable identity for the exact filesystem authorization used by execution.
+/// A serialization failure disables Known Delta for that command instead of
+/// allowing evidence to cross authorization boundaries.
+pub(crate) fn authorization_scope_fingerprint(
+    file_system: &FileSystemSandboxContext,
+    sandbox_permissions: SandboxPermissions,
+) -> Option<String> {
+    serde_json::to_vec(&AuthorizationScope {
+        schema_version: 1,
+        file_system,
+        sandbox_permissions,
+    })
+    .ok()
+    .map(|scope| digest(&scope))
+}
 
 #[derive(Default)]
 struct RuntimeQuarantineState {
     disabled_namespaces: HashSet<PathBuf>,
     unsafe_lineages: HashSet<PathBuf>,
+    all_namespaces_disabled: bool,
+}
+
+const MAX_DISABLED_RUNTIME_NAMESPACES: usize = 64;
+
+impl RuntimeQuarantineState {
+    fn lookup_disabled(&self, namespace: &Path, unsafe_marker: &Path) -> bool {
+        self.all_namespaces_disabled
+            || self.disabled_namespaces.contains(namespace)
+            || self.unsafe_lineages.contains(unsafe_marker)
+    }
+
+    fn mark_lineage_unsafe(&mut self, unsafe_marker: PathBuf) {
+        self.unsafe_lineages.insert(unsafe_marker);
+    }
+
+    fn release_lineage(&mut self, unsafe_marker: &Path) {
+        self.unsafe_lineages.remove(unsafe_marker);
+    }
+
+    fn disable_namespace(&mut self, namespace: PathBuf) {
+        if self.all_namespaces_disabled || self.disabled_namespaces.contains(&namespace) {
+            return;
+        }
+        if self.disabled_namespaces.len() >= MAX_DISABLED_RUNTIME_NAMESPACES {
+            self.disabled_namespaces.clear();
+            self.all_namespaces_disabled = true;
+            return;
+        }
+        self.disabled_namespaces.insert(namespace);
+    }
 }
 
 static RUNTIME_QUARANTINE_STATE: OnceLock<Mutex<RuntimeQuarantineState>> = OnceLock::new();
@@ -273,11 +331,29 @@ pub(crate) enum ProjectNamespaceHint<'a> {
     Resolved(Option<&'a str>),
 }
 
+#[cfg(test)]
 pub(crate) async fn immutable_git_show_identity_with_project_namespace(
     cwd: &Path,
     program: &str,
     args: &[String],
     project_namespace_hint: ProjectNamespaceHint<'_>,
+) -> Option<EvidenceIdentity> {
+    immutable_git_show_identity_with_authorization_scope(
+        cwd,
+        program,
+        args,
+        project_namespace_hint,
+        TEST_AUTHORIZATION_SCOPE,
+    )
+    .await
+}
+
+async fn immutable_git_show_identity_with_authorization_scope(
+    cwd: &Path,
+    program: &str,
+    args: &[String],
+    project_namespace_hint: ProjectNamespaceHint<'_>,
+    authorization_scope: &str,
 ) -> Option<EvidenceIdentity> {
     #[cfg(test)]
     test_observation::record_immutable_git_show_identity();
@@ -318,7 +394,7 @@ pub(crate) async fn immutable_git_show_identity_with_project_namespace(
     );
     let fingerprint = digest(
         format!(
-            "schema={EVIDENCE_SCHEMA_VERSION}\0project={project_namespace}\0op=git_show\0program={program_identity}\0cwd={cwd_position}\0object={normalized_requested}\0blob={resolved_blob}"
+            "schema={EVIDENCE_SCHEMA_VERSION}\0project={project_namespace}\0authorization={authorization_scope}\0op=git_show\0program={program_identity}\0cwd={cwd_position}\0object={normalized_requested}\0blob={resolved_blob}"
         )
         .as_bytes(),
     );
@@ -339,6 +415,7 @@ pub(crate) fn is_immutable_git_show_candidate(program: &str, args: &[String]) ->
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn prepare_immutable_git_show(
     codex_home: &Path,
     thread_id: &str,
@@ -348,11 +425,36 @@ pub(crate) async fn prepare_immutable_git_show(
     project_namespace_hint: ProjectNamespaceHint<'_>,
     force_fresh: bool,
 ) -> Option<PreparedKnownDelta> {
-    let identity = immutable_git_show_identity_with_project_namespace(
+    prepare_immutable_git_show_with_authorization_scope(
+        codex_home,
+        thread_id,
         cwd,
         program,
         args,
         project_namespace_hint,
+        TEST_AUTHORIZATION_SCOPE,
+        force_fresh,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_immutable_git_show_with_authorization_scope(
+    codex_home: &Path,
+    thread_id: &str,
+    cwd: &Path,
+    program: &str,
+    args: &[String],
+    project_namespace_hint: ProjectNamespaceHint<'_>,
+    authorization_scope: &str,
+    force_fresh: bool,
+) -> Option<PreparedKnownDelta> {
+    let identity = immutable_git_show_identity_with_authorization_scope(
+        cwd,
+        program,
+        args,
+        project_namespace_hint,
+        authorization_scope,
     )
     .await?;
     let candidate = lookup(codex_home, &identity).await;
@@ -428,8 +530,11 @@ pub(crate) async fn lookup(
         return None;
     }
     // A contradiction may be reported while this lookup is reading the old
-    // record. Recheck the process-local deny state before returning it.
-    if lookup_disabled(codex_home, &unsafe_marker) {
+    // record. Recheck both the transient deny state and its durable successor
+    // before returning it.
+    if lookup_disabled(codex_home, &unsafe_marker)
+        || tokio::fs::try_exists(&unsafe_marker).await.ok()?
+    {
         return None;
     }
     Some(EvidenceCandidate {
@@ -601,19 +706,24 @@ fn lookup_disabled(codex_home: &Path, unsafe_marker: &Path) -> bool {
         // entries.
         return true;
     };
-    state.disabled_namespaces.contains(&store_root(codex_home))
-        || state.unsafe_lineages.contains(unsafe_marker)
+    state.lookup_disabled(&store_root(codex_home), unsafe_marker)
 }
 
 fn mark_lineage_unsafe(unsafe_marker: PathBuf) {
     if let Ok(mut state) = runtime_quarantine_state().lock() {
-        state.unsafe_lineages.insert(unsafe_marker);
+        state.mark_lineage_unsafe(unsafe_marker);
+    }
+}
+
+fn release_lineage(unsafe_marker: &Path) {
+    if let Ok(mut state) = runtime_quarantine_state().lock() {
+        state.release_lineage(unsafe_marker);
     }
 }
 
 fn disable_namespace(codex_home: &Path) {
     if let Ok(mut state) = runtime_quarantine_state().lock() {
-        state.disabled_namespaces.insert(store_root(codex_home));
+        state.disable_namespace(store_root(codex_home));
     }
 }
 
@@ -724,6 +834,9 @@ async fn quarantine_with_faults(
             "Known Delta quarantine was not fully durable; cache namespace disabled"
         );
     }
+    // A settled quarantine is protected either by its durable lineage marker
+    // or by the fail-closed namespace state, so the transient race guard can go.
+    release_lineage(&unsafe_marker);
 }
 
 async fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
@@ -860,6 +973,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn authorization_scope_tracks_effective_file_system_and_override_mode() {
+        let root = TempDir::new().unwrap();
+        let absolute =
+            codex_utils_absolute_path::AbsolutePathBuf::try_from(root.path().to_path_buf())
+                .unwrap();
+        let cwd = codex_utils_path_uri::PathUri::from_abs_path(&absolute);
+        let read_only = FileSystemSandboxContext::from_legacy_sandbox_policy(
+            codex_protocol::protocol::SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            cwd.clone(),
+        )
+        .unwrap();
+        let full_access = FileSystemSandboxContext::from_legacy_sandbox_policy(
+            codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            cwd,
+        )
+        .unwrap();
+
+        let read_only_default =
+            authorization_scope_fingerprint(&read_only, SandboxPermissions::UseDefault).unwrap();
+        assert_eq!(
+            read_only_default,
+            authorization_scope_fingerprint(&read_only, SandboxPermissions::UseDefault).unwrap()
+        );
+        assert_ne!(
+            read_only_default,
+            authorization_scope_fingerprint(&read_only, SandboxPermissions::RequireEscalated,)
+                .unwrap()
+        );
+        assert_ne!(
+            read_only_default,
+            authorization_scope_fingerprint(&full_access, SandboxPermissions::UseDefault).unwrap()
+        );
+    }
+
+    #[test]
     fn immutable_git_show_gate_rejects_ordinary_commands_before_fingerprinting() {
         assert!(is_immutable_git_show_candidate(
             "git",
@@ -874,6 +1024,30 @@ mod tests {
             &["pattern".to_string(), "src".to_string()]
         ));
     }
+
+    #[test]
+    fn runtime_quarantine_state_is_bounded_and_fails_closed() {
+        let mut state = RuntimeQuarantineState::default();
+        let transient_marker = PathBuf::from("transient.unsafe");
+        state.mark_lineage_unsafe(transient_marker.clone());
+        assert!(state.lookup_disabled(Path::new("namespace"), &transient_marker));
+        state.release_lineage(&transient_marker);
+        assert!(!state.lookup_disabled(Path::new("namespace"), &transient_marker));
+
+        for index in 0..MAX_DISABLED_RUNTIME_NAMESPACES {
+            state.disable_namespace(PathBuf::from(format!("namespace-{index}")));
+        }
+        assert_eq!(
+            state.disabled_namespaces.len(),
+            MAX_DISABLED_RUNTIME_NAMESPACES
+        );
+        state.disable_namespace(PathBuf::from("overflow"));
+
+        assert!(state.all_namespaces_disabled);
+        assert!(state.disabled_namespaces.is_empty());
+        assert!(state.lookup_disabled(Path::new("any-namespace"), Path::new("any-marker")));
+    }
+
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
@@ -1030,6 +1204,80 @@ mod tests {
         assert_eq!(observed.immutable_git_show_identity_calls, 1);
         assert_eq!(observed.lookup_calls, 3);
         assert_eq!(observed.fingerprint_git_subprocesses, 3);
+    }
+
+    #[tokio::test]
+    async fn reusable_evidence_does_not_cross_authorization_scopes() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        let home = root.path().join("home");
+        init_repo(&repo, "immutable\n");
+        let blob = run_git(&repo, &["rev-parse", "HEAD:read.txt"]);
+        let args = ["show".to_string(), blob];
+        let identity = immutable_git_show_identity_with_authorization_scope(
+            &repo,
+            "git",
+            &args,
+            ProjectNamespaceHint::Discover,
+            "read-only-scope",
+        )
+        .await
+        .expect("immutable identity");
+        assert_eq!(
+            record_success(
+                &home,
+                &identity,
+                None,
+                b"immutable output",
+                Duration::from_secs(1),
+            )
+            .await,
+            Observation::Published
+        );
+        let candidate = lookup(&home, &identity).await.expect("shadow candidate");
+        assert_eq!(
+            record_success(
+                &home,
+                &identity,
+                Some(&candidate),
+                b"immutable output",
+                Duration::from_secs(1),
+            )
+            .await,
+            Observation::Unchanged {
+                reuse_enabled: true
+            }
+        );
+
+        let different_scope = prepare_immutable_git_show_with_authorization_scope(
+            &home,
+            "thread-b",
+            &repo,
+            "git",
+            &args,
+            ProjectNamespaceHint::Discover,
+            "workspace-write-scope",
+            false,
+        )
+        .await
+        .expect("prepared lookup");
+        assert!(!different_scope.has_candidate());
+        assert!(!different_scope.is_hit());
+
+        let same_scope = prepare_immutable_git_show_with_authorization_scope(
+            &home,
+            "thread-a",
+            &repo,
+            "git",
+            &args,
+            ProjectNamespaceHint::Discover,
+            "read-only-scope",
+            false,
+        )
+        .await
+        .expect("prepared lookup");
+        assert!(same_scope.has_candidate());
+        assert!(same_scope.is_hit());
     }
 
     #[tokio::test]

@@ -546,3 +546,35 @@ fn codex_apps_tools_cache_snapshot_tracks_startup_and_live_publication_state() {
     assert!(live_snapshot.codex_apps_ready());
     assert!(live_snapshot.is_fresh_for(std::time::Duration::from_secs(1)));
 }
+
+#[test]
+fn codex_apps_tools_cache_evicts_only_idle_lru_identities() {
+    let codex_home = tempdir().expect("tempdir");
+    let cache = CodexAppsToolsCache::default();
+    let key = |index: usize| CodexAppsToolsCacheKey {
+        account_id: Some(format!("account-{index}")),
+        chatgpt_user_id: Some(format!("user-{index}")),
+        is_workspace_account: false,
+        chatgpt_base_url: "https://chatgpt.com".to_string(),
+        product_sku: DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU.to_string(),
+    };
+
+    let pinned = cache.context(codex_home.path().to_path_buf(), key(0));
+    let idle = cache.context(codex_home.path().to_path_buf(), key(1));
+    let idle_entry = Arc::downgrade(&idle.entry);
+    drop(idle);
+    for index in 2..=CODEX_APPS_TOOLS_CACHE_CAPACITY + 1 {
+        drop(cache.context(codex_home.path().to_path_buf(), key(index)));
+    }
+
+    assert!(
+        idle_entry.upgrade().is_none(),
+        "oldest idle entry was retained"
+    );
+    let pinned_again = cache.context(codex_home.path().to_path_buf(), key(0));
+    assert!(Arc::ptr_eq(&pinned.entry, &pinned_again.entry));
+    assert_eq!(
+        lock_unpoisoned(&cache.entries).by_identity.len(),
+        CODEX_APPS_TOOLS_CACHE_CAPACITY
+    );
+}

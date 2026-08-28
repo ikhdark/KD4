@@ -1,6 +1,82 @@
 use super::*;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommandExecLogMetadata {
+    argv_count: usize,
+    env_key_count: usize,
+    process_id_present: bool,
+    tty: bool,
+    stream_stdin: bool,
+    stream_stdout_stderr: bool,
+    output_cap_present: bool,
+    disable_output_cap: bool,
+    disable_timeout: bool,
+    timeout_present: bool,
+    cwd_present: bool,
+    size_present: bool,
+    sandbox_policy_present: bool,
+    permission_profile_present: bool,
+}
+
+fn command_exec_log_metadata(params: &CommandExecParams) -> CommandExecLogMetadata {
+    CommandExecLogMetadata {
+        argv_count: params.command.len(),
+        env_key_count: params.env.as_ref().map_or(0, HashMap::len),
+        process_id_present: params.process_id.is_some(),
+        tty: params.tty,
+        stream_stdin: params.stream_stdin,
+        stream_stdout_stderr: params.stream_stdout_stderr,
+        output_cap_present: params.output_bytes_cap.is_some(),
+        disable_output_cap: params.disable_output_cap,
+        disable_timeout: params.disable_timeout,
+        timeout_present: params.timeout_ms.is_some(),
+        cwd_present: params.cwd.is_some(),
+        size_present: params.size.is_some(),
+        sandbox_policy_present: params.sandbox_policy.is_some(),
+        permission_profile_present: params.permission_profile.is_some(),
+    }
+}
+
+fn log_command_exec_request(params: &CommandExecParams) {
+    let metadata = command_exec_log_metadata(params);
+    tracing::debug!(
+        rpc.method = "command/exec",
+        argv_count = metadata.argv_count,
+        env_key_count = metadata.env_key_count,
+        process_id_present = metadata.process_id_present,
+        tty = metadata.tty,
+        stream_stdin = metadata.stream_stdin,
+        stream_stdout_stderr = metadata.stream_stdout_stderr,
+        output_cap_present = metadata.output_cap_present,
+        disable_output_cap = metadata.disable_output_cap,
+        disable_timeout = metadata.disable_timeout,
+        timeout_present = metadata.timeout_present,
+        cwd_present = metadata.cwd_present,
+        size_present = metadata.size_present,
+        sandbox_policy_present = metadata.sandbox_policy_present,
+        permission_profile_present = metadata.permission_profile_present,
+        "command request"
+    );
+}
+
+fn legacy_command_exec_config(
+    base_config: &Config,
+    cwd: &AbsolutePathBuf,
+    sandbox_policy: codex_protocol::protocol::SandboxPolicy,
+) -> codex_core::config::ConstraintResult<Config> {
+    let mut config = base_config.clone();
+    config.cwd = cwd.clone();
+    config.set_legacy_sandbox_policy(sandbox_policy)?;
+    if matches!(
+        config.permissions.permission_profile(),
+        codex_protocol::models::PermissionProfile::Disabled
+    ) {
+        config.permissions.network = None;
+    }
+    Ok(config)
+}
+
 #[derive(Clone)]
 pub(crate) struct CommandExecRequestProcessor {
     _arg0_paths: Arg0DispatchPaths,
@@ -94,7 +170,7 @@ impl CommandExecRequestProcessor {
         params: CommandExecParams,
         rpc_gate: &ConnectionRpcGate,
     ) -> Result<(), JSONRPCErrorError> {
-        tracing::debug!("ExecOneOffCommand params: {params:?}");
+        log_command_exec_request(&params);
 
         let request = request_id.clone();
 
@@ -185,7 +261,7 @@ impl CommandExecRequestProcessor {
         } else {
             ExecCapturePolicy::ShellTool
         };
-        let sandbox_cwd = if permission_profile.is_some() {
+        let sandbox_cwd = if permission_profile.is_some() || sandbox_policy.is_some() {
             cwd.clone()
         } else {
             self.config.cwd.clone()
@@ -226,30 +302,14 @@ impl CommandExecRequestProcessor {
                 config.effective_workspace_roots(),
             )
         } else if let Some(policy) = sandbox_policy.map(|policy| policy.to_core()) {
-            self.config
-                .permissions
-                .can_set_legacy_sandbox_policy(&policy, &sandbox_cwd)
-                .map_err(|err| invalid_request(format!("invalid sandbox policy: {err}")))?;
-            let file_system_sandbox_policy =
-                codex_protocol::permissions::FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&policy, &sandbox_cwd);
-            let network_sandbox_policy =
-                codex_protocol::permissions::NetworkSandboxPolicy::from(&policy);
-            let permission_profile =
-                codex_protocol::models::PermissionProfile::from_runtime_permissions_with_enforcement(
-                    codex_protocol::models::SandboxEnforcement::from_legacy_sandbox_policy(&policy),
-                    &file_system_sandbox_policy,
-                    network_sandbox_policy,
-                );
-            self.config
-                .permissions
-                .can_set_permission_profile(&permission_profile)
+            let config = legacy_command_exec_config(&self.config, &sandbox_cwd, policy)
                 .map_err(|err| invalid_request(format!("invalid sandbox policy: {err}")))?;
             (
-                permission_profile,
-                self.config.permissions.network.clone(),
-                self.config.permissions.permission_profile().clone(),
-                self.config.managed_network_requirements_enabled(),
-                self.config.effective_workspace_roots(),
+                config.permissions.effective_permission_profile(),
+                config.permissions.network.clone(),
+                config.permissions.permission_profile().clone(),
+                config.managed_network_requirements_enabled(),
+                config.effective_workspace_roots(),
             )
         } else {
             (
@@ -263,6 +323,7 @@ impl CommandExecRequestProcessor {
         let started_network_proxy = match network_proxy_spec.as_ref() {
             Some(spec) => match spec
                 .start_proxy(
+                    &self.config.codex_home,
                     &network_proxy_permission_profile,
                     /*policy_decider*/ None,
                     /*blocked_request_observer*/ None,
@@ -282,6 +343,7 @@ impl CommandExecRequestProcessor {
         };
         let exec_params = ExecParams {
             command,
+            codex_home: self.config.codex_home.clone(),
             cwd: cwd.clone(),
             expiration,
             capture_policy,
@@ -335,5 +397,93 @@ impl CommandExecRequestProcessor {
                 rpc_gate,
             )
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_core::config::ConfigBuilder;
+    use tempfile::TempDir;
+
+    #[test]
+    fn logging_contract_command_exec_metadata_omits_argv_and_env_values() {
+        let params = CommandExecParams {
+            command: vec![
+                "powershell".to_string(),
+                "-Command".to_string(),
+                "command secret".to_string(),
+            ],
+            process_id: Some("process secret".to_string()),
+            tty: true,
+            stream_stdin: true,
+            stream_stdout_stderr: true,
+            output_bytes_cap: Some(1024),
+            disable_output_cap: false,
+            disable_timeout: false,
+            timeout_ms: Some(1000),
+            cwd: Some(PathBuf::from("cwd secret")),
+            env: Some(HashMap::from([
+                ("SECRET_KEY".to_string(), Some("secret value".to_string())),
+                ("UNSET_ME".to_string(), None),
+            ])),
+            size: None,
+            sandbox_policy: None,
+            permission_profile: Some("profile secret".to_string()),
+        };
+
+        let metadata = command_exec_log_metadata(&params);
+
+        assert_eq!(metadata.argv_count, 3);
+        assert_eq!(metadata.env_key_count, 2);
+        assert!(metadata.process_id_present);
+        assert!(metadata.tty);
+        assert!(metadata.output_cap_present);
+        assert!(metadata.timeout_present);
+        assert!(metadata.cwd_present);
+        assert!(metadata.permission_profile_present);
+        let rendered = format!("{metadata:?}");
+        assert!(!rendered.contains("command secret"));
+        assert!(!rendered.contains("secret value"));
+        assert!(!rendered.contains("profile secret"));
+    }
+
+    #[tokio::test]
+    async fn command_exec_legacy_policy_retargets_workspace_write_to_request_cwd() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let base_cwd = temp_dir.path().join("base-cwd");
+        let request_cwd = temp_dir.path().join("request-cwd");
+        std::fs::create_dir_all(&base_cwd).expect("create base cwd");
+        std::fs::create_dir_all(&request_cwd).expect("create request cwd");
+        let base_config = ConfigBuilder::default()
+            .codex_home(temp_dir.path().to_path_buf())
+            .fallback_cwd(Some(base_cwd.clone()))
+            .build()
+            .await
+            .expect("build base config");
+        let base_cwd = AbsolutePathBuf::from_absolute_path(base_cwd).expect("absolute base cwd");
+        let request_cwd =
+            AbsolutePathBuf::from_absolute_path(request_cwd).expect("absolute request cwd");
+
+        let config = legacy_command_exec_config(
+            &base_config,
+            &request_cwd,
+            codex_protocol::protocol::SandboxPolicy::new_workspace_write_policy(),
+        )
+        .expect("derive legacy command config");
+
+        assert_eq!(config.cwd, request_cwd);
+        assert_eq!(
+            config.effective_workspace_roots(),
+            vec![request_cwd.clone()]
+        );
+        let file_system_policy = config.permissions.file_system_sandbox_policy();
+        assert!(
+            file_system_policy
+                .can_write_path_with_cwd(request_cwd.as_path(), request_cwd.as_path())
+        );
+        assert!(
+            !file_system_policy.can_write_path_with_cwd(base_cwd.as_path(), request_cwd.as_path())
+        );
     }
 }

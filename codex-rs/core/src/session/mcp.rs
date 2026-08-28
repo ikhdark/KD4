@@ -241,7 +241,7 @@ impl Session {
                         mcp_projection.plugins_available,
                         current.runtime_context().clone(),
                         available_environment_ids,
-                        current.manager_arc(),
+                        current.as_ref(),
                     );
                 }
                 current
@@ -439,6 +439,7 @@ impl Session {
         let mcp_runtime_context = McpRuntimeContext::new(environment_manager, cwd);
         let auth_statuses = compute_auth_statuses(
             mcp_servers.iter(),
+            &mcp_config.codex_home,
             mcp_config.mcp_oauth_credentials_store_mode,
             mcp_config.auth_keyring_backend_kind,
             auth.as_ref(),
@@ -508,6 +509,7 @@ impl Session {
             elicitation_reviewer,
             Some(self.mcp_elicitation_lifecycle()),
             expected_runtime.manager().elicitation_router(),
+            Some(expected_runtime.manager()),
         )
         .await;
         refreshed_manager
@@ -520,7 +522,7 @@ impl Session {
         if !Arc::ptr_eq(&current_runtime, &expected_runtime) {
             drop(projection_guard);
             cancellation_forwarding_stop.cancel();
-            drop(refreshed_manager);
+            refreshed_manager.shutdown().await;
             return current_runtime;
         }
         let mut published_token = self.services.mcp_startup_cancellation_token.lock().await;
@@ -528,14 +530,14 @@ impl Session {
             drop(published_token);
             drop(projection_guard);
             cancellation_forwarding_stop.cancel();
-            drop(refreshed_manager);
+            refreshed_manager.shutdown().await;
             return current_runtime;
         }
         *published_token = mcp_startup_cancellation_token;
         cancellation_forwarding_stop.cancel();
         drop(published_token);
-        // The previous runtime owns the old token and may still be serving an in-flight step.
-        // Its manager cancels that token when the last runtime handle is dropped.
+        // The previous runtime may still be serving an in-flight step. Connections adopted by
+        // this runtime remain live until the final manager lease is released.
         let mut state_owner = self.state.lock().await;
         let runtime = self.services.publish_mcp_runtime(
             &mut state_owner,

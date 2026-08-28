@@ -1063,6 +1063,11 @@ class DynamicToolSpec(RootModel[FunctionDynamicToolSpec | NamespaceDynamicToolSp
     root: FunctionDynamicToolSpec | NamespaceDynamicToolSpec
 
 
+class ExperimentalFeatureConsumer(Enum):
+    runtime = "runtime"
+    client = "client"
+
+
 class ExperimentalFeatureEnablementSetParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -2186,6 +2191,14 @@ class McpServerRefreshResponse(BaseModel):
     )
 
 
+class McpServerStartupFailure(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    error: str
+    server: str
+
+
 class McpServerStartupFailureReason(RootModel[Literal["reauthenticationRequired"]]):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -2557,6 +2570,13 @@ class PatchChangeKind(
         populate_by_name=True,
     )
     root: AddPatchChangeKind | DeletePatchChangeKind | UpdatePatchChangeKind
+
+
+class PathUri(RootModel[str]):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    root: str
 
 
 class PermissionProfileListParams(BaseModel):
@@ -4539,6 +4559,14 @@ class ThreadRollbackParams(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadSelectedEnvironment(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    cwd: PathUri
+    environment_id: Annotated[str, Field(alias="environmentId")]
+
+
 class ThreadSetNameParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -5185,7 +5213,6 @@ class TurnTimingTerminalization(BaseModel):
     )
     checkpoint_tokens: Annotated[int | None, Field(alias="checkpointTokens", ge=0)] = 0
     completion_gate_ns: Annotated[int, Field(alias="completionGateNs", ge=0)]
-    conservative_rerun_count: Annotated[int | None, Field(alias="conservativeRerunCount", ge=0)] = 0
     delivery_attempt_ns: Annotated[int | None, Field(alias="deliveryAttemptNs", ge=0)] = 0
     diff_refresh_count: Annotated[int | None, Field(alias="diffRefreshCount", ge=0)] = 0
     diff_reuse_count: Annotated[int | None, Field(alias="diffReuseCount", ge=0)] = 0
@@ -5198,7 +5225,6 @@ class TurnTimingTerminalization(BaseModel):
     interaction_release_ns: Annotated[int | None, Field(alias="interactionReleaseNs", ge=0)] = 0
     post_cleanup_ns: Annotated[int | None, Field(alias="postCleanupNs", ge=0)] = 0
     preparation_ns: Annotated[int | None, Field(alias="preparationNs", ge=0)] = 0
-    proof_reuse_count: Annotated[int | None, Field(alias="proofReuseCount", ge=0)] = 0
     review_ns: Annotated[int | None, Field(alias="reviewNs", ge=0)] = 0
     review_preflight_ns: Annotated[int | None, Field(alias="reviewPreflightNs", ge=0)] = 0
     reviewer_infrastructure_memo_hit_count: Annotated[
@@ -6732,6 +6758,12 @@ class ExperimentalFeature(BaseModel):
             description="Announcement copy shown to users when the feature is introduced. Null when this feature is not in beta."
         ),
     ] = None
+    consumer: Annotated[
+        ExperimentalFeatureConsumer | None,
+        Field(
+            description="Which side of the app-server boundary consumes this flag. Optional for clients generated before consumer metadata existed."
+        ),
+    ] = None
     default_enabled: Annotated[
         bool,
         Field(alias="defaultEnabled", description="Whether this feature is enabled by default."),
@@ -7105,6 +7137,16 @@ class McpResourceReadResponse(BaseModel):
         populate_by_name=True,
     )
     contents: list[ResourceContent]
+
+
+class McpServerStartupCompletedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    cancelled: list[str]
+    failed: list[McpServerStartupFailure]
+    ready: list[str]
+    thread_id: Annotated[str | None, Field(alias="threadId")] = None
 
 
 class McpServerStatus(BaseModel):
@@ -7592,6 +7634,17 @@ class ServerRequestResolvedServerNotification(BaseModel):
         Literal["serverRequest/resolved"], Field(title="ServerRequest/resolvedNotificationMethod")
     ]
     params: ServerRequestResolvedNotification
+
+
+class McpServerStartupCompletedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[
+        Literal["mcpServer/startup/completed"],
+        Field(title="McpServer/startup/completedNotificationMethod"),
+    ]
+    params: McpServerStartupCompletedNotification
 
 
 class AccountUpdatedServerNotification(BaseModel):
@@ -8215,23 +8268,13 @@ class TurnTimingCounters(BaseModel):
             ge=0,
         ),
     ] = 0
-    duplicate_validation_count: Annotated[
-        int | None,
-        Field(
-            alias="duplicateValidationCount",
-            description="Validation requests identified as duplicates and served from the ledger.",
-            ge=0,
-        ),
-    ] = 0
     exact_repeated_wait_count: Annotated[
         int | None, Field(alias="exactRepeatedWaitCount", ge=0)
     ] = 0
     executed_validation_count: Annotated[
         int | None,
         Field(
-            alias="executedValidationCount",
-            description="Validation commands that executed rather than reusing a proof.",
-            ge=0,
+            alias="executedValidationCount", description="Validation commands that executed.", ge=0
         ),
     ] = 0
     executed_validation_duration_ns: Annotated[
@@ -8244,14 +8287,6 @@ class TurnTimingCounters(BaseModel):
     ] = 0
     failure_diagnosis_count: Annotated[int | None, Field(alias="failureDiagnosisCount", ge=0)] = 0
     failure_signature_count: Annotated[int | None, Field(alias="failureSignatureCount", ge=0)] = 0
-    forced_fresh_validation_count: Annotated[
-        int | None,
-        Field(
-            alias="forcedFreshValidationCount",
-            description="Executed validation requests that explicitly bypassed reusable proof state.",
-            ge=0,
-        ),
-    ] = 0
     generations_by_disposition: Annotated[
         TurnTimingGenerationDispositionCounts | None, Field(alias="generationsByDisposition")
     ] = {"decisionBearing": 0, "deterministic": 0, "unknown": 0}
@@ -8353,14 +8388,6 @@ class TurnTimingCounters(BaseModel):
         Field(
             alias="residualDeterministicGenerationCount",
             description="Residual deterministic generation requests proved by the reasoning governor, including requests elided before provider dispatch.",
-            ge=0,
-        ),
-    ] = 0
-    reused_validation_count: Annotated[
-        int | None,
-        Field(
-            alias="reusedValidationCount",
-            description="Validation results served from the authoritative validation ledger.",
             ge=0,
         ),
     ] = 0
@@ -8576,7 +8603,7 @@ class TurnTimingToolCall(BaseModel):
         int | None,
         Field(
             alias="outputModelVisibleAtMs",
-            description="The direct tool output was committed to model-visible conversation history and the best-effort rollout persistence attempt returned. This does not prove that a rollout recorder existed, that its append succeeded, or that storage was flushed. Nested code-mode calls are represented by the outer direct tool output and leave this absent.",
+            description="The direct tool output was committed to model-visible conversation history. Durable rollout persistence is tracked independently by the tool-closure ledger. Nested code-mode calls are represented by the outer direct tool output and leave this absent.",
             ge=0,
         ),
     ] = None
@@ -8654,6 +8681,45 @@ class TurnTimingToolCall(BaseModel):
             description="Git dependencies that crossed the bounded capture deadline during a fresh pre-handler workspace capture.",
         ),
     ] = []
+
+
+class TurnTimingToolCallIdentity(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    call_id: Annotated[str, Field(alias="callId")]
+    execution_id: Annotated[str, Field(alias="executionId")]
+    parent_call_id: Annotated[str | None, Field(alias="parentCallId")] = None
+    sampling_generation_id: Annotated[str | None, Field(alias="samplingGenerationId")] = ""
+    source: TurnTimingToolCallSource | None = "direct"
+
+
+class TurnTimingToolClosure(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    accepted_count: Annotated[int | None, Field(alias="acceptedCount", ge=0)] = 0
+    complete: bool | None = False
+    duplicate_acceptance_count: Annotated[
+        int | None, Field(alias="duplicateAcceptanceCount", ge=0)
+    ] = 0
+    duplicate_call_id_count: Annotated[int | None, Field(alias="duplicateCallIdCount", ge=0)] = 0
+    duplicate_persistence_count: Annotated[
+        int | None, Field(alias="duplicatePersistenceCount", ge=0)
+    ] = 0
+    duplicate_timing_count: Annotated[int | None, Field(alias="duplicateTimingCount", ge=0)] = 0
+    orphan_calls: Annotated[list[TurnTimingToolCallIdentity] | None, Field(alias="orphanCalls")] = (
+        None
+    )
+    orphan_persistence_count: Annotated[int | None, Field(alias="orphanPersistenceCount", ge=0)] = 0
+    orphan_timing_count: Annotated[int | None, Field(alias="orphanTimingCount", ge=0)] = 0
+    overflow_count: Annotated[int | None, Field(alias="overflowCount", ge=0)] = 0
+    persisted_count: Annotated[int | None, Field(alias="persistedCount", ge=0)] = 0
+    terminal_count: Annotated[int | None, Field(alias="terminalCount", ge=0)] = 0
+    timing_paired_count: Annotated[int | None, Field(alias="timingPairedCount", ge=0)] = 0
+    unresolved_calls: Annotated[
+        list[TurnTimingToolCallIdentity] | None, Field(alias="unresolvedCalls")
+    ] = None
 
 
 class SpecialV2FileSystemPath(BaseModel):
@@ -10173,7 +10239,6 @@ class TurnTiming(BaseModel):
     ] = {
         "checkpointTokens": 0,
         "completionGateNs": 0,
-        "conservativeRerunCount": 0,
         "deliveryAttemptNs": 0,
         "diffRefreshCount": 0,
         "diffReuseCount": 0,
@@ -10186,7 +10251,6 @@ class TurnTiming(BaseModel):
         "interactionReleaseNs": 0,
         "postCleanupNs": 0,
         "preparationNs": 0,
-        "proofReuseCount": 0,
         "reviewNs": 0,
         "reviewPreflightNs": 0,
         "reviewerInfrastructureMemoHitCount": 0,
@@ -10208,6 +10272,26 @@ class TurnTiming(BaseModel):
             description="Bounded per-call relay timings captured at delivery. Offsets are from turn start; phase durations are diagnostics and are not additive with the canonical `exclusive` partition.",
         ),
     ] = None
+    tool_closure: Annotated[
+        TurnTimingToolClosure | None,
+        Field(
+            alias="toolClosure",
+            description="Exact accepted-call closure ledger. A terminal event is publishable only when every accepted direct and nested execution has timing, a terminal outcome, and exactly one persisted projection.",
+        ),
+    ] = {
+        "acceptedCount": 0,
+        "complete": True,
+        "duplicateAcceptanceCount": 0,
+        "duplicateCallIdCount": 0,
+        "duplicatePersistenceCount": 0,
+        "duplicateTimingCount": 0,
+        "orphanPersistenceCount": 0,
+        "orphanTimingCount": 0,
+        "overflowCount": 0,
+        "persistedCount": 0,
+        "terminalCount": 0,
+        "timingPairedCount": 0,
+    }
     unions: TurnTimingUnions
 
 
@@ -10684,7 +10768,7 @@ class ThreadForkResponse(BaseModel):
     sandbox: Annotated[
         SandboxPolicy,
         Field(
-            description="Legacy sandbox policy retained for compatibility. Experimental clients should prefer `activePermissionProfile` for profile provenance."
+            description="Legacy sandbox policy retained for compatibility. Experimental clients should prefer `permissionProfile` for exact permissions and `activePermissionProfile` for profile provenance."
         ),
     ]
     service_tier: Annotated[str | None, Field(alias="serviceTier")] = None
@@ -10752,7 +10836,7 @@ class ThreadResumeResponse(BaseModel):
     sandbox: Annotated[
         SandboxPolicy,
         Field(
-            description="Legacy sandbox policy retained for compatibility. Experimental clients should prefer `activePermissionProfile` for profile provenance."
+            description="Legacy sandbox policy retained for compatibility. Experimental clients should prefer `permissionProfile` for exact permissions and `activePermissionProfile` for profile provenance."
         ),
     ]
     service_tier: Annotated[str | None, Field(alias="serviceTier")] = None
@@ -10807,7 +10891,7 @@ class ThreadStartResponse(BaseModel):
     sandbox: Annotated[
         SandboxPolicy,
         Field(
-            description="Legacy sandbox policy retained for compatibility. Experimental clients should prefer `activePermissionProfile` for profile provenance."
+            description="Legacy sandbox policy retained for compatibility. Experimental clients should prefer `permissionProfile` for exact permissions and `activePermissionProfile` for profile provenance."
         ),
     ]
     service_tier: Annotated[str | None, Field(alias="serviceTier")] = None
@@ -10876,6 +10960,7 @@ class ServerNotification(
         | ItemMcpToolCallProgressServerNotification
         | McpServerOauthLoginCompletedServerNotification
         | McpServerStartupStatusUpdatedServerNotification
+        | McpServerStartupCompletedServerNotification
         | AccountUpdatedServerNotification
         | AccountRateLimitsUpdatedServerNotification
         | AppListUpdatedServerNotification
@@ -10943,6 +11028,7 @@ class ServerNotification(
         | ItemMcpToolCallProgressServerNotification
         | McpServerOauthLoginCompletedServerNotification
         | McpServerStartupStatusUpdatedServerNotification
+        | McpServerStartupCompletedServerNotification
         | AccountUpdatedServerNotification
         | AccountRateLimitsUpdatedServerNotification
         | AppListUpdatedServerNotification

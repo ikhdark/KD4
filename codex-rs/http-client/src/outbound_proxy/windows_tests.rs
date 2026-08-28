@@ -6,6 +6,16 @@ use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_CONNECTION_ERROR;
 use windows_sys::Win32::Networking::WinHttp::ERROR_WINHTTP_NAME_NOT_RESOLVED;
 
 #[test]
+fn winhttp_session_is_reused() {
+    let first = with_shared_winhttp_session(|session| Ok(session.0))
+        .expect("open the shared WinHTTP session");
+    let second = with_shared_winhttp_session(|session| Ok(session.0))
+        .expect("reuse the shared WinHTTP session");
+
+    assert_eq!(first, second);
+}
+
+#[test]
 fn proxy_bypass_matches_whitespace_separated_winhttp_entries() {
     let local_origin = RequestOrigin {
         scheme: "https".to_string(),
@@ -20,6 +30,46 @@ fn proxy_bypass_matches_whitespace_separated_winhttp_entries() {
         port: 443,
     };
     assert!(proxy_bypass_matches_origin("<local> *.corp", &corp_origin));
+}
+
+#[test]
+fn automatic_proxy_info_honors_matching_bypass() {
+    let proxy_info = ProxyInfo {
+        access_type: WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+        proxy: Some("proxy.example:8080".to_string()),
+        proxy_bypass: Some("<local>;*.corp".to_string()),
+    };
+    let origin = RequestOrigin {
+        scheme: "https".to_string(),
+        host: "service.corp".to_string(),
+        port: 443,
+    };
+
+    assert_eq!(
+        proxy_info_decision(&proxy_info, &origin),
+        SystemProxyDecision::Direct
+    );
+}
+
+#[test]
+fn automatic_proxy_info_uses_proxy_when_bypass_does_not_match() {
+    let proxy_info = ProxyInfo {
+        access_type: WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+        proxy: Some("proxy.example:8080".to_string()),
+        proxy_bypass: Some("<local>;*.corp".to_string()),
+    };
+    let origin = RequestOrigin {
+        scheme: "https".to_string(),
+        host: "api.example.com".to_string(),
+        port: 443,
+    };
+
+    assert_eq!(
+        proxy_info_decision(&proxy_info, &origin),
+        SystemProxyDecision::Proxy {
+            url: "http://proxy.example:8080".to_string(),
+        }
+    );
 }
 
 #[test]

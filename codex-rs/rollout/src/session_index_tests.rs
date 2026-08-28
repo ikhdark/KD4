@@ -512,6 +512,52 @@ async fn find_thread_names_by_ids_prefers_latest_entry() -> std::io::Result<()> 
 }
 
 #[test]
+fn confirmed_performance_batch_name_lookup_stops_after_newest_entries() -> std::io::Result<()> {
+    let temp = TempDir::new()?;
+    let path = session_index_path(temp.path());
+    let id1 = ThreadId::new();
+    let id2 = ThreadId::new();
+    let entries = [
+        SessionIndexEntry {
+            id: id1,
+            thread_name: "latest-one".to_string(),
+            updated_at: "2024-01-02T00:00:00Z".to_string(),
+        },
+        SessionIndexEntry {
+            id: id2,
+            thread_name: "latest-two".to_string(),
+            updated_at: "2024-01-02T00:00:00Z".to_string(),
+        },
+    ];
+    let mut contents = vec![b'x'; READ_CHUNK_SIZE * 2];
+    contents.push(b'\n');
+    for entry in &entries {
+        contents.extend_from_slice(
+            serde_json::to_string(entry)
+                .map_err(std::io::Error::other)?
+                .as_bytes(),
+        );
+        contents.push(b'\n');
+    }
+    let total_bytes = contents.len();
+    std::fs::write(&path, contents)?;
+
+    reset_session_index_reverse_bytes_read();
+    let found = scan_index_from_end_by_ids(&path, &HashSet::from([id1, id2]))?;
+    assert_eq!(
+        found,
+        HashMap::from([
+            (id1, "latest-one".to_string()),
+            (id2, "latest-two".to_string()),
+        ])
+    );
+    let bytes_read = session_index_reverse_bytes_read();
+    assert!(bytes_read <= READ_CHUNK_SIZE);
+    assert!(bytes_read < total_bytes);
+    Ok(())
+}
+
+#[test]
 fn scan_index_finds_latest_match_among_mixed_entries() -> std::io::Result<()> {
     let temp = TempDir::new()?;
     let path = session_index_path(temp.path());

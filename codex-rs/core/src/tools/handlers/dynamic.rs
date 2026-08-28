@@ -164,7 +164,11 @@ impl DynamicToolHandler {
     }
 }
 
-impl CoreToolRuntime for DynamicToolHandler {}
+impl CoreToolRuntime for DynamicToolHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
+    }
+}
 
 #[expect(
     clippy::await_holding_invalid_type,
@@ -349,6 +353,19 @@ mod tests {
                 .is_none(),
             "cancellation must remove the pending sender"
         );
+    }
+
+    #[test]
+    fn dynamic_handler_waits_for_runtime_cancellation_cleanup() {
+        let tool = DynamicToolFunctionSpec {
+            name: "dynamic_cleanup".to_string(),
+            description: "Dynamic cancellation cleanup fixture".to_string(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            defer_loading: false,
+        };
+        let handler = DynamicToolHandler::new(&tool).expect("valid dynamic tool schema");
+
+        assert!(handler.waits_for_runtime_cancellation());
     }
 
     #[test]

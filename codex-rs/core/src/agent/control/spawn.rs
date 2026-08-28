@@ -138,45 +138,96 @@ struct PendingSpawnCleanupJob {
     child_thread_id: ThreadId,
 }
 
-static PENDING_SPAWN_CLEANUP_SENDER: std::sync::OnceLock<
-    Option<std::sync::mpsc::Sender<PendingSpawnCleanupJob>>,
-> = std::sync::OnceLock::new();
+type PendingSpawnCleanupSender = std::sync::mpsc::Sender<PendingSpawnCleanupJob>;
+type PendingSpawnCleanupSenderState = std::sync::Mutex<Option<PendingSpawnCleanupSender>>;
 
-fn pending_spawn_cleanup_sender() -> Option<&'static std::sync::mpsc::Sender<PendingSpawnCleanupJob>>
-{
-    PENDING_SPAWN_CLEANUP_SENDER
-        .get_or_init(|| {
-            let (sender, receiver) = std::sync::mpsc::channel::<PendingSpawnCleanupJob>();
-            let worker = std::thread::Builder::new()
-                .name("codex-spawn-cleanup".to_string())
-                .spawn(move || {
-                    let runtime = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(runtime) => runtime,
-                        Err(error) => {
-                            warn!(%error, "failed to create agent spawn cleanup runtime");
-                            return;
-                        }
-                    };
-                    while let Ok(job) = receiver.recv() {
-                        let _ = runtime.block_on(job.control.rollback_failed_initial_submission(
-                            job.child_thread.as_ref(),
-                            job.child_thread_id,
-                            CodexErr::TurnAborted,
-                        ));
-                    }
-                });
-            match worker {
-                Ok(_) => Some(sender),
+static PENDING_SPAWN_CLEANUP_SENDER: std::sync::OnceLock<PendingSpawnCleanupSenderState> =
+    std::sync::OnceLock::new();
+
+fn pending_spawn_cleanup_sender_state() -> &'static PendingSpawnCleanupSenderState {
+    PENDING_SPAWN_CLEANUP_SENDER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn start_pending_spawn_cleanup_worker() -> Option<PendingSpawnCleanupSender> {
+    let (sender, receiver) = std::sync::mpsc::channel::<PendingSpawnCleanupJob>();
+    let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::Builder::new()
+        .name("codex-spawn-cleanup".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
                 Err(error) => {
-                    warn!(%error, "failed to start agent spawn cleanup worker");
-                    None
+                    let _ = ready_sender.send(Err(error.to_string()));
+                    return;
                 }
+            };
+            if ready_sender.send(Ok(())).is_err() {
+                return;
             }
-        })
-        .as_ref()
+            while let Ok(job) = receiver.recv() {
+                let _ = runtime.block_on(job.control.rollback_failed_initial_submission(
+                    job.child_thread.as_ref(),
+                    job.child_thread_id,
+                    CodexErr::TurnAborted,
+                ));
+            }
+        });
+    match worker {
+        Ok(_) => match ready_receiver.recv() {
+            Ok(Ok(())) => Some(sender),
+            Ok(Err(error)) => {
+                warn!(%error, "failed to create agent spawn cleanup runtime");
+                None
+            }
+            Err(error) => {
+                warn!(%error, "agent spawn cleanup worker stopped during startup");
+                None
+            }
+        },
+        Err(error) => {
+            warn!(%error, "failed to start agent spawn cleanup worker");
+            None
+        }
+    }
+}
+
+fn send_with_restarting_worker<T>(
+    state: &std::sync::Mutex<Option<std::sync::mpsc::Sender<T>>>,
+    mut start_worker: impl FnMut() -> Option<std::sync::mpsc::Sender<T>>,
+    mut job: T,
+) -> Result<(), T> {
+    let mut worker = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for _ in 0..2 {
+        if worker.is_none() {
+            *worker = start_worker();
+        }
+        let Some(sender) = worker.as_ref().cloned() else {
+            return Err(job);
+        };
+        match sender.send(job) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                job = error.0;
+                *worker = None;
+            }
+        }
+    }
+    Err(job)
+}
+
+fn schedule_pending_spawn_cleanup(
+    job: PendingSpawnCleanupJob,
+) -> Result<(), PendingSpawnCleanupJob> {
+    send_with_restarting_worker(
+        pending_spawn_cleanup_sender_state(),
+        start_pending_spawn_cleanup_worker,
+        job,
+    )
 }
 
 impl PendingSpawnCleanup {
@@ -216,24 +267,16 @@ impl Drop for PendingSpawnCleanup {
         if !self.armed {
             return;
         }
-        let Some(sender) = pending_spawn_cleanup_sender() else {
-            warn!(
-                child_thread_id = %self.child_thread_id,
-                "unable to schedule cleanup for cancelled agent spawn"
-            );
-            return;
-        };
-        if sender
-            .send(PendingSpawnCleanupJob {
-                control: self.control.clone(),
-                child_thread: Arc::clone(&self.child_thread),
-                child_thread_id: self.child_thread_id,
-            })
-            .is_err()
+        if schedule_pending_spawn_cleanup(PendingSpawnCleanupJob {
+            control: self.control.clone(),
+            child_thread: Arc::clone(&self.child_thread),
+            child_thread_id: self.child_thread_id,
+        })
+        .is_err()
         {
             warn!(
                 child_thread_id = %self.child_thread_id,
-                "agent spawn cleanup worker stopped before cleanup could be scheduled"
+                "unable to schedule cleanup for cancelled agent spawn"
             );
         }
     }
@@ -347,6 +390,9 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
 }
 
 fn is_multi_agent_v2_usage_hint_message(item: &ResponseItem, usage_hint_texts: &[String]) -> bool {
+    if crate::stable_context::is_multi_agent_usage_hint_item(item) {
+        return true;
+    }
     let ResponseItem::Message { role, content, .. } = item else {
         return false;
     };
@@ -1404,16 +1450,18 @@ impl AgentControl {
                 });
             }
         }
-        if preserve_reference_context_item
-            && multi_agent_version == MultiAgentVersion::V2
-            && let Some(subagent_usage_hint_text) =
-                config.multi_agent_v2.subagent_usage_hint_text.clone()
-            && let Some(subagent_usage_hint_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![
-                    subagent_usage_hint_text,
-                ])
-        {
-            forked_rollout_items.push(RolloutItem::ResponseItem(subagent_usage_hint_message));
+        if preserve_reference_context_item && multi_agent_version == MultiAgentVersion::V2 {
+            let subagent_usage_hint_sections =
+                crate::stable_context::multi_agent_usage_hint_sections(
+                    config.multi_agent_v2.subagent_usage_hint_text.as_deref(),
+                );
+            if let Some(subagent_usage_hint_message) =
+                crate::context_manager::updates::build_developer_update_item(
+                    subagent_usage_hint_sections,
+                )
+            {
+                forked_rollout_items.push(RolloutItem::ResponseItem(subagent_usage_hint_message));
+            }
         }
         if matches!(fork_mode, SpawnAgentForkMode::LastNTurns(_))
             && let Some(limit) = config
@@ -1673,5 +1721,33 @@ impl AgentControl {
         .await;
 
         Ok((resumed_thread.thread_id, multi_agent_version))
+    }
+}
+
+#[cfg(test)]
+mod pending_spawn_cleanup_worker_tests {
+    use super::send_with_restarting_worker;
+
+    #[test]
+    fn cleanup_worker_failure_does_not_disable_later_scheduling() {
+        let state = std::sync::Mutex::new(None);
+        assert_eq!(
+            send_with_restarting_worker(&state, || None, 1),
+            Err(1),
+            "a failed worker start should return the unscheduled job"
+        );
+
+        let (first_sender, first_receiver) = std::sync::mpsc::channel();
+        let mut first_sender = Some(first_sender);
+        send_with_restarting_worker(&state, || first_sender.take(), 2)
+            .expect("a later worker start should be retried");
+        assert_eq!(first_receiver.recv().expect("first worker job"), 2);
+        drop(first_receiver);
+
+        let (replacement_sender, replacement_receiver) = std::sync::mpsc::channel();
+        let mut replacement_sender = Some(replacement_sender);
+        send_with_restarting_worker(&state, || replacement_sender.take(), 3)
+            .expect("a disconnected cached worker should be replaced");
+        assert_eq!(replacement_receiver.recv().expect("replacement job"), 3);
     }
 }

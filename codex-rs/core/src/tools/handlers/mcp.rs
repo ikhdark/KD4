@@ -214,8 +214,7 @@ impl McpHandler {
             Arc::clone(&session),
             &step_context,
             call_id.clone(),
-            &self.tool_info.server_name,
-            self.tool_info.tool.name.as_ref(),
+            &self.tool_info,
             payload,
             cancellation_token,
         )
@@ -230,12 +229,17 @@ impl McpHandler {
                     &session.services.task_evidence,
                 )
                 .await;
-            let implementation_identity_hash =
+            let implementation_identity_hash = if evidence_ledger
+                .should_compute_external_mcp_evidence_identity(raw_server_result)
+            {
                 crate::tasks::completion_review::implementation_identity_for_evidence(
                     session.as_ref(),
                     &evidence_ledger,
                 )
-                .await;
+                .await
+            } else {
+                None
+            };
             match evidence_ledger
                 .record_external_mcp_evidence_bound_with_provenance(
                     &self.tool_info.server_name,
@@ -262,13 +266,13 @@ impl McpHandler {
             }
         }
 
-        Ok(boxed_tool_output(McpToolOutput {
-            result: result.result,
-            tool_input: result.tool_input,
-            wall_time: started.elapsed(),
-            original_image_detail_supported: can_request_original_image_detail(&turn.model_info),
-            truncation_policy: turn.model_info.truncation_policy.into(),
-        }))
+        Ok(boxed_tool_output(McpToolOutput::new(
+            result.result,
+            result.tool_input,
+            started.elapsed(),
+            can_request_original_image_detail(&turn.model_info),
+            turn.model_info.truncation_policy.into(),
+        )))
     }
 }
 
@@ -283,28 +287,13 @@ impl CoreToolRuntime for McpHandler {
 
     fn telemetry_tags<'a>(
         &'a self,
-        invocation: &'a ToolInvocation,
+        _invocation: &'a ToolInvocation,
     ) -> futures::future::BoxFuture<'a, ToolTelemetryTags> {
-        Box::pin(async move {
-            let manager = invocation.step_context.mcp.manager();
-            let live_tool_info = tokio::select! {
-                biased;
-                _ = invocation.cancellation_token.cancelled() => None,
-                live_tool_info = manager.tool_info(
-                    &self.tool_info.server_name,
-                    self.tool_info.tool.name.as_ref(),
-                ) => live_tool_info,
-            };
-            let server_name = live_tool_info
-                .as_ref()
-                .map(|tool_info| tool_info.server_name.clone())
-                .unwrap_or_else(|| self.tool_info.server_name.clone());
-            let mut tags = vec![("mcp_server", server_name)];
-            if let Some(origin) = live_tool_info.and_then(|tool_info| tool_info.server_origin) {
-                tags.push(("mcp_server_origin", origin));
-            }
-            tags
-        })
+        let mut tags = vec![("mcp_server", self.tool_info.server_name.clone())];
+        if let Some(origin) = self.tool_info.server_origin.clone() {
+            tags.push(("mcp_server_origin", origin));
+        }
+        Box::pin(async move { tags })
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
@@ -316,6 +305,10 @@ impl CoreToolRuntime for McpHandler {
             tool_name: self.hook_tool_name(),
             tool_input: mcp_hook_tool_input(arguments),
         })
+    }
+
+    fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
+        matches!(&invocation.payload, ToolPayload::Function { .. }).then(|| self.hook_tool_name())
     }
 
     fn with_updated_hook_input(
@@ -505,6 +498,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_telemetry_uses_the_already_resolved_tool_info() {
+        let (session, turn) = make_session_and_context().await;
+        let turn = Arc::new(turn);
+        let mut info = tool_info("memory", "memory", "create_entities");
+        info.server_origin = Some("registered-origin".to_string());
+        let handler = McpHandler::new(info).expect("MCP tool spec should build");
+        let invocation = ToolInvocation {
+            session: session.into(),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-mcp-telemetry".to_string(),
+            tool_name: codex_tools::ToolName::namespaced("memory", "create_entities"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+        };
+
+        assert_eq!(
+            handler.telemetry_tags(&invocation).await,
+            vec![
+                ("mcp_server", "memory".to_string()),
+                ("mcp_server_origin", "registered-origin".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_pre_tool_use_payload_keeps_builtin_like_tool_names_namespaced() {
         let payload = ToolPayload::Function {
             arguments: json!({ "message": "hello" }).to_string(),
@@ -569,8 +591,8 @@ mod tests {
         let payload = ToolPayload::Function {
             arguments: json!({ "path": "/tmp/notes.txt" }).to_string(),
         };
-        let output = McpToolOutput {
-            result: codex_protocol::mcp::CallToolResult {
+        let output = McpToolOutput::new(
+            codex_protocol::mcp::CallToolResult {
                 content: vec![json!({
                     "type": "text",
                     "text": "notes"
@@ -579,15 +601,15 @@ mod tests {
                 is_error: None,
                 meta: None,
             },
-            tool_input: json!({
+            json!({
                 "path": {
                     "file_id": "file_123"
                 }
             }),
-            wall_time: Duration::from_millis(42),
-            original_image_detail_supported: true,
-            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1024),
-        };
+            Duration::from_millis(42),
+            true,
+            codex_utils_output_truncation::TruncationPolicy::Bytes(1024),
+        );
         let (session, turn) = make_session_and_context().await;
         let turn = Arc::new(turn);
         let handler = McpHandler::new(tool_info("filesystem", "filesystem", "read_file"))
@@ -658,6 +680,49 @@ mod tests {
             McpHandler::new(server_opt_in_info)
                 .expect("MCP tool spec should build")
                 .supports_parallel_tool_calls()
+        );
+    }
+
+    #[test]
+    fn external_mutation_intent_uses_runtime_annotations_and_inspection_allowlist() {
+        let repo_atlas = McpHandler::new(tool_info("repo_atlas", "mcp__repo_atlas", "context_for"))
+            .expect("MCP tool spec should build");
+        assert_eq!(
+            repo_atlas.external_mutation_intent(),
+            ExternalMutationIntent::ProvenReadOnly
+        );
+
+        let github = McpHandler::new(tool_info("github", "mcp__codex_apps__github", "fetch_file"))
+            .expect("MCP tool spec should build");
+        assert_eq!(
+            github.external_mutation_intent(),
+            ExternalMutationIntent::ProvenReadOnly
+        );
+
+        let mut explicit_mutation = tool_info("repo_atlas", "mcp__repo_atlas", "context_for");
+        explicit_mutation.tool.annotations =
+            Some(rmcp::model::ToolAnnotations::new().read_only(false));
+        assert_eq!(
+            McpHandler::new(explicit_mutation)
+                .expect("MCP tool spec should build")
+                .external_mutation_intent(),
+            ExternalMutationIntent::MayMutate
+        );
+
+        let mut annotated_read = tool_info("other", "mcp__other", "lookup");
+        annotated_read.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
+        assert_eq!(
+            McpHandler::new(annotated_read)
+                .expect("MCP tool spec should build")
+                .external_mutation_intent(),
+            ExternalMutationIntent::ProvenReadOnly
+        );
+
+        assert_eq!(
+            McpHandler::new(tool_info("other", "mcp__other", "lookup"))
+                .expect("MCP tool spec should build")
+                .external_mutation_intent(),
+            ExternalMutationIntent::MayMutate
         );
     }
 

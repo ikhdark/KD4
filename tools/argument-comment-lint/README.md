@@ -58,33 +58,32 @@ create_openai_url(None, 3);
 
 Install the required tooling once:
 
-```bash
+```powershell
 cargo install --locked cargo-dylint dylint-link
-rustup toolchain install nightly-2025-09-18 \
-  --component llvm-tools-preview \
-  --component rustc-dev \
+rustup toolchain install nightly-2025-09-18 `
+  --component llvm-tools-preview `
+  --component rustc-dev `
   --component rust-src
 ```
 
 Run the lint crate tests:
 
-```bash
-cd tools/argument-comment-lint
+```powershell
+Set-Location tools/argument-comment-lint
 cargo test
 ```
 
 GitHub releases also publish a DotSlash file named
-`argument-comment-lint` for macOS arm64, Linux arm64, Linux x64, and Windows
-x64. The published package contains a small runner executable, a bundled
+`argument-comment-lint` for Windows x64. The published package contains a small runner executable, a bundled
 `cargo-dylint`, and the prebuilt lint library.
 
 The package is not a full Rust toolchain. Running the prebuilt path still
 requires the pinned nightly toolchain to be installed via `rustup`:
 
-```bash
-rustup toolchain install nightly-2025-09-18 \
-  --component llvm-tools-preview \
-  --component rustc-dev \
+```powershell
+rustup toolchain install nightly-2025-09-18 `
+  --component llvm-tools-preview `
+  --component rustc-dev `
   --component rust-src
 ```
 
@@ -94,22 +93,10 @@ path for both repository-wide and targeted runs such as
 `just argument-comment-lint -p codex-core`. The source-build path remains
 available in `run.py` for people iterating on the lint crate itself.
 
-The Unix archive layout is:
+The Windows archive is a `.zip` containing `.exe` runner/tool files and the `.dll` lint library.
 
-```text
-argument-comment-lint/
-  bin/
-    argument-comment-lint
-    cargo-dylint
-  lib/
-    libargument_comment_lint@nightly-2025-09-18-<target>.dylib|so
-```
-
-On Windows the same layout is published as a `.zip`, with `.exe` and `.dll`
-filenames instead.
-
-DotSlash resolves the package entrypoint to `argument-comment-lint/bin/argument-comment-lint`
-(or `.exe` on Windows). That runner finds the sibling bundled `cargo-dylint`
+DotSlash resolves the package entrypoint to
+`argument-comment-lint/bin/argument-comment-lint.exe`. That runner finds the sibling bundled `cargo-dylint`
 binary and the single packaged Dylint library under `lib/`, normalizes the
 host-qualified nightly filename to the plain `nightly-2025-09-18` channel when
 needed, and then invokes `cargo-dylint dylint --lib-path <that-library>` with
@@ -124,15 +111,15 @@ required for the current Windows Dylint driver path.
 
 If you are changing the lint crate itself, use the source-build wrapper:
 
-```bash
-./tools/argument-comment-lint/run.py -p codex-core
+```powershell
+python tools/argument-comment-lint/run.py -p codex-core
 ```
 
 Run the lint against `codex-rs` from the repo root:
 
-```bash
+```powershell
 just argument-comment-lint
-./tools/argument-comment-lint/run-prebuilt-linter.py -p codex-core
+python tools/argument-comment-lint/run-prebuilt-linter.py -p codex-core
 just argument-comment-lint -p codex-core
 ```
 
@@ -144,8 +131,8 @@ target set, so targeted wrapper runs cover test-only call sites by default.
 Repo runs also promote `argument_comment_mismatch` and
 `uncommented_anonymous_literal_argument` to errors by default:
 
-```bash
-./tools/argument-comment-lint/run-prebuilt-linter.py -p codex-core
+```powershell
+python tools/argument-comment-lint/run-prebuilt-linter.py -p codex-core
 ```
 
 The wrapper does that by setting `DYLINT_RUSTFLAGS`, and it leaves an explicit
@@ -154,14 +141,14 @@ already set it, because the current nightly Dylint flow can otherwise hit a
 rustc incremental compilation ICE locally. To override that behavior for an ad
 hoc run:
 
-```bash
-DYLINT_RUSTFLAGS="-A argument-comment-mismatch -A uncommented-anonymous-literal-argument" \
-CARGO_INCREMENTAL=1 \
-  ./tools/argument-comment-lint/run.py -p codex-core
+```powershell
+$env:DYLINT_RUSTFLAGS = "-A argument-comment-mismatch -A uncommented-anonymous-literal-argument"
+$env:CARGO_INCREMENTAL = "1"
+python tools/argument-comment-lint/run.py -p codex-core
 ```
 
 To override an explicitly narrow target selection, or to be explicit in scripts:
 
-```bash
-./tools/argument-comment-lint/run-prebuilt-linter.py -p codex-core -- --all-targets
+```powershell
+python tools/argument-comment-lint/run-prebuilt-linter.py -p codex-core -- --all-targets
 ```

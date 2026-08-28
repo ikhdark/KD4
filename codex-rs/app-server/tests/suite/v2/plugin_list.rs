@@ -3695,7 +3695,7 @@ async fn plugin_list_fetches_featured_plugin_ids_without_chatgpt_auth() -> Resul
 }
 
 #[tokio::test]
-async fn plugin_list_uses_warmed_featured_plugin_ids_cache_on_first_request() -> Result<()> {
+async fn plugin_startup_defers_featured_ids_fetch_until_plugin_list() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
     write_plugin_sync_config(codex_home.path(), &format!("{}/backend-api/", server.uri()))?;
@@ -3716,7 +3716,15 @@ async fn plugin_list_uses_warmed_featured_plugin_ids_cache_on_first_request() ->
         .build()
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    wait_for_featured_plugin_request_count(&server, /*expected_count*/ 1).await?;
+    assert!(
+        timeout(
+            Duration::from_millis(500),
+            wait_for_featured_plugin_request_count(&server, /*expected_count*/ 1),
+        )
+        .await
+        .is_err(),
+        "plugin startup must not fetch featured ids before plugin/list"
+    );
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
@@ -3736,6 +3744,25 @@ async fn plugin_list_uses_warmed_featured_plugin_ids_cache_on_first_request() ->
         response.featured_plugin_ids,
         vec!["linear@openai-curated".to_string()]
     );
+    wait_for_featured_plugin_request_count(&server, /*expected_count*/ 1).await?;
+
+    let second_request_id = mcp
+        .send_plugin_list_request(PluginListParams {
+            cwds: None,
+            marketplace_kinds: None,
+        })
+        .await?;
+    let second_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(second_request_id)),
+    )
+    .await??;
+    let second_response: PluginListResponse = to_response(second_response)?;
+    assert_eq!(
+        second_response.featured_plugin_ids,
+        response.featured_plugin_ids
+    );
+    wait_for_featured_plugin_request_count(&server, /*expected_count*/ 1).await?;
     Ok(())
 }
 

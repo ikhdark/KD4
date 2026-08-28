@@ -22,13 +22,20 @@ use codex_state::DB_METRIC_BACKFILL;
 use codex_state::DB_METRIC_BACKFILL_DURATION_MS;
 use codex_state::ExtractionOutcome;
 use codex_state::ThreadMetadataBuilder;
-use codex_state::apply_rollout_items;
+use codex_state::ThreadMetadataRolloutReducer;
+use codex_state::rollout_item_affects_thread_metadata;
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::time::SystemTime;
 use tracing::info;
 use tracing::warn;
 
 const BACKFILL_BATCH_SIZE: usize = 200;
+const EXTRACTION_CACHE_CAPACITY: usize = 256;
 #[cfg(not(test))]
 const BACKFILL_LEASE_SECONDS: i64 = 900;
 #[cfg(test)]
@@ -101,47 +108,219 @@ pub async fn extract_metadata_from_rollout(
     rollout_path: &Path,
     default_provider: &str,
 ) -> anyhow::Result<ExtractionOutcome> {
-    let (items, _thread_id, parse_errors) =
-        RolloutRecorder::load_rollout_items(rollout_path).await?;
-    if items.is_empty() {
-        return Err(anyhow::anyhow!(
-            "empty session file: {}",
-            rollout_path.display()
-        ));
+    extract_metadata_from_rollout_with_cache_status(rollout_path, default_provider)
+        .await
+        .map(|(outcome, _cache_hit)| outcome)
+}
+
+pub(crate) async fn extract_metadata_from_rollout_with_cache_status(
+    rollout_path: &Path,
+    default_provider: &str,
+) -> anyhow::Result<(ExtractionOutcome, bool)> {
+    if let Some(outcome) = cached_extraction_outcome(rollout_path, default_provider).await {
+        return Ok((outcome, true));
     }
-    let builder = builder_from_items(items.as_slice(), rollout_path).ok_or_else(|| {
-        anyhow::anyhow!(
-            "rollout missing metadata builder: {}",
-            rollout_path.display()
-        )
-    })?;
-    let parent_thread_id = builder.parent_thread_id;
-    let mut metadata = builder.build(default_provider);
-    let persisted_recency_at = codex_state::latest_rollout_recency_at(&items);
-    apply_rollout_items(&mut metadata, &items, default_provider);
-    if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
-        metadata.updated_at = updated_at;
-        if persisted_recency_at.is_none() {
-            metadata.recency_at = updated_at;
+    let mut accumulator = RolloutMetadataAccumulator::default();
+    let (_thread_id, parse_errors) = RolloutRecorder::for_each_rollout_item(rollout_path, |item| {
+        accumulator.push(item, rollout_path, default_provider);
+    })
+    .await?;
+    let outcome = accumulator
+        .finish(rollout_path, default_provider, parse_errors)
+        .await?;
+    Ok((outcome, false))
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ExtractionCacheKey {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    default_provider: String,
+}
+
+#[derive(Default)]
+struct ExtractionCache {
+    entries: HashMap<ExtractionCacheKey, ExtractionOutcome>,
+    order: VecDeque<ExtractionCacheKey>,
+}
+
+fn extraction_cache() -> &'static Mutex<ExtractionCache> {
+    static CACHE: OnceLock<Mutex<ExtractionCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ExtractionCache::default()))
+}
+
+async fn extraction_cache_key(
+    rollout_path: &Path,
+    default_provider: &str,
+) -> Option<ExtractionCacheKey> {
+    let metadata = tokio::fs::metadata(rollout_path).await.ok()?;
+    Some(ExtractionCacheKey {
+        path: rollout_path.to_path_buf(),
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        default_provider: default_provider.to_string(),
+    })
+}
+
+pub(crate) struct ExtractionCacheGuard {
+    key: Option<ExtractionCacheKey>,
+}
+
+pub(crate) async fn extraction_cache_guard(
+    rollout_path: &Path,
+    default_provider: &str,
+) -> ExtractionCacheGuard {
+    ExtractionCacheGuard {
+        key: extraction_cache_key(rollout_path, default_provider).await,
+    }
+}
+
+pub(crate) async fn cache_extraction_outcome(
+    guard: ExtractionCacheGuard,
+    outcome: ExtractionOutcome,
+) {
+    let Some(key) = guard.key else {
+        return;
+    };
+    let Some(current_key) = extraction_cache_key(&key.path, &key.default_provider).await else {
+        return;
+    };
+    if current_key != key {
+        return;
+    }
+    let mut cache = extraction_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.entries.retain(|candidate, _| {
+        candidate.path != key.path || candidate.default_provider != key.default_provider
+    });
+    cache.order.retain(|candidate| {
+        candidate.path != key.path || candidate.default_provider != key.default_provider
+    });
+    cache.order.push_back(key.clone());
+    cache.entries.insert(key, outcome);
+    while cache.order.len() > EXTRACTION_CACHE_CAPACITY {
+        if let Some(evicted) = cache.order.pop_front() {
+            cache.entries.remove(&evicted);
         }
     }
-    Ok(ExtractionOutcome {
-        metadata,
-        parent_thread_id,
-        memory_mode: items.iter().rev().find_map(|item| match item {
-            RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
-            RolloutItem::ResponseItem(_)
-            | RolloutItem::ToolManifest(_)
-            | RolloutItem::SamplingBoundary(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::Compacted(_)
-            | RolloutItem::TurnContext(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::EventMsg(_) => None,
-        }),
-        parse_errors,
-    })
+}
+
+async fn cached_extraction_outcome(
+    rollout_path: &Path,
+    default_provider: &str,
+) -> Option<ExtractionOutcome> {
+    let key = extraction_cache_key(rollout_path, default_provider).await?;
+    let cache = extraction_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.entries.get(&key).cloned()
+}
+
+#[derive(Default)]
+pub(crate) struct RolloutMetadataAccumulator {
+    metadata: Option<codex_state::ThreadMetadata>,
+    reducer: Option<ThreadMetadataRolloutReducer>,
+    pending_metadata_items: Vec<RolloutItem>,
+    parent_thread_id: Option<ThreadId>,
+    memory_mode: Option<String>,
+    saw_item: bool,
+    saw_first_session_meta: bool,
+    persisted_recency_at: bool,
+}
+
+impl RolloutMetadataAccumulator {
+    pub(crate) fn push(&mut self, item: RolloutItem, rollout_path: &Path, default_provider: &str) {
+        self.saw_item = true;
+        if codex_state::latest_rollout_recency_at(std::slice::from_ref(&item)).is_some() {
+            self.persisted_recency_at = true;
+        }
+        if let RolloutItem::SessionMeta(meta_line) = &item {
+            if let Some(mode) = meta_line.meta.memory_mode.as_ref() {
+                self.memory_mode = Some(mode.clone());
+            }
+            if !self.saw_first_session_meta {
+                self.saw_first_session_meta = true;
+                if let Some(builder) = builder_from_session_meta(meta_line, rollout_path) {
+                    self.parent_thread_id = builder.parent_thread_id;
+                    let mut projected = builder.build(default_provider);
+                    let mut streaming_reducer = ThreadMetadataRolloutReducer::default();
+                    for pending in self.pending_metadata_items.drain(..) {
+                        streaming_reducer.apply_item(&mut projected, &pending);
+                    }
+                    streaming_reducer.apply_item(&mut projected, &item);
+                    self.metadata = Some(projected);
+                    self.reducer = Some(streaming_reducer);
+                    return;
+                }
+            }
+        }
+
+        if let (Some(projected), Some(streaming_reducer)) =
+            (self.metadata.as_mut(), self.reducer.as_mut())
+        {
+            streaming_reducer.apply_item(projected, &item);
+        } else if rollout_item_affects_thread_metadata(&item) {
+            // Before the canonical SessionMeta, retain only the small subset that can affect
+            // SQLite metadata. Large response/tool payloads are discarded immediately.
+            self.pending_metadata_items.push(item);
+        }
+    }
+
+    pub(crate) async fn finish(
+        mut self,
+        rollout_path: &Path,
+        default_provider: &str,
+        parse_errors: usize,
+    ) -> anyhow::Result<ExtractionOutcome> {
+        if !self.saw_item {
+            return Err(anyhow::anyhow!(
+                "empty session file: {}",
+                rollout_path.display()
+            ));
+        }
+
+        let mut metadata = match self.metadata {
+            Some(metadata) => metadata,
+            None => {
+                let builder = builder_from_items(&self.pending_metadata_items, rollout_path)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "rollout missing metadata builder: {}",
+                            rollout_path.display()
+                        )
+                    })?;
+                self.parent_thread_id = builder.parent_thread_id;
+                let mut projected = builder.build(default_provider);
+                let mut streaming_reducer = ThreadMetadataRolloutReducer::default();
+                for item in &self.pending_metadata_items {
+                    streaming_reducer.apply_item(&mut projected, item);
+                }
+                self.reducer = Some(streaming_reducer);
+                projected
+            }
+        };
+        let reducer = self.reducer.ok_or_else(|| {
+            anyhow::anyhow!(
+                "rollout metadata projection is missing its reducer: {}",
+                rollout_path.display()
+            )
+        })?;
+        reducer.finish(&mut metadata, default_provider);
+        if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
+            metadata.updated_at = updated_at;
+            if !self.persisted_recency_at {
+                metadata.recency_at = updated_at;
+            }
+        }
+        Ok(ExtractionOutcome {
+            metadata,
+            parent_thread_id: self.parent_thread_id,
+            memory_mode: self.memory_mode,
+            parse_errors,
+        })
+    }
 }
 
 pub(crate) async fn backfill_sessions(

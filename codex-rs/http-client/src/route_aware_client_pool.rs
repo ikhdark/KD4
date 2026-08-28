@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -44,7 +45,43 @@ pub struct RouteAwareClientPool {
     http_client_factory: HttpClientFactory,
     route_class: ClientRouteClass,
     client_builder: HttpClientBuilder,
-    clients: Arc<Mutex<HashMap<OutboundProxyRoute, HttpClient>>>,
+    clients: Arc<Mutex<CachedRouteClients>>,
+}
+
+#[derive(Debug, Default)]
+struct CachedRouteClients {
+    clients: HashMap<OutboundProxyRoute, HttpClient>,
+    recency: VecDeque<OutboundProxyRoute>,
+}
+
+impl CachedRouteClients {
+    fn get(&mut self, route: &OutboundProxyRoute) -> Option<HttpClient> {
+        let client = self.clients.get(route)?.clone();
+        self.touch(route);
+        Some(client)
+    }
+
+    fn insert(&mut self, route: OutboundProxyRoute, client: HttpClient) {
+        if self.clients.contains_key(&route) {
+            self.clients.insert(route.clone(), client);
+            self.touch(&route);
+            return;
+        }
+        if self.clients.len() >= MAX_CACHED_ROUTES
+            && let Some(route_to_evict) = self.recency.pop_front()
+        {
+            self.clients.remove(&route_to_evict);
+        }
+        self.clients.insert(route.clone(), client);
+        self.recency.push_back(route);
+    }
+
+    fn touch(&mut self, route: &OutboundProxyRoute) {
+        if let Some(index) = self.recency.iter().position(|cached| cached == route) {
+            self.recency.remove(index);
+        }
+        self.recency.push_back(route.clone());
+    }
 }
 
 impl fmt::Debug for RouteAwareClientPool {
@@ -64,6 +101,8 @@ pub enum RouteAwareClientPoolError {
     Resolve(#[source] io::Error),
     #[error(transparent)]
     Build(#[from] BuildRouteAwareHttpClientError),
+    #[error("route-aware HTTP client build task failed: {0}")]
+    BuildTask(#[source] tokio::task::JoinError),
 }
 
 /// Error returned while building, routing, or sending a route-aware request.
@@ -221,6 +260,21 @@ impl RouteAwareRequestBuilder {
         self
     }
 
+    /// Appends URL query pairs to the request.
+    pub fn query<K, V>(mut self, query: &[(K, V)]) -> Self
+    where
+        K: AsRef<str>,
+        V: ToString,
+    {
+        if let Ok(request) = &mut self.request {
+            let mut pairs = request.url_mut().query_pairs_mut();
+            for (key, value) in query {
+                pairs.append_pair(key.as_ref(), &value.to_string());
+            }
+        }
+        self
+    }
+
     pub fn body<B>(mut self, body: B) -> Self
     where
         B: Into<reqwest::Body>,
@@ -303,7 +357,11 @@ impl RouteAwareClientPool {
         )
     }
 
-    fn with_builder(
+    /// Creates a route-aware pool from caller-owned transport defaults.
+    ///
+    /// The builder is cloned for every resolved route, so default headers, cookie stores, custom
+    /// CAs, and logging policy remain consistent while transport connections are reused.
+    pub fn with_builder(
         http_client_factory: HttpClientFactory,
         route_class: ClientRouteClass,
         client_builder: HttpClientBuilder,
@@ -312,7 +370,7 @@ impl RouteAwareClientPool {
             http_client_factory,
             route_class,
             client_builder,
-            clients: Arc::new(Mutex::new(HashMap::new())),
+            clients: Arc::new(Mutex::new(CachedRouteClients::default())),
         }
     }
 
@@ -417,6 +475,38 @@ impl RouteAwareClientPool {
         U: IntoUrl,
     {
         RouteAwareRequestBuilder::new(self.clone(), method, url)
+    }
+
+    /// Resolves and caches the concrete transport client for an endpoint URL.
+    ///
+    /// This is intended for higher-level API clients that own request encoding but still need
+    /// the configured outbound-proxy route and thread-scoped transport reuse.
+    pub async fn client_for_url(&self, url: &str) -> Result<HttpClient, RouteAwareRequestError> {
+        Ok(self
+            .client_for_url_with_resolver(url, |request_url| {
+                let http_client_factory = self.http_client_factory.clone();
+                async move {
+                    http_client_factory
+                        .resolve_proxy_route_async(request_url)
+                        .await
+                }
+            })
+            .await?
+            .1)
+    }
+
+    /// Returns the number of distinct resolved routes currently cached by this pool.
+    pub fn cached_route_count(&self) -> usize {
+        self.clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clients
+            .len()
+    }
+
+    /// Returns whether two pool handles share the same route-client cache.
+    pub fn shares_cache_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.clients, &other.clients)
     }
 
     async fn send(
@@ -562,14 +652,18 @@ impl RouteAwareClientPool {
         let route = resolve_route(request_url.to_string())
             .await
             .map_err(RouteAwareClientPoolError::Resolve)?;
-        let clients = match self.clients.lock() {
-            Ok(clients) => clients,
-            Err(error) => panic!("route-aware client cache lock should not be poisoned: {error}"),
+        let cached_client = {
+            let mut clients = match self.clients.lock() {
+                Ok(clients) => clients,
+                Err(error) => {
+                    panic!("route-aware client cache lock should not be poisoned: {error}")
+                }
+            };
+            clients.get(&route)
         };
-        if let Some(client) = clients.get(&route) {
-            return Ok((route, client.clone()));
+        if let Some(client) = cached_client {
+            return Ok((route, client));
         }
-        drop(clients);
 
         let client_builder = match self.http_client_factory.outbound_proxy_policy() {
             OutboundProxyPolicy::ReqwestDefault => self.client_builder.clone(),
@@ -577,22 +671,24 @@ impl RouteAwareClientPool {
                 self.client_builder.clone().without_redirects()
             }
         };
-        let client = client_builder.build_for_resolved_route(
-            &self.http_client_factory,
-            self.route_class,
-            &route,
-        )?;
+        let http_client_factory = self.http_client_factory.clone();
+        let route_class = self.route_class;
+        let route_for_build = route.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            client_builder.build_for_resolved_route(
+                &http_client_factory,
+                route_class,
+                &route_for_build,
+            )
+        })
+        .await
+        .map_err(RouteAwareClientPoolError::BuildTask)??;
         let mut clients = match self.clients.lock() {
             Ok(clients) => clients,
             Err(error) => panic!("route-aware client cache lock should not be poisoned: {error}"),
         };
         if let Some(existing_client) = clients.get(&route) {
-            return Ok((route, existing_client.clone()));
-        }
-        if clients.len() >= MAX_CACHED_ROUTES
-            && let Some(route_to_evict) = clients.keys().next().cloned()
-        {
-            clients.remove(&route_to_evict);
+            return Ok((route, existing_client));
         }
         clients.insert(route.clone(), client.clone());
         Ok((route, client))

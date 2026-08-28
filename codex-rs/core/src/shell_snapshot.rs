@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Stdio;
@@ -19,6 +20,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::Environment;
+use codex_exec_server::ExecBackend;
 use codex_exec_server::ExecEnvPolicy;
 use codex_exec_server::ExecOutputStream;
 use codex_exec_server::ExecParams;
@@ -27,14 +29,20 @@ use codex_exec_server::RemoveOptions;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
+use codex_shell_command::escape_powershell_single_quoted as powershell_single_quote;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use codex_utils_pty::ManagedRootProcess;
+use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
+use codex_utils_pty::configure_windows_command_args;
+use codex_utils_pty::run_windows_process_operation;
 use tokio::fs;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tracing::Instrument;
 use tracing::info_span;
 
@@ -661,10 +669,6 @@ fn strip_snapshot_preamble(snapshot: &str) -> Result<String> {
     Ok(snapshot[start..].to_string())
 }
 
-fn powershell_single_quote(input: &str) -> String {
-    input.replace('\'', "''")
-}
-
 async fn validate_snapshot(
     shell: &Shell,
     snapshot_path: &AbsolutePathBuf,
@@ -780,15 +784,20 @@ async fn run_script_with_timeout_with_args(
     cwd: &AbsolutePathBuf,
     environment_variables: &HashMap<String, String>,
 ) -> Result<String> {
-    let args = shell.derive_exec_args(script, use_login_shell);
+    let timeout_deadline = tokio::time::Instant::now() + snapshot_timeout;
+    let args = shell.derive_exec_args(script, use_login_shell)?;
     let args = clean_snapshot_shell_args(shell.shell_type, args, use_login_shell);
     let shell_name = shell.name();
 
     // Handler is kept as guard to control the drop. The `mut` pattern is required because .args()
     // returns a ref of handler.
     let mut handler = Command::new(&args[0]);
-    handler.args(&args[1..]);
-    handler.args(script_args);
+    let process_args = args[1..]
+        .iter()
+        .map(OsString::from)
+        .chain(script_args.iter().map(|arg| (*arg).to_os_string()))
+        .collect::<Vec<_>>();
+    configure_windows_command_args(handler.as_std_mut(), OsStr::new(&args[0]), &process_args);
     handler.stdin(Stdio::null());
     handler.current_dir(cwd);
     handler.env_clear();
@@ -797,11 +806,22 @@ async fn run_script_with_timeout_with_args(
     handler.kill_on_drop(true);
     handler.stdout(Stdio::piped());
     handler.stderr(Stdio::piped());
+    handler.creation_flags(WINDOWS_CREATE_SUSPENDED);
 
-    let mut child = handler
-        .spawn()
+    let managed = timeout_at(timeout_deadline, ManagedRootProcess::reserve_with_reclaim())
+        .await
+        .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))??;
+    let spawn_timeout = timeout_deadline.saturating_duration_since(tokio::time::Instant::now());
+    let mut child = run_windows_process_operation(spawn_timeout, move || handler.spawn())
+        .await
         .with_context(|| format!("Failed to execute {shell_name}"))?;
-    let process_group_id = child.id();
+    let process_id = child.id().context("Snapshot command had no process id")?;
+    if let Err(err) = managed.attach_and_resume(process_id) {
+        let _ = managed.terminate();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(err).context("Failed to contain snapshot command");
+    }
     let mut stdout = child
         .stdout
         .take()
@@ -811,7 +831,7 @@ async fn run_script_with_timeout_with_args(
         .take()
         .context("Snapshot command stderr was not piped")?;
 
-    let output = timeout(snapshot_timeout, async {
+    let output = timeout_at(timeout_deadline, async {
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
         let (status, stdout_read, stderr_read) = tokio::join!(
@@ -834,19 +854,14 @@ async fn run_script_with_timeout_with_args(
     let (status, stdout, stderr) = match output {
         Ok(output) => output?,
         Err(_) => {
-            if let Some(process_group_id) = process_group_id
-                && let Err(err) =
-                    codex_utils_pty::process_group::kill_process_group(process_group_id)
-            {
-                tracing::warn!(
-                    "Failed to kill timed-out snapshot process group {process_group_id}: {err:?}"
-                );
-            }
-            if let Err(err) = child.start_kill()
-                && err.kind() != ErrorKind::InvalidInput
-                && err.kind() != ErrorKind::NotFound
-            {
-                tracing::warn!("Failed to kill timed-out snapshot shell: {err:?}");
+            if let Err(job_err) = managed.terminate() {
+                tracing::warn!("Failed to kill timed-out snapshot process tree: {job_err:?}");
+                if let Err(err) = child.start_kill()
+                    && err.kind() != ErrorKind::InvalidInput
+                    && err.kind() != ErrorKind::NotFound
+                {
+                    tracing::warn!("Failed to kill timed-out snapshot shell: {err:?}");
+                }
             }
             drop(stdout);
             drop(stderr);
@@ -903,16 +918,17 @@ async fn run_remote_script_with_timeout(
 ) -> Result<String> {
     let args = clean_snapshot_shell_args(
         shell.shell_type,
-        shell.derive_exec_args(script, use_login_shell),
+        shell.derive_exec_args(script, use_login_shell)?,
         use_login_shell,
     );
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    let started = timeout(
-        snapshot_timeout,
-        environment.get_exec_backend().start(ExecParams {
+    let deadline = tokio::time::Instant::now() + snapshot_timeout;
+    run_remote_snapshot_process_before(
+        environment.get_exec_backend(),
+        ExecParams {
             process_id: format!("{session_id}-shell-snapshot-{nonce}").into(),
             argv: args,
             cwd: cwd.clone(),
@@ -924,10 +940,22 @@ async fn run_remote_script_with_timeout(
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
-        }),
+        },
+        deadline,
+        shell.name(),
     )
     .await
-    .map_err(|_| anyhow!("Snapshot command timed out for {}", shell.name()))??;
+}
+
+async fn run_remote_snapshot_process_before(
+    exec_backend: Arc<dyn ExecBackend>,
+    params: ExecParams,
+    deadline: tokio::time::Instant,
+    shell_name: &str,
+) -> Result<String> {
+    let started = timeout_at(deadline, exec_backend.start(params))
+        .await
+        .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))??;
     let process = started.process;
     let collect = async {
         let mut after_seq = None;
@@ -975,13 +1003,13 @@ async fn run_remote_script_with_timeout(
         }
         Ok::<_, anyhow::Error>(String::from_utf8_lossy(&stdout).into_owned())
     };
-    match timeout(snapshot_timeout, collect).await {
+    match timeout_at(deadline, collect).await {
         Ok(output) => output,
         Err(_) => {
             if let Err(err) = process.terminate().await {
                 tracing::warn!("Failed to terminate timed-out remote snapshot shell: {err:?}");
             }
-            Err(anyhow!("Snapshot command timed out for {}", shell.name()))
+            Err(anyhow!("Snapshot command timed out for {shell_name}"))
         }
     }
 }

@@ -7,6 +7,8 @@ use serde::Serialize;
 pub(crate) const TASK_EVIDENCE_STATE_OPEN_TAG: &str = "<kd4_task_state_v1>";
 pub(crate) const TASK_EVIDENCE_STATE_CLOSE_TAG: &str = "</kd4_task_state_v1>";
 const COMMAND_MUTATION_FOLLOW_UP: &str = "Unresolved command-mutation warnings require immediate follow-up before unrelated work or finalization: inspect a scoped repository status/diff, attribute every changed path and required hash, then reconcile the ledger signal. Do not merely acknowledge or repeatedly carry the warning.";
+const TASK_EVIDENCE_STATE_CLEARED: &str =
+    "The previously provided KD4 task state no longer applies.";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TaskEvidenceState {
@@ -54,10 +56,17 @@ impl WorldStateSection for TaskEvidenceState {
         {
             return None;
         }
-        self.summary
-            .clone()
-            .map(TaskEvidenceContext::new)
-            .map(|context| Box::new(context) as Box<dyn ContextualUserFragment>)
+
+        let summary = match (&self.summary, previous) {
+            (Some(summary), _) => summary.clone(),
+            (None, PreviousSectionState::Known(previous)) if previous.summary.is_some() => {
+                TASK_EVIDENCE_STATE_CLEARED.to_string()
+            }
+            (None, PreviousSectionState::Unknown) => TASK_EVIDENCE_STATE_CLEARED.to_string(),
+            (None, PreviousSectionState::Absent | PreviousSectionState::Known(_)) => return None,
+        };
+
+        Some(Box::new(TaskEvidenceContext::new(summary)))
     }
 }
 
@@ -120,5 +129,26 @@ mod tests {
         assert!(rendered.contains("inspect a scoped repository status/diff"));
         assert!(rendered.contains("attribute every changed path and required hash"));
         assert!(rendered.contains("Do not merely acknowledge"));
+    }
+
+    #[test]
+    fn clearing_task_state_supersedes_previous_once() {
+        let previous = TaskEvidenceState::new(Some("active state".to_string()));
+        let cleared = TaskEvidenceState::new(None);
+
+        let update = cleared
+            .render_diff(PreviousSectionState::Known(&previous.snapshot()))
+            .expect("clearing a previously visible task state must emit a supersession");
+        let rendered = update.render();
+
+        assert!(rendered.starts_with(TASK_EVIDENCE_STATE_OPEN_TAG));
+        assert!(rendered.ends_with(TASK_EVIDENCE_STATE_CLOSE_TAG));
+        assert!(rendered.contains(TASK_EVIDENCE_STATE_CLEARED));
+        assert!(
+            cleared
+                .render_diff(PreviousSectionState::Known(&cleared.snapshot()))
+                .is_none(),
+            "the cleared snapshot must not repeat the supersession"
+        );
     }
 }

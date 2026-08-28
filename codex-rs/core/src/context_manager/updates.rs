@@ -67,19 +67,23 @@ fn build_collaboration_mode_update_item(
     }
 
     let prev = previous?;
-    if prev.collaboration_mode.as_ref() != Some(&next.collaboration_mode) {
-        match CollaborationModeInstructions::from_collaboration_mode(&next.collaboration_mode) {
-            Some(instructions) => Some(instructions.render()),
-            None if prev.collaboration_mode.as_ref().is_some_and(|mode| {
-                CollaborationModeInstructions::from_collaboration_mode(mode).is_some()
-            }) =>
-            {
-                Some(CollaborationModeInstructions::reset().render())
-            }
-            None => None,
+    let previous_instructions = prev
+        .collaboration_mode
+        .as_ref()
+        .and_then(CollaborationModeInstructions::from_collaboration_mode)
+        .map(|instructions| instructions.render());
+    let next_instructions =
+        CollaborationModeInstructions::from_collaboration_mode(&next.collaboration_mode)
+            .map(|instructions| instructions.render());
+    if previous_instructions == next_instructions {
+        return None;
+    }
+    match next_instructions {
+        Some(instructions) => Some(instructions),
+        None if previous_instructions.is_some() => {
+            Some(CollaborationModeInstructions::reset().render())
         }
-    } else {
-        None
+        None => None,
     }
 }
 
@@ -117,7 +121,7 @@ fn build_personality_update_item(
     let previous = previous?;
 
     let personality = next.personality?;
-    if Some(personality) == previous.personality {
+    if Some(personality) == previous.personality && previous.model == next.model_info.slug {
         return None;
     }
 
@@ -137,11 +141,24 @@ pub(crate) fn personality_message_for(
     model_info: &ModelInfo,
     personality: Personality,
 ) -> Option<String> {
-    model_info
+    let catalog_message = model_info
         .model_messages
         .as_ref()
         .and_then(|spec| spec.get_personality_message(Some(personality)))
-        .filter(|message| !message.is_empty())
+        .filter(|message| !message.is_empty());
+    catalog_message.or_else(|| generic_personality_message(personality).map(str::to_string))
+}
+
+fn generic_personality_message(personality: Personality) -> Option<&'static str> {
+    match personality {
+        Personality::None => None,
+        Personality::Friendly => Some(
+            "Be warm, collaborative, and candid. Keep momentum while explaining decisions clearly; never trade truthfulness for agreement.",
+        ),
+        Personality::Pragmatic => Some(
+            "Be concise, direct, and engineering-focused. State assumptions, tradeoffs, and next actions plainly; avoid filler.",
+        ),
+    }
 }
 
 pub(crate) fn build_model_switch_update_item(
@@ -194,13 +211,15 @@ fn build_text_message(role: &str, text_sections: Vec<String>) -> Option<Response
         .map(|text| ContentItem::InputText { text })
         .collect();
 
-    Some(ResponseItem::Message {
+    let mut item = ResponseItem::Message {
         id: None,
         role: role.to_string(),
         content,
         phase: None,
         internal_chat_message_metadata_passthrough: None,
-    })
+    };
+    crate::stable_context::mark_trusted_stable_context_item(&mut item);
+    Some(item)
 }
 
 pub(crate) fn build_settings_update_items(
@@ -230,4 +249,58 @@ pub(crate) fn build_settings_update_items(
     build_developer_update_item(developer_update_sections)
         .into_iter()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_collaboration_mode_update_item;
+    use super::build_personality_update_item;
+    use super::generic_personality_message;
+    use crate::session::tests::make_session_and_context;
+    use codex_protocol::config_types::Personality;
+
+    #[test]
+    fn generic_personality_fallback_covers_template_less_models() {
+        assert!(
+            generic_personality_message(Personality::Friendly)
+                .is_some_and(|message| message.contains("warm, collaborative"))
+        );
+        assert!(
+            generic_personality_message(Personality::Pragmatic)
+                .is_some_and(|message| message.contains("engineering-focused"))
+        );
+        assert_eq!(generic_personality_message(Personality::None), None);
+    }
+
+    #[tokio::test]
+    async fn model_switch_reinjects_an_unchanged_personality() {
+        let (_session, mut next) = make_session_and_context().await;
+        next.personality = Some(Personality::Friendly);
+        next.model_info.model_messages = None;
+        let mut previous = next.to_turn_context_item();
+        previous.personality = Some(Personality::Friendly);
+        previous.model = "previous-model".to_string();
+
+        let update = build_personality_update_item(Some(&previous), &next, true)
+            .expect("model switch should refresh model-visible personality wording");
+
+        assert!(update.contains("<personality_spec>"));
+        assert!(update.contains("warm, collaborative"));
+    }
+
+    #[tokio::test]
+    async fn collaboration_metadata_change_without_prompt_change_emits_no_delta() {
+        let (_session, next) = make_session_and_context().await;
+        let mut previous = next.to_turn_context_item();
+        let previous_mode = previous
+            .collaboration_mode
+            .as_mut()
+            .expect("test turn should persist collaboration mode");
+        previous_mode.settings.model = "previous-model".to_string();
+
+        assert_eq!(
+            build_collaboration_mode_update_item(Some(&previous), &next),
+            None
+        );
+    }
 }

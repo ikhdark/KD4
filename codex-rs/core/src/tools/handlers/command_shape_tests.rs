@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::json;
 
 use crate::FunctionCallError;
@@ -76,6 +78,31 @@ fn argv_mode_accepts_program_and_args_without_script() {
             "program": "rg",
             "args": ["--files", "codex-rs"],
         })
+    );
+}
+
+#[test]
+fn authorization_identity_preserves_direct_argv_program() {
+    let args = vec!["--version".to_string()];
+    let invocation = parse(None, Some("argv"), Some(" tool.exe "), Some(&args), None)
+        .expect("nonblank program should parse without normalization");
+    let shell = Shell {
+        shell_type: ShellType::PowerShell,
+        shell_path: PathBuf::from("pwsh"),
+    };
+
+    assert_eq!(
+        invocation,
+        CommandInvocation::Argv {
+            program: " tool.exe ".to_string(),
+            args,
+        }
+    );
+    assert_eq!(
+        invocation
+            .to_exec_args(&shell, /*use_login_shell*/ false)
+            .expect("direct argv"),
+        vec![" tool.exe ".to_string(), "--version".to_string()]
     );
 }
 
@@ -272,6 +299,7 @@ fn script_mode_preserves_exact_nonblank_body() {
     assert_eq!(
         invocation
             .to_exec_args(&shell, /*use_login_shell*/ false)
+            .expect("PowerShell args")
             .last()
             .map(String::as_str),
         Some(script_body)
@@ -301,6 +329,7 @@ fn powershell_script_mode_preserves_exact_nonblank_body() {
     assert_eq!(
         invocation
             .to_safety_args(&shell, /*use_login_shell*/ false)
+            .expect("PowerShell safety args")
             .last()
             .map(String::as_str),
         Some(script_body)
@@ -323,7 +352,9 @@ fn powershell_script_mode_builds_encoded_args_without_host_powershell() {
         shell_path: PathBuf::from("pwsh"),
     };
 
-    let command = invocation.to_exec_args(&shell, /*use_login_shell*/ false);
+    let command = invocation
+        .to_exec_args(&shell, /*use_login_shell*/ false)
+        .expect("PowerShell args");
 
     assert_eq!(command.first().map(String::as_str), Some("pwsh"));
     assert!(command.iter().any(|arg| arg == "-NoLogo"));
@@ -351,7 +382,9 @@ fn powershell_script_mode_builds_plain_safety_args_without_host_powershell() {
         shell_path: PathBuf::from("pwsh"),
     };
 
-    let command = invocation.to_safety_args(&shell, /*use_login_shell*/ false);
+    let command = invocation
+        .to_safety_args(&shell, /*use_login_shell*/ false)
+        .expect("PowerShell safety args");
 
     assert_eq!(
         command,
@@ -362,6 +395,51 @@ fn powershell_script_mode_builds_plain_safety_args_without_host_powershell() {
             "-Command".to_string(),
             script_body.to_string(),
         ]
+    );
+}
+
+#[test]
+fn powershell_exec_and_safety_projections_encode_the_same_script() {
+    let script_body = "$value = 'quoted value'; Write-Output $value";
+    let invocation = CommandInvocation::PowerShellScript(script_body.to_string());
+    let shell = Shell {
+        shell_type: ShellType::PowerShell,
+        shell_path: PathBuf::from("pwsh"),
+    };
+    let exec = invocation
+        .to_exec_args(&shell, /*use_login_shell*/ false)
+        .expect("PowerShell execution args");
+    let safety = invocation
+        .to_safety_args(&shell, /*use_login_shell*/ false)
+        .expect("PowerShell safety args");
+    let exec_mode = exec
+        .iter()
+        .position(|arg| arg == "-EncodedCommand")
+        .expect("encoded execution mode");
+    let safety_mode = safety
+        .iter()
+        .position(|arg| arg == "-Command")
+        .expect("plain safety mode");
+
+    assert_eq!(&exec[..exec_mode], &safety[..safety_mode]);
+    assert_eq!(
+        safety.get(safety_mode + 1).map(String::as_str),
+        Some(script_body)
+    );
+
+    let encoded = exec.get(exec_mode + 1).expect("encoded script payload");
+    let bytes = BASE64_STANDARD.decode(encoded).expect("base64 payload");
+    let utf16 = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        String::from_utf16(&utf16).expect("UTF-16LE payload"),
+        format!(
+            "{}{}",
+            codex_shell_command::powershell::UTF8_OUTPUT_PREFIX,
+            script_body
+        )
     );
 }
 

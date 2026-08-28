@@ -117,7 +117,6 @@ use codex_exec_server::CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID_ENV_VAR;
 use codex_exec_server::CODEX_EXEC_SERVER_NOISE_REGISTRY_URL_ENV_VAR;
 use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
 use codex_login::default_client::CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR;
-use core_test_support::is_remote_test_environment;
 use core_test_support::test_codex::TestEnv;
 use core_test_support::test_codex::test_env;
 use tempfile::TempDir;
@@ -1755,10 +1754,6 @@ impl TestAppServerBuilder {
                 );
                 let (auto_env, delayed_exec_server) = match exec_server_delay {
                     Some(added_delay) => {
-                        ensure!(
-                            !is_remote_test_environment(),
-                            "TestAppServer exec-server delay only supports the local test environment"
-                        );
                         let exec_server_program =
                             codex_utils_cargo_bin::cargo_bin("exec-server")
                                 .context("should find binary for delayed exec-server fixture")?;

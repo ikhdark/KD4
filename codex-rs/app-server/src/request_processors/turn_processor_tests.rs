@@ -39,7 +39,31 @@ fn turn_interrupt_allows_running_startup_race_without_snapshot() {
 }
 
 #[test]
-fn in_flight_task_coalescing_fingerprint_normalizes_identity() {
+fn turn_start_rejects_an_active_turn_and_directs_the_client_to_steer() {
+    let error = validate_turn_start_target(Some("turn-active"), /*is_running*/ true)
+        .expect_err("turn/start must not submit input to an active turn");
+
+    assert!(error.message.contains("turn/steer"));
+    assert_eq!(
+        error.data,
+        Some(serde_json::json!({
+            "reason": "activeTurnInProgress",
+            "turnId": "turn-active",
+        }))
+    );
+
+    let error = validate_turn_start_target(None, /*is_running*/ true)
+        .expect_err("turn/start must reject the core-running projection race");
+    assert_eq!(
+        error.data,
+        Some(serde_json::json!({
+            "reason": "activeTurnInProgress",
+        }))
+    );
+}
+
+#[test]
+fn in_flight_task_coalescing_fingerprint_preserves_text_and_normalizes_identity_fields() {
     let params = |thread_id: &str, text: &str, run_independently| TurnStartParams {
         thread_id: thread_id.to_string(),
         client_user_message_id: Some(format!("client-{thread_id}")),
@@ -51,20 +75,25 @@ fn in_flight_task_coalescing_fingerprint_normalizes_identity() {
         ..Default::default()
     };
     let first = params("thread-1", "fix   the\n bug", None);
-    let duplicate = params("thread-2", "fix the bug", Some(true));
+    let same_task = params("thread-2", "fix   the\n bug", Some(true));
+    let whitespace_changed_task = params("thread-2", "fix the bug", Some(true));
 
     let first_fingerprint = normalized_task_fingerprint(&first, "C:/repo", "model=o3");
     assert_eq!(
         first_fingerprint,
-        normalized_task_fingerprint(&duplicate, "C:/repo", "model=o3")
+        normalized_task_fingerprint(&same_task, "C:/repo", "model=o3")
     );
     assert_ne!(
         first_fingerprint,
-        normalized_task_fingerprint(&duplicate, "C:/other", "model=o3")
+        normalized_task_fingerprint(&whitespace_changed_task, "C:/repo", "model=o3")
     );
     assert_ne!(
         first_fingerprint,
-        normalized_task_fingerprint(&duplicate, "C:/repo", "model=gpt-5")
+        normalized_task_fingerprint(&same_task, "C:/other", "model=o3")
+    );
+    assert_ne!(
+        first_fingerprint,
+        normalized_task_fingerprint(&same_task, "C:/repo", "model=gpt-5")
     );
 }
 
@@ -139,15 +168,11 @@ async fn missing_error_path_rejected_task_does_not_apply_connection_updates() {
     let existing_thread_id = ThreadId::new();
     let fingerprint = "same-task".to_string();
     manager
-        .claim_in_flight_task(
-            fingerprint.clone(),
-            existing_thread_id,
-            "turn-existing".to_string(),
-        )
+        .claim_turn_start(Some(&fingerprint), existing_thread_id, "turn-existing")
         .await;
     let updates_applied = std::cell::Cell::new(false);
 
-    let error = claim_in_flight_task_before_connection_updates(
+    let error = claim_turn_start_before_connection_updates(
         &manager,
         Some(&fingerprint),
         ThreadId::new(),
@@ -170,12 +195,50 @@ async fn missing_error_path_rejected_task_does_not_apply_connection_updates() {
 }
 
 #[tokio::test]
+async fn concurrent_turn_start_on_one_thread_is_rejected_before_connection_updates() {
+    let manager = ThreadStateManager::new();
+    let thread_id = ThreadId::new();
+    claim_turn_start_before_connection_updates(
+        &manager,
+        Some("first-task"),
+        thread_id,
+        "turn-first",
+        || async { Ok(()) },
+    )
+    .await
+    .expect("first turn should reserve the thread");
+    let updates_applied = std::cell::Cell::new(false);
+
+    let error = claim_turn_start_before_connection_updates(
+        &manager,
+        Some("second-task"),
+        thread_id,
+        "turn-second",
+        || async {
+            updates_applied.set(true);
+            Ok(())
+        },
+    )
+    .await
+    .expect_err("a second turn/start must not become steering input");
+
+    assert!(!updates_applied.get());
+    assert_eq!(
+        error.data,
+        Some(serde_json::json!({
+            "reason": "activeTurnInProgress",
+            "turnId": "turn-first",
+        }))
+    );
+}
+
+#[tokio::test]
 async fn missing_error_path_failed_connection_update_releases_task_claim() {
     let manager = ThreadStateManager::new();
     let thread_id = ThreadId::new();
     let fingerprint = "retryable-task".to_string();
 
-    claim_in_flight_task_before_connection_updates(
+    claim_turn_start_before_connection_updates(
         &manager,
         Some(&fingerprint),
         thread_id,
@@ -187,9 +250,39 @@ async fn missing_error_path_failed_connection_update_releases_task_claim() {
 
     assert_eq!(
         manager
-            .claim_in_flight_task(fingerprint, thread_id, "turn-retry".to_string())
+            .claim_turn_start(Some(&fingerprint), thread_id, "turn-retry")
             .await,
-        crate::thread_state::InFlightTaskClaim::Claimed
+        crate::thread_state::TurnStartClaim::Claimed
+    );
+}
+
+#[tokio::test]
+async fn rejected_core_start_releases_task_claim_for_exact_retry() {
+    let manager = ThreadStateManager::new();
+    let thread_id = ThreadId::new();
+    let fingerprint = "retryable-core-rejection";
+    assert_eq!(
+        manager
+            .claim_turn_start(Some(fingerprint), thread_id, "turn-rejected")
+            .await,
+        crate::thread_state::TurnStartClaim::Claimed
+    );
+
+    let error = release_turn_start_after_submission_error(
+        &manager,
+        thread_id,
+        "turn-rejected",
+        CodexErr::InvalidRequest("a turn is already active".to_string()),
+    )
+    .await;
+
+    assert_eq!(error.code, -32600);
+    assert_eq!(error.message, "a turn is already active");
+    assert_eq!(
+        manager
+            .claim_turn_start(Some(fingerprint), thread_id, "turn-retry")
+            .await,
+        crate::thread_state::TurnStartClaim::Claimed
     );
 }
 

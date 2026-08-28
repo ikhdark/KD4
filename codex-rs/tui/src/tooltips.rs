@@ -6,14 +6,10 @@ use std::sync::LazyLock;
 const ANNOUNCEMENT_TIP_URL: &str =
     "https://raw.githubusercontent.com/openai/codex/main/announcement_tip.toml";
 
-const IS_MACOS: bool = false;
-const IS_WINDOWS: bool = true;
-
 const APP_TOOLTIP: &str = "Try the **Codex App**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
 const FAST_TOOLTIP: &str =
     "*New* Use **/fast** to enable our fastest inference with increased plan usage.";
-const OTHER_TOOLTIP: &str = "*New* Build faster with the **Codex App**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
-const OTHER_TOOLTIP_NON_MAC: &str = "*New* Build faster with Codex.";
+const DEFAULT_TOOLTIP: &str = "*New* Build faster with Codex.";
 const FREE_GO_TOOLTIP: &str =
     "*New* For a limited time, Codex is included in your plan for free – let’s build together.";
 
@@ -23,15 +19,7 @@ static TOOLTIPS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     RAW_TOOLTIPS
         .lines()
         .map(str::trim)
-        .filter(|line| {
-            if line.is_empty() || line.starts_with('#') {
-                return false;
-            }
-            if !IS_MACOS && !IS_WINDOWS && line.contains("codex app") {
-                return false;
-            }
-            true
-        })
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect()
 });
 static ALL_TOOLTIPS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
@@ -74,12 +62,7 @@ pub(crate) fn get_tooltip(plan: Option<PlanType>, fast_mode_enabled: bool) -> Op
                 return Some(FREE_GO_TOOLTIP.to_string());
             }
             _ => {
-                let tooltip = if IS_MACOS {
-                    OTHER_TOOLTIP
-                } else {
-                    OTHER_TOOLTIP_NON_MAC
-                };
-                return Some(tooltip.to_string());
+                return Some(DEFAULT_TOOLTIP.to_string());
             }
         }
     }
@@ -88,11 +71,7 @@ pub(crate) fn get_tooltip(plan: Option<PlanType>, fast_mode_enabled: bool) -> Op
 }
 
 fn paid_app_tooltip() -> Option<&'static str> {
-    if IS_MACOS || IS_WINDOWS {
-        Some(APP_TOOLTIP)
-    } else {
-        None
-    }
+    Some(APP_TOOLTIP)
 }
 
 /// Paid users spend most startup sessions in a dedicated promo slot rather than the
@@ -180,8 +159,6 @@ pub(crate) mod announcement {
     #[derive(Debug, Deserialize, Copy, Clone, PartialEq, Eq)]
     #[serde(rename_all = "lowercase")]
     enum TargetOs {
-        Linux,
-        Macos,
         Windows,
         #[serde(other)]
         Unknown,
@@ -201,7 +178,7 @@ pub(crate) mod announcement {
     }
 
     fn blocking_init_announcement_tip() -> Option<String> {
-        // Avoid system proxy detection to prevent macOS system-configuration panics (#8912).
+        // Announcement fetching should not inherit system proxy state.
         let client = BlockingHttpClientBuilder::new().build_direct().ok()?;
         let response = client
             .get(ANNOUNCEMENT_TIP_URL)
@@ -451,7 +428,7 @@ from_date = "2000-01-01"
 # version_regex matches against the CLI version (env!("CARGO_PKG_VERSION")); omit to apply to all versions.
 # target_app specify which app should display the announcement (cli, vsce, ...).
 # target_plan_types optionally restricts the announcement to plan types like ["plus", "pro"].
-# target_oses optionally restricts the announcement to operating systems like ["macos", "windows"].
+# target_oses optionally restricts the announcement to Windows with ["windows"].
 
 [[announcements]]
 content = "Welcome to Codex! Check out the new onboarding flow."
@@ -521,15 +498,11 @@ target_plan_types = ["prp"]
     }
 
     #[test]
-    fn announcement_tip_toml_matches_target_os() {
+    fn announcement_tip_toml_matches_windows_and_rejects_other_operating_systems() {
         let toml = r#"
 [[announcements]]
-content = "linux announcement"
-target_oses = ["linux"]
-
-[[announcements]]
-content = "macos announcement"
-target_oses = ["macos"]
+content = "other operating system announcement"
+target_oses = ["other"]
 
 [[announcements]]
 content = "windows announcement"

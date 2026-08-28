@@ -62,7 +62,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
         request: ResponsesApiRequest,
         options: ResponsesOptions,
     ) -> Result<ResponseStream, ApiError> {
-        self.stream_request_with_dispatch_ready(&request, options, || {})
+        self.stream_request_with_dispatch_ready(&request, options, |_| {})
             .await
     }
 
@@ -80,7 +80,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
         &self,
         request: &ResponsesApiRequest,
         options: ResponsesOptions,
-        dispatch_ready: impl FnOnce(),
+        dispatch_ready: impl FnOnce(u64),
     ) -> Result<ResponseStream, ApiError> {
         let ResponsesOptions {
             session_id,
@@ -93,6 +93,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
 
         let body = EncodedJsonBody::encode(&request)
             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
+        let encoded_request_bytes = u64::try_from(body.as_bytes().len()).unwrap_or(u64::MAX);
 
         let mut headers = extra_headers;
         if let Some(ref thread_id) = thread_id {
@@ -103,7 +104,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
             insert_header(&mut headers, "x-openai-subagent", &subagent);
         }
 
-        dispatch_ready();
+        dispatch_ready(encoded_request_bytes);
         self.stream_encoded(body, headers, compression, turn_state)
             .await
     }

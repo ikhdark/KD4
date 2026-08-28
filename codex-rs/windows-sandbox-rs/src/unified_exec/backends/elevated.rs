@@ -23,7 +23,6 @@ use codex_utils_pty::SpawnedProcess;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -188,11 +187,11 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
     let (pipe_write, pipe_read) = transport.into_files();
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
-    let (stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(256);
+    let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(256);
     let stderr_rx = if tty {
         None
     } else {
-        Some(broadcast::channel::<Vec<u8>>(256))
+        Some(mpsc::channel::<Vec<u8>>(256))
     };
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
 
@@ -201,13 +200,21 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
     let terminator = {
         let outbound_tx = outbound_tx.clone();
         Some(Box::new(move || {
-            let _ = outbound_tx.send(FramedMessage {
-                version: IPC_PROTOCOL_VERSION,
-                message: Message::Terminate {
-                    payload: EmptyPayload::default(),
-                },
-            });
-        }) as Box<dyn FnMut() + Send + Sync>)
+            outbound_tx
+                .send(FramedMessage {
+                    version: IPC_PROTOCOL_VERSION,
+                    message: Message::Terminate {
+                        payload: EmptyPayload::default(),
+                    },
+                })
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "runner control pipe closed",
+                    )
+                })
+        })
+            as Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>)
     };
 
     start_runner_stdout_reader(
@@ -220,8 +227,8 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
     Ok(finish_driver_spawn(
         ProcessDriver {
             writer_tx,
-            stdout_rx,
-            stderr_rx: stderr_rx.map(|(_tx, rx)| rx),
+            stdout_rx: stdout_rx.into(),
+            stderr_rx: stderr_rx.map(|(_tx, rx)| rx.into()),
             exit_rx,
             terminator,
             writer_handle: Some(writer_handle),

@@ -897,9 +897,9 @@ impl App {
         let inferred_session = self
             .infer_session_for_thread_notification(thread_id, &notification)
             .await;
-        let (sender, store) = {
+        let (forwarder, store) = {
             let channel = self.ensure_thread_channel(thread_id);
-            (channel.sender.clone(), Arc::clone(&channel.store))
+            (channel.forwarder.clone(), Arc::clone(&channel.store))
         };
 
         let (should_send, pending_status) = {
@@ -915,19 +915,7 @@ impl App {
         let notification_status_change = SideParentStatusChange::for_notification(&notification);
 
         if should_send {
-            match sender.try_send(ThreadBufferedEvent::Notification(notification)) {
-                Ok(()) => {}
-                Err(TrySendError::Full(event)) => {
-                    tokio::spawn(async move {
-                        if let Err(err) = sender.send(event).await {
-                            tracing::warn!("thread {thread_id} event channel closed: {err}");
-                        }
-                    });
-                }
-                Err(TrySendError::Closed(_)) => {
-                    tracing::warn!("thread {thread_id} event channel closed");
-                }
-            }
+            forwarder.try_send(thread_id, ThreadBufferedEvent::Notification(notification));
         }
         if let Some(status) = pending_status {
             self.set_side_parent_status(thread_id, Some(status));
@@ -1028,9 +1016,9 @@ impl App {
         } else {
             None
         };
-        let (sender, store) = {
+        let (forwarder, store) = {
             let channel = self.ensure_thread_channel(thread_id);
-            (channel.sender.clone(), Arc::clone(&channel.store))
+            (channel.forwarder.clone(), Arc::clone(&channel.store))
         };
 
         let (should_send, pending_status) = {
@@ -1041,19 +1029,7 @@ impl App {
         let request_status = SideParentStatus::for_request(&request);
 
         if should_send {
-            match sender.try_send(ThreadBufferedEvent::Request(request)) {
-                Ok(()) => {}
-                Err(TrySendError::Full(event)) => {
-                    tokio::spawn(async move {
-                        if let Err(err) = sender.send(event).await {
-                            tracing::warn!("thread {thread_id} event channel closed: {err}");
-                        }
-                    });
-                }
-                Err(TrySendError::Closed(_)) => {
-                    tracing::warn!("thread {thread_id} event channel closed");
-                }
-            }
+            forwarder.try_send(thread_id, ThreadBufferedEvent::Request(request));
         } else if self.active_side_parent_thread_id().is_none()
             && let Some(request) = inactive_interactive_request
         {
@@ -1071,9 +1047,9 @@ impl App {
         thread_id: ThreadId,
         event: HistoryLookupResponse,
     ) -> Result<()> {
-        let (sender, store) = {
+        let (forwarder, store) = {
             let channel = self.ensure_thread_channel(thread_id);
-            (channel.sender.clone(), Arc::clone(&channel.store))
+            (channel.forwarder.clone(), Arc::clone(&channel.store))
         };
 
         let should_send = {
@@ -1093,19 +1069,7 @@ impl App {
         };
 
         if should_send {
-            match sender.try_send(ThreadBufferedEvent::HistoryEntryResponse(event)) {
-                Ok(()) => {}
-                Err(TrySendError::Full(event)) => {
-                    tokio::spawn(async move {
-                        if let Err(err) = sender.send(event).await {
-                            tracing::warn!("thread {thread_id} event channel closed: {err}");
-                        }
-                    });
-                }
-                Err(TrySendError::Closed(_)) => {
-                    tracing::warn!("thread {thread_id} event channel closed");
-                }
-            }
+            forwarder.try_send(thread_id, ThreadBufferedEvent::HistoryEntryResponse(event));
         }
         Ok(())
     }

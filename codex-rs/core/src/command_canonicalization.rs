@@ -11,24 +11,25 @@ const POWERSHELL_PROFILES_ENABLED_MODE: &str = "profiles-enabled";
 
 /// Canonicalize command argv for approval-cache matching.
 ///
-/// This keeps approval decisions stable across wrapper-path differences (for
-/// example `/bin/bash -lc` vs `bash -lc`) and across shell wrapper tools while
-/// preserving exact script text for complex scripts where we cannot safely
-/// recover a tokenized command sequence.
+/// Plain Bash-like scripts receive stable tokenization, while the exact shell
+/// executable and mode remain part of the key. Complex scripts preserve their
+/// exact script text as well.
 pub(crate) fn canonicalize_command_for_approval(command: &[String]) -> Vec<String> {
-    if let Some(commands) = parse_shell_lc_plain_commands(command)
-        && let [single_command] = commands.as_slice()
-    {
-        return single_command.clone();
-    }
-
-    if let Some((_shell, script)) = extract_bash_command(command) {
+    if let Some((shell, script)) = extract_bash_command(command) {
         let shell_mode = command.get(1).cloned().unwrap_or_default();
-        return vec![
+        let mut canonical = vec![
             CANONICAL_BASH_SCRIPT_PREFIX.to_string(),
+            shell.to_string(),
             shell_mode,
-            script.to_string(),
         ];
+        if let Some(commands) = parse_shell_lc_plain_commands(command)
+            && let [single_command] = commands.as_slice()
+        {
+            canonical.extend(single_command.iter().cloned());
+        } else {
+            canonical.push(script.to_string());
+        }
+        return canonical;
     }
 
     if let Some((shell, script)) = extract_noprofile_powershell_command(command)

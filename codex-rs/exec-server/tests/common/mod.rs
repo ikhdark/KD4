@@ -17,7 +17,6 @@ pub(crate) mod exec_server;
 
 pub(crate) const DELAYED_OUTPUT_AFTER_EXIT_PARENT_ARG: &str =
     "--codex-test-delayed-output-after-exit-parent";
-
 const CODEX_WINDOWS_SANDBOX_ARG1: &str = "--run-as-windows-sandbox";
 const DELAYED_OUTPUT_AFTER_EXIT_CHILD_ARG: &str = "--codex-test-delayed-output-after-exit-child";
 

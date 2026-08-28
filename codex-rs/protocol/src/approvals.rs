@@ -7,6 +7,7 @@ use crate::protocol::ReviewDecision;
 use crate::request_permissions::RequestPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
+use codex_utils_path_uri::PathUri;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -245,7 +246,14 @@ pub struct ExecApprovalRequestEvent {
     /// The command to be executed.
     pub command: Vec<String>,
     /// The command's working directory.
+    ///
+    /// This legacy host-native projection is retained for older clients. Use
+    /// `cwd_uri` when it is present.
     pub cwd: AbsolutePathBuf,
+    /// URI-preserving working directory for commands selected in foreign environments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cwd_uri: Option<PathUri>,
     /// Optional human-readable reason for the approval (e.g. retry without sandbox).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,

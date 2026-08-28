@@ -18,8 +18,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::PoisonError;
-use std::sync::TryLockError;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -128,19 +128,12 @@ fn parse_with_powershell_ast_request(
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone()
     };
-    let mut parser = match parser.try_lock() {
-        Ok(parser) => parser,
-        Err(TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(TryLockError::WouldBlock) => {
-            // Classification is synchronous, so queueing on the cached parser can
-            // hold an async shell admission worker indefinitely behind unrelated
-            // requests. Use a one-shot trusted parser under contention. Failure is
-            // still fail-closed and never admits the target command by itself.
-            let mut uncached_parser = None;
-            return parse_with_cached_process(&mut uncached_parser, executable, script, resolution);
-        }
-    };
+    let mut parser = lock_cached_parser(&parser);
     parse_with_cached_process(&mut parser, executable, script, resolution)
+}
+
+fn lock_cached_parser(parser: &CachedParser) -> MutexGuard<'_, Option<PowershellParserProcess>> {
+    parser.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub(crate) fn try_parse_powershell_ast_commands(
@@ -727,6 +720,28 @@ mod tests {
             resolved_application: None,
         }
         .into_outcome()
+    }
+
+    #[test]
+    fn cached_parser_contention_queues_instead_of_creating_an_uncached_host() {
+        let parser: CachedParser = Arc::new(Mutex::new(None));
+        let held = lock_cached_parser(&parser);
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let queued_parser = Arc::clone(&parser);
+        let queued = std::thread::spawn(move || {
+            let _guard = lock_cached_parser(&queued_parser);
+            acquired_tx.send(()).expect("report queued acquisition");
+        });
+
+        assert!(
+            acquired_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+            "contended parser access did not queue"
+        );
+        drop(held);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued parser access should resume");
+        queued.join().expect("queued parser thread");
     }
 
     #[test]

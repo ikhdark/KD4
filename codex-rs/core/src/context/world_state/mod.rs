@@ -153,6 +153,40 @@ impl ErasedWorldStateSection for ExtensionWorldStateSection {
     }
 }
 
+/// A last accepted extension snapshot retained while its current observation is unavailable.
+/// Preserved sections never render; a successful contributor result restores its render and
+/// retained-fragment policies on the next step.
+struct PreservedWorldStateSection(Value);
+
+impl ErasedWorldStateSection for PreservedWorldStateSection {
+    fn snapshot(&self) -> Option<Value> {
+        Some(self.0.clone())
+    }
+
+    fn matches_legacy_fragment(&self, _role: &str, _text: &str) -> bool {
+        false
+    }
+
+    fn has_retained_fragment_matcher(&self) -> bool {
+        false
+    }
+
+    fn matches_retained_fragment(&self, _role: &str, _text: &str) -> bool {
+        false
+    }
+
+    fn truncate_when_oversized(&self) -> bool {
+        false
+    }
+
+    fn render_diff(
+        &self,
+        _previous: PreviousSectionState<'_, Value>,
+    ) -> Option<Box<dyn ContextualUserFragment>> {
+        None
+    }
+}
+
 struct WorldStateContextFragment(RenderedWorldStateFragment);
 
 impl ContextualUserFragment for WorldStateContextFragment {
@@ -238,6 +272,10 @@ pub(crate) struct WorldStateSnapshot {
 }
 
 impl WorldStateSnapshot {
+    pub(crate) fn section(&self, id: &str) -> Option<&Value> {
+        self.sections.get(id)
+    }
+
     pub(crate) fn into_value(self) -> Value {
         Value::Object(self.sections.into_iter().collect())
     }
@@ -283,6 +321,15 @@ impl WorldState {
         );
         self.sections
             .insert(id, Box::new(ExtensionWorldStateSection(section)));
+    }
+
+    pub(crate) fn add_preserved_extension_section(&mut self, id: &'static str, snapshot: Value) {
+        assert!(
+            !self.sections.contains_key(id),
+            "duplicate world-state section ID: {id}"
+        );
+        self.sections
+            .insert(id, Box::new(PreservedWorldStateSection(snapshot)));
     }
 
     pub(crate) fn snapshot(&self) -> WorldStateSnapshot {

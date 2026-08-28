@@ -69,16 +69,13 @@ impl Policy {
 
         for (_program, rules) in self.rules_by_program.iter_all() {
             for rule in rules {
-                let Some(prefix_rule) = rule.as_any().downcast_ref::<PrefixRule>() else {
-                    continue;
-                };
-                if prefix_rule.decision != Decision::Allow {
+                if rule.decision != Decision::Allow {
                     continue;
                 }
 
-                let mut prefix = Vec::with_capacity(prefix_rule.pattern.rest.len() + 1);
-                prefix.push(prefix_rule.pattern.first.as_ref().to_string());
-                prefix.extend(prefix_rule.pattern.rest.iter().map(render_pattern_token));
+                let mut prefix = Vec::with_capacity(rule.pattern.rest.len() + 1);
+                prefix.push(rule.pattern.first.as_ref().to_string());
+                prefix.extend(rule.pattern.rest.iter().map(render_pattern_token));
                 prefixes.push(prefix);
             }
         }

@@ -214,6 +214,7 @@ async fn step_context_with_live_apps(
         /*elicitation_reviewer*/ None,
         /*elicitation_lifecycle*/ None,
         codex_mcp::ElicitationRequestRouter::default(),
+        /*previous_manager*/ None,
     )
     .await;
     assert!(
@@ -588,7 +589,7 @@ fn mcp_app_resource_uri_reads_known_tool_meta_keys() {
 
 #[tokio::test]
 async fn metadata_derivation_uses_the_supplied_live_tool_info() {
-    let (session, turn_context) = make_session_and_context().await;
+    let (session, _turn_context) = make_session_and_context().await;
     let manager = session.services.latest_mcp_runtime().manager_arc();
     let mut tool = rmcp::model::Tool::new_with_raw(
         "advertised_tool".to_string(),
@@ -610,7 +611,7 @@ async fn metadata_derivation_uses_the_supplied_live_tool_info() {
         .clone(),
     ));
     let tool_info = ToolInfo {
-        server_name: "snapshot_server".to_string(),
+        server_name: CODEX_APPS_MCP_SERVER_NAME.to_string(),
         supports_parallel_tool_calls: false,
         server_origin: Some("streamable_http".to_string()),
         callable_name: "advertised_tool".to_string(),
@@ -622,12 +623,14 @@ async fn metadata_derivation_uses_the_supplied_live_tool_info() {
         plugin_display_names: Vec::new(),
     };
 
-    let metadata =
-        mcp_tool_metadata_from_tool_info(&session, &turn_context, manager.as_ref(), &tool_info)
-            .await;
+    let metadata = mcp_tool_metadata_from_tool_info(manager.as_ref(), &tool_info).await;
 
     assert_eq!(metadata.connector_id.as_deref(), Some("snapshot-connector"));
     assert_eq!(metadata.connector_name.as_deref(), Some("Snapshot App"));
+    assert_eq!(
+        metadata.connector_description.as_deref(),
+        Some("Snapshot connector")
+    );
     assert_eq!(metadata.tool_title.as_deref(), Some("Advertised title"));
     assert_eq!(
         metadata.tool_description.as_deref(),
@@ -1677,6 +1680,10 @@ fn sanitize_mcp_tool_result_for_model_rewrites_image_content() {
         is_error: Some(false),
         meta: None,
     });
+    let retained_text_ptr = result.as_ref().expect("MCP result").content[1]["text"]
+        .as_str()
+        .expect("retained text")
+        .as_ptr();
 
     let got = sanitize_mcp_tool_result_for_model(/*supports_image_input*/ false, result)
         .expect("sanitized result");
@@ -1693,6 +1700,53 @@ fn sanitize_mcp_tool_result_for_model_rewrites_image_content() {
                 "text": "hello",
             }),
         ]
+    );
+    assert_eq!(
+        got.content[1]["text"].as_str().map(str::as_ptr),
+        Some(retained_text_ptr),
+        "retained content blocks should be moved into the sanitized result",
+    );
+}
+
+#[test]
+fn split_mcp_tool_call_execution_moves_raw_result() {
+    let raw_server_result = CallToolResult {
+        content: vec![serde_json::json!({
+            "type": "text",
+            "text": "raw server evidence",
+        })],
+        structured_content: None,
+        is_error: Some(false),
+        meta: None,
+    };
+    let raw_text_ptr = raw_server_result.content[0]["text"]
+        .as_str()
+        .expect("raw server text")
+        .as_ptr();
+    let model_result = CallToolResult {
+        content: vec![serde_json::json!({
+            "type": "text",
+            "text": "model-visible result",
+        })],
+        structured_content: None,
+        is_error: Some(false),
+        meta: None,
+    };
+
+    let (model_result, raw_server_result) =
+        split_mcp_tool_call_execution(Ok(ExecutedMcpToolCall {
+            raw_server_result: Some(raw_server_result),
+            model_result,
+        }));
+    let raw_server_result = raw_server_result.expect("raw server result");
+
+    assert!(model_result.is_ok());
+    assert_eq!(
+        raw_server_result.content[0]["text"]
+            .as_str()
+            .map(str::as_ptr),
+        Some(raw_text_ptr),
+        "the consuming split should move raw evidence instead of cloning it",
     );
 }
 
@@ -1736,10 +1790,39 @@ fn raw_mcp_tool_result_remains_exact_when_model_copy_is_sanitized() {
         original.clone(),
     )
     .expect("preserved result");
+    let raw = raw.expect("evidence-bearing result should retain the raw response");
 
     assert_eq!(raw, original);
     assert_ne!(model.content, raw.content);
     assert_eq!(model.structured_content, raw.structured_content);
+}
+
+#[test]
+fn ordinary_mcp_result_is_moved_directly_to_the_model_path() {
+    let original = CallToolResult {
+        content: vec![serde_json::json!({
+            "type": "text",
+            "text": "ordinary result",
+        })],
+        structured_content: Some(serde_json::json!({"complete": true})),
+        is_error: Some(false),
+        meta: None,
+    };
+    let text_ptr = original.content[0]["text"]
+        .as_str()
+        .expect("ordinary result text")
+        .as_ptr();
+
+    let (raw, model) =
+        preserve_raw_mcp_tool_result_for_evidence(/*supports_image_input*/ false, original)
+            .expect("ordinary result");
+
+    assert_eq!(raw, None);
+    assert_eq!(
+        model.content[0]["text"].as_str().map(str::as_ptr),
+        Some(text_ptr),
+        "ordinary results should be moved instead of cloned for unused evidence capture",
+    );
 }
 
 #[test]
@@ -2198,6 +2281,7 @@ async fn host_owned_codex_apps_manager(
         /*elicitation_reviewer*/ None,
         /*elicitation_lifecycle*/ None,
         codex_mcp::ElicitationRequestRouter::default(),
+        /*previous_manager*/ None,
     )
     .await;
     Arc::new(manager)
@@ -2880,7 +2964,7 @@ async fn persist_custom_mcp_tool_approval_writes_tool_override() {
 }
 
 #[tokio::test]
-async fn custom_mcp_tool_approval_mode_uses_server_default_with_tool_override() {
+async fn custom_mcp_tool_approval_mode_uses_typed_server_default_with_tool_override() {
     let tmp = tempdir().expect("tempdir");
     std::fs::write(
         tmp.path().join(CONFIG_TOML_FILE),
@@ -2901,6 +2985,20 @@ approval_mode = "prompt"
         .expect("load config");
     let (session, mut turn_context) = make_session_and_context().await;
     turn_context.config = Arc::new(config);
+
+    let configured_servers = turn_context.config.mcp_servers.get();
+    assert_eq!(
+        configured_mcp_tool_approval_mode(configured_servers, "docs", "read"),
+        Some(AppToolApproval::Approve)
+    );
+    assert_eq!(
+        configured_mcp_tool_approval_mode(configured_servers, "docs", "search"),
+        Some(AppToolApproval::Prompt)
+    );
+    assert_eq!(
+        configured_mcp_tool_approval_mode(configured_servers, "unknown", "search"),
+        None
+    );
 
     assert_eq!(
         custom_mcp_tool_approval_mode(&session, &turn_context, "docs", "read").await,

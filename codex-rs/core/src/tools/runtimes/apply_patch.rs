@@ -43,8 +43,14 @@ use std::time::Instant;
 #[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize)]
 pub(crate) struct ApplyPatchApprovalKey {
     environment_id: String,
+    approval_scope_id: String,
     path: PathUri,
 }
+
+/// Keeps approval for a less-restricted retry separate from ordinary patch
+/// approval. `ApprovalStore` includes the key type in its serialized namespace.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize)]
+struct ApplyPatchEscalationApprovalKey(ApplyPatchApprovalKey);
 
 #[derive(Debug)]
 pub struct ApplyPatchRequest {
@@ -92,16 +98,16 @@ impl ApplyPatchRuntime {
         let coordinator = ctx.session.services.agent_control.task_coordinator();
         let binding = coordinator.binding_for_source(&ctx.turn.session_source);
         if let Some(binding) = &binding {
-            let task = coordinator
-                .get_agent_task(binding.assignment_id, Some(0))
+            let authorization = coordinator
+                .get_agent_task_authorization(binding.assignment_id)
                 .await
                 .map_err(|error| {
                     ToolError::Rejected(format!(
                         "apply_patch: typed assignment state is unavailable: {error}"
                     ))
                 })?;
-            if task.current_attempt.attempt_id != binding.attempt_id
-                || task.current_attempt.state != AttemptState::Active
+            if authorization.current_attempt.attempt_id != binding.attempt_id
+                || authorization.current_attempt.state != AttemptState::Active
             {
                 return Err(ToolError::Rejected(
                     "apply_patch: the bound typed assignment attempt is no longer active"
@@ -279,6 +285,11 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
             .cloned()
             .map(|path| ApplyPatchApprovalKey {
                 environment_id: req.turn_environment.environment_id.clone(),
+                approval_scope_id: req
+                    .turn_environment
+                    .environment
+                    .approval_scope_id()
+                    .to_string(),
                 path,
             })
             .collect()
@@ -300,15 +311,27 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
                 return ReviewDecision::Approved;
             }
             if let Some(reason) = retry_reason {
-                return session
-                    .request_patch_approval(
-                        turn,
-                        call_id,
-                        changes.clone(),
-                        Some(reason),
-                        /*grant_root*/ None,
-                    )
-                    .await;
+                let escalation_approval_keys = approval_keys
+                    .into_iter()
+                    .map(ApplyPatchEscalationApprovalKey)
+                    .collect();
+                return with_cached_approval(
+                    &session.services,
+                    "apply_patch",
+                    escalation_approval_keys,
+                    || async move {
+                        session
+                            .request_patch_approval(
+                                turn,
+                                call_id,
+                                changes,
+                                Some(reason),
+                                /*grant_root*/ None,
+                            )
+                            .await
+                    },
+                )
+                .await;
             }
 
             with_cached_approval(

@@ -440,7 +440,6 @@ async fn session_configured_preserves_profile_workspace_roots() {
     let profile_root = test_path_buf("/home/user/shared").abs();
     chat.config.cwd = previous_cwd.clone();
     chat.config.workspace_roots = vec![previous_cwd, profile_root.clone()];
-    chat.config.workspace_roots_explicit = false;
     chat.config
         .permissions
         .set_workspace_roots(chat.config.workspace_roots.clone());
