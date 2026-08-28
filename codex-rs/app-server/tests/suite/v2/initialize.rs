@@ -190,7 +190,7 @@ async fn initialize_response_includes_local_runtime_metadata() -> Result<()> {
     let message = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.initialize_with_client_info(ClientInfo {
-            name: "codex_desktop".to_string(),
+            name: "Codex Desktop".to_string(),
             title: Some("Codex Desktop".to_string()),
             version: "0.1.0".to_string(),
         }),
@@ -239,7 +239,7 @@ async fn initialize_response_includes_local_runtime_metadata() -> Result<()> {
     fs_wait::wait_for_path_exists(&receipt_path, Duration::from_secs(5)).await?;
     let receipt: Value = serde_json::from_slice(&std::fs::read(receipt_path)?)?;
     assert_eq!(receipt["schemaVersion"], 1);
-    assert_eq!(receipt["clientName"], "codex_desktop");
+    assert_eq!(receipt["clientName"], "Codex Desktop");
     assert_eq!(
         receipt["codexHome"],
         codex_home.path().to_string_lossy().as_ref()

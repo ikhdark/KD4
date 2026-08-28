@@ -17,7 +17,7 @@ const LOCAL_PUBLISH_DIR_ENV: &str = "CODEX_LOCAL_PUBLISH_DIR";
 const LOCAL_CLI_PATH_ENV: &str = "CODEX_CLI_PATH";
 const ACTION_PUBLISH_LOCAL_CODEX: &str = "publishLocalCodex";
 const ACTION_RESTART_CODEX_DESKTOP: &str = "restartCodexDesktop";
-pub(crate) const DESKTOP_CLIENT_NAME: &str = "codex_desktop";
+pub(crate) const DESKTOP_CLIENT_NAME: &str = "Codex Desktop";
 pub(crate) const DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH: &str =
     "runtime/desktop-app-server-runtime.json";
 

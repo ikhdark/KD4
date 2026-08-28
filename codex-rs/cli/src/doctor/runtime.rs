@@ -273,7 +273,7 @@ pub(super) async fn desktop_runtime_chain_check(
         .remediation("Run just publish-local-codex-final, then restart Codex Desktop.");
     }
 
-    let processes = match desktop_process_probe().await {
+    let processes = match desktop_process_probe(&target_path).await {
         Ok(processes) => processes,
         Err(err) => {
             details.push(format!("desktop app-server probe: <unavailable: {err}>"));
@@ -686,7 +686,11 @@ fn push_desktop_runtime_receipt_details(
     details.push(format!("receipt build built: {}", receipt.build_built));
 }
 
-async fn desktop_process_probe() -> Result<Vec<self::DesktopProcessEvidence>, String> {
+const MAX_DESKTOP_PROCESS_EVIDENCE: usize = 20;
+
+async fn desktop_process_probe(
+    target_path: &Path,
+) -> Result<Vec<self::DesktopProcessEvidence>, String> {
     let mut command = tokio::process::Command::new("powershell");
     command
         .args([
@@ -695,7 +699,6 @@ async fn desktop_process_probe() -> Result<Vec<self::DesktopProcessEvidence>, St
             r#"
 Get-CimInstance Win32_Process -Filter "Name='codex.exe'" -OperationTimeoutSec 2 -ErrorAction Stop |
     Where-Object { $_.ProcessId -ne [uint32]$env:CODEX_DOCTOR_CURRENT_PID } |
-    Select-Object -First 20 |
     ForEach-Object {
         [pscustomobject]@{
             pid = [uint32]$_.ProcessId
@@ -711,12 +714,35 @@ Get-CimInstance Win32_Process -Filter "Name='codex.exe'" -OperationTimeoutSec 2 
         return Err(format!("PowerShell exited with {}", output.status));
     }
 
-    String::from_utf8_lossy(&output.stdout)
+    let processes = String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| serde_json::from_str(line).map_err(|err| err.to_string()))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(prioritize_desktop_processes(processes, target_path))
+}
+
+fn prioritize_desktop_processes(
+    mut processes: Vec<DesktopProcessEvidence>,
+    target_path: &Path,
+) -> Vec<DesktopProcessEvidence> {
+    processes.sort_by_key(|process| {
+        std::cmp::Reverse((
+            process.is_app_server
+                && process
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| same_path(path, target_path)),
+            process.is_app_server,
+            process
+                .path
+                .as_deref()
+                .is_some_and(|path| same_path(path, target_path)),
+        ))
+    });
+    processes.truncate(MAX_DESKTOP_PROCESS_EVIDENCE);
+    processes
 }
 
 fn matching_desktop_app_servers<'a>(
@@ -893,6 +919,33 @@ mod tests {
 
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].pid, 13);
+    }
+
+    #[test]
+    fn desktop_process_evidence_retains_target_app_server_past_display_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("codex.exe");
+        let mut processes = (1..=MAX_DESKTOP_PROCESS_EVIDENCE)
+            .map(|pid| DesktopProcessEvidence {
+                pid: pid as u32,
+                path: Some(temp.path().join(format!("other-{pid}.exe"))),
+                is_app_server: false,
+            })
+            .collect::<Vec<_>>();
+        processes.push(DesktopProcessEvidence {
+            pid: 42,
+            path: Some(target.clone()),
+            is_app_server: true,
+        });
+
+        let prioritized = prioritize_desktop_processes(processes, &target);
+
+        assert_eq!(prioritized.len(), MAX_DESKTOP_PROCESS_EVIDENCE);
+        assert_eq!(prioritized[0].pid, 42);
+        assert_eq!(
+            matching_desktop_app_servers(&prioritized, &target, 99)[0].pid,
+            42
+        );
     }
 
     #[test]
