@@ -560,18 +560,13 @@ await tools.request_permissions({
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_terminal_failure_stops_before_another_model_request() -> Result<()> {
+async fn code_mode_failure_returns_to_model_for_repair() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = CodeModeElicitationHarness::start(
         r#"throw new Error("terminal failure marker");"#,
         PermissionProfile::Disabled,
-        |config| {
-            config
-                .features
-                .enable(Feature::TaskCompletionReviewer)
-                .expect("enable completion reviewer to prove terminal failure bypasses it");
-        },
+        |_| {},
     )
     .await?;
 
@@ -599,44 +594,22 @@ async fn code_mode_terminal_failure_stops_before_another_model_request() -> Resu
         }
     })
     .await
-    .expect("timed out waiting for terminal failure completion");
+    .expect("timed out waiting for failure recovery completion");
 
-    assert_eq!(
-        errors.len(),
-        1,
-        "terminal failure must emit one typed error"
-    );
-    let error_message = errors[0].message.as_str();
-    assert!(
-        !error_message.is_empty(),
-        "terminal failure must surface a nonempty error"
-    );
-    assert_eq!(
-        completed.error.as_ref().map(|error| error.message.as_str()),
-        Some(error_message),
-        "the terminal receipt must preserve the emitted typed error"
-    );
-    let completion = completed
-        .completion
-        .expect("terminal failure must carry semantic completion status");
-    assert_eq!(completion.status, TaskCompletionStatus::Partial);
-    assert!(
-        completion
-            .reasons
-            .iter()
-            .any(|reason| reason == error_message)
-    );
+    assert!(errors.is_empty(), "recoverable failure emitted {errors:?}");
+    assert!(completed.error.is_none());
+    assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
 
     let timing = completed
         .timing
-        .expect("terminal failure must carry the closed timing profile");
+        .expect("recovered failure must carry the closed timing profile");
     assert!(timing.profile_valid);
     assert!(timing.classification_complete);
     assert_eq!(timing.exclusive.unclassified_ns, 0);
     assert_eq!(timing.terminalization.unclassified_ns, 0);
-    assert_eq!(timing.counters.model_request_count, 1);
-    assert_eq!(timing.counters.logical_generation_count, 1);
-    assert_eq!(timing.counters.attempts_by_kind.primary, 1);
+    assert_eq!(timing.counters.model_request_count, 2);
+    assert_eq!(timing.counters.logical_generation_count, 2);
+    assert_eq!(timing.counters.attempts_by_kind.primary, 2);
     assert_eq!(timing.counters.attempts_by_kind.retry, 0);
     assert_eq!(timing.counters.attempts_by_kind.fallback, 0);
     assert_eq!(timing.counters.model_retry_count, 0);
@@ -649,7 +622,7 @@ async fn code_mode_terminal_failure_stops_before_another_model_request() -> Resu
     assert_eq!(call.source, TurnTimingToolCallSource::Direct);
     assert_eq!(call.outcome.as_deref(), Some("failure"));
     assert!(call.output_model_visible_at_ms.is_some());
-    assert!(call.model_resumed_at_ms.is_none());
+    assert!(call.model_resumed_at_ms.is_some());
 
     let closure = &timing.tool_closure;
     assert_eq!(closure.accepted_count, 1);
@@ -666,24 +639,23 @@ async fn code_mode_terminal_failure_stops_before_another_model_request() -> Resu
     assert!(closure.unresolved_calls.is_empty());
     assert!(closure.orphan_calls.is_empty());
     assert!(closure.complete);
-    assert!(harness.follow_up.requests().is_empty());
+    let follow_up = harness.follow_up.single_request().body_json().to_string();
+    assert!(
+        follow_up.contains("terminal failure marker"),
+        "the repair request must contain the failed exec result: {follow_up}"
+    );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_nested_required_nonzero_stops_before_another_model_request() -> Result<()> {
+async fn code_mode_nested_nonzero_returns_to_model_for_repair() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = CodeModeElicitationHarness::start(
         r#"await tools.exec_command({ cmd: "exit 7" });"#,
         PermissionProfile::Disabled,
-        |config| {
-            config
-                .features
-                .enable(Feature::TaskCompletionReviewer)
-                .expect("enable completion reviewer to prove nested failure bypasses it");
-        },
+        |_| {},
     )
     .await?;
 
@@ -711,40 +683,22 @@ async fn code_mode_nested_required_nonzero_stops_before_another_model_request() 
         }
     })
     .await
-    .expect("timed out waiting for nested required failure completion");
+    .expect("timed out waiting for nested failure recovery completion");
 
-    assert_eq!(
-        errors.len(),
-        1,
-        "nested required failure must emit one typed error"
-    );
-    let error_message = errors[0].message.as_str();
-    assert!(!error_message.is_empty());
-    assert_eq!(
-        completed.error.as_ref().map(|error| error.message.as_str()),
-        Some(error_message)
-    );
-    let completion = completed
-        .completion
-        .expect("nested required failure must carry semantic completion status");
-    assert_eq!(completion.status, TaskCompletionStatus::Partial);
-    assert!(
-        completion
-            .reasons
-            .iter()
-            .any(|reason| reason == error_message)
-    );
+    assert!(errors.is_empty(), "recoverable failure emitted {errors:?}");
+    assert!(completed.error.is_none());
+    assert_eq!(completed.last_agent_message.as_deref(), Some("done"));
 
     let timing = completed
         .timing
-        .expect("nested required failure must carry the closed timing profile");
+        .expect("recovered nested failure must carry the closed timing profile");
     assert!(timing.profile_valid);
     assert!(timing.classification_complete);
     assert_eq!(timing.exclusive.unclassified_ns, 0);
     assert_eq!(timing.terminalization.unclassified_ns, 0);
-    assert_eq!(timing.counters.model_request_count, 1);
-    assert_eq!(timing.counters.logical_generation_count, 1);
-    assert_eq!(timing.counters.attempts_by_kind.primary, 1);
+    assert_eq!(timing.counters.model_request_count, 2);
+    assert_eq!(timing.counters.logical_generation_count, 2);
+    assert_eq!(timing.counters.attempts_by_kind.primary, 2);
     assert_eq!(timing.counters.attempts_by_kind.retry, 0);
     assert_eq!(timing.counters.attempts_by_kind.fallback, 0);
     assert_eq!(timing.counters.model_retry_count, 0);
@@ -773,7 +727,7 @@ async fn code_mode_nested_required_nonzero_stops_before_another_model_request() 
     );
     assert_eq!(direct.sampling_generation_id, nested.sampling_generation_id);
     assert!(direct.output_model_visible_at_ms.is_some());
-    assert!(direct.model_resumed_at_ms.is_none());
+    assert!(direct.model_resumed_at_ms.is_some());
     assert!(nested.model_resumed_at_ms.is_none());
 
     let closure = &timing.tool_closure;
@@ -791,7 +745,11 @@ async fn code_mode_nested_required_nonzero_stops_before_another_model_request() 
     assert!(closure.unresolved_calls.is_empty());
     assert!(closure.orphan_calls.is_empty());
     assert!(closure.complete);
-    assert!(harness.follow_up.requests().is_empty());
+    let follow_up = harness.follow_up.single_request().body_json().to_string();
+    assert!(
+        follow_up.contains("exit code 7") || follow_up.contains("exit 7"),
+        "the repair request must contain the nested command failure: {follow_up}"
+    );
 
     Ok(())
 }

@@ -11,7 +11,6 @@ enum AbLatencyMetric {
     SamplingToCall,
     PostToolHandoff,
     ParallelGateWait,
-    WorkspaceEvidence,
     ProjectionPersistence,
     Terminalization,
 }
@@ -37,13 +36,16 @@ impl AbLatencyMetric {
         Self::Preparation,
         Self::PreFirstOutput,
     ];
-    const REPLAY: [Self; 8] = [
+    // Workspace-evidence timing is intentionally excluded: the baseline's
+    // terminal failure has no repair operation to time, while the candidate's
+    // successful follow-up does. The raw evidence counters and exact artifact
+    // contract remain part of the replay sample.
+    const REPLAY: [Self; 7] = [
         Self::ControllableTurn,
         Self::Preparation,
         Self::SamplingToCall,
         Self::PostToolHandoff,
         Self::ParallelGateWait,
-        Self::WorkspaceEvidence,
         Self::ProjectionPersistence,
         Self::Terminalization,
     ];
@@ -56,7 +58,6 @@ impl AbLatencyMetric {
             Self::SamplingToCall => "sampling_to_call",
             Self::PostToolHandoff => "post_tool_handoff",
             Self::ParallelGateWait => "parallel_gate_wait",
-            Self::WorkspaceEvidence => "workspace_evidence",
             Self::ProjectionPersistence => "projection_persistence",
             Self::Terminalization => "terminalization",
         }
@@ -70,9 +71,6 @@ impl AbLatencyMetric {
             Self::SamplingToCall => sample.sampling_to_call_ns,
             Self::PostToolHandoff => sample.post_tool_handoff_ns,
             Self::ParallelGateWait => sample.parallel_gate_wait_ns,
-            Self::WorkspaceEvidence => sample
-                .workspace_evidence_before_ns
-                .saturating_add(sample.workspace_evidence_after_ns),
             Self::ProjectionPersistence => sample.persistence_union_ns,
             Self::Terminalization => sample.finalization_ns,
         }
@@ -1245,13 +1243,7 @@ fn evaluate_session_replay(
                     cluster.cluster
                 ));
             }
-            for purpose in [
-                "wait",
-                "repair",
-                "failure_diagnosis",
-                "redundant_continuation",
-                "repeated_discovery",
-            ] {
+            for purpose in ["wait", "terminal_failure", "repeated_discovery"] {
                 if a.generation_purposes
                     .get(purpose)
                     .copied()
@@ -1275,6 +1267,7 @@ fn evaluate_session_replay(
                 "repair",
                 "failure_diagnosis",
                 "redundant_continuation",
+                "terminal_failure",
                 "reviewer",
                 "proof",
                 "compaction",
@@ -1402,6 +1395,7 @@ fn replay_sample_contract_violations(
     sample: &Sample,
     violations: &mut Vec<String>,
 ) {
+    let expected_terminalized_subturns = u32::from(variant == "A");
     let closure_complete = sample.tool_closure.as_ref().is_some_and(|closure| {
         closure.complete
             && tool_closure_matches_sample(sample, closure)
@@ -1420,6 +1414,8 @@ fn replay_sample_contract_violations(
         || sample.orphan_tool_calls != 0
         || sample.incomplete_lifecycle_calls != 0
         || sample.unexpected_live_processes != 0
+        || sample.failure_terminalized_subturns != expected_terminalized_subturns
+        || sample.typed_error_count != expected_terminalized_subturns
         || !closure_complete
         || !tool_graph_matches_workload(sample, AbWorkload::SessionReplay)
     {
@@ -1440,15 +1436,32 @@ fn replay_sample_contract_violations(
                 "passed",
                 0,
                 true,
-            ),
-            (
-                "required_terminal_failure",
-                "turn_complete",
-                Some("partial"),
-                "failed",
-                1,
+                true,
                 false,
             ),
+            if variant == "B" {
+                (
+                    "recoverable_exec_failure",
+                    "turn_complete",
+                    Some("passed"),
+                    "passed",
+                    0,
+                    true,
+                    true,
+                    true,
+                )
+            } else {
+                (
+                    "recoverable_exec_failure",
+                    "error",
+                    None,
+                    "failed",
+                    1,
+                    false,
+                    false,
+                    false,
+                )
+            },
             (
                 "retained_process_abort",
                 "turn_aborted",
@@ -1456,15 +1469,29 @@ fn replay_sample_contract_violations(
                 "canceled",
                 0,
                 false,
+                true,
+                false,
             ),
         ];
         let expected_generations = if variant == "B" {
-            [4, 1, 3]
+            [4, 3, 3]
         } else {
-            [10, 4, 4]
+            [10, 1, 4]
         };
         for (
-            (subturn, (name, terminal, completion, result, errors, final_response)),
+            (
+                subturn,
+                (
+                    name,
+                    terminal,
+                    completion,
+                    result,
+                    errors,
+                    final_response,
+                    closure_complete,
+                    artifact_present,
+                ),
+            ),
             expected_generations,
         ) in sample
             .replay_subturns
@@ -1479,7 +1506,8 @@ fn replay_sample_contract_violations(
                 || subturn.application_result != result
                 || subturn.typed_error_count != errors
                 || subturn.final_response_present != final_response
-                || !subturn.closure_complete
+                || subturn.closure_complete != closure_complete
+                || subturn.follow_up_artifact_present != artifact_present
             {
                 violations.push(format!(
                     "cluster:{cluster}:pair:{pair}:{variant}:subturn_contract:{name}"
@@ -2855,7 +2883,7 @@ fn capture_ab_workload(
 
 const AB_REPLAY_ACTION_PROMPT: &str = "Inspect the exact turn-latency benchmark owner, implementation, and direct test, then perform the targeted benchmark action.";
 const AB_REPLAY_ACTION_REPLY: &str = "targeted replay action complete";
-const AB_REPLAY_FAILURE_PROMPT: &str = "Run the deterministic required terminal-failure action.";
+const AB_REPLAY_FAILURE_PROMPT: &str = "Create the deterministic follow-up text artifact after recovering from the required exec failure.";
 const AB_REPLAY_HISTORY_SEED_PREFIX: &str = "replay-stable-history-";
 const AB_REPLAY_HISTORY_SEED_REPLY: &str = "replay history recorded";
 const AB_REPLAY_ACTION_FIRST_MARKER: &str =
@@ -2865,6 +2893,9 @@ const AB_REPLAY_TEST_PATH: &str = "codex-rs/core/benches/turn_latency/tests.rs";
 const AB_REPLAY_BASELINE_MARKER: &str = "__KD4_REPLAY_STATE_BASELINE__";
 const AB_REPLAY_MUTATED_MARKER: &str = "__KD4_REPLAY_STATE_MUTATED__";
 const AB_REPLAY_VALIDATION_MARKER: &str = "__KD4_REPLAY_VALIDATION_PASSED__";
+const AB_REPLAY_FOLLOW_UP_ARTIFACT_PATH: &str = "state/follow-up.txt";
+const AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT: &str =
+    "__KD4_REPLAY_FOLLOW_UP_ARTIFACT__\n";
 const AB_REPLAY_VALIDATION_TEST_PATH: &str = "replay_validation_test.py";
 const AB_REPLAY_VALIDATION_SELECTOR: &str = "replay_validation_test.ReplayValidation.test_mutation";
 const AB_REPLAY_OWNER_PATHS: [&str; 1] = ["source_owners.toml"];
@@ -2923,16 +2954,14 @@ const AB_REPLAY_REPAIR_PATCH: &str =
     "*** Begin Patch\n*** Update File: state/repair.txt\n@@\n-baseline\n+repaired\n*** End Patch";
 const AB_REPLAY_MUTATION_PATCH: &str = "*** Begin Patch\n*** Update File: codex-rs/core/benches/turn_latency.rs\n@@\n-__KD4_REPLAY_STATE_BASELINE__\n+__KD4_REPLAY_STATE_MUTATED__\n*** End Patch";
 const AB_REPLAY_REQUIRED_FAILURE_SOURCE: &str =
-    r#"throw new Error("required replay terminal failure");"#;
+    r#"throw new Error("required replay exec failure");"#;
 const AB_REPLAY_FAILURE_DIAGNOSIS_SOURCE: &str = r#"
 await Promise.all([
-  tools.update_plan({ plan: [{ step: "diagnose required terminal failure", status: "in_progress" }] }),
-  tools.update_plan({ plan: [{ step: "wait after required terminal failure", status: "pending" }] }),
+  tools.update_plan({ plan: [{ step: "diagnose required exec failure", status: "in_progress" }] }),
+  tools.update_plan({ plan: [{ step: "create the requested artifact", status: "pending" }] }),
 ]);
 "#;
-const AB_REPLAY_FAILURE_REPAIR_SOURCE: &str = r#"
-await tools.update_plan({ plan: [{ step: "attempt repair after required terminal failure", status: "in_progress" }] });
-"#;
+const AB_REPLAY_FAILURE_REPLY: &str = "follow-up artifact created after exec recovery";
 const AB_REPLAY_RETAINED_WAIT_SOURCE: &str = r#"
 await tools.update_plan({ plan: [{ step: "avoidable retained-process wait", status: "in_progress" }] });
 "#;
@@ -3098,6 +3127,33 @@ fn replay_direct_exec_command_events(
             8,
         ),
     ]
+}
+
+fn replay_code_mode_exec_command_events(
+    response_id: &str,
+    call_suffix: &str,
+    fixture_program: &Path,
+    fixture_root: &Path,
+    mode: &str,
+    paths: &[&str],
+    input_tokens: u64,
+) -> Vec<serde_json::Value> {
+    let mut child_args = vec!["ab-replay-command".to_string(), mode.to_string()];
+    child_args.extend(paths.iter().map(|path| (*path).to_string()));
+    let arguments = serde_json::json!({
+        "kind": "argv",
+        "program": fixture_program,
+        "args": child_args,
+        "workdir": fixture_root,
+        "yield_time_ms": 10_000,
+        "tty": false,
+    });
+    let arguments = serde_json::to_string(&arguments)
+        .unwrap_or_else(|error| panic!("serialize replay nested exec_command arguments: {error}"));
+    let source = format!(
+        "const result = await tools.exec_command({arguments});\ntext(result.output);"
+    );
+    replay_exec_events(response_id, call_suffix, &source, input_tokens)
 }
 
 fn replay_direct_validation_events(response_id: &str, input_tokens: u64) -> Vec<serde_json::Value> {
@@ -3389,24 +3445,41 @@ impl wiremock::Respond for ReplayActionResponder {
             ),
             (
                 ReplayActionResponseRoute::Failure {
+                    action_first: true,
+                    ..
+                },
+                1,
+            )
+            | (
+                ReplayActionResponseRoute::Failure {
                     action_first: false,
                     ..
                 },
                 2,
-            ) => replay_exec_events(
+            ) => replay_code_mode_exec_command_events(
                 &response_id,
-                "failure-repair",
-                AB_REPLAY_FAILURE_REPAIR_SOURCE,
+                "failure-artifact-repair",
+                &self.fixture_program,
+                &self.fixture_root,
+                "artifact",
+                &[AB_REPLAY_FOLLOW_UP_ARTIFACT_PATH],
                 1_792,
             ),
             (
+                ReplayActionResponseRoute::Failure {
+                    action_first: true,
+                    ..
+                },
+                2,
+            )
+            | (
                 ReplayActionResponseRoute::Failure {
                     action_first: false,
                     ..
                 },
                 3,
             ) => vec![
-                ev_assistant_message(&response_id, "forbidden replay failure resume"),
+                ev_assistant_message(&response_id, AB_REPLAY_FAILURE_REPLY),
                 ev_completed_with_usage(&response_id, 1_792, 1_280, 8, 0),
             ],
             (ReplayActionResponseRoute::HistorySeed, _) => vec![
@@ -3432,6 +3505,51 @@ struct ReplayActionFixture {
     request_capture: HighVolumeRequestCapture,
     action_response_stage: Arc<AtomicUsize>,
     failure_response_stage: Arc<AtomicUsize>,
+}
+
+async fn submit_replay_turn(test: &TestCodex, prompt: &str) -> Result<String> {
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: prompt.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: test.session_configured.model.clone(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let event = test.codex.next_event().await?;
+            match event.msg {
+                EventMsg::TurnStarted(event) => return Ok(event.turn_id),
+                EventMsg::Error(event) => {
+                    anyhow::bail!("replay turn failed before start: {}", event.message)
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for replay turn start")?
 }
 
 fn replay_git(root: &Path, args: &[&str]) -> Result<()> {
@@ -3579,14 +3697,39 @@ impl ReplayActionFixture {
         })
     }
 
-    async fn turn(&self, prompt: &str) -> (Sample, Vec<wiremock::Request>) {
+    async fn turn(
+        &self,
+        prompt: &str,
+    ) -> (Sample, Vec<wiremock::Request>, bool, u32) {
         let requests_before = self.request_capture.request_count();
         let started = Instant::now();
-        let completion = self.test.submit_turn_and_capture_completion(prompt).await;
+        let mut turns = 0_u32;
+        let terminal = match submit_replay_turn(&self.test, prompt).await {
+            Ok(turn_id) => {
+                turns = 1;
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let event = self.test.codex.next_event().await?;
+                        match event.msg {
+                            EventMsg::TurnComplete(event) if event.turn_id == turn_id => {
+                                return Ok(EventMsg::TurnComplete(event));
+                            }
+                            EventMsg::Error(event) => return Ok(EventMsg::Error(event)),
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .context("timed out waiting for replay turn terminal event")
+                .and_then(|result| result)
+            }
+            Err(error) => Err(error),
+        };
         let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let requests = self.request_capture.requests_since(requests_before);
-        let mut sample = match completion {
-            Ok(completion) => {
+        let mut terminalized = false;
+        let mut sample = match terminal {
+            Ok(EventMsg::TurnComplete(completion)) => {
                 let mut sample = completion
                     .timing
                     .as_ref()
@@ -3641,6 +3784,28 @@ impl ReplayActionFixture {
                     .unwrap_or_default();
                 sample
             }
+            Ok(EventMsg::Error(error)) => {
+                terminalized = true;
+                let mut failure_codes = Vec::new();
+                if prompt != AB_REPLAY_FAILURE_PROMPT
+                    || !error.message.contains("required replay exec failure")
+                {
+                    failure_codes.push(format!(
+                        "replay_unexpected_terminal_error:{}",
+                        error.message
+                    ));
+                }
+                Sample {
+                    duration_ns,
+                    workload_subturns: 1,
+                    terminal_event: "error".to_string(),
+                    typed_error_count: 1,
+                    failure_terminalized_subturns: 1,
+                    failure_codes,
+                    ..Sample::default()
+                }
+            }
+            Ok(_) => unreachable!("replay terminal capture returns only completion or error"),
             Err(error) => Sample {
                 duration_ns,
                 workload_subturns: 1,
@@ -3649,8 +3814,29 @@ impl ReplayActionFixture {
                 ..Sample::default()
             },
         };
+        if terminalized {
+            turns = turns.saturating_add(1);
+            let cleanup_prompt = format!("{AB_REPLAY_HISTORY_SEED_PREFIX}terminal-cleanup");
+            match self
+                .test
+                .submit_turn_and_capture_completion(&cleanup_prompt)
+                .await
+            {
+                Ok(completion)
+                    if completion.error.is_none()
+                        && completion.last_agent_message.as_deref()
+                            == Some(AB_REPLAY_HISTORY_SEED_REPLY) => {}
+                Ok(completion) => sample.failure_codes.push(format!(
+                    "replay_terminal_cleanup_contract:error={:?}:message={:?}",
+                    completion.error, completion.last_agent_message
+                )),
+                Err(error) => sample
+                    .failure_codes
+                    .push(format!("replay_terminal_cleanup:{error}")),
+            }
+        }
         sample.failed = !sample.failure_codes.is_empty();
-        (sample, requests)
+        (sample, requests, terminalized, turns)
     }
 
     async fn action_and_failure(
@@ -3666,7 +3852,13 @@ impl ReplayActionFixture {
             self.action_response_stage.as_ref(),
             self.failure_response_stage.as_ref(),
         );
-        let (mut action, action_requests) = self.turn(AB_REPLAY_ACTION_PROMPT).await;
+        let (mut action, action_requests, action_terminalized, mut action_turns) =
+            self.turn(AB_REPLAY_ACTION_PROMPT).await;
+        if action_terminalized {
+            action
+                .failure_codes
+                .push("replay_action_unexpected_terminalization".to_string());
+        }
         let action_instruction = action_requests
             .first()
             .is_some_and(replay_request_has_action_first_instruction);
@@ -3741,27 +3933,58 @@ impl ReplayActionFixture {
             typed_error_count: action.typed_error_count,
             final_response_present: action.final_response_present,
             closure_complete: action.lifecycle_complete,
+            follow_up_artifact_present: false,
         };
 
-        let (mut failure, _) = self.turn(AB_REPLAY_FAILURE_PROMPT).await;
-        let failure_target = if action_instruction { 1 } else { 4 };
+        let (mut failure, failure_requests, failure_terminalized, failure_turns) =
+            self.turn(AB_REPLAY_FAILURE_PROMPT).await;
+        action_turns = action_turns.saturating_add(failure_turns);
+        let artifact_created = fs::read_to_string(
+            self.test
+                .cwd_path()
+                .join(AB_REPLAY_FOLLOW_UP_ARTIFACT_PATH),
+        )
+        .is_ok_and(|content| content == AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT);
+        let failure_target = if failure_terminalized { 1 } else { 3 };
         let failure_generations = failure.logical_generations;
-        if failure_generations != failure_target {
+        let observed_failure_generations = if failure_terminalized {
+            failure_requests.len().min(u32::MAX as usize) as u32
+        } else {
+            failure_generations
+        };
+        if observed_failure_generations != failure_target {
             failure
                 .failure_codes
                 .push("replay_failure_generation_count".to_string());
         }
-        failure.failure_terminalized_subturns = 1;
+        if failure_terminalized == action_instruction {
+            failure
+                .failure_codes
+                .push("replay_failure_terminalization_lane".to_string());
+        }
+        if failure_terminalized && artifact_created {
+            failure
+                .failure_codes
+                .push("replay_failure_terminalized_artifact_present".to_string());
+        } else if !failure_terminalized && !artifact_created {
+            failure
+                .failure_codes
+                .push("replay_failure_follow_up_artifact_missing".to_string());
+        }
+        failure.failed = !failure.failure_codes.is_empty();
         let failure_record = AbReplaySubturnRecord {
-            name: "required_terminal_failure".to_string(),
-            logical_generations: failure_generations,
+            name: "recoverable_exec_failure".to_string(),
+            logical_generations: observed_failure_generations,
             terminal_event: failure.terminal_event.clone(),
             completion_status: failure.completion_status.clone(),
-            application_result: if failure.typed_error_count == 1
-                && failure.completion_status.as_deref() == Some("partial")
-                && !failure.final_response_present
-            {
+            application_result: if failure_terminalized {
                 "failed"
+            } else if artifact_created
+                && failure.typed_error_count == 0
+                && failure.completion_status.as_deref() == Some("passed")
+                && failure.final_response_present
+            {
+                "passed"
             } else {
                 "partial"
             }
@@ -3769,9 +3992,54 @@ impl ReplayActionFixture {
             typed_error_count: failure.typed_error_count,
             final_response_present: failure.final_response_present,
             closure_complete: failure.lifecycle_complete,
+            follow_up_artifact_present: artifact_created,
         };
         let mut aggregate = Some(action);
-        merge_high_volume_sample(&mut aggregate, failure);
+        if failure_terminalized {
+            let Some(aggregate) = aggregate.as_mut() else {
+                unreachable!("replay action merge must retain an aggregate");
+            };
+            aggregate.logical_generations = aggregate
+                .logical_generations
+                .saturating_add(observed_failure_generations);
+            aggregate.provider_attempts = aggregate
+                .provider_attempts
+                .saturating_add(observed_failure_generations);
+            aggregate.sampling_requests = aggregate
+                .sampling_requests
+                .saturating_add(observed_failure_generations);
+            aggregate.provider_input_tokens =
+                aggregate.provider_input_tokens.saturating_add(1_536);
+            aggregate.provider_cached_input_tokens =
+                aggregate.provider_cached_input_tokens.saturating_add(1_024);
+            aggregate.provider_visible_output_tokens =
+                aggregate.provider_visible_output_tokens.saturating_add(24);
+            aggregate.provider_reasoning_tokens =
+                aggregate.provider_reasoning_tokens.saturating_add(8);
+            aggregate.provider_total_tokens =
+                aggregate.provider_total_tokens.saturating_add(1_568);
+            aggregate.token_usage_records = aggregate.token_usage_records.saturating_add(1);
+            aggregate.prompt_input_tokens = aggregate
+                .prompt_input_tokens
+                .saturating_add(
+                    failure_requests
+                        .iter()
+                        .map(high_volume_request_body_json)
+                        .map(|body| prompt_input_tokens_from_body(&body))
+                        .sum(),
+                );
+            aggregate.serialized_bytes = aggregate.serialized_bytes.saturating_add(
+                failure_requests
+                    .iter()
+                    .map(|request| request.body.len() as u64)
+                    .sum(),
+            );
+            aggregate.failure_terminalized_subturns = 1;
+            aggregate.typed_error_count = 1;
+            aggregate.failure_codes.append(&mut failure.failure_codes);
+        } else {
+            merge_high_volume_sample(&mut aggregate, failure);
+        }
         let Some(aggregate) = aggregate else {
             unreachable!("replay action/failure merge must retain an aggregate");
         };
@@ -3780,7 +4048,7 @@ impl ReplayActionFixture {
             targeted_action,
             action_record,
             failure_record,
-            2,
+            action_turns,
         )
     }
 }
@@ -4115,6 +4383,7 @@ impl ReplayRetainedAbortFixture {
             closure_complete: aggregate
                 .as_ref()
                 .is_some_and(|sample| sample.lifecycle_complete),
+            follow_up_artifact_present: false,
         };
         (aggregate.unwrap_or_default(), record, turns)
     }
@@ -4265,8 +4534,9 @@ impl SessionReplayFixture {
                 ("targeted_action".to_string(), 1),
                 ("mutation".to_string(), 1),
                 ("validation".to_string(), 1),
-                ("final_response".to_string(), 1),
-                ("terminal_failure".to_string(), 1),
+                ("final_response".to_string(), 2),
+                ("recoverable_failure".to_string(), 1),
+                ("failure_recovery".to_string(), 1),
                 ("retained_process_start".to_string(), 1),
                 ("retained_process_poll".to_string(), 2),
             ])
@@ -4278,10 +4548,7 @@ impl SessionReplayFixture {
                 ("broad_discovery".to_string(), 3),
                 ("repeated_discovery".to_string(), 2),
                 ("wait".to_string(), 1),
-                ("repair".to_string(), 1),
-                ("failure_diagnosis".to_string(), 1),
-                ("redundant_continuation".to_string(), 1),
-                ("reviewer".to_string(), 1),
+                ("terminal_failure".to_string(), 1),
             ])
         };
         let expected_generations = if targeted_action {
@@ -4515,7 +4782,7 @@ fn ab_fixture_hash(workload: AbWorkload) -> String {
             "prompt={AB_ABORT_RETAINED_PROMPT}\nprogram=current_worker\nchild=ab-retained-child\nyield_time_ms={AB_ABORT_RETAINED_YIELD_TIME_MS}\nidentity_barrier=exec_command_begin\nownership_barrier=exact_background_terminal\naction=interrupt\nusage=1024:768:24:8\nforbidden_resume={AB_ABORT_RETAINED_FORBIDDEN_RESUME_REPLY}\nterminal=turn_aborted:interrupted\npersisted_cancellation=exactly_once\ncleanup=zero_background_terminals\nlatency=correctness_only\nreset=thread_rollback"
         ),
         AbWorkload::SessionReplay => format!(
-            "profile=replay\npairs={AB_REPLAY_PAIRS}\nwarmups=0\nsubturns=actionable_success,required_terminal_failure,retained_process_abort\ngenerations=A:{AB_REPLAY_A_GENERATIONS},B:{AB_REPLAY_B_GENERATIONS}\ncontention=3_direct:5_nested\nretained_polls=2\ncomparison=pointwise_50_percent\nbootstrap=false\nretry=false\nreset=verified_before_each_pair"
+            "profile=replay\npairs={AB_REPLAY_PAIRS}\nwarmups=0\nsubturns=actionable_success,recoverable_exec_failure,retained_process_abort\nfailure_contract=A:error_without_artifact,B:turn_complete_with_exact_artifact\nfollow_up_artifact={AB_REPLAY_FOLLOW_UP_ARTIFACT_PATH}:{AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT}\ngenerations=A:{AB_REPLAY_A_GENERATIONS},B:{AB_REPLAY_B_GENERATIONS}\ncontention=3_direct:5_nested\nretained_polls=2\ncomparison=pointwise_50_percent\nbootstrap=false\nretry=false\nreset=verified_before_each_pair"
         ),
     };
     sha256_bytes(fixture.as_bytes())

@@ -713,7 +713,7 @@ async fn call_nested_tool(
                     false,
                     0,
                     Vec::new(),
-                    Some((terminal_cause, message)),
+                    terminal_cause.map(|cause| (cause, message)),
                 );
             return Err(error);
         }

@@ -14,7 +14,7 @@ fn benchmark_cli_rejects_test_harness_only_command() {
 }
 
 fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
-    let (direct_count, nested_count) = if action_first { (10, 6) } else { (23, 20) };
+    let (direct_count, nested_count) = if action_first { (10, 6) } else { (19, 16) };
     let retained_exec_index = direct_count - 4;
     let retained_poll_one_index = direct_count - 3;
     let retained_poll_two_index = direct_count - 2;
@@ -67,8 +67,9 @@ fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
             ("targeted_action".to_string(), 1),
             ("mutation".to_string(), 1),
             ("validation".to_string(), 1),
-            ("final_response".to_string(), 1),
-            ("terminal_failure".to_string(), 1),
+            ("final_response".to_string(), 2),
+            ("recoverable_failure".to_string(), 1),
+            ("failure_recovery".to_string(), 1),
             ("retained_process_start".to_string(), 1),
             ("retained_process_poll".to_string(), 2),
         ])
@@ -78,10 +79,7 @@ fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
             ("broad_discovery".to_string(), 3),
             ("repeated_discovery".to_string(), 2),
             ("wait".to_string(), 1),
-            ("repair".to_string(), 1),
-            ("failure_diagnosis".to_string(), 1),
-            ("redundant_continuation".to_string(), 1),
-            ("reviewer".to_string(), 1),
+            ("terminal_failure".to_string(), 1),
         ])
     };
     Sample {
@@ -126,16 +124,23 @@ fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
                 typed_error_count: 0,
                 final_response_present: true,
                 closure_complete: true,
+                follow_up_artifact_present: false,
             },
             AbReplaySubturnRecord {
-                name: "required_terminal_failure".to_string(),
-                logical_generations: if action_first { 1 } else { 4 },
-                terminal_event: "turn_complete".to_string(),
-                completion_status: Some("partial".to_string()),
-                application_result: "failed".to_string(),
-                typed_error_count: 1,
-                final_response_present: false,
-                closure_complete: true,
+                name: "recoverable_exec_failure".to_string(),
+                logical_generations: if action_first { 3 } else { 1 },
+                terminal_event: if action_first {
+                    "turn_complete"
+                } else {
+                    "error"
+                }
+                .to_string(),
+                completion_status: action_first.then(|| "passed".to_string()),
+                application_result: if action_first { "passed" } else { "failed" }.to_string(),
+                typed_error_count: u32::from(!action_first),
+                final_response_present: action_first,
+                closure_complete: action_first,
+                follow_up_artifact_present: action_first,
             },
             AbReplaySubturnRecord {
                 name: "retained_process_abort".to_string(),
@@ -146,6 +151,7 @@ fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
                 typed_error_count: 0,
                 final_response_present: false,
                 closure_complete: true,
+                follow_up_artifact_present: false,
             },
         ],
         replay_targeted_action: Some(AbReplayTargetedActionEvidence {
@@ -169,6 +175,8 @@ fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
             passed: true,
         }),
         generation_purposes,
+        failure_terminalized_subturns: u32::from(!action_first),
+        typed_error_count: u32::from(!action_first),
         tool_call_graph,
         tool_closure: Some(AbToolClosureCompat {
             accepted_count: total_calls as u32,
@@ -3447,6 +3455,22 @@ fn ab_overlay_execution_profiles_are_exact() {
 #[test]
 fn ab_overlay_session_replay_enforces_every_pair_without_bootstrap() {
     let config = AbExecutionProfile::Replay.config();
+    assert_eq!(
+        AbWorkload::SessionReplay
+            .latency_metrics()
+            .iter()
+            .map(|metric| metric.name())
+            .collect::<Vec<_>>(),
+        vec![
+            "controllable_turn",
+            "request_preparation",
+            "sampling_to_call",
+            "post_tool_handoff",
+            "parallel_gate_wait",
+            "projection_persistence",
+            "terminalization",
+        ]
+    );
     let clusters = vec![valid_session_replay_cluster()];
     let verdict = evaluate_ab_workload_with_config(
         &clusters,
@@ -3528,6 +3552,36 @@ fn ab_overlay_session_replay_requires_retained_cleanup_and_no_avoidable_resume()
 }
 
 #[test]
+fn ab_overlay_session_replay_requires_a_terminal_defect_and_b_artifact_recovery() {
+    let mut a = valid_session_replay_sample(false, 100);
+    let mut violations = Vec::new();
+    replay_sample_contract_violations(1, 0, "A", &a, &mut violations);
+    assert!(violations.is_empty(), "{violations:#?}");
+    assert_eq!(a.failure_terminalized_subturns, 1);
+    assert_eq!(a.replay_subturns[1].terminal_event, "error");
+    assert!(!a.replay_subturns[1].follow_up_artifact_present);
+
+    a.replay_subturns[1].follow_up_artifact_present = true;
+    violations.clear();
+    replay_sample_contract_violations(1, 0, "A", &a, &mut violations);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("recoverable_exec_failure"))
+    );
+
+    let mut b = valid_session_replay_sample(true, 50);
+    b.replay_subturns[1].follow_up_artifact_present = false;
+    violations.clear();
+    replay_sample_contract_violations(1, 0, "B", &b, &mut violations);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("recoverable_exec_failure"))
+    );
+}
+
+#[test]
 fn ab_overlay_session_replay_rejects_incomplete_or_over_limit_pairs() {
     let config = AbExecutionProfile::Replay.config();
     let mut clusters = vec![valid_session_replay_cluster()];
@@ -3598,6 +3652,16 @@ fn ab_overlay_session_replay_stages_ignore_projected_output_count() {
     let failure_stages =
         failure_routes.map(|route| replay_response_stage(route, &action_stage, &failure_stage));
     assert_eq!(failure_stages, [0, 1, 2, 3]);
+
+    reset_replay_response_stages(&action_stage, &failure_stage);
+    let candidate_failure_routes =
+        [0, 1, 1].map(|output_count| ReplayActionResponseRoute::Failure {
+            action_first: true,
+            output_count,
+        });
+    let candidate_failure_stages = candidate_failure_routes
+        .map(|route| replay_response_stage(route, &action_stage, &failure_stage));
+    assert_eq!(candidate_failure_stages, [0, 1, 2]);
 }
 
 #[test]
@@ -3650,6 +3714,22 @@ fn ab_overlay_session_replay_routes_custom_tool_output_to_follow_up() {
         Some(1)
     );
 
+    let artifact_events = replay_code_mode_exec_command_events(
+        "artifact-response",
+        "artifact-repair",
+        Path::new("benchmark-worker"),
+        Path::new("benchmark-workspace"),
+        "artifact",
+        &[AB_REPLAY_FOLLOW_UP_ARTIFACT_PATH],
+        1_792,
+    );
+    let artifact_source = artifact_events[1]["item"]["input"]
+        .as_str()
+        .expect("artifact repair must be a Code Mode exec source");
+    assert!(artifact_source.contains("tools.exec_command"));
+    assert!(artifact_source.contains(AB_REPLAY_FOLLOW_UP_ARTIFACT_PATH));
+    assert!(artifact_source.contains("ab-replay-command"));
+
     let initial = serde_json::json!({
         "input": [{
             "role": "user",
@@ -3693,6 +3773,7 @@ fn ab_overlay_session_replay_routes_custom_tool_output_to_follow_up() {
 
     let sample = valid_session_replay_sample(true, 50);
     assert_eq!(sample.replay_subturns[0].logical_generations, 4);
+    assert_eq!(sample.replay_subturns[1].logical_generations, 3);
     assert_eq!(
         sample.replay_subturns[0].completion_status.as_deref(),
         Some("passed")
@@ -4705,7 +4786,7 @@ fn ab_overlay_report_shards_and_payload_hash_are_stable() {
 #[test]
 fn ab_overlay_replay_session_audit_provenance_is_exact_and_profile_scoped() {
     let expected = replay_session_audit_evidence();
-    assert_eq!(AB_REPORT_SCHEMA_VERSION, 15);
+    assert_eq!(AB_REPORT_SCHEMA_VERSION, 16);
     assert_eq!(
         expected.schema_version,
         AB_REPLAY_SESSION_AUDIT_EVIDENCE_VERSION

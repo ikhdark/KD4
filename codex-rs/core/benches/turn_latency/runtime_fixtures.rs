@@ -2057,6 +2057,12 @@ fn run_ab_replay_command(mode: &str, paths: &[PathBuf]) -> Result<()> {
             );
             println!("{AB_REPLAY_MUTATED_MARKER}");
         }
+        "artifact" => {
+            anyhow::ensure!(paths.len() == 1, "replay artifact requires the exact target");
+            fs::write(&paths[0], AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT)
+                .with_context(|| format!("write replay artifact {}", paths[0].display()))?;
+            println!("{AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT}");
+        }
         other => anyhow::bail!("unknown replay child command `{other}`"),
     }
     Ok(())
@@ -3114,16 +3120,17 @@ fn tool_graph_matches_workload(sample: &Sample, workload: AbWorkload) -> bool {
                 .as_ref()
                 .is_some_and(|evidence| evidence.targeted);
             let (expected_direct, expected_nested, expected_total) =
-                if targeted { (10, 6, 16) } else { (23, 20, 43) };
+                if targeted { (10, 6, 16) } else { (19, 16, 35) };
+            let subturn_closure_matches = sample.replay_subturns.len() == 3
+                && sample.replay_subturns[0].closure_complete
+                && sample.replay_subturns[2].closure_complete
+                && sample.replay_subturns[1].closure_complete == targeted;
             if sample.workload_subturns != 3
                 || sample.replay_subturns.len() != 3
                 || sample.direct_tool_calls != expected_direct
                 || sample.nested_tool_calls != expected_nested
                 || sample.tool_call_graph.len() != expected_total
-                || !sample
-                    .replay_subturns
-                    .iter()
-                    .all(|subturn| subturn.closure_complete)
+                || !subturn_closure_matches
             {
                 return false;
             }

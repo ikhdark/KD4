@@ -104,9 +104,9 @@ pub(crate) fn required_tool_terminal_cause(
         Some("recoverable_cancellation") => {
             Some(RequiredToolTerminalCause::RecoverableCancellation)
         }
-        Some("failure") => Some(RequiredToolTerminalCause::Failure),
+        Some("failure") => None,
         _ => match outcome_context.outcome {
-            ToolOutputOutcome::Failure => Some(RequiredToolTerminalCause::Failure),
+            ToolOutputOutcome::Failure => None,
             ToolOutputOutcome::TimedOut => Some(RequiredToolTerminalCause::TimedOut),
             ToolOutputOutcome::Skipped
                 if outcome_context.skip_disposition
@@ -123,12 +123,11 @@ pub(crate) fn required_tool_terminal_cause(
 
 pub(crate) fn required_tool_error_terminal_cause(
     error: &FunctionCallError,
-) -> RequiredToolTerminalCause {
+) -> Option<RequiredToolTerminalCause> {
     match error {
-        FunctionCallError::DeniedToModel(_) => RequiredToolTerminalCause::Blocked,
-        FunctionCallError::RespondToModel(_) | FunctionCallError::Fatal(_) => {
-            RequiredToolTerminalCause::Failure
-        }
+        FunctionCallError::DeniedToModel(_) => Some(RequiredToolTerminalCause::Blocked),
+        FunctionCallError::RespondToModel(_) => None,
+        FunctionCallError::Fatal(_) => Some(RequiredToolTerminalCause::Failure),
     }
 }
 
@@ -1371,11 +1370,14 @@ impl ToolCallRuntime {
                 )
                 .await;
                 return Ok(ToolCallCompletion {
-                    required_terminal: required_tool_terminal(
-                        &call,
-                        ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
-                        None,
-                    ),
+                    required_terminal: Some(RequiredToolTerminal {
+                        call_id: call.call_id.clone(),
+                        cause: RequiredToolTerminalCause::Failure,
+                        message: format!(
+                            "required tool `{}` repeated the same failure",
+                            call.tool_name
+                        ),
+                    }),
                     response,
                 });
             }
@@ -1686,13 +1688,13 @@ impl ToolCallRuntime {
                     }
                     Ok(ToolCallCompletion {
                         response,
-                        required_terminal: Some(RequiredToolTerminal {
+                        required_terminal: terminal_cause.map(|cause| RequiredToolTerminal {
                             call_id: error_call.call_id,
-                            cause: terminal_cause,
+                            cause,
                             message: format!(
                                 "required tool `{}` {}",
                                 error_call.tool_name,
-                                match terminal_cause {
+                                match cause {
                                     RequiredToolTerminalCause::Blocked => "blocked",
                                     RequiredToolTerminalCause::Failure => "failed",
                                     RequiredToolTerminalCause::TimedOut => "timed out",
@@ -2488,7 +2490,14 @@ mod tests {
                 ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
                 None,
             ),
-            Some(RequiredToolTerminalCause::Failure),
+            None,
+        );
+        assert_eq!(
+            required_tool_terminal_cause(
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
+                Some(&serde_json::json!({ "outcome": "failure" })),
+            ),
+            None,
         );
         assert_eq!(
             required_tool_terminal_cause(
@@ -2501,13 +2510,13 @@ mod tests {
             required_tool_error_terminal_cause(&FunctionCallError::DeniedToModel(
                 "rejected by user".to_string(),
             )),
-            RequiredToolTerminalCause::Blocked,
+            Some(RequiredToolTerminalCause::Blocked),
         );
         assert_eq!(
             required_tool_error_terminal_cause(&FunctionCallError::RespondToModel(
                 "command exited nonzero".to_string(),
             )),
-            RequiredToolTerminalCause::Failure,
+            None,
         );
     }
 

@@ -609,7 +609,7 @@ impl AbWorkload {
                 latency_metrics: Vec::new(),
             },
             Self::SessionReplay => AbWorkloadShape {
-                aggregation: "three linked subturns: actionable success, required terminal failure, and retained-process abort".to_string(),
+                aggregation: "three linked subturns: actionable success, recoverable exec failure with artifact repair, and retained-process abort".to_string(),
                 subturns_per_sample: 3,
                 logical_generations_per_sample: AB_REPLAY_B_GENERATIONS,
                 direct_outer_calls_per_generation: 0,
@@ -708,6 +708,8 @@ struct AbReplaySubturnRecord {
     typed_error_count: u32,
     final_response_present: bool,
     closure_complete: bool,
+    #[serde(default)]
+    follow_up_artifact_present: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
