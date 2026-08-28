@@ -528,7 +528,6 @@ def script_audit_context_issues() -> list[str]:
     issues: list[str] = []
     required_paths = (
         REPO_ROOT / "AGENTS.md",
-        SCRIPTS_ROOT / "AGENTS.md",
         SCRIPTS_ROOT / "pyproject.toml",
         SCRIPTS_ROOT / "uv.lock",
         REPO_ROOT / "package.json",
