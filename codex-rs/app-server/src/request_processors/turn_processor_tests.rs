@@ -79,6 +79,7 @@ fn in_flight_task_coalescing_fingerprint_preserves_text_and_normalizes_identity_
     let whitespace_changed_task = params("thread-2", "fix the bug", Some(true));
 
     let first_fingerprint = normalized_task_fingerprint(&first, "C:/repo", "model=o3");
+    assert!(first_fingerprint.is_some());
     assert_eq!(
         first_fingerprint,
         normalized_task_fingerprint(&same_task, "C:/repo", "model=o3")

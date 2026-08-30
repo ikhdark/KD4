@@ -219,6 +219,12 @@ test *args:
 test-fast *args:
     $forwarded_args = @($args | Select-Object -Skip 1); if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed "target" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run @forwarded_args
 
+# Keep the raw config, resolved defaults, and reachable sampling policy in one gate.
+[windows]
+adaptive-reasoning-contract-check:
+    just test-fast -p codex-config --no-tests=fail -E 'test(reasoning_phase_efforts_distinguish_absent_empty_partial_and_full_tables) | test(empty_higher_reasoning_phase_table_preserves_lower_entries) | test(partial_higher_reasoning_phase_table_merges_per_field)'
+    just test-fast -p codex-core --no-tests=fail -E 'test(load_config_defaults_phase_tracking_to_compatibility_efforts) | test(load_config_preserves_explicit_reasoning_phase_effort_overrides) | test(load_config_preserves_all_explicit_reasoning_phase_effort_overrides) | test(reachable_changed_continuation_uses_the_lowest_supported_explicit_override) | test(reachable_changed_continuation_defaults_to_low_even_when_turn_is_high) | test(request_policy_rejects_host_terminal_completion) | test(protocol_terminal_continuation_is_marked_for_host_elision_only_when_unchanged) | test(global_effort_survives_unoverridden_decision_bearing_phases)'
+
 [windows]
 _core-test-helpers-if-needed target_dir *args:
     $forwarded_args = @($args | Select-Object -Skip 2); $text = ($forwarded_args -join " "); $has_filter = ($forwarded_args -contains "-E") -or ($forwarded_args -contains "--filter-expr") -or ($text -match "--filter-expr="); if (-not $has_filter) { just _core-test-helpers "{{ target_dir }}"; exit $LASTEXITCODE }; just _core-test-helpers-runtime "{{ target_dir }}"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; if ($text -match "(?i)rmcp|mcp|plugin|test_stdio_server") { just _core-test-helpers-mcp "{{ target_dir }}"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; if ($text -match "(?i)windows_sandbox|windows-sandbox|sandbox|codex_command_runner") { just _core-test-helpers-windows-sandbox "{{ target_dir }}"; exit $LASTEXITCODE }

@@ -136,6 +136,24 @@ impl ResponsesEventInterpreter {
         &mut self,
         payload: &str,
     ) -> Result<Vec<ResponseEvent>, ResponsesEventError> {
+        // Probe only the discriminator first. Rate-limit frames are the sole variant that
+        // needs the flattened body, so every other frame avoids that deserialization shape
+        // entirely.
+        #[derive(Deserialize)]
+        struct EventKindProbe<'a> {
+            #[serde(rename = "type", borrow, default)]
+            kind: Option<std::borrow::Cow<'a, str>>,
+        }
+
+        let probe: EventKindProbe<'_> = serde_json::from_str(payload)?;
+        if probe.kind.as_deref() == Some("codex.rate_limits") {
+            let event: RateLimitStreamEvent = serde_json::from_str(payload)?;
+            return Ok(rate_limit_snapshot_from_event(event.rate_limit)
+                .map(ResponseEvent::RateLimits)
+                .into_iter()
+                .collect());
+        }
+
         let event: ResponsesStreamEvent = serde_json::from_str(payload)?;
 
         if let Some(response_turn_state) = event.turn_state()
@@ -149,13 +167,6 @@ impl ResponsesEventInterpreter {
                 treatment_from_headers(&json_headers_to_http_headers(headers))
         {
             self.safety_buffering_treatment = updated_treatment;
-        }
-
-        if event.kind() == "codex.rate_limits" {
-            return Ok(rate_limit_snapshot_from_event(event.rate_limit)
-                .map(ResponseEvent::RateLimits)
-                .into_iter()
-                .collect());
         }
 
         let mut events = Vec::new();
@@ -264,6 +275,16 @@ pub(crate) struct ResponsesStreamEvent {
     summary_index: Option<i64>,
     content_index: Option<i64>,
     safety_buffering: Option<Value>,
+}
+
+/// Rate-limit frames only.
+///
+/// `#[serde(flatten)]` forces serde to buffer every unmatched key of the enclosing object
+/// into owned `Content` values. Keeping it on this dedicated struct means ordinary stream
+/// frames, which vastly outnumber rate-limit frames, deserialize through the direct struct
+/// visitor instead of paying that buffering per delta.
+#[derive(Deserialize, Debug)]
+pub(crate) struct RateLimitStreamEvent {
     #[serde(flatten)]
     rate_limit: RateLimitEventBody,
 }
@@ -739,7 +760,7 @@ mod tests {
 
     #[test]
     fn deserialized_rate_limit_event_supplies_snapshot_without_reparse() {
-        let event: ResponsesStreamEvent = serde_json::from_str(
+        let event: RateLimitStreamEvent = serde_json::from_str(
             r#"{"type":"codex.rate_limits","metered_limit_name":"codex-fast","rate_limits":{"primary":{"used_percent":25.0}}}"#,
         )
         .expect("rate-limit event should deserialize once");
@@ -751,6 +772,24 @@ mod tests {
         assert_eq!(
             snapshot.primary.map(|window| window.used_percent),
             Some(25.0)
+        );
+    }
+
+    #[test]
+    fn ordinary_stream_event_ignores_unmatched_fields_without_rate_limit_flattening() {
+        let mut interpreter = ResponsesEventInterpreter::new(
+            &ResponsesStreamMetadata::default(),
+            /*turn_state*/ None,
+        );
+
+        let events = interpreter
+            .process_payload(
+                r#"{"type":"response.output_text.delta","delta":"hello","obfuscation":"ignored","sequence_number":7}"#,
+            )
+            .expect("ordinary delta should ignore unmatched transport fields");
+
+        assert!(
+            matches!(events.as_slice(), [ResponseEvent::OutputTextDelta(delta)] if delta == "hello")
         );
     }
 

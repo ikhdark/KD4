@@ -821,36 +821,46 @@ impl Session {
                 let Some(active_turn) = active.as_mut() else {
                     return TerminalSchedule::NotFound;
                 };
-                let Some(coordinator) = active_turn.terminal.as_ref().cloned() else {
-                    let taskless_turn_state = (expected_turn_id.is_none()
-                        && active_turn.task.is_none())
-                    .then(|| Arc::clone(&active_turn.turn_state));
-                    drop(active);
+                match active_turn.terminal.as_ref().cloned() {
+                    Some(coordinator) => {
+                        if expected_turn_id
+                            .is_some_and(|turn_id| coordinator.turn_id() != turn_id)
+                        {
+                            return TerminalSchedule::NotFound;
+                        }
+                        let Some(permit) = coordinator.try_claim() else {
+                            return TerminalSchedule::AlreadyRunning(coordinator);
+                        };
+                        let Some(task) = active_turn.task.take() else {
+                            return TerminalSchedule::AlreadyRunning(coordinator);
+                        };
+                        coordinator
+                            .seal_tool_call_acceptance(&task.turn_context.turn_timing_state);
+                        self.terminal_interaction_pending
+                            .store(true, Ordering::Release);
+                        Ok((
+                            task,
+                            Arc::clone(&active_turn.turn_state),
+                            active_turn.reasoning_policy_recorder.clone(),
+                            permit,
+                            coordinator,
+                        ))
+                    }
+                    None => Err(
+                        (expected_turn_id.is_none() && active_turn.task.is_none())
+                            .then(|| Arc::clone(&active_turn.turn_state)),
+                    ),
+                }
+            };
+            let scheduling = match scheduling {
+                Ok(scheduling) => scheduling,
+                Err(taskless_turn_state) => {
                     if let Some(taskless_turn_state) = taskless_turn_state {
                         self.recover_cancelled_taskless_placeholder(&taskless_turn_state)
                             .await;
                     }
                     return TerminalSchedule::NotFound;
-                };
-                if expected_turn_id.is_some_and(|turn_id| coordinator.turn_id() != turn_id) {
-                    return TerminalSchedule::NotFound;
                 }
-                let Some(permit) = coordinator.try_claim() else {
-                    return TerminalSchedule::AlreadyRunning(coordinator);
-                };
-                let Some(task) = active_turn.task.take() else {
-                    return TerminalSchedule::AlreadyRunning(coordinator);
-                };
-                coordinator.seal_tool_call_acceptance(&task.turn_context.turn_timing_state);
-                self.terminal_interaction_pending
-                    .store(true, Ordering::Release);
-                (
-                    task,
-                    Arc::clone(&active_turn.turn_state),
-                    active_turn.reasoning_policy_recorder.clone(),
-                    permit,
-                    coordinator,
-                )
             };
 
             let (task, turn_state, reasoning_policy_recorder, permit, coordinator) = scheduling;
@@ -1140,16 +1150,14 @@ impl Session {
                     turn_context.multi_agent_version,
                 ),
             )
-        {
-            if let Err(err) = self
+            && let Err(err) = self
                 .record_conversation_items_durable(&turn_context, std::slice::from_ref(&marker))
                 .await
-            {
-                warn!(
-                    turn_id = %turn_context.sub_id,
-                    "failed to persist interrupted-turn marker before terminal event: {err}"
-                );
-            }
+        {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                "failed to persist interrupted-turn marker before terminal event: {err}"
+            );
         }
 
         let restart_for_pending_input = if requires_abort_cleanup {

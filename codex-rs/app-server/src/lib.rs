@@ -19,7 +19,6 @@ use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 
 use crate::analytics_utils::analytics_events_client_from_config;
@@ -192,7 +191,7 @@ enum OutboundControlEvent {
         disconnect_sender: Option<CancellationToken>,
         initialized: Arc<AtomicBool>,
         experimental_api_enabled: Arc<AtomicBool>,
-        opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
+        opted_out_notification_methods: Arc<transport::OutboundNotificationOptOuts>,
     },
     /// Remove state for a closed/disconnected connection.
     Closed { connection_id: ConnectionId },
@@ -914,8 +913,9 @@ pub async fn run_main(
                                     .await;
                                 let outbound_experimental_api_enabled =
                                     Arc::new(AtomicBool::new(false));
-                                let outbound_opted_out_notification_methods =
-                                    Arc::new(RwLock::new(HashSet::new()));
+                                let outbound_opted_out_notification_methods = Arc::new(
+                                    transport::OutboundNotificationOptOuts::new(HashSet::new()),
+                                );
                                 if outbound_control_tx
                                     .send(OutboundControlEvent::Opened {
                                         connection_id,
@@ -989,13 +989,10 @@ pub async fn run_main(
                                         let experimental_api_enabled =
                                             connection_state.session.experimental_api_enabled();
                                         let is_initialized = connection_state.session.initialized();
-                                        if let Ok(mut opted_out_notification_methods) = connection_state
+                                        if !connection_state
                                             .outbound_opted_out_notification_methods
-                                            .write()
+                                            .replace(opted_out_notification_methods_snapshot)
                                         {
-                                            *opted_out_notification_methods =
-                                                opted_out_notification_methods_snapshot;
-                                        } else {
                                             warn!(
                                                 "failed to update outbound opted-out notifications"
                                             );

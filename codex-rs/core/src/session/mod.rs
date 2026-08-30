@@ -367,8 +367,25 @@ fn digest_context_fragments(items: &[ResponseItem]) -> Vec<ContextFragmentDigest
 
 struct InitialContextBuild {
     items: Vec<ResponseItem>,
+    turn_context_items: Vec<ResponseItem>,
     world_state_snapshot: WorldStateSnapshot,
     fragment_digests: Vec<ContextFragmentDigest>,
+}
+
+/// One immutable context projection prepared for both pre-turn accounting and the eventual
+/// history commit. The planning generation is validated while this value is committed, so a
+/// stale projection can never advance history or a realized context baseline.
+pub(crate) struct PreparedContextUpdate {
+    turn_context: Arc<TurnContext>,
+    world_state: Arc<WorldState>,
+    context_items: Vec<ResponseItem>,
+    baseline: ContextBaselineCandidate,
+}
+
+impl PreparedContextUpdate {
+    pub(crate) fn context_items(&self) -> &[ResponseItem] {
+        &self.context_items
+    }
 }
 
 fn context_snapshot_matches(
@@ -1207,25 +1224,6 @@ fn push_rendered_prompt_fragment(
     }
 }
 
-fn push_prompt_fragment(
-    fragment: PromptFragment,
-    budget: &mut ModelContextBudget,
-    developer_sections: &mut Vec<String>,
-    contextual_user_sections: &mut Vec<String>,
-    separate_developer_sections: &mut Vec<String>,
-) {
-    let Some((slot, text)) = take_prompt_fragment(fragment, budget) else {
-        return;
-    };
-    push_rendered_prompt_fragment(
-        slot,
-        text,
-        developer_sections,
-        contextual_user_sections,
-        separate_developer_sections,
-    );
-}
-
 struct PreparedEventDispatch {
     terminal_source: Option<EventMsg>,
     legacy_events: Vec<EventMsg>,
@@ -1279,13 +1277,10 @@ impl StartupRolloutFacts {
                     if let Some(initial_messages) = initial_messages.as_mut() {
                         initial_messages.push(event.clone());
                     }
-                    match event {
-                        EventMsg::TokenCount(event) => {
-                            if let Some(info) = event.info.as_ref() {
-                                last_token_info = Some(info.clone());
-                            }
-                        }
-                        _ => {}
+                    if let EventMsg::TokenCount(event) = event
+                        && let Some(info) = event.info.as_ref()
+                    {
+                        last_token_info = Some(info.clone());
                     }
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
@@ -2081,7 +2076,8 @@ impl Session {
             let mut config = (*state.session_configuration.original_config_do_not_use).clone();
             config.config_layer_stack = config
                 .config_layer_stack
-                .with_user_layer_from(&next_config.config_layer_stack);
+                .with_user_layer_from(&next_config.config_layer_stack)
+                .into();
             for feature in refreshed_features {
                 let enabled = next_config.features.enabled(*feature);
                 if let Err(err) = config.features.set_enabled(*feature, enabled) {
@@ -2204,7 +2200,8 @@ impl Session {
             for (config_toml_path, user_config) in reloaded_user_configs {
                 config.config_layer_stack = config
                     .config_layer_stack
-                    .with_user_config(&config_toml_path, user_config);
+                    .with_user_config(&config_toml_path, user_config)
+                    .into();
             }
             config.tool_suggest =
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
@@ -2473,8 +2470,13 @@ impl Session {
     }
 
     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
-        // Persist the event into rollout storage; the store applies its persistence policy.
-        if persist {
+        // Reject transient events before entering the persistence stack. Live delivery remains
+        // independent and follows below.
+        if persist
+            && self
+                .live_thread()
+                .is_some_and(|live_thread| live_thread.should_persist_event(&event.msg))
+        {
             let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
             if matches!(&event.msg, EventMsg::TurnStarted(_)) {
                 // TurnStarted is an ordered lifecycle boundary, not a durability boundary. Keep
@@ -3367,6 +3369,19 @@ impl Session {
         items
     }
 
+    fn prepare_owned_conversation_items_for_history(
+        turn_id: &str,
+        mut items: Vec<ResponseItem>,
+    ) -> Vec<ResponseItem> {
+        if response_items_need_preparation(&items) {
+            prepare_response_items(&mut items);
+        }
+        for item in &mut items {
+            item.set_turn_id_if_missing(turn_id);
+        }
+        Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned()
+    }
+
     fn assign_missing_response_item_id(item: &mut ResponseItem) {
         if item.id().is_some_and(|id| !id.is_empty()) {
             return;
@@ -3479,12 +3494,29 @@ impl Session {
         items: &[ResponseItem],
         wait_for_durability: bool,
     ) -> std::io::Result<()> {
-        // Build the retry key before assigning generated item IDs so the same
-        // logical commit remains stable across repeated calls.
-        let commit_key = durable_history_commit_key(&turn_context.sub_id, items)?;
-        let items = self
-            .prepare_conversation_items_for_history(turn_context, items)
-            .into_owned();
+        // Build the retry key before assigning generated item IDs so the same logical commit
+        // remains stable across repeated calls. Keep ordinary tool results inline to avoid adding
+        // a scheduler handoff to the tool-continuation path, while moving large or structured
+        // batches to the blocking pool. Either path returns the one owned batch that persistence
+        // and live history will share.
+        let turn_id = turn_context.sub_id.clone();
+        let (commit_key, items) = if conversation_items_need_blocking_history_identity(items) {
+            let raw_items = items.to_vec();
+            tokio::task::spawn_blocking(move || {
+                let commit_key = durable_history_commit_key(&turn_id, &raw_items)?;
+                let items = Self::prepare_owned_conversation_items_for_history(&turn_id, raw_items);
+                Ok::<_, std::io::Error>((commit_key, items))
+            })
+            .await
+            .map_err(|err| {
+                std::io::Error::other(format!("history identity task failed: {err}"))
+            })??
+        } else {
+            let commit_key = durable_history_commit_key(&turn_id, items)?;
+            let items =
+                Self::prepare_owned_conversation_items_for_history(&turn_id, items.to_vec());
+            (commit_key, items)
+        };
         let persistence_timing_guard = turn_context
             .turn_timing_state
             .begin_local_phase(TurnLocalPhase::Persistence);
@@ -3953,8 +3985,28 @@ impl Session {
         self.set_multi_agent_version_if_unset(selected)
     }
 
+    /// Records that a consumer asked for `RawResponseItem` events on this thread.
+    ///
+    /// The flag is monotonic: once any subscriber opts in, the producer keeps emitting raw
+    /// events for the rest of the thread's life, matching the app-server's per-thread
+    /// `experimental_raw_events` contract.
+    pub(crate) fn request_raw_response_items(&self) {
+        self.raw_response_items_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn raw_response_items_requested(&self) -> bool {
+        self.raw_response_items_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
+        // Raw events clone every recorded item, including full tool outputs, and occupy a
+        // bounded event-channel slot. Skip construction entirely when no consumer opted in.
+        if !self.raw_response_items_requested() {
+            return;
+        }
         for item in items {
             let msg = EventMsg::RawResponseItem(RawResponseItemEvent { item: item.clone() });
             self.services
@@ -4070,23 +4122,32 @@ impl Session {
         fragments
     }
 
+    #[cfg(test)]
     async fn build_turn_context_contribution_items(
         &self,
         turn_context: &TurnContext,
         estimate: bool,
     ) -> Vec<ResponseItem> {
+        let mut extension_context_budget = ModelContextBudget::default();
+        let rendered_fragments = self
+            .poll_turn_context_contributors(turn_context, estimate)
+            .await
+            .into_iter()
+            .filter_map(|fragment| take_prompt_fragment(fragment, &mut extension_context_budget))
+            .collect();
+        Self::build_context_contribution_items_from_rendered_fragments(rendered_fragments)
+    }
+
+    fn build_context_contribution_items_from_rendered_fragments(
+        rendered_fragments: Vec<(PromptSlot, String)>,
+    ) -> Vec<ResponseItem> {
         let mut developer_sections = Vec::new();
         let mut contextual_user_sections = Vec::new();
         let mut separate_developer_sections = Vec::new();
-        let mut extension_context_budget = ModelContextBudget::default();
-
-        for fragment in self
-            .poll_turn_context_contributors(turn_context, estimate)
-            .await
-        {
-            push_prompt_fragment(
-                fragment,
-                &mut extension_context_budget,
+        for (slot, text) in rendered_fragments {
+            push_rendered_prompt_fragment(
+                slot,
+                text,
                 &mut developer_sections,
                 &mut contextual_user_sections,
                 &mut separate_developer_sections,
@@ -4306,6 +4367,7 @@ impl Session {
                 &mut stable_separate_developer_sections,
             );
         }
+        let mut rendered_turn_context_fragments = Vec::new();
         for fragment in self
             .poll_turn_context_contributors(turn_context, estimate)
             .await
@@ -4314,6 +4376,7 @@ impl Session {
             else {
                 continue;
             };
+            rendered_turn_context_fragments.push((slot, text.clone()));
             push_rendered_prompt_fragment(
                 slot,
                 text.clone(),
@@ -4426,8 +4489,12 @@ impl Session {
         ) {
             stable_items.push(message);
         }
+        let turn_context_items = Self::build_context_contribution_items_from_rendered_fragments(
+            rendered_turn_context_fragments,
+        );
         InitialContextBuild {
             items,
+            turn_context_items,
             world_state_snapshot: delivered_world_state_snapshot,
             fragment_digests: digest_context_fragments(&stable_items),
         }
@@ -4477,26 +4544,17 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) async fn persist_sampling_boundary_ordered(
-        &self,
-        boundary: codex_protocol::protocol::SamplingBoundaryItem,
-    ) -> std::io::Result<()> {
-        self.persist_rollout_items_ordered(&[RolloutItem::SamplingBoundary(boundary)])
-            .await
-    }
-
     pub(crate) async fn bind_context_baseline_candidate(
         &self,
         sampling_request_id: &str,
         physical_attempt_id: &str,
     ) -> bool {
         let mut state = self.state.lock().await;
-        let Some(mut candidate) = state.pending_context_baseline() else {
+        let Some(candidate) = state.pending_context_baseline_mut() else {
             return false;
         };
         candidate.bound_sampling_request_id = Some(sampling_request_id.to_string());
         candidate.bound_physical_attempt_id = Some(physical_attempt_id.to_string());
-        state.stage_context_baseline(candidate);
         true
     }
 
@@ -4505,29 +4563,33 @@ impl Session {
         sampling_request_id: &str,
         physical_attempt_id: &str,
     ) -> std::io::Result<bool> {
-        let candidate = {
+        let (mut authoritative, world_state_snapshot, world_state_item, fragment_digests) = {
             let state = self.state.lock().await;
-            state.pending_context_baseline()
+            let Some(candidate) = state.pending_context_baseline_ref() else {
+                return Ok(false);
+            };
+            if candidate.bound_sampling_request_id.as_deref() != Some(sampling_request_id)
+                || candidate.bound_physical_attempt_id.as_deref() != Some(physical_attempt_id)
+            {
+                return Ok(false);
+            }
+            (
+                candidate.turn_context_item.clone(),
+                candidate.world_state_snapshot.clone(),
+                candidate.world_state_item.clone(),
+                candidate.fragment_digests.clone(),
+            )
         };
-        let Some(candidate) = candidate else {
-            return Ok(false);
-        };
-        if candidate.bound_sampling_request_id.as_deref() != Some(sampling_request_id)
-            || candidate.bound_physical_attempt_id.as_deref() != Some(physical_attempt_id)
-        {
-            return Ok(false);
-        }
 
-        let mut authoritative = candidate.turn_context_item.clone();
         authoritative.context_provenance = Some(TurnContextProvenance {
             accepted_attempt: AcceptedAttemptProvenance {
                 sampling_request_id: sampling_request_id.to_string(),
                 physical_attempt_id: physical_attempt_id.to_string(),
             },
-            fragment_digests: candidate.fragment_digests.clone(),
+            fragment_digests,
         });
         let mut rollout_items = Vec::with_capacity(2);
-        if let Some(world_state_item) = candidate.world_state_item.clone() {
+        if let Some(world_state_item) = world_state_item {
             rollout_items.push(RolloutItem::WorldState(world_state_item));
         }
         rollout_items.push(RolloutItem::TurnContext(authoritative.clone()));
@@ -4538,12 +4600,10 @@ impl Session {
         self.persist_rollout_items_ordered(&rollout_items).await?;
 
         let mut state = self.state.lock().await;
-        state
-            .history
-            .set_world_state_baseline(candidate.world_state_snapshot);
+        state.history.set_world_state_baseline(world_state_snapshot);
         state.set_reference_context_item(Some(authoritative));
         if state
-            .pending_context_baseline()
+            .pending_context_baseline_ref()
             .is_some_and(|live_candidate| {
                 live_candidate.bound_sampling_request_id.as_deref() == Some(sampling_request_id)
                     && live_candidate.bound_physical_attempt_id.as_deref()
@@ -4856,13 +4916,17 @@ impl Session {
         state.reference_context_item()
     }
 
-    /// Builds the model-visible context update for pre-turn accounting without advancing any
-    /// persisted or in-memory baselines.
-    pub(crate) async fn estimate_context_update_items(
+    pub(crate) async fn has_reference_context_item(&self) -> bool {
+        let state = self.state.lock().await;
+        state.has_reference_context_item()
+    }
+
+    async fn prepare_context_update_inner(
         &self,
         step_context: &StepContext,
-    ) -> Vec<ResponseItem> {
-        let turn_context = step_context.turn.as_ref();
+        estimate: bool,
+    ) -> PreparedContextUpdate {
+        let turn_context = Arc::clone(&step_context.turn);
         let (reference_context_item, pending_context_baseline) = {
             let state = self.state.lock().await;
             (
@@ -4881,129 +4945,24 @@ impl Session {
         let turn_context_item = turn_context.to_turn_context_item();
         let turn_context_changed =
             !context_snapshot_matches(represented_context_item, &turn_context_item);
-        let world_state = self.estimate_world_state_for_step(step_context).await;
-        let complete_context = self
-            .build_initial_context_with_world_state_and_mcp(turn_context, &world_state, true)
-            .await;
-        let represented_fragment_digests = pending_context_baseline
-            .as_ref()
-            .map(|candidate| candidate.fragment_digests.as_slice())
-            .or_else(|| {
-                reference_context_item
-                    .as_ref()
-                    .and_then(|item| item.context_provenance.as_ref())
-                    .map(|provenance| provenance.fragment_digests.as_slice())
-            });
-
-        if represented_context_item.is_none()
-            || represented_fragment_digests.is_some_and(|represented| {
-                represented != complete_context.fragment_digests.as_slice()
-            })
-        {
-            return complete_context.items;
-        }
-
-        let mut context_items = self
-            .build_settings_update_items(represented_context_item, turn_context)
-            .await;
-        let mut history = self.clone_history().await;
-        if let Some(candidate) = pending_context_baseline.as_ref() {
-            history.set_world_state_baseline(candidate.world_state_snapshot.clone());
-        }
-        let (world_state_fragments, _) = history.update_world_state(&world_state);
-        context_items.extend(crate::context_manager::updates::merge_contextual_fragments(
-            world_state_fragments,
-        ));
-        if turn_context_changed {
-            context_items.extend(
-                self.build_turn_context_contribution_items(turn_context, true)
-                    .await,
-            );
-        }
-        context_items
-    }
-
-    /// Persist the latest turn context snapshot for the first real user turn and for
-    /// steady-state turns that emit model-visible context updates.
-    ///
-    /// When the reference snapshot is missing, this injects full initial context. Otherwise, it
-    /// emits only context diffs.
-    ///
-    /// If full context is injected and a model switch occurred, this prepends the compact
-    /// `<model_switch>` compatibility note while preserving the session base instructions.
-    ///
-    /// This is the normal runtime path that establishes a new `reference_context_item`.
-    /// Mid-turn compaction is the other path that can re-establish that reference when it
-    /// reinjects full initial context into replacement history. Live world-state changes may
-    /// independently advance their in-memory baseline within a turn.
-    #[instrument(level = "trace", skip_all)]
-    pub(crate) async fn record_context_updates_and_set_reference_context_item(
-        &self,
-        step_context: &StepContext,
-    ) -> Arc<WorldState> {
-        self.record_context_updates_and_set_reference_context_item_inner(step_context, None)
-            .await
-            .unwrap_or_default()
-    }
-
-    /// Compares a pending plan's generation and begins its persistence while
-    /// holding the session-state owner. A stale plan leaves history, the
-    /// pending context baseline, and rollout storage untouched.
-    pub(crate) async fn compare_and_record_context_updates(
-        &self,
-        step_context: &StepContext,
-        expected_planning_generation: u64,
-    ) -> Option<Arc<WorldState>> {
-        self.record_context_updates_and_set_reference_context_item_inner(
-            step_context,
-            Some(expected_planning_generation),
-        )
-        .await
-    }
-
-    fn compare_and_commit_planning_state<R>(
-        &self,
-        state_owner: &mut SessionState,
-        expected_planning_generation: Option<u64>,
-        commit: impl FnOnce(&mut SessionState) -> R,
-    ) -> Option<R> {
-        if expected_planning_generation
-            .is_some_and(|expected| self.services.planning_generation() != expected)
-        {
-            return None;
-        }
-        Some(commit(state_owner))
-    }
-
-    async fn record_context_updates_and_set_reference_context_item_inner(
-        &self,
-        step_context: &StepContext,
-        expected_planning_generation: Option<u64>,
-    ) -> Option<Arc<WorldState>> {
-        let turn_context = step_context.turn.as_ref();
-        let (reference_context_item, pending_context_baseline) = {
-            let state = self.state.lock().await;
-            (
-                state.reference_context_item(),
-                state.pending_context_baseline(),
-            )
-        };
-        let represented_context_item = pending_context_baseline
-            .as_ref()
-            .map(|candidate| &candidate.turn_context_item)
-            .or(reference_context_item.as_ref());
-        let turn_context_item = turn_context.to_turn_context_item();
-        let turn_context_changed =
-            !context_snapshot_matches(represented_context_item, &turn_context_item);
-        let world_state = Arc::new(self.build_world_state_for_step(step_context).await);
+        let world_state = Arc::new(if estimate {
+            self.estimate_world_state_for_step(step_context).await
+        } else {
+            self.build_world_state_for_step(step_context).await
+        });
         let complete_context = self
             .build_initial_context_with_world_state_and_mcp(
-                turn_context,
+                turn_context.as_ref(),
                 world_state.as_ref(),
-                false,
+                estimate,
             )
             .await;
-        let fragment_digests = complete_context.fragment_digests.clone();
+        let InitialContextBuild {
+            items: complete_items,
+            turn_context_items,
+            world_state_snapshot: complete_world_state_snapshot,
+            fragment_digests,
+        } = complete_context;
         let represented_fragment_digests = pending_context_baseline
             .as_ref()
             .map(|candidate| candidate.fragment_digests.as_slice())
@@ -5013,31 +4972,22 @@ impl Session {
                     .and_then(|item| item.context_provenance.as_ref())
                     .map(|provenance| provenance.fragment_digests.as_slice())
             });
-        // TurnContextItem covers the structured settings baseline, while the
-        // accepted fragment receipts cover every other model-visible initial
-        // input (developer instructions, skills, and context contributors).
-        // If those receipts no longer describe the context we would build now,
-        // replay the authoritative full context instead of silently retaining
-        // the previous turn's text.
+
         let should_inject_full_context = represented_context_item.is_none()
             || represented_fragment_digests
                 .is_some_and(|represented| represented != fragment_digests.as_slice());
-        // Build a candidate without advancing either realized baseline. The
-        // exact physical request that accepts these items commits it later.
         let (mut context_items, world_state_item, world_state_snapshot) =
             if should_inject_full_context {
                 (
-                    complete_context.items.clone(),
+                    complete_items,
                     Some(WorldStateItem::full(
-                        complete_context.world_state_snapshot.clone().into_value(),
+                        complete_world_state_snapshot.clone().into_value(),
                     )),
-                    complete_context.world_state_snapshot,
+                    complete_world_state_snapshot,
                 )
             } else {
-                // Steady-state path: append only built-in context diffs here; turn-scoped extension
-                // context is added below.
                 let mut context_items = self
-                    .build_settings_update_items(represented_context_item, turn_context)
+                    .build_settings_update_items(represented_context_item, turn_context.as_ref())
                     .await;
                 let (world_state_items, world_state_item, world_state_snapshot) = {
                     let mut history = self.clone_history().await;
@@ -5067,14 +5017,107 @@ impl Session {
                 (context_items, world_state_item, world_state_snapshot)
             };
         if !should_inject_full_context && turn_context_changed {
-            context_items.extend(
-                self.build_turn_context_contribution_items(turn_context, false)
-                    .await,
-            );
+            // These are the exact turn-contributor fragments captured while building the full
+            // candidate above. Reusing them avoids a second contributor poll in the diff path.
+            context_items.extend(turn_context_items);
         }
-        let context_items = self
-            .prepare_conversation_items_for_history(turn_context, &context_items)
-            .into_owned();
+        PreparedContextUpdate {
+            turn_context,
+            world_state,
+            context_items,
+            baseline: ContextBaselineCandidate {
+                turn_context_item,
+                world_state_snapshot,
+                world_state_item,
+                fragment_digests,
+                bound_sampling_request_id: None,
+                bound_physical_attempt_id: None,
+            },
+        }
+    }
+
+    /// Builds the immutable model-visible context candidate used by both planning and commit.
+    pub(crate) async fn prepare_context_update(
+        &self,
+        step_context: &StepContext,
+    ) -> PreparedContextUpdate {
+        self.prepare_context_update_inner(step_context, false).await
+    }
+
+    /// Builds a read-only preview for tests and callers that do not intend to commit it.
+    #[cfg(test)]
+    pub(crate) async fn estimate_context_update_items(
+        &self,
+        step_context: &StepContext,
+    ) -> Vec<ResponseItem> {
+        self.prepare_context_update_inner(step_context, true)
+            .await
+            .context_items
+    }
+
+    /// Persist the latest turn context snapshot for the first real user turn and for
+    /// steady-state turns that emit model-visible context updates.
+    ///
+    /// When the reference snapshot is missing, this injects full initial context. Otherwise, it
+    /// emits only context diffs.
+    ///
+    /// If full context is injected and a model switch occurred, this prepends the compact
+    /// `<model_switch>` compatibility note while preserving the session base instructions.
+    ///
+    /// This is the normal runtime path that establishes a new `reference_context_item`.
+    /// Mid-turn compaction is the other path that can re-establish that reference when it
+    /// reinjects full initial context into replacement history. Live world-state changes may
+    /// independently advance their in-memory baseline within a turn.
+    #[instrument(level = "trace", skip_all)]
+    pub(crate) async fn record_context_updates_and_set_reference_context_item(
+        &self,
+        step_context: &StepContext,
+    ) -> Arc<WorldState> {
+        let prepared = self.prepare_context_update(step_context).await;
+        self.commit_prepared_context_update(prepared, None)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Compares a pending plan's generation and begins its persistence while
+    /// holding the session-state owner. A stale plan leaves history, the
+    /// pending context baseline, and rollout storage untouched.
+    pub(crate) async fn compare_and_record_context_updates(
+        &self,
+        prepared: PreparedContextUpdate,
+        expected_planning_generation: u64,
+    ) -> Option<Arc<WorldState>> {
+        self.commit_prepared_context_update(prepared, Some(expected_planning_generation))
+            .await
+    }
+
+    fn compare_and_commit_planning_state<R>(
+        &self,
+        state_owner: &mut SessionState,
+        expected_planning_generation: Option<u64>,
+        commit: impl FnOnce(&mut SessionState) -> R,
+    ) -> Option<R> {
+        if expected_planning_generation
+            .is_some_and(|expected| self.services.planning_generation() != expected)
+        {
+            return None;
+        }
+        Some(commit(state_owner))
+    }
+
+    async fn commit_prepared_context_update(
+        &self,
+        prepared: PreparedContextUpdate,
+        expected_planning_generation: Option<u64>,
+    ) -> Option<Arc<WorldState>> {
+        let PreparedContextUpdate {
+            turn_context,
+            world_state,
+            context_items,
+            baseline,
+        } = prepared;
+        let context_items =
+            Self::prepare_owned_conversation_items_for_history(&turn_context.sub_id, context_items);
         {
             let mut state = self.state.lock().await;
             self.compare_and_commit_planning_state(
@@ -5090,14 +5133,7 @@ impl Session {
                             turn_context.model_info.truncation_policy.into(),
                         );
                     }
-                    state.stage_context_baseline(ContextBaselineCandidate {
-                        turn_context_item,
-                        world_state_snapshot,
-                        world_state_item,
-                        fragment_digests,
-                        bound_sampling_request_id: None,
-                        bound_physical_attempt_id: None,
-                    });
+                    state.stage_context_baseline(baseline);
                 },
             )?;
         }
@@ -5107,7 +5143,7 @@ impl Session {
                 .begin_local_phase(TurnLocalPhase::Persistence);
             self.persist_rollout_response_items(&context_items).await;
             drop(persistence_timing_guard);
-            self.send_raw_response_items(turn_context, &context_items)
+            self.send_raw_response_items(turn_context.as_ref(), &context_items)
                 .await;
         }
         Some(world_state)
@@ -5514,6 +5550,18 @@ fn durable_history_commit_key(turn_id: &str, items: &[ResponseItem]) -> std::io:
     Ok(format!("{turn_id}:{:x}", writer.0.finalize()))
 }
 
+const HISTORY_IDENTITY_OFFLOAD_MIN_TEXT_BYTES: usize = 48 * 1024;
+
+fn conversation_items_need_blocking_history_identity(items: &[ResponseItem]) -> bool {
+    items.iter().any(|item| match item {
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => output
+            .text_content()
+            .is_none_or(|text| text.len() >= HISTORY_IDENTITY_OFFLOAD_MIN_TEXT_BYTES),
+        _ => true,
+    })
+}
+
 pub(crate) fn emit_subagent_session_started(
     analytics_events_client: &AnalyticsEventsClient,
     client_metadata: AppServerClientMetadata,
@@ -5579,7 +5627,7 @@ async fn build_hooks_for_config(
         ),
         feature_enabled: config.features.enabled(Feature::CodexHooks),
         bypass_hook_trust: config.bypass_hook_trust,
-        config_layer_stack: Some(config.config_layer_stack.clone()),
+        config_layer_stack: Some(config.config_layer_stack.as_ref().clone()),
         plugin_hook_sources,
         plugin_hook_load_warnings,
         shell_program: hook_shell_program,

@@ -17,6 +17,7 @@ mod test_support;
 
 use codex_git_utils::RepositoryContext;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::StateDbHandle;
@@ -342,6 +343,39 @@ impl ThreadStore for LocalThreadStore {
             if !persisted_items.is_empty() {
                 projection.append_pending(persisted_items).await;
             }
+            Ok(())
+        })
+    }
+
+    fn append_persisted_items<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        items: &'a [RolloutItem],
+    ) -> ThreadStoreFuture<'a, ()> {
+        Box::pin(async move {
+            if items.is_empty() {
+                return Ok(());
+            }
+            let (projection, _operation) =
+                projection::initialized_entry_for_append(self, thread_id).await?;
+            live_writer::append_persisted_items(self, thread_id, items).await?;
+            projection.append_durable(items).await
+        })
+    }
+
+    fn append_persisted_items_ordered<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        items: &'a [RolloutItem],
+    ) -> ThreadStoreFuture<'a, ()> {
+        Box::pin(async move {
+            if items.is_empty() {
+                return Ok(());
+            }
+            let (projection, _operation) =
+                projection::initialized_entry_for_append(self, thread_id).await?;
+            live_writer::append_persisted_items_ordered(self, thread_id, items).await?;
+            projection.append_pending(items.to_vec()).await;
             Ok(())
         })
     }

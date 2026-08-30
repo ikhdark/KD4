@@ -185,7 +185,18 @@ pub(crate) use resolved_permission_profile::PermissionProfileState;
 fn effective_reasoning_phase_efforts(
     configured: Option<ReasoningPhaseEfforts>,
 ) -> ReasoningPhaseEfforts {
-    configured.unwrap_or_default()
+    let configured = configured.unwrap_or_default();
+    ReasoningPhaseEfforts {
+        orient: configured.orient.or(Some(ReasoningEffort::High)),
+        inspect: configured.inspect.or(Some(ReasoningEffort::Low)),
+        implement: configured.implement.or(Some(ReasoningEffort::High)),
+        diagnose: configured.diagnose.or(Some(ReasoningEffort::High)),
+        verify: configured.verify.or(Some(ReasoningEffort::Low)),
+        finalize: configured.finalize.or(Some(ReasoningEffort::Low)),
+        deterministic_continuation: configured
+            .deterministic_continuation
+            .or(Some(ReasoningEffort::Low)),
+    }
 }
 
 /// Maximum number of source bytes retained across project documentation files.
@@ -686,7 +697,7 @@ pub enum ThreadStoreConfig {
 pub struct Config {
     /// Provenance for how this [`Config`] was derived (merged layers + enforced
     /// requirements).
-    pub config_layer_stack: ConfigLayerStack,
+    pub config_layer_stack: Arc<ConfigLayerStack>,
 
     /// Warnings collected during config load that should be shown on startup.
     pub startup_warnings: Vec<String>,
@@ -1007,8 +1018,8 @@ pub struct Config {
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
 
     /// Per-logical-request reasoning effort overrides. The sampling governor
-    /// remains enabled when the table is absent, and omitted fields inherit
-    /// `model_reasoning_effort`.
+    /// remains enabled when the table is absent. Omitted fields use the
+    /// compatibility defaults documented by [`ReasoningPhaseEfforts`].
     pub reasoning_phase_efforts: Option<ReasoningPhaseEfforts>,
 
     /// Optional value to use for `reasoning.summary` when making a request
@@ -3667,7 +3678,7 @@ impl Config {
                 .and_then(|config_lock| config_lock.save_fields_resolved_from_model_catalog)
                 .unwrap_or(true),
             config_lock_toml: None,
-            config_layer_stack,
+            config_layer_stack: Arc::new(config_layer_stack),
             history,
             ephemeral: ephemeral.unwrap_or_default(),
             extra_config: None,

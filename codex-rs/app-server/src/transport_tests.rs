@@ -70,6 +70,33 @@ fn response_with_reasoning_policy_history() -> OutgoingMessage {
     })
 }
 
+#[test]
+fn empty_notification_opt_outs_skip_method_rendering_and_lock_acquisition() {
+    let (writer, _reader) = mpsc::channel(1);
+    let opt_outs = Arc::new(OutboundNotificationOptOuts::new(HashSet::new()));
+    let connection = OutboundConnectionState::new(
+        writer,
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(true)),
+        Arc::clone(&opt_outs),
+        /*disconnect_sender*/ None,
+    );
+    let notification = OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+        ConfigWarningNotification {
+            summary: "ordinary notification".to_string(),
+            details: None,
+            path: None,
+            range: None,
+        },
+    ));
+
+    assert!(!should_skip_notification_for_connection(
+        &connection,
+        &notification
+    ));
+    assert_eq!(opt_outs.lock_reads.load(Ordering::Relaxed), 0);
+}
+
 #[tokio::test]
 async fn envelope_target_selection_preserves_the_only_delivery_path_difference() {
     let initialized_connection_id = ConnectionId(1);
@@ -84,7 +111,7 @@ async fn envelope_target_selection_preserves_the_only_delivery_path_difference()
             initialized_writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
         ),
     );
@@ -94,7 +121,7 @@ async fn envelope_target_selection_preserves_the_only_delivery_path_difference()
             uninitialized_writer_tx,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
         ),
     );
@@ -148,7 +175,9 @@ async fn to_connection_notification_respects_opt_out_filters() {
     let (writer_tx, mut writer_rx) = mpsc::channel(1);
     let initialized = Arc::new(AtomicBool::new(true));
     let opted_out_notification_methods =
-        Arc::new(RwLock::new(HashSet::from(["configWarning".to_string()])));
+        Arc::new(OutboundNotificationOptOuts::new(HashSet::from([
+            "configWarning".to_string(),
+        ])));
 
     let mut connections = HashMap::new();
     connections.insert(
@@ -197,7 +226,9 @@ async fn to_connection_notifications_are_dropped_for_opted_out_clients() {
             writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(RwLock::new(HashSet::from(["configWarning".to_string()]))),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::from([
+                "configWarning".to_string(),
+            ]))),
             /*disconnect_sender*/ None,
         ),
     );
@@ -237,7 +268,7 @@ async fn to_connection_notifications_are_preserved_for_non_opted_out_clients() {
             writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
         ),
     );
@@ -284,7 +315,7 @@ async fn to_connection_receipt_sender_reaches_the_transport_writer() {
             writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
         ),
     );
@@ -332,7 +363,7 @@ async fn experimental_notifications_are_dropped_without_capability() {
             writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
         ),
     );
@@ -370,7 +401,7 @@ async fn experimental_notifications_are_preserved_with_capability() {
             writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
         ),
     );
@@ -418,7 +449,7 @@ async fn reasoning_policy_summary_notification_respects_capability() {
             writer_tx,
             Arc::new(AtomicBool::new(true)),
             experimental_api_enabled.clone(),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
         ),
     );
@@ -473,7 +504,7 @@ async fn reasoning_policy_history_is_omitted_without_capability() {
             writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
         ),
     );
@@ -515,7 +546,7 @@ async fn reasoning_policy_history_is_preserved_with_capability() {
             writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
         ),
     );
@@ -557,7 +588,7 @@ async fn command_execution_request_approval_strips_additional_permissions_withou
             writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
         ),
     );
@@ -623,7 +654,7 @@ async fn command_execution_request_approval_keeps_additional_permissions_with_ca
             writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
         ),
     );
@@ -704,7 +735,7 @@ async fn broadcast_does_not_block_on_slow_connection() {
             fast_writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             Some(fast_disconnect_token.clone()),
         ),
     );
@@ -714,7 +745,7 @@ async fn broadcast_does_not_block_on_slow_connection() {
             slow_writer_tx.clone(),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             Some(slow_disconnect_token.clone()),
         ),
     );
@@ -799,7 +830,7 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
             writer_tx,
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(RwLock::new(HashSet::new())),
+            Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
             /*disconnect_sender*/ None,
         ),
     );

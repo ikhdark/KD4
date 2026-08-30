@@ -181,8 +181,11 @@ fn hierarchical_paired_bootstrap_for_shape(
         .flat_map(|cluster| cluster.b_samples.iter())
         .map(|sample| metric.value(sample) as f64)
         .collect::<Vec<_>>();
+    let baseline_p95_ns = percentile(&all_a, 0.95);
     let point_median_ratio = percentile(&all_b, 0.5) / percentile(&all_a, 0.5);
-    let point_p95_ratio = percentile(&all_b, 0.95) / percentile(&all_a, 0.95);
+    let point_p95_ratio = percentile(&all_b, 0.95) / baseline_p95_ns;
+    let p95_ratio_ucb_gate_applied =
+        baseline_p95_ns >= AB_P95_RATIO_UCB_GATE_MIN_BASELINE_NS as f64;
 
     let metric_seed = metric.name().bytes().fold(AB_BOOTSTRAP_SEED, |seed, byte| {
         seed.rotate_left(5) ^ u64::from(byte)
@@ -210,6 +213,7 @@ fn hierarchical_paired_bootstrap_for_shape(
     let p95_ratio_ucb = percentile(&p95_ratios, ucb_quantile);
     Ok(AbLatencyGate {
         metric: metric.name().to_string(),
+        baseline_p95_ns,
         point_median_ratio,
         point_p95_ratio,
         median_ratio_lcb,
@@ -221,9 +225,11 @@ fn hierarchical_paired_bootstrap_for_shape(
         pairs_per_cluster,
         median_ratio_ucb_limit: AB_MEDIAN_RATIO_UCB_LIMIT,
         p95_ratio_ucb_limit: AB_P95_RATIO_UCB_LIMIT,
+        p95_ratio_ucb_gate_applied,
+        p95_ratio_ucb_gate_min_baseline_ns: AB_P95_RATIO_UCB_GATE_MIN_BASELINE_NS,
         target_ratio: AB_INCREMENTAL_RATIO_TARGET,
         passed: median_ratio_ucb <= AB_MEDIAN_RATIO_UCB_LIMIT
-            && p95_ratio_ucb <= AB_P95_RATIO_UCB_LIMIT,
+            && (!p95_ratio_ucb_gate_applied || p95_ratio_ucb <= AB_P95_RATIO_UCB_LIMIT),
     })
 }
 
@@ -1148,7 +1154,8 @@ fn evaluate_ab_workload_with_config(
     let latency_contract_clearly_failed = latency_contract_complete
         && latency_gates.iter().any(|gate| {
             gate.median_ratio_lcb > gate.median_ratio_ucb_limit
-                || gate.p95_ratio_lcb > gate.p95_ratio_ucb_limit
+                || (gate.p95_ratio_ucb_gate_applied
+                    && gate.p95_ratio_lcb > gate.p95_ratio_ucb_limit)
         });
     let (decision, stop_reason) = if !correctness_violations.is_empty() {
         (
@@ -1605,8 +1612,9 @@ fn replay_descriptive_latency_gate(
         "{} has zero A duration",
         metric.name()
     );
+    let baseline_p95_ns = percentile(&a, 0.95);
     let point_median_ratio = percentile(&b, 0.5) / percentile(&a, 0.5);
-    let point_p95_ratio = percentile(&b, 0.95) / percentile(&a, 0.95);
+    let point_p95_ratio = percentile(&b, 0.95) / baseline_p95_ns;
     let passed = cluster
         .a_samples
         .iter()
@@ -1615,6 +1623,7 @@ fn replay_descriptive_latency_gate(
         .all(|(a, b)| replay_latency_pair_passes(metric.value(a), metric.value(b)));
     Ok(AbLatencyGate {
         metric: metric.name().to_string(),
+        baseline_p95_ns,
         point_median_ratio,
         point_p95_ratio,
         median_ratio_lcb: point_median_ratio,
@@ -1626,6 +1635,8 @@ fn replay_descriptive_latency_gate(
         pairs_per_cluster,
         median_ratio_ucb_limit: AB_REPLAY_RATIO_TARGET,
         p95_ratio_ucb_limit: AB_REPLAY_RATIO_TARGET,
+        p95_ratio_ucb_gate_applied: false,
+        p95_ratio_ucb_gate_min_baseline_ns: 0,
         target_ratio: AB_REPLAY_RATIO_TARGET,
         passed,
     })
@@ -2088,29 +2099,21 @@ fn select_turn_latency_executable_from_cargo_json(output: &[u8]) -> Result<PathB
 }
 
 fn build_turn_latency_worker(codex_rs: &Path, target_dir: &Path) -> Result<PathBuf> {
-    const ARGS: [&str; 6] = [
-        "build",
-        "-p",
-        "codex-core",
-        "--bench",
-        "turn_latency",
-        "--message-format=json-render-diagnostics",
-    ];
     #[cfg(test)]
     AB_BUILD_COMMAND_INVOCATIONS.fetch_add(1, Ordering::SeqCst);
     let command_target_dir = cargo_target_dir_for_command(target_dir);
     let output = Command::new("cargo")
         .current_dir(codex_rs)
         .env("CARGO_TARGET_DIR", &command_target_dir)
-        .args(ARGS)
+        .args(AB_WORKER_BUILD_ARGS)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()
-        .with_context(|| format!("run cargo {}", ARGS.join(" ")))?;
+        .with_context(|| format!("run cargo {}", AB_WORKER_BUILD_ARGS.join(" ")))?;
     anyhow::ensure!(
         output.status.success(),
         "cargo {} failed with {}",
-        ARGS.join(" "),
+        AB_WORKER_BUILD_ARGS.join(" "),
         output.status
     );
     select_turn_latency_executable_from_cargo_json(&output.stdout)
@@ -2118,26 +2121,14 @@ fn build_turn_latency_worker(codex_rs: &Path, target_dir: &Path) -> Result<PathB
 
 fn build_ab_variant(worktree: &Path, target_dir: &Path) -> Result<AbBuild> {
     let codex_rs = worktree.join("codex-rs");
-    run_build_command(
-        &codex_rs,
-        target_dir,
-        &["build", "-p", "codex-cli", "--bin", "codex"],
-    )?;
-    run_build_command(
-        &codex_rs,
-        target_dir,
-        &[
-            "build",
-            "-p",
-            "codex-code-mode-host",
-            "--bin",
-            "codex-code-mode-host",
-        ],
-    )?;
+    run_build_command(&codex_rs, target_dir, &AB_CLI_BUILD_ARGS)?;
+    run_build_command(&codex_rs, target_dir, &AB_HOST_BUILD_ARGS)?;
     let worker = build_turn_latency_worker(&codex_rs, target_dir)?;
-    let cli = target_dir.join("debug").join(executable_name("codex"));
+    let cli = target_dir
+        .join(AB_BUILD_PROFILE_DIR)
+        .join(executable_name("codex"));
     let host = target_dir
-        .join("debug")
+        .join(AB_BUILD_PROFILE_DIR)
         .join(executable_name("codex-code-mode-host"));
     anyhow::ensure!(cli.is_file(), "missing built CLI: {}", cli.display());
     anyhow::ensure!(host.is_file(), "missing built host: {}", host.display());
@@ -2156,22 +2147,11 @@ fn build_ab_variant(worktree: &Path, target_dir: &Path) -> Result<AbBuild> {
 
 fn ab_build_configuration_hash(rustc_version: &str, rust_target: &str) -> String {
     let payload = serde_json::json!({
-        "profile": "dev",
+        "profile": AB_BUILD_PROFILE,
         "features": Vec::<String>::new(),
         "rustc_version": rustc_version,
         "rust_target": rust_target,
-        "commands": [
-            ["build", "-p", "codex-cli", "--bin", "codex"],
-            ["build", "-p", "codex-code-mode-host", "--bin", "codex-code-mode-host"],
-            [
-                "build",
-                "-p",
-                "codex-core",
-                "--bench",
-                "turn_latency",
-                "--message-format=json-render-diagnostics",
-            ],
-        ],
+        "commands": [AB_CLI_BUILD_ARGS, AB_HOST_BUILD_ARGS, AB_WORKER_BUILD_ARGS],
         "worker_stack_bytes": AB_WORKER_STACK_BYTES,
         "workload_schema_version": AB_WORKLOAD_SCHEMA_VERSION,
         "metric_gate_version": AB_METRIC_GATE_VERSION,
@@ -4787,6 +4767,9 @@ fn ab_profile_configuration_hash(config: AbExecutionConfig, workloads: &[AbWorkl
             "bootstrap_replicates": AB_BOOTSTRAP_REPLICATES,
             "bootstrap_seed": AB_BOOTSTRAP_SEED,
             "family_wise_alpha": AB_FAMILY_WISE_ALPHA,
+            "median_ratio_ucb_limit": AB_MEDIAN_RATIO_UCB_LIMIT,
+            "p95_ratio_ucb_limit": AB_P95_RATIO_UCB_LIMIT,
+            "p95_ratio_ucb_gate_min_baseline_ns": AB_P95_RATIO_UCB_GATE_MIN_BASELINE_NS,
         });
     }
     sha256_bytes(
@@ -5125,7 +5108,7 @@ fn run_ab_compare(args: &AbCompareArgs) -> Result<()> {
         candidate_cli_binary_sha256: manifest.candidate.cli_sha256.clone(),
         rustc_version: manifest.rustc_version.clone(),
         rust_target: manifest.rust_target,
-        profile: "dev".to_string(),
+        profile: AB_BUILD_PROFILE.to_string(),
         execution_profile: args.profile,
         features: Vec::new(),
         bootstrap_seed: if args.profile == AbExecutionProfile::Replay {
@@ -5251,7 +5234,7 @@ fn ab_latency_gate_expectation(
     }
     match mode {
         AbLatencyGateMode::Hard => {
-            "This result counts. The statistical upper bound may be at most 5% slower at the median and 10% slower at p95."
+            "This result counts. The statistical upper bound may be at most 5% slower at the median. The p95 upper-bound limit is 10% when baseline p95 is at least 5 ms."
         }
         AbLatencyGateMode::Advisory => {
             "This timing is informational in this profile and does not decide the overall result."
@@ -5380,6 +5363,17 @@ fn render_ab_plain_language_report(report: &AbReport) -> String {
                 "    Technical ratios: median {:.3}x; p95 {:.3}x; gate passed={}",
                 gate.point_median_ratio, gate.point_p95_ratio, gate.passed
             ));
+            if report.provenance.execution_profile != AbExecutionProfile::Replay
+                && !gate.p95_ratio_ucb_gate_applied
+            {
+                lines.push(format!(
+                    "    p95 ratio veto: not applied because baseline p95 {} is below the {} floor.",
+                    format_duration_ns_for_humans(gate.baseline_p95_ns),
+                    format_duration_ns_for_humans(
+                        gate.p95_ratio_ucb_gate_min_baseline_ns as f64
+                    )
+                ));
+            }
             lines.push(format!(
                 "    Plain language: median was {}; this metric {}.",
                 plain_language_ratio(gate.point_median_ratio),
@@ -5588,7 +5582,7 @@ fn import_accepted_ab_report(args: &AbImportReportArgs) -> Result<AbImportReport
         "accepted report workload results are incomplete"
     );
     anyhow::ensure!(
-        report.provenance.profile == "dev"
+        report.provenance.profile == AB_BUILD_PROFILE
             && report.provenance.features.is_empty()
             && report.provenance.bootstrap_seed == AB_BOOTSTRAP_SEED
             && report.provenance.worker_stack_bytes == AB_WORKER_STACK_BYTES

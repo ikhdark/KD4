@@ -34,6 +34,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::AuthProvider;
@@ -118,6 +119,8 @@ use http::HeaderValue;
 use http::StatusCode;
 use http::StatusCode as HttpStatusCode;
 use lru::LruCache;
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use sha2::Digest;
 use sha2::Sha256;
 use std::time::Duration;
@@ -396,6 +399,102 @@ impl ModelRequestMeasurements {
                 b"tool_schema_array_envelope",
             );
         }
+        Self::from_context(logical_request_bytes, context, tool_schema_breakdown)
+    }
+
+    fn for_responses_request_from_encoded_cancellable(
+        request: &ResponsesApiRequest,
+        provenance: &PromptProvenanceSidecar,
+        base_instructions: &str,
+        cancellation: Option<&CancellationToken>,
+        encoded_request: &[u8],
+        logical_request_bytes: u64,
+    ) -> serde_json::Result<Self> {
+        #[derive(Deserialize)]
+        struct EncodedResponsesRequest<'a> {
+            #[serde(borrow)]
+            instructions: Option<&'a RawValue>,
+            #[serde(borrow)]
+            input: Vec<&'a RawValue>,
+            #[serde(borrow)]
+            tools: Option<Vec<&'a RawValue>>,
+        }
+
+        ensure_measurement_not_cancelled(cancellation)?;
+        let encoded: EncodedResponsesRequest<'_> = serde_json::from_slice(encoded_request)?;
+        if encoded.input.len() != request.input.len()
+            || encoded.tools.as_ref().map(Vec::len)
+                != request.tools.as_deref().map(<[serde_json::Value]>::len)
+        {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded transport request is an incremental projection",
+            )));
+        }
+        let embedded_base_index = (!base_instructions.is_empty()
+            && request.instructions.is_empty()
+            && request.input.first().is_some_and(|item| {
+                matches!(
+                    item,
+                    ResponseItem::Message { role, content, .. }
+                        if role == "developer"
+                            && matches!(
+                                content.as_slice(),
+                                [ContentItem::InputText { text }] if text == base_instructions
+                            )
+                )
+            }))
+        .then_some(0);
+        let mut context = PromptContextBreakdown::from_serialized_response_items(
+            &request.input,
+            &encoded.input,
+            provenance,
+            embedded_base_index,
+        )?;
+        ensure_measurement_not_cancelled(cancellation)?;
+        if !request.instructions.is_empty() {
+            let instructions = encoded.instructions.ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "encoded request omitted logical instructions",
+                ))
+            })?;
+            context.record_serialized(
+                PromptContextCategory::BaseSystem,
+                instructions.get().as_bytes(),
+            );
+        }
+        let mut tool_schema_breakdown = Vec::new();
+        if let (Some(tools), Some(serialized_tools)) =
+            (request.tools.as_deref(), encoded.tools.as_deref())
+        {
+            for (index, (tool, serialized_tool)) in
+                tools.iter().zip(serialized_tools.iter()).enumerate()
+            {
+                ensure_measurement_not_cancelled(cancellation)?;
+                let serialized_tool_bytes = serialized_tool.get().as_bytes();
+                context
+                    .record_serialized(PromptContextCategory::ToolSchemas, serialized_tool_bytes);
+                tool_schema_breakdown.extend(measure_tool_schemas_from_encoded(
+                    tool,
+                    index,
+                    serialized_tool,
+                )?);
+            }
+            context.record_sequence_envelope(
+                PromptContextCategory::ToolSchemas,
+                tools.len(),
+                b"tool_schema_array_envelope",
+            );
+        }
+        Self::from_context(logical_request_bytes, context, tool_schema_breakdown)
+    }
+
+    fn from_context(
+        logical_request_bytes: u64,
+        context: PromptContextBreakdown,
+        tool_schema_breakdown: Vec<ModelToolSchemaTelemetry>,
+    ) -> serde_json::Result<Self> {
         let full_prompt_estimated_tokens = context.total_estimated_tokens();
         let tool_token_count =
             i64::try_from(context.estimated_tokens(PromptContextCategory::ToolSchemas))
@@ -617,6 +716,76 @@ fn measure_tool_schemas(
     )?])
 }
 
+fn measure_tool_schemas_from_encoded(
+    tool: &serde_json::Value,
+    index: usize,
+    serialized_tool: &RawValue,
+) -> serde_json::Result<Vec<ModelToolSchemaTelemetry>> {
+    let namespace = (tool.get("type").and_then(serde_json::Value::as_str) == Some("namespace"))
+        .then(|| tool.get("name").and_then(serde_json::Value::as_str))
+        .flatten();
+    if let Some(namespace) = namespace
+        && let Some(tools) = tool.get("tools").and_then(serde_json::Value::as_array)
+    {
+        #[derive(Deserialize)]
+        struct EncodedNamespace<'a> {
+            #[serde(borrow)]
+            tools: Vec<&'a RawValue>,
+        }
+
+        let encoded_namespace: EncodedNamespace<'_> = serde_json::from_str(serialized_tool.get())?;
+        if tools.len() != encoded_namespace.tools.len() {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded namespace tools do not match logical tools",
+            )));
+        }
+        return tools
+            .iter()
+            .zip(encoded_namespace.tools)
+            .enumerate()
+            .map(|(nested_index, (nested, serialized_nested))| {
+                Ok(measure_leaf_tool_schema_from_encoded(
+                    nested,
+                    nested_index,
+                    Some(namespace),
+                    serialized_nested.get().as_bytes(),
+                ))
+            })
+            .collect();
+    }
+    Ok(vec![measure_leaf_tool_schema_from_encoded(
+        tool,
+        index,
+        None,
+        serialized_tool.get().as_bytes(),
+    )])
+}
+
+fn measure_leaf_tool_schema_from_encoded(
+    tool: &serde_json::Value,
+    index: usize,
+    namespace: Option<&str>,
+    serialized: &[u8],
+) -> ModelToolSchemaTelemetry {
+    let name = tool
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| tool.get("type").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("tool_{index}"));
+    ModelToolSchemaTelemetry {
+        name,
+        namespace: namespace.map(str::to_string),
+        serialized_bytes: u64::try_from(serialized.len()).unwrap_or(u64::MAX),
+        approx_tokens: u64::try_from(approx_token_count(
+            std::str::from_utf8(serialized).unwrap_or_default(),
+        ))
+        .unwrap_or(u64::MAX),
+        selected_by_model: false,
+    }
+}
+
 fn measure_leaf_tool_schema(
     tool: &serde_json::Value,
     index: usize,
@@ -772,20 +941,44 @@ fn measure_responses_request_after_dispatch(
     prompt: Prompt,
     cancellation: CancellationToken,
     logical_request_bytes: Option<u64>,
-    wire_request_bytes: u64,
+    encoded_request: Option<Bytes>,
 ) -> tokio::task::JoinHandle<PostDispatchRequestMeasurements> {
     tokio::spawn(async move {
         let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
         let blocking_cancellation = cancellation.clone();
         let result = tokio::task::spawn_blocking(move || {
             let measurements = (|| {
-                let mut measurements = ModelRequestMeasurements::for_responses_request_cancellable(
-                    &request,
-                    &prompt.prompt_provenance,
-                    &prompt.base_instructions.text,
-                    Some(&blocking_cancellation),
-                    logical_request_bytes,
-                )?;
+                let wire_request_bytes = encoded_request.as_ref().map_or(0, |encoded| {
+                    u64::try_from(encoded.len()).unwrap_or(u64::MAX)
+                });
+                let mut measurements = match encoded_request.as_deref() {
+                    Some(encoded) => {
+                        ModelRequestMeasurements::for_responses_request_from_encoded_cancellable(
+                            &request,
+                            &prompt.prompt_provenance,
+                            &prompt.base_instructions.text,
+                            Some(&blocking_cancellation),
+                            encoded,
+                            logical_request_bytes.unwrap_or(wire_request_bytes),
+                        )
+                        .or_else(|_| {
+                            ModelRequestMeasurements::for_responses_request_cancellable(
+                                &request,
+                                &prompt.prompt_provenance,
+                                &prompt.base_instructions.text,
+                                Some(&blocking_cancellation),
+                                logical_request_bytes,
+                            )
+                        })?
+                    }
+                    None => ModelRequestMeasurements::for_responses_request_cancellable(
+                        &request,
+                        &prompt.prompt_provenance,
+                        &prompt.base_instructions.text,
+                        Some(&blocking_cancellation),
+                        logical_request_bytes,
+                    )?,
+                };
                 measurements.wire_request_bytes = wire_request_bytes;
                 Ok::<_, serde_json::Error>(measurements)
             })();
@@ -3443,14 +3636,13 @@ impl ModelClientSession {
                 .turn_timing
                 .as_ref()
                 .map(|timing| timing.begin_local_phase(TurnLocalPhase::Serialization));
-            let dispatched_request_bytes = Arc::new(AtomicU64::new(0));
-            let dispatched_request_bytes_for_callback = Arc::clone(&dispatched_request_bytes);
+            let dispatched_request = Arc::new(OnceLock::new());
+            let dispatched_request_for_callback = Arc::clone(&dispatched_request);
             let stream_result = client
                 .stream_request_with_dispatch_ready(&request, options, {
                     let attempt_clock = attempt_clock.clone();
                     move |request_bytes| {
-                        dispatched_request_bytes_for_callback
-                            .store(request_bytes, Ordering::Release);
+                        let _ = dispatched_request_for_callback.set(request_bytes);
                         attempt_clock.mark_dispatch_ready();
                         drop(serialization_timing_guard);
                         drop(transport_readiness_guard);
@@ -3464,9 +3656,10 @@ impl ModelClientSession {
                 attempt_clock.mark_stream_established();
             }
             let prompt_cache_key = request.prompt_cache_key.clone();
-            let dispatched_request_bytes = dispatched_request_bytes.load(Ordering::Acquire);
-            let logical_request_bytes =
-                (dispatched_request_bytes > 0).then_some(dispatched_request_bytes);
+            let dispatched_request = dispatched_request.get().cloned();
+            let logical_request_bytes = dispatched_request
+                .as_ref()
+                .map(|request| u64::try_from(request.len()).unwrap_or(u64::MAX));
             let measurement_cancellation = CancellationToken::new();
             let measurement_task =
                 AbortOnDropHandle::new(measure_responses_request_after_dispatch(
@@ -3474,7 +3667,7 @@ impl ModelClientSession {
                     prompt.clone(),
                     measurement_cancellation.clone(),
                     logical_request_bytes,
-                    dispatched_request_bytes,
+                    dispatched_request,
                 ));
             let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
             let prompt_digests = prompt.digests;
@@ -3918,8 +4111,8 @@ impl ModelClientSession {
             let queue_clock = attempt_clock.clone();
             let dispatch_clock = attempt_clock.clone();
             let established_clock = attempt_clock.clone();
-            let dispatched_request_bytes = Arc::new(AtomicU64::new(0));
-            let dispatched_request_bytes_for_callback = Arc::clone(&dispatched_request_bytes);
+            let dispatched_request = Arc::new(OnceLock::new());
+            let dispatched_request_for_callback = Arc::clone(&dispatched_request);
             let stream_result = websocket_connection
                 .stream_request_with_dispatch_ready(
                     &ws_request,
@@ -3931,8 +4124,7 @@ impl ModelClientSession {
                         }
                     },
                     move |request_bytes| {
-                        dispatched_request_bytes_for_callback
-                            .store(request_bytes, Ordering::Release);
+                        let _ = dispatched_request_for_callback.set(request_bytes);
                         if let Some(clock) = dispatch_clock {
                             clock.mark_dispatch_ready();
                         }
@@ -3956,7 +4148,7 @@ impl ModelClientSession {
             ) {
                 (Some(logical_request), Some(attempt_clock), Some(attempt_identity)) => {
                     let prompt_cache_key = logical_request.prompt_cache_key.clone();
-                    let dispatched_request_bytes = dispatched_request_bytes.load(Ordering::Acquire);
+                    let dispatched_request = dispatched_request.get().cloned();
                     let measurement_cancellation = CancellationToken::new();
                     let measurement_task =
                         AbortOnDropHandle::new(measure_responses_request_after_dispatch(
@@ -3964,7 +4156,7 @@ impl ModelClientSession {
                             prompt.clone(),
                             measurement_cancellation.clone(),
                             /*logical_request_bytes*/ None,
-                            dispatched_request_bytes,
+                            dispatched_request,
                         ));
                     let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
                     let prompt_digests = prompt.digests;

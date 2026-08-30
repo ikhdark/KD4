@@ -218,11 +218,14 @@ impl ConfigManager {
             || self.loader_overrides.user_config_profile.is_some()
         {
             let user_config_path = self.loader_overrides.user_config_path(self.codex_home())?;
-            config.config_layer_stack = config.config_layer_stack.with_user_config_profile(
-                &user_config_path,
-                self.loader_overrides.user_config_profile.as_ref(),
-                TomlValue::Table(toml::map::Map::new()),
-            );
+            config.config_layer_stack = config
+                .config_layer_stack
+                .with_user_config_profile(
+                    &user_config_path,
+                    self.loader_overrides.user_config_profile.as_ref(),
+                    TomlValue::Table(toml::map::Map::new()),
+                )
+                .into();
         }
         self.apply_runtime_feature_enablement(&mut config);
         self.apply_arg0_paths(&mut config);

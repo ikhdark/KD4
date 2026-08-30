@@ -179,12 +179,24 @@ impl SessionState {
         self.history.reference_context_item()
     }
 
+    pub(crate) fn has_reference_context_item(&self) -> bool {
+        self.history.has_reference_context_item()
+    }
+
     pub(crate) fn stage_context_baseline(&mut self, candidate: ContextBaselineCandidate) {
         self.pending_context_baseline = Some(candidate);
     }
 
     pub(crate) fn pending_context_baseline(&self) -> Option<ContextBaselineCandidate> {
         self.pending_context_baseline.clone()
+    }
+
+    pub(crate) fn pending_context_baseline_ref(&self) -> Option<&ContextBaselineCandidate> {
+        self.pending_context_baseline.as_ref()
+    }
+
+    pub(crate) fn pending_context_baseline_mut(&mut self) -> Option<&mut ContextBaselineCandidate> {
+        self.pending_context_baseline.as_mut()
     }
 
     pub(crate) fn clear_pending_context_baseline(&mut self) {

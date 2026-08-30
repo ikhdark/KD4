@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use codex_git_utils::RepositoryContext;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutConfig;
@@ -143,6 +144,22 @@ pub(super) async fn append_items_ordered(
     append_items_with_flush(store, params, false).await
 }
 
+pub(super) async fn append_persisted_items(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    items: &[RolloutItem],
+) -> ThreadStoreResult<()> {
+    append_persisted_items_with_flush(store, thread_id, items, true).await
+}
+
+pub(super) async fn append_persisted_items_ordered(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    items: &[RolloutItem],
+) -> ThreadStoreResult<()> {
+    append_persisted_items_with_flush(store, thread_id, items, false).await
+}
+
 async fn append_items_with_flush(
     store: &LocalThreadStore,
     params: AppendThreadItemsParams,
@@ -151,18 +168,28 @@ async fn append_items_with_flush(
     // LocalThreadStore rejects paginated threads before opening a writer.
     let persisted_items =
         persisted_rollout_items(params.items.as_slice(), ThreadHistoryMode::Legacy);
+    append_persisted_items_with_flush(store, params.thread_id, persisted_items.as_slice(), flush)
+        .await
+}
+
+async fn append_persisted_items_with_flush(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    persisted_items: &[RolloutItem],
+    flush: bool,
+) -> ThreadStoreResult<()> {
     if persisted_items.is_empty() {
         return Ok(());
     }
-    let recorder = store.live_recorder(params.thread_id).await?;
+    let recorder = store.live_recorder(thread_id).await?;
     if flush {
         recorder
-            .record_canonical_items(persisted_items.as_slice())
+            .record_canonical_items(persisted_items)
             .await
             .map_err(thread_store_io_error)?;
     } else {
         recorder
-            .record_canonical_items_ordered(persisted_items.as_slice())
+            .record_canonical_items_ordered(persisted_items)
             .await
             .map_err(thread_store_io_error)?;
     }

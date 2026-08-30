@@ -34,7 +34,7 @@ impl EnvironmentsState {
             network: network_from_turn_context(turn_context),
             filesystem: Some(FileSystemContext::from_permission_profile(
                 &turn_context.permission_profile,
-                &turn_context.config.effective_workspace_roots(),
+                turn_context.effective_workspace_roots(),
             )),
             subagents: None,
         }

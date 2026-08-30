@@ -116,7 +116,8 @@ async fn profile_permissions_selection_popup_with_disallowed_full_access_snapsho
             codex_config::SandboxModeRequirement::WorkspaceWrite,
         ]),
         ..Default::default()
-    });
+    })
+    .into();
 
     chat.open_permissions_popup();
 
@@ -503,7 +504,7 @@ async fn startup_windows_sandbox_prompt_blocks_disallowed_unelevated_fallback() 
     chat.set_feature_enabled(Feature::WindowsSandbox, /*enabled*/ false);
     chat.set_feature_enabled(Feature::WindowsSandboxElevated, /*enabled*/ false);
     chat.config.config_layer_stack =
-        windows_sandbox_requirements_stack(vec![WindowsSandboxModeToml::Elevated]);
+        windows_sandbox_requirements_stack(vec![WindowsSandboxModeToml::Elevated]).into();
 
     chat.maybe_prompt_windows_sandbox_enable(/*show_now*/ true);
 
@@ -523,7 +524,7 @@ async fn windows_sandbox_required_enable_prompt_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.config.config_layer_stack =
-        windows_sandbox_requirements_stack(vec![WindowsSandboxModeToml::Elevated]);
+        windows_sandbox_requirements_stack(vec![WindowsSandboxModeToml::Elevated]).into();
     let preset = builtin_approval_presets()
         .into_iter()
         .find(|preset| preset.id == "auto")
@@ -545,7 +546,8 @@ async fn windows_sandbox_required_enable_prompt_reopens_on_cancel_when_unelevate
     chat.config.config_layer_stack = windows_sandbox_requirements_stack(vec![
         WindowsSandboxModeToml::Elevated,
         WindowsSandboxModeToml::Unelevated,
-    ]);
+    ])
+    .into();
     let preset = builtin_approval_presets()
         .into_iter()
         .find(|preset| preset.id == "auto")
@@ -569,7 +571,8 @@ async fn required_windows_sandbox_setup_defers_configured_initial_prompt() {
     chat.config.config_layer_stack = windows_sandbox_requirements_stack(vec![
         WindowsSandboxModeToml::Elevated,
         WindowsSandboxModeToml::Unelevated,
-    ]);
+    ])
+    .into();
     chat.initial_user_message =
         create_initial_user_message(Some(initial_prompt.clone()), Vec::new(), Vec::new());
 
@@ -625,7 +628,7 @@ async fn windows_sandbox_required_fallback_prompt_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.config.config_layer_stack =
-        windows_sandbox_requirements_stack(vec![WindowsSandboxModeToml::Elevated]);
+        windows_sandbox_requirements_stack(vec![WindowsSandboxModeToml::Elevated]).into();
     let preset = builtin_approval_presets()
         .into_iter()
         .find(|preset| preset.id == "auto")

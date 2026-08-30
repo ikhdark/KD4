@@ -134,13 +134,35 @@ macro_rules! experimental_type_entry {
 pub enum ClientRequestSerializationScope {
     Global(&'static str),
     GlobalSharedRead(&'static str),
-    Thread { thread_id: String },
-    ThreadPath { path: PathBuf },
-    CommandExecProcess { process_id: String },
-    Process { process_handle: String },
-    FuzzyFileSearchSession { session_id: String },
-    FsWatch { watch_id: String },
-    McpOauth { server_name: String },
+    Thread {
+        thread_id: String,
+    },
+    /// Out-of-band control traffic for a thread, such as `turn/interrupt`.
+    ///
+    /// Shares the thread's queue key so control work is still serialized against that
+    /// thread, but runs in a reserved lane ahead of queued mutations. Control requests
+    /// cannot reorder two mutations relative to each other.
+    ThreadControl {
+        thread_id: String,
+    },
+    ThreadPath {
+        path: PathBuf,
+    },
+    CommandExecProcess {
+        process_id: String,
+    },
+    Process {
+        process_handle: String,
+    },
+    FuzzyFileSearchSession {
+        session_id: String,
+    },
+    FsWatch {
+        watch_id: String,
+    },
+    McpOauth {
+        server_name: String,
+    },
 }
 
 macro_rules! serialization_scope_expr {
@@ -155,6 +177,11 @@ macro_rules! serialization_scope_expr {
     };
     ($actual_params:ident, thread_id($params:ident . $field:ident)) => {
         Some(ClientRequestSerializationScope::Thread {
+            thread_id: $actual_params.$field.clone(),
+        })
+    };
+    ($actual_params:ident, thread_control_id($params:ident . $field:ident)) => {
+        Some(ClientRequestSerializationScope::ThreadControl {
             thread_id: $actual_params.$field.clone(),
         })
     };
@@ -903,7 +930,9 @@ client_request_definitions! {
     },
     TurnInterrupt => "turn/interrupt" {
         params: v2::TurnInterruptParams,
-        serialization: thread_id(params.thread_id),
+        // Interrupts observe and cancel in-flight turn state rather than extending the
+        // ordered mutation sequence, so they run in the thread's control lane.
+        serialization: thread_control_id(params.thread_id),
         response: v2::TurnInterruptResponse,
     },
     BugCreate => "bug/create" {

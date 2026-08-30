@@ -78,6 +78,10 @@ impl<'a> AppToolPolicyEvaluator<'a> {
 pub fn apps_config_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
 ) -> Option<AppsConfigToml> {
+    if !config_layer_stack.enabled_layers_contain_top_level_key("apps") {
+        return None;
+    }
+
     config_layer_stack
         .effective_config()
         .as_table()

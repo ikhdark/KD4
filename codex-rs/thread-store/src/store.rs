@@ -1,5 +1,6 @@
 use codex_git_utils::RepositoryContext;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use std::any::Any;
 use std::future::Future;
@@ -71,6 +72,32 @@ pub trait ThreadStore: Any + Send + Sync {
     /// barrier. Stores that do not buffer writes may use the ordinary append contract.
     fn append_items_ordered(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
         self.append_items(params)
+    }
+
+    /// Appends items that the caller has already reduced to the shared persistence policy.
+    ///
+    /// The default preserves compatibility with stores that only implement the raw-item API.
+    fn append_persisted_items<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        items: &'a [RolloutItem],
+    ) -> ThreadStoreFuture<'a, ()> {
+        self.append_items(AppendThreadItemsParams {
+            thread_id,
+            items: items.to_vec(),
+        })
+    }
+
+    /// Ordered counterpart to [`ThreadStore::append_persisted_items`].
+    fn append_persisted_items_ordered<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        items: &'a [RolloutItem],
+    ) -> ThreadStoreFuture<'a, ()> {
+        self.append_items_ordered(AppendThreadItemsParams {
+            thread_id,
+            items: items.to_vec(),
+        })
     }
 
     /// Materializes the thread if persistence is lazy, then persists all queued items.

@@ -2156,7 +2156,8 @@ async fn project_layers_do_not_override_project_root_markers() {
         ConfigRequirements::default(),
         ConfigRequirementsToml::default(),
     )
-    .expect("valid project layer ordering");
+    .expect("valid project layer ordering")
+    .into();
 
     let discovery = agents_md_paths(&config).await.expect("discover paths");
 

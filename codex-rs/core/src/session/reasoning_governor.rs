@@ -1461,32 +1461,49 @@ fn structured_action_identity_from_canonical(
     Some(StructuredActionIdentity { identity, class })
 }
 
+struct Sha256Writer(Sha256);
+
+impl std::io::Write for Sha256Writer {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        Digest::update(&mut self.0, buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_evidence_identity(value: &impl Serialize) -> Option<String> {
+    let mut writer = Sha256Writer(Sha256::new());
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(format!("{:x}", writer.0.finalize()))
+}
+
 fn response_evidence_identity(response: &ResponseInputItem) -> Option<String> {
-    let canonical = match response {
+    match response {
         ResponseInputItem::Message {
             role,
             content,
             phase,
-        } => serde_json::to_vec(&(role, content, phase)).ok()?,
+        } => serialized_evidence_identity(&(role, content, phase)),
         ResponseInputItem::FunctionCallOutput { output, .. }
         | ResponseInputItem::CustomToolCallOutput { output, .. } => {
-            serde_json::to_vec(output).ok()?
+            serialized_evidence_identity(output)
         }
-        ResponseInputItem::McpToolCallOutput { output, .. } => serde_json::to_vec(output).ok()?,
+        ResponseInputItem::McpToolCallOutput { output, .. } => serialized_evidence_identity(output),
         ResponseInputItem::ToolSearchOutput {
             status,
             execution,
             tools,
             omitted_result_count,
             ..
-        } => serde_json::to_vec(&(status, execution, tools, omitted_result_count)).ok()?,
-    };
-    Some(format!("{:x}", Sha256::digest(canonical)))
+        } => serialized_evidence_identity(&(status, execution, tools, omitted_result_count)),
+    }
 }
 
 fn value_evidence_identity(value: &Value) -> Option<String> {
-    let canonical = serde_json::to_vec(&canonicalize_json(value)).ok()?;
-    Some(format!("{:x}", Sha256::digest(canonical)))
+    serialized_evidence_identity(&canonicalize_json(value))
 }
 
 fn terminal_failure_can_be_reused_without_dispatch(tool_name: &ToolName) -> bool {
@@ -2592,13 +2609,22 @@ pub(crate) fn resolve_request_policy_for_generation(
     model_info: &ModelInfo,
     sampling: &SamplingGenerationDisposition,
 ) -> SamplingRequestPolicy {
+    debug_assert!(
+        !matches!(
+            sampling,
+            SamplingGenerationDisposition::ResidualDeterministic(
+                ResidualDeterministicSamplingProof {
+                    exact_action: ResidualDeterministicAction::CompleteProtocolTurn,
+                    ..
+                }
+            )
+        ),
+        "host-terminal continuation must be elided before request policy resolution"
+    );
     if sampling.is_residual_deterministic() {
         let configured_override =
             config.and_then(|config| config.deterministic_continuation.clone());
-        let configured_effort = configured_override
-            .clone()
-            .or(turn_fallback)
-            .unwrap_or(ReasoningEffort::Low);
+        let configured_effort = configured_override.clone().unwrap_or(ReasoningEffort::Low);
         let effective_effort = lowest_supported_equivalent(configured_effort.clone(), model_info);
         return SamplingRequestPolicy {
             phase,
@@ -2815,7 +2841,6 @@ mod tests {
                 .map(|(index, status)| PlanItemArg {
                     step: format!("step {index}"),
                     status,
-                    ..Default::default()
                 })
                 .collect(),
         }
@@ -2925,86 +2950,79 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_changed_continuation_uses_the_lowest_supported_override() {
+    fn reachable_changed_continuation_uses_the_lowest_supported_explicit_override() {
         let model = model(
             &[ReasoningEffort::Medium, ReasoningEffort::High],
             ReasoningEffort::High,
         );
         let config = config();
-        let residual = SamplingGenerationDisposition::ResidualDeterministic(
-            ResidualDeterministicSamplingProof {
-                relevant_state_fingerprint: "state".to_string(),
-                exact_action: ResidualDeterministicAction::RequireChangedContinuation,
-            },
-        );
+        let request = reachable_changed_continuation_request();
 
         let deterministic = resolve_request_policy_for_generation(
             Some(SamplingReasoningPhase::Finalize),
             Some(&config),
             Some(ReasoningEffort::High),
             &model,
-            &residual,
+            &request.sampling,
         );
         assert_eq!(deterministic.configured_effort, Some(ReasoningEffort::Low));
         assert_eq!(
             deterministic.effective_effort,
             Some(ReasoningEffort::Medium)
         );
-
-        for phase in [
-            SamplingReasoningPhase::Implement,
-            SamplingReasoningPhase::Diagnose,
-            SamplingReasoningPhase::Verify,
-            SamplingReasoningPhase::Finalize,
-        ] {
-            let ordinary = resolve_request_policy_for_generation(
-                Some(phase),
-                Some(&config),
-                Some(ReasoningEffort::High),
-                &model,
-                &SamplingGenerationDisposition::DecisionBearing,
-            );
-            let expected = match phase {
-                SamplingReasoningPhase::Verify | SamplingReasoningPhase::Finalize => {
-                    ReasoningEffort::Medium
-                }
-                SamplingReasoningPhase::Implement | SamplingReasoningPhase::Diagnose => {
-                    ReasoningEffort::High
-                }
-                SamplingReasoningPhase::Orient | SamplingReasoningPhase::Inspect => unreachable!(),
-            };
-            assert_eq!(ordinary.effective_effort, Some(expected));
-        }
+        assert_eq!(deterministic.request_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(
+            deterministic.source,
+            SamplingRequestPolicySource::PhaseOverride
+        );
     }
 
     #[test]
-    fn residual_deterministic_sampling_defaults_to_low_without_an_override() {
+    fn reachable_changed_continuation_defaults_to_low_even_when_turn_is_high() {
         let model = model(
             &[ReasoningEffort::Low, ReasoningEffort::High],
             ReasoningEffort::High,
         );
-        let residual = SamplingGenerationDisposition::ResidualDeterministic(
-            ResidualDeterministicSamplingProof {
-                relevant_state_fingerprint: "state".to_string(),
-                exact_action: ResidualDeterministicAction::RequireChangedContinuation,
-            },
-        );
+        let request = reachable_changed_continuation_request();
 
         let policy = resolve_request_policy_for_generation(
             Some(SamplingReasoningPhase::Finalize),
             Some(&ReasoningPhaseEfforts::default()),
             Some(ReasoningEffort::High),
             &model,
-            &residual,
+            &request.sampling,
         );
 
         assert_eq!(policy.configured_effort, Some(ReasoningEffort::Low));
         assert_eq!(policy.effective_effort, Some(ReasoningEffort::Low));
+        assert_eq!(policy.request_effort, Some(ReasoningEffort::Low));
         assert_eq!(policy.source, SamplingRequestPolicySource::TurnFallback);
     }
 
     #[test]
-    fn kd4_latency_stable_continuation_protocol_terminal_elides_sampling_only_when_unchanged() {
+    #[should_panic(
+        expected = "host-terminal continuation must be elided before request policy resolution"
+    )]
+    fn request_policy_rejects_host_terminal_completion() {
+        let model = model(&[ReasoningEffort::Low], ReasoningEffort::Low);
+        let terminal = SamplingGenerationDisposition::ResidualDeterministic(
+            ResidualDeterministicSamplingProof {
+                relevant_state_fingerprint: "state".to_string(),
+                exact_action: ResidualDeterministicAction::CompleteProtocolTurn,
+            },
+        );
+
+        let _ = resolve_request_policy_for_generation(
+            Some(SamplingReasoningPhase::Finalize),
+            Some(&ReasoningPhaseEfforts::default()),
+            Some(ReasoningEffort::High),
+            &model,
+            &terminal,
+        );
+    }
+
+    #[test]
+    fn protocol_terminal_continuation_is_marked_for_host_elision_only_when_unchanged() {
         let governor = SamplingReasoningGovernor::new(Some(&ReasoningPhaseEfforts::default()));
         let baselines = governor.baselines(7);
         let unchanged = settled(7);
@@ -3232,7 +3250,7 @@ mod tests {
     }
 
     #[test]
-    fn global_effort_survives_unoverridden_phases_and_deterministic_continuation() {
+    fn global_effort_survives_unoverridden_decision_bearing_phases() {
         let phase_efforts = ReasoningPhaseEfforts::default();
         let model = model(
             &[
@@ -3261,37 +3279,6 @@ mod tests {
             assert_eq!(policy.effective_effort, Some(ReasoningEffort::High));
             assert_eq!(policy.source, SamplingRequestPolicySource::TurnFallback);
         }
-
-        let deterministic = SamplingGenerationDisposition::ResidualDeterministic(
-            ResidualDeterministicSamplingProof {
-                relevant_state_fingerprint: "same-state".to_string(),
-                exact_action: ResidualDeterministicAction::CompleteProtocolTurn,
-            },
-        );
-        let policy = resolve_request_policy_for_generation(
-            Some(SamplingReasoningPhase::Finalize),
-            Some(&phase_efforts),
-            Some(ReasoningEffort::High),
-            &model,
-            &deterministic,
-        );
-        assert_eq!(policy.configured_effort, Some(ReasoningEffort::High));
-        assert_eq!(policy.effective_effort, Some(ReasoningEffort::High));
-        assert_eq!(policy.source, SamplingRequestPolicySource::TurnFallback);
-
-        let explicit = ReasoningPhaseEfforts {
-            deterministic_continuation: Some(ReasoningEffort::Low),
-            ..ReasoningPhaseEfforts::default()
-        };
-        let policy = resolve_request_policy_for_generation(
-            Some(SamplingReasoningPhase::Finalize),
-            Some(&explicit),
-            Some(ReasoningEffort::High),
-            &model,
-            &deterministic,
-        );
-        assert_eq!(policy.configured_effort, Some(ReasoningEffort::Low));
-        assert_eq!(policy.source, SamplingRequestPolicySource::PhaseOverride);
     }
 
     #[test]
@@ -4725,6 +4712,44 @@ mod tests {
             false,
         );
         collector
+    }
+
+    fn reachable_changed_continuation_request() -> GenerationRequestDisposition {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let (baselines, settled) = unchanged_state(&governor);
+
+        let first = residual_tool_collector(&governor, &baselines, "revision-1", "same");
+        assert_eq!(
+            governor.evaluate_convergence(&baselines, &first, &settled),
+            SamplingConvergenceDecision::default()
+        );
+        assert_eq!(
+            governor
+                .continuation_generation_request(&baselines, &first, &settled, false, false)
+                .sampling,
+            SamplingGenerationDisposition::DecisionBearing
+        );
+
+        let repeated = residual_tool_collector(&governor, &baselines, "revision-1", "same");
+        let repeated_decision = governor.evaluate_convergence(&baselines, &repeated, &settled);
+        assert_eq!(
+            repeated_decision.continuation,
+            ContinuationDisposition::ModelRequired
+        );
+        assert!(repeated_decision.directive.is_some());
+        let request =
+            governor.continuation_generation_request(&baselines, &repeated, &settled, false, false);
+        assert!(matches!(
+            &request.sampling,
+            SamplingGenerationDisposition::ResidualDeterministic(
+                ResidualDeterministicSamplingProof {
+                    exact_action: ResidualDeterministicAction::RequireChangedContinuation,
+                    ..
+                }
+            )
+        ));
+        assert!(!request.completes_protocol_turn_deterministically());
+        request
     }
 
     #[test]

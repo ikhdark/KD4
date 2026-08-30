@@ -72,6 +72,34 @@ fn unrestricted_config_layer_stack() -> ConfigLayerStack {
     ConfigLayerStack::default()
 }
 
+#[test]
+fn plugin_config_clones_preserve_layer_stack_identity_for_cache_lookup() {
+    let input = PluginsConfigInput::new(
+        unrestricted_config_layer_stack(),
+        /*plugins_enabled*/ true,
+        /*remote_plugin_enabled*/ false,
+        String::new(),
+    );
+    let cloned = input.clone();
+    assert!(Arc::ptr_eq(
+        &input.config_layer_stack,
+        &cloned.config_layer_stack
+    ));
+
+    let shared_key = PluginLoadCacheKey::from_config(&input, false);
+    let cloned_key = PluginLoadCacheKey::from_config(&cloned, false);
+    assert_eq!(shared_key, cloned_key);
+
+    let independently_loaded = PluginsConfigInput::new(
+        unrestricted_config_layer_stack(),
+        /*plugins_enabled*/ true,
+        /*remote_plugin_enabled*/ false,
+        String::new(),
+    );
+    let independent_key = PluginLoadCacheKey::from_config(&independently_loaded, false);
+    assert_ne!(shared_key, independent_key);
+}
+
 fn config_layer_stack_with_requirements(
     codex_home: &Path,
     user_config: &str,
@@ -2654,8 +2682,7 @@ fn loaded_plugins_cache_invalidation_rejects_stale_load_completion() {
     let codex_home = TempDir::new().unwrap();
     let manager = PluginsManager::new(codex_home.path().to_path_buf());
     let cache_key = PluginLoadCacheKey {
-        configured_plugins: HashMap::new(),
-        skill_config_rules: SkillConfigRules::default(),
+        config_layer_stack: ConfigLayerStackIdentity(Arc::new(ConfigLayerStack::default())),
         remote_global_catalog_active: false,
     };
     let stale_generation = manager.loaded_plugins_cache_generation();
@@ -2665,6 +2692,8 @@ fn loaded_plugins_cache_invalidation_rejects_stale_load_completion() {
         stale_generation,
         cache_key.clone(),
         Vec::new(),
+        None,
+        PluginLoadOutcome::default(),
         PluginSkillSnapshots::for_plugin_load(),
     );
 

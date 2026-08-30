@@ -46,7 +46,6 @@ use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -496,7 +495,9 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             .connection_opened(IN_PROCESS_CONNECTION_ID, Arc::clone(&outbound_initialized))
             .await;
         let outbound_experimental_api_enabled = Arc::new(AtomicBool::new(false));
-        let outbound_opted_out_notification_methods = Arc::new(RwLock::new(HashSet::new()));
+        let outbound_opted_out_notification_methods = Arc::new(
+            crate::transport::OutboundNotificationOptOuts::new(HashSet::new()),
+        );
 
         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
         outbound_connections.insert(
@@ -568,12 +569,9 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                                 let experimental_api_enabled =
                                     session.experimental_api_enabled();
                                 let is_initialized = session.initialized();
-                                if let Ok(mut opted_out_notification_methods) =
-                                    outbound_opted_out_notification_methods.write()
+                                if !outbound_opted_out_notification_methods
+                                    .replace(opted_out_notification_methods_snapshot)
                                 {
-                                    *opted_out_notification_methods =
-                                        opted_out_notification_methods_snapshot;
-                                } else {
                                     warn!("failed to update outbound opted-out notifications");
                                 }
                                 outbound_experimental_api_enabled.store(

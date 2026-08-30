@@ -1060,7 +1060,7 @@ impl OutgoingMessageSender {
             targeted_connections = connection_ids.len(),
             "app-server event: {notification}"
         );
-        let outgoing_message = OutgoingMessage::AppServerNotification(notification.clone());
+        let outgoing_message = OutgoingMessage::AppServerNotification(notification);
         if connection_ids.is_empty() {
             if let Err(err) = self
                 .sender
@@ -1073,12 +1073,19 @@ impl OutgoingMessageSender {
             }
             return;
         }
-        for connection_id in connection_ids {
+        let mut outgoing_message = Some(outgoing_message);
+        for (index, connection_id) in connection_ids.iter().enumerate() {
+            let Some(message) =
+                clone_or_take_last(&mut outgoing_message, index + 1 == connection_ids.len())
+            else {
+                warn!("targeted notification value was exhausted before fanout completed");
+                break;
+            };
             if let Err(err) = self
                 .sender
                 .send(OutgoingEnvelope::ToConnection {
                     connection_id: *connection_id,
-                    message: outgoing_message.clone(),
+                    message,
                     write_complete_tx: None,
                 })
                 .await
@@ -1536,6 +1543,14 @@ fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+fn clone_or_take_last<T: Clone>(value: &mut Option<T>, is_last: bool) -> Option<T> {
+    if is_last {
+        value.take()
+    } else {
+        value.as_ref().cloned()
+    }
+}
+
 fn now_unix_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1547,6 +1562,7 @@ fn now_unix_timestamp_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use codex_app_server_protocol::AccountLoginCompletedNotification;
@@ -1584,6 +1600,33 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct CloneCounter(Arc<AtomicUsize>);
+
+    impl Clone for CloneCounter {
+        fn clone(&self) -> Self {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Self(Arc::clone(&self.0))
+        }
+    }
+
+    #[test]
+    fn targeted_notification_moves_the_last_value_instead_of_cloning_it() {
+        let clone_count = Arc::new(AtomicUsize::new(0));
+        let mut single = Some(CloneCounter(Arc::clone(&clone_count)));
+        assert!(clone_or_take_last(&mut single, true).is_some());
+        assert_eq!(clone_count.load(Ordering::SeqCst), 0);
+
+        let mut multiple = Some(CloneCounter(Arc::clone(&clone_count)));
+        assert!(clone_or_take_last(&mut multiple, false).is_some());
+        assert!(clone_or_take_last(&mut multiple, true).is_some());
+        assert_eq!(clone_count.load(Ordering::SeqCst), 1);
+        assert!(
+            clone_or_take_last(&mut multiple, true).is_none(),
+            "an exhausted fanout value must not panic"
+        );
+    }
 
     #[test]
     fn internal_api_visibility_is_minimal() {

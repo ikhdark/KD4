@@ -40,7 +40,7 @@ pub(crate) use codex_app_server_transport::validate_websocket_listener;
 pub(crate) struct ConnectionState {
     pub(crate) outbound_initialized: Arc<AtomicBool>,
     pub(crate) outbound_experimental_api_enabled: Arc<AtomicBool>,
-    pub(crate) outbound_opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
+    pub(crate) outbound_opted_out_notification_methods: Arc<OutboundNotificationOptOuts>,
     pub(crate) session: Arc<ConnectionSessionState>,
 }
 
@@ -49,7 +49,7 @@ impl ConnectionState {
         _origin: ConnectionOrigin,
         outbound_initialized: Arc<AtomicBool>,
         outbound_experimental_api_enabled: Arc<AtomicBool>,
-        outbound_opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
+        outbound_opted_out_notification_methods: Arc<OutboundNotificationOptOuts>,
     ) -> Self {
         Self {
             outbound_initialized,
@@ -60,10 +60,52 @@ impl ConnectionState {
     }
 }
 
+pub(crate) struct OutboundNotificationOptOuts {
+    methods: RwLock<HashSet<String>>,
+    has_any: AtomicBool,
+    #[cfg(test)]
+    lock_reads: std::sync::atomic::AtomicUsize,
+}
+
+impl OutboundNotificationOptOuts {
+    pub(crate) fn new(methods: HashSet<String>) -> Self {
+        let has_any = !methods.is_empty();
+        Self {
+            methods: RwLock::new(methods),
+            has_any: AtomicBool::new(has_any),
+            #[cfg(test)]
+            lock_reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn replace(&self, methods: HashSet<String>) -> bool {
+        let Ok(mut current) = self.methods.write() else {
+            return false;
+        };
+        let has_any = !methods.is_empty();
+        *current = methods;
+        self.has_any.store(has_any, Ordering::Release);
+        true
+    }
+
+    fn has_any(&self) -> bool {
+        self.has_any.load(Ordering::Acquire)
+    }
+
+    fn contains(&self, method: &str) -> Option<bool> {
+        #[cfg(test)]
+        self.lock_reads.fetch_add(1, Ordering::Relaxed);
+        self.methods
+            .read()
+            .ok()
+            .map(|methods| methods.contains(method))
+    }
+}
+
 pub(crate) struct OutboundConnectionState {
     pub(crate) initialized: Arc<AtomicBool>,
     pub(crate) experimental_api_enabled: Arc<AtomicBool>,
-    pub(crate) opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
+    pub(crate) opted_out_notification_methods: Arc<OutboundNotificationOptOuts>,
     pub(crate) writer: mpsc::Sender<QueuedOutgoingMessage>,
     disconnect_sender: Option<CancellationToken>,
 }
@@ -73,7 +115,7 @@ impl OutboundConnectionState {
         writer: mpsc::Sender<QueuedOutgoingMessage>,
         initialized: Arc<AtomicBool>,
         experimental_api_enabled: Arc<AtomicBool>,
-        opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
+        opted_out_notification_methods: Arc<OutboundNotificationOptOuts>,
         disconnect_sender: Option<CancellationToken>,
     ) -> Self {
         Self {
@@ -100,11 +142,6 @@ fn should_skip_notification_for_connection(
     connection_state: &OutboundConnectionState,
     message: &OutgoingMessage,
 ) -> bool {
-    let Ok(opted_out_notification_methods) = connection_state.opted_out_notification_methods.read()
-    else {
-        warn!("failed to read outbound opted-out notifications");
-        return false;
-    };
     match message {
         OutgoingMessage::AppServerNotification(notification) => {
             if notification.experimental_reason().is_some()
@@ -114,8 +151,20 @@ fn should_skip_notification_for_connection(
             {
                 return true;
             }
+            // The common case is an empty set. Check its lock-free summary before taking the
+            // lock or rendering the method name, which allocates for every stream delta.
+            if !connection_state.opted_out_notification_methods.has_any() {
+                return false;
+            }
             let method = notification.to_string();
-            opted_out_notification_methods.contains(method.as_str())
+            let Some(contains_method) = connection_state
+                .opted_out_notification_methods
+                .contains(method.as_str())
+            else {
+                warn!("failed to read outbound opted-out notifications");
+                return false;
+            };
+            contains_method
         }
         _ => false,
     }
@@ -235,11 +284,27 @@ pub(crate) async fn route_outgoing_envelope(
         OutgoingEnvelope::Broadcast { message } => (message, None),
     };
 
-    for connection_id in target_connection_ids {
+    // Hand the value to the final recipient instead of cloning for it. Single-connection
+    // delivery, which is the common case, then performs no deep clone at all.
+    let mut message = Some(message);
+    let target_count = target_connection_ids.len();
+    for (index, connection_id) in target_connection_ids.into_iter().enumerate() {
+        let is_last = index + 1 == target_count;
+        let outgoing = if is_last {
+            match message.take() {
+                Some(outgoing) => outgoing,
+                None => break,
+            }
+        } else {
+            match message.as_ref() {
+                Some(outgoing) => outgoing.clone(),
+                None => break,
+            }
+        };
         let _ = send_message_to_connection(
             connections,
             connection_id,
-            message.clone(),
+            outgoing,
             write_complete_tx.take(),
         )
         .await;

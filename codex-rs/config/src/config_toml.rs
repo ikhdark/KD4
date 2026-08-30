@@ -1071,7 +1071,15 @@ mod tests {
             toml::from_str("[reasoning_phase_efforts]").expect("empty table should deserialize");
         assert_eq!(
             empty.reasoning_phase_efforts,
-            Some(ReasoningPhaseEfforts::default())
+            Some(ReasoningPhaseEfforts {
+                orient: None,
+                inspect: None,
+                implement: None,
+                diagnose: None,
+                verify: None,
+                finalize: None,
+                deterministic_continuation: None,
+            })
         );
 
         let partial: ConfigToml = toml::from_str(
@@ -1084,8 +1092,13 @@ inspect = "low"
         assert_eq!(
             partial.reasoning_phase_efforts,
             Some(ReasoningPhaseEfforts {
+                orient: None,
                 inspect: Some(ReasoningEffort::Low),
-                ..Default::default()
+                implement: None,
+                diagnose: None,
+                verify: None,
+                finalize: None,
+                deterministic_continuation: None,
             })
         );
 
@@ -1102,11 +1115,17 @@ deterministic_continuation = "low"
 "#,
         )
         .expect("full table should deserialize");
-        assert!(
-            full.reasoning_phase_efforts
-                .expect("table should be present")
-                .finalize
-                .is_some()
+        assert_eq!(
+            full.reasoning_phase_efforts,
+            Some(ReasoningPhaseEfforts {
+                orient: Some(ReasoningEffort::Medium),
+                inspect: Some(ReasoningEffort::Low),
+                implement: Some(ReasoningEffort::High),
+                diagnose: Some(ReasoningEffort::High),
+                verify: Some(ReasoningEffort::Low),
+                finalize: Some(ReasoningEffort::Low),
+                deterministic_continuation: Some(ReasoningEffort::Low),
+            })
         );
     }
 

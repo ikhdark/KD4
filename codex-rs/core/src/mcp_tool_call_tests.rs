@@ -468,7 +468,7 @@ print({hook_output:?})
     .expect("write hooks.json");
     let hook_list = codex_hooks::list_hooks(HooksConfig {
         feature_enabled: true,
-        config_layer_stack: Some(turn_context.config.config_layer_stack.clone()),
+        config_layer_stack: Some(turn_context.config.config_layer_stack.as_ref().clone()),
         ..HooksConfig::default()
     });
     assert_eq!(hook_list.hooks.len(), 1);

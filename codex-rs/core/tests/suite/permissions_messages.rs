@@ -662,7 +662,7 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
         let workspace_roots = vec![config.cwd.clone(), writable_root_for_config];
         config.workspace_roots = workspace_roots.clone();
         config.permissions.set_workspace_roots(workspace_roots);
-        config.config_layer_stack = ConfigLayerStack::default();
+        config.config_layer_stack = ConfigLayerStack::default().into();
     });
     let test = builder.build(&server).await?;
 

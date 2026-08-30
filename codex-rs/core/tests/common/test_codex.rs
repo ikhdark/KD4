@@ -594,6 +594,7 @@ impl TestCodexBuilder {
                 .await?
             }
         };
+        new_conversation.thread.request_raw_response_items();
 
         Ok(TestCodex {
             home,

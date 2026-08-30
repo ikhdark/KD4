@@ -2661,13 +2661,6 @@ impl TurnTimingState {
         self.begin_guard(GuardKind::Local(phase))
     }
 
-    pub(crate) fn begin_persistence_outside_preparation<'a>(
-        self: &Arc<Self>,
-        preparation: &'a mut Option<TurnTimingGuard>,
-    ) -> TurnPreparationPhaseGuard<'a> {
-        self.begin_phase_outside_preparation(preparation, TurnLocalPhase::Persistence)
-    }
-
     pub(crate) fn begin_request_preparation(
         self: &Arc<Self>,
         preparation: &mut Option<TurnTimingGuard>,

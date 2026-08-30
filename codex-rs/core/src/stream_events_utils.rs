@@ -263,6 +263,29 @@ impl InFlightToolCall {
         }
     }
 
+    /// Retires a deferred call that must never reach its handler.
+    ///
+    /// A deferred tool is admitted only after the provider response tail closes
+    /// successfully. When the tail ends in a terminal stream error or a cancellation, the
+    /// call is retired with a model-visible failure output instead of being executed, so the
+    /// history still pairs every call with an output while no side effect is performed.
+    pub(crate) fn into_unexecuted_result(self, message: String) -> InFlightToolResult {
+        let response = crate::tools::parallel::ToolCallRuntime::failure_response_for_message(
+            &self.call, message,
+        );
+        self.timing.mark_relay_enqueue();
+        if let Some(turn_timing_state) = self.timing.turn_timing_state() {
+            reconcile_turn_progress_event(&turn_timing_state, 1, "relay enqueue");
+        }
+        InFlightToolResult {
+            call: self.call,
+            call_id: self.call_id,
+            execution_id: self.execution_id,
+            timing: self.timing,
+            result: Ok(ToolCallCompletion::nonterminal(response)),
+        }
+    }
+
     pub(crate) async fn into_future(self) -> InFlightToolResult {
         let result = self.future.await;
         self.timing.mark_relay_enqueue();
@@ -660,6 +683,17 @@ pub(crate) async fn handle_output_item_done(
                     ctx.sess
                         .emit_turn_item_started(&ctx.turn_context, &finalized_turn_item.turn_item)
                         .await;
+                    // S1: this item never streamed live, either because a turn-item
+                    // contributor may rewrite assistant text or because the provider sent no
+                    // `OutputItemAdded`. Replay the finalized text as a delta so a client
+                    // still observes started -> delta -> completed, and so the deltas it sees
+                    // agree with the contributed item rather than the pre-contribution text.
+                    emit_finalized_assistant_text_replay(
+                        ctx.sess.as_ref(),
+                        &ctx.turn_context,
+                        &finalized_turn_item.turn_item,
+                    )
+                    .await;
                 }
 
                 ctx.sess
@@ -761,6 +795,44 @@ pub(crate) async fn handle_non_tool_response_item(
         }
         _ => None,
     }
+}
+
+/// Emits the finalized assistant text of an item that was never streamed live.
+///
+/// Clients treat assistant text as an incremental stream. An item that produced no deltas
+/// would otherwise appear only at completion, so replay its finalized text as one delta
+/// between the started and completed events. Items with no visible text emit nothing.
+async fn emit_finalized_assistant_text_replay(
+    sess: &Session,
+    turn_context: &TurnContext,
+    turn_item: &TurnItem,
+) {
+    let TurnItem::AgentMessage(agent_message) = turn_item else {
+        return;
+    };
+    let text = agent_message
+        .content
+        .iter()
+        .map(|content| match content {
+            codex_protocol::items::AgentMessageContent::Text { text } => text.as_str(),
+        })
+        .collect::<String>();
+    if text.is_empty() {
+        return;
+    }
+    sess.send_event(
+        turn_context,
+        codex_protocol::protocol::EventMsg::AgentMessageContentDelta(
+            codex_protocol::protocol::AgentMessageContentDeltaEvent {
+                thread_id: sess.thread_id.to_string(),
+                turn_id: turn_context.sub_id.clone(),
+                item_id: turn_item.id(),
+                delta: text,
+                memory_citation: None,
+            },
+        ),
+    )
+    .await;
 }
 
 pub(crate) async fn finalize_turn_item(

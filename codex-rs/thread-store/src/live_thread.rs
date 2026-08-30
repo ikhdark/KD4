@@ -11,10 +11,10 @@ use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutPersistenceTelemetry;
 use codex_rollout::measure_and_filter_rollout_items;
 use codex_rollout::persisted_rollout_items;
+use codex_rollout::should_persist_event_msg;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::LoadThreadHistoryParams;
 use crate::LocalThreadStore;
@@ -276,6 +276,10 @@ impl LiveThread {
         self.append_items_with_durability(raw_items, false).await
     }
 
+    pub fn should_persist_event(&self, event: &EventMsg) -> bool {
+        should_persist_event_msg(event, self.history_mode)
+    }
+
     async fn append_items_with_durability(
         &self,
         raw_items: &[RolloutItem],
@@ -292,18 +296,6 @@ impl LiveThread {
         } else {
             (persisted_rollout_items(raw_items, self.history_mode), None)
         };
-        let terminal_append =
-            TerminalAppendGuard::new(Arc::clone(&self.terminal_events), items.as_slice());
-        let params = AppendThreadItemsParams {
-            thread_id: self.thread_id,
-            items: raw_items.to_vec(),
-        };
-        if durable {
-            self.thread_store.append_items(params).await?;
-        } else {
-            self.thread_store.append_items_ordered(params).await?;
-        }
-        terminal_append.commit(items.as_slice());
         if let Some(measurement) = measurement.as_ref() {
             self.persistence_telemetry
                 .record_batch(raw_items, measurement);
@@ -311,6 +303,18 @@ impl LiveThread {
         if items.is_empty() {
             return Ok(());
         }
+        let terminal_append =
+            TerminalAppendGuard::new(Arc::clone(&self.terminal_events), items.as_slice());
+        if durable {
+            self.thread_store
+                .append_persisted_items(self.thread_id, items.as_slice())
+                .await?;
+        } else {
+            self.thread_store
+                .append_persisted_items_ordered(self.thread_id, items.as_slice())
+                .await?;
+        }
+        terminal_append.commit(items.as_slice());
         let update = self
             .metadata_sync
             .lock()

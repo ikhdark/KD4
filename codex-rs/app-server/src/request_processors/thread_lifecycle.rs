@@ -536,6 +536,11 @@ pub(super) async fn ensure_conversation_listener_for_instance(
             )));
         }
     };
+    if raw_events_enabled {
+        // Tell the producer a consumer exists before the listener starts, so no raw event is
+        // suppressed for a subscriber that asked for them.
+        conversation.request_raw_response_items();
+    }
     if let Err(error) = ensure_listener_task_running(
         listener_task_context.clone(),
         conversation_id,
@@ -683,15 +688,14 @@ pub(super) async fn ensure_listener_task_running(
                         }
                     };
 
-                    thread_state
-                        .lock()
-                        .await
-                        .track_current_turn_event(&event.id, &event.msg);
-                    let active_turn_id = thread_state
-                        .lock()
-                        .await
-                        .open_turn_id()
-                        .map(str::to_owned);
+                    let (active_turn_id, raw_events_enabled) = {
+                        let mut state = thread_state.lock().await;
+                        state.track_current_turn_event(&event.id, &event.msg);
+                        (
+                            state.open_turn_id().map(str::to_owned),
+                            state.experimental_raw_events,
+                        )
+                    };
                     release_turn_start_for_event(
                         &thread_state_manager,
                         conversation_id,
@@ -700,16 +704,13 @@ pub(super) async fn ensure_listener_task_running(
                         active_turn_id.as_deref(),
                     )
                     .await;
-                    let raw_events_enabled = thread_state.lock().await.experimental_raw_events;
                     if matches!(&event.msg, EventMsg::RawResponseItem(_)) && !raw_events_enabled {
                         continue;
                     }
-                    let subscribed_connection_ids = thread_state_manager
-                        .subscribed_connection_ids(conversation_id)
-                        .await;
-                    let experimental_api_connection_ids = thread_state_manager
-                        .experimental_api_connection_ids(conversation_id)
-                        .await;
+                    let (subscribed_connection_ids, experimental_api_connection_ids) =
+                        thread_state_manager
+                            .connection_ids_for_thread(conversation_id)
+                            .await;
                     let thread_outgoing =
                         ThreadScopedOutgoingMessageSender::new_with_experimental_api_connections(
                         outgoing_for_task.clone(),
@@ -719,7 +720,7 @@ pub(super) async fn ensure_listener_task_running(
                     );
 
                     apply_bespoke_event_handling(
-                        event.clone(),
+                        event,
                         conversation_id,
                         conversation.clone(),
                         thread_manager.clone(),

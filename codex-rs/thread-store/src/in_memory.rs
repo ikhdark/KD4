@@ -58,6 +58,9 @@ mod tests {
     use crate::ThreadPersistenceMetadata;
     use crate::ThreadSortKey;
     use codex_protocol::models::BaseInstructions;
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::TurnCompleteEvent;
@@ -145,6 +148,71 @@ mod tests {
         ));
         assert!(missing.is_none());
         assert_eq!(store.calls().await.load_history, 0);
+    }
+
+    #[tokio::test]
+    async fn live_thread_rejects_transient_items_before_calling_the_store() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let thread_id = ThreadId::default();
+        let live_thread = LiveThread::create(
+            store.clone(),
+            create_thread_params(thread_id, ThreadHistoryMode::Legacy),
+        )
+        .await
+        .expect("create live thread");
+
+        live_thread
+            .append_items(&[RolloutItem::EventMsg(EventMsg::ShutdownComplete)])
+            .await
+            .expect("ignore transient event");
+
+        assert_eq!(store.calls().await.append_items_requests, 0);
+    }
+
+    /// N16 regression: a durable append must reach the store through the borrowed
+    /// already-filtered API. The owned `AppendThreadItemsParams` path copies every raw item
+    /// before the store can apply the persistence policy, so taking it means the batch was
+    /// deep-cloned an extra time on the way to disk.
+    #[tokio::test]
+    async fn durable_items_reach_the_store_without_an_extra_owned_copy() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let thread_id = ThreadId::default();
+        let live_thread = LiveThread::create(
+            store.clone(),
+            create_thread_params(thread_id, ThreadHistoryMode::Legacy),
+        )
+        .await
+        .expect("create live thread");
+
+        let durable = RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("x".repeat(4096)),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        });
+
+        live_thread
+            .append_items_ordered(std::slice::from_ref(&durable))
+            .await
+            .expect("append durable item");
+
+        let calls = store.calls().await;
+        assert_eq!(
+            calls.append_borrowed_item_batches, 1,
+            "durable appends must use the borrowed already-filtered store API"
+        );
+        assert_eq!(
+            calls.append_owned_item_batches, 0,
+            "durable appends must not copy the raw batch into an owned request"
+        );
+        assert_eq!(
+            calls.owned_items_copied, 0,
+            "no rollout item may be copied into an owned request batch"
+        );
+        assert_eq!(calls.append_items_ordered, 1);
     }
 
     #[tokio::test]
@@ -411,6 +479,13 @@ pub struct InMemoryThreadStoreCalls {
     pub append_items_requests: usize,
     pub append_items: usize,
     pub append_items_ordered: usize,
+    /// Appends that arrived through the owned [`AppendThreadItemsParams`] API, which copies
+    /// every raw item before the store can apply the persistence policy.
+    pub append_owned_item_batches: usize,
+    /// Appends that arrived through the borrowed already-filtered API.
+    pub append_borrowed_item_batches: usize,
+    /// Rollout items the store had to copy out of an owned request batch.
+    pub owned_items_copied: usize,
     pub persist_thread: usize,
     pub flush_thread: usize,
     pub shutdown_thread: usize,
@@ -546,6 +621,8 @@ impl InMemoryThreadStore {
         }
         let mut state = self.state.lock().await;
         state.calls.append_items_requests += 1;
+        state.calls.append_owned_item_batches += 1;
+        state.calls.owned_items_copied += params.items.len();
         let history_mode = history_mode_from_state(&state, params.thread_id);
         let persisted_items = persisted_rollout_items(params.items.as_slice(), history_mode);
         if persisted_items.is_empty() {
@@ -560,6 +637,30 @@ impl InMemoryThreadStore {
             .entry(params.thread_id)
             .or_default()
             .extend(persisted_items);
+        Ok(())
+    }
+
+    async fn append_persisted_items_with_ordering(
+        &self,
+        thread_id: ThreadId,
+        items: &[RolloutItem],
+        ordered: bool,
+    ) -> ThreadStoreResult<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.state.lock().await;
+        state.calls.append_items_requests += 1;
+        state.calls.append_borrowed_item_batches += 1;
+        state.calls.append_items += 1;
+        if ordered {
+            state.calls.append_items_ordered += 1;
+        }
+        state
+            .histories
+            .entry(thread_id)
+            .or_default()
+            .extend_from_slice(items);
         Ok(())
     }
 
@@ -693,6 +794,26 @@ impl ThreadStore for InMemoryThreadStore {
     fn append_items_ordered(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(InMemoryThreadStore::append_items_with_ordering(
             self, params, true,
+        ))
+    }
+
+    fn append_persisted_items<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        items: &'a [RolloutItem],
+    ) -> ThreadStoreFuture<'a, ()> {
+        Box::pin(InMemoryThreadStore::append_persisted_items_with_ordering(
+            self, thread_id, items, false,
+        ))
+    }
+
+    fn append_persisted_items_ordered<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        items: &'a [RolloutItem],
+    ) -> ThreadStoreFuture<'a, ()> {
+        Box::pin(InMemoryThreadStore::append_persisted_items_with_ordering(
+            self, thread_id, items, true,
         ))
     }
 

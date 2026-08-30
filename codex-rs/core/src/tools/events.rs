@@ -880,10 +880,8 @@ async fn emit_exec_end(
                 }
                 None => None,
             };
-            let workspace_changed = match (baseline.as_ref(), current.as_ref()) {
-                (Some(Some(before)), Some(after)) => Some(before != after),
-                _ => None,
-            };
+            let workspace_changed =
+                observed_workspace_identity_changed(baseline.as_ref(), current.as_ref());
             observed_workspace_identity = current;
             crate::turn_diff_tracker::resolve_uncertain_command_observation(workspace_changed)
         };
@@ -1027,6 +1025,13 @@ async fn emit_exec_end(
         .await;
 }
 
+fn observed_workspace_identity_changed(
+    baseline: Option<&Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
+    current: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
+) -> Option<bool> {
+    baseline.map(|baseline| baseline.as_ref() != current)
+}
+
 fn workspace_identity_capture_required(
     required: bool,
     observed: Option<&crate::git_workspace::WorkspaceEvidenceIdentity>,
@@ -1164,6 +1169,15 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
+
+    #[test]
+    fn authoritative_non_git_uncertain_command_identity_is_unchanged() {
+        assert_eq!(
+            observed_workspace_identity_changed(Some(&None), None),
+            Some(false)
+        );
+        assert_eq!(observed_workspace_identity_changed(None, None), None);
+    }
 
     async fn enable_typed_task_for_repo(
         session: &mut Arc<Session>,

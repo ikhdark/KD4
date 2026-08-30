@@ -40,6 +40,39 @@ enum NextProjectRead {
     },
 }
 
+#[tokio::test]
+async fn project_root_markers_recover_after_cache_poisoning_and_are_reused() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let config = Arc::new(
+        ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(temp.path().to_path_buf()))
+            .build()
+            .await
+            .expect("config"),
+    );
+    let manager = AgentsMdManager::new(None);
+    let poisoning = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _cache = manager
+            .project_root_markers_cache
+            .lock()
+            .expect("unpoisoned project root marker cache");
+        panic!("poison project root marker cache");
+    }));
+    assert!(poisoning.is_err());
+
+    let first = manager.project_root_markers(config.as_ref());
+    let second = manager.project_root_markers(config.as_ref());
+
+    assert!(Arc::ptr_eq(&first, &second));
+
+    let replacement = Arc::new((*config).clone());
+    let replacement_markers = manager.project_root_markers(replacement.as_ref());
+    assert_eq!(first.as_ref(), replacement_markers.as_ref());
+    assert!(Arc::ptr_eq(&first, &replacement_markers));
+}
+
 struct ControlledFileSystem {
     target: AbsolutePathBuf,
     next_project_read: StdMutex<NextProjectRead>,

@@ -163,6 +163,10 @@ pub struct TurnContext {
     pub(crate) sub_id: String,
     pub(crate) trace_id: Option<String>,
     pub config: Arc<Config>,
+    /// Deduplicated workspace roots are immutable for the lifetime of a turn.
+    /// Keeping one shared projection avoids rebuilding and cloning the list for
+    /// every tool attempt and context projection.
+    pub(crate) effective_workspace_roots: Arc<[AbsolutePathBuf]>,
     /// Fully resolved instructions for this turn. Keeping the rendered text on
     /// the turn avoids rebuilding it during token-estimate and retry paths.
     pub(crate) base_instructions: Arc<BaseInstructions>,
@@ -218,6 +222,26 @@ enum TurnMultiAgentRuntime {
     Preview,
 }
 
+/// Only fields below are rewritten by [`Session::build_per_turn_config`].
+/// Comparing this projection is sufficient to decide whether its clone still
+/// represents the base config, without walking unrelated config maps and layer
+/// data. The layer-stack identity guards the same projection when it is used to
+/// reuse the prior turn's effective config after a config reload.
+fn same_turn_config_projection(left: &Config, right: &Config) -> bool {
+    Arc::ptr_eq(&left.config_layer_stack, &right.config_layer_stack)
+        && left.cwd == right.cwd
+        && left.model == right.model
+        && left.workspace_roots == right.workspace_roots
+        && left.permissions == right.permissions
+        && left.model_reasoning_effort == right.model_reasoning_effort
+        && left.model_reasoning_summary == right.model_reasoning_summary
+        && left.service_tier == right.service_tier
+        && left.personality == right.personality
+        && left.approvals_reviewer == right.approvals_reviewer
+        && left.web_search_mode == right.web_search_mode
+        && left.features == right.features
+}
+
 impl TurnContext {
     pub(crate) async fn queue_post_tool_contexts(
         &self,
@@ -264,6 +288,10 @@ impl TurnContext {
     /// preserves the session's explicit legacy fallback.
     pub(crate) fn cwd(&self) -> &AbsolutePathBuf {
         &self.config.cwd
+    }
+
+    pub(crate) fn effective_workspace_roots(&self) -> &[AbsolutePathBuf] {
+        &self.effective_workspace_roots
     }
 
     /// Returns the selected environment cwd without projecting foreign paths
@@ -507,11 +535,13 @@ impl TurnContext {
                 tracing::warn!(%error, "model refresh failed; retaining the current turn catalog");
                 Arc::clone(&self.available_models)
             });
+        let effective_workspace_roots = config.effective_workspace_roots().into();
 
         Self {
             sub_id: self.sub_id.clone(),
             trace_id: self.trace_id.clone(),
             config: Arc::new(config),
+            effective_workspace_roots,
             base_instructions: Arc::new(BaseInstructions {
                 text: model_info.base_instructions.clone(),
             }),
@@ -592,7 +622,6 @@ impl TurnContext {
             permissions: permissions.into(),
             cwd: Some(cwd.clone()),
             workspace_roots: self
-                .config
                 .effective_workspace_roots()
                 .iter()
                 .map(PathUri::from_abs_path)
@@ -621,12 +650,12 @@ impl TurnContext {
     }
 
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
-        let workspace_roots = self.config.effective_workspace_roots();
+        let workspace_roots = self.effective_workspace_roots();
         let cwd = self.cwd().clone();
         TurnContextItem {
             turn_id: Some(self.sub_id.clone()),
             cwd,
-            workspace_roots: (!workspace_roots.is_empty()).then_some(workspace_roots),
+            workspace_roots: (!workspace_roots.is_empty()).then(|| workspace_roots.to_vec()),
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
             approval_policy: self.approval_policy.value(),
@@ -718,7 +747,7 @@ impl Session {
             );
         }
         per_turn_config.features = config.features.clone();
-        if per_turn_config == *config {
+        if same_turn_config_projection(&per_turn_config, &config) {
             config
         } else {
             Arc::new(per_turn_config)
@@ -801,10 +830,12 @@ impl Session {
         let base_instructions = Arc::new(BaseInstructions {
             text: model_info.base_instructions.clone(),
         });
+        let effective_workspace_roots = per_turn_config.effective_workspace_roots().into();
         TurnContext {
             sub_id,
             trace_id: current_span_trace_id(),
             config: per_turn_config,
+            effective_workspace_roots,
             base_instructions,
             auth_manager: auth_manager_for_context,
             model_info,
@@ -1090,7 +1121,9 @@ impl Session {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match cached.as_ref() {
-                Some(previous) if previous.as_ref() == per_turn_config.as_ref() => {
+                Some(previous)
+                    if same_turn_config_projection(previous.as_ref(), per_turn_config.as_ref()) =>
+                {
                     Arc::clone(previous)
                 }
                 _ => {

@@ -38,6 +38,51 @@ async fn process_compacted_history_with_test_session(
 }
 
 #[tokio::test]
+async fn compaction_reuses_a_generation_workspace_identity_without_recapturing_git() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let prefetched = session
+        .services
+        .git_workspace
+        .workspace_evidence_identity(turn_context.config.cwd.as_path())
+        .await;
+    let captures_before = session
+        .services
+        .git_workspace
+        .workspace_evidence_capture_count();
+
+    let resolved =
+        workspace_identity_for_compaction(&session, &turn_context, Some(&prefetched)).await;
+
+    assert_eq!(resolved, prefetched);
+    assert_eq!(
+        session
+            .services
+            .git_workspace
+            .workspace_evidence_capture_count(),
+        captures_before,
+        "mid-turn compaction must reuse the generation-boundary identity"
+    );
+}
+
+#[test]
+fn inline_compaction_reuses_the_supplied_client_session_without_creating_one() {
+    let mut supplied_session = 17_u8;
+    let mut create_called = false;
+
+    {
+        let mut selected =
+            reuse_or_create_compaction_client_session(Some(&mut supplied_session), || {
+                create_called = true;
+                99
+            });
+        *selected.as_mut() = 23;
+    }
+
+    assert!(!create_called);
+    assert_eq!(supplied_session, 23);
+}
+
+#[tokio::test]
 async fn compaction_initial_context_carries_only_delivered_world_state_snapshot() {
     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
     let mut world_state = WorldState::default();
@@ -570,22 +615,46 @@ fn final_bounded_compaction_preserves_all_required_sections() {
 }
 
 #[test]
-fn compaction_section_allocations_fit_without_final_blind_cut() {
+fn compaction_section_allocations_preserve_evidence_and_next_action_under_pressure() {
+    let evidence_sentinel = "EVIDENCE-RETENTION-SENTINEL";
+    let next_action_sentinel = "NEXT-ACTION-RETENTION-SENTINEL";
     let generated = format!(
         "{}\n{}",
         "preamble ".repeat(1_000),
         COMPACTION_SECTIONS
             .iter()
-            .map(|(heading, _)| format!("{heading}\n{}", "bounded content ".repeat(1_000)))
+            .map(|(heading, _)| {
+                let sentinel = match *heading {
+                    EVIDENCE_HEADING => evidence_sentinel,
+                    NEXT_ACTION_HEADING => next_action_sentinel,
+                    _ => "SECTION-RETENTION-SENTINEL",
+                };
+                format!(
+                    "{heading}\n{sentinel}\n{}",
+                    "bounded content ".repeat(1_000)
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n\n")
+    );
+
+    let undersized_summary = truncate_compaction_summary(&generated, 1_800);
+    assert!(
+        !undersized_summary.contains(next_action_sentinel),
+        "pressure fixture no longer reproduces the former task-state budget loss"
     );
 
     let summary = truncate_compaction_summary(&generated, COMPACT_TASK_STATE_MAX_TOKENS);
 
     assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
-    assert!(summary.contains(NEXT_ACTION_HEADING));
-    assert!(section_has_nonempty_body(&summary, NEXT_ACTION_HEADING));
+    assert!(
+        summary.contains(evidence_sentinel),
+        "bounded checkpoint lost meaningful Evidence content: {summary}"
+    );
+    assert!(
+        summary.contains(next_action_sentinel),
+        "bounded checkpoint lost meaningful Next action content: {summary}"
+    );
 }
 
 #[test]

@@ -10,6 +10,7 @@ use super::response_item_may_include_external_context;
 use super::tool_call_arguments_length;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_rx;
 use crate::tools::ToolRouter;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -34,6 +35,7 @@ use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
 use codex_tools::ToolName;
 use codex_tools::ToolPayload;
@@ -461,6 +463,66 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
             "type": "tool_search_error",
             "message": "failed to parse function arguments: invalid type: integer `42`, expected a string",
         })]
+    );
+}
+
+#[tokio::test]
+async fn unstreamed_contributed_assistant_item_replays_finalized_text_between_lifecycle_events() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.turn_item_contributor(Arc::new(RewriteAgentMessageContributor));
+    Arc::get_mut(&mut session)
+        .expect("test session should be uniquely owned")
+        .services
+        .extensions = Arc::new(builder.build());
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let router = Arc::new(ToolRouter::from_context(
+        step_context.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            mcp_tools: None,
+            deferred_mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: turn_context.dynamic_tools.as_slice(),
+            exposure_identity: Default::default(),
+        },
+        &Default::default(),
+    ));
+    let step_context = step_context.with_tool_router_for_test(router);
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let tool_runtime = ToolCallRuntime::new(Arc::clone(&session), step_context, tracker);
+    let mut ctx = HandleOutputCtx {
+        sess: session,
+        turn_context: Arc::clone(&turn_context),
+        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+        tool_runtime,
+        cancellation_token: CancellationToken::new(),
+        response_item_recorder: OrderedResponseItemRecorder::default(),
+    };
+
+    handle_output_item_done(
+        &mut ctx,
+        assistant_output_text("original assistant text"),
+        /*previously_active_item*/ None,
+        &mut true,
+    )
+    .await
+    .expect("assistant message should complete");
+
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let Some(event) = match event.msg {
+            EventMsg::ItemStarted(_) => Some("started".to_string()),
+            EventMsg::AgentMessageContentDelta(event) => Some(format!("delta:{}", event.delta)),
+            EventMsg::ItemCompleted(_) => Some("completed".to_string()),
+            _ => None,
+        } {
+            events.push(event);
+        }
+    }
+    assert_eq!(
+        events,
+        ["started", "delta:contributed assistant text", "completed"]
     );
 }
 

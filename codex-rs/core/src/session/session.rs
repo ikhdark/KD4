@@ -414,6 +414,13 @@ pub(crate) struct Session {
     pub(crate) terminal_interaction_pending: std::sync::atomic::AtomicBool,
     /// Prevents terminal cleanup from waking queued work after shutdown begins.
     pub(crate) shutting_down: std::sync::atomic::AtomicBool,
+    /// Whether any attached consumer asked for `RawResponseItem` events.
+    ///
+    /// Raw events mirror every recorded history item, so producing them clones each tool
+    /// output and spends a bounded event-channel slot. Consumers opt in per thread and the
+    /// flag is monotonic for the thread's lifetime, matching the app-server's own
+    /// `experimental_raw_events` semantics.
+    pub(crate) raw_response_items_requested: std::sync::atomic::AtomicBool,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
@@ -1647,6 +1654,7 @@ impl Session {
                 terminal_tasks: tokio_util::task::TaskTracker::new(),
                 terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
+                raw_response_items_requested: std::sync::atomic::AtomicBool::new(false),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,

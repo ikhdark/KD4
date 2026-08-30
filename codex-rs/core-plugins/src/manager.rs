@@ -65,7 +65,6 @@ use codex_config::types::ToolSuggestDiscoverableType;
 use codex_core_skills::PluginSkillSnapshots;
 use codex_core_skills::SkillMetadata;
 use codex_core_skills::config_rules::SkillConfigRules;
-use codex_core_skills::config_rules::skill_config_rules_from_stack;
 use codex_hooks::plugin_hook_declarations;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
@@ -88,7 +87,6 @@ use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -107,7 +105,7 @@ const FEATURED_PLUGIN_IDS_CACHE_TTL: std::time::Duration =
 
 #[derive(Debug, Clone)]
 pub struct PluginsConfigInput {
-    pub config_layer_stack: ConfigLayerStack,
+    pub config_layer_stack: Arc<ConfigLayerStack>,
     pub plugins_enabled: bool,
     pub remote_plugin_enabled: bool,
     pub chatgpt_base_url: String,
@@ -116,7 +114,7 @@ pub struct PluginsConfigInput {
 
 impl PluginsConfigInput {
     pub fn new(
-        config_layer_stack: ConfigLayerStack,
+        config_layer_stack: impl Into<Arc<ConfigLayerStack>>,
         plugins_enabled: bool,
         remote_plugin_enabled: bool,
         chatgpt_base_url: String,
@@ -131,14 +129,14 @@ impl PluginsConfigInput {
     }
 
     pub fn new_with_http_client_factory(
-        config_layer_stack: ConfigLayerStack,
+        config_layer_stack: impl Into<Arc<ConfigLayerStack>>,
         plugins_enabled: bool,
         remote_plugin_enabled: bool,
         chatgpt_base_url: String,
         http_client_factory: HttpClientFactory,
     ) -> Self {
         Self {
-            config_layer_stack,
+            config_layer_stack: config_layer_stack.into(),
             plugins_enabled,
             remote_plugin_enabled,
             chatgpt_base_url,
@@ -413,6 +411,8 @@ pub struct PluginsManager {
 struct LoadedPluginsCacheEntry {
     key: PluginLoadCacheKey,
     plugins: Vec<LoadedPlugin>,
+    resolved_auth_mode: Option<AuthMode>,
+    resolved_outcome: PluginLoadOutcome,
     plugin_skill_snapshots: PluginSkillSnapshots,
 }
 
@@ -422,25 +422,27 @@ struct LoadedPluginsCache {
     entry: Option<LoadedPluginsCacheEntry>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug)]
+struct ConfigLayerStackIdentity(Arc<ConfigLayerStack>);
+
+impl PartialEq for ConfigLayerStackIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ConfigLayerStackIdentity {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PluginLoadCacheKey {
-    configured_plugins: HashMap<String, PluginConfig>,
-    skill_config_rules: SkillConfigRules,
+    config_layer_stack: ConfigLayerStackIdentity,
     remote_global_catalog_active: bool,
 }
 
 impl PluginLoadCacheKey {
-    fn from_config(
-        config: &PluginsConfigInput,
-        codex_home: &Path,
-        remote_global_catalog_active: bool,
-    ) -> Self {
+    fn from_config(config: &PluginsConfigInput, remote_global_catalog_active: bool) -> Self {
         Self {
-            configured_plugins: configured_plugins_from_stack(
-                &config.config_layer_stack,
-                codex_home,
-            ),
-            skill_config_rules: skill_config_rules_from_stack(&config.config_layer_stack),
+            config_layer_stack: ConfigLayerStackIdentity(Arc::clone(&config.config_layer_stack)),
             remote_global_catalog_active,
         }
     }
@@ -467,6 +469,23 @@ fn retain_first_active_plugin_mcp_server_by_name(plugins: &mut [LoadedPlugin]) {
             false
         });
     }
+}
+
+fn resolve_loaded_plugins_for_auth_mode(
+    mut plugins: Vec<LoadedPlugin>,
+    auth_mode: Option<AuthMode>,
+) -> PluginLoadOutcome {
+    for plugin in &mut plugins {
+        let plugin_active = plugin.is_active();
+        apply_app_mcp_routing_policy(
+            &mut plugin.apps,
+            &mut plugin.mcp_servers,
+            auth_mode,
+            plugin_active,
+        );
+    }
+    retain_first_active_plugin_mcp_server_by_name(&mut plugins);
+    PluginLoadOutcome::from_plugins(plugins)
 }
 
 impl PluginsManager {
@@ -574,11 +593,8 @@ impl PluginsManager {
         if !config.plugins_enabled {
             return None;
         }
-        let key = PluginLoadCacheKey::from_config(
-            config,
-            self.codex_home.as_path(),
-            self.remote_global_catalog_active(config),
-        );
+        let key =
+            PluginLoadCacheKey::from_config(config, self.remote_global_catalog_active(config));
         self.loaded_plugins_cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -608,21 +624,17 @@ impl PluginsManager {
         }
 
         let remote_global_catalog_active = self.remote_global_catalog_active(config);
-        let cache_key = PluginLoadCacheKey::from_config(
-            config,
-            self.codex_home.as_path(),
-            remote_global_catalog_active,
-        );
-        if !force_reload && let Some(plugins) = self.cached_loaded_plugins(&cache_key) {
-            return self.resolve_loaded_plugins_for_auth(plugins);
+        let cache_key = PluginLoadCacheKey::from_config(config, remote_global_catalog_active);
+        if !force_reload && let Some(outcome) = self.cached_plugin_outcome(&cache_key) {
+            return outcome;
         }
 
         let Ok(_load_permit) = self.loaded_plugins_load_semaphore.acquire().await else {
             warn!("plugin load semaphore closed");
             return PluginLoadOutcome::default();
         };
-        if !force_reload && let Some(plugins) = self.cached_loaded_plugins(&cache_key) {
-            return self.resolve_loaded_plugins_for_auth(plugins);
+        if !force_reload && let Some(outcome) = self.cached_plugin_outcome(&cache_key) {
+            return outcome;
         }
         let cache_generation = self.loaded_plugins_cache_generation();
         let plugin_skill_snapshots = PluginSkillSnapshots::for_plugin_load();
@@ -636,28 +648,21 @@ impl PluginsManager {
         )
         .await;
         log_plugin_load_errors(&plugins);
+        let resolved_auth_mode = self.auth_mode();
+        let outcome = resolve_loaded_plugins_for_auth_mode(plugins.clone(), resolved_auth_mode);
         self.cache_loaded_plugins_if_current(
             cache_generation,
             cache_key,
-            plugins.clone(),
+            plugins,
+            resolved_auth_mode,
+            outcome.clone(),
             plugin_skill_snapshots,
         );
-        self.resolve_loaded_plugins_for_auth(plugins)
+        outcome
     }
 
-    fn resolve_loaded_plugins_for_auth(&self, mut plugins: Vec<LoadedPlugin>) -> PluginLoadOutcome {
-        let auth_mode = self.auth_mode();
-        for plugin in &mut plugins {
-            let plugin_active = plugin.is_active();
-            apply_app_mcp_routing_policy(
-                &mut plugin.apps,
-                &mut plugin.mcp_servers,
-                auth_mode,
-                plugin_active,
-            );
-        }
-        retain_first_active_plugin_mcp_server_by_name(&mut plugins);
-        PluginLoadOutcome::from_plugins(plugins)
+    fn resolve_loaded_plugins_for_auth(&self, plugins: Vec<LoadedPlugin>) -> PluginLoadOutcome {
+        resolve_loaded_plugins_for_auth_mode(plugins, self.auth_mode())
     }
 
     pub fn clear_cache(&self) {
@@ -779,6 +784,7 @@ impl PluginsManager {
             .effective_plugin_skill_roots()
     }
 
+    #[cfg(test)]
     fn cached_loaded_plugins(&self, key: &PluginLoadCacheKey) -> Option<Vec<LoadedPlugin>> {
         self.loaded_plugins_cache
             .read()
@@ -787,6 +793,21 @@ impl PluginsManager {
             .as_ref()
             .filter(|cached| cached.key == *key)
             .map(|cached| cached.plugins.clone())
+    }
+
+    fn cached_plugin_outcome(&self, key: &PluginLoadCacheKey) -> Option<PluginLoadOutcome> {
+        let auth_mode = self.auth_mode();
+        let mut cache = self
+            .loaded_plugins_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cached = cache.entry.as_mut().filter(|cached| cached.key == *key)?;
+        if cached.resolved_auth_mode != auth_mode {
+            cached.resolved_outcome =
+                resolve_loaded_plugins_for_auth_mode(cached.plugins.clone(), auth_mode);
+            cached.resolved_auth_mode = auth_mode;
+        }
+        Some(cached.resolved_outcome.clone())
     }
 
     fn loaded_plugins_cache_generation(&self) -> u64 {
@@ -801,6 +822,8 @@ impl PluginsManager {
         generation: u64,
         key: PluginLoadCacheKey,
         plugins: Vec<LoadedPlugin>,
+        resolved_auth_mode: Option<AuthMode>,
+        resolved_outcome: PluginLoadOutcome,
         plugin_skill_snapshots: PluginSkillSnapshots,
     ) {
         let mut cache = match self.loaded_plugins_cache.write() {
@@ -811,6 +834,8 @@ impl PluginsManager {
             cache.entry = Some(LoadedPluginsCacheEntry {
                 key,
                 plugins,
+                resolved_auth_mode,
+                resolved_outcome,
                 plugin_skill_snapshots,
             });
         }

@@ -238,20 +238,22 @@ async fn debounced_receiver_flushes_pending_on_shutdown() {
 }
 
 #[tokio::test]
-async fn subscriber_buffer_overflow_requires_a_rescan() {
+async fn subscriber_buffer_overflow_retains_coarse_path_evidence() {
     let (tx, mut rx) = watch_channel();
     let paths = (0..=SUBSCRIBER_PATH_BUFFER_CAPACITY)
-        .map(|index| path(&format!("changed-{index}")))
+        .map(|index| path(&format!("workspace/generated/changed-{index}")))
         .collect::<Vec<_>>();
 
     tx.add_changed_paths(&paths).await;
 
-    assert_eq!(
-        rx.recv().await,
-        Some(FileWatcherEvent {
-            paths: Vec::new(),
-            rescan_required: true,
-        })
+    let event = rx.recv().await.expect("compressed change event");
+    assert!(!event.rescan_required);
+    assert!(event.paths.len() < SUBSCRIBER_PATH_BUFFER_CAPACITY);
+    assert!(
+        event
+            .paths
+            .iter()
+            .any(|changed| path("workspace/generated/changed-0").starts_with(changed))
     );
 }
 
@@ -1116,4 +1118,61 @@ fn reconciliation_requests_are_coalesced_to_one_pending_wakeup() {
         reconcile_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
+}
+
+/// N19: overflowing the path buffer must narrow invalidation to ancestor prefixes instead of
+/// discarding every retained per-path freshness proof for the whole repository.
+#[test]
+fn overflowing_paths_collapse_into_ancestor_prefixes() {
+    let capacity = 4;
+    let mut changed_paths = (0..capacity)
+        .map(|index| {
+            PathBuf::from("repo")
+                .join("src")
+                .join(format!("f{index}.rs"))
+        })
+        .collect::<BTreeSet<PathBuf>>();
+
+    assert!(compress_changed_paths(&mut changed_paths, capacity));
+
+    assert!(
+        changed_paths.len() < capacity,
+        "compression must free room for the next path"
+    );
+    assert!(
+        changed_paths.contains(&PathBuf::from("repo").join("src")),
+        "collapsed entries must cover the files they replaced: {changed_paths:?}"
+    );
+}
+
+/// Compression must never widen past what actually changed.
+#[test]
+fn compression_keeps_unrelated_subtrees_separate() {
+    // Compression stops as soon as the set fits, so a single collapse round leaves the two
+    // subtrees distinct instead of widening to their common parent.
+    let capacity = 3;
+    let mut changed_paths = BTreeSet::from([
+        PathBuf::from("repo").join("a").join("one.rs"),
+        PathBuf::from("repo").join("a").join("two.rs"),
+        PathBuf::from("repo").join("b").join("three.rs"),
+    ]);
+
+    assert!(compress_changed_paths(&mut changed_paths, capacity));
+
+    assert_eq!(
+        changed_paths,
+        BTreeSet::from([
+            PathBuf::from("repo").join("a"),
+            PathBuf::from("repo").join("b"),
+        ]),
+        "sibling subtrees must stay distinct while a shallower representation still fits"
+    );
+}
+
+/// Roots cannot be collapsed any further, so the caller must still be told to fall back.
+#[test]
+fn compression_reports_failure_when_nothing_can_collapse() {
+    let mut changed_paths = BTreeSet::from([PathBuf::from("a"), PathBuf::from("b")]);
+
+    assert!(!compress_changed_paths(&mut changed_paths, 1));
 }

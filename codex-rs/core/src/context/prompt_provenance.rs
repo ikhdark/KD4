@@ -5,7 +5,9 @@ use codex_extension_api::PromptFragmentKind;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
+use serde::Deserialize;
 use serde::Serialize;
+use serde_json::value::RawValue;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
@@ -144,8 +146,24 @@ impl CategorizedPromptFragment {
 type PromptContributionsByItem = Arc<BTreeMap<[u8; 32], Arc<[Option<PromptContextCategory>]>>>;
 
 #[derive(Clone, Debug, Default)]
+pub(crate) struct PromptItemProvenance {
+    categories: Arc<[Option<PromptContextCategory>]>,
+    current_input: bool,
+}
+
+impl PromptItemProvenance {
+    fn new(categories: Vec<Option<PromptContextCategory>>, current_input: bool) -> Self {
+        Self {
+            categories: categories.into(),
+            current_input,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub(crate) struct PromptProvenanceSidecar {
     contributions_by_item: PromptContributionsByItem,
+    aligned_items: Arc<[PromptItemProvenance]>,
     current_turn_id: Option<String>,
     current_input_fingerprint: Option<[u8; 32]>,
 }
@@ -178,29 +196,7 @@ impl PromptProvenanceSidecar {
                 .or_insert(Some(category));
         }
 
-        let mut contributions_by_item = BTreeMap::new();
-        for item in items {
-            let ResponseItem::Message { content, .. } = item else {
-                continue;
-            };
-            let categories = content
-                .iter()
-                .map(|content| match content {
-                    ContentItem::InputText { text } => {
-                        let hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
-                        categories_by_content_hash.get(&hash).copied().flatten()
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if categories.iter().any(Option::is_some)
-                && let Ok(fingerprint) = response_item_fingerprint(item)
-            {
-                contributions_by_item.insert(fingerprint, categories.into());
-            }
-        }
-
-        let current_input = items.iter().rev().find(|item| {
+        let current_input_index = items.iter().rposition(|item| {
             let ResponseItem::Message { role, content, .. } = item else {
                 return false;
             };
@@ -213,13 +209,49 @@ impl PromptProvenanceSidecar {
                     _ => true,
                 })
         });
+        let mut contributions_by_item = BTreeMap::new();
+        let mut aligned_items = Vec::with_capacity(items.len());
+        let mut current_input_fingerprint = None;
+        for (index, item) in items.iter().enumerate() {
+            let ResponseItem::Message { content, .. } = item else {
+                aligned_items.push(PromptItemProvenance::default());
+                continue;
+            };
+            let categories = content
+                .iter()
+                .map(|content| match content {
+                    ContentItem::InputText { text } => {
+                        let hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+                        categories_by_content_hash.get(&hash).copied().flatten()
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let current_input = current_input_index == Some(index);
+            let fingerprint = if prompt_item_requires_fingerprint(&categories, current_input) {
+                response_item_fingerprint(item).ok()
+            } else {
+                None
+            };
+            if categories.iter().any(Option::is_some)
+                && let Some(fingerprint) = fingerprint
+            {
+                contributions_by_item.insert(fingerprint, categories.clone().into());
+            }
+            if current_input {
+                current_input_fingerprint = fingerprint;
+            }
+            aligned_items.push(PromptItemProvenance::new(categories, current_input));
+        }
+
         Self {
             contributions_by_item: Arc::new(contributions_by_item),
-            current_turn_id: current_input
+            aligned_items: aligned_items.into(),
+            current_turn_id: current_input_index
+                .and_then(|index| items.get(index))
                 .and_then(ResponseItem::turn_id)
                 .map(str::to_string),
-            current_input_fingerprint: current_input
-                .and_then(|item| response_item_fingerprint(item).ok()),
+            current_input_fingerprint,
         }
     }
 
@@ -249,11 +281,17 @@ impl PromptProvenanceSidecar {
             return self.clone();
         }
         let mut contributions_by_item = self.contributions_by_item.as_ref().clone();
-        for item in items {
+        let mut aligned_items = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
             let ResponseItem::Message { content, .. } = item else {
+                aligned_items.push(PromptItemProvenance::default());
                 continue;
             };
             let Ok(fingerprint) = response_item_fingerprint(item) else {
+                aligned_items.push(PromptItemProvenance::new(
+                    vec![None; content.len()],
+                    self.is_current_input(item),
+                ));
                 continue;
             };
             let mut categories = contributions_by_item
@@ -275,11 +313,19 @@ impl PromptProvenanceSidecar {
                 }
             }
             if changed {
-                contributions_by_item.insert(fingerprint, categories.into());
+                contributions_by_item.insert(fingerprint, categories.clone().into());
             }
+            aligned_items.push(PromptItemProvenance::new(
+                categories,
+                self.aligned_items
+                    .get(index)
+                    .is_some_and(|item| item.current_input)
+                    || self.is_current_input(item),
+            ));
         }
         Self {
             contributions_by_item: Arc::new(contributions_by_item),
+            aligned_items: aligned_items.into(),
             current_turn_id: self.current_turn_id.clone(),
             current_input_fingerprint: self.current_input_fingerprint,
         }
@@ -300,9 +346,14 @@ impl PromptProvenanceSidecar {
         }
         Self {
             contributions_by_item: Arc::new(contributions_by_item),
+            aligned_items: Arc::clone(&self.aligned_items),
             current_turn_id: self.current_turn_id.clone(),
             current_input_fingerprint: self.current_input_fingerprint,
         }
+    }
+
+    fn aligned_item(&self, index: usize) -> Option<&PromptItemProvenance> {
+        self.aligned_items.get(index)
     }
 
     fn contributions(&self, item: &ResponseItem) -> Option<&[Option<PromptContextCategory>]> {
@@ -367,6 +418,43 @@ impl PromptContextBreakdown {
         for item in items {
             let serialized_item = serde_json::to_vec(item)?;
             breakdown.record_response_item(item, &serialized_item, sidecar)?;
+        }
+        breakdown.record_overhead(
+            PromptContextCategory::OtherInjected,
+            sequence_envelope_bytes(items.len()),
+            b"response_input_array_envelope",
+        );
+        Ok(breakdown)
+    }
+
+    /// Measures response items from the bytes emitted by the transport
+    /// serializer. The sidecar's aligned provenance was established while the
+    /// prompt was assembled, so the diagnostic path does not serialize items
+    /// again merely to recover category identities.
+    pub(crate) fn from_serialized_response_items(
+        items: &[ResponseItem],
+        serialized_items: &[&RawValue],
+        sidecar: &PromptProvenanceSidecar,
+        embedded_base_index: Option<usize>,
+    ) -> serde_json::Result<Self> {
+        if items.len() != serialized_items.len() {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized request input does not match logical input",
+            )));
+        }
+        let aligned_offset = items.len().saturating_sub(sidecar.aligned_items.len());
+        let mut breakdown = Self::default();
+        for (index, (item, raw_item)) in items.iter().zip(serialized_items.iter()).enumerate() {
+            let serialized_item = raw_item.get().as_bytes();
+            if embedded_base_index == Some(index) {
+                breakdown.record_serialized(PromptContextCategory::BaseSystem, serialized_item);
+                continue;
+            }
+            let aligned = index
+                .checked_sub(aligned_offset)
+                .and_then(|index| sidecar.aligned_item(index));
+            breakdown.record_serialized_response_item(item, serialized_item, raw_item, aligned)?;
         }
         breakdown.record_overhead(
             PromptContextCategory::OtherInjected,
@@ -496,6 +584,73 @@ impl PromptContextBreakdown {
         Ok(())
     }
 
+    fn record_serialized_response_item(
+        &mut self,
+        item: &ResponseItem,
+        serialized_item: &[u8],
+        raw_item: &RawValue,
+        provenance: Option<&PromptItemProvenance>,
+    ) -> serde_json::Result<()> {
+        if matches!(item, ResponseItem::AdditionalTools { .. }) {
+            self.record_serialized(PromptContextCategory::ToolSchemas, serialized_item);
+            return Ok(());
+        }
+        let ResponseItem::Message { role, content, .. } = item else {
+            self.record_serialized(PromptContextCategory::History, serialized_item);
+            return Ok(());
+        };
+        let fallback = if role == "user" && provenance.is_some_and(|value| value.current_input) {
+            PromptContextCategory::TaskInput
+        } else if role == "developer" {
+            PromptContextCategory::OtherInjected
+        } else {
+            PromptContextCategory::History
+        };
+        let categories = provenance
+            .map(|value| {
+                value
+                    .categories
+                    .iter()
+                    .map(|category| category.unwrap_or(fallback))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![fallback; content.len()]);
+        let first = categories.first().copied().unwrap_or(fallback);
+        if categories.iter().all(|category| *category == first) {
+            self.record_serialized(first, serialized_item);
+            return Ok(());
+        }
+
+        #[derive(Deserialize)]
+        struct RawMessage<'a> {
+            #[serde(borrow)]
+            content: Vec<&'a RawValue>,
+        }
+
+        let raw_message: RawMessage<'_> = serde_json::from_str(raw_item.get())?;
+        if raw_message.content.len() != content.len() {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized message content does not match logical content",
+            )));
+        }
+        let mut content_bytes = 0_u64;
+        for (serialized_content, category) in raw_message.content.iter().zip(categories) {
+            let serialized_content = serialized_content.get().as_bytes();
+            content_bytes = content_bytes
+                .saturating_add(u64::try_from(serialized_content.len()).unwrap_or(u64::MAX));
+            self.record_serialized(category, serialized_content);
+        }
+        self.record_overhead(
+            PromptContextCategory::OtherInjected,
+            u64::try_from(serialized_item.len())
+                .unwrap_or(u64::MAX)
+                .saturating_sub(content_bytes),
+            b"mixed_message_envelope",
+        );
+        Ok(())
+    }
+
     fn record_overhead(
         &mut self,
         category: PromptContextCategory,
@@ -545,6 +700,13 @@ fn response_item_fingerprint(item: &ResponseItem) -> serde_json::Result<[u8; 32]
     hasher.update((serialized.len() as u64).to_be_bytes());
     hasher.update(serialized);
     Ok(hasher.finalize().into())
+}
+
+fn prompt_item_requires_fingerprint(
+    categories: &[Option<PromptContextCategory>],
+    current_input: bool,
+) -> bool {
+    current_input || categories.iter().any(Option::is_some)
 }
 
 fn category_for_stable_kind(kind: StableContextKind) -> PromptContextCategory {
@@ -620,6 +782,16 @@ mod tests {
         let categorized = CategorizedPromptFragment::from_extension(fragment.clone());
         assert_eq!(categorized.category(), PromptContextCategory::Memory);
         assert_eq!(categorized.into_fragment(), fragment);
+    }
+
+    #[test]
+    fn ordinary_history_does_not_require_a_provenance_fingerprint() {
+        assert!(!prompt_item_requires_fingerprint(&[None, None], false));
+        assert!(prompt_item_requires_fingerprint(&[None], true));
+        assert!(prompt_item_requires_fingerprint(
+            &[Some(PromptContextCategory::Memory)],
+            false
+        ));
     }
 
     #[test]

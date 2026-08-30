@@ -758,6 +758,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn connection_ids_for_thread_captures_both_views_together() {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let regular = ConnectionId(41);
+        let experimental = ConnectionId(42);
+        manager
+            .connection_initialized(regular, ConnectionCapabilities::default())
+            .await;
+        manager
+            .connection_initialized(
+                experimental,
+                ConnectionCapabilities {
+                    experimental_api: true,
+                    ..ConnectionCapabilities::default()
+                },
+            )
+            .await;
+        assert!(
+            manager
+                .try_add_connection_to_thread(thread_id, regular)
+                .await
+        );
+        assert!(
+            manager
+                .try_add_connection_to_thread(thread_id, experimental)
+                .await
+        );
+
+        let (subscribed, experimental_connections) =
+            manager.connection_ids_for_thread(thread_id).await;
+
+        assert_eq!(subscribed.len(), 2);
+        assert!(subscribed.contains(&regular));
+        assert!(subscribed.contains(&experimental));
+        assert_eq!(experimental_connections, vec![experimental]);
+    }
+
     fn terminal_event(turn_id: &str, message: &str) -> EventMsg {
         EventMsg::TurnComplete(codex_protocol::protocol::TurnCompleteEvent {
             turn_id: turn_id.to_string(),
@@ -1527,16 +1565,22 @@ impl ThreadStateManager {
             .unwrap_or_default()
     }
 
-    pub(crate) async fn experimental_api_connection_ids(
+    pub(crate) async fn connection_ids_for_thread(
         &self,
         thread_id: ThreadId,
-    ) -> Vec<ConnectionId> {
+    ) -> (Vec<ConnectionId>, Vec<ConnectionId>) {
         let state = self.state.lock().await;
-        state
-            .threads
-            .get(&thread_id)
-            .into_iter()
-            .flat_map(|thread_entry| thread_entry.connection_ids.iter())
+        let Some(thread_entry) = state.threads.get(&thread_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        let subscribed = thread_entry
+            .connection_ids
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let experimental = thread_entry
+            .connection_ids
+            .iter()
             .filter_map(|connection_id| {
                 state
                     .live_connections
@@ -1544,7 +1588,8 @@ impl ThreadStateManager {
                     .is_some_and(|capabilities| capabilities.experimental_api)
                     .then_some(*connection_id)
             })
-            .collect()
+            .collect();
+        (subscribed, experimental)
     }
 
     pub(crate) async fn connection_supports_experimental_api(

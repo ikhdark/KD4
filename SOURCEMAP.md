@@ -49,7 +49,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 Update it in the same change whenever the repository materially changes.
 
 <!-- BEGIN TRACKED PATH SNAPSHOT -->
-Tracked repository path snapshot: `count=4985 sha256=c6a8ee9f417b8298a373a27eb8147a8c0fb19261ba052c271461cf2e6e3a1158`.
+Tracked repository path snapshot: `count=5000 sha256=ad9e0df19259d0818afa7db5274ecc9000c09aad9a3a09908341921beb3752c7`.
 <!-- END TRACKED PATH SNAPSHOT -->
 
 Every repository file or directory add, delete, move, or rename also requires
@@ -408,6 +408,7 @@ remain required.
 | Focused Rust crate                           | `just test-fast -p <crate>` or the nearest focused recipe/filter                                                                                                                 |
 | App-server protocol/schema                   | focused crate tests plus `just app-server-schema-check`                                                                                                                          |
 | Config schema                                | focused config/core tests plus `just config-schema-check`                                                                                                                        |
+| Adaptive-reasoning config and sampling       | `just adaptive-reasoning-contract-check`                                                                                                                                         |
 | Thread-config protobuf                       | `just generate-config-proto-check`                                                                                                                                               |
 | Hooks/schema                                 | focused hook tests; run `just write-hooks-schema` only for intentional regeneration                                                                                              |
 | TypeScript SDK                               | `just sdk-ts-check`                                                                                                                                                              |

@@ -9,6 +9,7 @@ use crate::responses_stream::ResponsesEventInterpreter;
 use crate::responses_stream::ResponsesStreamMetadata;
 use crate::responses_stream::json_headers_to_http_headers;
 use crate::telemetry::WebsocketTelemetry;
+use bytes::Bytes;
 use codex_client::TransportError;
 use codex_http_client::HttpClientFactory;
 use codex_websocket_client::WebSocketConnection;
@@ -31,6 +32,7 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -383,7 +385,7 @@ impl ResponsesWebsocketConnection {
         connection_reused: bool,
         turn_state: Option<Arc<OnceLock<String>>>,
         queue_started: impl FnOnce(),
-        dispatch_ready: impl FnOnce(u64) + Send + 'static,
+        dispatch_ready: impl FnOnce(Bytes) + Send + 'static,
         stream_established: impl FnOnce() + Send + 'static,
     ) -> Result<ResponseStream, ApiError> {
         let (tx_event, rx_event) =
@@ -394,7 +396,7 @@ impl ResponsesWebsocketConnection {
         let upstream_request_id = metadata.upstream_request_id().map(str::to_string);
         let telemetry = self.telemetry.clone();
         let request_text = serialize_websocket_request(request)?;
-        let encoded_request_bytes = u64::try_from(request_text.len()).unwrap_or(u64::MAX);
+        let encoded_request: Bytes = request_text.clone().into();
         let (tx_send_complete, rx_send_complete) = oneshot::channel();
         queue_started();
 
@@ -417,7 +419,7 @@ impl ResponsesWebsocketConnection {
                         return;
                     };
 
-                    dispatch_ready(encoded_request_bytes);
+                    dispatch_ready(encoded_request);
                     let send_result = send_websocket_request(
                         ws_stream,
                         request_text,
@@ -861,21 +863,19 @@ fn websocket_read_error(err: WsError) -> ApiError {
 
 async fn send_websocket_request(
     ws_stream: &WsStream,
-    request_text: String,
+    request_text: Utf8Bytes,
     idle_timeout: Duration,
     telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
     connection_reused: bool,
 ) -> Result<(), ApiError> {
     let request_start = Instant::now();
-    let result = tokio::time::timeout(
-        idle_timeout,
-        ws_stream.send(Message::Text(request_text.into())),
-    )
-    .await
-    .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
-    .and_then(|result| {
-        result.map_err(|err| ApiError::Stream(format!("failed to send websocket request: {err}")))
-    });
+    let result = tokio::time::timeout(idle_timeout, ws_stream.send(Message::Text(request_text)))
+        .await
+        .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
+        .and_then(|result| {
+            result
+                .map_err(|err| ApiError::Stream(format!("failed to send websocket request: {err}")))
+        });
 
     if let Some(t) = telemetry.as_ref() {
         t.on_ws_request(
@@ -890,8 +890,9 @@ async fn send_websocket_request(
     Ok(())
 }
 
-fn serialize_websocket_request(request: &ResponsesWsRequest) -> Result<String, ApiError> {
+fn serialize_websocket_request(request: &ResponsesWsRequest) -> Result<Utf8Bytes, ApiError> {
     serde_json::to_string(request)
+        .map(Utf8Bytes::from)
         .map_err(|err| ApiError::Stream(format!("failed to encode websocket request: {err}")))
 }
 
@@ -1013,8 +1014,7 @@ mod tests {
         let queue_events = Arc::clone(&events);
         let dispatch_events = Arc::clone(&events);
         let established_events = Arc::clone(&events);
-        let expected_request_bytes =
-            u64::try_from(serialize_websocket_request(&request).unwrap().len()).unwrap();
+        let expected_request = serialize_websocket_request(&request).unwrap();
 
         let stream = connection
             .stream_request_with_dispatch_ready(
@@ -1023,7 +1023,7 @@ mod tests {
                 None,
                 move || queue_events.lock().unwrap().push("queue"),
                 move |request_bytes| {
-                    assert_eq!(request_bytes, expected_request_bytes);
+                    assert_eq!(request_bytes.as_ref(), expected_request.as_bytes());
                     dispatch_events.lock().unwrap().push("dispatch");
                 },
                 move || established_events.lock().unwrap().push("established"),

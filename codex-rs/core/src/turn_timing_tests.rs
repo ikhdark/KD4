@@ -87,36 +87,6 @@ impl TurnClock for FakeClock {
     }
 }
 
-#[derive(Debug)]
-struct AdvancingClock {
-    next: Mutex<TimeSample>,
-    step_ns: u128,
-}
-
-impl AdvancingClock {
-    fn every_ms(step_ms: u128) -> Self {
-        Self {
-            next: Mutex::new(TimeSample {
-                monotonic_ns: 0,
-                wall_unix_ms: 0,
-            }),
-            step_ns: step_ms.saturating_mul(NS_PER_MS),
-        }
-    }
-}
-
-impl TurnClock for AdvancingClock {
-    fn sample(&self) -> ClockSample {
-        let mut next = self.next.lock().expect("advancing clock lock");
-        let sample = *next;
-        next.monotonic_ns = next.monotonic_ns.saturating_add(self.step_ns);
-        next.wall_unix_ms = next
-            .wall_unix_ms
-            .saturating_add(i64::try_from(self.step_ns / NS_PER_MS).unwrap_or(i64::MAX));
-        ClockSample { time: sample }
-    }
-}
-
 #[derive(Debug, Default)]
 struct CoordinatedClockState {
     sample_count: u8,
@@ -2349,26 +2319,6 @@ fn named_local_phases_record_union_time_without_disturbing_partition() {
 }
 
 #[test]
-fn ordered_persistence_is_excluded_from_request_preparation_without_a_timing_gap() {
-    let (clock, state) = timing();
-    state.mark_turn_started();
-    let mut preparation = Some(state.begin_local_phase(TurnLocalPhase::Preparation));
-
-    clock.set_ms(10);
-    let persistence = state.begin_persistence_outside_preparation(&mut preparation);
-    clock.set_ms(40);
-    drop(persistence);
-    clock.set_ms(50);
-    drop(preparation.take());
-
-    let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.local.preparation_ns, 20 * NS_PER_MS);
-    assert_eq!(profile.local.persistence_ns, 30 * NS_PER_MS);
-    assert_eq!(profile.exclusive.orchestration_ns, 50 * NS_PER_MS);
-    assert_eq!(profile.exclusive.total_ns(), profile.inclusive_duration_ns);
-}
-
-#[test]
 fn startup_prewarm_wait_is_excluded_from_request_preparation_without_a_timing_gap() {
     let (clock, state) = timing();
     state.mark_turn_started();
@@ -2435,35 +2385,6 @@ fn predispatch_failure_closes_request_preparation_before_error_lifecycle() {
     assert_eq!(profile.local.preparation_ns, 5 * NS_PER_MS);
     assert_eq!(profile.exclusive.finalization_ns, 15 * NS_PER_MS);
     assert_eq!(profile.exclusive.total_ns(), profile.inclusive_duration_ns);
-}
-
-#[test]
-fn persistence_outside_preparation_has_no_unattributed_gap() {
-    let clock = Arc::new(AdvancingClock::every_ms(1));
-    let state = Arc::new(TurnTimingState::with_clock(clock));
-    state.mark_turn_started();
-    let mut preparation = Some(state.begin_local_phase(TurnLocalPhase::Preparation));
-
-    let persistence = state.begin_persistence_outside_preparation(&mut preparation);
-    drop(persistence);
-    drop(preparation.take());
-    state.mark_model_request_dispatched();
-    assert_eq!(
-        state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("ready".into())),
-        Some(Duration::from_millis(6))
-    );
-
-    let profile = state.complete_snapshot().profile;
-    let pre_output = profile
-        .pre_first_model_output
-        .expect("model output freezes pre-output attribution");
-    assert_eq!(profile.local.preparation_ns, 2 * NS_PER_MS);
-    assert_eq!(profile.local.persistence_ns, NS_PER_MS);
-    // One millisecond precedes request preparation and one follows it. Persistence
-    // replaces preparation for its interval, so every pre-output interval stays owned.
-    assert_eq!(pre_output.unattributed_pre_output_ns, 2 * NS_PER_MS);
-    assert_eq!(pre_output.attributed_client_union_ns, 3 * NS_PER_MS);
-    assert_eq!(pre_output.client_critical_path_ns, 5 * NS_PER_MS);
 }
 
 #[test]

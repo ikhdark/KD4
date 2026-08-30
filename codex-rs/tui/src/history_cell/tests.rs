@@ -2136,17 +2136,14 @@ fn plan_update_with_note_and_wrapping_snapshot() {
                 PlanItemArg {
                     step: "Investigate existing error paths and logging around HTTP timeouts".into(),
                     status: StepStatus::Completed,
-                    ..Default::default()
                 },
                 PlanItemArg {
                     step: "Harden Grafana client error handling with retry/backoff and user‑friendly messages".into(),
                     status: StepStatus::InProgress,
-                    ..Default::default()
                 },
                 PlanItemArg {
                     step: "Add tests for transient failure scenarios and surfacing to the UI".into(),
                     status: StepStatus::Pending,
-                    ..Default::default()
                 },
             ],
         };
@@ -2166,12 +2163,10 @@ fn plan_update_without_note_snapshot() {
             PlanItemArg {
                 step: "Define error taxonomy".into(),
                 status: StepStatus::InProgress,
-                ..Default::default()
             },
             PlanItemArg {
                 step: "Implement mapping to user messages".into(),
                 status: StepStatus::Pending,
-                ..Default::default()
             },
         ],
     };
@@ -2193,7 +2188,6 @@ fn plan_update_does_not_split_url_like_tokens_in_note_or_step() {
         plan: vec![PlanItemArg {
             step: format!("Validate callbacks under {step_url} before rollout."),
             status: StepStatus::InProgress,
-            ..Default::default()
         }],
     };
 

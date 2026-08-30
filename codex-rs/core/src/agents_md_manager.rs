@@ -8,10 +8,12 @@ use crate::agents_md::load_project_instructions_from_discovery;
 use crate::config::Config;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use codex_config::ConfigLayerStack;
 use codex_extension_api::UserInstructions;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_utils_path_uri::PathUri;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 
@@ -20,6 +22,12 @@ pub(crate) struct AgentsMdManager {
     user_instructions: Option<UserInstructions>,
     refresh_gate: Semaphore,
     cache: Mutex<AgentsMdCache>,
+    project_root_markers_cache: StdMutex<Option<ProjectRootMarkersCacheEntry>>,
+}
+
+struct ProjectRootMarkersCacheEntry {
+    config_layer_stack: Arc<ConfigLayerStack>,
+    markers: Arc<[String]>,
 }
 
 #[derive(Default)]
@@ -110,7 +118,27 @@ impl AgentsMdManager {
                 .filter(|instructions| !instructions.text.trim().is_empty()),
             refresh_gate: Semaphore::new(1),
             cache: Mutex::new(AgentsMdCache::default()),
+            project_root_markers_cache: StdMutex::new(None),
         }
+    }
+
+    fn project_root_markers(&self, config: &Config) -> Arc<[String]> {
+        let mut cache = self
+            .project_root_markers_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cache.as_ref()
+            && Arc::ptr_eq(&cached.config_layer_stack, &config.config_layer_stack)
+        {
+            return Arc::clone(&cached.markers);
+        }
+
+        let markers: Arc<[String]> = effective_project_root_markers(config).into();
+        *cache = Some(ProjectRootMarkersCacheEntry {
+            config_layer_stack: config.config_layer_stack.clone(),
+            markers: Arc::clone(&markers),
+        });
+        markers
     }
 
     pub(crate) async fn refresh(&self, config: &Config, environments: &TurnEnvironmentSnapshot) {
@@ -173,16 +201,16 @@ impl AgentsMdManager {
         config: Arc<Config>,
         environments: &TurnEnvironmentSnapshot,
     ) -> AgentsMdObservation {
-        let project_root_markers = effective_project_root_markers(config.as_ref());
+        let project_root_markers = self.project_root_markers(config.as_ref());
         let key = AgentsMdCacheKey::capture_with_markers(
             config.as_ref(),
             environments,
-            &project_root_markers,
+            project_root_markers.as_ref(),
         );
         let discovery = discover_project_instructions_with_markers(
             Arc::clone(&config),
             environments,
-            &project_root_markers,
+            project_root_markers.as_ref(),
         )
         .await;
         let source_fingerprint = discovery.source_fingerprint();

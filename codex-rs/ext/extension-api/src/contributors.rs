@@ -347,4 +347,17 @@ pub trait TurnItemContributor: Send + Sync {
         turn_store: &'a ExtensionData,
         item: &'a mut TurnItem,
     ) -> ExtensionFuture<'a, Result<(), String>>;
+
+    /// Whether this contributor may rewrite assistant message text.
+    ///
+    /// Assistant text is streamed to clients as deltas before the item completes. A
+    /// contributor that rewrites that text would make the streamed deltas disagree with the
+    /// finalized item, so the runtime buffers deltas for such items and replays them to match
+    /// the contributed text instead. Contributors that only annotate non-text fields should
+    /// override this to `false` so their items keep streaming live.
+    ///
+    /// The default is conservative: an unaudited contributor is assumed to rewrite text.
+    fn mutates_assistant_text(&self) -> bool {
+        true
+    }
 }

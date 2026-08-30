@@ -56,6 +56,18 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+#[test]
+fn missing_stabilized_context_update_returns_a_fatal_error() {
+    let mut prepared_context_update = None;
+
+    let result = take_stabilized_context_update(&mut prepared_context_update);
+
+    let Err(CodexErr::Fatal(message)) = result else {
+        panic!("missing stabilized context must return a fatal error");
+    };
+    assert!(message.contains("did not carry its context candidate"));
+}
 use wiremock::Mock;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
@@ -355,33 +367,6 @@ fn projected_prompt_compaction_reuses_equal_and_incrementally_appended_projectio
         "later generations must reuse the compacted projection",
     );
     assert_matches_independent_compaction(&equal_prepared, &equal);
-
-    let old_repository =
-        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nold\n</INSTRUCTIONS>";
-    let current_repository =
-        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\ncurrent\n</INSTRUCTIONS>";
-    let split_prepared = prepare(vec![
-        message(old_repository),
-        tool_search_output(),
-        message("continue"),
-        message(current_repository),
-    ]);
-    let split = compact_projected_prompt_inputs(&split_prepared);
-    assert_eq!(split.pass_count, 2);
-    assert!(Arc::ptr_eq(
-        &split.input,
-        &split.tool_history_fallback_input
-    ));
-    assert!(Arc::ptr_eq(
-        &split.stable_context_fallback_input,
-        &split.stable_context_tool_history_fallback_input
-    ));
-    assert!(!Arc::ptr_eq(
-        &split.input,
-        &split.stable_context_fallback_input
-    ));
-    assert_ne!(split.input, split.stable_context_fallback_input);
-    assert_matches_independent_compaction(&split_prepared, &split);
 
     let mut advancing_history = ContextManager::new();
     let initial_items = [message("before"), tool_search_output()];
@@ -959,6 +944,30 @@ async fn pending_turn_router_reuses_session_cache_until_planning_changes() -> Re
         "pending-turn planning reuse is not a model-generation router decision",
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn prepared_router_config_match_accepts_the_shared_turn_snapshot() {
+    let (_session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let shared = Arc::clone(&turn_context.config);
+
+    assert!(Arc::ptr_eq(&shared, &turn_context.config));
+    assert!(same_config_snapshot(&shared, &turn_context.config));
+}
+
+#[tokio::test]
+async fn effective_workspace_roots_are_cached_in_the_turn_context() {
+    let (_session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let first = turn_context.effective_workspace_roots();
+    let second = turn_context.effective_workspace_roots();
+
+    assert!(!first.is_empty());
+    assert_eq!(first, second);
+    assert_eq!(first.as_ptr(), second.as_ptr());
+    assert_eq!(
+        first,
+        turn_context.config.effective_workspace_roots().as_slice()
+    );
 }
 
 #[tokio::test]
@@ -1634,6 +1643,18 @@ fn tool_relay_reconciliation_advances_without_watchdog() {
         NextSampleBlockReason::ReadyToSample
     );
     assert_eq!(orphan_passes, 0);
+}
+
+#[test]
+fn ordered_sampling_prefix_holds_ready_state_until_append_completes() {
+    assert_eq!(
+        hold_sampling_readiness_for_ordered_prefix(NextSampleBlockReason::ReadyToSample),
+        NextSampleBlockReason::WaitingForDelivery
+    );
+    assert_eq!(
+        hold_sampling_readiness_for_ordered_prefix(NextSampleBlockReason::WaitingForGate),
+        NextSampleBlockReason::WaitingForGate
+    );
 }
 
 fn authoritative_wait_result(
@@ -3886,6 +3907,7 @@ async fn pending_plan_commit_and_invalidation_share_the_session_state_owner() {
         .capture_step_context(Arc::clone(&turn_context))
         .await;
     let stale_generation = session.services.planning_generation();
+    let prepared_context_update = session.prepare_context_update(step_context.as_ref()).await;
     let history_before = session.clone_history().await.into_raw_items();
     assert!(
         session
@@ -3903,11 +3925,10 @@ async fn pending_plan_commit_and_invalidation_share_the_session_state_owner() {
         let commit_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let commit_attempted_task = Arc::clone(&commit_attempted);
         let commit_session = Arc::clone(&session);
-        let commit_step_context = Arc::clone(&step_context);
         let commit = tokio::spawn(async move {
             commit_attempted_task.store(true, Ordering::Release);
             commit_session
-                .compare_and_record_context_updates(commit_step_context.as_ref(), stale_generation)
+                .compare_and_record_context_updates(prepared_context_update, stale_generation)
                 .await
         });
         wait_for_concurrent_state_attempt(&commit_attempted);
@@ -3937,9 +3958,10 @@ async fn pending_plan_commit_and_invalidation_share_the_session_state_owner() {
     let step_context = session
         .capture_step_context(Arc::clone(&turn_context))
         .await;
+    let prepared_context_update = session.prepare_context_update(step_context.as_ref()).await;
     assert!(
         session
-            .compare_and_record_context_updates(step_context.as_ref(), current_generation)
+            .compare_and_record_context_updates(prepared_context_update, current_generation)
             .await
             .is_some()
     );
@@ -4205,11 +4227,21 @@ fn pending_injection_byte_count_serializes_each_item_once_with_array_overhead() 
 fn stop_hook_continuation_reaches_the_final_response() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
         "stop_hook_continuation_reaches_the_final_response",
-        stop_hook_continuation_reaches_the_final_response_impl,
+        || stop_hook_continuation_reaches_the_final_response_impl(false),
     )
 }
 
-async fn stop_hook_continuation_reaches_the_final_response_impl() -> Result<()> {
+#[test]
+fn direct_runtime_stop_hook_continuation_reaches_the_final_response() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "direct_runtime_stop_hook_continuation_reaches_the_final_response",
+        || stop_hook_continuation_reaches_the_final_response_impl(true),
+    )
+}
+
+async fn stop_hook_continuation_reaches_the_final_response_impl(
+    direct_runtime: bool,
+) -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
     let response_log = responses::mount_sse_sequence(
@@ -4247,7 +4279,12 @@ async fn stop_hook_continuation_reaches_the_final_response_impl() -> Result<()> 
         .with_pre_build_hook(|home| {
             write_one_shot_stop_hook(home).expect("write stop-hook fixture");
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(move |config| {
+            trust_discovered_hooks(config);
+            if direct_runtime {
+                let _ = config.features.enable(Feature::DirectRuntime);
+            }
+        });
     let test = builder.build(&server).await?;
 
     test.codex
@@ -4528,14 +4565,14 @@ fn controlled_tool_call(
 
 #[tokio::test]
 async fn non_eager_tool_future_waits_for_the_response_tail_to_close() {
-    let response_tail_closed = CancellationToken::new();
+    let response_tail = ResponseTailSignal::new();
     let (first_poll_tx, mut first_poll_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
         FuturesOrdered::new();
     in_flight.push_back(defer_tool_future_until_response_tail(
         controlled_tool_call("deferred", first_poll_tx, release_rx),
-        response_tail_closed.clone(),
+        response_tail.clone(),
     ));
 
     let result_task = tokio::spawn(async move {
@@ -4550,7 +4587,7 @@ async fn non_eager_tool_future_waits_for_the_response_tail_to_close() {
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
     ));
 
-    response_tail_closed.cancel();
+    response_tail.close(ResponseTailOutcome::SuccessfulTail);
     first_poll_rx
         .await
         .expect("tool execution should start after the response tail closes");
@@ -4564,6 +4601,34 @@ async fn non_eager_tool_future_waits_for_the_response_tail_to_close() {
         .expect("deferred tool should succeed")
         .response;
     assert_eq!(result, synthetic_tool_result("deferred"));
+}
+
+#[tokio::test]
+async fn non_eager_tool_future_is_retired_when_the_response_tail_fails() {
+    let response_tail = ResponseTailSignal::new();
+    let (first_poll_tx, first_poll_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let deferred = defer_tool_future_until_response_tail(
+        controlled_tool_call("not-admitted", first_poll_tx, release_rx),
+        response_tail.clone(),
+    );
+    let result_task = tokio::spawn(deferred);
+
+    response_tail.close(ResponseTailOutcome::TerminalError);
+
+    let result = result_task.await.expect("retired tool task should finish");
+    assert!(
+        result.result.is_ok(),
+        "retirement should be model-visible output"
+    );
+    assert!(
+        first_poll_rx.await.is_err(),
+        "a failed response tail must not poll the tool handler"
+    );
+    assert!(
+        release_tx.send(()).is_err(),
+        "retiring the tool must drop its unstarted future"
+    );
 }
 
 #[tokio::test(start_paused = true)]

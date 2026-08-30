@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -40,7 +42,7 @@ struct SnapshotCacheOptions<'a> {
 pub struct SkillsLoadInput {
     pub cwd: AbsolutePathBuf,
     pub effective_skill_roots: Vec<PluginSkillRoot>,
-    pub config_layer_stack: ConfigLayerStack,
+    pub config_layer_stack: Arc<ConfigLayerStack>,
     pub bundled_skills_enabled: bool,
     plugin_skill_snapshots: Option<PluginSkillSnapshots>,
 }
@@ -49,13 +51,13 @@ impl SkillsLoadInput {
     pub fn new(
         cwd: AbsolutePathBuf,
         effective_skill_roots: Vec<PluginSkillRoot>,
-        config_layer_stack: ConfigLayerStack,
+        config_layer_stack: impl Into<Arc<ConfigLayerStack>>,
         bundled_skills_enabled: bool,
     ) -> Self {
         Self {
             cwd,
             effective_skill_roots,
-            config_layer_stack,
+            config_layer_stack: config_layer_stack.into(),
             bundled_skills_enabled,
             plugin_skill_snapshots: None,
         }
@@ -78,6 +80,7 @@ pub struct SkillsService {
     codex_home: AbsolutePathBuf,
     restriction_product: Option<Product>,
     extra_roots: RwLock<Vec<AbsolutePathBuf>>,
+    input_snapshot_cache: RwLock<HashMap<SkillsInputCacheKey, HostSkillsSnapshot>>,
     snapshot_cache: RwLock<HashMap<SkillsCacheKey, HostSkillsSnapshot>>,
 }
 
@@ -95,6 +98,7 @@ impl SkillsService {
             codex_home,
             restriction_product,
             extra_roots: RwLock::new(Vec::new()),
+            input_snapshot_cache: RwLock::new(HashMap::new()),
             snapshot_cache: RwLock::new(HashMap::new()),
         };
         if !bundled_skills_enabled {
@@ -135,20 +139,27 @@ impl SkillsService {
         input: &SkillsLoadInput,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> HostSkillsSnapshot {
+        let input_cache_key = SkillsInputCacheKey::new(input, fs.as_ref());
+        if let Some(snapshot) = self.cached_input_snapshot(&input_cache_key) {
+            return snapshot;
+        }
         let roots = self.skill_roots_for_config(input, fs).await;
         let skill_config_rules = skill_config_rules_from_stack(&input.config_layer_stack);
-        self.snapshot_for_roots(
-            input,
-            roots,
-            skill_config_rules,
-            SnapshotCacheOptions {
-                force_reload: false,
-                cache_result: true,
-                isolate_file_system: true,
-                cwd_cache_key: None,
-            },
-        )
-        .await
+        let snapshot = self
+            .snapshot_for_roots(
+                input,
+                roots,
+                skill_config_rules,
+                SnapshotCacheOptions {
+                    force_reload: false,
+                    cache_result: true,
+                    isolate_file_system: true,
+                    cwd_cache_key: None,
+                },
+            )
+            .await;
+        self.cache_input_snapshot(input_cache_key, snapshot.clone());
+        snapshot
     }
 
     pub async fn skill_roots_for_config(
@@ -265,11 +276,17 @@ impl SkillsService {
     }
 
     pub fn clear_cache(&self) {
+        let mut input_cache = self
+            .input_snapshot_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let input_entries = input_cache.len();
+        input_cache.clear();
         let mut cache = self
             .snapshot_cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cleared = cache.len();
+        let cleared = cache.len() + input_entries;
         cache.clear();
         info!("skills cache cleared ({cleared} entries)");
     }
@@ -281,10 +298,76 @@ impl SkillsService {
         }
     }
 
+    fn cached_input_snapshot(&self, cache_key: &SkillsInputCacheKey) -> Option<HostSkillsSnapshot> {
+        match self.input_snapshot_cache.read() {
+            Ok(cache) => cache.get(cache_key).cloned(),
+            Err(err) => err.into_inner().get(cache_key).cloned(),
+        }
+    }
+
+    fn cache_input_snapshot(&self, cache_key: SkillsInputCacheKey, snapshot: HostSkillsSnapshot) {
+        let mut cache = self
+            .input_snapshot_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !cache.contains_key(&cache_key)
+            && cache.len() >= MAX_CACHED_SKILL_SNAPSHOTS
+            && let Some(evicted_key) = cache.keys().next().cloned()
+        {
+            cache.remove(&evicted_key);
+        }
+        cache.insert(cache_key, snapshot);
+    }
+
     fn extra_roots(&self) -> Vec<AbsolutePathBuf> {
         match self.extra_roots.read() {
             Ok(roots) => roots.clone(),
             Err(err) => err.into_inner().clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConfigLayerStackIdentity(Arc<ConfigLayerStack>);
+
+impl PartialEq for ConfigLayerStackIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ConfigLayerStackIdentity {}
+
+impl Hash for ConfigLayerStackIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.0) as usize).hash(state);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SkillsInputCacheKey {
+    config_layer_stack: ConfigLayerStackIdentity,
+    cwd: AbsolutePathBuf,
+    effective_skill_roots: Vec<PluginSkillRoot>,
+    bundled_skills_enabled: bool,
+    plugin_skill_snapshots_identity: Option<u64>,
+    file_system_identity: usize,
+}
+
+impl SkillsInputCacheKey {
+    fn new(input: &SkillsLoadInput, fs: Option<&Arc<dyn ExecutorFileSystem>>) -> Self {
+        Self {
+            config_layer_stack: ConfigLayerStackIdentity(Arc::clone(&input.config_layer_stack)),
+            cwd: input.cwd.clone(),
+            effective_skill_roots: input.effective_skill_roots.clone(),
+            bundled_skills_enabled: input.bundled_skills_enabled,
+            plugin_skill_snapshots_identity: input
+                .plugin_skill_snapshots
+                .as_ref()
+                .map(PluginSkillSnapshots::cache_identity),
+            file_system_identity: fs
+                .map(|fs| Arc::as_ptr(fs).cast::<()>() as usize)
+                .unwrap_or_default(),
         }
     }
 }

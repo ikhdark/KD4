@@ -144,6 +144,28 @@ apps = true
 }
 
 #[test]
+fn top_level_key_presence_ignores_disabled_layers() {
+    let disabled_apps = ConfigLayerEntry::new_disabled(
+        ConfigLayerSource::SessionFlags,
+        toml::from_str("[apps.default]\nenabled = false").expect("disabled apps config"),
+        "test-disabled",
+    );
+    let enabled_features = ConfigLayerEntry::new(
+        ConfigLayerSource::SessionFlags,
+        toml::from_str("[features]\napps = true").expect("enabled features config"),
+    );
+    let stack = ConfigLayerStack::new(
+        vec![disabled_apps, enabled_features],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("ordered config layer stack");
+
+    assert!(!stack.enabled_layers_contain_top_level_key("apps"));
+    assert!(stack.enabled_layers_contain_top_level_key("features"));
+}
+
+#[test]
 fn with_user_config_updates_matching_user_layer_without_replacing_active_profile() {
     let temp_dir = TempDir::new().expect("tempdir");
     let base_file = test_user_config_path(&temp_dir, "config.toml");

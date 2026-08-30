@@ -548,7 +548,7 @@ fn accepted_batch_report_for_import() -> AbReport {
             candidate_cli_binary_sha256: "b-cli".to_string(),
             rustc_version: "rustc test".to_string(),
             rust_target: "test-target".to_string(),
-            profile: "dev".to_string(),
+            profile: AB_BUILD_PROFILE.to_string(),
             execution_profile: profile,
             features: Vec::new(),
             bootstrap_seed: AB_BOOTSTRAP_SEED,
@@ -1610,11 +1610,11 @@ fn test_prepared_build(root: &Path, name: &str, marker: &str) -> (String, String
     let filtered_tree = canonical_filtered_tree_identity(&worktree, &commit).unwrap();
 
     let target = root.join(format!("{name}-target"));
-    let debug = target.join("debug");
-    let deps = debug.join("deps");
+    let profile_dir = target.join(AB_BUILD_PROFILE_DIR);
+    let deps = profile_dir.join("deps");
     fs::create_dir_all(&deps).unwrap();
-    let cli = debug.join(executable_name("codex"));
-    let host = debug.join(executable_name("codex-code-mode-host"));
+    let cli = profile_dir.join(executable_name("codex"));
+    let host = profile_dir.join(executable_name("codex-code-mode-host"));
     let worker = deps.join(executable_name(&format!("turn_latency-{name}")));
     fs::write(&cli, format!("{name}-cli")).unwrap();
     fs::write(&host, format!("{name}-host")).unwrap();
@@ -2058,6 +2058,36 @@ fn ab_overlay_incremental_gate_accepts_non_regression_and_rejects_regression() {
 }
 
 #[test]
+fn ab_overlay_p95_ratio_gate_uses_the_baseline_duration_floor() {
+    let mut below_floor = paired_clusters(1_000_000, 1_000_000);
+    for cluster in &mut below_floor {
+        cluster.b_samples[0].controllable_duration_ns = 2_000_000;
+    }
+    let below_floor =
+        hierarchical_paired_bootstrap(&below_floor, AbLatencyMetric::ControllableTurn)
+            .expect("a sub-floor p95 should remain measurable");
+    assert_eq!(below_floor.baseline_p95_ns, 1_000_000.0);
+    assert!(!below_floor.p95_ratio_ucb_gate_applied);
+    assert_eq!(
+        below_floor.p95_ratio_ucb_gate_min_baseline_ns,
+        AB_P95_RATIO_UCB_GATE_MIN_BASELINE_NS
+    );
+    assert!(below_floor.p95_ratio_ucb > AB_P95_RATIO_UCB_LIMIT);
+    assert!(below_floor.passed);
+
+    let mut at_floor = paired_clusters(5_000_000, 5_000_000);
+    for cluster in &mut at_floor {
+        cluster.b_samples[0].controllable_duration_ns = 10_000_000;
+    }
+    let at_floor = hierarchical_paired_bootstrap(&at_floor, AbLatencyMetric::ControllableTurn)
+        .expect("an at-floor p95 should remain measurable");
+    assert_eq!(at_floor.baseline_p95_ns, 5_000_000.0);
+    assert!(at_floor.p95_ratio_ucb_gate_applied);
+    assert!(at_floor.p95_ratio_ucb > AB_P95_RATIO_UCB_LIMIT);
+    assert!(!at_floor.passed);
+}
+
+#[test]
 fn ab_overlay_final_profile_balances_independent_clusters_and_worker_repetition() {
     let config = AbExecutionProfile::Final.config();
 
@@ -2066,6 +2096,15 @@ fn ab_overlay_final_profile_balances_independent_clusters_and_worker_repetition(
     assert_eq!(config.looks, [10]);
     assert_eq!(config.clusters * config.max_pairs_per_cluster(), 140);
     assert_eq!(config.ucb_quantile(), 1.0 - AB_FAMILY_WISE_ALPHA);
+    assert_eq!(AB_BUILD_PROFILE, "release");
+    assert_eq!(AB_BUILD_PROFILE_DIR, "release");
+    for args in [
+        AB_CLI_BUILD_ARGS.as_slice(),
+        AB_HOST_BUILD_ARGS.as_slice(),
+        AB_WORKER_BUILD_ARGS.as_slice(),
+    ] {
+        assert!(args.contains(&AB_BUILD_PROFILE_FLAG));
+    }
 }
 
 #[test]
@@ -3032,16 +3071,34 @@ fn ab_overlay_retained_exec_lifecycle_is_exact_and_routable() {
         .as_deref(),
         Some("1001")
     );
-    assert_eq!(
-        retained_exit_code_from_output(
-            "__KD4_RETAINED_FINISHED__\nProcess exited with code 0; wall time: 1.2500 seconds\n"
-        ),
-        Some(0)
-    );
-    assert_eq!(
-        retained_exit_code_from_output("Process exited with code -1; wall time: 0.2500 seconds\n"),
-        Some(-1)
-    );
+    assert!(retained_process_exit_observed(
+        &[Some("__KD4_RETAINED_FINISHED__\n")],
+        true
+    ));
+    assert!(!retained_process_exit_observed(
+        &[Some("__KD4_RETAINED_FINISHED__\n")],
+        false
+    ));
+    assert!(!retained_process_exit_observed(
+        &[Some(
+            "Process exited with code 0; wall time: 1.2500 seconds\n",
+        )],
+        true
+    ));
+    assert!(retained_process_exit_observed(
+        &[
+            Some("__KD4_RETAINED_POLL__\n__KD4_RETAINED_FINISHED__\n"),
+            Some("Process exited with code 0; wall time: 1.2500 seconds\n"),
+        ],
+        true
+    ));
+
+    let mut coalesced_control = std::io::Cursor::new(b"poll\nfinish\n");
+    let mut pending_control = Vec::new();
+    wait_for_retained_control(&mut coalesced_control, &mut pending_control, b"poll")
+        .expect("the live poll marker should be recognized");
+    wait_for_retained_control(&mut coalesced_control, &mut pending_control, b"finish")
+        .expect("the coalesced terminal marker must remain available");
 
     let retained_call = codex_protocol::protocol::TurnTimingToolCall {
         call_id: "retained-call-0".to_string(),
@@ -5233,7 +5290,7 @@ fn ab_overlay_report_shards_and_payload_hash_are_stable() {
 #[test]
 fn ab_overlay_replay_session_audit_provenance_is_exact_and_profile_scoped() {
     let expected = replay_session_audit_evidence();
-    assert_eq!(AB_REPORT_SCHEMA_VERSION, 19);
+    assert_eq!(AB_REPORT_SCHEMA_VERSION, 20);
     assert_eq!(
         expected.schema_version,
         AB_REPLAY_SESSION_AUDIT_EVIDENCE_VERSION

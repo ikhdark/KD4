@@ -257,7 +257,7 @@ impl ToolOrchestrator {
             .sandbox_cwd(req)
             .cloned()
             .unwrap_or_else(|| turn_ctx.cwd_uri());
-        let workspace_roots = turn_ctx.config.effective_workspace_roots();
+        let workspace_roots = turn_ctx.effective_workspace_roots();
         let initial_attempt = SandboxAttempt {
             codex_home: &turn_ctx.config.codex_home,
             sandbox: initial_sandbox,
@@ -266,7 +266,7 @@ impl ToolOrchestrator {
             exec_server_permissions: turn_ctx.config.permissions.permission_profile(),
             enforce_managed_network: managed_network_active,
             sandbox_cwd: &sandbox_policy_cwd,
-            workspace_roots: workspace_roots.as_slice(),
+            workspace_roots,
             windows_sandbox_level: turn_ctx.windows_sandbox_level,
             windows_sandbox_private_desktop: turn_ctx
                 .config
@@ -442,7 +442,7 @@ impl ToolOrchestrator {
                     exec_server_permissions: turn_ctx.config.permissions.permission_profile(),
                     enforce_managed_network: managed_network_active,
                     sandbox_cwd: &sandbox_policy_cwd,
-                    workspace_roots: workspace_roots.as_slice(),
+                    workspace_roots,
                     windows_sandbox_level: turn_ctx.windows_sandbox_level,
                     windows_sandbox_private_desktop: turn_ctx
                         .config

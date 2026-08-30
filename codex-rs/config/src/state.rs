@@ -461,6 +461,20 @@ impl ConfigLayerStack {
         Some(merged)
     }
 
+    /// Returns whether any enabled ordinary layer defines `key` at its top level.
+    ///
+    /// This is a cheap presence check for callers that only need to decide whether
+    /// constructing the full merged config can affect their result.
+    pub fn enabled_layers_contain_top_level_key(&self, key: &str) -> bool {
+        self.layers.iter().any(|layer| {
+            !layer.is_disabled()
+                && layer
+                    .config
+                    .as_table()
+                    .is_some_and(|table| table.contains_key(key))
+        })
+    }
+
     pub fn requirements(&self) -> &ConfigRequirements {
         &self.requirements
     }

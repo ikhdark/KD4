@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::PluginSkillRoot;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -91,8 +92,8 @@ pub fn prompt_safe_plugin_description(description: Option<&str>) -> Option<Strin
 /// Callers must apply any runtime capability policies before constructing this outcome.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginLoadOutcome<M> {
-    plugins: Vec<LoadedPlugin<M>>,
-    capability_summaries: Vec<PluginCapabilitySummary>,
+    plugins: Arc<[LoadedPlugin<M>]>,
+    capability_summaries: Arc<[PluginCapabilitySummary]>,
 }
 
 impl<M: Clone> Default for PluginLoadOutcome<M> {
@@ -106,9 +107,10 @@ impl<M: Clone> PluginLoadOutcome<M> {
         let capability_summaries = plugins
             .iter()
             .filter_map(plugin_capability_summary_from_loaded)
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+            .into();
         Self {
-            plugins,
+            plugins: plugins.into(),
             capability_summaries,
         }
     }
@@ -253,5 +255,18 @@ mod tests {
         let removed_provider_trait = ["trait Plugin", "Provider"].concat();
         assert!(!include_str!("load_outcome.rs").contains(&removed_skill_roots_trait));
         assert!(!include_str!("provider.rs").contains(&removed_provider_trait));
+    }
+
+    #[test]
+    fn cloning_an_outcome_reuses_immutable_plugin_storage() {
+        let outcome =
+            PluginLoadOutcome::from_plugins(vec![loaded_plugin("sample@test", Vec::new())]);
+        let cloned = outcome.clone();
+
+        assert!(Arc::ptr_eq(&outcome.plugins, &cloned.plugins));
+        assert!(Arc::ptr_eq(
+            &outcome.capability_summaries,
+            &cloned.capability_summaries
+        ));
     }
 }

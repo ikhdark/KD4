@@ -231,6 +231,41 @@ async fn skills_for_config_reuses_cache_for_same_effective_config() {
 }
 
 #[tokio::test]
+async fn skills_for_config_short_circuits_on_the_stable_input_identity() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let config_layer_stack = Arc::new(config_stack(&codex_home, ""));
+    let input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        Vec::new(),
+        Arc::clone(&config_layer_stack),
+        /*bundled_skills_enabled*/ false,
+    );
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let fs: Arc<dyn ExecutorFileSystem> = Arc::clone(&LOCAL_FS);
+
+    write_user_skill(&codex_home, "a", "skill-a", "from a");
+    let first = skills_service
+        .snapshot_for_config(&input, Some(Arc::clone(&fs)))
+        .await;
+    write_user_skill(&codex_home, "b", "skill-b", "from b");
+    let second = skills_service.snapshot_for_config(&input, Some(fs)).await;
+
+    assert_eq!(first.outcome().skills, second.outcome().skills);
+    assert_eq!(
+        skills_service
+            .input_snapshot_cache
+            .read()
+            .expect("input cache lock")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn skills_for_config_isolates_snapshots_by_executor_file_system() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let cwd = tempfile::tempdir().expect("tempdir");

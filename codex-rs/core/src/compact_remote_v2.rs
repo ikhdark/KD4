@@ -180,13 +180,11 @@ async fn run_remote_compact_task_inner(
     .await;
     let status = compaction_status_from_result(&result);
     let codex_error = result.as_ref().err();
-    if result.is_ok() {
-        if run_post_compact_hook_gate(sess, turn_context, trigger, None).await {
-            attempt
-                .track(sess.as_ref(), status, codex_error, analytics_details)
-                .await;
-            return Err(CodexErr::TurnAborted);
-        }
+    if result.is_ok() && run_post_compact_hook_gate(sess, turn_context, trigger, None).await {
+        attempt
+            .track(sess.as_ref(), status, codex_error, analytics_details)
+            .await;
+        return Err(CodexErr::TurnAborted);
     }
     attempt
         .track(sess.as_ref(), status, codex_error, analytics_details)

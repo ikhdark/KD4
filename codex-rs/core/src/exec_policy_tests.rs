@@ -137,7 +137,8 @@ async fn child_uses_parent_exec_policy_when_non_exec_policy_layers_differ() {
         child_config.config_layer_stack.requirements().clone(),
         child_config.config_layer_stack.requirements_toml().clone(),
     )
-    .expect("config layer stack");
+    .expect("config layer stack")
+    .into();
 
     assert!(child_uses_parent_exec_policy(&parent_config, &child_config));
 }
@@ -148,9 +149,12 @@ async fn child_does_not_use_parent_exec_policy_when_ignore_rules_differs() {
     let mut child_config = parent_config.clone();
     child_config.config_layer_stack = child_config
         .config_layer_stack
+        .as_ref()
+        .clone()
         .with_user_and_project_exec_policy_rules_ignored(
             /*ignore_user_and_project_exec_policy_rules*/ true,
-        );
+        )
+        .into();
 
     assert!(!child_uses_parent_exec_policy(
         &parent_config,
@@ -191,7 +195,8 @@ async fn child_does_not_use_parent_exec_policy_when_requirements_exec_policy_dif
         requirements,
         child_config.config_layer_stack.requirements_toml().clone(),
     )
-    .expect("config layer stack");
+    .expect("config layer stack")
+    .into();
 
     assert!(!child_uses_parent_exec_policy(
         &parent_config,

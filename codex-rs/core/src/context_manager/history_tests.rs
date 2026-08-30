@@ -42,6 +42,8 @@ use image::Luma;
 use image::Rgba;
 use pretty_assertions::assert_eq;
 use regex_lite::Regex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
 const EXEC_FORMAT_MAX_TOKENS: usize = 2_500;
@@ -262,6 +264,18 @@ fn cloning_history_shares_realized_context_and_world_state_baselines() {
         history.world_state_baseline(),
         cloned.world_state_baseline()
     );
+}
+
+#[test]
+fn reference_context_presence_can_be_checked_without_materializing_the_item() {
+    let mut history = ContextManager::new();
+    assert!(!history.has_reference_context_item());
+
+    history.set_reference_context_item(Some(reference_context_item()));
+    assert!(history.has_reference_context_item());
+
+    history.set_reference_context_item(None);
+    assert!(!history.has_reference_context_item());
 }
 
 #[test]
@@ -2334,6 +2348,27 @@ fn unchanged_tool_projection_preserves_prepared_sidecars() {
             .compacted_tool_search_outputs_are_materialized()
             .is_some()
     );
+}
+
+#[test]
+fn tool_search_compaction_uses_projection_identity_without_content_scans() {
+    let mut prepared = create_history_with_items(vec![agent_message("same content")])
+        .prepare_for_prompt(&default_input_modalities());
+    prepared.fallback_items =
+        PreparedPromptItems::from_shared(Arc::clone(&prepared.shared_items()));
+    prepared.unreplaced_fallback_items = prepared.fallback_items.clone();
+    let build_count = AtomicUsize::new(0);
+
+    let compacted = prepared.compacted_tool_search_outputs(|items| {
+        build_count.fetch_add(1, Ordering::Relaxed);
+        Arc::from(items.as_ref().to_vec())
+    });
+
+    assert_eq!(build_count.load(Ordering::Relaxed), 2);
+    assert!(Arc::ptr_eq(&compacted[0], &compacted[2]));
+    assert!(Arc::ptr_eq(&compacted[1], &compacted[3]));
+    assert_eq!(compacted[0], compacted[1]);
+    assert!(!Arc::ptr_eq(&compacted[0], &compacted[1]));
 }
 
 #[test]

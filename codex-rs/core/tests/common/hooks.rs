@@ -14,7 +14,7 @@ pub fn trust_discovered_hooks(config: &mut Config) {
 
     let listed = codex_hooks::list_hooks(codex_hooks::HooksConfig {
         feature_enabled: true,
-        config_layer_stack: Some(config.config_layer_stack.clone()),
+        config_layer_stack: Some(config.config_layer_stack.as_ref().clone()),
         ..codex_hooks::HooksConfig::default()
     });
     assert!(
@@ -26,7 +26,7 @@ pub fn trust_discovered_hooks(config: &mut Config) {
 
 pub fn trust_hooks(config: &mut Config, hooks: Vec<HookListEntry>) {
     config.config_layer_stack =
-        trusted_config_layer_stack(&config.config_layer_stack, &config.codex_home, hooks);
+        trusted_config_layer_stack(&config.config_layer_stack, &config.codex_home, hooks).into();
 }
 
 pub fn trusted_config_layer_stack(

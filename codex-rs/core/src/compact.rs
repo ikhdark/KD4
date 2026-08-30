@@ -70,7 +70,7 @@ const COMPACTION_SUMMARY_ITEM_ID_PREFIX: &str = "msg_compaction_summary_";
 const COMPACTION_SUMMARY_ITEM_ID_BASE: &str = "msg_compaction_summary";
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 16_000;
 const COMPACT_AGENT_MESSAGE_MAX_TOKENS: usize = 8_000;
-const COMPACT_TASK_STATE_MAX_TOKENS: usize = 1_800;
+const COMPACT_TASK_STATE_MAX_TOKENS: usize = 2_400;
 const COMPACT_UNSTRUCTURED_UPDATE_MAX_TOKENS: usize = 1_000;
 const GOAL_HEADING: &str = "## Goal";
 const CURRENT_STATE_HEADING: &str = "## Current state";
@@ -83,8 +83,8 @@ const COMPACTION_SECTIONS: [(&str, usize); 6] = [
     (CURRENT_STATE_HEADING, 350),
     (COMPLETED_WORK_HEADING, 250),
     (UNRESOLVED_WORK_HEADING, 350),
-    (EVIDENCE_HEADING, 300),
-    (NEXT_ACTION_HEADING, 150),
+    (EVIDENCE_HEADING, 500),
+    (NEXT_ACTION_HEADING, 250),
 ];
 pub(crate) const MAX_RETAINED_USER_IMAGES: usize = 8;
 pub(crate) const MAX_RETAINED_USER_IMAGE_BYTES: usize =
@@ -168,14 +168,49 @@ fn incremental_summarization_prompt(compact_prompt: Option<&str>) -> &str {
     compact_prompt.unwrap_or(INCREMENTAL_SUMMARIZATION_PROMPT)
 }
 
+enum CompactionClientSession<'a, T> {
+    Reused(&'a mut T),
+    Owned(T),
+}
+
+impl<T> AsMut<T> for CompactionClientSession<'_, T> {
+    fn as_mut(&mut self) -> &mut T {
+        match self {
+            Self::Reused(value) => value,
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+fn reuse_or_create_compaction_client_session<'a, T>(
+    reusable: Option<&'a mut T>,
+    create: impl FnOnce() -> T,
+) -> CompactionClientSession<'a, T> {
+    match reusable {
+        Some(value) => CompactionClientSession::Reused(value),
+        None => CompactionClientSession::Owned(create()),
+    }
+}
+
+pub(crate) struct InlineAutoCompactReuse<'a> {
+    pub(crate) client_session: &'a mut ModelClientSession,
+    pub(crate) prefetched_workspace_identity:
+        Option<&'a Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
+}
+
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    reuse: InlineAutoCompactReuse<'_>,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
+    let InlineAutoCompactReuse {
+        client_session,
+        prefetched_workspace_identity,
+    } = reuse;
     let prompt = turn_context
         .config
         .compact_prompt
@@ -191,6 +226,8 @@ pub(crate) async fn run_inline_auto_compact_task(
     run_compact_task_inner(
         sess,
         turn_context,
+        Some(client_session),
+        prefetched_workspace_identity,
         input,
         initial_context_injection,
         CompactionTrigger::Auto,
@@ -221,6 +258,10 @@ pub(crate) async fn run_compact_task(
     run_compact_task_inner(
         sess.clone(),
         turn_context,
+        // A standalone compaction turn has no in-flight sampling session to inherit.
+        /*client_session*/
+        None,
+        /*prefetched_workspace_identity*/ None,
         input,
         InitialContextInjection::AtStart(world_state),
         CompactionTrigger::Manual,
@@ -236,6 +277,8 @@ pub(crate) async fn run_compact_task(
 async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    client_session: Option<&mut ModelClientSession>,
+    prefetched_workspace_identity: Option<&Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     trigger: CompactionTrigger,
@@ -269,6 +312,8 @@ async fn run_compact_task_inner(
     let result = run_compact_task_inner_impl(
         Arc::clone(&sess),
         Arc::clone(&turn_context),
+        client_session,
+        prefetched_workspace_identity,
         input,
         initial_context_injection,
         compaction_metadata,
@@ -301,9 +346,12 @@ async fn run_compact_task_inner(
     result.map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_compact_task_inner_impl(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    client_session: Option<&mut ModelClientSession>,
+    prefetched_workspace_identity: Option<&Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
     mut input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
@@ -335,10 +383,18 @@ async fn run_compact_task_inner_impl(
         text: COMPACTION_BASE_INSTRUCTIONS.trim().to_string(),
     };
     let max_retries = turn_context.provider.info().stream_max_retries();
-    let mut client_session = sess.services.model_client.new_session();
-    // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
-    // request tracking)
-    // survives retries within this compact turn.
+    // Reuse the turn's live session when compaction runs inside a turn so the warm transport,
+    // sticky routing, and websocket incremental-request state carry over instead of forcing a
+    // second handshake while the turn's own connection sits idle. A standalone compaction turn
+    // has no such session and opens its own, which then publishes normally on drop.
+    //
+    // The caller reaches this point only after its response stream has closed: `run_turn`
+    // compacts from the post-sampling branch, and pre-sampling compaction runs before any
+    // stream is opened. Retries inside this compact turn keep sharing the one session.
+    let mut client_session = reuse_or_create_compaction_client_session(client_session, || {
+        sess.services.model_client.new_session()
+    });
+    let client_session = client_session.as_mut();
     let window_id = sess.current_window_id().await;
     let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
         sess.installation_id.clone(),
@@ -346,11 +402,12 @@ async fn run_compact_task_inner_impl(
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
 
-    let workspace_identity = sess
-        .services
-        .git_workspace
-        .workspace_evidence_identity(turn_context.config.cwd.as_path())
-        .await;
+    let workspace_identity = workspace_identity_for_compaction(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        prefetched_workspace_identity,
+    )
+    .await;
     let turn_input = history
         .clone()
         .for_compaction_prompt_with_completed_tool_projection(
@@ -375,7 +432,7 @@ async fn run_compact_task_inner_impl(
             let attempt_result = drain_to_completed(
                 &sess,
                 turn_context.as_ref(),
-                &mut client_session,
+                &mut *client_session,
                 &responses_metadata,
                 &prompt,
                 cancellation_token,
@@ -426,7 +483,7 @@ async fn run_compact_task_inner_impl(
                         &mut retry_state,
                         max_retries,
                         e,
-                        &mut client_session,
+                        &mut *client_session,
                         sess.as_ref(),
                         turn_context.as_ref(),
                         ResponsesStreamRequest::LocalCompaction,
@@ -529,6 +586,24 @@ async fn run_compact_task_inner_impl(
     });
     sess.send_event(&turn_context, warning).await;
     Ok(summary_text)
+}
+
+async fn workspace_identity_for_compaction(
+    sess: &Session,
+    turn_context: &TurnContext,
+    prefetched_workspace_identity: Option<&Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
+) -> Option<crate::git_workspace::WorkspaceEvidenceIdentity> {
+    match prefetched_workspace_identity {
+        // `Some(None)` is an authoritative capture of a non-Git workspace and must suppress a
+        // second repository probe just as an ordinary identity does.
+        Some(workspace_identity) => workspace_identity.clone(),
+        None => {
+            sess.services
+                .git_workspace
+                .workspace_evidence_identity(turn_context.config.cwd.as_path())
+                .await
+        }
+    }
 }
 
 pub(crate) fn strip_compaction_startup_envelopes(items: Vec<ResponseItem>) -> Vec<ResponseItem> {

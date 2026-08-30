@@ -103,16 +103,45 @@ const AB_BATCH_LOOKS: [usize; 1] = [20];
 const AB_FINAL_LOOKS: [usize; 1] = [AB_ITERATIONS];
 const AB_REPLAY_LOOKS: [usize; 1] = [10];
 const AB_CORRECTNESS_ONLY_LOOKS: [usize; 1] = [1];
+const AB_BUILD_PROFILE: &str = "release";
+const AB_BUILD_PROFILE_FLAG: &str = "--release";
+const AB_BUILD_PROFILE_DIR: &str = "release";
+const AB_CLI_BUILD_ARGS: [&str; 6] = [
+    "build",
+    AB_BUILD_PROFILE_FLAG,
+    "-p",
+    "codex-cli",
+    "--bin",
+    "codex",
+];
+const AB_HOST_BUILD_ARGS: [&str; 6] = [
+    "build",
+    AB_BUILD_PROFILE_FLAG,
+    "-p",
+    "codex-code-mode-host",
+    "--bin",
+    "codex-code-mode-host",
+];
+const AB_WORKER_BUILD_ARGS: [&str; 7] = [
+    "build",
+    AB_BUILD_PROFILE_FLAG,
+    "-p",
+    "codex-core",
+    "--bench",
+    "turn_latency",
+    "--message-format=json-render-diagnostics",
+];
 const AB_MEDIAN_RATIO_UCB_LIMIT: f64 = 1.05;
 const AB_P95_RATIO_UCB_LIMIT: f64 = 1.10;
+const AB_P95_RATIO_UCB_GATE_MIN_BASELINE_NS: u64 = 5_000_000;
 const AB_INCREMENTAL_RATIO_TARGET: f64 = 1.00;
 const AB_REPLAY_REQUIRED_IMPROVEMENT_PERCENT: u64 = 25;
 const AB_REPLAY_RATIO_TARGET: f64 = 0.75;
 const AB_WORKLOAD_SCHEMA_VERSION: u16 = 17;
 const AB_BASELINE_STATE_SCHEMA_VERSION: u16 = 2;
 const AB_FILTERED_TREE_IDENTITY_VERSION: u16 = 1;
-const AB_METRIC_GATE_VERSION: u16 = 23;
-const AB_REPORT_SCHEMA_VERSION: u16 = 19;
+const AB_METRIC_GATE_VERSION: u16 = 24;
+const AB_REPORT_SCHEMA_VERSION: u16 = 20;
 const AB_REPLAY_SESSION_AUDIT_EVIDENCE_VERSION: u16 = 1;
 const AB_PREPARED_MANIFEST_SCHEMA_VERSION: u16 = 1;
 const AB_WORKER_STACK_BYTES: &str = "16777216";

@@ -30,23 +30,33 @@ pub(crate) fn normalize_key_aliases(path: &[String], table: &mut TomlMap<String,
 }
 
 pub(crate) fn normalized_with_key_aliases(value: &TomlValue, path: &[String]) -> TomlValue {
+    normalize_owned_key_aliases(value.clone(), &mut path.to_vec())
+}
+
+/// Owned counterpart to [`normalized_with_key_aliases`].
+///
+/// Normalization rebuilds every table anyway, so a caller that already owns
+/// `value` can hand it over instead of paying for a second deep copy. `path`
+/// is used as a scratch buffer and is restored before returning.
+pub(crate) fn normalize_owned_key_aliases(value: TomlValue, path: &mut Vec<String>) -> TomlValue {
     match value {
         TomlValue::Table(table) => {
             let mut normalized = TomlMap::new();
             for (key, child) in table {
-                let mut child_path = path.to_vec();
-                child_path.push(key.clone());
-                normalized.insert(key.clone(), normalized_with_key_aliases(child, &child_path));
+                path.push(key.clone());
+                let child = normalize_owned_key_aliases(child, path);
+                path.pop();
+                normalized.insert(key, child);
             }
             normalize_key_aliases(path, &mut normalized);
             TomlValue::Table(normalized)
         }
         TomlValue::Array(items) => TomlValue::Array(
             items
-                .iter()
-                .map(|item| normalized_with_key_aliases(item, path))
+                .into_iter()
+                .map(|item| normalize_owned_key_aliases(item, path))
                 .collect(),
         ),
-        _ => value.clone(),
+        other => other,
     }
 }

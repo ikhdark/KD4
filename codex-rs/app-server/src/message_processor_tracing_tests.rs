@@ -115,6 +115,21 @@ fn unqueued_request_skips_request_size_serialization() {
     assert_eq!(serializations.load(Ordering::Relaxed), 1);
 }
 
+#[test]
+fn queued_request_size_matches_compact_json_without_materializing_it() {
+    let request = serde_json::json!({
+        "input": "multibyte µ payload".repeat(1024),
+        "enabled": true,
+    });
+
+    assert_eq!(
+        serialized_request_queue_bytes(true, &request),
+        serde_json::to_vec(&request)
+            .expect("serialize comparison request")
+            .len(),
+    );
+}
+
 struct TestTracing {
     exporter: InMemorySpanExporter,
     provider: SdkTracerProvider,

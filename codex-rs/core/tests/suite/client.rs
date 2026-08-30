@@ -2079,10 +2079,12 @@ async fn skills_are_omitted_from_developer_message_under_budget_pressure() {
         .with_config(move |config| {
             config.cwd = codex_home_path.abs();
             let user_config_path = codex_home_path.join("config.toml").abs();
-            config.config_layer_stack = ConfigLayerStack::default().with_user_config(
-                &user_config_path,
-                toml! { skills = { bundled = { enabled = false } } }.into(),
-            );
+            config.config_layer_stack = ConfigLayerStack::default()
+                .with_user_config(
+                    &user_config_path,
+                    toml! { skills = { bundled = { enabled = false } } }.into(),
+                )
+                .into();
             config.model_context_window = Some(12_000);
         });
     let codex = builder

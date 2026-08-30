@@ -53,6 +53,7 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::ClientRequestSerializationScope;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::ExperimentalApi;
@@ -139,8 +140,22 @@ fn serialized_request_queue_bytes<T: Serialize + ?Sized>(
     if !is_serialized {
         return 0;
     }
-    serde_json::to_vec(request)
-        .map(|request| request.len())
+    struct CountingWriter(usize);
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buffer.len());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = CountingWriter(0);
+    serde_json::to_writer(&mut writer, request)
+        .map(|()| writer.0)
         .unwrap_or(usize::MAX)
 }
 
@@ -839,8 +854,15 @@ impl MessageProcessor {
         let handler_rpc_gate = Arc::clone(&rpc_gate);
         let processor = Arc::clone(self);
         let span = request_context.span();
+        // Control traffic is admitted from its own reserved lane and is never charged against
+        // the queued-payload byte budget, so it does not need a size at all.
+        let needs_queue_bytes = matches!(
+            serialization_scope,
+            Some(ref scope)
+                if !matches!(scope, ClientRequestSerializationScope::ThreadControl { .. })
+        );
         let estimated_request_bytes =
-            serialized_request_queue_bytes(serialization_scope.is_some(), &codex_request);
+            serialized_request_queue_bytes(needs_queue_bytes, &codex_request);
         let request = QueuedInitializedRequest::new_with_estimated_bytes(
             rpc_gate,
             estimated_request_bytes,

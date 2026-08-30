@@ -5,6 +5,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 use crate::agents_md::RepositoryStableContextBundle;
@@ -18,6 +19,7 @@ use crate::client_common::ResponseEvent;
 use crate::client_common::ToolSchemaArtifact;
 use crate::collect_explicit_skill_mentions;
 use crate::compact::InitialContextInjection;
+use crate::compact::InlineAutoCompactReuse;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact::should_use_remote_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
@@ -66,6 +68,7 @@ use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
+use crate::session::PreparedContextUpdate;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::reasoning_governor::AuthoritativeWaitResolution;
@@ -333,7 +336,7 @@ pub(crate) async fn run_turn(
     let mut preparation_timing_guard = None;
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
-    if sess.reference_context_item().await.is_none() {
+    if !sess.has_reference_context_item().await {
         client_session
             .invalidate_provider_history_inheritance("realized context baseline is unknown");
     }
@@ -343,7 +346,7 @@ pub(crate) async fn run_turn(
     let mut planning_iterations = 0;
     let mut completed_mcp_effect = None;
     let pending_turn_plan_result = loop {
-        let pending_turn_plan = match stabilize_pending_turn_plan(
+        let mut pending_turn_plan = match stabilize_pending_turn_plan(
             &sess,
             &turn_context,
             &input,
@@ -357,9 +360,11 @@ pub(crate) async fn run_turn(
             Ok(plan) => plan,
             Err(err) => break Err(err),
         };
+        let prepared_context_update =
+            take_stabilized_context_update(&mut pending_turn_plan.prepared_context_update)?;
         let (world_state, display_roots) = tokio::join!(
             sess.compare_and_record_context_updates(
-                pending_turn_plan.step_context.as_ref(),
+                prepared_context_update,
                 pending_turn_plan.planning_generation,
             ),
             turn_diff_display_roots(sess.as_ref(), turn_context.as_ref()),
@@ -857,6 +862,7 @@ pub(crate) async fn run_turn(
                         Arc::clone(&step_context),
                         /*fallback_step_context*/ None,
                         &mut client_session,
+                        prefetched_workspace_identity.as_ref(),
                         InitialContextInjection::AtStart(Arc::clone(&world_state)),
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
@@ -885,22 +891,9 @@ pub(crate) async fn run_turn(
                     } else {
                         last_agent_message = sampling_request_last_agent_message;
                     }
-                    if turn_context.config.features.enabled(Feature::DirectRuntime) {
-                        match completion_pending_input_disposition(
-                            &logical_generation_budget,
-                            sess.input_queue.has_pending_input(&sess.active_turn).await,
-                        ) {
-                            CompletionPendingInputDisposition::Continue => {
-                                pending_continuation_cause = Some(ContinuationCause::PendingInput);
-                                continue 'sampling_loop;
-                            }
-                            CompletionPendingInputDisposition::Defer => {
-                                defer_pending_input = true;
-                            }
-                            CompletionPendingInputDisposition::None => {}
-                        }
-                        break;
-                    }
+                    // C1: the direct runtime shares this completion path. It must not skip
+                    // the after-agent and completion-stop hooks, because those are the
+                    // authoritative, user-configured control over whether a turn may finish.
                     let mutating_finalizer_aborted = if matches!(
                         turn_context.config.after_agent_policy,
                         AfterAgentPolicy::MutatingFinalizer
@@ -1542,6 +1535,7 @@ async fn run_hooks_and_record_inputs_detailed(
 struct PendingTurnPlan {
     planning_generation: u64,
     step_context: Arc<StepContext>,
+    prepared_context_update: Option<PreparedContextUpdate>,
     first_router: Arc<ToolRouter>,
     injection_items: Vec<ResponseItem>,
     explicitly_enabled_connectors: HashSet<String>,
@@ -1552,6 +1546,16 @@ struct PendingTurnPlan {
     tracking: TrackEventsContext,
     mentioned_apps: Vec<(String, Option<String>)>,
     mentioned_plugins: Vec<PluginCapabilitySummary>,
+}
+
+fn take_stabilized_context_update(
+    prepared_context_update: &mut Option<PreparedContextUpdate>,
+) -> CodexResult<PreparedContextUpdate> {
+    prepared_context_update.take().ok_or_else(|| {
+        CodexErr::Fatal(
+            "a stabilized pending-turn plan did not carry its context candidate".to_string(),
+        )
+    })
 }
 
 enum PendingTurnPlanBuild {
@@ -1718,7 +1722,7 @@ async fn build_pure_pending_turn_plan(
     );
 
     if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
-        let (first_router, context_update_items) = tokio::join!(
+        let (first_router, prepared_context_update) = tokio::join!(
             built_tools_for_pending_turn(
                 sess.as_ref(),
                 step_context.as_ref(),
@@ -1726,17 +1730,17 @@ async fn build_pure_pending_turn_plan(
                 planning_generation,
                 cancellation_token
             ),
-            sess.estimate_context_update_items(step_context.as_ref()),
+            sess.prepare_context_update(step_context.as_ref()),
         );
         let first_router = first_router?;
         if sess.services.planning_generation() != planning_generation {
             return Ok(PendingTurnPlanBuild::Stale);
         }
-        let initial_context = sess.reference_context_item().await.is_none();
+        let initial_context = !sess.has_reference_context_item().await;
         let pending_token_estimate = estimate_pending_tokens(
             input,
             &[],
-            &context_update_items,
+            prepared_context_update.context_items(),
             first_router.as_ref(),
             initial_context,
         );
@@ -1746,6 +1750,7 @@ async fn build_pure_pending_turn_plan(
         return Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
             planning_generation,
             step_context,
+            prepared_context_update: Some(prepared_context_update),
             first_router,
             injection_items: Vec::new(),
             explicitly_enabled_connectors: HashSet::new(),
@@ -1908,9 +1913,9 @@ async fn build_pure_pending_turn_plan(
             filter_unchanged_stable_context_items(history.raw_items(), injection_items);
     }
 
-    // Final read-only DAG leaves build the router and context estimate concurrently,
+    // Final DAG leaves build the router and immutable context candidate concurrently,
     // then validate the generation before accepting either.
-    let (first_router, context_update_items) = tokio::join!(
+    let (first_router, prepared_context_update) = tokio::join!(
         built_tools_for_pending_turn(
             sess.as_ref(),
             step_context.as_ref(),
@@ -1918,7 +1923,7 @@ async fn build_pure_pending_turn_plan(
             planning_generation,
             cancellation_token,
         ),
-        sess.estimate_context_update_items(step_context.as_ref()),
+        sess.prepare_context_update(step_context.as_ref()),
     );
     let first_router = first_router?;
     if sess.services.planning_generation() != planning_generation {
@@ -1927,11 +1932,11 @@ async fn build_pure_pending_turn_plan(
     let mut warnings = planned_mcp.warnings;
     warnings.extend(first_router.planning_warnings().iter().cloned());
     warnings.extend(skill_plan.injections.warnings.iter().cloned());
-    let initial_context = sess.reference_context_item().await.is_none();
+    let initial_context = !sess.has_reference_context_item().await;
     let pending_token_estimate = estimate_pending_tokens(
         input,
         &injection_items,
-        &context_update_items,
+        prepared_context_update.context_items(),
         first_router.as_ref(),
         initial_context,
     );
@@ -1940,6 +1945,7 @@ async fn build_pure_pending_turn_plan(
     Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
         planning_generation,
         step_context,
+        prepared_context_update: Some(prepared_context_update),
         first_router,
         projected_prompt_pressure,
         injection_items,
@@ -2035,6 +2041,7 @@ async fn stabilize_pending_turn_plan(
             sess,
             turn_context,
             client_session,
+            Arc::clone(&plan.step_context),
             plan.projected_prompt_pressure,
             !incoming_precompaction_completed,
             cancellation_token,
@@ -2603,6 +2610,7 @@ async fn run_pending_input_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
+    step_context: Arc<StepContext>,
     projected_prompt_pressure: ProjectedPromptPressure,
     allow_pending_input_compaction: bool,
     cancellation_token: &CancellationToken,
@@ -2621,13 +2629,15 @@ async fn run_pending_input_pre_sampling_compact(
         return Ok(None);
     }
 
-    // Pre-turn compaction runs before run_turn creates the normal sampling step.
-    let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
+    // Reuse the step context the pending-turn plan was built from. Capturing another one
+    // would re-run AGENTS.md discovery and MCP runtime resolution for the same step, and any
+    // compaction invalidates this plan and restarts the loop with a fresh capture anyway.
     run_auto_compact(
         sess,
         step_context,
         /*fallback_step_context*/ None,
         client_session,
+        /*prefetched_workspace_identity*/ None,
         InitialContextInjection::DoNotInject,
         CompactionReason::ContextLimit,
         CompactionPhase::PreTurn,
@@ -2709,6 +2719,7 @@ async fn maybe_run_previous_model_inline_compact(
             step_context,
             fallback_step_context,
             client_session,
+            /*prefetched_workspace_identity*/ None,
             InitialContextInjection::DoNotInject,
             CompactionReason::CompHashChanged,
             CompactionPhase::PreTurn,
@@ -2757,6 +2768,7 @@ async fn maybe_run_previous_model_inline_compact(
             step_context,
             fallback_step_context,
             client_session,
+            /*prefetched_workspace_identity*/ None,
             InitialContextInjection::DoNotInject,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
@@ -2779,6 +2791,7 @@ async fn run_auto_compact(
     step_context: Arc<StepContext>,
     fallback_step_context: Option<Arc<StepContext>>,
     client_session: &mut ModelClientSession,
+    prefetched_workspace_identity: Option<&Option<crate::git_workspace::WorkspaceEvidenceIdentity>>,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -2822,6 +2835,11 @@ async fn run_auto_compact(
         run_inline_auto_compact_task(
             Arc::clone(sess),
             Arc::clone(turn_context),
+            InlineAutoCompactReuse {
+                // Reuse the turn transport, matching the remote-compaction path above.
+                client_session,
+                prefetched_workspace_identity,
+            },
             initial_context_injection,
             reason,
             phase,
@@ -2901,29 +2919,7 @@ fn compact_projected_prompt_inputs(
         stable_context_fallback_input,
         tool_history_fallback_input,
         stable_context_tool_history_fallback_input,
-    ] = prepared.compacted_tool_search_outputs(|projections| {
-        let mut compacted_by_source =
-            Vec::<(Arc<[ResponseItem]>, Arc<[ResponseItem]>)>::with_capacity(4);
-        projections.map(|input| {
-            let previously_compacted = compacted_by_source
-                .iter()
-                .find(|(source, _)| Arc::ptr_eq(source, &input))
-                .or_else(|| {
-                    compacted_by_source
-                        .iter()
-                        .find(|(source, _)| source.as_ref() == input.as_ref())
-                })
-                .map(|(_, compacted)| Arc::clone(compacted));
-            if let Some(compacted) = previously_compacted {
-                return compacted;
-            }
-
-            let source = Arc::clone(&input);
-            let compacted = compact_acknowledged_tool_search_outputs(input);
-            compacted_by_source.push((source, Arc::clone(&compacted)));
-            compacted
-        })
-    });
+    ] = prepared.compacted_tool_search_outputs(compact_acknowledged_tool_search_outputs);
     #[cfg(test)]
     let pass_count = {
         let compacted = [
@@ -3155,10 +3151,43 @@ struct ResolvedRequestScaffold {
     locally_reused: bool,
 }
 
+/// Cheap identity for the model-visible tool surface of one request.
+///
+/// Materializing the schema artifact walks the registry and takes the router schema lock, so
+/// the scaffold cache compares this token first and only acquires the artifact on a miss.
+/// `router` is the registry identity and `activation_revision` advances whenever deferred
+/// tool activation changes the exposed surface, which together determine the artifact the
+/// router would hand back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ToolSchemaSurfaceToken {
+    router: *const ToolRouter,
+    activation_revision: u64,
+    terminal_completion_only: bool,
+}
+
+// The pointer is only ever compared for identity; it is never dereferenced.
+unsafe impl Send for ToolSchemaSurfaceToken {}
+unsafe impl Sync for ToolSchemaSurfaceToken {}
+
+impl ToolSchemaSurfaceToken {
+    fn capture(
+        router: &ToolRouter,
+        turn: &crate::session::turn_context::TurnContext,
+        terminal_completion_only: bool,
+    ) -> Self {
+        Self {
+            router: std::ptr::from_ref(router),
+            activation_revision: turn.deferred_tool_activation_revision(),
+            terminal_completion_only,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RequestScaffoldCacheEntry {
     owner: RequestScaffoldOwner,
     scaffold: Arc<RequestScaffold>,
+    tool_schema_surface: ToolSchemaSurfaceToken,
 }
 
 #[derive(Debug, Default)]
@@ -3183,18 +3212,39 @@ impl RequestScaffoldCache {
             .config
             .include_permissions_instructions
             .then(|| sess.services.exec_policy.current());
+        let tool_schema_surface =
+            ToolSchemaSurfaceToken::capture(router, &step_context.turn, terminal_completion_only);
+        // Check the cheap surface token before materializing the schema artifact so a repeated
+        // request with an unchanged tool surface never touches the router schema cache.
+        if let Some(entry) = self.entry.as_ref()
+            && entry.tool_schema_surface == tool_schema_surface
+            && entry
+                .owner
+                .matches(prepared, step_context, exec_policy.as_ref())
+            && entry.scaffold.base_instructions == *base_instructions
+        {
+            return ResolvedRequestScaffold {
+                scaffold: Arc::clone(&entry.scaffold),
+                locally_reused: true,
+            };
+        }
+
         let tools = if terminal_completion_only {
             Arc::new(ToolSchemaArtifact::default())
         } else {
             router.model_visible_schemas_for_turn(&step_context.turn)
         };
-        if let Some(entry) = self.entry.as_ref()
+        // A different router instance or activation revision can still project the same
+        // surface. Fall back to the artifact comparison so those requests keep reusing the
+        // scaffold instead of rebuilding it.
+        if let Some(entry) = self.entry.as_mut()
             && entry
                 .owner
                 .matches(prepared, step_context, exec_policy.as_ref())
             && entry.scaffold.base_instructions == *base_instructions
             && tool_schema_surface_matches(&entry.scaffold.tools, &tools)
         {
+            entry.tool_schema_surface = tool_schema_surface;
             return ResolvedRequestScaffold {
                 scaffold: Arc::clone(&entry.scaffold),
                 locally_reused: true,
@@ -3218,6 +3268,7 @@ impl RequestScaffoldCache {
         self.entry = Some(RequestScaffoldCacheEntry {
             owner,
             scaffold: Arc::clone(&scaffold),
+            tool_schema_surface,
         });
         #[cfg(test)]
         {
@@ -3463,14 +3514,7 @@ async fn run_sampling_request(
             base_instructions,
             terminal_completion_only,
         );
-    if !terminal_completion_only {
-        // Tool-manifest construction and its ordered rollout append are persistence work, not
-        // model-request preparation. Keep the append before the sampling boundary for replay
-        // ordering, but do not charge its (potentially cold) canonicalization to the owned
-        // request-preparation lane.
-        let manifest_persistence_guard = turn_context
-            .turn_timing_state
-            .begin_persistence_outside_preparation(preparation_timing_guard);
+    let pending_tool_manifest = Arc::new(Mutex::new(if !terminal_completion_only {
         let previous_manifest_hash = sess
             .queued_tool_manifest_hash
             .lock()
@@ -3478,9 +3522,10 @@ async fn run_sampling_request(
             .clone();
         let manifest = router
             .tool_manifest_for_rollout(turn_context.as_ref(), previous_manifest_hash.as_deref());
-        persist_tool_manifest_before_sampling(sess.as_ref(), manifest).await?;
-        drop(manifest_persistence_guard);
-    }
+        Some(manifest)
+    } else {
+        None
+    }));
 
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&sess),
@@ -3537,6 +3582,7 @@ async fn run_sampling_request(
             reasoning_phase,
             reasoning_trigger,
             generation_request.sampling.clone(),
+            Arc::clone(&pending_tool_manifest),
             cancellation_token.child_token(),
             &mut attempt_progress,
         )
@@ -3612,24 +3658,37 @@ fn retain_accepted_sampling_input(
     accepted_attempt_input
 }
 
-pub(super) async fn persist_tool_manifest_before_sampling(
+pub(super) async fn persist_sampling_prefix_before_dispatch(
     sess: &Session,
-    manifest: codex_protocol::protocol::ToolManifestItem,
+    manifest: Option<codex_protocol::protocol::ToolManifestItem>,
+    boundary: codex_protocol::protocol::SamplingBoundaryItem,
 ) -> CodexResult<()> {
-    let manifest_hash = manifest.hash.clone();
-    sess.persist_rollout_items_ordered(&[codex_protocol::protocol::RolloutItem::ToolManifest(
-        manifest,
-    )])
-    .await
-    .map_err(|err| {
-        CodexErr::Fatal(format!(
-            "failed to order tool manifest before provider dispatch: {err}"
-        ))
-    })?;
-    *sess
-        .queued_tool_manifest_hash
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(manifest_hash);
+    let manifest_hash = manifest.as_ref().map(|manifest| manifest.hash.clone());
+    let has_manifest = manifest.is_some();
+    let mut prefix = Vec::with_capacity(if has_manifest { 2 } else { 1 });
+    if let Some(manifest) = manifest {
+        prefix.push(codex_protocol::protocol::RolloutItem::ToolManifest(
+            manifest,
+        ));
+    }
+    prefix.push(codex_protocol::protocol::RolloutItem::SamplingBoundary(
+        boundary,
+    ));
+    sess.persist_rollout_items_ordered(prefix.as_slice())
+        .await
+        .map_err(|err| {
+            CodexErr::Fatal(if has_manifest {
+                format!("failed to order tool manifest before provider dispatch: {err}")
+            } else {
+                format!("failed to order sampling boundary before provider dispatch: {err}")
+            })
+        })?;
+    if let Some(manifest_hash) = manifest_hash {
+        *sess
+            .queued_tool_manifest_hash
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(manifest_hash);
+    }
     Ok(())
 }
 
@@ -3686,6 +3745,13 @@ struct SessionPreparedRouter {
     router: Arc<ToolRouter>,
 }
 
+fn same_config_snapshot(
+    left: &Arc<crate::config::Config>,
+    right: &Arc<crate::config::Config>,
+) -> bool {
+    Arc::ptr_eq(left, right) || left.as_ref() == right.as_ref()
+}
+
 #[derive(Default)]
 pub(super) struct SessionPreparedRouterCache {
     entry: std::sync::Mutex<Option<SessionPreparedRouter>>,
@@ -3699,7 +3765,7 @@ impl SessionPreparedRouterCache {
             .as_ref()
             .filter(|entry| {
                 entry.planning_generation == planning_generation
-                    && entry.config.as_ref() == turn_context.config.as_ref()
+                    && same_config_snapshot(&entry.config, &turn_context.config)
                     && entry.dynamic_tools.as_slice() == turn_context.dynamic_tools.as_slice()
             })
             .map(|entry| Arc::clone(&entry.router))
@@ -4740,6 +4806,19 @@ pub(crate) fn reconcile_turn_progress(
     }
 }
 
+fn hold_sampling_readiness_for_ordered_prefix(
+    reason: NextSampleBlockReason,
+) -> NextSampleBlockReason {
+    if reason == NextSampleBlockReason::ReadyToSample {
+        // The provider request is not dispatchable until its sampling boundary (and, when
+        // present, the matching tool manifest) has joined the ordered rollout. Keep the timing
+        // state blocked until that append and context binding both succeed.
+        NextSampleBlockReason::WaitingForDelivery
+    } else {
+        reason
+    }
+}
+
 pub(crate) fn reconcile_turn_progress_event(
     turn_timing_state: &TurnTimingState,
     pending_tool_count: usize,
@@ -4815,13 +4894,77 @@ fn start_eager_tool_future(future: InFlightToolCall) -> BoxFuture<'static, InFli
     })
 }
 
+/// How the provider response tail ended.
+///
+/// Deferred tools are admitted only on [`ResponseTailOutcome::SuccessfulTail`]. A terminal
+/// stream error or a cancellation retires them without invoking their handlers, so a
+/// response the provider never completed cannot produce a side effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResponseTailOutcome {
+    SuccessfulTail,
+    TerminalError,
+    Cancelled,
+}
+
+impl ResponseTailOutcome {
+    fn unexecuted_message(self) -> Option<&'static str> {
+        match self {
+            Self::SuccessfulTail => None,
+            Self::TerminalError => Some(
+                "This tool was not executed: the model response stream failed before it closed.",
+            ),
+            Self::Cancelled => {
+                Some("This tool was not executed: the turn was interrupted before it started.")
+            }
+        }
+    }
+}
+
+/// Wakes deferred tool calls once and tells them whether they may run.
+#[derive(Clone)]
+pub(crate) struct ResponseTailSignal {
+    closed: CancellationToken,
+    outcome: Arc<OnceLock<ResponseTailOutcome>>,
+}
+
+impl ResponseTailSignal {
+    fn new() -> Self {
+        Self {
+            closed: CancellationToken::new(),
+            outcome: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Publishes the tail outcome, then wakes every deferred call.
+    ///
+    /// The outcome is written before the wake so a woken call always observes it. Only the
+    /// first close is authoritative.
+    fn close(&self, outcome: ResponseTailOutcome) {
+        let _ = self.outcome.set(outcome);
+        self.closed.cancel();
+    }
+
+    async fn wait(&self) -> ResponseTailOutcome {
+        self.closed.cancelled().await;
+        self.outcome
+            .get()
+            .copied()
+            // A wake without a published outcome can only come from teardown.
+            .unwrap_or(ResponseTailOutcome::Cancelled)
+    }
+}
+
 fn defer_tool_future_until_response_tail(
     future: InFlightToolCall,
-    response_tail_closed: CancellationToken,
+    response_tail: ResponseTailSignal,
 ) -> BoxFuture<'static, InFlightToolResult> {
     Box::pin(async move {
-        response_tail_closed.cancelled().await;
-        future.into_future().await
+        match response_tail.wait().await.unexecuted_message() {
+            // The tail never closed successfully, so this call was never admitted. Retire it
+            // with a model-visible output instead of running its handler.
+            Some(message) => future.into_unexecuted_result(message.to_string()),
+            None => future.into_future().await,
+        }
     })
 }
 
@@ -4883,20 +5026,21 @@ async fn try_run_sampling_request(
     reasoning_phase: Option<SamplingReasoningPhase>,
     reasoning_trigger: codex_protocol::protocol::ReasoningPolicyTrigger,
     sampling: SamplingGenerationDisposition,
+    pending_tool_manifest: Arc<Mutex<Option<codex_protocol::protocol::ToolManifestItem>>>,
     cancellation_token: CancellationToken,
     attempt_progress: &mut SamplingAttemptProgress,
 ) -> CodexResult<SamplingRequestResult> {
     let mut active_without_pending_passes = 0_u8;
-    let next_sample_reason = reconcile_turn_progress(
+    let next_sample_reason = hold_sampling_readiness_for_ordered_prefix(reconcile_turn_progress(
         &turn_context.turn_timing_state,
         0,
         &mut active_without_pending_passes,
-    );
+    ));
     turn_context
         .turn_timing_state
         .record_next_sample_block_reason(next_sample_reason);
     trace!(?next_sample_reason, "sampling admission reconciliation");
-    if sess.reference_context_item().await.is_none() {
+    if !sess.has_reference_context_item().await {
         client_session.invalidate_provider_history_inheritance(
             "realized context baseline is unknown before sampling",
         );
@@ -5047,11 +5191,13 @@ async fn try_run_sampling_request(
     let boundary_turn_timing = Arc::clone(&turn_context.turn_timing_state);
     let bound_context_attempts = Arc::new(Mutex::new(HashSet::new()));
     let boundary_bound_context_attempts = Arc::clone(&bound_context_attempts);
+    let boundary_pending_tool_manifest = Arc::clone(&pending_tool_manifest);
     let attempt_prepared: AttemptPreparedCallback = Arc::new(move |identity| {
         let sess = Arc::clone(&boundary_session);
         let turn_id = boundary_turn_id.clone();
         let turn_timing_state = Arc::clone(&boundary_turn_timing);
         let bound_context_attempts = Arc::clone(&boundary_bound_context_attempts);
+        let pending_tool_manifest = Arc::clone(&boundary_pending_tool_manifest);
         Box::pin(async move {
             let terminal = sess
                 .active_turn
@@ -5111,18 +5257,21 @@ async fn try_run_sampling_request(
             } else {
                 None
             };
-            sess.persist_sampling_boundary_ordered(SamplingBoundaryItem {
-                sampling_request_id: identity.sampling_request_id.clone(),
-                physical_attempt_id: identity.physical_attempt_id.clone(),
-                turn_id: Some(turn_id),
-                unresolved_context: true,
-            })
-            .await
-            .map_err(|err| {
-                CodexErr::Fatal(format!(
-                    "failed to order sampling boundary before provider dispatch: {err}"
-                ))
-            })?;
+            let manifest = pending_tool_manifest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            persist_sampling_prefix_before_dispatch(
+                sess.as_ref(),
+                manifest,
+                SamplingBoundaryItem {
+                    sampling_request_id: identity.sampling_request_id.clone(),
+                    physical_attempt_id: identity.physical_attempt_id.clone(),
+                    turn_id: Some(turn_id),
+                    unresolved_context: true,
+                },
+            )
+            .await?;
             if sess
                 .bind_context_baseline_candidate(
                     &identity.sampling_request_id,
@@ -5138,6 +5287,7 @@ async fn try_run_sampling_request(
                         identity.physical_attempt_id.clone(),
                     ));
             }
+            turn_timing_state.record_next_sample_block_reason(NextSampleBlockReason::ReadyToSample);
             Ok(sampling_admission)
         })
     });
@@ -5162,7 +5312,7 @@ async fn try_run_sampling_request(
     let mut in_flight: FuturesOrdered<BoxFuture<'static, InFlightToolResult>> =
         FuturesOrdered::new();
     let mut completed_in_flight = VecDeque::new();
-    let response_tail_closed = CancellationToken::new();
+    let response_tail = ResponseTailSignal::new();
     let response_item_recorder = OrderedResponseItemRecorder::default();
     let mut earlier_tool_calls_eligible = true;
     let mut all_tool_calls_eager_read_eligible = true;
@@ -5203,8 +5353,15 @@ async fn try_run_sampling_request(
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
-    let defer_streamed_turn_items_for_contributors =
-        !sess.services.extensions.turn_item_contributors().is_empty();
+    // S1: only a contributor that may rewrite assistant text forces buffering. Contributors
+    // that just annotate non-text fields keep true streaming, and buffered items still replay
+    // their finalized text as a delta before completion.
+    let defer_streamed_turn_items_for_contributors = sess
+        .services
+        .extensions
+        .turn_item_contributors()
+        .iter()
+        .any(|contributor| contributor.mutates_assistant_text());
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
     let outcome: CodexResult<UnsettledSamplingRequestResult> = loop {
@@ -5283,43 +5440,43 @@ async fn try_run_sampling_request(
             let context_baseline_was_bound = bound_context_attempts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&(
-                    identity.sampling_request_id.clone(),
-                    identity.physical_attempt_id.clone(),
-                ));
-            match sess
-                .commit_context_baseline_candidate(
-                    &identity.sampling_request_id,
-                    &identity.physical_attempt_id,
-                )
-                .await
-            {
-                Ok(true) => context_baseline_committed = true,
-                Ok(false) if !context_baseline_was_bound => {
-                    // Unchanged world state does not stage a context candidate.
-                    // Accept the provider response while preserving fail-closed
-                    // behavior for an attempt that did bind a candidate and
-                    // subsequently failed to commit it.
-                    context_baseline_committed = true;
-                }
-                Ok(false) => {
-                    sess.mark_context_baseline_unknown().await;
-                    client_session.invalidate_provider_history_inheritance(
-                        "prepared context did not match the provider-accepted attempt",
-                    );
-                    break Err(CodexErr::Fatal(
-                        "provider accepted a sampling attempt without a matching prepared context"
-                            .to_string(),
-                    ));
-                }
-                Err(err) => {
-                    sess.mark_context_baseline_unknown().await;
-                    client_session.invalidate_provider_history_inheritance(
-                        "authoritative context persistence failed after provider acceptance",
-                    );
-                    break Err(CodexErr::Fatal(format!(
-                        "provider accepted sampling attempt but authoritative context persistence failed: {err}"
-                    )));
+                .iter()
+                .any(|(sampling_request_id, physical_attempt_id)| {
+                    sampling_request_id == &identity.sampling_request_id
+                        && physical_attempt_id == &identity.physical_attempt_id
+                });
+            if !context_baseline_was_bound {
+                // Unchanged world state does not stage a context candidate. Avoid taking the
+                // session-state lock on the first response event when there is nothing to commit.
+                context_baseline_committed = true;
+            } else {
+                match sess
+                    .commit_context_baseline_candidate(
+                        &identity.sampling_request_id,
+                        &identity.physical_attempt_id,
+                    )
+                    .await
+                {
+                    Ok(true) => context_baseline_committed = true,
+                    Ok(false) => {
+                        sess.mark_context_baseline_unknown().await;
+                        client_session.invalidate_provider_history_inheritance(
+                            "prepared context did not match the provider-accepted attempt",
+                        );
+                        break Err(CodexErr::Fatal(
+                            "provider accepted a sampling attempt without a matching prepared context"
+                                .to_string(),
+                        ));
+                    }
+                    Err(err) => {
+                        sess.mark_context_baseline_unknown().await;
+                        client_session.invalidate_provider_history_inheritance(
+                            "authoritative context persistence failed after provider acceptance",
+                        );
+                        break Err(CodexErr::Fatal(format!(
+                            "provider accepted sampling attempt but authoritative context persistence failed: {err}"
+                        )));
+                    }
                 }
             }
         }
@@ -5397,7 +5554,7 @@ async fn try_run_sampling_request(
                     } else {
                         in_flight.push_back(defer_tool_future_until_response_tail(
                             tool_future,
-                            response_tail_closed.clone(),
+                            response_tail.clone(),
                         ));
                     }
                 }
@@ -5727,10 +5884,17 @@ async fn try_run_sampling_request(
             }
         }
     };
-    // FuturesOrdered polls every inserted slot while streaming. Open deferred
-    // slots only after the provider response closes so non-eager tools cannot
-    // begin execution during the response tail.
-    response_tail_closed.cancel();
+    // FuturesOrdered polls every inserted slot while streaming. Open deferred slots only
+    // after the provider response closes so non-eager tools cannot begin execution during the
+    // response tail, and only when that close was successful: a terminal stream error or a
+    // cancellation retires them unexecuted rather than running a handler for a response the
+    // provider never completed. Tools already admitted before the error are not undone.
+    let tail_outcome = match &outcome {
+        Ok(_) => ResponseTailOutcome::SuccessfulTail,
+        Err(CodexErr::TurnAborted | CodexErr::Interrupted) => ResponseTailOutcome::Cancelled,
+        Err(_) => ResponseTailOutcome::TerminalError,
+    };
+    response_tail.close(tail_outcome);
     drop(sampling_timing_guard);
 
     flush_assistant_text_segments_all(

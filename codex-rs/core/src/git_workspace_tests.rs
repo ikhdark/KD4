@@ -775,6 +775,19 @@ async fn workspace_evidence_identity_recaptures_without_waiting_for_watcher_deli
 }
 
 #[tokio::test]
+async fn workspace_evidence_root_resolution_accepts_nested_working_directories() {
+    let (_temp, repo) = create_clean_git_repo().await;
+    let nested = repo.join("nested").join("deeper");
+    std::fs::create_dir_all(&nested).expect("create nested cwd");
+
+    let resolved = resolve_workspace_evidence_root(&nested)
+        .await
+        .expect("resolve repository root");
+
+    assert_eq!(resolved, canonical_workspace_evidence_root(repo.as_path()));
+}
+
+#[tokio::test]
 async fn concurrent_workspace_evidence_capture_coalesces_without_crossing_mutation_epoch() {
     let (_temp, repo) = create_clean_git_repo().await;
     let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));

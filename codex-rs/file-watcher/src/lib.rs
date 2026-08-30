@@ -164,6 +164,7 @@ impl WatchSender {
         for path in paths {
             if changed_paths.len() >= SUBSCRIBER_PATH_BUFFER_CAPACITY
                 && !changed_paths.contains(path)
+                && !compress_changed_paths(&mut changed_paths, SUBSCRIBER_PATH_BUFFER_CAPACITY)
             {
                 changed_paths.clear();
                 drop(changed_paths);
@@ -213,6 +214,43 @@ fn watch_channel() -> (WatchSender, Receiver) {
         },
         Receiver { inner },
     )
+}
+
+/// Coarsens the deepest retained paths until another distinct path fits.
+///
+/// Overflow is rare and already means an exact path list is too large. Keeping
+/// directory-level evidence is preferable to replacing every known change with
+/// a global rescan marker, because consumers can still preserve freshness for
+/// unrelated paths.
+fn compress_changed_paths(paths: &mut BTreeSet<PathBuf>, capacity: usize) -> bool {
+    if capacity == 0 {
+        return false;
+    }
+
+    while paths.len() >= capacity {
+        let deepest = paths
+            .iter()
+            .map(|path| path.components().count())
+            .max()
+            .unwrap_or(0);
+        let mut compressed = BTreeSet::new();
+        for path in paths.iter() {
+            if path.components().count() == deepest {
+                compressed.insert(
+                    path.parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| path.clone()),
+                );
+            } else {
+                compressed.insert(path.clone());
+            }
+        }
+        if compressed == *paths {
+            return false;
+        }
+        *paths = compressed;
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -335,6 +373,10 @@ impl ThrottledWatchReceiver {
             for path in event.paths {
                 if self.changed_paths.len() >= SUBSCRIBER_PATH_BUFFER_CAPACITY
                     && !self.changed_paths.contains(&path)
+                    && !compress_changed_paths(
+                        &mut self.changed_paths,
+                        SUBSCRIBER_PATH_BUFFER_CAPACITY,
+                    )
                 {
                     self.changed_paths.clear();
                     self.rescan_required = true;
@@ -413,6 +455,10 @@ impl DebouncedWatchReceiver {
             for path in event.paths {
                 if self.changed_paths.len() >= SUBSCRIBER_PATH_BUFFER_CAPACITY
                     && !self.changed_paths.contains(&path)
+                    && !compress_changed_paths(
+                        &mut self.changed_paths,
+                        SUBSCRIBER_PATH_BUFFER_CAPACITY,
+                    )
                 {
                     self.changed_paths.clear();
                     self.rescan_required = true;
@@ -1239,6 +1285,10 @@ impl FileWatcher {
                         {
                             if changed_paths.len() >= SUBSCRIBER_PATH_BUFFER_CAPACITY
                                 && !changed_paths.contains(&path)
+                                && !compress_changed_paths(
+                                    &mut changed_paths,
+                                    SUBSCRIBER_PATH_BUFFER_CAPACITY,
+                                )
                             {
                                 changed_paths.clear();
                                 rescan_required = true;

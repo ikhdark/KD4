@@ -465,22 +465,33 @@ async fn load_config_resolves_experimental_request_user_input_enabled() -> std::
 }
 
 #[tokio::test]
-async fn load_config_defaults_phase_tracking_to_global_reasoning_effort() -> std::io::Result<()> {
+async fn load_config_defaults_phase_tracking_to_compatibility_efforts() -> std::io::Result<()> {
     let codex_home = tempdir()?;
+    let config_toml: ConfigToml = toml::from_str(
+        r#"
+model_reasoning_effort = "medium"
+"#,
+    )
+    .expect("reasoning config should deserialize");
     let config = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            model_reasoning_effort: Some(ReasoningEffort::High),
-            ..ConfigToml::default()
-        },
+        config_toml,
         ConfigOverrides::default(),
         codex_home.abs(),
     )
     .await?;
 
-    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Medium));
     assert_eq!(
         config.reasoning_phase_efforts,
-        Some(ReasoningPhaseEfforts::default())
+        Some(ReasoningPhaseEfforts {
+            orient: Some(ReasoningEffort::High),
+            inspect: Some(ReasoningEffort::Low),
+            implement: Some(ReasoningEffort::High),
+            diagnose: Some(ReasoningEffort::High),
+            verify: Some(ReasoningEffort::Low),
+            finalize: Some(ReasoningEffort::Low),
+            deterministic_continuation: Some(ReasoningEffort::Low),
+        })
     );
     Ok(())
 }
@@ -488,15 +499,17 @@ async fn load_config_defaults_phase_tracking_to_global_reasoning_effort() -> std
 #[tokio::test]
 async fn load_config_preserves_explicit_reasoning_phase_effort_overrides() -> std::io::Result<()> {
     let codex_home = tempdir()?;
+    let config_toml: ConfigToml = toml::from_str(
+        r#"
+[reasoning_phase_efforts]
+orient = "low"
+inspect = "medium"
+deterministic_continuation = "high"
+"#,
+    )
+    .expect("partial reasoning phase config should deserialize");
     let config = Config::load_from_base_config_with_overrides(
-        ConfigToml {
-            reasoning_phase_efforts: Some(ReasoningPhaseEfforts {
-                inspect: Some(ReasoningEffort::Medium),
-                verify: Some(ReasoningEffort::High),
-                ..ReasoningPhaseEfforts::default()
-            }),
-            ..ConfigToml::default()
-        },
+        config_toml,
         ConfigOverrides::default(),
         codex_home.abs(),
     )
@@ -505,9 +518,52 @@ async fn load_config_preserves_explicit_reasoning_phase_effort_overrides() -> st
     assert_eq!(
         config.reasoning_phase_efforts,
         Some(ReasoningPhaseEfforts {
+            orient: Some(ReasoningEffort::Low),
             inspect: Some(ReasoningEffort::Medium),
+            implement: Some(ReasoningEffort::High),
+            diagnose: Some(ReasoningEffort::High),
+            verify: Some(ReasoningEffort::Low),
+            finalize: Some(ReasoningEffort::Low),
+            deterministic_continuation: Some(ReasoningEffort::High),
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_preserves_all_explicit_reasoning_phase_effort_overrides() -> std::io::Result<()>
+{
+    let codex_home = tempdir()?;
+    let config_toml: ConfigToml = toml::from_str(
+        r#"
+[reasoning_phase_efforts]
+orient = "low"
+inspect = "high"
+implement = "low"
+diagnose = "low"
+verify = "high"
+finalize = "high"
+deterministic_continuation = "high"
+"#,
+    )
+    .expect("full reasoning phase config should deserialize");
+    let config = Config::load_from_base_config_with_overrides(
+        config_toml,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        config.reasoning_phase_efforts,
+        Some(ReasoningPhaseEfforts {
+            orient: Some(ReasoningEffort::Low),
+            inspect: Some(ReasoningEffort::High),
+            implement: Some(ReasoningEffort::Low),
+            diagnose: Some(ReasoningEffort::Low),
             verify: Some(ReasoningEffort::High),
-            ..ReasoningPhaseEfforts::default()
+            finalize: Some(ReasoningEffort::High),
+            deterministic_continuation: Some(ReasoningEffort::High),
         })
     );
     Ok(())
@@ -2075,7 +2131,8 @@ async fn managed_unrestricted_permission_profile_still_enables_network_requireme
         ..Default::default()
     });
     config.config_layer_stack = ConfigLayerStack::new(layers, requirements, requirements_toml)
-        .expect("config layer stack with network requirements");
+        .expect("config layer stack with network requirements")
+        .into();
 
     assert!(config.managed_network_requirements_enabled());
     Ok(())

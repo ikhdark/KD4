@@ -109,6 +109,7 @@ pub(super) async fn spawn_review_thread(
         sub_id: review_turn_id.clone(),
         trace_id: current_span_trace_id(),
         config: per_turn_config,
+        effective_workspace_roots: Arc::clone(&parent_turn_context.effective_workspace_roots),
         base_instructions: Arc::clone(&parent_turn_context.base_instructions),
         auth_manager: auth_manager_for_context,
         model_info: model_info.clone(),

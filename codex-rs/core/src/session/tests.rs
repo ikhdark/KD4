@@ -1179,7 +1179,7 @@ async fn preview_session_start_hooks(
 ) -> std::io::Result<Vec<codex_protocol::protocol::HookRunSummary>> {
     let hooks = Hooks::new(HooksConfig {
         feature_enabled: true,
-        config_layer_stack: Some(config.config_layer_stack.clone()),
+        config_layer_stack: Some(config.config_layer_stack.as_ref().clone()),
         ..HooksConfig::default()
     });
 
@@ -1687,7 +1687,8 @@ async fn danger_full_access_tool_attempts_do_not_enforce_managed_network() -> an
             ..Default::default()
         });
         config.config_layer_stack = ConfigLayerStack::new(layers, requirements, requirements_toml)
-            .expect("rebuild config layer stack with network requirements");
+            .expect("rebuild config layer stack with network requirements")
+            .into();
     })
     .await?;
 
@@ -2343,6 +2344,55 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, strip_response_item_ids(history.raw_items()));
+}
+
+/// N1 regression: raw response items mirror every recorded history item, including full
+/// tool outputs, so the producer must not build or send them when no consumer opted in.
+#[tokio::test]
+async fn raw_response_items_are_not_produced_when_no_consumer_requested_them() {
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+    session
+        .raw_response_items_requested
+        .store(false, std::sync::atomic::Ordering::Release);
+
+    session
+        .record_conversation_items(&turn_context, &[user_message("hello")])
+        .await;
+
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(event.msg, EventMsg::RawResponseItem(_)),
+            "suppressed sessions must not emit raw response items"
+        );
+    }
+}
+
+/// A consumer that opts in must still observe raw response items.
+#[tokio::test]
+async fn raw_response_items_resume_after_a_consumer_requests_them() {
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+    session
+        .raw_response_items_requested
+        .store(false, std::sync::atomic::Ordering::Release);
+    assert!(!session.raw_response_items_requested());
+
+    session.request_raw_response_items();
+    assert!(session.raw_response_items_requested());
+
+    session
+        .record_conversation_items(&turn_context, &[user_message("hello")])
+        .await;
+
+    let mut saw_raw_response_item = false;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event.msg, EventMsg::RawResponseItem(_)) {
+            saw_raw_response_item = true;
+        }
+    }
+    assert!(
+        saw_raw_response_item,
+        "an opted-in consumer must still observe raw response items"
+    );
 }
 
 #[tokio::test]
@@ -8516,6 +8566,11 @@ where
         terminal_tasks: tokio_util::task::TaskTracker::new(),
         terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
+        // Test sessions observe raw response items by default so the many existing
+        // raw-event delivery assertions keep exercising the delivery path. Production
+        // sessions start suppressed until a consumer opts in; that gate has its own
+        // dedicated coverage in `raw_response_items_*` below.
+        raw_response_items_requested: std::sync::atomic::AtomicBool::new(true),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -8999,7 +9054,8 @@ async fn record_context_updates_emits_environment_item_for_network_changes() {
         requirements,
         config.config_layer_stack.requirements_toml().clone(),
     )
-    .expect("rebuild config layer stack with network requirements");
+    .expect("rebuild config layer stack with network requirements")
+    .into();
     let active_permission_profile = config
         .permissions
         .active_permission_profile()
@@ -9187,6 +9243,53 @@ const MUTABLE_CONTEXT_WORLD_STATE_ID: &str = "mutable_context_world_state_test";
 struct MutableContextWorldStateTestContributor {
     prompt_calls: Arc<std::sync::atomic::AtomicUsize>,
     world_revision: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct PreparedContextCountingContributor {
+    thread_calls: Arc<std::sync::atomic::AtomicUsize>,
+    turn_calls: Arc<std::sync::atomic::AtomicUsize>,
+    world_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl codex_extension_api::ContextContributor for PreparedContextCountingContributor {
+    fn contribute_thread_context<'a>(
+        &'a self,
+        _session_store: &'a codex_extension_api::ExtensionData,
+        _thread_store: &'a codex_extension_api::ExtensionData,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        self.thread_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            vec![codex_extension_api::PromptFragment::developer_policy(
+                "prepared thread context",
+            )]
+        })
+    }
+
+    fn contribute_turn_context<'a>(
+        &'a self,
+        _input: codex_extension_api::TurnContextContributionInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        self.turn_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            vec![codex_extension_api::PromptFragment::developer_policy(
+                "prepared turn context",
+            )]
+        })
+    }
+
+    fn contribute_world_state<'a>(
+        &'a self,
+        _input: codex_extension_api::WorldStateContributionInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<
+        'a,
+        Vec<codex_extension_api::WorldStateSectionContribution>,
+    > {
+        self.world_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Vec::new() })
+    }
 }
 
 impl ConcurrentContextTestContributor {
@@ -9469,6 +9572,40 @@ async fn build_initial_context_includes_prompt_fragments_from_extensions() {
             .any(|text| *text == "prompt extension enabled"),
         "expected prompt extension developer text, got {developer_messages:?}"
     );
+}
+
+#[tokio::test]
+async fn prepared_context_update_polls_contributors_once_across_planning_and_commit() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let thread_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let turn_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let world_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(PreparedContextCountingContributor {
+        thread_calls: Arc::clone(&thread_calls),
+        turn_calls: Arc::clone(&turn_calls),
+        world_calls: Arc::clone(&world_calls),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(turn_context);
+    let planning_generation = session.services.planning_generation();
+
+    let prepared = session.prepare_context_update(&step_context).await;
+    assert_eq!(thread_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(turn_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(world_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    assert!(
+        session
+            .compare_and_record_context_updates(prepared, planning_generation)
+            .await
+            .is_some()
+    );
+    assert_eq!(thread_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(turn_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(world_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -11545,6 +11682,44 @@ fn durable_history_commit_key_matches_the_existing_compact_json_identity() {
     );
 }
 
+#[test]
+fn history_identity_offload_is_reserved_for_large_tool_results() {
+    let output = |text: String| ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "offload-boundary".to_string(),
+        output: FunctionCallOutputPayload::from_text(text),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    assert!(!conversation_items_need_blocking_history_identity(&[
+        output("ordinary result".to_string())
+    ]));
+    assert!(conversation_items_need_blocking_history_identity(&[
+        output("x".repeat(HISTORY_IDENTITY_OFFLOAD_MIN_TEXT_BYTES))
+    ]));
+}
+
+#[test]
+fn owned_history_preparation_preserves_payload_and_assigns_identity_once() {
+    let output_text = "owned preparation payload".repeat(1024);
+    let items = vec![ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "owned-preparation".to_string(),
+        output: FunctionCallOutputPayload::from_text(output_text.clone()),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+
+    let prepared = Session::prepare_owned_conversation_items_for_history("turn-owned", items);
+
+    assert_eq!(prepared.len(), 1);
+    assert!(prepared[0].id().is_some_and(|id| !id.is_empty()));
+    assert!(
+        serde_json::to_string(&prepared[0])
+            .expect("serialize prepared item")
+            .contains(&output_text)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordered_conversation_commit_defers_flush_to_terminal_barrier_and_is_idempotent() {
     let (mut sess, tc, _rx) = make_session_and_context_with_rx().await;
@@ -11699,12 +11874,14 @@ async fn initial_input_and_sampling_boundary_share_the_terminal_durability_barri
     assert_eq!(after_input.persist_thread, before_input.persist_thread);
     assert_eq!(after_input.flush_thread, before_input.flush_thread);
 
-    sess.persist_sampling_boundary_ordered(codex_protocol::protocol::SamplingBoundaryItem {
-        sampling_request_id: "request-1".to_string(),
-        physical_attempt_id: "attempt-1".to_string(),
-        turn_id: Some(tc.sub_id.clone()),
-        unresolved_context: true,
-    })
+    sess.persist_rollout_items_ordered(&[RolloutItem::SamplingBoundary(
+        codex_protocol::protocol::SamplingBoundaryItem {
+            sampling_request_id: "request-1".to_string(),
+            physical_attempt_id: "attempt-1".to_string(),
+            turn_id: Some(tc.sub_id.clone()),
+            unresolved_context: true,
+        },
+    )])
     .await
     .expect("sampling boundary should join the ordered request prefix");
     let after_boundary = store.calls().await;
@@ -11758,23 +11935,22 @@ async fn tool_manifest_persistence_failure_stops_ordered_request_prefix() {
     let provider_setup_started = std::sync::atomic::AtomicBool::new(false);
 
     let result: CodexResult<()> = async {
-        super::turn::persist_tool_manifest_before_sampling(
+        super::turn::persist_sampling_prefix_before_dispatch(
             sess.as_ref(),
-            codex_protocol::protocol::ToolManifestItem::full(
+            Some(codex_protocol::protocol::ToolManifestItem::full(
                 "manifest-before-dispatch".to_string(),
                 serde_json::json!([]),
-            ),
+            )),
+            codex_protocol::protocol::SamplingBoundaryItem {
+                sampling_request_id: "request-after-failed-manifest".to_string(),
+                physical_attempt_id: "attempt-after-failed-manifest".to_string(),
+                turn_id: Some(tc.sub_id.clone()),
+                unresolved_context: true,
+            },
         )
         .await?;
         provider_setup_started.store(true, std::sync::atomic::Ordering::SeqCst);
-        sess.persist_sampling_boundary_ordered(codex_protocol::protocol::SamplingBoundaryItem {
-            sampling_request_id: "request-after-failed-manifest".to_string(),
-            physical_attempt_id: "attempt-after-failed-manifest".to_string(),
-            turn_id: Some(tc.sub_id.clone()),
-            unresolved_context: true,
-        })
-        .await
-        .map_err(|err| CodexErr::Fatal(err.to_string()))
+        Ok(())
     }
     .await;
 
@@ -11801,6 +11977,49 @@ async fn tool_manifest_persistence_failure_stops_ordered_request_prefix() {
         rollout_before,
         "neither the failed manifest nor a later sampling boundary may change the rollout"
     );
+}
+
+#[tokio::test]
+async fn tool_manifest_and_first_sampling_boundary_share_one_ordered_append() {
+    let (mut sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
+    )
+    .await;
+    let before = store.calls().await;
+
+    super::turn::persist_sampling_prefix_before_dispatch(
+        sess.as_ref(),
+        Some(codex_protocol::protocol::ToolManifestItem::full(
+            "manifest-before-dispatch".to_string(),
+            serde_json::json!([]),
+        )),
+        codex_protocol::protocol::SamplingBoundaryItem {
+            sampling_request_id: "request-1".to_string(),
+            physical_attempt_id: "attempt-1".to_string(),
+            turn_id: Some(tc.sub_id.clone()),
+            unresolved_context: true,
+        },
+    )
+    .await
+    .expect("persist sampling prefix");
+
+    let after = store.calls().await;
+    assert_eq!(after.append_items_ordered, before.append_items_ordered + 1);
+    let history = codex_thread_store::ThreadStore::load_history(
+        store.as_ref(),
+        codex_thread_store::LoadThreadHistoryParams {
+            thread_id: sess.thread_id,
+            include_archived: false,
+        },
+    )
+    .await
+    .expect("load persisted sampling prefix");
+    assert!(matches!(
+        history.items.as_slice(),
+        [.., RolloutItem::ToolManifest(_), RolloutItem::SamplingBoundary(boundary)]
+            if boundary.sampling_request_id == "request-1"
+    ));
 }
 
 #[tokio::test]
@@ -13783,7 +14002,7 @@ async fn session_start_hooks_only_load_from_trusted_project_layers() -> std::io:
 
     let hook_list = codex_hooks::list_hooks(codex_hooks::HooksConfig {
         feature_enabled: true,
-        config_layer_stack: Some(config.config_layer_stack.clone()),
+        config_layer_stack: Some(config.config_layer_stack.as_ref().clone()),
         ..codex_hooks::HooksConfig::default()
     });
     let expected_source_path = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
@@ -13843,7 +14062,7 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
 
         let hook_list = codex_hooks::list_hooks(codex_hooks::HooksConfig {
             feature_enabled: true,
-            config_layer_stack: Some(config.config_layer_stack.clone()),
+            config_layer_stack: Some(config.config_layer_stack.as_ref().clone()),
             ..codex_hooks::HooksConfig::default()
         });
         assert_eq!(

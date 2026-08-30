@@ -488,7 +488,8 @@ async fn with_app_enabled_state_preserves_unrelated_disabled_connector() {
     };
     config.config_layer_stack =
         ConfigLayerStack::new(Vec::new(), ConfigRequirements::default(), requirements)
-            .expect("requirements stack");
+            .expect("requirements stack")
+            .into();
 
     let mut slack = app("connector_slack");
     slack.is_enabled = false;

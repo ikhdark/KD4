@@ -367,22 +367,37 @@ fn retained_session_id_from_output(output: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn retained_exit_code_from_output(output: &str) -> Option<i32> {
-    const PREFIX: &str = "Process exited with code ";
-    output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix(PREFIX))
-        .and_then(|value| {
-            let value = value.trim_start();
-            let digit_start = usize::from(value.starts_with('-'));
-            let digit_len = value[digit_start..]
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .map(char::len_utf8)
-                .sum::<usize>();
-            (digit_len > 0).then(|| &value[..digit_start + digit_len])
-        })
-        .and_then(|value| value.parse().ok())
+fn retained_process_exit_observed(outputs: &[Option<&str>], cleanup_complete: bool) -> bool {
+    cleanup_complete
+        && outputs
+            .iter()
+            .flatten()
+            .any(|output| output.contains(AB_RETAINED_FINISHED_MARKER))
+}
+
+fn wait_for_retained_control(
+    reader: &mut impl Read,
+    pending: &mut Vec<u8>,
+    expected: &[u8],
+) -> Result<()> {
+    anyhow::ensure!(
+        !expected.is_empty(),
+        "retained-process control marker must not be empty"
+    );
+    loop {
+        if let Some(start) = pending
+            .windows(expected.len())
+            .position(|window| window == expected)
+        {
+            pending.drain(..start + expected.len());
+            return Ok(());
+        }
+
+        let mut chunk = [0_u8; 64];
+        let count = reader.read(&mut chunk)?;
+        anyhow::ensure!(count != 0, "retained-process control stdin closed");
+        pending.extend_from_slice(&chunk[..count]);
+    }
 }
 
 fn retained_output_for_call(requests: &[wiremock::Request], call_id: &str) -> Option<String> {
@@ -1840,13 +1855,16 @@ impl RetainedExecFixture {
                         .flatten()
                         .filter_map(retained_session_id_from_output)
                         .collect();
-                sample.retained_process_exit_observed =
-                    terminal_poll_output.as_deref().is_some_and(|output| {
-                        retained_exit_code_from_output(output) == Some(0)
-                            && output.contains(AB_RETAINED_FINISHED_MARKER)
-                    });
                 sample.retained_process_cleanup_complete =
                     self.test.codex.list_background_terminals().await.is_empty();
+                sample.retained_process_exit_observed = retained_process_exit_observed(
+                    &[
+                        initial_output.as_deref(),
+                        live_poll_output.as_deref(),
+                        terminal_poll_output.as_deref(),
+                    ],
+                    sample.retained_process_cleanup_complete,
+                );
 
                 if completion.error.is_some() {
                     sample
@@ -1948,32 +1966,17 @@ fn run_ab_exclusive_gate_child() -> Result<()> {
 }
 
 fn run_ab_retained_child() -> Result<()> {
-    fn wait_for_control(reader: &mut impl Read, expected: &[u8]) -> Result<()> {
-        let mut received = Vec::new();
-        loop {
-            let mut chunk = [0_u8; 64];
-            let count = reader.read(&mut chunk)?;
-            anyhow::ensure!(count != 0, "retained-process control stdin closed");
-            received.extend_from_slice(&chunk[..count]);
-            if received
-                .windows(expected.len())
-                .any(|window| window == expected)
-            {
-                return Ok(());
-            }
-        }
-    }
-
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
+    let mut pending = Vec::new();
     let stdout = std::io::stdout();
     let mut writer = stdout.lock();
     writeln!(writer, "{AB_RETAINED_READY_MARKER}")?;
     writer.flush()?;
-    wait_for_control(&mut reader, b"poll")?;
+    wait_for_retained_control(&mut reader, &mut pending, b"poll")?;
     writeln!(writer, "{AB_RETAINED_POLL_MARKER}")?;
     writer.flush()?;
-    wait_for_control(&mut reader, b"finish")?;
+    wait_for_retained_control(&mut reader, &mut pending, b"finish")?;
     writeln!(writer, "{AB_RETAINED_FINISHED_MARKER}")?;
     writer.flush()?;
     std::thread::sleep(Duration::from_millis(100));

@@ -18,6 +18,7 @@ use std::time::SystemTime;
 
 use codex_config::ProjectDiscoveryContext;
 use codex_file_system::ExecutorFileSystem;
+use codex_file_watcher::DebouncedWatchReceiver;
 use codex_file_watcher::FileWatcher;
 use codex_file_watcher::FileWatcherSubscriber;
 use codex_file_watcher::WatchPath;
@@ -50,6 +51,7 @@ const GIT_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKSPACE_GENERATION_DEADLINE: Duration = Duration::from_secs(5);
 const WORKSPACE_GENERATION_MAX_PATHS: usize = 256;
 const WORKSPACE_GENERATION_MAX_DECLARED_BYTES: u64 = 64 * 1024 * 1024;
+const WORKSPACE_WATCHER_DEBOUNCE: Duration = Duration::from_millis(50);
 const SOURCE_CHANGE_JOURNAL_CAPACITY: usize = 4_096;
 const RETAINED_REPOSITORY_CAPACITY: usize = 64;
 const GENERATED_CODEX_EVAL_PATHSPEC: &str = ":(exclude).codex/evals/**";
@@ -211,9 +213,15 @@ pub(crate) async fn capture_workspace_evidence_identity(
 async fn capture_workspace_evidence_identity_with_attribution(
     cwd: &Path,
 ) -> WorkspaceEvidenceCapture {
-    let Some(repo_root) = get_git_repo_root(cwd) else {
+    let Some(repo_root) = resolve_workspace_evidence_root(cwd).await else {
         return WorkspaceEvidenceCapture::default();
     };
+    capture_workspace_evidence_identity_for_repo_root_with_attribution(repo_root).await
+}
+
+async fn capture_workspace_evidence_identity_for_repo_root_with_attribution(
+    repo_root: PathBuf,
+) -> WorkspaceEvidenceCapture {
     match within_workspace_generation_deadline(
         WORKSPACE_GENERATION_DEADLINE,
         capture_workspace_generation_marker(repo_root),
@@ -234,6 +242,18 @@ async fn capture_workspace_evidence_identity_with_attribution(
             ],
         },
     }
+}
+
+async fn resolve_workspace_evidence_root(cwd: &Path) -> Option<PathBuf> {
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        get_git_repo_root(&cwd)
+            .as_deref()
+            .map(canonical_workspace_evidence_root)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn within_workspace_generation_deadline<T, Capture>(
@@ -808,15 +828,19 @@ impl GitWorkspaceCache {
             #[cfg(test)]
             root_resolution_count: AtomicU64::new(0),
         });
-        if let Some(mut receiver) = receiver
+        if let Some(receiver) = receiver
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
             let weak_cache = Arc::downgrade(&cache);
             runtime.spawn(async move {
+                let mut receiver =
+                    DebouncedWatchReceiver::new(receiver, WORKSPACE_WATCHER_DEBOUNCE);
                 while let Some(_event) = receiver.recv().await {
                     let Some(cache) = weak_cache.upgrade() else {
                         return;
                     };
+                    // One generation per debounced filesystem burst keeps an authoritative
+                    // capture key stable while an editor or build emits many adjacent events.
                     cache.watcher_generation.fetch_add(1, Ordering::AcqRel);
                 }
                 if let Some(cache) = weak_cache.upgrade() {
@@ -824,11 +848,13 @@ impl GitWorkspaceCache {
                 }
             });
         }
-        if let Some(mut source_receiver) = source_receiver
+        if let Some(source_receiver) = source_receiver
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
             let weak_cache = Arc::downgrade(&cache);
             runtime.spawn(async move {
+                let mut source_receiver =
+                    DebouncedWatchReceiver::new(source_receiver, WORKSPACE_WATCHER_DEBOUNCE);
                 while let Some(event) = source_receiver.recv().await {
                     let Some(cache) = weak_cache.upgrade() else {
                         return;
@@ -877,10 +903,7 @@ impl GitWorkspaceCache {
         &self,
         cwd: &Path,
     ) -> WorkspaceEvidenceCapture {
-        let Some(repo_root) = get_git_repo_root(cwd)
-            .as_deref()
-            .map(canonical_workspace_evidence_root)
-        else {
+        let Some(repo_root) = resolve_workspace_evidence_root(cwd).await else {
             return WorkspaceEvidenceCapture::default();
         };
         let key = WorkspaceEvidenceCaptureKey {
@@ -924,8 +947,10 @@ impl GitWorkspaceCache {
                             pause.started.notify_one();
                             pause.release.notified().await;
                         }
-                        capture_workspace_evidence_identity_with_attribution(&capture_repo_root)
-                            .await
+                        capture_workspace_evidence_identity_for_repo_root_with_attribution(
+                            capture_repo_root,
+                        )
+                        .await
                     }
                     .boxed()
                     .shared();

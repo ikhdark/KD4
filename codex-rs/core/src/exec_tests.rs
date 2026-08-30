@@ -115,6 +115,44 @@ fn streamed_output_chunks(receiver: &async_channel::Receiver<Event>) -> Vec<Vec<
     chunks
 }
 
+#[test]
+fn temporary_output_channel_backpressure_does_not_disable_later_live_output() {
+    let (tx, rx) = async_channel::bounded(1);
+    let stream = StdoutStream::without_progress("sub".into(), "call".into(), tx);
+    let limiter = OutputDeltaLimiter::default();
+
+    assert_eq!(
+        try_send_limited_output_delta(&stream, false, b"first".to_vec(), &limiter),
+        OutputDeltaSendOutcome::Continue
+    );
+    assert_eq!(
+        try_send_limited_output_delta(&stream, false, b"dropped".to_vec(), &limiter),
+        OutputDeltaSendOutcome::Continue
+    );
+    assert_eq!(streamed_output_chunks(&rx), vec![b"first".to_vec()]);
+
+    assert_eq!(
+        try_send_limited_output_delta(&stream, false, b"later".to_vec(), &limiter),
+        OutputDeltaSendOutcome::Continue
+    );
+    assert_eq!(streamed_output_chunks(&rx), vec![b"later".to_vec()]);
+}
+
+#[test]
+fn a_closed_output_channel_ends_live_output() {
+    // A dropped receiver is permanent, unlike momentary backpressure, so the
+    // caller must stop attempting live deltas for the rest of the command.
+    let (tx, rx) = async_channel::bounded(1);
+    let stream = StdoutStream::without_progress("sub".into(), "call".into(), tx);
+    let limiter = OutputDeltaLimiter::default();
+    drop(rx);
+
+    assert_eq!(
+        try_send_limited_output_delta(&stream, false, b"undeliverable".to_vec(), &limiter),
+        OutputDeltaSendOutcome::Stop
+    );
+}
+
 fn make_exec_output(
     exit_code: i32,
     stdout: &str,

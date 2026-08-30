@@ -33,6 +33,11 @@ impl EncodedJsonBody {
         &self.bytes
     }
 
+    /// Returns a reference-counted view of the encoded JSON without copying it.
+    pub fn shared_bytes(&self) -> Bytes {
+        self.bytes.clone()
+    }
+
     pub(crate) fn trace_bytes(&self) -> &[u8] {
         self.trace_bytes.as_ref().unwrap_or(&self.bytes)
     }

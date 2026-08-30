@@ -676,6 +676,61 @@ fn model_request_measurements_reuse_authoritative_encoded_request_length() {
 }
 
 #[test]
+fn model_request_measurements_reuse_encoded_item_and_tool_bytes() {
+    let mut request = history_test_request(vec![
+        history_test_tool_output("call-1", "persisted output"),
+        history_test_item("current input", Some("turn-1")),
+    ]);
+    request.tools = Some(
+        vec![json!({
+            "type": "namespace",
+            "name": "agents",
+            "tools": [{
+                "type": "function",
+                "name": "spawn_agent",
+                "parameters": {"type": "object"}
+            }]
+        })]
+        .into(),
+    );
+    let provenance = history_test_provenance(&request);
+    let encoded = serde_json::to_vec(&request).expect("serialize authoritative request once");
+    let expected = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &provenance,
+        &request.instructions,
+    )
+    .expect("measure from logical values");
+    let measured = ModelRequestMeasurements::for_responses_request_from_encoded_cancellable(
+        &request,
+        &provenance,
+        &request.instructions,
+        /*cancellation*/ None,
+        &encoded,
+        encoded.len() as u64,
+    )
+    .expect("measure from transport-owned bytes");
+
+    assert_eq!(
+        measured.logical_request_bytes,
+        expected.logical_request_bytes
+    );
+    assert_eq!(
+        measured.prompt_context_categories,
+        expected.prompt_context_categories
+    );
+    assert_eq!(measured.tool_token_count, expected.tool_token_count);
+    assert_eq!(
+        measured.tool_schema_breakdown[0].serialized_bytes,
+        expected.tool_schema_breakdown[0].serialized_bytes
+    );
+    assert_eq!(
+        measured.tool_schema_breakdown[0].approx_tokens,
+        expected.tool_schema_breakdown[0].approx_tokens
+    );
+}
+
+#[test]
 fn model_request_measurements_stop_when_cancelled() {
     let request = history_test_request(vec![history_test_item("input", None)]);
     let cancellation = tokio_util::sync::CancellationToken::new();

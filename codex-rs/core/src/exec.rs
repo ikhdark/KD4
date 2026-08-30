@@ -92,6 +92,12 @@ pub(crate) enum OutputDeltaDecision {
     Suppress,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputDeltaSendOutcome {
+    Continue,
+    Stop,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct OutputDeltaLimiter {
     emitted: AtomicUsize,
@@ -753,12 +759,13 @@ async fn exec_windows_sandbox(
             if !live_output_enabled_for_sink.load(Ordering::Acquire) {
                 return;
             }
-            if !try_send_limited_output_delta(
+            if try_send_limited_output_delta(
                 stream,
                 matches!(capture_stream, CaptureOutputStream::Stderr),
                 chunk.to_vec(),
                 &limiter,
-            ) {
+            ) == OutputDeltaSendOutcome::Stop
+            {
                 live_output_enabled_for_sink.store(false, Ordering::Release);
             }
         }) as CaptureOutputSink,
@@ -1386,7 +1393,8 @@ async fn read_output_into_capture<R: AsyncRead + Unpin + Send + 'static>(
                 take_utf8_safe_output_chunk(&mut pending_delta, /*flush_incomplete*/ false)
             {
                 live_output_enabled =
-                    try_send_limited_output_delta(stream, is_stderr, chunk, &output_delta_limiter);
+                    try_send_limited_output_delta(stream, is_stderr, chunk, &output_delta_limiter)
+                        == OutputDeltaSendOutcome::Continue;
                 if !live_output_enabled {
                     pending_delta.clear();
                     break;
@@ -1403,7 +1411,9 @@ async fn read_output_into_capture<R: AsyncRead + Unpin + Send + 'static>(
         while let Some(chunk) =
             take_utf8_safe_output_chunk(&mut pending_delta, /*flush_incomplete*/ true)
         {
-            if !try_send_limited_output_delta(stream, is_stderr, chunk, &output_delta_limiter) {
+            if try_send_limited_output_delta(stream, is_stderr, chunk, &output_delta_limiter)
+                == OutputDeltaSendOutcome::Stop
+            {
                 break;
             }
         }
@@ -1469,14 +1479,20 @@ fn try_send_limited_output_delta(
     is_stderr: bool,
     chunk: Vec<u8>,
     limiter: &OutputDeltaLimiter,
-) -> bool {
-    let (chunk, continue_streaming) = match limiter.claim() {
-        OutputDeltaDecision::Emit => (chunk, true),
-        OutputDeltaDecision::EmitCapNotice => (EXEC_OUTPUT_DELTA_CAP_NOTICE.to_vec(), false),
-        OutputDeltaDecision::Suppress => return false,
+) -> OutputDeltaSendOutcome {
+    let (chunk, outcome) = match limiter.claim() {
+        OutputDeltaDecision::Emit => (chunk, OutputDeltaSendOutcome::Continue),
+        OutputDeltaDecision::EmitCapNotice => (
+            EXEC_OUTPUT_DELTA_CAP_NOTICE.to_vec(),
+            OutputDeltaSendOutcome::Stop,
+        ),
+        OutputDeltaDecision::Suppress => return OutputDeltaSendOutcome::Stop,
     };
     let event = output_delta_event(stream, is_stderr, chunk);
-    stream.tx_event.try_send(event).is_ok() && continue_streaming
+    match stream.tx_event.try_send(event) {
+        Ok(()) | Err(async_channel::TrySendError::Full(_)) => outcome,
+        Err(async_channel::TrySendError::Closed(_)) => OutputDeltaSendOutcome::Stop,
+    }
 }
 
 fn synthetic_exit_status(code: i32) -> ExitStatus {

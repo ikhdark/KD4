@@ -1218,6 +1218,7 @@ struct AbPairedCluster {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AbLatencyGate {
     metric: String,
+    baseline_p95_ns: f64,
     point_median_ratio: f64,
     point_p95_ratio: f64,
     median_ratio_lcb: f64,
@@ -1229,6 +1230,8 @@ struct AbLatencyGate {
     pairs_per_cluster: usize,
     median_ratio_ucb_limit: f64,
     p95_ratio_ucb_limit: f64,
+    p95_ratio_ucb_gate_applied: bool,
+    p95_ratio_ucb_gate_min_baseline_ns: u64,
     target_ratio: f64,
     passed: bool,
 }

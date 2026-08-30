@@ -82,12 +82,10 @@ fn map_todo_items_preserves_text_and_completion_state() {
         TurnPlanStep {
             step: "inspect bootstrap".to_string(),
             status: TurnPlanStepStatus::InProgress,
-            ..Default::default()
         },
         TurnPlanStep {
             step: "drop legacy notifications".to_string(),
             status: TurnPlanStepStatus::Completed,
-            ..Default::default()
         },
     ]);
 
@@ -1132,12 +1130,10 @@ fn plan_update_emits_started_then_updated_then_completed() {
                 TurnPlanStep {
                     step: "step one".to_string(),
                     status: TurnPlanStepStatus::Pending,
-                    ..Default::default()
                 },
                 TurnPlanStep {
                     step: "step two".to_string(),
                     status: TurnPlanStepStatus::InProgress,
-                    ..Default::default()
                 },
             ],
         },
@@ -1175,12 +1171,10 @@ fn plan_update_emits_started_then_updated_then_completed() {
                 TurnPlanStep {
                     step: "step one".to_string(),
                     status: TurnPlanStepStatus::Completed,
-                    ..Default::default()
                 },
                 TurnPlanStep {
                     step: "step two".to_string(),
                     status: TurnPlanStepStatus::InProgress,
-                    ..Default::default()
                 },
             ],
         },
@@ -1272,7 +1266,6 @@ fn plan_update_after_completion_starts_new_todo_list_with_new_id() {
             plan: vec![TurnPlanStep {
                 step: "only".to_string(),
                 status: TurnPlanStepStatus::Pending,
-                ..Default::default()
             }],
         },
     ));
@@ -1305,7 +1298,6 @@ fn plan_update_after_completion_starts_new_todo_list_with_new_id() {
             plan: vec![TurnPlanStep {
                 step: "again".to_string(),
                 status: TurnPlanStepStatus::Pending,
-                ..Default::default()
             }],
         },
     ));

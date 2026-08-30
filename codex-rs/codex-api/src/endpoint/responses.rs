@@ -10,6 +10,7 @@ use crate::requests::headers::insert_header;
 use crate::requests::headers::subagent_header;
 use crate::sse::spawn_response_stream;
 use crate::telemetry::SseTelemetry;
+use bytes::Bytes;
 use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_client::RequestCompression;
@@ -80,7 +81,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
         &self,
         request: &ResponsesApiRequest,
         options: ResponsesOptions,
-        dispatch_ready: impl FnOnce(u64),
+        dispatch_ready: impl FnOnce(Bytes),
     ) -> Result<ResponseStream, ApiError> {
         let ResponsesOptions {
             session_id,
@@ -93,7 +94,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
 
         let body = EncodedJsonBody::encode(&request)
             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
-        let encoded_request_bytes = u64::try_from(body.as_bytes().len()).unwrap_or(u64::MAX);
+        let encoded_request = body.shared_bytes();
 
         let mut headers = extra_headers;
         if let Some(ref thread_id) = thread_id {
@@ -104,7 +105,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
             insert_header(&mut headers, "x-openai-subagent", &subagent);
         }
 
-        dispatch_ready(encoded_request_bytes);
+        dispatch_ready(encoded_request);
         self.stream_encoded(body, headers, compression, turn_state)
             .await
     }

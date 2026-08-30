@@ -213,29 +213,6 @@ pub(crate) type SharedPromptProjections = [Arc<[ResponseItem]>; 4];
 struct CompactedPromptProjections([PreparedPromptItems; 4]);
 
 impl CompactedPromptProjections {
-    fn from_shared(projections: SharedPromptProjections) -> Self {
-        let mut prepared_by_source =
-            Vec::<(Arc<[ResponseItem]>, PreparedPromptItems)>::with_capacity(4);
-        let prepared = projections
-            .into_iter()
-            .map(|projection| {
-                if let Some((_, prepared)) = prepared_by_source
-                    .iter()
-                    .find(|(source, _)| Arc::ptr_eq(source, &projection))
-                {
-                    return prepared.clone();
-                }
-
-                let prepared = PreparedPromptItems::from_shared(Arc::clone(&projection));
-                prepared_by_source.push((projection, prepared.clone()));
-                prepared
-            })
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("prompt projections have a fixed width"));
-        Self(prepared)
-    }
-
     fn shared(&self) -> SharedPromptProjections {
         std::array::from_fn(|index| self.0[index].shared())
     }
@@ -301,10 +278,12 @@ impl PreparedPromptInput {
         self.fallback_items.shared()
     }
 
+    #[cfg(test)]
     pub(crate) fn shared_unreplaced_items(&self) -> Arc<[ResponseItem]> {
         self.unreplaced_items.shared()
     }
 
+    #[cfg(test)]
     pub(crate) fn shared_unreplaced_fallback_items(&self) -> Arc<[ResponseItem]> {
         self.unreplaced_fallback_items.shared()
     }
@@ -333,16 +312,32 @@ impl PreparedPromptInput {
 
     pub(crate) fn compacted_tool_search_outputs(
         &self,
-        build: impl FnOnce(SharedPromptProjections) -> SharedPromptProjections,
+        mut build: impl FnMut(Arc<[ResponseItem]>) -> Arc<[ResponseItem]>,
     ) -> SharedPromptProjections {
         self.compacted_tool_search_outputs
             .get_or_init(|| {
-                CompactedPromptProjections::from_shared(build([
-                    self.shared_items(),
-                    self.shared_fallback_items(),
-                    self.shared_unreplaced_items(),
-                    self.shared_unreplaced_fallback_items(),
-                ]))
+                let projections = [
+                    &self.items,
+                    &self.fallback_items,
+                    &self.unreplaced_items,
+                    &self.unreplaced_fallback_items,
+                ];
+                let mut compacted_by_source =
+                    Vec::<(PreparedPromptItems, PreparedPromptItems)>::with_capacity(4);
+                let compacted = std::array::from_fn(|index| {
+                    let source = projections[index];
+                    if let Some((_, compacted)) = compacted_by_source
+                        .iter()
+                        .find(|(candidate, _)| candidate.shares_storage_with(source))
+                    {
+                        return compacted.clone();
+                    }
+
+                    let compacted = PreparedPromptItems::from_shared(build(source.shared()));
+                    compacted_by_source.push((source.clone(), compacted.clone()));
+                    compacted
+                });
+                CompactedPromptProjections(compacted)
             })
             .shared()
     }
@@ -563,6 +558,13 @@ impl ContextManager {
         }
     }
 
+    pub(crate) fn has_reference_context_item(&self) -> bool {
+        matches!(
+            self.realized_context_baseline,
+            RealizedContextBaseline::Known(_)
+        )
+    }
+
     pub(crate) fn update_world_state(
         &mut self,
         world_state: &WorldState,
@@ -744,8 +746,13 @@ impl ContextManager {
             PromptProvenanceSidecar::from_assembled_items(&items, &projection.manifest);
         let fingerprint =
             PreparedHistoryFingerprint::new(&items, &projection.manifest, policy).ok();
-        let items = PreparedPromptItems::from_shared(items);
-        let fallback_items = PreparedPromptItems::from_shared(projection.fallback_items);
+        let projected_items = items;
+        let items = PreparedPromptItems::from_shared(Arc::clone(&projected_items));
+        let fallback_items = if Arc::ptr_eq(&projected_items, &projection.fallback_items) {
+            items.clone()
+        } else {
+            PreparedPromptItems::from_shared(projection.fallback_items)
+        };
         let prepared = PreparedPromptInput {
             unreplaced_items: items.clone(),
             unreplaced_fallback_items: fallback_items.clone(),

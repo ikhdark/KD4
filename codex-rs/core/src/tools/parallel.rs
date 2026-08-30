@@ -440,8 +440,13 @@ impl WorkspaceEvidenceGenerationBatch {
         }
 
         let mut groups = std::collections::BTreeMap::<std::path::PathBuf, Group>::new();
+        let mut canonical_keys =
+            std::collections::HashMap::<std::path::PathBuf, std::path::PathBuf>::new();
         for response in responses {
-            let key = canonical_workspace_evidence_key(&response.workspace_cwd);
+            let key = canonical_workspace_evidence_key_cached(
+                &response.workspace_cwd,
+                &mut canonical_keys,
+            );
             groups
                 .entry(key)
                 .or_insert_with(|| Group {
@@ -453,7 +458,10 @@ impl WorkspaceEvidenceGenerationBatch {
                 .push(response);
         }
         for mutation in mutations {
-            let key = canonical_workspace_evidence_key(&mutation.workspace_cwd);
+            let key = canonical_workspace_evidence_key_cached(
+                &mutation.workspace_cwd,
+                &mut canonical_keys,
+            );
             groups
                 .entry(key)
                 .or_insert_with(|| Group {
@@ -474,7 +482,8 @@ impl WorkspaceEvidenceGenerationBatch {
             .filter_map(|response| response_input_call_id(&response.response).map(str::to_string))
             .collect::<std::collections::BTreeSet<_>>();
 
-        let primary_key = canonical_workspace_evidence_key(turn.config.cwd.as_path());
+        let primary_key =
+            canonical_workspace_evidence_key_cached(turn.config.cwd.as_path(), &mut canonical_keys);
         let mut prefetched_workspace_identity = None;
         let mut finalized_responses = Vec::new();
         let git_workspace = Arc::clone(&session.services.git_workspace);
@@ -621,6 +630,18 @@ fn canonical_workspace_evidence_key(cwd: &std::path::Path) -> std::path::PathBuf
         .and_then(|root| dunce::canonicalize(root).ok())
         .or_else(|| dunce::canonicalize(cwd).ok())
         .unwrap_or_else(|| cwd.to_path_buf())
+}
+
+fn canonical_workspace_evidence_key_cached(
+    cwd: &std::path::Path,
+    cache: &mut std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if let Some(key) = cache.get(cwd) {
+        return key.clone();
+    }
+    let key = canonical_workspace_evidence_key(cwd);
+    cache.insert(cwd.to_path_buf(), key.clone());
+    key
 }
 
 fn workspace_tool_may_use_parallel_gate(supports_parallel: bool, workspace_capable: bool) -> bool {
@@ -1147,7 +1168,19 @@ impl ToolCallRuntime {
                 (revision, captured_current)
             }
             Some(baseline) => finish_workspace_evidence_capture(baseline, mutation_advanced),
-            None => (None, false),
+            None => {
+                // An executed payload can refine the workspace classification
+                // enough to invalidate the pre-dispatch baseline. Capture the
+                // authoritative post-call identity instead of publishing an
+                // observation that is stale from birth. `None` remains an
+                // authoritative identity for a non-Git workspace.
+                let revision = session
+                    .services
+                    .git_workspace
+                    .workspace_evidence_identity(&classification.workspace_cwd)
+                    .await;
+                (revision, true)
+            }
         };
         Self::register_workspace_evidence_observation(
             session,
@@ -2098,12 +2131,7 @@ impl ToolCallRuntime {
                             if wait_for_runtime_cancellation {
                                 runtime_cancellation_token.cancel();
                             }
-                            // User-visible cancellation must not wait for a
-                            // process/runtime teardown. Move the owned dispatch
-                            // future into a supervised task with a firm later
-                            // deadline; it retains repository and process
-                            // ownership until cleanup is confirmed or aborted.
-                            tokio::spawn(supervise_cancelled_dispatch_cleanup(
+                            let cleanup = supervise_cancelled_dispatch_cleanup(
                                 dispatch_handle,
                                 wait_for_runtime_cancellation,
                                 owns_unified_exec_processes,
@@ -2111,7 +2139,18 @@ impl ToolCallRuntime {
                                 call.call_id.clone(),
                                 call.tool_name.clone(),
                                 Arc::clone(&cancellation_timing),
-                            ));
+                            );
+                            if owns_unified_exec_processes {
+                                // A retained exec process is part of the turn's terminal
+                                // ownership barrier. Do not publish TurnAborted until the
+                                // originating handler and its process registry entry close.
+                                cleanup.await;
+                            } else {
+                                // Other runtimes retain their owned dispatch future in a
+                                // supervised task so user-visible cancellation does not wait
+                                // for teardown beyond the terminal result they already own.
+                                tokio::spawn(cleanup);
+                            }
                         }
                         let mut response = Self::aborted_response(&call, secs);
                         scope_tool_dispatch_timing(
@@ -2490,6 +2529,19 @@ mod tests {
     use codex_protocol::models::FunctionCallOutputBody;
     use codex_protocol::models::FunctionCallOutputPayload;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn generation_flush_reuses_canonical_workspace_keys_for_the_same_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path();
+        let mut cache = std::collections::HashMap::new();
+
+        let first = canonical_workspace_evidence_key_cached(cwd, &mut cache);
+        let second = canonical_workspace_evidence_key_cached(cwd, &mut cache);
+
+        assert_eq!(first, second);
+        assert_eq!(cache.len(), 1);
+    }
 
     #[test]
     fn required_tool_terminal_classification_preserves_success_yield_and_nonblocking_skips() {
@@ -4057,6 +4109,61 @@ mod tests {
                 .workspace_evidence_capture_count(),
             captures_before.saturating_add(1),
             "the admitted call should capture exactly one baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_evidence_without_compatible_baseline_recaptures_after_call() {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let workspace = tempfile::tempdir().expect("non-Git workspace cwd");
+        let call_id = "post-call-recapture";
+        let response = ResponseInputItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload::from_text("current output".to_string()),
+        };
+        let classification = crate::tool_history::WorkspaceCallClassification {
+            observes_workspace: true,
+            workspace_cwd: workspace.path().to_path_buf(),
+            source_dependencies: Default::default(),
+        };
+
+        assert!(
+            !ToolCallRuntime::register_workspace_evidence_after_call(
+                session.as_ref(),
+                &turn_context,
+                WorkspaceEvidenceAfterCall {
+                    response: &response,
+                    baseline: None,
+                    mutation_advanced: false,
+                    source_dependencies_override: None,
+                    classification: &classification,
+                    workspace_gate_guard: None,
+                },
+                None,
+                None,
+            )
+            .await
+        );
+
+        let canonical: Arc<[ResponseItem]> = Arc::from([
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "write_stdin".to_string(),
+                namespace: None,
+                arguments: "{\"session_id\":1000}".to_string(),
+                call_id: call_id.to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::from(response),
+        ]);
+        let history = session.clone_history().await;
+        let projected = history
+            .tool_history_state()
+            .project_with_workspace_identity(Arc::clone(&canonical), None);
+        assert_eq!(
+            projected.items, canonical,
+            "a missing pre-call baseline must be replaced by an authoritative post-call capture"
         );
     }
 

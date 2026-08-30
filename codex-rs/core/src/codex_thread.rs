@@ -433,6 +433,15 @@ impl CodexThread {
             .await
     }
 
+    /// Declares that this thread has a consumer for `RawResponseItem` events.
+    ///
+    /// Producing raw events clones every recorded history item, so the runtime suppresses
+    /// them until a consumer opts in. Callers invoke this when a subscriber attaches with
+    /// raw events enabled.
+    pub fn request_raw_response_items(&self) {
+        self.codex.session.request_raw_response_items();
+    }
+
     pub async fn set_openai_form_elicitation_support(&self, supported: bool) -> anyhow::Result<()> {
         self.codex
             .session

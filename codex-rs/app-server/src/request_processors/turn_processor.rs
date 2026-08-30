@@ -103,11 +103,24 @@ fn canonicalize_task_fingerprint_json(value: &mut Value) {
     }
 }
 
+struct Sha256Writer(Sha256);
+
+impl std::io::Write for Sha256Writer {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        Digest::update(&mut self.0, buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn normalized_task_fingerprint(
     params: &TurnStartParams,
     workspace_identity: &str,
     settings_identity: &str,
-) -> String {
+) -> Option<String> {
     let mut request = serde_json::to_value(params).unwrap_or(Value::Null);
     if let Value::Object(request) = &mut request {
         request.remove("threadId");
@@ -120,7 +133,9 @@ fn normalized_task_fingerprint(
         "workspace": workspace_identity,
         "settings": settings_identity,
     });
-    format!("{:x}", Sha256::digest(identity.to_string().as_bytes()))
+    let mut writer = Sha256Writer(Sha256::new());
+    serde_json::to_writer(&mut writer, &identity).ok()?;
+    Some(format!("{:x}", writer.0.finalize()))
 }
 
 fn task_workspace_identity(
@@ -620,7 +635,10 @@ impl TurnRequestProcessor {
         Ok(())
     }
 
-    async fn turn_task_fingerprint(params: &TurnStartParams, thread: &CodexThread) -> String {
+    async fn turn_task_fingerprint(
+        params: &TurnStartParams,
+        thread: &CodexThread,
+    ) -> Option<String> {
         let snapshot = thread.config_snapshot().await;
         let workspace_identity =
             task_workspace_identity(params, snapshot.cwd(), &snapshot.workspace_roots);
@@ -681,7 +699,7 @@ impl TurnRequestProcessor {
         let task_fingerprint = if params.run_independently.unwrap_or(false) {
             None
         } else {
-            Some(Self::turn_task_fingerprint(&params, thread.as_ref()).await)
+            Self::turn_task_fingerprint(&params, thread.as_ref()).await
         };
         let environment_selections =
             resolve_turn_environment_selections(self.thread_manager.as_ref(), params.environments)?;
