@@ -1254,8 +1254,6 @@ fn response_item_needs_turn_id(item: &ResponseItem) -> bool {
 
 struct StartupRolloutFacts {
     initial_messages: Option<Vec<EventMsg>>,
-    terminal_recovery_turn_id: Option<String>,
-    terminal_authority: Option<crate::task_evidence::AuthoritativeTerminalEventV1>,
     mailbox_communication_ids: Vec<codex_protocol::ResponseItemId>,
     has_prior_user_turns: bool,
     last_token_info: Option<TokenUsageInfo>,
@@ -1263,12 +1261,10 @@ struct StartupRolloutFacts {
 }
 
 impl StartupRolloutFacts {
-    fn reduce(thread_id: ThreadId, history: &InitialHistory) -> Self {
+    fn reduce(history: &InitialHistory) -> Self {
         let items = history.get_rollout_items();
         let mut initial_messages =
             (!matches!(history, InitialHistory::New | InitialHistory::Cleared)).then(Vec::new);
-        let mut terminal_recovery_turn_id = None;
-        let mut terminal_authority = None;
         let mut mailbox_communication_ids = Vec::new();
         let mut prior_user_turns = PriorUserTurnTracker::default();
         let mut last_token_info = None;
@@ -1284,32 +1280,12 @@ impl StartupRolloutFacts {
                         initial_messages.push(event.clone());
                     }
                     match event {
-                        EventMsg::TurnStarted(started) => {
-                            terminal_recovery_turn_id = Some(started.turn_id.clone());
-                        }
-                        EventMsg::TurnComplete(completed)
-                            if terminal_recovery_turn_id.as_deref()
-                                == Some(completed.turn_id.as_str()) =>
-                        {
-                            terminal_recovery_turn_id = None;
-                        }
-                        EventMsg::TurnAborted(aborted)
-                            if aborted.turn_id.as_deref()
-                                == terminal_recovery_turn_id.as_deref() =>
-                        {
-                            terminal_recovery_turn_id = None;
-                        }
                         EventMsg::TokenCount(event) => {
                             if let Some(info) = event.info.as_ref() {
                                 last_token_info = Some(info.clone());
                             }
                         }
                         _ => {}
-                    }
-                    if let Some(authority) =
-                        crate::tasks::terminal_authority_from_event(thread_id, event)
-                    {
-                        terminal_authority = Some(authority);
                     }
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
@@ -1326,8 +1302,6 @@ impl StartupRolloutFacts {
 
         Self {
             initial_messages,
-            terminal_recovery_turn_id,
-            terminal_authority,
             mailbox_communication_ids,
             has_prior_user_turns: prior_user_turns.has_prior_user_turns(),
             last_token_info,
@@ -1476,7 +1450,6 @@ impl Session {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) async fn codex_home(&self) -> AbsolutePathBuf {
         let state = self.state.lock().await;
         state.session_configuration.codex_home().clone()
@@ -1705,8 +1678,7 @@ impl Session {
 
     #[cfg(test)]
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
-        let startup_rollout_facts =
-            StartupRolloutFacts::reduce(self.thread_id, &conversation_history);
+        let startup_rollout_facts = StartupRolloutFacts::reduce(&conversation_history);
         self.record_initial_history_with_facts(conversation_history, startup_rollout_facts)
             .await;
     }
@@ -1716,15 +1688,12 @@ impl Session {
         conversation_history: InitialHistory,
         startup_rollout_facts: StartupRolloutFacts,
     ) {
-        let (is_subagent, forked_from_thread_id) = {
+        let is_subagent = {
             let state = self.state.lock().await;
-            (
-                state
-                    .session_configuration
-                    .session_source
-                    .is_non_root_agent(),
-                state.session_configuration.forked_from_thread_id,
-            )
+            state
+                .session_configuration
+                .session_source
+                .is_non_root_agent()
         };
         let has_prior_user_turns = startup_rollout_facts.has_prior_user_turns;
         let last_token_info = startup_rollout_facts.last_token_info;
@@ -1799,25 +1768,6 @@ impl Session {
                     reconstructed_provider_id.as_deref(),
                 )
                 .await;
-                if let Some(source_thread_id) = forked_from_thread_id {
-                    let forked_history = self.clone_history().await;
-                    if !self
-                        .services
-                        .task_evidence
-                        .inherit_forked_history(source_thread_id, forked_history.raw_items())
-                        .await
-                    {
-                        self.services
-                            .task_evidence
-                            .mark_user_source_capture_failed()
-                            .await;
-                        warn!(
-                            %source_thread_id,
-                            "failed to reconcile inherited task evidence for forked thread"
-                        );
-                    }
-                }
-
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
                 if let Some(info) = last_token_info {
@@ -1895,7 +1845,6 @@ impl Session {
             first_window_id,
             previous_window_id,
             window_id,
-            last_passed_root_completion_turn_id,
         } = self
             .reconstruct_history_from_rollout(turn_context, rollout_items)
             .await;
@@ -1949,7 +1898,6 @@ impl Session {
                 },
             );
             state.set_previous_turn_settings(previous_turn_settings.clone());
-            state.set_last_passed_root_completion_turn_id(last_passed_root_completion_turn_id);
         }
         if let Some(prefix_tokens) = prefix_tokens {
             self.set_auto_compact_window_estimated_prefill_for_scope(turn_context, prefix_tokens)
@@ -2056,14 +2004,6 @@ impl Session {
                 .turn_environments
                 .update_selections(updated_session_configuration.environment_selections());
             self.services.advance_planning_generation(&mut state_owner);
-        }
-        if previous_session_configuration.cwd() != updated_session_configuration.cwd() {
-            self.services
-                .task_evidence
-                .rebind_to_cwd(updated_session_configuration.cwd())
-                .await;
-            self.services
-                .set_kd4_repository_context(self.services.task_evidence.repository_root());
         }
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
 
@@ -2334,287 +2274,6 @@ impl Session {
             .await;
     }
 
-    /// Attempts terminal-event persistence within a fixed finalization budget.
-    ///
-    /// A timeout is intentionally distinguishable from dispatch: callers can downgrade a
-    /// completion gate and still deliver the terminal event live.
-    pub(crate) async fn persist_terminal_event_for_dispatch(
-        &self,
-        msg: &EventMsg,
-        timeout: Duration,
-    ) -> Result<(), String> {
-        let rollout_items = [RolloutItem::EventMsg(msg.clone())];
-        match tokio::time::timeout(timeout, async {
-            if let Some(live_thread) = self.live_thread() {
-                live_thread
-                    .append_items(&rollout_items)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
-            Ok::<(), String>(())
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err("timed out persisting the terminal event".to_string()),
-        }
-    }
-
-    /// Delivers the already-persisted (or explicitly degraded) terminal event without putting
-    /// any task-store or rollout I/O in front of the client-visible milestone.
-    pub(crate) async fn dispatch_terminal_event_live(
-        &self,
-        turn_context: &TurnContext,
-        msg: EventMsg,
-        timeout: Duration,
-    ) -> bool {
-        self.services
-            .rollout_thread_trace
-            .record_codex_turn_event(&turn_context.sub_id, &msg);
-        self.services
-            .rollout_thread_trace
-            .record_tool_call_event(turn_context.sub_id.as_str(), &msg);
-        self.services
-            .rollout_thread_trace
-            .record_protocol_event(&msg);
-        let event = Event {
-            id: turn_context.sub_id.clone(),
-            msg,
-        };
-        if let Some(status) = agent_status_from_event(&event.msg) {
-            self.agent_status.send_replace(status);
-        }
-        match tokio::time::timeout(timeout, self.tx_event.send(event)).await {
-            Ok(Ok(())) => true,
-            Ok(Err(err)) => {
-                debug!("dropping terminal live event because channel is closed: {err}");
-                false
-            }
-            Err(_) => {
-                debug!(
-                    "terminal live event handoff timed out; retaining the active turn for retry"
-                );
-                false
-            }
-        }
-    }
-
-    pub(crate) fn try_send_live_event_accepted(&self, event: Event) -> bool {
-        if let Some(status) = agent_status_from_event(&event.msg) {
-            self.agent_status.send_replace(status);
-        }
-        match self.tx_event.try_send(event) {
-            Ok(()) => true,
-            Err(err) => {
-                debug!("dropping live event because channel is unavailable: {err}");
-                false
-            }
-        }
-    }
-
-    pub(crate) async fn register_authoritative_terminal_delivery(
-        &self,
-        terminal_identity: String,
-        fingerprint: String,
-    ) -> bool {
-        if let Some(acknowledged_fingerprint) = self
-            .services
-            .task_evidence
-            .acknowledged_terminal_fingerprint(&terminal_identity)
-            .await
-        {
-            return acknowledged_fingerprint == fingerprint;
-        }
-        {
-            let mut registry = self.terminal_delivery_cache.lock().await;
-            match registry.by_identity.get(&terminal_identity) {
-                Some(existing) if existing.fingerprint != fingerprint => return false,
-                Some(_) => {}
-                None => {
-                    registry.by_identity.insert(
-                        terminal_identity.clone(),
-                        session::TerminalDeliveryCacheEntry {
-                            fingerprint: fingerprint.clone(),
-                            acknowledged: false,
-                            redelivery_scheduled: false,
-                            recovery_notified: false,
-                        },
-                    );
-                }
-            }
-        }
-        if let Some(acknowledged_fingerprint) = self
-            .services
-            .task_evidence
-            .acknowledged_terminal_fingerprint(&terminal_identity)
-            .await
-        {
-            if acknowledged_fingerprint == fingerprint {
-                self.prune_durably_acknowledged_terminal_delivery(&terminal_identity, &fingerprint)
-                    .await;
-                return true;
-            }
-            return false;
-        }
-        true
-    }
-
-    pub(crate) async fn claim_terminal_recovery_notification(
-        &self,
-        terminal_identity: &str,
-    ) -> bool {
-        let mut registry = self.terminal_delivery_cache.lock().await;
-        let Some(entry) = registry.by_identity.get_mut(terminal_identity) else {
-            return false;
-        };
-        if entry.recovery_notified {
-            return false;
-        }
-        entry.recovery_notified = true;
-        true
-    }
-
-    pub(crate) async fn terminal_delivery_acknowledged(
-        &self,
-        terminal_identity: &str,
-        fingerprint: &str,
-    ) -> bool {
-        if self
-            .terminal_delivery_cache
-            .lock()
-            .await
-            .by_identity
-            .get(terminal_identity)
-            .is_some_and(|entry| entry.fingerprint == fingerprint && entry.acknowledged)
-        {
-            return true;
-        }
-        self.services
-            .task_evidence
-            .acknowledged_terminal_fingerprint(terminal_identity)
-            .await
-            .as_deref()
-            == Some(fingerprint)
-    }
-
-    pub(crate) async fn durably_acknowledged_terminal_fingerprint(
-        &self,
-        turn_id: &str,
-    ) -> Option<String> {
-        self.services
-            .task_evidence
-            .acknowledged_terminal_fingerprint(&format!("{}:{turn_id}", self.thread_id))
-            .await
-    }
-
-    pub(crate) async fn terminal_events_requiring_app_server_acknowledgement(
-        &self,
-    ) -> Option<HashMap<String, String>> {
-        self.services
-            .task_evidence
-            .terminal_events_requiring_app_server_acknowledgement()
-            .await
-    }
-
-    pub(crate) async fn prune_durably_acknowledged_terminal_delivery(
-        &self,
-        terminal_identity: &str,
-        fingerprint: &str,
-    ) {
-        let mut registry = self.terminal_delivery_cache.lock().await;
-        if registry
-            .by_identity
-            .get(terminal_identity)
-            .is_some_and(|entry| entry.fingerprint == fingerprint && !entry.redelivery_scheduled)
-        {
-            registry.by_identity.remove(terminal_identity);
-        }
-    }
-
-    pub(crate) async fn prune_terminal_delivery_if_durably_acknowledged(
-        &self,
-        terminal_identity: &str,
-    ) {
-        if let Some(fingerprint) = self
-            .services
-            .task_evidence
-            .acknowledged_terminal_fingerprint(terminal_identity)
-            .await
-        {
-            self.prune_durably_acknowledged_terminal_delivery(terminal_identity, &fingerprint)
-                .await;
-        }
-    }
-
-    pub(crate) async fn acknowledge_terminal_event(
-        &self,
-        turn_id: &str,
-        fingerprint: &str,
-    ) -> bool {
-        let terminal_identity = format!("{}:{turn_id}", self.thread_id);
-        {
-            let mut registry = self.terminal_delivery_cache.lock().await;
-            let Some(entry) = registry.by_identity.get_mut(&terminal_identity) else {
-                return false;
-            };
-            if entry.fingerprint != fingerprint {
-                warn!(
-                    turn_id,
-                    expected_fingerprint = %entry.fingerprint,
-                    received_fingerprint = fingerprint,
-                    "rejected conflicting app-server terminal acknowledgement"
-                );
-                return false;
-            }
-            entry.acknowledged = true;
-        }
-        let mirrored_durably = self
-            .services
-            .task_evidence
-            .acknowledge_terminal_event(&terminal_identity, fingerprint)
-            .await;
-        if !mirrored_durably {
-            // The process-local acknowledgement is still authoritative for this live session;
-            // durable recovery will replay if the evidence receipt could not be updated.
-            debug!(
-                turn_id,
-                "terminal acknowledgement could not be mirrored durably"
-            );
-        } else if self
-            .services
-            .task_evidence
-            .acknowledged_terminal_fingerprint(&terminal_identity)
-            .await
-            .as_deref()
-            == Some(fingerprint)
-        {
-            self.prune_durably_acknowledged_terminal_delivery(&terminal_identity, fingerprint)
-                .await;
-        }
-        true
-    }
-
-    /// Completes parent notification and legacy event emission after the
-    /// interactive terminal milestone has detached the turn.
-    pub(crate) async fn finish_terminal_event_dispatch(
-        &self,
-        turn_context: &TurnContext,
-        legacy_source: &EventMsg,
-    ) -> bool {
-        let parent_notification_completed = self
-            .maybe_notify_parent_of_terminal_turn(turn_context, legacy_source)
-            .await;
-        self.finish_prepared_event_dispatch(
-            turn_context,
-            PreparedEventDispatch {
-                terminal_source: None,
-                legacy_events: legacy_source.as_legacy_events(self.show_raw_agent_reasoning()),
-            },
-        )
-        .await;
-        parent_notification_completed
-    }
-
     async fn finish_prepared_event_dispatch(
         &self,
         turn_context: &TurnContext,
@@ -2727,7 +2386,6 @@ impl Session {
             *parent_thread_id,
             child_agent_path,
             status,
-            crate::terminal_event_fingerprint(msg).as_deref(),
         )
         .await
     }
@@ -2739,7 +2397,6 @@ impl Session {
         parent_thread_id: ThreadId,
         child_agent_path: &codex_protocol::AgentPath,
         status: AgentStatus,
-        terminal_fingerprint: Option<&str>,
     ) -> bool {
         let Some(parent_agent_path) = child_agent_path
             .as_str()
@@ -2763,19 +2420,13 @@ impl Session {
             .rollout_thread_trace
             .is_enabled()
             .then(|| message.clone());
-        let mut communication = InterAgentCommunication::new(
+        let communication = InterAgentCommunication::new(
             child_agent_path.clone(),
             parent_agent_path,
             Vec::new(),
             message,
             /*trigger_turn*/ false,
         );
-        if let Some(fingerprint) = terminal_fingerprint {
-            communication.id = Some(ResponseItemId::from_server(format!(
-                "terminal_result_{}_{}_{}_parent_notification",
-                self.thread_id, turn_context.sub_id, fingerprint
-            )));
-        }
         let context =
             AgentCommunicationContext::new(AgentCommunicationKind::Result, self.thread_id);
         if let Err(err) = self
@@ -3415,8 +3066,6 @@ impl Session {
         call_id: String,
         args: RequestUserInputArgs,
     ) -> Option<RequestUserInputResponse> {
-        let decision_call_id = call_id.clone();
-        let decision_questions = args.questions.clone();
         let _elicitation = self.services.elicitations.register();
         let sub_id = turn_context.sub_id.clone();
         let (tx_response, rx_response) = oneshot::channel();
@@ -3448,19 +3097,7 @@ impl Session {
         let _interactive_wait_guard = turn_context
             .turn_timing_state
             .begin_interactive_wait(InteractiveWaitKind::UserInput);
-        let response = rx_response.await.ok()?;
-        if !response.interrupted {
-            self.services
-                .task_evidence
-                .record_locked_user_decisions(
-                    &decision_call_id,
-                    &turn_context.sub_id,
-                    &decision_questions,
-                    &response,
-                )
-                .await;
-        }
-        Some(response)
+        rx_response.await.ok()
     }
 
     #[expect(
@@ -5053,8 +4690,14 @@ impl Session {
         let mutation = crate::tool_history::ToolHistoryMutation::RegisterCandidate { candidate };
         let mut state = self.state.lock().await;
         state.apply_tool_history_mutation(&mutation);
-        self.tool_history_persistence
-            .enqueue_mutation(mutation, "completed-tool history metadata");
+        if let Err(err) = self
+            .tool_history_persistence
+            .enqueue_mutation(mutation, "completed-tool history metadata")
+        {
+            tracing::warn!(
+                "failed to enqueue completed-tool history metadata; in-memory state is not durable: {err}"
+            );
+        }
     }
 
     pub(crate) async fn register_workspace_evidence<WorkspaceGateGuard: Send>(
@@ -5076,8 +4719,14 @@ impl Session {
             crate::tool_history::ToolHistoryMutation::RegisterWorkspaceEvidence { observation };
         let mut state = self.state.lock().await;
         state.apply_tool_history_mutation(&mutation);
-        self.tool_history_persistence
-            .enqueue_mutation(mutation, "workspace evidence metadata");
+        if let Err(err) = self
+            .tool_history_persistence
+            .enqueue_mutation(mutation, "workspace evidence metadata")
+        {
+            tracing::warn!(
+                "failed to enqueue workspace evidence metadata; in-memory state is not durable: {err}"
+            );
+        }
     }
 
     pub(crate) async fn register_non_workspace_code_mode_call(
@@ -5093,8 +4742,14 @@ impl Session {
             crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall { call_id };
         let mut state = self.state.lock().await;
         state.apply_tool_history_mutation(&mutation);
-        self.tool_history_persistence
-            .enqueue_mutation(mutation, "code-mode workspace classification metadata");
+        if let Err(err) = self
+            .tool_history_persistence
+            .enqueue_mutation(mutation, "code-mode workspace classification metadata")
+        {
+            tracing::warn!(
+                "failed to enqueue code-mode workspace classification metadata; in-memory state is not durable: {err}"
+            );
+        }
     }
 
     pub(crate) async fn flush_tool_history_persistence(&self) {
@@ -5137,8 +4792,14 @@ impl Session {
             if !state.apply_tool_history_mutation(&mutation) {
                 return;
             }
-            self.tool_history_persistence
-                .enqueue_mutation(mutation, "source-dependency invalidation state");
+            if let Err(err) = self
+                .tool_history_persistence
+                .enqueue_mutation(mutation, "source-dependency invalidation state")
+            {
+                tracing::warn!(
+                    "failed to enqueue source-dependency invalidation state; in-memory state is not durable: {err}"
+                );
+            }
         }
         drop(reconciliation_permit);
         self.tool_history_persistence.drain().await;
@@ -5163,31 +4824,19 @@ impl Session {
             if call_ids.is_empty() {
                 return;
             }
-            self.tool_history_persistence.enqueue_mutation(
+            if let Err(err) = self.tool_history_persistence.enqueue_mutation(
                 crate::tool_history::ToolHistoryMutation::MarkConsumed {
                     call_ids,
                     generation,
                 },
                 "completed-tool consumption state",
-            );
+            ) {
+                tracing::warn!(
+                    "failed to enqueue completed-tool consumption state; in-memory state is not durable: {err}"
+                );
+            }
         }
         drop(reconciliation_permit);
-        self.tool_history_persistence.drain().await;
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn last_passed_root_completion_turn_id(&self) -> Option<String> {
-        self.state
-            .lock()
-            .await
-            .last_passed_root_completion_turn_id()
-    }
-
-    pub(crate) async fn set_last_passed_root_completion_turn_id(&self, turn_id: Option<String>) {
-        self.state
-            .lock()
-            .await
-            .set_last_passed_root_completion_turn_id(turn_id);
     }
 
     pub(crate) async fn current_window_id(&self) -> String {
@@ -5655,44 +5304,12 @@ impl Session {
         client_id: Option<String>,
     ) {
         turn_context.turn_timing_state.record_user_input();
-        // Mint the durable user item before history persistence so the private KD4 ledger can
-        // bind exact pre-compaction inputs to the same stable item identity.
         let mut user_message_item = UserMessageItem::new(input);
         let response_item_id = ResponseItemId::with_suffix("msg", &user_message_item.id);
         user_message_item.id = response_item_id.to_string();
         user_message_item.client_id = client_id;
         let mut response_item = self.response_item_from_user_input(input.to_vec());
         response_item.set_id(Some(response_item_id));
-        let completion_evidence_eligible = self.services.task_evidence.allows_kd4_completion()
-            && !matches!(
-                turn_context.session_source,
-                SessionSource::SubAgent(SubAgentSource::Review)
-            );
-        if turn_context
-            .config
-            .features
-            .enabled(Feature::TaskCompletionReviewer)
-            && completion_evidence_eligible
-            && !self
-                .services
-                .task_evidence
-                .record_user_sources(&user_message_item.id, input)
-                .await
-        {
-            self.services
-                .task_evidence
-                .mark_user_source_capture_failed()
-                .await;
-            tracing::warn!(
-                turn_id = %turn_context.sub_id,
-                "KD4 user-source ledger capture was not durably persisted"
-            );
-        }
-        if completion_evidence_eligible {
-            self.capture_completion_workspace_baseline(turn_context)
-                .await;
-        }
-
         // Persist the user message to history, but emit the turn item from `UserInput` so
         // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
@@ -5704,89 +5321,6 @@ impl Session {
         // Keep the accepted input ordered in the rollout, then let the sampling or terminal
         // barrier materialize the complete prefix once. Materializing here would force an extra
         // disk transaction immediately before every initial model request.
-    }
-
-    async fn capture_completion_workspace_baseline(&self, turn_context: &TurnContext) {
-        let coordinator = self.services.agent_control.task_coordinator();
-        let coordination = if coordinator.store().is_none() {
-            coordinator
-                .initialize_for_workspace_coordination(
-                    self.services.state_db.clone(),
-                    turn_context.config.sqlite_home.clone(),
-                    turn_context.config.model_provider_id.clone(),
-                    self.services.agent_control.session_id().to_string(),
-                )
-                .await
-        } else {
-            Ok(())
-        };
-        if let Err(error) = coordination {
-            self.services
-                .task_evidence
-                .mark_workspace_event_baseline_failed(&format!(
-                    "workspace coordination could not initialize before baseline capture: {error}",
-                ))
-                .await;
-            return;
-        }
-        let (Some(store), Some(repo_root)) = (
-            coordinator.store(),
-            self.services.task_evidence.repository_root(),
-        ) else {
-            self.services
-                .task_evidence
-                .mark_workspace_event_baseline_failed(
-                    "workspace coordination was unavailable after initialization",
-                )
-                .await;
-            return;
-        };
-        let typed_assignment_baseline = match coordinator.root_session_id() {
-            Some(root_session_id) => store
-                .list_agent_task_bindings(root_session_id, Some(256))
-                .await
-                .map(|bindings| {
-                    bindings
-                        .into_iter()
-                        .map(|binding| binding.assignment_id.to_string())
-                        .collect::<std::collections::BTreeSet<_>>()
-                }),
-            None => Ok(std::collections::BTreeSet::new()),
-        };
-        match (
-            store
-                .capture_workspace_revision(&repo_root, Vec::new())
-                .await,
-            typed_assignment_baseline,
-        ) {
-            (Ok(revision), Ok(typed_assignment_baseline))
-                if self
-                    .services
-                    .task_evidence
-                    .seed_workspace_event_baseline(
-                        revision.epoch,
-                        typed_assignment_baseline.clone(),
-                    )
-                    .await => {}
-            (Ok(_), Ok(_)) => {
-                self.services
-                    .task_evidence
-                    .mark_workspace_event_baseline_failed(
-                        "the workspace-event baseline could not be persisted",
-                    )
-                    .await;
-            }
-            (revision, bindings) => {
-                self.services
-                    .task_evidence
-                    .mark_workspace_event_baseline_failed(&format!(
-                        "the workspace-event baseline could not be captured: revision={:?}; bindings={:?}",
-                        revision.err(),
-                        bindings.err(),
-                    ))
-                    .await;
-            }
-        }
     }
 
     pub(crate) async fn notify_stream_error(

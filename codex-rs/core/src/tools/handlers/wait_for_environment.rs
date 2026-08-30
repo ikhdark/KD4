@@ -93,7 +93,7 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
                         format!(
                             "Environment `{environment_id}` failed to start and is unavailable. Continue without it."
                         ),
-                        Some(true),
+                        Some(false),
                     )));
                 }
             }
@@ -107,3 +107,23 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
 }
 
 impl CoreToolRuntime for WaitForEnvironmentHandler {}
+
+#[cfg(test)]
+mod tests {
+    use codex_tools::ToolOutput;
+    use codex_tools::ToolOutputOutcome;
+
+    use super::*;
+
+    #[test]
+    fn environment_start_failure_is_reported_as_failure() {
+        let output = FunctionToolOutput::from_text(
+            "Environment `env-1` failed to start and is unavailable. Continue without it."
+                .to_string(),
+            Some(false),
+        );
+
+        assert!(!output.success_for_logging());
+        assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+    }
+}

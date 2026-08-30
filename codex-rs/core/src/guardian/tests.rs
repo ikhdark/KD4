@@ -1149,6 +1149,15 @@ fn format_guardian_action_pretty_reports_no_truncation_for_small_payload() -> se
 }
 
 #[test]
+fn over_truncation_guardian_fails_closed_before_reviewing_an_incomplete_action() {
+    let error = crate::guardian::review_session::reject_truncated_reviewed_action(true)
+        .expect_err("a guardian must not review an incomplete action payload");
+
+    assert!(error.to_string().contains("exact payload was truncated"));
+    assert!(crate::guardian::review_session::reject_truncated_reviewed_action(false).is_ok());
+}
+
+#[test]
 fn format_guardian_action_pretty_bounds_nested_mcp_arguments() -> serde_json::Result<()> {
     let large_argument = "argument ".repeat(100_000);
     let action = GuardianApprovalRequest::McpToolCall {
@@ -1348,6 +1357,31 @@ fn guardian_assessment_action_redacts_apply_patch_patch_text() {
             "type": "apply_patch",
             "cwd": expected_cwd,
             "files": [expected_file],
+        }),
+    );
+}
+
+#[test]
+fn guardian_assessment_action_preserves_foreign_exec_cwd() {
+    let cwd = PathUri::parse("file:///tmp/remote-workspace").expect("POSIX remote cwd URI");
+    let expected_cwd = LegacyAppPathString::from(cwd.clone());
+    let action = GuardianApprovalRequest::ExecCommand {
+        id: "exec-remote".to_string(),
+        command: vec!["git".to_string(), "status".to_string()],
+        cwd,
+        sandbox_permissions: crate::sandboxing::SandboxPermissions::RequireEscalated,
+        additional_permissions: None,
+        justification: Some("inspect the remote checkout".to_string()),
+        tty: false,
+    };
+
+    assert_eq!(
+        serde_json::to_value(guardian_assessment_action(&action)).expect("serialize action"),
+        serde_json::json!({
+            "type": "command",
+            "source": "unified_exec",
+            "command": "git status",
+            "cwd": expected_cwd,
         }),
     );
 }
@@ -2522,7 +2556,6 @@ fn guardian_reused_trunk_ignores_stale_prior_turn_completion() -> anyhow::Result
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: Some(1),
-                completion: None,
                 timing: None,
             }),
         })
@@ -2781,37 +2814,18 @@ async fn guardian_review_does_not_retry_missing_assessment_payload() -> anyhow::
 }
 
 #[test]
-fn guardian_review_retries_two_parse_failures_then_approves() -> anyhow::Result<()> {
+fn guardian_review_does_not_retry_parse_failure() -> anyhow::Result<()> {
     run_multi_thread_test_with_stack(|| async {
         skip_if_no_network!(Ok(()));
 
         let server = start_mock_server().await;
-        let approval = serde_json::json!({
-            "risk_level": "low",
-            "user_authorization": "high",
-            "outcome": "allow",
-            "rationale": "retry succeeded",
-        })
-        .to_string();
         let request_log = mount_sse_sequence(
             &server,
-            vec![
-                sse(vec![
-                    ev_response_created("resp-parse-failure-1"),
-                    ev_assistant_message("msg-parse-failure-1", "not valid guardian json"),
-                    ev_completed("resp-parse-failure-1"),
-                ]),
-                sse(vec![
-                    ev_response_created("resp-parse-failure-2"),
-                    ev_assistant_message("msg-parse-failure-2", "still not valid guardian json"),
-                    ev_completed("resp-parse-failure-2"),
-                ]),
-                sse(vec![
-                    ev_response_created("resp-approved"),
-                    ev_assistant_message("msg-approved", &approval),
-                    ev_completed("resp-approved"),
-                ]),
-            ],
+            vec![sse(vec![
+                ev_response_created("resp-parse-failure"),
+                ev_assistant_message("msg-parse-failure", "not valid guardian json"),
+                ev_completed("resp-parse-failure"),
+            ])],
         )
         .await;
         let (session, turn) = guardian_test_session_and_turn(&server).await;
@@ -2828,23 +2842,24 @@ fn guardian_review_retries_two_parse_failures_then_approves() -> anyhow::Result<
         )
         .await;
 
-        let GuardianReviewOutcome::Completed(assessment) = outcome else {
-            panic!("expected guardian assessment");
-        };
-        assert_eq!(assessment.outcome, GuardianAssessmentOutcome::Allow);
-        assert_eq!(assessment.rationale, "retry succeeded");
-        assert_eq!(metadata.attempt_count, 3);
+        assert!(matches!(
+            outcome,
+            GuardianReviewOutcome::Error(
+                crate::guardian::review::GuardianReviewError::Parse { .. }
+            )
+        ));
+        assert_eq!(metadata.attempt_count, 1);
         assert!(matches!(
             metadata.guardian_session_kind,
             Some(codex_analytics::GuardianReviewSessionKind::TrunkReused)
         ));
-        assert_eq!(request_log.requests().len(), 3);
+        assert_eq!(request_log.requests().len(), 1);
         Ok(())
     })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_review_exhausts_three_failures_with_one_terminal_event() -> anyhow::Result<()> {
+async fn guardian_review_parse_failure_emits_one_terminal_event() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -2882,7 +2897,7 @@ async fn guardian_review_exhausts_three_failures_with_one_terminal_event() -> an
     .await;
 
     assert_eq!(decision, ReviewDecision::Denied);
-    assert_eq!(request_log.requests().len(), 3);
+    assert_eq!(request_log.requests().len(), 1);
     let mut statuses = Vec::new();
     while let Ok(event) = rx.try_recv() {
         if let EventMsg::GuardianAssessment(event) = event.msg {

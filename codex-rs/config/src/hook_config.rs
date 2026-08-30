@@ -188,7 +188,15 @@ impl ManagedHooksRequirementsToml {
     }
 
     pub fn managed_dir_for_current_platform(&self) -> Option<&Path> {
-        self.windows_managed_dir.as_deref()
+        self.managed_dir_for_platform(cfg!(windows))
+    }
+
+    fn managed_dir_for_platform(&self, is_windows: bool) -> Option<&Path> {
+        if is_windows {
+            self.windows_managed_dir.as_deref()
+        } else {
+            self.managed_dir.as_deref()
+        }
     }
 }
 

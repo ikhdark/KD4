@@ -186,14 +186,9 @@ impl AgentsMdManager {
         )
         .await;
         let source_fingerprint = discovery.source_fingerprint();
-        if source_fingerprint.is_some() {
-            let cache = self.cache.lock().await;
-            if cache.key.as_ref() == Some(&key)
-                && cache.source_fingerprint.as_ref() == source_fingerprint.as_ref()
-            {
-                return cache.cached_observation(AgentsMdFreshness::Refreshed);
-            }
-        }
+        // File metadata is discovery evidence, not a content identity. Editors, sync tools, and
+        // remote filesystems can replace a file while preserving its size and modification time,
+        // so every sampling-step refresh must read the discovered instruction files again.
         let load = load_project_instructions_from_discovery(
             config.as_ref(),
             self.user_instructions.clone(),

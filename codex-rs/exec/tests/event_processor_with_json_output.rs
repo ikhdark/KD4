@@ -15,8 +15,6 @@ use codex_app_server_protocol::McpToolCallStatus as ApiMcpToolCallStatus;
 use codex_app_server_protocol::PatchApplyStatus as ApiPatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind as ApiPatchChangeKind;
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::TaskCompletionGate;
-use codex_app_server_protocol::TaskCompletionStatus;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::TokenUsageBreakdown;
@@ -91,11 +89,6 @@ fn map_todo_items_preserves_text_and_completion_state() {
             status: TurnPlanStepStatus::Completed,
             ..Default::default()
         },
-        TurnPlanStep {
-            step: "prove runtime path".to_string(),
-            status: TurnPlanStepStatus::Passed,
-            ..Default::default()
-        },
     ]);
 
     assert_eq!(
@@ -107,10 +100,6 @@ fn map_todo_items_preserves_text_and_completion_state() {
             },
             TodoItem {
                 text: "drop legacy notifications".to_string(),
-                completed: true,
-            },
-            TodoItem {
-                text: "prove runtime path".to_string(),
                 completed: true,
             },
         ]
@@ -166,7 +155,6 @@ fn turn_started_emits_turn_started_event() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -820,11 +808,6 @@ fn collab_spawn_begin_and_end_emit_item_events() {
                         status: ApiCollabAgentStatus::Running,
                         message: None,
                         surfaced_result: None,
-                        completion: Some(TaskCompletionGate {
-                            status: TaskCompletionStatus::Partial,
-                            reasons: vec!["validation pending".to_string()],
-                            evidence_path: Some("artifacts/completion.json".to_string()),
-                        }),
                         last_agent_message: Some("implementation complete".to_string()),
                     },
                 )]),
@@ -871,11 +854,6 @@ fn collab_spawn_begin_and_end_emit_item_events() {
                                 status: CollabAgentStatus::Running,
                                 message: None,
                                 surfaced_result: None,
-                                completion: Some(TaskCompletionGate {
-                                    status: TaskCompletionStatus::Partial,
-                                    reasons: vec!["validation pending".to_string()],
-                                    evidence_path: Some("artifacts/completion.json".to_string(),),
-                                }),
                                 last_agent_message: Some("implementation complete".to_string(),),
                             },
                         )]),
@@ -1235,7 +1213,6 @@ fn plan_update_emits_started_then_updated_then_completed() {
         TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1245,7 +1222,6 @@ fn plan_update_emits_started_then_updated_then_completed() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1304,7 +1280,6 @@ fn plan_update_after_completion_starts_new_todo_list_with_new_id() {
         TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1314,7 +1289,6 @@ fn plan_update_after_completion_starts_new_todo_list_with_new_id() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1395,7 +1369,6 @@ fn token_usage_update_is_emitted_on_turn_completion() {
         TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1405,7 +1378,6 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1438,7 +1410,6 @@ fn turn_completion_recovers_final_message_from_turn_items() {
         TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1453,7 +1424,6 @@ fn turn_completion_recovers_final_message_from_turn_items() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1519,7 +1489,6 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
         TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1540,7 +1509,6 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1595,7 +1563,6 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
         TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1610,7 +1577,6 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1653,7 +1619,6 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
         TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1663,7 +1628,6 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1698,7 +1662,6 @@ fn surfaced_result_without_canonical_message_clears_plain_output_and_stays_typed
         TurnCompletedNotification {
             surfaced_result: Some(surfaced_result.clone()),
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1713,7 +1676,6 @@ fn surfaced_result_without_canonical_message_clears_plain_output_and_stays_typed
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1759,7 +1721,6 @@ fn failed_turn_clears_stale_final_message() {
         TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1773,7 +1734,6 @@ fn failed_turn_clears_stale_final_message() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1794,7 +1754,6 @@ fn turn_completion_falls_back_to_final_plan_text() {
         TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1807,7 +1766,6 @@ fn turn_completion_falls_back_to_final_plan_text() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1857,7 +1815,6 @@ fn turn_failure_prefers_structured_error_message() {
         TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1867,7 +1824,6 @@ fn turn_failure_prefers_structured_error_message() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1927,7 +1883,6 @@ fn interrupted_turn_emits_turn_failed_terminal_event() {
         TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1937,7 +1892,6 @@ fn interrupted_turn_emits_turn_failed_terminal_event() {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,

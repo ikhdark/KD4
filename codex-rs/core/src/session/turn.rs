@@ -34,7 +34,6 @@ use crate::context_manager::ContextManager;
 use crate::context_manager::PreparedPromptInput;
 use crate::context_manager::compact_acknowledged_tool_search_outputs;
 use crate::feedback_tags;
-use crate::hook_runtime::LegacyAfterAgentHookOutcome;
 use crate::hook_runtime::emit_hook_stop_reason;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
@@ -64,6 +63,7 @@ use crate::plugins::build_plugin_injections;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
+use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::EXTENSION_CONTEXT_CONTRIBUTOR_TIMEOUT;
 use crate::session::PreviousTurnSettings;
@@ -100,7 +100,6 @@ use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_con
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item_with_finalized_facts;
 use crate::tasks::TurnTaskResult;
-use crate::tasks::completion_review::CompletionReviewTurnEvidence;
 use crate::tasks::emit_compact_metric;
 use crate::tool_history::ModelGenerationId;
 use crate::tools::ToolRouter;
@@ -330,10 +329,7 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<TurnTaskResult> {
-    let mut completion_review_state =
-        crate::tasks::completion_review::CompletionReviewState::default();
     let mut mutating_finalizer_ran = false;
-    let mut mutating_finalizer_candidate_diff = None;
     let mut preparation_timing_guard = None;
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
@@ -432,7 +428,6 @@ pub(crate) async fn run_turn(
     let mut logical_generation_budget = LogicalGenerationBudget::default();
     let mut generation_budget_error_reported = false;
     let mut defer_pending_input = false;
-    let mut consecutive_server_resample_honored = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
@@ -483,11 +478,7 @@ pub(crate) async fn run_turn(
             run_hooks_and_record_inputs_detailed(&sess, &turn_context, &pending_input).await;
         if recorded_input.accepted_context_input {
             prefetched_workspace_identity = None;
-            completion_review_state =
-                crate::tasks::completion_review::CompletionReviewState::default();
             mutating_finalizer_ran = false;
-            mutating_finalizer_candidate_diff = None;
-            consecutive_server_resample_honored = false;
             reasoning_governor.accepted_user_input();
         }
         if recorded_input.should_stop {
@@ -523,8 +514,7 @@ pub(crate) async fn run_turn(
                         Some(ContinuationCause::Compaction) => {
                             Some(TurnTimingGenerationPurpose::CompactionRecovery)
                         }
-                        Some(ContinuationCause::CompletionReviewRepair)
-                        | Some(ContinuationCause::InvalidImageRecovery)
+                        Some(ContinuationCause::InvalidImageRecovery)
                         | Some(ContinuationCause::StopHook) => {
                             Some(TurnTimingGenerationPurpose::Repair)
                         }
@@ -764,14 +754,9 @@ pub(crate) async fn run_turn(
                         &request_signals,
                         &settled_state,
                         has_pending_input,
-                        protocol_resample_completion_allowed(
-                            server_resample_eligible,
-                            consecutive_server_resample_honored,
-                        ),
+                        protocol_resample_completion_allowed(server_resample_eligible),
                     )
                 });
-                consecutive_server_resample_honored =
-                    server_resample_eligible && next_generation_request.is_some();
                 if next_generation_request
                     .as_ref()
                     .is_some_and(|request| request.sampling.is_residual_deterministic())
@@ -900,6 +885,22 @@ pub(crate) async fn run_turn(
                     } else {
                         last_agent_message = sampling_request_last_agent_message;
                     }
+                    if turn_context.config.features.enabled(Feature::DirectRuntime) {
+                        match completion_pending_input_disposition(
+                            &logical_generation_budget,
+                            sess.input_queue.has_pending_input(&sess.active_turn).await,
+                        ) {
+                            CompletionPendingInputDisposition::Continue => {
+                                pending_continuation_cause = Some(ContinuationCause::PendingInput);
+                                continue 'sampling_loop;
+                            }
+                            CompletionPendingInputDisposition::Defer => {
+                                defer_pending_input = true;
+                            }
+                            CompletionPendingInputDisposition::None => {}
+                        }
+                        break;
+                    }
                     let mutating_finalizer_aborted = if matches!(
                         turn_context.config.after_agent_policy,
                         AfterAgentPolicy::MutatingFinalizer
@@ -913,98 +914,10 @@ pub(crate) async fn run_turn(
                             last_agent_message.clone(),
                         )
                         .await;
-                        if let Some(reason) = after_agent_outcome.observation_error {
-                            record_completion_review_partial_reason(
-                                &sess,
-                                format!("AfterAgent completion observation failed: {reason}"),
-                            )
-                            .await;
-                        } else if after_agent_outcome.workspace_changed {
-                            reasoning_governor.host_mutation();
-                            turn_diff_tracker.lock().await.record_unknown_mutation();
-                            mutating_finalizer_candidate_diff =
-                                crate::git_workspace::capture_candidate_diff(
-                                    turn_context.config.cwd.as_path(),
-                                )
-                                .await
-                                .map(|capture| {
-                                    String::from_utf8_lossy(&capture.raw_diff).into_owned()
-                                });
-                        }
-                        if after_agent_outcome.aborted {
-                            record_completion_review_partial_reason(
-                                &sess,
-                                "the reviewed candidate changed during terminal finalization"
-                                    .to_string(),
-                            )
-                            .await;
-                        }
                         after_agent_outcome.aborted
                     } else {
                         false
                     };
-                    let completion_review_turn_evidence = {
-                        let tracker = turn_diff_tracker.lock().await;
-                        CompletionReviewTurnEvidence {
-                            exact_diff: mutating_finalizer_candidate_diff
-                                .clone()
-                                .or_else(|| tracker.get_unified_diff()),
-                            mutation_revision: tracker.current_mutation_revision(),
-                        }
-                    };
-                    let review_outcome = Box::pin(
-                        crate::tasks::completion_review::coordinate_completion_review(
-                            &sess,
-                            &turn_context,
-                            &cancellation_token,
-                            &completion_review_turn_evidence,
-                            last_agent_message.as_deref(),
-                            logical_generation_budget.has_regular_generation_capacity(),
-                            &mut completion_review_state,
-                        ),
-                    )
-                    .await?;
-                    let mut review_report =
-                        report_completion_review_outcome(&sess, &turn_context, review_outcome)
-                            .await;
-                    if review_report.repair_injected {
-                        if mutating_finalizer_aborted {
-                            return Ok(after_agent_abort_result(
-                                last_agent_message,
-                                surfaced_result,
-                                defer_pending_input,
-                            ));
-                        }
-                        if admit_regular_follow_up(
-                            sess.as_ref(),
-                            turn_context.as_ref(),
-                            &logical_generation_budget,
-                            &mut generation_budget_error_reported,
-                        )
-                        .await
-                        {
-                            reasoning_governor.host_diagnose();
-                            prepare_completion_review_retry(
-                                &mut pending_generation_request,
-                                &mut mutating_finalizer_candidate_diff,
-                            );
-                            pending_continuation_cause =
-                                Some(ContinuationCause::CompletionReviewRepair);
-                            continue 'sampling_loop;
-                        }
-                    }
-                    if mutating_finalizer_aborted {
-                        return Ok(after_agent_abort_result(
-                            last_agent_message,
-                            surfaced_result,
-                            defer_pending_input,
-                        ));
-                    }
-                    let correction_consumed = sess
-                        .services
-                        .task_evidence
-                        .completion_review_correction_consumed()
-                        .await;
                     let completion_stop_report = run_completion_stop_hook(
                         &sess,
                         &turn_context,
@@ -1012,19 +925,6 @@ pub(crate) async fn run_turn(
                         last_agent_message.clone(),
                     )
                     .await;
-                    let mut terminal_hook_workspace_changed =
-                        completion_stop_report.workspace_changed;
-                    let mut terminal_hook_candidate_diff = None;
-                    if terminal_hook_workspace_changed {
-                        reasoning_governor.host_mutation();
-                        turn_diff_tracker.lock().await.record_unknown_mutation();
-                        terminal_hook_candidate_diff =
-                            crate::git_workspace::capture_candidate_diff(
-                                turn_context.config.cwd.as_path(),
-                            )
-                            .await
-                            .map(|capture| String::from_utf8_lossy(&capture.raw_diff).into_owned());
-                    }
                     if let Some(hook_prompt_message) = completion_stop_report.continuation_prompt
                         && admit_regular_follow_up(
                             sess.as_ref(),
@@ -1039,24 +939,6 @@ pub(crate) async fn run_turn(
                             hook_prompt_message,
                         )
                         .await;
-                        if !matches!(
-                            sess.services
-                                .task_evidence
-                                .prepare_terminal_hook_completion_review_reentry(
-                                    correction_consumed,
-                                )
-                                .await,
-                            crate::task_evidence::AtomicReviewTransition::Persisted(())
-                        ) {
-                            record_completion_review_partial_reason(
-                                &sess,
-                                "the completion review could not durably re-enter for Stop continuation"
-                                    .to_string(),
-                            )
-                            .await;
-                        }
-                        completion_review_state =
-                            crate::tasks::completion_review::CompletionReviewState::default();
                         stop_hook_active = true;
                         reasoning_governor.host_diagnose();
                         clear_pending_generation_request(&mut pending_generation_request);
@@ -1064,23 +946,12 @@ pub(crate) async fn run_turn(
                         continue 'sampling_loop;
                     }
                     if completion_stop_report.should_stop {
-                        if terminal_hook_workspace_changed {
-                            record_completion_review_partial_reason(
-                                &sess,
-                                "Stop ended the turn after mutating the reviewed candidate"
-                                    .to_string(),
-                            )
-                            .await;
-                        }
-                        if let Some(message) =
-                            sess.services.task_evidence.finalization_advisory().await
-                            && review_report.advisory.as_deref() != Some(message.as_str())
-                        {
-                            sess.send_event(
-                                &turn_context,
-                                EventMsg::Warning(WarningEvent { message }),
-                            )
-                            .await;
+                        if mutating_finalizer_aborted {
+                            return Ok(after_agent_abort_result(
+                                last_agent_message,
+                                surfaced_result,
+                                defer_pending_input,
+                            ));
                         }
                         emit_hook_stop_reason(
                             &sess,
@@ -1091,7 +962,7 @@ pub(crate) async fn run_turn(
                         .await;
                         break 'sampling_loop;
                     }
-                    let after_agent_outcome = if matches!(
+                    let after_agent_aborted = if matches!(
                         turn_context.config.after_agent_policy,
                         AfterAgentPolicy::Legacy
                     ) {
@@ -1102,109 +973,16 @@ pub(crate) async fn run_turn(
                             last_agent_message.clone(),
                         )
                         .await
+                        .aborted
                     } else {
-                        LegacyAfterAgentHookOutcome::default()
+                        false
                     };
-                    if let Some(reason) = after_agent_outcome.observation_error {
-                        record_completion_review_partial_reason(
-                            &sess,
-                            format!("AfterAgent completion observation failed: {reason}"),
-                        )
-                        .await;
-                    } else if after_agent_outcome.workspace_changed {
-                        terminal_hook_workspace_changed = true;
-                        reasoning_governor.host_mutation();
-                        turn_diff_tracker.lock().await.record_unknown_mutation();
-                        terminal_hook_candidate_diff =
-                            crate::git_workspace::capture_candidate_diff(
-                                turn_context.config.cwd.as_path(),
-                            )
-                            .await
-                            .map(|capture| String::from_utf8_lossy(&capture.raw_diff).into_owned());
-                    }
-                    if after_agent_outcome.aborted {
+                    if mutating_finalizer_aborted || after_agent_aborted {
                         return Ok(after_agent_abort_result(
                             last_agent_message,
                             surfaced_result,
                             defer_pending_input,
                         ));
-                    }
-                    if terminal_hook_workspace_changed && review_report.provisional_clean {
-                        if !matches!(
-                            sess.services
-                                .task_evidence
-                                .prepare_terminal_hook_completion_review_reentry(
-                                    correction_consumed,
-                                )
-                                .await,
-                            crate::task_evidence::AtomicReviewTransition::Persisted(())
-                        ) {
-                            record_completion_review_partial_reason(
-                                &sess,
-                                "the completion review could not durably re-enter after terminal hook mutation"
-                                    .to_string(),
-                            )
-                            .await;
-                        } else {
-                            completion_review_state =
-                                crate::tasks::completion_review::CompletionReviewState::default();
-                            let completion_review_turn_evidence = {
-                                let tracker = turn_diff_tracker.lock().await;
-                                CompletionReviewTurnEvidence {
-                                    exact_diff: terminal_hook_candidate_diff
-                                        .clone()
-                                        .or_else(|| tracker.get_unified_diff()),
-                                    mutation_revision: tracker.current_mutation_revision(),
-                                }
-                            };
-                            let refreshed_review = Box::pin(
-                                crate::tasks::completion_review::coordinate_completion_review(
-                                    &sess,
-                                    &turn_context,
-                                    &cancellation_token,
-                                    &completion_review_turn_evidence,
-                                    last_agent_message.as_deref(),
-                                    logical_generation_budget.has_regular_generation_capacity(),
-                                    &mut completion_review_state,
-                                ),
-                            )
-                            .await?;
-                            let refreshed_review_report = report_completion_review_outcome(
-                                &sess,
-                                &turn_context,
-                                refreshed_review,
-                            )
-                            .await;
-                            if refreshed_review_report.repair_injected
-                                && admit_regular_follow_up(
-                                    sess.as_ref(),
-                                    turn_context.as_ref(),
-                                    &logical_generation_budget,
-                                    &mut generation_budget_error_reported,
-                                )
-                                .await
-                            {
-                                reasoning_governor.host_diagnose();
-                                prepare_completion_review_retry(
-                                    &mut pending_generation_request,
-                                    &mut mutating_finalizer_candidate_diff,
-                                );
-                                pending_continuation_cause =
-                                    Some(ContinuationCause::CompletionReviewRepair);
-                                continue 'sampling_loop;
-                            }
-                            review_report = refreshed_review_report;
-                            trace!(
-                                provisional_clean = review_report.provisional_clean,
-                                "refreshed completion review outcome recorded"
-                            );
-                        }
-                    }
-                    if let Some(message) = sess.services.task_evidence.finalization_advisory().await
-                        && review_report.advisory.as_deref() != Some(message.as_str())
-                    {
-                        sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message }))
-                            .await;
                     }
                     match completion_pending_input_disposition(
                         &logical_generation_budget,
@@ -1299,14 +1077,6 @@ pub(crate) async fn run_turn(
 
 fn clear_pending_generation_request<Request>(pending_generation_request: &mut Option<Request>) {
     *pending_generation_request = None;
-}
-
-fn prepare_completion_review_retry<Request>(
-    pending_generation_request: &mut Option<Request>,
-    mutating_finalizer_candidate_diff: &mut Option<String>,
-) {
-    clear_pending_generation_request(pending_generation_request);
-    *mutating_finalizer_candidate_diff = None;
 }
 
 fn rebase_generation_request_after_compaction(
@@ -1485,9 +1255,6 @@ fn completion_pending_input_disposition(
 const LOGICAL_GENERATION_BUDGET_EXHAUSTED_MESSAGE: &str =
     "The turn reached its logical generation limit before all requested work completed.";
 const LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE: &str = "The logical generation limit has been reached. This is the final tool-free synthesis request. Do not call tools. Summarize completed work and truthfully report any remaining work, failed validation, or blocker.";
-const LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_REASON: &str =
-    "the logical generation budget forced terminal synthesis before ordinary completion";
-
 async fn record_forced_terminal_budget_boundary(sess: &Session, turn_context: &TurnContext) {
     let directive_item = ResponseItem::Message {
         id: None,
@@ -1505,11 +1272,6 @@ async fn record_forced_terminal_budget_boundary(sess: &Session, turn_context: &T
         EventMsg::Warning(WarningEvent {
             message: LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE.to_string(),
         }),
-    )
-    .await;
-    record_completion_review_partial_reason(
-        sess,
-        LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_REASON.to_string(),
     )
     .await;
 }
@@ -1609,18 +1371,15 @@ fn generation_needs_follow_up(
     }
 }
 
-fn protocol_resample_completion_allowed(
-    server_resample_eligible: bool,
-    consecutive_server_resample_honored: bool,
-) -> bool {
-    server_resample_eligible && consecutive_server_resample_honored
+fn protocol_resample_completion_allowed(server_resample_eligible: bool) -> bool {
+    server_resample_eligible
 }
 
 fn generation_request_action_changed(
     generation_request: &GenerationRequestDisposition,
     next_generation_request: Option<&GenerationRequestDisposition>,
 ) -> bool {
-    next_generation_request.is_some_and(|next| next != generation_request)
+    next_generation_request.is_none_or(|next| next != generation_request)
 }
 
 fn take_convergence_observation(
@@ -1664,54 +1423,7 @@ async fn record_convergence_decision(
         .await;
 }
 
-async fn record_completion_review_partial_reason(sess: &Session, reason: String) {
-    let turn_state = {
-        let active_turn = sess.active_turn.lock().await;
-        active_turn
-            .as_ref()
-            .map(|active_turn| Arc::clone(&active_turn.turn_state))
-    };
-    if let Some(turn_state) = turn_state {
-        turn_state
-            .lock()
-            .await
-            .record_completion_review_partial_reason(reason);
-    }
-}
-
-async fn report_completion_review_outcome(
-    sess: &Session,
-    turn_context: &TurnContext,
-    outcome: crate::tasks::completion_review::CompletionReviewCoordinatorOutcome,
-) -> CompletionReviewReport {
-    let advisory = outcome.advisory;
-    if let Some(warning) = advisory.as_ref() {
-        sess.send_event(
-            turn_context,
-            EventMsg::Warning(WarningEvent {
-                message: warning.clone(),
-            }),
-        )
-        .await;
-    }
-    for reason in outcome.partial_reasons {
-        record_completion_review_partial_reason(sess, reason).await;
-    }
-    CompletionReviewReport {
-        provisional_clean: outcome.provisional_clean,
-        repair_injected: outcome.repair_injected,
-        advisory,
-    }
-}
-
-struct CompletionReviewReport {
-    provisional_clean: bool,
-    repair_injected: bool,
-    advisory: Option<String>,
-}
-
 struct CompletionStopHookReport {
-    workspace_changed: bool,
     continuation_prompt: Option<ResponseItem>,
     should_stop: bool,
     stop_reason: Option<String>,
@@ -1725,13 +1437,6 @@ async fn run_completion_stop_hook(
 ) -> CompletionStopHookReport {
     let observed =
         run_turn_stop_hooks(sess, turn_context, stop_hook_active, last_agent_message).await;
-    if let Some(reason) = observed.observation_error {
-        record_completion_review_partial_reason(
-            sess,
-            format!("Stop completion observation failed: {reason}"),
-        )
-        .await;
-    }
     let stop = observed.stop;
     let continuation_prompt = stop
         .should_block
@@ -1755,7 +1460,6 @@ async fn run_completion_stop_hook(
         .await;
     }
     CompletionStopHookReport {
-        workspace_changed: observed.workspace_changed,
         continuation_prompt,
         should_stop: stop.should_stop,
         stop_reason: stop.stop_reason,
@@ -3689,10 +3393,8 @@ async fn run_sampling_request(
 ) -> CodexResult<(SamplingRequestResult, Arc<[ResponseItem]>)> {
     let turn_context = Arc::clone(&step_context.turn);
     let terminal_completion_only = generation_request.terminal_completion_only;
-    // Deferred schemas are leased to one model request. Record the set that
-    // was already active before dispatch; discovery performed by tools in this
-    // request creates new activations that must remain available to the next
-    // continuation and therefore are not part of this release set.
+    // Record the deferred schemas advertised by this request. Settling the guard preserves them
+    // for later continuations in the same turn; capability refresh and turn teardown own expiry.
     let _advertised_deferred_tool_lease = (!terminal_completion_only).then(|| {
         let advertised_deferred_tools = turn_context.activated_deferred_tools();
         AdvertisedDeferredToolLease::new(Arc::clone(&turn_context), advertised_deferred_tools)
@@ -3795,7 +3497,7 @@ async fn run_sampling_request(
         )
     });
     let max_retries = turn_context.provider.info().stream_max_retries();
-    let mut retries = 0;
+    let mut retry_state = ResponsesStreamRetryState::default();
     let mut accepted_attempt_input = prepared_input.shared_items();
     let prompt_construction_guard = turn_context
         .turn_timing_state
@@ -3865,7 +3567,7 @@ async fn run_sampling_request(
         }
 
         let retry_result = handle_retryable_response_stream_error(
-            &mut retries,
+            &mut retry_state,
             max_retries,
             err,
             client_session,
@@ -5014,9 +4716,10 @@ pub(crate) fn reconcile_turn_progress(
     let context = turn_timing_state.lifecycle_context();
     if pending_tool_count == 0 && context.active_tool_count > 0 {
         *active_without_pending_passes = active_without_pending_passes.saturating_add(1);
-        debug_assert!(
-            *active_without_pending_passes <= 1,
-            "active_without_pending_tool survived more than one reconciliation pass"
+        trace!(
+            active_without_pending_passes = *active_without_pending_passes,
+            active_tool_count = context.active_tool_count,
+            "active tool lifecycle is awaiting a later reconciliation pass"
         );
     } else {
         *active_without_pending_passes = 0;
@@ -6142,11 +5845,11 @@ async fn try_run_sampling_request(
     }
 
     if let Some(etag) = latest_models_etag {
-        sess.services
-            .models_manager
-            .clone()
-            .notify_etag(etag, turn_context.config.http_client_factory())
-            .await;
+        let models_manager = Arc::clone(&sess.services.models_manager);
+        let http_client_factory = turn_context.config.http_client_factory();
+        drop(tokio::spawn(async move {
+            models_manager.notify_etag(etag, http_client_factory).await;
+        }));
     }
 
     outcome

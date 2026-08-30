@@ -17,6 +17,7 @@ use crate::hook_runtime::run_pre_compact_hook_gate;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_retry::ResponsesStreamRequest;
+use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -180,12 +181,7 @@ async fn run_remote_compact_task_inner(
     let status = compaction_status_from_result(&result);
     let codex_error = result.as_ref().err();
     if result.is_ok() {
-        let recovery_summary = sess
-            .services
-            .task_evidence
-            .compaction_recovery_summary()
-            .await;
-        if run_post_compact_hook_gate(sess, turn_context, trigger, Some(&recovery_summary)).await {
+        if run_post_compact_hook_gate(sess, turn_context, trigger, None).await {
             attempt
                 .track(sess.as_ref(), status, codex_error, analytics_details)
                 .await;
@@ -388,7 +384,7 @@ async fn run_remote_compaction_request_v2(
         .info()
         .stream_max_retries()
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
-    let mut retries = 0;
+    let mut retry_state = ResponsesStreamRetryState::default();
     turn_context.turn_timing_state.begin_compaction_generation();
     loop {
         let trace_attempt = compaction_trace.start_attempt(&RemoteCompactionV2TraceRequest {
@@ -438,7 +434,7 @@ async fn run_remote_compaction_request_v2(
             Err(err) if !err.is_retryable() => return Err(err),
             Err(err) => {
                 handle_retryable_response_stream_error(
-                    &mut retries,
+                    &mut retry_state,
                     max_retries,
                     err,
                     client_session,

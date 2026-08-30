@@ -7,7 +7,6 @@ use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
 use crate::context::is_legacy_compaction_warning_fragment;
 use crate::context::is_startup_contextual_user_fragment;
-use crate::context::is_task_evidence_context_fragment;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::hook_runtime::run_post_compact_hook_gate;
@@ -16,6 +15,7 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_retry::ResponsesStreamRequest;
+use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_retryable_response_stream_error;
 #[cfg(test)]
 use crate::session::PreviousTurnSettings;
@@ -24,6 +24,8 @@ use crate::session::turn::get_last_assistant_message_from_turn;
 use crate::session::turn_context::TurnContext;
 use crate::stable_context::StableContextTarget;
 use crate::stable_context::project_stable_context;
+use crate::tools::command_output_artifact::CanonicalOutputArtifact;
+use crate::tools::command_output_artifact::create_canonical_output_artifact;
 use codex_analytics::CodexCompactionEvent;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
@@ -50,6 +52,7 @@ use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_tools::CanonicalToolResult;
 use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text_to_token_ceiling;
@@ -65,8 +68,8 @@ pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACTION_SUMMARY_ITEM_ID_PREFIX: &str = "msg_compaction_summary_";
 const COMPACTION_SUMMARY_ITEM_ID_BASE: &str = "msg_compaction_summary";
-const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 4_000;
-const COMPACT_AGENT_MESSAGE_MAX_TOKENS: usize = 4_000;
+const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 16_000;
+const COMPACT_AGENT_MESSAGE_MAX_TOKENS: usize = 8_000;
 const COMPACT_TASK_STATE_MAX_TOKENS: usize = 1_800;
 const COMPACT_UNSTRUCTURED_UPDATE_MAX_TOKENS: usize = 1_000;
 const GOAL_HEADING: &str = "## Goal";
@@ -355,6 +358,9 @@ async fn run_compact_task_inner_impl(
             workspace_identity.as_ref(),
         );
     let turn_input = strip_compaction_startup_envelopes(turn_input);
+    let artifact_pin_payload = history
+        .tool_history_state()
+        .artifact_pin_payload_for_items(&turn_input);
     let prompt = Prompt {
         input: turn_input.into(),
         base_instructions: base_instructions.clone(),
@@ -364,7 +370,7 @@ async fn run_compact_task_inner_impl(
         validated_compaction_summary(previous_summary.as_deref(), "", false)
     } else {
         turn_context.turn_timing_state.begin_compaction_generation();
-        let mut retries = 0;
+        let mut retry_state = ResponsesStreamRetryState::default();
         loop {
             let attempt_result = drain_to_completed(
                 &sess,
@@ -417,7 +423,7 @@ async fn run_compact_task_inner_impl(
                 }
                 Err(e) => {
                     if let Err(e) = handle_retryable_response_stream_error(
-                        &mut retries,
+                        &mut retry_state,
                         max_retries,
                         e,
                         &mut client_session,
@@ -447,6 +453,9 @@ async fn run_compact_task_inner_impl(
             return Err(error);
         }
     };
+    let text_recovery_sidecar =
+        persist_compaction_text_recovery(sess.as_ref(), history.raw_items(), &unresolved_history)
+            .await;
     // The summary and durable world state own consumed continuation state. Preserve only the
     // exact input tail that no model-generated item has consumed yet, in its original order.
     let mut summary_for_history = summary_text.clone();
@@ -454,7 +463,14 @@ async fn run_compact_task_inner_impl(
         summary_for_history.push_str("\n\n");
         summary_for_history.push_str(COMPACT_IMAGE_OMISSION_MARKER);
     }
-    unresolved_history.push(compaction_summary_item(summary_for_history));
+    let mut summary_item =
+        compaction_summary_item_with_artifact_pins(summary_for_history, artifact_pin_payload);
+    if let Some(text) = text_recovery_sidecar
+        && let ResponseItem::Message { content, .. } = &mut summary_item
+    {
+        content.push(ContentItem::InputText { text });
+    }
+    unresolved_history.push(summary_item);
     let mut new_history = unresolved_history;
     if let Some(summary_item) = new_history.last_mut() {
         // This replacement history skips `record_conversation_items`; only the appended summary
@@ -528,13 +544,7 @@ pub(crate) fn strip_compaction_startup_envelopes(items: Vec<ResponseItem>) -> Ve
                 phase,
                 internal_chat_message_metadata_passthrough,
             } if role == "user" => {
-                // The compaction prompt names the structured task-state envelope as its
-                // authoritative continuation state. Strip reproducible startup material, but
-                // retain that one dynamic envelope so local compaction can actually consume it.
-                content.retain(|part| {
-                    !is_startup_contextual_user_fragment(part)
-                        || is_task_evidence_context_fragment(part)
-                });
+                content.retain(|part| !is_startup_contextual_user_fragment(part));
                 (!content.is_empty()).then_some(ResponseItem::Message {
                     id,
                     role,
@@ -1382,15 +1392,88 @@ fn compaction_text_omission_receipt(
     }
 }
 
+async fn persist_compaction_text_recovery(
+    sess: &Session,
+    source_items: &[ResponseItem],
+    bounded_history: &[ResponseItem],
+) -> Option<String> {
+    let canonical = compaction_text_recovery_canonical(source_items, bounded_history)?;
+    let codex_home = sess.codex_home().await;
+    let artifact = create_canonical_output_artifact(
+        codex_home.as_path(),
+        &sess.thread_id().to_string(),
+        &canonical,
+    )
+    .await;
+    compaction_text_recovery_sidecar(&canonical, &artifact)
+}
+
+fn compaction_text_recovery_canonical(
+    source_items: &[ResponseItem],
+    bounded_history: &[ResponseItem],
+) -> Option<CanonicalToolResult> {
+    let omitted = bounded_history.iter().any(|item| {
+        serde_json::to_string(item)
+            .is_ok_and(|rendered| rendered.contains(COMPACT_TEXT_OMISSION_MARKER))
+    });
+    if !omitted {
+        return None;
+    }
+    let exact_items = unresolved_compaction_items(source_items)
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item,
+                ResponseItem::Message { .. } | ResponseItem::AgentMessage { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    Some(CanonicalToolResult::json(serde_json::json!({
+        "version": 1,
+        "kind": "local_compaction_text_recovery",
+        "instruction": "Recover exact unresolved text with read_tool_output and a json_pointer under /items; do not ask the user to repeat it.",
+        "items": exact_items,
+    })))
+}
+
+fn compaction_text_recovery_sidecar(
+    canonical: &CanonicalToolResult,
+    artifact: &CanonicalOutputArtifact,
+) -> Option<String> {
+    let artifact_id = artifact.artifact_id()?;
+    serde_json::to_string(&serde_json::json!({
+        "version": 1,
+        "kind": "local_compaction_text_recovery",
+        "artifact_id": artifact_id,
+        "canonical_sha256": canonical.sha256,
+        "canonical_bytes": canonical.exact_bytes,
+        "complete": artifact.complete,
+        "unavailable_ranges": artifact.unavailable_ranges,
+        "instruction": "Use read_tool_output with this artifact_id and json_pointer selectors under /items to recover exact omitted unresolved text; do not rerun work or ask the user to repeat it."
+    }))
+    .ok()
+}
+
 pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
 }
 
 fn compaction_summary_item(summary_text: String) -> ResponseItem {
+    compaction_summary_item_with_artifact_pins(summary_text, None)
+}
+
+fn compaction_summary_item_with_artifact_pins(
+    summary_text: String,
+    artifact_pin_payload: Option<String>,
+) -> ResponseItem {
+    let mut content = vec![ContentItem::InputText { text: summary_text }];
+    if let Some(text) = artifact_pin_payload {
+        content.push(ContentItem::InputText { text });
+    }
     ResponseItem::Message {
         id: Some(ResponseItemId::new(COMPACTION_SUMMARY_ITEM_ID_BASE)),
         role: "user".to_string(),
-        content: vec![ContentItem::InputText { text: summary_text }],
+        content,
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }

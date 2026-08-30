@@ -14,15 +14,18 @@ Git index. Corpus validation rejects modifications to existing files, so the
 fixtures do not depend on any repository commit remaining reachable after a
 history rewrite.
 
-The before-change baseline uses:
+Every frozen run uses:
 
 - KD4 binary version: `codex-cli 0.0.0`;
 - model: `gpt-5.6-sol`;
 - reasoning effort: `max`;
-- sandbox: `read-only`;
 - session persistence: `--ephemeral`;
 - user configuration: ignored after authentication with
   `--ignore-user-config`.
+
+Audit cases use the `read-only` sandbox. Repair cases use `workspace-write` so
+the candidate can edit the isolated fixture; the scorer accepts changes only
+to the paths declared by that case's repair contract.
 
 Each result records the SHA-256 of the exact KD4 binary used and the fixed
 execution settings. Absolute paths, credentials, raw usage identifiers, and
@@ -30,7 +33,9 @@ machine-specific model output are local-only and must not be committed.
 
 ## Corpus layout
 
-- `cases.jsonl` is the frozen manifest.
+- `cases.jsonl` is the frozen manifest. Repair records also declare editable
+  paths, a changed-line limit, prohibited added mechanisms, event-derived tool
+  limits, and an immutable direct validation script.
 - `prompts/` contains one repository-relative audit prompt per case.
 - `patches/` contains self-contained new-file fixture patches.
 - `validate_cases.py` validates manifest shape, category coverage, referenced
@@ -61,22 +66,25 @@ For each case:
 1. Create an empty disposable directory and run `git init` in it.
 2. Apply the referenced patch from the KD4 checkout when one is present.
 3. Read the referenced prompt verbatim.
-4. Run the recorded KD4 binary and fixed settings:
+4. Run the recorded KD4 binary and fixed settings. Use `read-only` for an audit
+   case and `workspace-write` for a repair case:
 
    ```text
    codex exec --ephemeral --ignore-user-config --model gpt-5.6-sol \
-     -c model_reasoning_effort="max" --sandbox read-only --json \
+     -c model_reasoning_effort="max" --sandbox <case-sandbox> --json \
      -C <disposable-repository> <prompt>
    ```
 
-5. Preserve the complete JSONL event stream without alteration in the result's
+5. For a repair case, capture `git diff --no-ext-diff --binary` verbatim as the
+   result's `candidate_patch` before removing the disposable repository.
+6. Preserve the complete JSONL event stream without alteration in the result's
    `raw_events` array. The ignored local result may contain machine-specific
    paths; do not commit it.
-6. Classify the final answer into the stable corpus finding kinds without
+7. Classify the final answer into the stable corpus finding kinds without
    changing its meaning.
-7. Save the wrapper as
+8. Save the wrapper as
    `.codex/evals/investigation/<run-name>/<case-id>.json`.
-8. Remove the disposable repository.
+9. Remove the disposable repository.
 
 The result wrapper is:
 
@@ -117,17 +125,25 @@ The result wrapper is:
 }
 ```
 
+A repair wrapper additionally contains
+`"candidate_patch": "verbatim unified diff"` and records
+`"sandbox": "workspace-write"`.
+
 `reported_findings` is a human classification of the preserved final output,
 not a replacement for it. A finding may be mapped to an expected stable kind
 only when the final output identifies the same violated invariant and causal
 path. Every structured locator must occur in the final output, and
 `final_output` must exactly equal the last completed agent-message event.
-Uncertain language must remain `uncertain` or `deferred`.
+Uncertain language must remain `uncertain` or `deferred`. Repair cases have no
+classified findings; their outcome comes from the candidate patch contract.
 
 The scorer derives tool-call and repeated-equivalent-action counts from the
-preserved event stream. Do not add hand-entered metric totals: semantic
-premature-completion judgements and monetary costs are not scored without an
-independently generated evidence format.
+preserved event stream. For repair cases, it reconstructs the frozen fixture,
+applies the candidate patch, checks the declared scope and deterministic
+limits, then runs the immutable direct test. Test success depends on the
+process exit status, not parsed test output. Do not add hand-entered metric
+totals: semantic premature-completion judgements and monetary costs are not
+scored without an independently generated evidence format.
 
 ## Score a run
 
@@ -141,5 +157,6 @@ The scorer hashes `--binary` itself and requires every result wrapper to match
 that digest. A wrapper-provided digest alone is never accepted as provenance.
 
 The scorer reports confirmed-finding recall, precision, clean-control false
-positives, deferred or uncertain findings, and event-derived tool calls and
-repeated equivalent actions.
+positives, deferred or uncertain findings, event-derived tool calls and
+repeated equivalent actions, and the repair-contract pass rate with exact
+per-case violations.

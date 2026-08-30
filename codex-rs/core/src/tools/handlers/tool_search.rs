@@ -38,9 +38,8 @@ use unicode_segmentation::UnicodeSegmentation;
 const MAX_TOOL_SEARCH_HANDLER_CACHE: usize = 4;
 const MAX_TOOL_SEARCH_RESULT_CACHE: usize = 32;
 const MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES: usize = 256 * 1024;
-// Tool-search outputs stay in model-visible history. Keep each serialized
-// result near a 768-token projection (using the core's 4 bytes/token estimate)
-// while exact-name recovery preserves a callable schema for oversized tools.
+// Tool-search outputs stay in model-visible history. Keep ordinary serialized
+// results near a 768-token projection (using the core's 4 bytes/token estimate).
 const MAX_TOOL_SEARCH_RESULT_BYTES: usize = 3 * 1024;
 const MAX_TOOL_SEARCH_QUERY_BYTES: usize = 4 * 1024;
 const MAX_TOOL_SEARCH_LIMIT: usize = 64;
@@ -215,27 +214,29 @@ struct ToolSearchNameIndex {
 
 impl ToolSearchNameIndex {
     fn new(search_info: &ToolSearchInfo) -> Self {
-        let entry_names = search_info
+        let mut entry_names = search_info
             .entry
             .tool_names
             .iter()
             .map(|name| normalize_tool_search_query(name))
-            .collect();
+            .collect::<HashSet<_>>();
         let mut output_names = HashMap::<String, HashSet<String>>::new();
         match &search_info.entry.output {
             LoadableToolSpec::Function(tool) => {
-                output_names
-                    .entry(normalize_tool_search_query(&tool.name))
-                    .or_default()
-                    .insert(tool.name.clone());
+                index_output_name(
+                    &mut entry_names,
+                    &mut output_names,
+                    &ToolName::plain(tool.name.clone()),
+                );
             }
             LoadableToolSpec::Namespace(namespace) => {
                 for tool in &namespace.tools {
                     let ResponsesApiNamespaceTool::Function(tool) = tool;
-                    output_names
-                        .entry(normalize_tool_search_query(&tool.name))
-                        .or_default()
-                        .insert(tool.name.clone());
+                    index_output_name(
+                        &mut entry_names,
+                        &mut output_names,
+                        &ToolName::namespaced(namespace.name.clone(), tool.name.clone()),
+                    );
                 }
             }
         }
@@ -251,6 +252,25 @@ impl ToolSearchNameIndex {
 
     fn output_names_for(&self, normalized_query: &str) -> Option<&HashSet<String>> {
         self.output_names.get(normalized_query)
+    }
+}
+
+fn index_output_name(
+    entry_names: &mut HashSet<String>,
+    output_names: &mut HashMap<String, HashSet<String>>,
+    tool_name: &ToolName,
+) {
+    let aliases = [
+        tool_name.name.clone(),
+        codex_tools::code_mode_name_for_tool_name(tool_name),
+    ];
+    for alias in aliases {
+        let normalized = normalize_tool_search_query(&alias);
+        entry_names.insert(normalized.clone());
+        output_names
+            .entry(normalized)
+            .or_default()
+            .insert(tool_name.name.clone());
     }
 }
 
@@ -297,6 +317,7 @@ struct ToolSearchCacheEntry {
 struct ToolSearchResult {
     tools: Vec<LoadableToolSpec>,
     serialized_tools: Vec<serde_json::Value>,
+    activation_tools: Vec<ToolName>,
     omitted_result_count: usize,
     encoded_tools_len: usize,
 }
@@ -306,6 +327,7 @@ impl Default for ToolSearchResult {
         Self {
             tools: Vec::new(),
             serialized_tools: Vec::new(),
+            activation_tools: Vec::new(),
             omitted_result_count: 0,
             encoded_tools_len: 2,
         }
@@ -744,7 +766,7 @@ impl ToolSearchHandler {
 
         let limit = args.limit.unwrap_or(TOOL_SEARCH_DEFAULT_LIMIT);
         let result = self.search(&args.query, limit)?;
-        turn.activate_deferred_tools(result.tools.iter().flat_map(loadable_tool_names));
+        turn.activate_deferred_tools(result.activation_tools.iter().cloned());
 
         Ok(boxed_tool_output(ToolSearchOutput {
             tools: result.serialized_tools.clone(),
@@ -854,6 +876,7 @@ impl ToolSearchHandler {
         exact_query: Option<&str>,
     ) -> Result<ToolSearchResult, FunctionCallError> {
         let mut retained = ToolSearchResultBuilder::new();
+        let mut activation_tools = Vec::new();
         let mut omitted_result_count = 0usize;
         for result_id in results {
             let result = &result_id.info(&self.search_infos).entry;
@@ -866,8 +889,8 @@ impl ToolSearchHandler {
             } else if let Some(recovery) = exact_output_names
                 .and_then(|names| compact_exact_match_recovery(&result.output, names))
             {
-                if retained.try_push(&recovery) {
-                } else {
+                if !retained.try_push(&recovery) {
+                    activation_tools.extend(loadable_tool_names(&recovery));
                     omitted_result_count = omitted_result_count.saturating_add(1);
                 }
             } else {
@@ -875,10 +898,14 @@ impl ToolSearchHandler {
             }
         }
         let (tools, encoded_tools_len) = retained.finish();
+        activation_tools.extend(tools.iter().flat_map(loadable_tool_names));
+        activation_tools.sort_unstable();
+        activation_tools.dedup();
         let serialized_tools = serialize_loadable_tools(&tools);
         Ok(ToolSearchResult {
             tools,
             serialized_tools,
+            activation_tools,
             omitted_result_count,
             encoded_tools_len,
         })
@@ -1702,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_tool_search_contract_omits_exact_match_when_safe_schema_exceeds_budget() {
+    fn token_backfire_oversized_exact_match_stays_activatable() {
         let mut search_info = search_info("calendar", None, "calendar", "create_event");
         let LoadableToolSpec::Namespace(namespace) = &mut search_info.entry.output else {
             panic!("test search info should be a namespace");
@@ -1729,10 +1756,35 @@ mod tests {
 
         let tools = ToolSearchHandler::new(vec![search_info])
             .search("create_event", TOOL_SEARCH_DEFAULT_LIMIT)
-            .expect("oversized exact-name search should return an explicit omission");
+            .expect("oversized exact-name search should keep the tool activatable");
 
         assert!(tools.tools.is_empty());
         assert_eq!(tools.omitted_result_count, 1);
+        assert!(tools.encoded_tools_len <= MAX_TOOL_SEARCH_RESULT_BYTES);
+        assert_eq!(
+            tools.activation_tools,
+            vec![ToolName::namespaced("mcp__calendar", "create_event")]
+        );
+    }
+
+    #[test]
+    fn qualified_namespace_name_is_an_exact_search_match() {
+        let handler = ToolSearchHandler::new(vec![search_info(
+            "calendar",
+            None,
+            "calendar",
+            "create_event",
+        )]);
+
+        let tools = handler
+            .search("mcp__calendar__create_event", TOOL_SEARCH_DEFAULT_LIMIT)
+            .expect("qualified exact-name search should succeed");
+
+        assert_eq!(tools.tools.len(), 1);
+        assert_eq!(
+            tools.activation_tools,
+            vec![ToolName::namespaced("mcp__calendar", "create_event")]
+        );
     }
 
     #[test]

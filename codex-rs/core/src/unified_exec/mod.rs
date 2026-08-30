@@ -29,7 +29,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
-use std::sync::atomic::AtomicBool;
 
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -224,8 +223,7 @@ impl ProcessStore {
 pub(crate) struct UnifiedExecProcessManager {
     process_store: Arc<Mutex<ProcessStore>>,
     max_write_stdin_yield_time_ms: u64,
-    deferred_executor_enabled: bool,
-    executor_ready: AtomicBool,
+    executor_ready_environments: StdMutex<HashSet<String>>,
 }
 
 impl UnifiedExecProcessManager {
@@ -238,15 +236,22 @@ impl UnifiedExecProcessManager {
 
     pub(crate) fn new_with_deferred_executor(
         max_write_stdin_yield_time_ms: u64,
-        deferred_executor_enabled: bool,
+        _deferred_executor_enabled: bool,
     ) -> Self {
         Self {
             process_store: Arc::new(Mutex::new(ProcessStore::default())),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
-            deferred_executor_enabled,
-            executor_ready: AtomicBool::new(false),
+            executor_ready_environments: StdMutex::new(HashSet::new()),
         }
+    }
+
+    fn mark_executor_ready(&self, environment_id: &str) -> bool {
+        let mut ready = self
+            .executor_ready_environments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !ready.insert(environment_id.to_string())
     }
 }
 
@@ -277,7 +282,7 @@ pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
 }
 
 pub(crate) fn clamp_yield_time_for_readiness(yield_time_ms: u64, executor_ready: bool) -> u64 {
-    let yield_time_ms = if !executor_ready {
+    let yield_time_ms = if cfg!(windows) && !executor_ready {
         yield_time_ms.max(WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS)
     } else {
         yield_time_ms

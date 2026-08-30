@@ -1,3 +1,9 @@
+use codex_agent_task_store::AttemptId;
+use codex_protocol::protocol::ToolExecutionId;
+use serde::Deserialize;
+use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -8,28 +14,14 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-#[cfg(test)]
-use std::time::Duration;
-
-use codex_agent_task_store::AttemptId;
-use codex_protocol::plan_tool::ValidationRoute;
-use codex_protocol::protocol::ToolExecutionId;
-use codex_protocol::validation::ValidationResult;
-use codex_protocol::validation::ValidationTerminalStatus;
-use serde::Deserialize;
-use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
 use tokio::sync::Mutex;
-use tokio::time::Instant;
 
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::handlers::command_search::RgSearchBreadth;
 use crate::tools::handlers::command_search::RgSearchNarrowing;
-use crate::validation_admission::ValidationLaunchPlan;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
-const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 2;
+const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 3;
 const COMMAND_FINGERPRINT_VERSION: &str = "v2";
 static NEXT_COMMAND_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -70,6 +62,7 @@ struct SearchNarrowingAttempt {
     search_identity: String,
     scope_identity: String,
     parent_scope_identity: Option<String>,
+    scope_state_identity: Option<String>,
     can_record_miss: bool,
 }
 
@@ -78,6 +71,7 @@ struct SearchMissCacheKey {
     environment_id: String,
     repository_identity: String,
     search_identity: String,
+    scope_state_identity: String,
     execution_context: BTreeMap<String, String>,
 }
 
@@ -186,6 +180,7 @@ impl CommandAttemptKey {
             search_identity: search.search_identity,
             scope_identity: search.scope_identity,
             parent_scope_identity: search.parent_scope_identity,
+            scope_state_identity: search.scope_state_identity,
             can_record_miss: search.can_record_miss,
         });
         self
@@ -193,7 +188,7 @@ impl CommandAttemptKey {
 
     fn search_miss_cache_key(&self) -> Option<SearchMissCacheKey> {
         let search = self.eligible_search_miss()?;
-        Some(self.search_miss_cache_key_for(search))
+        self.search_miss_cache_key_for(search)
     }
 
     fn eligible_search_miss(&self) -> Option<&SearchNarrowingAttempt> {
@@ -202,19 +197,24 @@ impl CommandAttemptKey {
             .filter(|search| search.can_record_miss)
     }
 
-    fn search_miss_cache_key_for(&self, search: &SearchNarrowingAttempt) -> SearchMissCacheKey {
-        let has_workspace_identity = self.execution_context.contains_key("workspace_identity");
-        SearchMissCacheKey {
+    fn search_miss_cache_key_for(
+        &self,
+        search: &SearchNarrowingAttempt,
+    ) -> Option<SearchMissCacheKey> {
+        Some(SearchMissCacheKey {
             environment_id: search.environment_id.clone(),
             repository_identity: search.repository_identity.clone(),
             search_identity: search.search_identity.clone(),
+            scope_state_identity: search.scope_state_identity.clone()?,
             execution_context: self
                 .execution_context
                 .iter()
-                .filter(|(label, _)| !(has_workspace_identity && *label == "repository_epoch"))
+                .filter(|(label, _)| {
+                    !matches!(label.as_str(), "repository_epoch" | "workspace_identity")
+                })
                 .map(|(label, fingerprint)| (label.clone(), fingerprint.clone()))
                 .collect(),
-        }
+        })
     }
 
     pub(crate) fn fingerprint(&self) -> String {
@@ -346,8 +346,6 @@ pub(crate) struct RunningCommand {
     pub(crate) key: CommandAttemptKey,
     pub(crate) artifact: RawOutputArtifact,
     completed_exit_code: Option<i32>,
-    validation_launch: Option<ValidationLaunchPlan>,
-    started_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -371,7 +369,6 @@ struct CommandExecutionPersistence {
 struct CommandExecutionCacheDocument {
     schema_version: u32,
     workspace_identity: crate::git_workspace::WorkspaceEvidenceIdentity,
-    repository_epoch: u64,
     search_misses: Vec<SearchMissCacheKey>,
 }
 
@@ -431,19 +428,18 @@ struct CommandExecutionState {
     search: CommandSearchState,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct CompletedValidation {
-    pub(crate) result: ValidationResult,
-    pub(crate) bound_plan_step: Option<(String, u64)>,
-    pub(crate) bound_work_unit: Option<(String, u64)>,
-    pub(crate) focused_validation_token:
-        Option<crate::agent::task_coordinator::FocusedValidationToken>,
-}
-
 pub(crate) struct CommandExecutionLedger {
     state: Mutex<CommandExecutionState>,
     workspace_identity_refresh: tokio::sync::Semaphore,
     persistence: Option<CommandExecutionPersistence>,
+    #[cfg(test)]
+    cache_persist_test_gate: std::sync::Mutex<Option<CachePersistTestGate>>,
+}
+
+#[cfg(test)]
+struct CachePersistTestGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl Default for CommandExecutionLedger {
@@ -452,6 +448,8 @@ impl Default for CommandExecutionLedger {
             state: Mutex::new(CommandExecutionState::default()),
             workspace_identity_refresh: tokio::sync::Semaphore::new(/*permits*/ 1),
             persistence: None,
+            #[cfg(test)]
+            cache_persist_test_gate: std::sync::Mutex::new(None),
         }
     }
 }
@@ -472,6 +470,8 @@ impl CommandExecutionLedger {
             state: Mutex::new(CommandExecutionState::default()),
             workspace_identity_refresh: tokio::sync::Semaphore::new(/*permits*/ 1),
             persistence: Some(persistence),
+            #[cfg(test)]
+            cache_persist_test_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -624,7 +624,9 @@ impl CommandExecutionLedger {
                 .observed_workspace_identity
                 .as_ref()
                 .is_some_and(|(epoch, _)| *epoch == repository_epoch)
-                || state.repository.workspace_identity_observation_epoch == Some(repository_epoch)
+                || (observed_workspace_identity.is_none()
+                    && state.repository.workspace_identity_observation_epoch
+                        == Some(repository_epoch))
             {
                 return repository_epoch;
             }
@@ -644,24 +646,15 @@ impl CommandExecutionLedger {
                     .as_ref()
                     .is_none_or(|root| identity.repository_root.as_ref() == Some(root))
         });
-        let workspace_identity = match observed_workspace_identity {
-            Some(workspace_identity) => workspace_identity,
-            None => {
-                let Some(persistence) = self.persistence.as_ref() else {
-                    self.finish_workspace_identity_observation_without_identity(repository_epoch)
-                        .await;
-                    return repository_epoch;
-                };
-                let Some(workspace_identity) =
+        let observed_workspace_identity = match observed_workspace_identity {
+            Some(identity) => Some(identity),
+            None => match self.persistence.as_ref() {
+                Some(persistence) => {
                     crate::git_workspace::capture_workspace_evidence_identity(&persistence.cwd)
                         .await
-                else {
-                    self.finish_workspace_identity_observation_without_identity(repository_epoch)
-                        .await;
-                    return repository_epoch;
-                };
-                workspace_identity
-            }
+                }
+                None => None,
+            },
         };
         let cached_document = if repository_epoch == 0 {
             match self.persistence.as_ref() {
@@ -673,27 +666,29 @@ impl CommandExecutionLedger {
                     })
                     .filter(|document| {
                         document.schema_version == COMMAND_EXECUTION_CACHE_SCHEMA_VERSION
-                            && document.workspace_identity == workspace_identity
                     }),
                 None => None,
             }
         } else {
             None
         };
-        let workspace_identity_hash = workspace_identity_hash(&workspace_identity);
+        let workspace_identity_hash = observed_workspace_identity
+            .as_ref()
+            .map(workspace_identity_hash);
+        let cached_document = cached_document.filter(|document| {
+            observed_workspace_identity.as_ref() == Some(&document.workspace_identity)
+        });
         let mut state = self.state.lock().await;
-        if state.repository.epoch == repository_epoch
-            && state.repository.observed_workspace_identity.is_none()
-        {
-            let observed_epoch = cached_document
-                .as_ref()
-                .map_or(repository_epoch, |document| document.repository_epoch);
-            state.repository.epoch = observed_epoch;
-            state.repository.workspace_identity_observation_epoch = Some(observed_epoch);
-            state.repository.observed_workspace_identity =
-                Some((observed_epoch, workspace_identity));
-            state.repository.observed_workspace_identity_hash =
-                Some((observed_epoch, workspace_identity_hash));
+        if state.repository.epoch == repository_epoch {
+            state.repository.workspace_identity_observation_epoch = Some(repository_epoch);
+            if let (Some(workspace_identity), Some(workspace_identity_hash)) =
+                (observed_workspace_identity, workspace_identity_hash)
+            {
+                state.repository.observed_workspace_identity =
+                    Some((repository_epoch, workspace_identity));
+                state.repository.observed_workspace_identity_hash =
+                    Some((repository_epoch, workspace_identity_hash));
+            }
             if let Some(document) = cached_document {
                 for search_miss in document
                     .search_misses
@@ -707,15 +702,6 @@ impl CommandExecutionLedger {
             }
         }
         state.repository.epoch
-    }
-
-    async fn finish_workspace_identity_observation_without_identity(&self, repository_epoch: u64) {
-        let mut state = self.state.lock().await;
-        if state.repository.epoch == repository_epoch
-            && state.repository.observed_workspace_identity.is_none()
-        {
-            state.repository.workspace_identity_observation_epoch = Some(repository_epoch);
-        }
     }
 
     pub(crate) async fn current_workspace_identity_hash(
@@ -818,31 +804,6 @@ impl CommandExecutionLedger {
             process_id,
             key,
             artifact,
-            None,
-            Instant::now(),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub(crate) async fn track_running_process_with_validation_contract(
-        &self,
-        process_id: u32,
-        key: CommandAttemptKey,
-        artifact: RawOutputArtifact,
-        validation_launch: Option<ValidationLaunchPlan>,
-        started_at: Instant,
-    ) -> Result<(), String> {
-        let execution_id = self.allocate_execution_id();
-        self.track_running_process_with_execution_id(
-            execution_id,
-            ToolExecutionId::default(),
-            process_id,
-            key,
-            artifact,
-            validation_launch,
-            started_at,
         )
         .await
     }
@@ -855,8 +816,6 @@ impl CommandExecutionLedger {
         process_id: u32,
         key: CommandAttemptKey,
         artifact: RawOutputArtifact,
-        validation_launch: Option<ValidationLaunchPlan>,
-        started_at: Instant,
     ) -> Result<(), String> {
         let mut state = self.state.lock().await;
         debug_assert_command_execution_invariants(&state);
@@ -874,8 +833,6 @@ impl CommandExecutionLedger {
                 key,
                 artifact,
                 completed_exit_code: None,
-                validation_launch,
-                started_at,
             },
         );
         debug_assert_command_execution_invariants(&state);
@@ -923,6 +880,11 @@ impl CommandExecutionLedger {
     }
 
     pub(crate) async fn finish_turn(&self, turn_id: &str) {
+        self.finish_turn_before_terminal(turn_id).await;
+        self.persist_cache_after_terminal().await;
+    }
+
+    pub(crate) async fn finish_turn_before_terminal(&self, turn_id: &str) {
         self.forget_turn_repository_revision(turn_id).await;
         self.state
             .lock()
@@ -930,32 +892,70 @@ impl CommandExecutionLedger {
             .repository
             .typed_mutation_baselines
             .retain(|_, pending| pending.turn_id != turn_id);
+    }
+
+    pub(crate) async fn persist_cache_after_terminal(&self) {
         self.persist_cache().await;
     }
 
+    #[cfg(test)]
+    pub(crate) fn block_next_cache_persist_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let previous = self
+            .cache_persist_test_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(CachePersistTestGate {
+                entered: entered_tx,
+                release: release_rx,
+            });
+        assert!(
+            previous.is_none(),
+            "cache persistence test gate already installed"
+        );
+        (entered_rx, release_tx)
+    }
+
     async fn persist_cache(&self) {
+        #[cfg(test)]
+        let test_gate = self
+            .cache_persist_test_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some(gate) = test_gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
+        }
         let Some(persistence) = self.persistence.clone() else {
             return;
         };
-        let (repository_epoch, observed_workspace_identity, search_misses) = {
+        let Some((workspace_identity, search_misses)) = ({
             let state = self.state.lock().await;
-            (
-                state.repository.epoch,
-                state.repository.observed_workspace_identity.clone(),
-                state.search.miss_order.iter().cloned().collect::<Vec<_>>(),
-            )
-        };
-        let Some((observed_epoch, observed_workspace_identity)) = observed_workspace_identity
-        else {
+            state
+                .repository
+                .observed_workspace_identity
+                .as_ref()
+                .filter(|(epoch, _)| *epoch == state.repository.epoch)
+                .map(|(_, workspace_identity)| {
+                    (
+                        workspace_identity.clone(),
+                        state.search.miss_order.iter().cloned().collect::<Vec<_>>(),
+                    )
+                })
+        }) else {
             return;
         };
-        if observed_epoch != repository_epoch {
-            return;
-        }
         let document = CommandExecutionCacheDocument {
             schema_version: COMMAND_EXECUTION_CACHE_SCHEMA_VERSION,
-            workspace_identity: observed_workspace_identity,
-            repository_epoch,
+            workspace_identity,
             search_misses,
         };
         let Ok(bytes) = serde_json::to_vec_pretty(&document) else {
@@ -1152,238 +1152,6 @@ impl CommandExecutionLedger {
         {}
         debug_assert_command_execution_invariants(&state);
         CompletionApplyResult::Applied
-    }
-
-    pub(crate) async fn complete_running_validation(
-        &self,
-        process_id: u32,
-        timed_out: bool,
-    ) -> Option<CompletedValidation> {
-        let (launch, artifact, started_at, exit_code) = {
-            let mut state = self.state.lock().await;
-            let running = if let Some(running) = state.process.running.get_mut(&process_id) {
-                running
-            } else {
-                &mut state
-                    .process
-                    .pending_by_execution_id
-                    .values_mut()
-                    .find(|pending| pending.process_id == process_id)?
-                    .command
-            };
-            let exit_code = running.completed_exit_code?;
-            let launch = running.validation_launch.take()?;
-            (
-                launch,
-                running.artifact.clone(),
-                running.started_at,
-                exit_code,
-            )
-        };
-        self.complete_validation_from_launch(
-            &launch,
-            Some(artifact),
-            started_at,
-            Some(exit_code),
-            timed_out,
-            Some(process_id.to_string()),
-        )
-        .await
-    }
-
-    pub(crate) async fn complete_timed_out_running_validation(
-        &self,
-        process_id: u32,
-    ) -> Option<CompletedValidation> {
-        let (launch, artifact, started_at) = {
-            let mut state = self.state.lock().await;
-            let running = if let Some(running) = state.process.running.get_mut(&process_id) {
-                running
-            } else {
-                &mut state
-                    .process
-                    .pending_by_execution_id
-                    .values_mut()
-                    .find(|pending| pending.process_id == process_id)?
-                    .command
-            };
-            let launch = running.validation_launch.take()?;
-            (launch, running.artifact.clone(), running.started_at)
-        };
-        self.complete_validation_from_launch(
-            &launch,
-            Some(artifact),
-            started_at,
-            /*exit_code*/ None,
-            /*timed_out*/ true,
-            Some(process_id.to_string()),
-        )
-        .await
-    }
-
-    pub(crate) async fn complete_inline_validation(
-        &self,
-        launch: &ValidationLaunchPlan,
-        artifact: Option<RawOutputArtifact>,
-        started_at: Instant,
-        exit_code: Option<i32>,
-        timed_out: bool,
-        process_id: Option<String>,
-    ) -> Option<CompletedValidation> {
-        self.complete_validation_from_launch(
-            launch, artifact, started_at, exit_code, timed_out, process_id,
-        )
-        .await
-    }
-
-    async fn complete_validation_from_launch(
-        &self,
-        launch: &ValidationLaunchPlan,
-        artifact: Option<RawOutputArtifact>,
-        started_at: Instant,
-        exit_code: Option<i32>,
-        timed_out: bool,
-        process_id: Option<String>,
-    ) -> Option<CompletedValidation> {
-        let (Some(route), Some(call_id)) = (
-            launch.structured_route.clone(),
-            launch.validation_call_id.clone(),
-        ) else {
-            return None;
-        };
-        self.complete_validation(
-            route,
-            call_id,
-            launch.bound_plan_step.clone(),
-            launch.bound_work_unit.clone(),
-            artifact,
-            started_at,
-            exit_code,
-            timed_out,
-            process_id,
-            launch.turn_timing_state.clone(),
-            launch.focused_validation_token.clone(),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn complete_validation(
-        &self,
-        route: ValidationRoute,
-        call_id: String,
-        bound_plan_step: Option<(String, u64)>,
-        bound_work_unit: Option<(String, u64)>,
-        artifact: Option<RawOutputArtifact>,
-        started_at: Instant,
-        exit_code: Option<i32>,
-        timed_out: bool,
-        process_id: Option<String>,
-        turn_timing_state: Option<std::sync::Arc<crate::turn_timing::TurnTimingState>>,
-        focused_validation_token: Option<crate::agent::task_coordinator::FocusedValidationToken>,
-    ) -> Option<CompletedValidation> {
-        let [leaf] = route.leaves.as_slice() else {
-            return None;
-        };
-        let (raw_artifact_ref, raw_artifact_sha256, retained_output) = match artifact.as_ref() {
-            Some(artifact) => artifact
-                .validation_integrity_with_output()
-                .await
-                .map_or((None, None, None), |(reference, sha256, output)| {
-                    (Some(reference), Some(sha256), Some(output))
-                }),
-            None => (None, None, None),
-        };
-        let selected_test_evidence = retained_output.as_deref().map_or_else(
-            || {
-                if validation_route_is_test(&route) {
-                    SelectedTestEvidence::Missing
-                } else {
-                    SelectedTestEvidence::NotATest
-                }
-            },
-            |output| selected_test_evidence(&route, output),
-        );
-        let selected_test_count = match selected_test_evidence {
-            SelectedTestEvidence::Exact(count) => Some(count),
-            SelectedTestEvidence::NotATest
-            | SelectedTestEvidence::Missing
-            | SelectedTestEvidence::Ambiguous => None,
-        };
-        let missing_selected_tests = exit_code == Some(0)
-            && !timed_out
-            && validation_route_is_test(&route)
-            && !matches!(selected_test_evidence, SelectedTestEvidence::Exact(1..));
-        let succeeded = exit_code == Some(0) && !timed_out && !missing_selected_tests;
-        let result = ValidationResult {
-            argv: leaf.argv.clone(),
-            covered_paths: leaf.covered_paths.clone(),
-            call_id: call_id.clone(),
-            process_id,
-            status: if succeeded {
-                ValidationTerminalStatus::Succeeded
-            } else {
-                ValidationTerminalStatus::Failed
-            },
-            duration_ms: u64::try_from(
-                Instant::now()
-                    .saturating_duration_since(started_at)
-                    .as_millis(),
-            )
-            .unwrap_or(u64::MAX),
-            summary: Some(if missing_selected_tests {
-                "validation did not prove a nonzero selected-test count".to_string()
-            } else {
-                match (timed_out, exit_code, selected_test_count) {
-                    (true, _, _) => "validation timed out".to_string(),
-                    (false, Some(0), Some(count)) => {
-                        format!("validation succeeded with {count} selected tests")
-                    }
-                    (false, Some(0), None) => "validation succeeded".to_string(),
-                    (false, Some(exit_code), _) => {
-                        format!("validation exited with code {exit_code}")
-                    }
-                    (false, None, _) => {
-                        "validation terminated without an exit code".to_string()
-                    }
-                }
-            }),
-            failure_excerpt: (!succeeded).then(|| {
-                if missing_selected_tests {
-                    "test validation exited successfully without a positive selected-test count; exact output is retained in the immutable artifact"
-                        .to_string()
-                } else {
-                    match (timed_out, exit_code) {
-                        (true, _) => "validation timed out".to_string(),
-                        (false, Some(exit_code)) => {
-                            format!("validation exited with code {exit_code}")
-                        }
-                        (false, None) => {
-                            "validation terminated without an exit code".to_string()
-                        }
-                    }
-                }
-            }),
-            raw_artifact_ref,
-            raw_artifact_sha256,
-        };
-        let duration_ms = result.duration_ms;
-        if let Some(turn_timing_state) = turn_timing_state {
-            turn_timing_state.record_executed_validation(duration_ms);
-        }
-        tracing::info!(
-            disposition = "executed",
-            validation_call_id = %call_id,
-            duration_ms,
-            succeeded,
-            "validation process completed"
-        );
-        Some(CompletedValidation {
-            result,
-            bound_plan_step,
-            bound_work_unit,
-            focused_validation_token,
-        })
     }
 
     #[cfg(test)]
@@ -1584,9 +1352,6 @@ fn record_running_exit_locked(
     running: &RunningCommand,
     exit_code: i32,
 ) {
-    if running.validation_launch.is_some() {
-        return;
-    }
     record_search_result_locked(state, &running.key, exit_code);
     record_exit_locked(state, &running.key, exit_code);
 }
@@ -1604,7 +1369,9 @@ fn record_search_result_locked(
     {
         state.search.allowed_expansions.insert(parent_scope);
     }
-    let search_miss_key = key.search_miss_cache_key_for(search);
+    let Some(search_miss_key) = key.search_miss_cache_key_for(search) else {
+        return;
+    };
     if exit_code == 1 && state.search.misses.insert(search_miss_key.clone()) {
         state.search.miss_order.push_back(search_miss_key);
         while state.search.misses.len() > MAX_TRACKED_COMMANDS {
@@ -1676,173 +1443,6 @@ fn command_attempt_is_active(state: &CommandExecutionState, key: &CommandAttempt
         .any(|running| running.key == *key)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValidationTestRunner {
-    Cargo,
-    Nextest,
-    Wrapped,
-    Unverified,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectedTestEvidence {
-    NotATest,
-    Exact(u64),
-    Missing,
-    Ambiguous,
-}
-
-fn validation_test_runner(route: &ValidationRoute) -> Option<ValidationTestRunner> {
-    let leaf = route.leaves.as_slice().first()?;
-    let [program, arguments @ ..] = leaf.argv.as_slice() else {
-        return None;
-    };
-    let program = normalized_executable_name(program);
-    match (program.as_str(), arguments) {
-        ("cargo", [subcommand, ..]) if subcommand == "test" => Some(ValidationTestRunner::Cargo),
-        ("cargo", [plugin, subcommand, ..]) if plugin == "nextest" && subcommand == "run" => {
-            Some(ValidationTestRunner::Nextest)
-        }
-        ("cargo-nextest", [subcommand, ..]) if subcommand == "run" => {
-            Some(ValidationTestRunner::Nextest)
-        }
-        ("just", [recipe, ..])
-            if matches!(
-                recipe.as_str(),
-                "test-fast" | "test-lane" | "test-lane-fast" | "test-lane-package"
-            ) =>
-        {
-            Some(ValidationTestRunner::Wrapped)
-        }
-        _ if leaf.argv.iter().any(|argument| test_intent_token(argument)) => {
-            Some(ValidationTestRunner::Unverified)
-        }
-        _ => None,
-    }
-}
-
-fn validation_route_is_test(route: &ValidationRoute) -> bool {
-    validation_test_runner(route).is_some()
-}
-
-fn normalized_executable_name(program: &str) -> String {
-    let file_name = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    let normalized = file_name.to_ascii_lowercase();
-    normalized
-        .strip_suffix(".exe")
-        .unwrap_or(&normalized)
-        .to_string()
-}
-
-fn test_intent_token(argument: &str) -> bool {
-    let normalized = normalized_executable_name(argument);
-    matches!(
-        normalized.as_str(),
-        "test" | "tests" | "pytest" | "unittest" | "nextest"
-    ) || normalized.starts_with("test-")
-        || normalized.ends_with("-test")
-        || normalized.contains("-test-")
-        || normalized.starts_with("--test")
-}
-
-fn selected_test_evidence(route: &ValidationRoute, output: &[u8]) -> SelectedTestEvidence {
-    let Some(runner) = validation_test_runner(route) else {
-        return SelectedTestEvidence::NotATest;
-    };
-    let cargo = cargo_selected_test_count(output);
-    let nextest = nextest_selected_test_count(output);
-    match runner {
-        ValidationTestRunner::Cargo => {
-            cargo.map_or(SelectedTestEvidence::Missing, SelectedTestEvidence::Exact)
-        }
-        ValidationTestRunner::Nextest => {
-            nextest.map_or(SelectedTestEvidence::Missing, SelectedTestEvidence::Exact)
-        }
-        ValidationTestRunner::Wrapped => match (cargo, nextest) {
-            (Some(count), None) | (None, Some(count)) => SelectedTestEvidence::Exact(count),
-            (Some(_), Some(_)) => SelectedTestEvidence::Ambiguous,
-            (None, None) => SelectedTestEvidence::Missing,
-        },
-        ValidationTestRunner::Unverified => SelectedTestEvidence::Missing,
-    }
-}
-
-fn cargo_selected_test_count(output: &[u8]) -> Option<u64> {
-    let output = String::from_utf8_lossy(output);
-    let running = output
-        .lines()
-        .filter_map(parse_cargo_running_line)
-        .collect::<Vec<_>>();
-    let results = output
-        .lines()
-        .filter_map(parse_cargo_result_line)
-        .collect::<Vec<_>>();
-    (!running.is_empty()
-        && running.len() == results.len()
-        && running
-            .iter()
-            .zip(&results)
-            .all(|(left, right)| left == right))
-    .then(|| running.into_iter().sum())
-}
-
-fn parse_cargo_running_line(line: &str) -> Option<u64> {
-    let words = line.split_whitespace().collect::<Vec<_>>();
-    match words.as_slice() {
-        ["running", count, "test" | "tests"] => count.parse().ok(),
-        _ => None,
-    }
-}
-
-fn parse_cargo_result_line(line: &str) -> Option<u64> {
-    let summary = line.trim().strip_prefix("test result: ")?;
-    let (status, fields) = summary.split_once(". ")?;
-    if !matches!(status, "ok" | "FAILED") {
-        return None;
-    }
-    let mut passed = None;
-    let mut failed = None;
-    let mut ignored = 0;
-    let mut measured = 0;
-    for field in fields.split(';') {
-        let mut words = field.split_whitespace();
-        let Some(count) = words.next().and_then(|count| count.parse::<u64>().ok()) else {
-            continue;
-        };
-        match words.next()? {
-            "passed" => passed = Some(count),
-            "failed" => failed = Some(count),
-            "ignored" => ignored = count,
-            "measured" => measured = count,
-            _ => {}
-        }
-    }
-    Some(passed? + failed? + ignored + measured)
-}
-
-fn nextest_selected_test_count(output: &[u8]) -> Option<u64> {
-    let output = String::from_utf8_lossy(output);
-    let summaries = output
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if !line.starts_with("Summary [") {
-                return None;
-            }
-            let words = line.split_whitespace().collect::<Vec<_>>();
-            words.windows(3).find_map(|window| {
-                (matches!(window[1], "test" | "tests") && window[2] == "run:")
-                    .then(|| window[0].parse::<u64>().ok())
-                    .flatten()
-            })
-        })
-        .collect::<Vec<_>>();
-    match summaries.as_slice() {
-        [count] => Some(*count),
-        _ => None,
-    }
-}
-
 async fn write_cache_document(cache_path: PathBuf, bytes: Vec<u8>) -> io::Result<()> {
     let _commit =
         tokio::task::spawn_blocking(move || write_cache_document_blocking(&cache_path, &bytes))
@@ -1870,6 +1470,7 @@ fn write_cache_document_blocking(
     Ok(DurableCacheCommit)
 }
 
+#[cfg(windows)]
 fn sync_cache_parent(parent: &Path) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -1879,6 +1480,11 @@ fn sync_cache_parent(parent: &Path) -> io::Result<()> {
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(parent)?
         .sync_all()
+}
+
+#[cfg(not(windows))]
+fn sync_cache_parent(parent: &Path) -> io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
 }
 
 #[cfg(test)]
@@ -1912,161 +1518,6 @@ mod tests {
         assert!(status.success(), "git init failed");
     }
 
-    fn validation_launch() -> ValidationLaunchPlan {
-        ValidationLaunchPlan {
-            classification: crate::validation_admission::classify_validation(
-                &crate::tools::handlers::command_shape::CommandInvocation::Argv {
-                    program: "cargo".to_string(),
-                    args: vec!["test".to_string()],
-                },
-            ),
-            authorization_revision: 1,
-            explicitly_tagged: false,
-            structured_route: None,
-            bound_plan_step: None,
-            bound_work_unit: None,
-            validation_call_id: None,
-            turn_timing_state: None,
-            focused_validation_token: None,
-        }
-    }
-
-    fn receipt_validation_launch(call_id: &str) -> ValidationLaunchPlan {
-        ValidationLaunchPlan {
-            structured_route: Some(focused_cargo_route()),
-            bound_plan_step: Some(("implementation-step".to_string(), 7)),
-            validation_call_id: Some(call_id.to_string()),
-            ..validation_launch()
-        }
-    }
-
-    fn focused_cargo_route() -> ValidationRoute {
-        ValidationRoute {
-            leaves: vec![codex_protocol::plan_tool::ValidationRouteLeaf {
-                argv: vec![
-                    "cargo".to_string(),
-                    "test".to_string(),
-                    "-p".to_string(),
-                    "codex-core".to_string(),
-                    "focused_case".to_string(),
-                ],
-                covered_paths: vec!["core/src/tools/command_execution.rs".to_string()],
-                timeout_ms: 30_000,
-            }],
-            ordering: Default::default(),
-        }
-    }
-    #[tokio::test]
-    async fn zero_test_validation_fails_without_losing_launch_binding() {
-        let temp = tempfile::tempdir().expect("artifact directory");
-        let ledger = CommandExecutionLedger::default();
-        let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
-            temp.path(),
-            "bound-plan-step-test",
-            b"running 0 tests\ntest result: ok. 0 passed; 0 failed\n",
-        )
-        .await;
-
-        let completed = ledger
-            .complete_validation(
-                focused_cargo_route(),
-                "bound-plan-step-call".to_string(),
-                Some(("implementation-step".to_string(), 7)),
-                None,
-                Some(artifact),
-                Instant::now(),
-                Some(0),
-                false,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("completed validation result");
-        assert_eq!(completed.result.status, ValidationTerminalStatus::Failed);
-        assert_eq!(
-            completed.result.summary.as_deref(),
-            Some("validation did not prove a nonzero selected-test count")
-        );
-        assert_eq!(
-            completed.result.failure_excerpt.as_deref(),
-            Some(
-                "test validation exited successfully without a positive selected-test count; exact output is retained in the immutable artifact"
-            )
-        );
-        assert_eq!(
-            completed.bound_plan_step,
-            Some(("implementation-step".to_string(), 7))
-        );
-        assert_eq!(completed.bound_work_unit, None);
-    }
-
-    #[tokio::test]
-    async fn validation_result_uses_exit_status_without_parsing_output() {
-        let temp = tempfile::tempdir().expect("artifact directory");
-        let ledger = CommandExecutionLedger::default();
-        let misleading_artifact =
-            crate::tools::command_output_artifact::create_raw_output_artifact(
-                temp.path(),
-                "exit-status-oracle-test",
-                b"running 1 test\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured\n",
-            )
-            .await;
-
-        let succeeded = ledger
-            .complete_validation(
-                focused_cargo_route(),
-                "exit-zero-call".to_string(),
-                None,
-                None,
-                Some(misleading_artifact),
-                Instant::now(),
-                Some(0),
-                false,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("exit-zero result");
-        let failed = ledger
-            .complete_validation(
-                focused_cargo_route(),
-                "nonzero-call".to_string(),
-                None,
-                None,
-                None,
-                Instant::now(),
-                Some(7),
-                false,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("nonzero result");
-        let timed_out = ledger
-            .complete_validation(
-                focused_cargo_route(),
-                "timeout-call".to_string(),
-                None,
-                None,
-                None,
-                Instant::now(),
-                Some(0),
-                true,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("timeout result");
-
-        assert_eq!(succeeded.result.status, ValidationTerminalStatus::Succeeded);
-        assert_eq!(failed.result.status, ValidationTerminalStatus::Failed);
-        assert_eq!(timed_out.result.status, ValidationTerminalStatus::Failed);
-    }
-
     #[tokio::test]
     async fn token_efficiency_broad_rg_is_admitted_with_or_without_narrow_miss() {
         let ledger = CommandExecutionLedger::default();
@@ -2079,6 +1530,8 @@ mod tests {
                 search_identity: "needle:src".to_string(),
                 scope_identity: "src".to_string(),
                 parent_scope_identity: Some("repo".to_string()),
+                scope_state_identity: Some("scope-state".to_string()),
+                state_paths: Vec::new(),
                 can_record_miss: true,
             }),
         );
@@ -2091,6 +1544,8 @@ mod tests {
                 search_identity: "needle:repo".to_string(),
                 scope_identity: "repo".to_string(),
                 parent_scope_identity: None,
+                scope_state_identity: Some("scope-state".to_string()),
+                state_paths: Vec::new(),
                 can_record_miss: true,
             }),
         );
@@ -2128,6 +1583,8 @@ mod tests {
                 search_identity: "other:src".to_string(),
                 scope_identity: "src".to_string(),
                 parent_scope_identity: Some("repo".to_string()),
+                scope_state_identity: Some("scope-state".to_string()),
+                state_paths: Vec::new(),
                 can_record_miss: true,
             }),
         );
@@ -2140,6 +1597,8 @@ mod tests {
                 search_identity: "needle:repo".to_string(),
                 scope_identity: "repo".to_string(),
                 parent_scope_identity: None,
+                scope_state_identity: Some("scope-state".to_string()),
+                state_paths: Vec::new(),
                 can_record_miss: true,
             }),
         );
@@ -2164,6 +1623,8 @@ mod tests {
                 search_identity: "needle:src".to_string(),
                 scope_identity: "src".to_string(),
                 parent_scope_identity: Some("repo".to_string()),
+                scope_state_identity: Some("scope-state".to_string()),
+                state_paths: Vec::new(),
                 can_record_miss: false,
             }),
         );
@@ -2185,6 +1646,8 @@ mod tests {
             search_identity: search_identity.to_string(),
             scope_identity: search_identity.to_string(),
             parent_scope_identity: Some("repo".to_string()),
+            scope_state_identity: Some("scope-state".to_string()),
+            state_paths: Vec::new(),
             can_record_miss: true,
         };
         let first = key("rg needle src")
@@ -2245,11 +1708,18 @@ mod tests {
                 &key("rg needle src")
                     .with_repository_epoch(3)
                     .with_workspace_identity(Some("workspace-b"))
-                    .with_search_narrowing("turn-b", "repo-a", Some(search("needle:src"))),
+                    .with_search_narrowing(
+                        "turn-b",
+                        "repo-a",
+                        Some(RgSearchNarrowing {
+                            scope_state_identity: Some("scope-state-b".to_string()),
+                            ..search("needle:src")
+                        }),
+                    ),
                 false,
             )
             .await
-            .expect("changed exact workspace identity executes");
+            .expect("changed search scope state executes");
     }
 
     #[tokio::test]
@@ -2261,6 +1731,8 @@ mod tests {
             search_identity: "needle:src".to_string(),
             scope_identity: "repo/src".to_string(),
             parent_scope_identity: Some("repo".to_string()),
+            scope_state_identity: Some("scope-state".to_string()),
+            state_paths: Vec::new(),
             can_record_miss: true,
         };
         let first = key("rg needle src")
@@ -2306,8 +1778,6 @@ mod tests {
                 42,
                 key("first"),
                 RawOutputArtifact::unavailable("first"),
-                None,
-                Instant::now(),
             )
             .await
             .expect("track first running process");
@@ -2339,8 +1809,6 @@ mod tests {
                 42,
                 key("second"),
                 RawOutputArtifact::unavailable("second"),
-                None,
-                Instant::now(),
             )
             .await
             .expect("track second running process");
@@ -2390,8 +1858,6 @@ mod tests {
                 42,
                 first_key.clone(),
                 RawOutputArtifact::unavailable("first"),
-                None,
-                Instant::now(),
             )
             .await
             .expect("track first running process");
@@ -2404,8 +1870,6 @@ mod tests {
                 42,
                 key("second"),
                 RawOutputArtifact::unavailable("second"),
-                None,
-                Instant::now(),
             )
             .await
             .expect_err("a live process id must not be reassigned");
@@ -2432,8 +1896,6 @@ mod tests {
                 73,
                 key("sticky-exit"),
                 RawOutputArtifact::unavailable("sticky exit"),
-                None,
-                Instant::now(),
             )
             .await
             .expect("track running process");
@@ -2648,145 +2110,6 @@ mod tests {
         assert_eq!(ledger.consecutive_failures(&live_key).await, 0);
     }
 
-    #[tokio::test]
-    async fn tracked_validation_watcher_completion_records_once_without_retry_state() {
-        let ledger = CommandExecutionLedger::default();
-        let command_key = key("cargo test --test focused");
-        let finalized_artifact = RawOutputArtifact::unavailable("finalized watcher artifact");
-        ledger
-            .begin_attempt(&command_key, false)
-            .await
-            .expect("attempt");
-        ledger
-            .track_running_process_with_validation_contract(
-                42,
-                command_key.clone(),
-                RawOutputArtifact::unavailable("initial watcher artifact"),
-                Some(receipt_validation_launch("watcher-validation-call")),
-                Instant::now() - Duration::from_millis(25),
-            )
-            .await
-            .expect("track validation process");
-
-        assert!(
-            ledger
-                .mark_running_process_completed(42, 7)
-                .await
-                .accepted()
-        );
-        assert!(
-            ledger
-                .mark_running_process_completed(42, 7)
-                .await
-                .accepted()
-        );
-        ledger
-            .update_running_artifact(42, finalized_artifact.clone())
-            .await;
-        let completed = ledger
-            .complete_running_validation(42, false)
-            .await
-            .expect("watcher validation result");
-        assert_eq!(completed.result.call_id, "watcher-validation-call");
-        assert_eq!(completed.result.process_id.as_deref(), Some("42"));
-        assert_eq!(completed.result.status, ValidationTerminalStatus::Failed);
-        assert!(
-            ledger
-                .complete_running_validation(42, false)
-                .await
-                .is_none()
-        );
-        assert!(ledger.finish_running_process(42, Some(7)).await.accepted());
-
-        let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
-        assert_eq!(snapshot.consecutive_failures, 0);
-        assert_eq!(snapshot.last_exit_code, None);
-        assert_eq!(snapshot.deterministic_failure, None);
-        ledger
-            .begin_attempt(&command_key, false)
-            .await
-            .expect("validation results do not enter the generic retry cache");
-    }
-
-    #[tokio::test]
-    async fn tracked_validation_handler_completion_does_not_enter_retry_state() {
-        let ledger = CommandExecutionLedger::default();
-        let command_key = key("cargo test --test direct");
-        let finalized_artifact = RawOutputArtifact::unavailable("finalized handler artifact");
-        ledger
-            .begin_attempt(&command_key, false)
-            .await
-            .expect("attempt");
-        ledger
-            .track_running_process_with_validation_contract(
-                43,
-                command_key.clone(),
-                RawOutputArtifact::unavailable("initial handler artifact"),
-                Some(validation_launch()),
-                Instant::now() - Duration::from_millis(25),
-            )
-            .await
-            .expect("track validation process");
-        ledger
-            .update_running_artifact(43, finalized_artifact.clone())
-            .await;
-
-        assert!(ledger.finish_running_process(43, Some(9)).await.accepted());
-        assert!(!ledger.finish_running_process(43, Some(9)).await.accepted());
-
-        let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
-        assert_eq!(snapshot.consecutive_failures, 0);
-        assert_eq!(snapshot.last_exit_code, None);
-        assert_eq!(snapshot.deterministic_failure, None);
-        ledger
-            .begin_attempt(&command_key, false)
-            .await
-            .expect("handler-completed validation does not enter the generic retry cache");
-    }
-
-    #[tokio::test]
-    async fn tracked_validation_success_clears_prior_deterministic_failure() {
-        let ledger = CommandExecutionLedger::default();
-        let command_key = key("cargo test --test recovered");
-        ledger
-            .record_input_state_determined_failure(
-                &command_key,
-                InputStateDetermined::ApplyPatchEnvironmentIdMismatch,
-                RawOutputArtifact::unavailable(
-                    InputStateDetermined::ApplyPatchEnvironmentIdMismatch.evidence_description(),
-                ),
-                -1,
-            )
-            .await;
-        ledger
-            .track_running_process_with_validation_contract(
-                44,
-                command_key.clone(),
-                RawOutputArtifact::unavailable("successful validation artifact"),
-                Some(validation_launch()),
-                Instant::now(),
-            )
-            .await
-            .expect("track validation process");
-
-        assert!(
-            ledger
-                .mark_running_process_completed(44, 0)
-                .await
-                .accepted()
-        );
-        assert!(ledger.finish_running_process(44, Some(0)).await.accepted());
-
-        let snapshot = ledger.snapshot(&command_key).await.expect("tracked entry");
-        assert_eq!(snapshot.consecutive_failures, 0);
-        assert_eq!(snapshot.last_exit_code, Some(0));
-        assert_eq!(snapshot.deterministic_failure, None);
-        ledger
-            .begin_attempt(&command_key, false)
-            .await
-            .expect("successful tracked validation permits another attempt");
-    }
-
     #[test]
     fn persisted_command_fingerprint_is_versioned_and_stable() {
         assert_eq!(
@@ -2859,6 +2182,8 @@ mod tests {
             search_identity: "needle:src".to_string(),
             scope_identity: "src".to_string(),
             parent_scope_identity: Some("repo".to_string()),
+            scope_state_identity: Some("scope-state".to_string()),
+            state_paths: Vec::new(),
             can_record_miss: true,
         };
         let base = CommandAttemptKey::new(
@@ -3064,6 +2389,8 @@ mod tests {
                     search_identity: "needle:src".to_string(),
                     scope_identity: "src".to_string(),
                     parent_scope_identity: Some("repository".to_string()),
+                    scope_state_identity: Some("scope-state".to_string()),
+                    state_paths: Vec::new(),
                     can_record_miss: true,
                 }),
             )

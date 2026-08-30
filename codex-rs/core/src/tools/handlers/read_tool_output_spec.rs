@@ -9,6 +9,9 @@ use crate::tools::command_output_artifact::ARTIFACT_SEARCH_MAX_QUERY_BYTES;
 use crate::tools::command_output_artifact::ARTIFACT_SEARCH_MAX_RESULTS;
 
 pub(crate) const READ_TOOL_OUTPUT_TOOL_NAME: &str = "read_tool_output";
+pub(crate) const READ_TOOL_OUTPUT_MAX_BYTES: usize = 16_384;
+pub(crate) const READ_TOOL_OUTPUT_MAX_SELECTORS: usize = 64;
+pub(crate) const READ_TOOL_OUTPUT_MAX_LEGACY_RANGES: usize = 16;
 
 pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
     let selector_schema = JsonSchema::one_of(
@@ -107,11 +110,18 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
     let artifact_id = JsonSchema::string(Some(
         "Opaque UUID from the original tool projection.".to_string(),
     ));
-    let max_bytes = JsonSchema::integer(Some(
+    let max_bytes = bounded_integer(
+        1,
+        READ_TOOL_OUTPUT_MAX_BYTES as u64,
         "Legacy compatibility field; validated but never used to clip a selected value."
             .to_string(),
-    ));
-    let selectors = JsonSchema::array(selector_schema, Some("Preferred selector list; exact duplicates and overlapping or adjacent same-kind ranges are normalized into stable canonical source order.".to_string()));
+    );
+    let selectors = bounded_array(
+        selector_schema,
+        1,
+        READ_TOOL_OUTPUT_MAX_SELECTORS as u64,
+        "Preferred selector list; exact duplicates and overlapping or adjacent same-kind ranges are normalized into stable canonical source order.".to_string(),
+    );
     let legacy_start_line = bounded_integer(
         1,
         usize::MAX as u64,
@@ -122,7 +132,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
         usize::MAX as u64,
         "Legacy inclusive last line.".to_string(),
     );
-    let legacy_ranges = JsonSchema::array(
+    let legacy_ranges = bounded_array(
         JsonSchema::object(
             BTreeMap::from([
                 (
@@ -137,7 +147,9 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
             Some(vec!["start_line".to_string(), "end_line".to_string()]),
             Some(false.into()),
         ),
-        Some("Up to 16 legacy line ranges normalized into selectors.".to_string()),
+        1,
+        READ_TOOL_OUTPUT_MAX_LEGACY_RANGES as u64,
+        "Up to 16 legacy line ranges normalized into selectors.".to_string(),
     );
     let input_variant = |variant_properties: Vec<(String, JsonSchema)>, required: Vec<&str>| {
         let mut properties = BTreeMap::from([
@@ -154,7 +166,7 @@ pub(crate) fn create_read_tool_output_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_TOOL_OUTPUT_TOOL_NAME.to_string(),
-        description: "Search or select from one validated immutable tool-output snapshot without rerunning its producer. Exact selectors are deduplicated; overlapping or adjacent byte and line ranges are coalesced; results use stable canonical source order. A search selector returns its merged exact contexts in hydrated_ranges in the same call; child_selectors remain exact recovery receipts and continuation advances only when another bounded page exists. Batch independent line, byte, section, and JSON-pointer selectors instead of rereading tiny fragments. Exact values are never clipped: deterministic byte subdivisions are consumed internally only when the complete transaction fits its final budget; otherwise selector_too_large or aggregate_omitted returns exact canonical ranges and deterministic child selectors. complete is true only when every normalized selector is present. After an overflow status, retry only the returned continuation or child_selectors and never broaden or repeat the parent selector. Recovery reopens and validates the retained artifact, never recursively spills, and never creates a child artifact."
+        description: "Search or select one validated immutable tool-output snapshot without rerunning it. Batch independent selectors instead of rereading tiny fragments. Searches return exact hydrated_ranges in the same call. Values are never clipped; overflow returns exact ranges and deterministic child_selectors. complete means every selector is present. After overflow, retry only the returned continuation or child_selectors. Recovery reopens and validates the retained artifact without recursive spills or child artifacts."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -204,6 +216,14 @@ fn bounded_integer(minimum: u64, maximum: u64, description: String) -> JsonSchem
         minimum: Some(Number::from(minimum)),
         maximum: Some(Number::from(maximum)),
         ..JsonSchema::integer(Some(description))
+    }
+}
+
+fn bounded_array(items: JsonSchema, minimum: u64, maximum: u64, description: String) -> JsonSchema {
+    JsonSchema {
+        min_items: Some(minimum),
+        max_items: Some(maximum),
+        ..JsonSchema::array(items, Some(description))
     }
 }
 

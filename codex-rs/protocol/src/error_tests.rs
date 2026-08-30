@@ -110,6 +110,46 @@ fn server_overloaded_maps_to_protocol() {
 }
 
 #[test]
+fn unexpected_status_retryability_is_status_specific() {
+    for status in [
+        StatusCode::BAD_REQUEST,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+        StatusCode::METHOD_NOT_ALLOWED,
+        StatusCode::UNPROCESSABLE_ENTITY,
+    ] {
+        assert!(
+            !unexpected_response(status).is_retryable(),
+            "status {status}"
+        );
+    }
+
+    for status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::BAD_GATEWAY,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        assert!(
+            unexpected_response(status).is_retryable(),
+            "status {status}"
+        );
+    }
+}
+
+fn unexpected_response(status: StatusCode) -> CodexErr {
+    CodexErr::UnexpectedStatus(UnexpectedResponseError {
+        status,
+        body: String::new(),
+        user_message: None,
+        url: None,
+        cf_ray: None,
+        request_id: None,
+        identity_authorization_error: None,
+        identity_error_code: None,
+    })
+}
+
+#[test]
 fn sandbox_denied_uses_aggregated_output_when_stderr_empty() {
     let output = ExecToolCallOutput {
         exit_code: 77,

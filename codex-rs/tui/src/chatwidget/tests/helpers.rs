@@ -969,7 +969,6 @@ pub(super) fn app_server_turn(
         started_at: None,
         completed_at: None,
         duration_ms,
-        completion: None,
         timing: None,
         surfaced_result: None,
         reasoning_policy_history: None,
@@ -1000,7 +999,6 @@ pub(super) fn handle_turn_completed(
         ServerNotification::TurnCompleted(TurnCompletedNotification {
             surfaced_result: None,
             thread_id: chat.thread_id.map(|id| id.to_string()).unwrap_or_default(),
-            completion: None,
             turn: app_server_turn(
                 turn_id,
                 AppServerTurnStatus::Completed,
@@ -1018,7 +1016,6 @@ pub(super) fn handle_turn_interrupted(chat: &mut ChatWidget, turn_id: &str) {
         ServerNotification::TurnCompleted(TurnCompletedNotification {
             surfaced_result: None,
             thread_id: chat.thread_id.map(|id| id.to_string()).unwrap_or_default(),
-            completion: None,
             turn: app_server_turn(
                 turn_id,
                 AppServerTurnStatus::Interrupted,

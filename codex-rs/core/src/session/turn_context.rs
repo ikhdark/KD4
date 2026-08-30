@@ -197,7 +197,6 @@ pub struct TurnContext {
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
     /// Deferred tools selected during this root task, bound to exact capability revisions.
     pub(crate) deferred_tool_activations: Arc<std::sync::RwLock<DeferredToolActivationState>>,
-    pub(crate) kd4_workflow_enabled: bool,
     pub(crate) validation_authorization: crate::validation_admission::SharedValidationAuthorization,
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
@@ -372,29 +371,16 @@ impl TurnContext {
         self.deferred_tool_activation_snapshot().1
     }
 
-    /// Releases only deferred capabilities that were advertised to the model
-    /// for the sampling request that just settled. Activations created by tool
-    /// discovery during that request are deliberately retained for the next
-    /// request, so schemas remain visible for exactly the continuation that
-    /// can use them instead of accumulating for the rest of the turn.
+    /// Settles a sampling request that advertised deferred capabilities.
+    ///
+    /// Activations deliberately remain live for the rest of this turn. A model may need an
+    /// intervening reasoning or tool step before it can call a discovered tool, so request-scoped
+    /// release can erase the only callable schema before use. Capability refresh still removes
+    /// stale revisions, and dropping this turn context removes all remaining activations.
     pub(crate) fn release_advertised_deferred_tools(
         &self,
-        advertised: &HashSet<codex_tools::ToolName>,
+        _advertised: &HashSet<codex_tools::ToolName>,
     ) {
-        if advertised.is_empty() {
-            return;
-        }
-        let mut state = self
-            .deferred_tool_activations
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before = state.activations.len();
-        state
-            .activations
-            .retain(|tool_name, _| !advertised.contains(tool_name));
-        if state.activations.len() != before {
-            state.revision = state.revision.saturating_add(1);
-        }
     }
 
     pub(crate) fn refresh_deferred_tool_capabilities(
@@ -562,7 +548,6 @@ impl TurnContext {
             final_output_json_schema: self.final_output_json_schema.clone(),
             dynamic_tools: self.dynamic_tools.clone(),
             deferred_tool_activations: Arc::clone(&self.deferred_tool_activations),
-            kd4_workflow_enabled: self.kd4_workflow_enabled,
             validation_authorization: Arc::clone(&self.validation_authorization),
             turn_metadata_state: self.turn_metadata_state.clone(),
             extension_data: Arc::clone(&self.extension_data),
@@ -771,7 +756,6 @@ impl Session {
         network: Option<NetworkProxy>,
         environments: TurnEnvironmentSnapshot,
         git_metadata_source: Option<GitWorkspaceMetadataSource>,
-        kd4_workflow_enabled: bool,
         sub_id: String,
         skills_snapshot: HostSkillsSnapshot,
     ) -> TurnContext {
@@ -852,12 +836,9 @@ impl Session {
             deferred_tool_activations: Arc::new(std::sync::RwLock::new(
                 DeferredToolActivationState::default(),
             )),
-            kd4_workflow_enabled,
-            validation_authorization: Arc::new(tokio::sync::RwLock::new(if kd4_workflow_enabled {
-                crate::validation_admission::ValidationAuthorization::enabled()
-            } else {
-                crate::validation_admission::ValidationAuthorization::default()
-            })),
+            validation_authorization: Arc::new(tokio::sync::RwLock::new(
+                crate::validation_admission::ValidationAuthorization::default(),
+            )),
             turn_metadata_state,
             extension_data,
             turn_skills: TurnSkillsContext::new(skills_snapshot),
@@ -1118,11 +1099,6 @@ impl Session {
                 }
             }
         };
-        let kd4_workflow_enabled = resolve_kd4_workflow_enabled(
-            per_turn_config.kd4_workflow_enabled,
-            self.services
-                .kd4_workflow_enabled_for(per_turn_config.cwd.as_path()),
-        );
         let mut turn_context: TurnContext = Self::make_turn_context(
             self.thread_id(),
             self.session_id(),
@@ -1146,7 +1122,6 @@ impl Session {
                 }),
             turn_environments,
             git_metadata_source,
-            kd4_workflow_enabled,
             sub_id,
             skills_snapshot,
         );
@@ -1213,22 +1188,5 @@ impl Session {
     async fn default_turn_configuration(&self) -> SessionConfiguration {
         let state = self.state.lock().await;
         state.session_configuration.clone()
-    }
-}
-
-fn resolve_kd4_workflow_enabled(configured: Option<bool>, detected: bool) -> bool {
-    configured.unwrap_or(detected)
-}
-
-#[cfg(test)]
-mod kd4_workflow_tests {
-    use super::resolve_kd4_workflow_enabled;
-
-    #[test]
-    fn explicit_kd4_workflow_setting_overrides_marker_detection() {
-        assert!(!resolve_kd4_workflow_enabled(Some(false), true));
-        assert!(resolve_kd4_workflow_enabled(Some(true), false));
-        assert!(resolve_kd4_workflow_enabled(None, true));
-        assert!(!resolve_kd4_workflow_enabled(None, false));
     }
 }

@@ -1,0 +1,38 @@
+diff --git a/investigation_cases/repair_minimal_batch.py b/investigation_cases/repair_minimal_batch.py
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/repair_minimal_batch.py
+@@ -0,0 +1,12 @@
++def batches(values, width):
++    if width <= 0:
++        raise ValueError("width must be positive")
++
++    result = []
++    start = 0
++
++    while start + width < len(values):
++        result.append(values[start : start + width])
++        start += width
++
++    return result
+diff --git a/investigation_cases/test_repair_minimal_batch.py b/investigation_cases/test_repair_minimal_batch.py
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/test_repair_minimal_batch.py
+@@ -0,0 +1,16 @@
++import unittest
++
++from repair_minimal_batch import batches
++
++
++class BatchesTests(unittest.TestCase):
++    def test_boundary_behavior(self):
++        self.assertEqual(batches([], 2), [])
++        with self.assertRaises(ValueError):
++            batches([1], 0)
++        self.assertEqual(batches([1, 2], 2), [[1, 2]])
++        self.assertEqual(batches([1, 2, 3], 2), [[1, 2], [3]])
++
++
++if __name__ == "__main__":
++    unittest.main()

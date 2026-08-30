@@ -15,6 +15,7 @@ pub(crate) struct SessionStartOutput {
 #[derive(Debug, Clone)]
 pub(crate) struct PreToolUseOutput {
     pub universal: UniversalOutput,
+    pub should_block: bool,
     pub block_reason: Option<String>,
     pub additional_context: Option<String>,
     pub updated_input: Option<serde_json::Value>,
@@ -140,6 +141,16 @@ pub(crate) fn parse_pre_tool_use(stdout: &str) -> Option<PreToolUseOutput> {
             || output.permission_decision_reason.is_some()
             || output.updated_input.is_some()
     });
+    let should_block = if use_hook_specific_decision {
+        hook_specific_output.is_some_and(|output| {
+            matches!(
+                output.permission_decision,
+                Some(PreToolUsePermissionDecisionWire::Deny)
+            )
+        })
+    } else {
+        matches!(decision, Some(PreToolUseDecisionWire::Block))
+    };
     let invalid_reason = unsupported_pre_tool_use_universal(&universal).or_else(|| {
         if use_hook_specific_decision {
             hook_specific_output.and_then(unsupported_pre_tool_use_hook_specific_output)
@@ -180,6 +191,7 @@ pub(crate) fn parse_pre_tool_use(stdout: &str) -> Option<PreToolUseOutput> {
 
     Some(PreToolUseOutput {
         universal,
+        should_block,
         block_reason,
         additional_context,
         updated_input,

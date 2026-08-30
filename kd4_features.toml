@@ -79,37 +79,6 @@ path = "scripts/test_kd4_perf_snapshot.py"
 contains = "test_phase0_profile_covers_required_baseline_categories"
 
 [[features]]
-id = "task-continuity-hooks"
-version = 1
-status = "enabled"
-capability_kind = "workflow"
-owner = ".codex/hooks"
-summary = "Repository-local lifecycle hooks that persist, compact, restore, and retain bounded task-continuity capsules while failing open."
-upstream_equivalent = "none"
-config_keys = []
-runtime_verification = { kind = "contract_test", path = "scripts/test_task_continuity_hook.py", symbol = "test_manifest_command_fails_open_before_helper_in_non_git_directory", command = ["python", "-m", "unittest", "scripts.test_task_continuity_hook.TaskContinuityHookTest.test_manifest_command_fails_open_before_helper_in_non_git_directory"] }
-
-[[features.evidence]]
-kind = "entrypoint"
-path = ".codex/hooks/task-continuity-entry.ps1"
-contains = "param("
-
-[[features.evidence]]
-kind = "registration"
-path = ".codex/hooks.json"
-contains = "task-continuity-entry.ps1"
-
-[[features.evidence]]
-kind = "workflow"
-path = ".codex/hooks/task-continuity.ps1"
-contains = "param("
-
-[[features.evidence]]
-kind = "test"
-path = "scripts/test_task_continuity_hook.py"
-contains = "class TaskContinuityHookTest"
-
-[[features]]
 id = "extension-boundary-core"
 version = 1
 status = "enabled"
@@ -513,60 +482,6 @@ summary = "Retired duplicate budget table whose values conflicted with live owne
 upstream_equivalent = "owner-local constants and typed config defaults"
 config_keys = []
 retired_paths = ["codex-rs/config/src/coding_budgets.rs"]
-
-[[features]]
-id = "task-evidence-completion-gate"
-version = 13
-status = "enabled"
-capability_kind = "runtime"
-owner = "codex-rs/core"
-summary = "Persisted versioned task evidence, including explicit plan acknowledgement, versioned manifests, candidate-bound proof identity, atomic completion-review and terminal-delivery lineage, and migration from older schemas."
-upstream_equivalent = "none"
-config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/task_evidence_tests.rs", symbol = "current_schema_reload_removes_stale_skipped_step_requirements", command = ["cargo", "test", "-p", "codex-core", "current_schema_reload_removes_stale_skipped_step_requirements"] }
-contract_schema_version = 14
-contract_schema_source = "codex-rs/core/src/task_evidence.rs"
-contract_schema_symbol = "TASK_EVIDENCE_SCHEMA_VERSION"
-source_owner = "task-evidence-runtime"
-
-[[features]]
-id = "task-completion-reviewer"
-version = 2
-status = "enabled"
-runtime_status = "enabled"
-runtime_status_source = "codex-rs/features/src/lib.rs"
-runtime_feature_key = "features.task_completion_reviewer"
-capability_kind = "runtime"
-owner = "codex-rs/core"
-summary = "Host-enforced KD4 completion review with sparse exception-only reviewer output, deterministic host-selected lenses, candidate-bound evidence, host-validated freshness, host-computed cleanliness, one automatic correction phase, and one independent rereview."
-upstream_equivalent = "none"
-config_keys = ["features.task_completion_reviewer"]
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tasks/completion_review_v2.rs", symbol = "sparse_wire_contract_requires_all_five_arrays_and_rejects_legacy_fields", command = ["cargo", "test", "-p", "codex-core", "sparse_wire_contract_requires_all_five_arrays_and_rejects_legacy_fields"] }
-
-[[features.evidence]]
-kind = "entrypoint"
-path = "codex-rs/core/src/tasks/completion_review_v2.rs"
-contains = "pub(crate) async fn coordinate_completion_review"
-
-[[features.evidence]]
-kind = "registration"
-path = "codex-rs/core/src/session/turn.rs"
-contains = "coordinate_completion_review("
-
-[[features.evidence]]
-kind = "module"
-path = "codex-rs/core/src/tasks/mod.rs"
-contains = "#[path = \"completion_review_v2.rs\"]"
-
-[[features.evidence]]
-kind = "config"
-path = "codex-rs/features/src/lib.rs"
-contains = "key: \"task_completion_reviewer\""
-
-[[features.evidence]]
-kind = "test"
-path = "codex-rs/core/src/tasks/completion_review_v2.rs"
-contains = "sparse_wire_contract_requires_all_five_arrays_and_rejects_legacy_fields"
 
 [[features]]
 id = "repository-intelligence"

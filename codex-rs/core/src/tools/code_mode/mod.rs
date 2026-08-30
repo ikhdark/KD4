@@ -51,6 +51,8 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
 use codex_utils_output_truncation::resolve_output_limits;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
+use codex_utils_output_truncation::truncate_text;
+use codex_utils_string::approx_token_count;
 
 use delegate::CodeModeDispatchBroker;
 use delegate::CodeModeDispatchWorker;
@@ -500,7 +502,7 @@ fn format_runtime_response(
         }
         RuntimeResponse::Terminated { content_items, .. } => {
             let content_items = into_function_call_output_content_items(content_items);
-            (content_items, OutputOutcome::Failure, true)
+            (content_items, OutputOutcome::Failure, false)
         }
         RuntimeResponse::Result {
             content_items,
@@ -525,13 +527,16 @@ fn format_runtime_response(
 
     content_items.extend(post_tool_use_feedback);
     sanitize_image_detail_items(original_image_detail_supported, &mut content_items);
+    let mut canonical_content_items = content_items.clone();
     let mut content_items =
         truncate_code_mode_result(content_items, max_output_tokens, outcome, hard_limit);
     let semantic_evidence = serde_json::json!({
         "status": &script_status,
         "content_items": &content_items,
     });
-    prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
+    let elapsed = started_at.elapsed();
+    prepend_script_status(&mut content_items, &script_status, elapsed);
+    prepend_script_status(&mut canonical_content_items, &script_status, elapsed);
     let typed_outcome = match (yielded, outcome) {
         (true, _) => codex_tools::ToolOutputOutcome::Yielded,
         (false, OutputOutcome::Success) => codex_tools::ToolOutputOutcome::Success,
@@ -545,6 +550,7 @@ fn format_runtime_response(
         crate::tools::context::semantic_failure_sampling_signal(semantic_evidence)
     };
     FunctionToolOutput::from_content(content_items, Some(success))
+        .with_canonical_body(canonical_content_items)
         .with_outcome(typed_outcome)
         .with_sampling_request_signal(sampling_request_signal)
         .with_deterministic_continuation_owner_key(continuation_owner_key)
@@ -602,7 +608,43 @@ fn truncate_code_mode_result(
         return truncated_items;
     }
 
+    if outcome == OutputOutcome::Failure
+        && let Some(error_index) = items.iter().position(|item| {
+            matches!(
+                item,
+                FunctionCallOutputContentItem::InputText { text }
+                    if text.starts_with("Script error:\n")
+            )
+        })
+    {
+        return truncate_mixed_code_mode_failure(items, error_index, limits.applied_limit);
+    }
+
     truncate_function_output_items_with_policy(&items, policy)
+}
+
+fn truncate_mixed_code_mode_failure(
+    mut items: Vec<FunctionCallOutputContentItem>,
+    error_index: usize,
+    token_limit: usize,
+) -> Vec<FunctionCallOutputContentItem> {
+    let FunctionCallOutputContentItem::InputText { text: error_text } = items.remove(error_index)
+    else {
+        unreachable!("the caller identifies a script-error text item")
+    };
+    let error_tokens = approx_token_count(&error_text);
+    let reserved_error_tokens = error_tokens.min(token_limit);
+    let other_policy = TruncationPolicy::Tokens(token_limit.saturating_sub(reserved_error_tokens));
+    let mut projected = truncate_function_output_items_with_policy(&items, other_policy);
+    let error_text = if error_tokens <= reserved_error_tokens {
+        error_text
+    } else {
+        truncate_text(&error_text, TruncationPolicy::Tokens(reserved_error_tokens))
+    };
+    if !error_text.is_empty() {
+        projected.push(FunctionCallOutputContentItem::InputText { text: error_text });
+    }
+    projected
 }
 
 fn code_mode_text_content(items: &[FunctionCallOutputContentItem]) -> String {
@@ -828,12 +870,23 @@ fn is_batchable_observation(tool_name: &ToolName, payload: &ToolPayload) -> bool
 
 fn result_has_live_exec_session(result: &JsonValue) -> bool {
     [
-        result.get("session_id"),
-        result.pointer("/result/essential/session_id"),
+        (
+            result.get("session_id"),
+            result.get("process_exited"),
+            result.get("exit_code"),
+        ),
+        (
+            result.pointer("/result/essential/session_id"),
+            result.pointer("/result/essential/process_exited"),
+            result.pointer("/result/essential/exit_code"),
+        ),
     ]
     .into_iter()
-    .flatten()
-    .any(|session_id| !session_id.is_null())
+    .any(|(session_id, process_exited, exit_code)| {
+        session_id.is_some_and(|session_id| !session_id.is_null())
+            && !process_exited.and_then(JsonValue::as_bool).unwrap_or(false)
+            && exit_code.is_none_or(JsonValue::is_null)
+    })
 }
 
 fn nested_failure_fingerprint(tool_name: &ToolName, error: &str) -> String {
@@ -939,6 +992,7 @@ mod tests {
     use super::OutputOutcome;
     use super::build_nested_tool_payload;
     use super::fold_nested_required_terminal;
+    use super::format_runtime_response;
     use super::is_batchable_observation;
     use super::nested_failure_fingerprint;
     use super::result_has_live_exec_session;
@@ -951,6 +1005,7 @@ mod tests {
     use codex_code_mode::CodeModeToolKind;
     use codex_code_mode::ExecuteRequest;
     use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
+    use codex_code_mode::RuntimeResponse;
     use codex_protocol::models::FunctionCallOutputContentItem;
     use codex_protocol::models::SearchToolCallParams;
     use codex_tools::ToolName;
@@ -1150,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_live_exec_session_is_detected() {
+    fn tool_result_correctness_projected_live_exec_session_is_detected() {
         assert!(result_has_live_exec_session(&json!({"session_id": 7})));
         assert!(result_has_live_exec_session(&json!({
             "version": 1,
@@ -1169,6 +1224,21 @@ mod tests {
             },
         })));
         assert!(!result_has_live_exec_session(&json!({"exit_code": 0})));
+        assert!(!result_has_live_exec_session(&json!({
+            "session_id": 7,
+            "exit_code": 7,
+            "process_exited": true,
+        })));
+        assert!(!result_has_live_exec_session(&json!({
+            "version": 1,
+            "result": {
+                "essential": {
+                    "session_id": 7,
+                    "exit_code": null,
+                    "process_exited": true,
+                },
+            },
+        })));
     }
 
     #[test]
@@ -1267,6 +1337,47 @@ mod tests {
     }
 
     #[test]
+    fn code_mode_truncation_preserves_full_canonical_recovery() {
+        let sentinel = "CANONICAL_SENTINEL_AFTER_THE_MODEL_LIMIT";
+        let output = format_runtime_response(
+            RuntimeResponse::Result {
+                cell_id: CellId::new("canonical-cell".to_string()),
+                content_items: vec![codex_code_mode::FunctionCallOutputContentItem::InputText {
+                    text: format!("{}{}", "x".repeat(400), sentinel),
+                }],
+                error_text: None,
+            },
+            Some(5),
+            5,
+            false,
+            std::time::Instant::now(),
+            Vec::new(),
+        );
+
+        let projected =
+            codex_protocol::models::function_call_output_content_items_to_text(&output.body)
+                .expect("projected code-mode text");
+        assert!(projected.contains("Warning: truncated output"));
+        assert!(!projected.contains(sentinel));
+
+        let canonical = output
+            .canonical_result(&ToolPayload::Custom {
+                input: "return a large result".to_string(),
+            })
+            .expect("canonical code-mode result");
+        assert!(String::from_utf8_lossy(&canonical.bytes).contains(sentinel));
+        assert!(
+            output
+                .projection_metadata()
+                .expect("projection metadata")
+                .spillable_text
+                .iter()
+                .any(|text| text.contains(sentinel)),
+            "artifact admission must receive the complete provider output"
+        );
+    }
+
+    #[test]
     fn code_mode_truncation_applies_hard_limit() {
         let items = vec![FunctionCallOutputContentItem::InputText {
             text: "x".repeat(400),
@@ -1282,35 +1393,62 @@ mod tests {
     }
 
     #[test]
-    fn default_outer_success_budget_is_narrow_and_explicit_requests_can_use_the_hard_cap() {
-        let text = "x".repeat(24_000);
-        assert!(codex_utils_string::approx_token_count(&text) > 4_000);
-        let items = vec![FunctionCallOutputContentItem::InputText { text }];
+    fn over_truncation_mixed_code_mode_failure_preserves_the_script_error() {
+        let items = vec![
+            FunctionCallOutputContentItem::InputText {
+                text: "ordinary output ".repeat(1_000),
+            },
+            FunctionCallOutputContentItem::EncryptedContent {
+                encrypted_content: "opaque".to_string(),
+            },
+            FunctionCallOutputContentItem::InputText {
+                text: "Script error:\nROOT_CAUSE_SENTINEL".to_string(),
+            },
+        ];
 
         let projected =
-            truncate_code_mode_result(items.clone(), None, OutputOutcome::Success, usize::MAX);
+            truncate_code_mode_result(items, Some(40), OutputOutcome::Failure, usize::MAX);
 
-        let [FunctionCallOutputContentItem::InputText { text }] = projected.as_slice() else {
+        assert!(projected.iter().any(|item| matches!(
+            item,
+            FunctionCallOutputContentItem::InputText { text }
+                if text == "Script error:\nROOT_CAUSE_SENTINEL"
+        )));
+    }
+
+    #[test]
+    fn default_outer_success_budget_preserves_output_above_the_old_cap() {
+        let text = "x".repeat(24_000);
+        let original_tokens = codex_utils_string::approx_token_count(&text);
+        assert!(original_tokens > 4_000);
+        assert!(original_tokens < codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
+        let items = vec![FunctionCallOutputContentItem::InputText { text: text.clone() }];
+
+        let projected = truncate_code_mode_result(items, None, OutputOutcome::Success, usize::MAX);
+
+        let [
+            FunctionCallOutputContentItem::InputText {
+                text: projected_text,
+            },
+        ] = projected.as_slice()
+        else {
             panic!("expected one projected text item");
         };
-        assert!(text.starts_with("Warning: truncated output"));
-        assert!(
-            codex_utils_string::approx_token_count(text)
-                <= codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL
-        );
+        assert_eq!(projected_text, &text);
 
-        let expanded = truncate_code_mode_result(
-            items,
-            Some(6_000),
-            OutputOutcome::Success,
-            codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
-        );
-        let [FunctionCallOutputContentItem::InputText { text }] = expanded.as_slice() else {
-            panic!("expected one expanded text item");
+        let oversized = vec![FunctionCallOutputContentItem::InputText {
+            text: "x".repeat(48_000),
+        }];
+        let capped = truncate_code_mode_result(oversized, None, OutputOutcome::Success, usize::MAX);
+        let [FunctionCallOutputContentItem::InputText { text: capped_text }] = capped.as_slice()
+        else {
+            panic!("expected one capped text item");
         };
-        let expanded_tokens = codex_utils_string::approx_token_count(text);
-        assert!(expanded_tokens > codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL);
-        assert!(expanded_tokens <= 6_000);
+        assert!(capped_text.starts_with("Warning: truncated output"));
+        assert!(
+            codex_utils_string::approx_token_count(capped_text)
+                <= codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL
+        );
     }
 
     #[tokio::test]

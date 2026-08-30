@@ -10,9 +10,9 @@ use codex_app_server_protocol::FsWatchParams;
 use codex_app_server_protocol::FsWatchResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::ServerNotification;
-use codex_file_watcher::DebouncedWatchReceiver;
 use codex_file_watcher::FileWatcher;
 use codex_file_watcher::FileWatcherSubscriber;
+use codex_file_watcher::ThrottledWatchReceiver;
 use codex_file_watcher::WatchPath;
 use codex_file_watcher::WatchRegistration;
 use std::collections::HashMap;
@@ -173,7 +173,7 @@ impl FsWatchManager {
             let (done_tx, done_rx) = oneshot::channel();
             let task = tokio::spawn(async move {
                 if start_rx.await.is_ok() {
-                    let mut rx = DebouncedWatchReceiver::new(rx, FS_CHANGED_NOTIFICATION_DEBOUNCE);
+                    let mut rx = ThrottledWatchReceiver::new(rx, FS_CHANGED_NOTIFICATION_DEBOUNCE);
                     loop {
                         let event = tokio::select! {
                             biased;

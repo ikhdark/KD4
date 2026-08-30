@@ -2098,6 +2098,69 @@ async fn get_account_with_chatgpt_without_email() -> Result<()> {
 }
 
 #[tokio::test]
+async fn get_account_transient_refresh_failure_is_observable() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            ..Default::default()
+        },
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("stale-access-token")
+            .refresh_token("stale-refresh-token")
+            .account_id(WORKSPACE_ID_STALE)
+            .email("user@example.com")
+            .plan_type("pro")
+            .last_refresh(Some(Utc::now() - ChronoDuration::days(9))),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1..=2)
+        .mount(&server)
+        .await;
+
+    let refresh_url = format!("{}/oauth/token", server.uri());
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
+            ("OPENAI_API_KEY", None),
+            (
+                REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+                Some(refresh_url.as_str()),
+            ),
+        ])
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_get_account_request(GetAccountParams {
+            refresh_token: true,
+        })
+        .await?;
+    let err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert_eq!(
+        err.error.message,
+        "failed to refresh account token; retry the request"
+    );
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn get_account_omits_chatgpt_after_permanent_refresh_failure() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(

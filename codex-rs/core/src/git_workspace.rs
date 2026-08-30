@@ -47,6 +47,9 @@ use tracing::warn;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 
 const GIT_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKSPACE_GENERATION_DEADLINE: Duration = Duration::from_secs(5);
+const WORKSPACE_GENERATION_MAX_PATHS: usize = 256;
+const WORKSPACE_GENERATION_MAX_DECLARED_BYTES: u64 = 64 * 1024 * 1024;
 const SOURCE_CHANGE_JOURNAL_CAPACITY: usize = 4_096;
 const RETAINED_REPOSITORY_CAPACITY: usize = 64;
 const GENERATED_CODEX_EVAL_PATHSPEC: &str = ":(exclude).codex/evals/**";
@@ -163,29 +166,6 @@ impl GitWorkspaceMetadata {
     }
 }
 
-/// One immutable, read-only Git observation used by the completion candidate.
-/// The caller owns artifact retention and checkpoint preview bounds.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct CandidateDiffCapture {
-    repository_root: Option<String>,
-    pub(crate) head_identity: Option<String>,
-    pub(crate) index_identity: Option<String>,
-    pub(crate) worktree_identity: Option<String>,
-    pub(crate) changed_paths: Vec<String>,
-    pub(crate) raw_diff: Vec<u8>,
-}
-
-impl CandidateDiffCapture {
-    pub(crate) fn workspace_evidence_identity(&self) -> WorkspaceEvidenceIdentity {
-        WorkspaceEvidenceIdentity {
-            repository_root: self.repository_root.clone(),
-            head_identity: self.head_identity.clone(),
-            index_identity: self.index_identity.clone(),
-            worktree_identity: self.worktree_identity.clone(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct WorkspaceEvidenceIdentity {
     #[serde(default)]
@@ -220,29 +200,12 @@ pub(crate) struct WorkspaceEvidenceCapture {
     pub(crate) timed_out_git_dependencies: Vec<WorkspaceEvidenceGitDependency>,
 }
 
-#[derive(Debug)]
-enum CandidateGitOutput {
-    Output(Vec<u8>),
-    Failed,
-    TimedOut,
-}
-
-impl CandidateGitOutput {
-    fn into_output(self) -> Option<Vec<u8>> {
-        match self {
-            Self::Output(output) => Some(output),
-            Self::Failed | Self::TimedOut => None,
-        }
-    }
-}
-
 pub(crate) async fn capture_workspace_evidence_identity(
     cwd: &Path,
 ) -> Option<WorkspaceEvidenceIdentity> {
-    let repo_root = get_git_repo_root(cwd)?;
-    stable_workspace_capture(|| capture_candidate_diff_once(&repo_root, None))
+    capture_workspace_evidence_identity_with_attribution(cwd)
         .await
-        .map(|capture| capture.workspace_evidence_identity())
+        .identity
 }
 
 async fn capture_workspace_evidence_identity_with_attribution(
@@ -251,215 +214,110 @@ async fn capture_workspace_evidence_identity_with_attribution(
     let Some(repo_root) = get_git_repo_root(cwd) else {
         return WorkspaceEvidenceCapture::default();
     };
-    let timed_out_git_dependencies = StdMutex::new(BTreeSet::new());
-    let identity = stable_workspace_capture(|| {
-        capture_candidate_diff_once(&repo_root, Some(&timed_out_git_dependencies))
-    })
+    match within_workspace_generation_deadline(
+        WORKSPACE_GENERATION_DEADLINE,
+        capture_workspace_generation_marker(repo_root),
+    )
     .await
-    .map(|capture| capture.workspace_evidence_identity());
-    let timed_out_git_dependencies = timed_out_git_dependencies
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .into_iter()
-        .collect();
-    WorkspaceEvidenceCapture {
-        identity,
-        timed_out_git_dependencies,
-    }
-}
-
-pub(crate) async fn capture_candidate_diff(cwd: &Path) -> Option<CandidateDiffCapture> {
-    let repo_root = get_git_repo_root(cwd)?;
-    stable_workspace_capture(|| capture_candidate_diff_once(&repo_root, None)).await
-}
-
-async fn capture_candidate_diff_once(
-    repo_root: &Path,
-    timed_out_git_dependencies: Option<&StdMutex<BTreeSet<WorkspaceEvidenceGitDependency>>>,
-) -> Option<CandidateDiffCapture> {
-    let (head, index_capture, worktree_capture, untracked) = tokio::join!(
-        candidate_git_output(repo_root, &["rev-parse", "--verify", "HEAD"]),
-        candidate_git_output(
-            repo_root,
-            &[
-                "diff",
-                "--cached",
-                "--raw",
-                "-z",
-                "--patch",
-                "--binary",
-                "--no-ext-diff",
-                "--",
-                ".",
-                GENERATED_CODEX_EVAL_PATHSPEC,
-            ]
-        ),
-        candidate_git_output(
-            repo_root,
-            &[
-                "diff",
-                "--raw",
-                "-z",
-                "--patch",
-                "--binary",
-                "--no-ext-diff",
-                "--",
-                ".",
-                GENERATED_CODEX_EVAL_PATHSPEC,
-            ]
-        ),
-        candidate_git_output(
-            repo_root,
-            &[
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "-z",
-                "--",
-                ".",
-                GENERATED_CODEX_EVAL_PATHSPEC,
-            ],
-        ),
-    );
-    let timed_out = candidate_git_timeouts(&head, &index_capture, &worktree_capture, &untracked);
-    if !timed_out.is_empty()
-        && let Some(recorded) = timed_out_git_dependencies
     {
-        recorded
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(timed_out);
+        Ok(identity) => WorkspaceEvidenceCapture {
+            identity,
+            timed_out_git_dependencies: Vec::new(),
+        },
+        Err(_) => WorkspaceEvidenceCapture {
+            identity: None,
+            timed_out_git_dependencies: vec![
+                WorkspaceEvidenceGitDependency::Head,
+                WorkspaceEvidenceGitDependency::Index,
+                WorkspaceEvidenceGitDependency::Worktree,
+                WorkspaceEvidenceGitDependency::Untracked,
+            ],
+        },
     }
-    let head = head.into_output();
-    let index_capture = index_capture.into_output();
-    let worktree_capture = worktree_capture.into_output();
-    let untracked = untracked.into_output();
-    let (index_paths, index_diff) = candidate_diff_and_paths(index_capture?)?;
-    let (worktree_paths, worktree_diff) = candidate_diff_and_paths(worktree_capture?)?;
-    let untracked = untracked?;
-    let head_identity = candidate_head_identity(head);
-    let index_identity = Some(format!("{:x}", Sha256::digest(&index_diff)));
-    let untracked_paths = candidate_untracked_paths(&untracked)?;
-    let (untracked_paths, untracked_manifest) =
-        candidate_untracked_manifest(repo_root.to_path_buf(), untracked_paths).await?;
+}
+
+async fn within_workspace_generation_deadline<T, Capture>(
+    deadline: Duration,
+    capture: Capture,
+) -> Result<T, tokio::time::error::Elapsed>
+where
+    Capture: Future<Output = T>,
+{
+    timeout(deadline, capture).await
+}
+
+fn workspace_generation_status_args() -> &'static [&'static str] {
+    &[
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--",
+        ".",
+        GENERATED_CODEX_EVAL_PATHSPEC,
+    ]
+}
+
+async fn capture_workspace_generation_marker(
+    repo_root: PathBuf,
+) -> Option<WorkspaceEvidenceIdentity> {
+    let (head, status) = tokio::join!(
+        workspace_generation_git_output(&repo_root, &["rev-parse", "--verify", "HEAD"]),
+        workspace_generation_git_output(&repo_root, workspace_generation_status_args()),
+    );
+    let status = status?;
+    let paths = workspace_generation_paths(&status);
+    let metadata = workspace_generation_metadata(repo_root.clone(), paths).await?;
+
+    let mut index_hasher = Sha256::new();
+    index_hasher.update(b"KD4_WORKSPACE_INDEX_GENERATION_V1\n");
+    index_hasher.update(&status);
     let mut worktree_hasher = Sha256::new();
-    worktree_hasher.update(&worktree_diff);
-    worktree_hasher.update(&untracked_manifest);
-    let worktree_identity = Some(format!("{:x}", worktree_hasher.finalize()));
-    let changed_paths = index_paths
-        .into_iter()
-        .chain(worktree_paths)
-        .chain(untracked_paths)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let mut raw_diff = Vec::with_capacity(index_diff.len().saturating_add(worktree_diff.len()));
-    raw_diff.extend_from_slice(b"KD4_CANDIDATE_INDEX_DIFF_V1\n");
-    raw_diff.extend_from_slice(&index_diff);
-    raw_diff.extend_from_slice(b"\nKD4_CANDIDATE_WORKTREE_DIFF_V1\n");
-    raw_diff.extend_from_slice(&worktree_diff);
-    raw_diff.extend_from_slice(b"\nKD4_CANDIDATE_UNTRACKED_MANIFEST_V1\n");
-    raw_diff.extend_from_slice(&untracked_manifest);
-    Some(CandidateDiffCapture {
+    worktree_hasher.update(b"KD4_WORKSPACE_WORKTREE_GENERATION_V1\n");
+    worktree_hasher.update(&status);
+    worktree_hasher.update(&metadata.manifest);
+
+    Some(WorkspaceEvidenceIdentity {
         repository_root: Some(
-            dunce::canonicalize(repo_root)
-                .unwrap_or_else(|_| repo_root.to_path_buf())
+            dunce::canonicalize(&repo_root)
+                .unwrap_or(repo_root)
                 .to_string_lossy()
                 .into_owned(),
         ),
-        head_identity,
-        index_identity,
-        worktree_identity,
-        changed_paths,
-        raw_diff,
+        head_identity: workspace_head_identity(head),
+        index_identity: Some(format!("{:x}", index_hasher.finalize())),
+        worktree_identity: Some(format!("{:x}", worktree_hasher.finalize())),
     })
 }
 
-fn candidate_git_timeouts(
-    head: &CandidateGitOutput,
-    index: &CandidateGitOutput,
-    worktree: &CandidateGitOutput,
-    untracked: &CandidateGitOutput,
-) -> Vec<WorkspaceEvidenceGitDependency> {
-    [
-        (WorkspaceEvidenceGitDependency::Head, head),
-        (WorkspaceEvidenceGitDependency::Index, index),
-        (WorkspaceEvidenceGitDependency::Worktree, worktree),
-        (WorkspaceEvidenceGitDependency::Untracked, untracked),
-    ]
-    .into_iter()
-    .filter_map(|(dependency, output)| {
-        matches!(output, CandidateGitOutput::TimedOut).then_some(dependency)
-    })
-    .collect()
-}
-
-fn candidate_diff_and_paths(mut output: Vec<u8>) -> Option<(Vec<String>, Vec<u8>)> {
-    if output.is_empty() {
-        return Some((Vec::new(), Vec::new()));
-    }
-    let mut offset = 0;
-    let mut paths = Vec::new();
-    while output.get(offset) == Some(&b':') {
-        let header_end = output[offset..].iter().position(|byte| *byte == 0)? + offset;
-        let header = std::str::from_utf8(&output[offset..header_end]).ok()?;
-        let status = header.split_ascii_whitespace().next_back()?;
-        let path_start = header_end.saturating_add(1);
-        let path_end = output[path_start..].iter().position(|byte| *byte == 0)? + path_start;
-        let first_path = std::str::from_utf8(&output[path_start..path_end]).ok()?;
-        offset = path_end.saturating_add(1);
-        if matches!(status.as_bytes().first(), Some(b'R' | b'C')) {
-            paths.push(first_path.to_string());
-            let second_path_end = output[offset..].iter().position(|byte| *byte == 0)? + offset;
-            paths.push(
-                std::str::from_utf8(&output[offset..second_path_end])
-                    .ok()?
-                    .to_string(),
-            );
-            offset = second_path_end.saturating_add(1);
-        } else {
-            paths.push(first_path.to_string());
-        }
-    }
-    if output.get(offset) == Some(&0) {
-        offset = offset.saturating_add(1);
-    }
-    if offset < output.len() && !output[offset..].starts_with(b"diff --git ") {
-        return None;
-    }
-    let patch = output.split_off(offset);
-    Some((paths, patch))
-}
-
-fn candidate_untracked_paths(output: &[u8]) -> Option<Vec<String>> {
-    output
+fn workspace_generation_paths(status: &[u8]) -> Vec<String> {
+    let mut paths = status
         .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| std::str::from_utf8(entry).map(str::to_string))
-        .collect::<Result<Vec<_>, _>>()
-        .ok()
+        .filter_map(|record| {
+            let field_index: usize = match record.first().copied() {
+                Some(b'1') => 8,
+                Some(b'2') => 9,
+                Some(b'u') => 10,
+                Some(b'?') => {
+                    return std::str::from_utf8(record.get(2..)?)
+                        .ok()
+                        .map(str::to_string);
+                }
+                _ => return None,
+            };
+            record
+                .splitn(field_index.saturating_add(1), |byte| *byte == b' ')
+                .nth(field_index)
+                .and_then(|path| std::str::from_utf8(path).ok())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
-async fn stable_workspace_capture<T, Capture, CaptureFuture>(mut capture_once: Capture) -> Option<T>
-where
-    T: Eq,
-    Capture: FnMut() -> CaptureFuture,
-    CaptureFuture: std::future::Future<Output = Option<T>>,
-{
-    const MAX_CAPTURE_ATTEMPTS: usize = 3;
-
-    let mut previous = capture_once().await?;
-    for _ in 1..MAX_CAPTURE_ATTEMPTS {
-        let current = capture_once().await?;
-        if current == previous {
-            return Some(current);
-        }
-        previous = current;
-    }
-    None
-}
-
-fn candidate_head_identity(head: Option<Vec<u8>>) -> Option<String> {
+fn workspace_head_identity(head: Option<Vec<u8>>) -> Option<String> {
     head.and_then(|head| {
         String::from_utf8(head)
             .ok()
@@ -468,60 +326,79 @@ fn candidate_head_identity(head: Option<Vec<u8>>) -> Option<String> {
     })
 }
 
-async fn candidate_untracked_manifest(
+struct WorkspaceGenerationMetadata {
+    manifest: Vec<u8>,
+}
+
+async fn workspace_generation_metadata(
     repo_root: PathBuf,
     paths: Vec<String>,
-) -> Option<(Vec<String>, Vec<u8>)> {
+) -> Option<WorkspaceGenerationMetadata> {
     tokio::task::spawn_blocking(move || {
-        let mut paths = paths;
-        paths.sort();
-        paths.dedup();
-        let mut manifest = Vec::new();
-        for path in &paths {
-            let absolute = repo_root.join(path);
+        if paths.len() > WORKSPACE_GENERATION_MAX_PATHS {
+            return None;
+        }
+        let total_paths = paths.len();
+        let mut manifest = format!("total_paths={total_paths}\n").into_bytes();
+        let mut observed_declared_bytes = 0_u64;
+
+        for path in paths {
+            let absolute = repo_root.join(&path);
             let metadata = std::fs::symlink_metadata(&absolute).ok()?;
-            if metadata.file_type().is_symlink() {
-                let target = std::fs::read_link(&absolute).ok()?;
-                let target = target.to_str()?;
-                manifest.extend_from_slice(path.as_bytes());
-                manifest.push(0);
-                manifest.extend_from_slice(b"symlink");
-                manifest.push(0);
-                manifest.extend_from_slice(
-                    format!("{:x}", Sha256::digest(target.as_bytes())).as_bytes(),
-                );
-                manifest.push(b'\n');
-                continue;
-            }
-            if !metadata.is_file() {
+            let declared_bytes = if metadata.is_file() {
+                metadata.len()
+            } else {
+                0
+            };
+            if observed_declared_bytes.saturating_add(declared_bytes)
+                > WORKSPACE_GENERATION_MAX_DECLARED_BYTES
+            {
                 return None;
             }
-            let mut file = File::open(&absolute).ok()?;
-            let mut hasher = Sha256::new();
-            let mut bytes = 0_u64;
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let read = file.read(&mut buffer).ok()?;
-                if read == 0 {
-                    break;
-                }
-                bytes = bytes.saturating_add(u64::try_from(read).ok()?);
-                hasher.update(&buffer[..read]);
-            }
+            let kind = if metadata.file_type().is_symlink() {
+                "symlink"
+            } else if metadata.is_file() {
+                "file"
+            } else if metadata.is_dir() {
+                "directory"
+            } else {
+                "other"
+            };
             manifest.extend_from_slice(path.as_bytes());
             manifest.push(0);
-            manifest.extend_from_slice(bytes.to_string().as_bytes());
+            manifest.extend_from_slice(kind.as_bytes());
             manifest.push(0);
-            manifest.extend_from_slice(format!("{:x}", hasher.finalize()).as_bytes());
+            manifest.extend_from_slice(declared_bytes.to_string().as_bytes());
+            manifest.push(0);
+            if metadata.file_type().is_symlink() {
+                let target = std::fs::read_link(&absolute).ok()?;
+                manifest.extend_from_slice(
+                    format!("{:x}", Sha256::digest(target.to_string_lossy().as_bytes())).as_bytes(),
+                );
+            } else if metadata.is_file() {
+                let remaining =
+                    WORKSPACE_GENERATION_MAX_DECLARED_BYTES.saturating_sub(observed_declared_bytes);
+                let mut content = Vec::new();
+                File::open(&absolute)
+                    .ok()?
+                    .take(remaining.saturating_add(1))
+                    .read_to_end(&mut content)
+                    .ok()?;
+                if u64::try_from(content.len()).ok()? > remaining {
+                    return None;
+                }
+                manifest.extend_from_slice(format!("{:x}", Sha256::digest(&content)).as_bytes());
+            }
             manifest.push(b'\n');
+            observed_declared_bytes = observed_declared_bytes.saturating_add(declared_bytes);
         }
-        Some((paths, manifest))
+        Some(WorkspaceGenerationMetadata { manifest })
     })
     .await
     .ok()?
 }
 
-async fn candidate_git_output(repo_root: &Path, args: &[&str]) -> CandidateGitOutput {
+async fn workspace_generation_git_output(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut command = Command::new("git");
     command
         .arg("-c")
@@ -531,12 +408,8 @@ async fn candidate_git_output(repo_root: &Path, args: &[&str]) -> CandidateGitOu
         .env("GIT_OPTIONAL_LOCKS", "0")
         .current_dir(repo_root)
         .kill_on_drop(true);
-    match timeout(GIT_DEPENDENCY_TIMEOUT, command.output()).await {
-        Err(_) => CandidateGitOutput::TimedOut,
-        Ok(Err(_)) => CandidateGitOutput::Failed,
-        Ok(Ok(output)) if output.status.success() => CandidateGitOutput::Output(output.stdout),
-        Ok(Ok(_)) => CandidateGitOutput::Failed,
-    }
+    let output = command.output().await.ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 impl GitWorkspaceMetadataSource {
@@ -670,9 +543,20 @@ struct InFlightWorkspaceEvidenceCapture {
 }
 
 #[cfg(test)]
-struct WorkspaceEvidenceCapturePause {
+pub(crate) struct WorkspaceEvidenceCapturePause {
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl WorkspaceEvidenceCapturePause {
+    pub(crate) async fn wait_until_started(&self) {
+        self.started.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 pub(crate) struct GitWorkspaceCache {
@@ -698,12 +582,6 @@ pub(crate) struct GitWorkspaceCache {
     workspace_evidence_waiter_joined: tokio::sync::Notify,
     #[cfg(test)]
     root_resolution_count: AtomicU64,
-}
-
-pub(crate) struct WorkspaceChangeObservation {
-    watcher_generation: u64,
-    host_mutation_generation: u64,
-    _registration: WatchRegistration,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1127,7 +1005,9 @@ impl GitWorkspaceCache {
     }
 
     #[cfg(test)]
-    fn pause_next_workspace_evidence_capture(&self) -> Arc<WorkspaceEvidenceCapturePause> {
+    pub(crate) fn pause_next_workspace_evidence_capture(
+        &self,
+    ) -> Arc<WorkspaceEvidenceCapturePause> {
         let pause = Arc::new(WorkspaceEvidenceCapturePause {
             started: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
@@ -1388,12 +1268,6 @@ impl GitWorkspaceCache {
         }
     }
 
-    pub(crate) fn reliable_watcher_generation(&self) -> Option<u64> {
-        self.watcher_reliable
-            .load(Ordering::Acquire)
-            .then(|| self.watcher_generation.load(Ordering::Acquire))
-    }
-
     fn reliable_source_watcher_generation(&self) -> Option<u64> {
         self.source_watcher_reliable
             .load(Ordering::Acquire)
@@ -1535,41 +1409,6 @@ impl GitWorkspaceCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut journal.freshness_lookup_count)
-    }
-
-    pub(crate) fn begin_workspace_change_observation(
-        &self,
-        repo_root: &Path,
-    ) -> Option<WorkspaceChangeObservation> {
-        let watcher_generation = self.reliable_watcher_generation()?;
-        let host_mutation_generation = self.host_mutation_generation.load(Ordering::Acquire);
-        let registration = self
-            .watcher_subscriber
-            .as_ref()?
-            .register_paths(vec![WatchPath {
-                path: repo_root.to_path_buf(),
-                recursive: true,
-            }])
-            .ok()?;
-        if self.reliable_watcher_generation() != Some(watcher_generation)
-            || self.host_mutation_generation.load(Ordering::Acquire) != host_mutation_generation
-        {
-            return None;
-        }
-        Some(WorkspaceChangeObservation {
-            watcher_generation,
-            host_mutation_generation,
-            _registration: registration,
-        })
-    }
-
-    pub(crate) fn workspace_change_observation_is_current(
-        &self,
-        observation: &WorkspaceChangeObservation,
-    ) -> bool {
-        self.reliable_watcher_generation() == Some(observation.watcher_generation)
-            && self.host_mutation_generation.load(Ordering::Acquire)
-                == observation.host_mutation_generation
     }
 
     pub(crate) fn note_host_workspace_mutation(&self) {

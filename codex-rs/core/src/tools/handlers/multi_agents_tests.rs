@@ -11,8 +11,6 @@ use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context as make_session_and_context_base;
 use crate::session::tests::make_session_and_context_with_rx as make_session_and_context_with_rx_base;
 use crate::session::turn_context::TurnContext;
-use crate::session_prefix::format_inter_agent_completion_message;
-use crate::session_prefix::format_subagent_notification_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
@@ -67,8 +65,6 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
-use codex_protocol::protocol::TaskCompletionGate;
-use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -983,22 +979,30 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         .expect("spawned typed agent should have a config snapshot")
         .session_source;
     let validation_call_id = format!("validation-{}", ThreadId::new());
-    let validation_token = agent_control
-        .task_coordinator()
-        .begin_focused_validation_for_source(
-            &child_source,
-            validation_call_id.clone(),
-            "focused validation".to_string(),
-        )
+    let mut validation_call = codex_agent_task_store::ValidationCall {
+        call_id: validation_call_id.clone(),
+        attempt_id: binding.attempt_id,
+        command_summary: "focused validation".to_string(),
+        evidence: codex_agent_task_store::ValidationEvidence::default(),
+        status: codex_agent_task_store::ValidationCallStatus::Running,
+        recorded_at: chrono::Utc::now(),
+    };
+    task_store
+        .record_validation_call(validation_call.clone())
         .await
-        .expect("validation call should start for the bound attempt")
-        .expect("child source should retain its typed binding");
-    agent_control
-        .task_coordinator()
-        .finish_focused_validation(
-            validation_token,
-            codex_agent_task_store::ValidationCallStatus::Succeeded,
-        )
+        .expect("validation call should start for the bound attempt");
+    validation_call.evidence.validation_result = Some(json!({
+        "argv": ["focused validation"],
+        "coveredPaths": [risk_path.clone()],
+        "callId": validation_call_id.clone(),
+        "processId": null,
+        "status": "succeeded",
+        "durationMs": 1,
+    }));
+    validation_call.status = codex_agent_task_store::ValidationCallStatus::Succeeded;
+    validation_call.recorded_at += chrono::Duration::milliseconds(1);
+    task_store
+        .record_validation_call(validation_call)
         .await
         .expect("validation call should finish for the same bound attempt");
     let (mut child_session, mut child_turn) = make_session_and_context().await;
@@ -2649,7 +2653,6 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
-                completion: None,
                 timing: None,
             }),
         )
@@ -2688,13 +2691,7 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
     assert_eq!(
         worker.agent_status,
         json!({
-            "terminal_with_completion": {
-                "last_agent_message": "typed agent /root/worker finished with status Completed(Some(\"done\")) without submitting a receipt",
-                "completion": {
-                    "status": "blocked",
-                    "reasons": ["durable typed receipt status: needs_main"]
-                }
-            }
+            "errored": "durable typed receipt status: needs_main: typed agent /root/worker finished with status Completed(Some(\"done\")) without submitting a receipt"
         })
     );
     assert_eq!(worker.last_task_message.as_deref(), Some("TaskCapsuleV1"));
@@ -3054,121 +3051,6 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
                 && communication.encrypted_content.as_deref() == Some("continue")
                 && !communication.trigger_turn
     )));
-}
-
-#[tokio::test]
-async fn multi_agent_v2_missing_receipt_notifies_parent_once() {
-    let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
-    let mut config = turn.config.as_ref().clone();
-    let _ = config.features.enable(Feature::MultiAgentV2);
-    set_turn_config(&mut turn, config);
-    let root = manager
-        .start_thread((*turn.config).clone())
-        .await
-        .expect("root thread should start");
-    // Production spawn_agent calls happen after the parent turn has resolved
-    // and stored its runtime; mirror that before using the synthetic handler.
-    root.thread.codex.session.new_default_turn().await;
-    session.services.agent_control = manager.agent_control();
-    session.thread_id = root.thread_id;
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
-
-    SpawnAgentHandlerV2::default()
-        .handle(invocation(
-            session.clone(),
-            turn.clone(),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "boot worker",
-                "task_name": "worker"
-            })),
-        ))
-        .await
-        .expect("spawn worker");
-    let agent_id = session
-        .services
-        .agent_control
-        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
-        .await
-        .expect("worker should resolve");
-    let thread = manager
-        .get_thread(agent_id)
-        .await
-        .expect("worker thread should exist");
-    let worker_path = AgentPath::try_from("/root/worker").expect("worker path");
-
-    let first_turn = thread.codex.session.new_default_turn().await;
-    thread
-        .codex
-        .session
-        .send_event(
-            first_turn.as_ref(),
-            EventMsg::TurnComplete(TurnCompleteEvent {
-                surfaced_result: None,
-                turn_id: first_turn.sub_id.clone(),
-                last_agent_message: Some("first done".to_string()),
-                error: None,
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-                completion: None,
-                timing: None,
-            }),
-        )
-        .await;
-
-    let first_notification = format_inter_agent_completion_message(
-        AgentPath::root(),
-        worker_path.clone(),
-        &AgentStatus::TerminalWithCompletion {
-            last_agent_message: Some(
-                "typed agent /root/worker finished with status Completed(Some(\"first done\")) without submitting a receipt"
-                    .to_string(),
-            ),
-            surfaced_result: None,
-            error: None,
-            completion: TaskCompletionGate {
-                status: TaskCompletionStatus::Blocked,
-                reasons: vec!["durable typed receipt status: needs_main".to_string()],
-                evidence_path: None,
-            },
-        },
-    )
-    .expect("missing-receipt terminal status should render");
-
-    let notifications = timeout(Duration::from_secs(5), async {
-        loop {
-            let notifications = manager
-                .captured_ops()
-                .into_iter()
-                .filter_map(|(id, op)| {
-                    (id == root.thread_id)
-                        .then_some(op)
-                        .and_then(|op| match op {
-                            Op::InterAgentCommunication { communication }
-                                if communication.author == worker_path
-                                    && communication.recipient == AgentPath::root()
-                                    && communication.other_recipients.is_empty()
-                                    && !communication.trigger_turn =>
-                            {
-                                Some(communication.content)
-                            }
-                            _ => None,
-                        })
-                })
-                .collect::<Vec<_>>();
-            if notifications == [first_notification.clone()] {
-                break notifications;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("parent should receive the durable missing-receipt notification");
-
-    assert_eq!(notifications, [first_notification]);
 }
 
 #[tokio::test]
@@ -4919,86 +4801,6 @@ async fn wait_agent_returns_final_status_without_timeout() {
         }
     );
     assert_eq!(success, None);
-}
-
-#[tokio::test]
-async fn wait_agent_and_completion_notification_preserve_completion_gate() {
-    let (mut session, mut turn) = make_session_and_context().await;
-    let mut config = (*turn.config).clone();
-    let _ = config.features.disable(Feature::MultiAgentV2);
-    set_turn_config(&mut turn, config);
-    let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
-    let thread = manager
-        .start_thread(turn.config.as_ref().clone())
-        .await
-        .expect("start thread");
-    let agent_id = thread.thread_id;
-    let child_turn = thread.thread.codex.session.new_default_turn().await;
-    let completion = TaskCompletionGate {
-        status: TaskCompletionStatus::Partial,
-        reasons: vec!["validation is stale".to_string()],
-        evidence_path: Some("task-evidence/thread.json".to_string()),
-    };
-    thread
-        .thread
-        .codex
-        .session
-        .send_event(
-            child_turn.as_ref(),
-            EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: child_turn.sub_id.clone(),
-                last_agent_message: Some("partial".to_string()),
-                surfaced_result: None,
-                error: None,
-                completion: Some(completion.clone()),
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-                timing: None,
-            }),
-        )
-        .await;
-
-    let output = WaitAgentHandler::default()
-        .handle(invocation(
-            Arc::new(session),
-            Arc::new(turn),
-            "wait_agent",
-            function_payload(json!({"targets": [agent_id.to_string()]})),
-        ))
-        .await
-        .expect("wait_agent should return the already-final status");
-    let (content, success) = expect_text_output(output);
-    let result: wait::WaitAgentResult =
-        serde_json::from_str(&content).expect("wait_agent result should be json");
-    let expected_status = AgentStatus::TerminalWithCompletion {
-        last_agent_message: Some("partial".to_string()),
-        surfaced_result: None,
-        error: None,
-        completion,
-    };
-    assert_eq!(
-        result,
-        wait::WaitAgentResult {
-            status: HashMap::from([(agent_id.to_string(), expected_status.clone())]),
-            timed_out: false,
-        }
-    );
-    assert_eq!(success, None);
-
-    let notification = format_subagent_notification_message("worker", &expected_status);
-    assert!(notification.contains("terminal_with_completion"));
-    assert!(notification.contains("task-evidence/thread.json"));
-
-    let inter_agent_message = format_inter_agent_completion_message(
-        AgentPath::root(),
-        AgentPath::try_from("/root/worker").expect("valid worker path"),
-        &expected_status,
-    )
-    .expect("terminal status should render");
-    assert!(inter_agent_message.contains("Completion gate (machine-readable):"));
-    assert!(inter_agent_message.contains("task-evidence/thread.json"));
 }
 
 #[tokio::test]

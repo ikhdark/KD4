@@ -261,15 +261,12 @@ where
     Fut: Future<Output = anyhow::Result<DirectoryListResponse>>,
 {
     let response =
-        fetch_page("/connectors/directory/list_workspace?external_logos=true".to_string()).await;
-    match response {
-        Ok(response) => Ok(response
-            .apps
-            .into_iter()
-            .filter(|app| !is_hidden_directory_app(app))
-            .collect()),
-        Err(_) => Ok(Vec::new()),
-    }
+        fetch_page("/connectors/directory/list_workspace?external_logos=true".to_string()).await?;
+    Ok(response
+        .apps
+        .into_iter()
+        .filter(|app| !is_hidden_directory_app(app))
+        .collect())
 }
 
 fn merge_directory_apps(apps: Vec<DirectoryApp>) -> Vec<DirectoryApp> {
@@ -725,6 +722,136 @@ mod tests {
         );
         assert_eq!(connectors[1].id, "beta");
         assert_eq!(connectors[1].name, "Beta");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "test serializes access to the shared connector cache for its full duration"
+    )]
+    async fn list_all_connectors_retries_workspace_page_after_transient_failure()
+    -> anyhow::Result<()> {
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+
+        let codex_home = TempDir::new()?;
+        let cache_context = cache_context(&codex_home, "workspace-retry");
+        let workspace_calls = Arc::new(AtomicUsize::new(0));
+        let first_workspace_calls = Arc::clone(&workspace_calls);
+
+        let first = list_all_connectors_with_options(
+            cache_context.clone(),
+            /*is_workspace_account*/ true,
+            /*force_refetch*/ false,
+            move |path| {
+                let workspace_calls = Arc::clone(&first_workspace_calls);
+                async move {
+                    if path.starts_with("/connectors/directory/list_workspace") {
+                        workspace_calls.fetch_add(1, Ordering::SeqCst);
+                        anyhow::bail!("transient workspace failure");
+                    }
+                    Ok(DirectoryListResponse {
+                        apps: vec![app("global", "Global")],
+                        next_token: None,
+                    })
+                }
+            },
+        )
+        .await;
+        assert!(first.is_err());
+
+        let second_workspace_calls = Arc::clone(&workspace_calls);
+        let second = list_all_connectors_with_options(
+            cache_context,
+            /*is_workspace_account*/ true,
+            /*force_refetch*/ false,
+            move |path| {
+                let workspace_calls = Arc::clone(&second_workspace_calls);
+                async move {
+                    if path.starts_with("/connectors/directory/list_workspace") {
+                        workspace_calls.fetch_add(1, Ordering::SeqCst);
+                        return Ok(DirectoryListResponse {
+                            apps: vec![app("workspace", "Workspace")],
+                            next_token: None,
+                        });
+                    }
+                    Ok(DirectoryListResponse {
+                        apps: vec![app("global", "Global")],
+                        next_token: None,
+                    })
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(workspace_calls.load(Ordering::SeqCst), 2);
+        assert!(second.iter().any(|connector| connector.id == "workspace"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "test serializes access to the shared connector cache for its full duration"
+    )]
+    async fn failed_workspace_refresh_preserves_complete_cached_listing() -> anyhow::Result<()> {
+        let _cache_guard = CONNECTOR_DIRECTORY_CACHE_TEST_LOCK.lock().await;
+
+        let codex_home = TempDir::new()?;
+        let cache_context = cache_context(&codex_home, "workspace-refresh-failure");
+        list_all_connectors_with_options(
+            cache_context.clone(),
+            /*is_workspace_account*/ true,
+            /*force_refetch*/ false,
+            move |path| async move {
+                if path.starts_with("/connectors/directory/list_workspace") {
+                    return Ok(DirectoryListResponse {
+                        apps: vec![app("workspace", "Workspace")],
+                        next_token: None,
+                    });
+                }
+                Ok(DirectoryListResponse {
+                    apps: vec![app("global", "Global")],
+                    next_token: None,
+                })
+            },
+        )
+        .await?;
+
+        let refresh = list_all_connectors_with_options(
+            cache_context.clone(),
+            /*is_workspace_account*/ true,
+            /*force_refetch*/ true,
+            move |path| async move {
+                if path.starts_with("/connectors/directory/list_workspace") {
+                    anyhow::bail!("transient workspace failure");
+                }
+                Ok(DirectoryListResponse {
+                    apps: vec![app("new-global", "New Global")],
+                    next_token: None,
+                })
+            },
+        )
+        .await;
+        assert!(refresh.is_err());
+
+        let cached = list_all_connectors_with_options(
+            cache_context,
+            /*is_workspace_account*/ true,
+            /*force_refetch*/ false,
+            move |_path| async move {
+                anyhow::bail!("the previous complete listing should remain cached");
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            cached
+                .iter()
+                .map(|connector| connector.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["global", "workspace"]
+        );
         Ok(())
     }
 

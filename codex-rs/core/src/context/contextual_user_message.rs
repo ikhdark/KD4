@@ -3,8 +3,6 @@ use codex_protocol::items::parse_hook_prompt_fragment;
 use codex_protocol::models::ContentItem;
 
 use super::AdditionalContextUserFragment;
-use super::CompletionCheckpointContext;
-use super::CompletionReviewRepair;
 use super::FragmentRegistration;
 use super::FragmentRegistrationProxy;
 use super::InternalModelContextFragment;
@@ -17,7 +15,6 @@ use super::TurnAborted;
 use super::UserInstructions;
 use super::UserShellCommand;
 use super::world_state::EnvironmentsState;
-use super::world_state::TaskEvidenceContext;
 
 // These warnings are no longer produced. The fragment definitions remain here so compaction can
 // recognize messages restored from old sessions.
@@ -108,10 +105,6 @@ static ENVIRONMENT_CONTEXT_REGISTRATION: FragmentRegistrationProxy<EnvironmentsS
     FragmentRegistrationProxy::new();
 static ADDITIONAL_CONTEXT_REGISTRATION: FragmentRegistrationProxy<AdditionalContextUserFragment> =
     FragmentRegistrationProxy::new();
-static COMPLETION_REVIEW_REPAIR_REGISTRATION: FragmentRegistrationProxy<CompletionReviewRepair> =
-    FragmentRegistrationProxy::new();
-static COMPLETION_CHECKPOINT_REGISTRATION: FragmentRegistrationProxy<CompletionCheckpointContext> =
-    FragmentRegistrationProxy::new();
 static SKILL_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<SkillInjection> =
     FragmentRegistrationProxy::new();
 static USER_SHELL_COMMAND_REGISTRATION: FragmentRegistrationProxy<UserShellCommand> =
@@ -138,15 +131,11 @@ static TASK_CAPSULE_REGISTRATION: FragmentRegistrationProxy<TaskCapsuleFragment>
     FragmentRegistrationProxy::new();
 static TASK_MODEL_GUIDANCE_REGISTRATION: FragmentRegistrationProxy<TaskModelGuidance> =
     FragmentRegistrationProxy::new();
-static TASK_EVIDENCE_STATE_REGISTRATION: FragmentRegistrationProxy<TaskEvidenceContext> =
-    FragmentRegistrationProxy::new();
 
 static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &USER_INSTRUCTIONS_REGISTRATION,
     &ENVIRONMENT_CONTEXT_REGISTRATION,
     &ADDITIONAL_CONTEXT_REGISTRATION,
-    &COMPLETION_CHECKPOINT_REGISTRATION,
-    &COMPLETION_REVIEW_REPAIR_REGISTRATION,
     &SKILL_INSTRUCTIONS_REGISTRATION,
     &USER_SHELL_COMMAND_REGISTRATION,
     &TURN_ABORTED_REGISTRATION,
@@ -158,7 +147,6 @@ static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &LEGACY_MODEL_MISMATCH_WARNING_REGISTRATION,
     &TASK_CAPSULE_REGISTRATION,
     &TASK_MODEL_GUIDANCE_REGISTRATION,
-    &TASK_EVIDENCE_STATE_REGISTRATION,
 ];
 
 static STARTUP_CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
@@ -167,7 +155,6 @@ static STARTUP_CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &SKILL_INSTRUCTIONS_REGISTRATION,
     &RECOMMENDED_PLUGINS_REGISTRATION,
     &TASK_MODEL_GUIDANCE_REGISTRATION,
-    &TASK_EVIDENCE_STATE_REGISTRATION,
 ];
 
 fn is_standard_contextual_user_text(text: &str) -> bool {
@@ -190,13 +177,6 @@ pub(crate) fn is_startup_contextual_user_fragment(content_item: &ContentItem) ->
     STARTUP_CONTEXTUAL_USER_FRAGMENTS
         .iter()
         .any(|fragment| fragment.matches_text(text))
-}
-
-pub(crate) fn is_task_evidence_context_fragment(content_item: &ContentItem) -> bool {
-    let ContentItem::InputText { text } = content_item else {
-        return false;
-    };
-    TASK_EVIDENCE_STATE_REGISTRATION.matches_text(text)
 }
 
 pub(crate) fn is_legacy_compaction_warning_fragment(content_item: &ContentItem) -> bool {

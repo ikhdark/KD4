@@ -34,11 +34,7 @@ pub(crate) struct PlanStoreUpdate {
     pub(crate) effect: PlanUpdateEffect,
 }
 
-/// Authoritative session-local TODO/checklist state when durable task evidence
-/// is not enabled.
-///
-/// Durable task evidence owns its plan separately; ordinary plan updates use
-/// this store without depending on that subsystem.
+/// Authoritative session-local TODO/checklist state.
 #[derive(Debug, Default)]
 pub(crate) struct PlanStore {
     current: Mutex<Option<UpdatePlanArgs>>,
@@ -109,14 +105,7 @@ fn same_structure(left: &UpdatePlanArgs, right: &UpdatePlanArgs) -> bool {
 }
 
 fn same_item_structure(left: &PlanItemArg, right: &PlanItemArg) -> bool {
-    left.id == right.id
-        && left.step == right.step
-        && left.depends_on == right.depends_on
-        && left.acceptance_criteria == right.acceptance_criteria
-        && left.runtime_paths == right.runtime_paths
-        && left.generated_artifacts == right.generated_artifacts
-        && left.risks == right.risks
-        && left.validation_route == right.validation_route
+    left.step == right.step
 }
 
 #[cfg(test)]
@@ -129,16 +118,14 @@ mod tests {
         UpdatePlanArgs {
             explanation: None,
             plan: vec![PlanItemArg {
-                id: Some("step-1".to_string()),
                 step: step.to_string(),
                 status,
-                ..Default::default()
             }],
         }
     }
 
     #[tokio::test]
-    async fn classifies_straight_line_plan_updates_without_task_evidence() {
+    async fn classifies_straight_line_checklist_updates() {
         let store = PlanStore::default();
 
         assert_eq!(

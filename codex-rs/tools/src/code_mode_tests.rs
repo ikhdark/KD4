@@ -124,7 +124,7 @@ declare const tools: { apply_patch(input: string, options?: { timeout_ms?: numbe
 }
 
 #[test]
-fn collect_code_mode_tool_definitions_preserves_flattened_name_collisions() {
+fn collect_code_mode_tool_definitions_disambiguates_flattened_name_collisions() {
     let function = |name: &str, description: &str| ResponsesApiTool {
         name: name.to_string(),
         description: description.to_string(),
@@ -148,7 +148,16 @@ fn collect_code_mode_tool_definitions_preserves_flattened_name_collisions() {
     let definitions = collect_code_mode_tool_definitions(&specs);
 
     assert_eq!(definitions.len(), 2);
-    assert!(definitions.iter().all(|tool| tool.name == "acme__lookup"));
+    assert_ne!(
+        codex_code_mode::normalize_code_mode_identifier(&definitions[0].name),
+        codex_code_mode::normalize_code_mode_identifier(&definitions[1].name)
+    );
+    assert!(definitions.iter().any(|tool| tool.name == "acme__lookup"));
+    assert!(
+        definitions
+            .iter()
+            .any(|tool| tool.name.starts_with("acme__lookup__"))
+    );
     assert!(
         definitions
             .iter()
@@ -158,6 +167,11 @@ fn collect_code_mode_tool_definitions_preserves_flattened_name_collisions() {
         definitions
             .iter()
             .any(|tool| tool.tool_name == ToolName::namespaced("acme", "lookup"))
+    );
+    assert!(
+        definitions
+            .iter()
+            .all(|tool| tool.description.contains(&tool.name))
     );
 }
 

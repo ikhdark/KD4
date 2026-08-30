@@ -689,6 +689,30 @@ mod tests {
         assert_eq!(process.terminate_calls.load(Ordering::Acquire), 2);
     }
 
+    #[tokio::test]
+    async fn executor_transport_close_terminates_once() {
+        let process = Arc::new(BlockingExecProcess::new());
+        process.terminate_allowed.send_replace(true);
+        let process_trait: Arc<dyn ExecProcess> = process.clone();
+        let handle = StdioServerProcessHandle::executor(
+            "single-owner-test-server".to_string(),
+            Arc::clone(&process_trait),
+        );
+        let mut transport = StdioServerTransport {
+            inner: StdioServerTransportInner::Executor(ExecutorProcessTransport::new(
+                process_trait,
+                "single-owner-test-server".to_string(),
+            )),
+            process: handle,
+        };
+
+        transport.close().await.expect("transport should close");
+        drop(transport);
+        tokio::task::yield_now().await;
+
+        assert_eq!(process.terminate_calls.load(Ordering::Acquire), 1);
+    }
+
     #[test]
     fn remote_env_policy_uses_core_env_without_remote_source_vars() {
         let policy = ExecutorStdioServerLauncher::remote_env_policy(&[]);

@@ -17,7 +17,6 @@ use crate::protocol::v2::McpToolCallResult;
 use crate::protocol::v2::McpToolCallStatus;
 use crate::protocol::v2::ReasoningPolicyHistory;
 use crate::protocol::v2::SurfacedToolResult;
-use crate::protocol::v2::TaskCompletionGate;
 use crate::protocol::v2::ThreadItem;
 use crate::protocol::v2::Turn;
 use crate::protocol::v2::TurnError as V2TurnError;
@@ -111,7 +110,6 @@ pub struct ThreadHistoryTurnChange {
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub duration_ms: Option<i64>,
-    pub completion: Option<TaskCompletionGate>,
     pub timing: Option<TurnTiming>,
     pub surfaced_result: Option<SurfacedToolResult>,
     pub reasoning_policy_history: Option<ReasoningPolicyHistory>,
@@ -142,7 +140,6 @@ impl ThreadHistoryTurnChange {
             started_at: turn.started_at,
             completed_at: turn.completed_at,
             duration_ms: turn.duration_ms,
-            completion: turn.completion.clone(),
             timing: turn.timing.clone(),
             surfaced_result: turn.surfaced_result.clone(),
             reasoning_policy_history: turn.reasoning_policy_history.clone(),
@@ -157,7 +154,6 @@ impl ThreadHistoryTurnChange {
             started_at: turn.started_at,
             completed_at: turn.completed_at,
             duration_ms: turn.duration_ms,
-            completion: turn.completion.clone(),
             timing: turn.timing.clone(),
             surfaced_result: turn.surfaced_result.clone(),
             reasoning_policy_history: turn.reasoning_policy_history.clone(),
@@ -939,9 +935,7 @@ impl ThreadHistoryBuilder {
     ) {
         let has_receiver = payload.new_thread_id.is_some();
         let status = match &payload.status {
-            AgentStatus::Errored(_)
-            | AgentStatus::TerminalWithCompletion { error: Some(_), .. }
-            | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
+            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
             _ if has_receiver => CollabAgentToolCallStatus::Completed,
             _ => CollabAgentToolCallStatus::Failed,
         };
@@ -992,9 +986,7 @@ impl ThreadHistoryBuilder {
         payload: &codex_protocol::protocol::CollabAgentInteractionEndEvent,
     ) {
         let status = match &payload.status {
-            AgentStatus::Errored(_)
-            | AgentStatus::TerminalWithCompletion { error: Some(_), .. }
-            | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
+            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
             _ => CollabAgentToolCallStatus::Completed,
         };
         let receiver_id = payload.receiver_thread_id.to_string();
@@ -1050,14 +1042,11 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabWaitingEndEvent,
     ) {
-        let status = if payload.statuses.values().any(|status| {
-            matches!(
-                status,
-                AgentStatus::Errored(_)
-                    | AgentStatus::TerminalWithCompletion { error: Some(_), .. }
-                    | AgentStatus::NotFound
-            )
-        }) {
+        let status = if payload
+            .statuses
+            .values()
+            .any(|status| matches!(status, AgentStatus::Errored(_) | AgentStatus::NotFound))
+        {
             CollabAgentToolCallStatus::Failed
         } else {
             CollabAgentToolCallStatus::Completed
@@ -1103,9 +1092,7 @@ impl ThreadHistoryBuilder {
 
     fn handle_collab_close_end(&mut self, payload: &codex_protocol::protocol::CollabCloseEndEvent) {
         let status = match &payload.status {
-            AgentStatus::Errored(_)
-            | AgentStatus::TerminalWithCompletion { error: Some(_), .. }
-            | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
+            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
             _ => CollabAgentToolCallStatus::Completed,
         };
         let receiver_id = payload.receiver_thread_id.to_string();
@@ -1151,9 +1138,7 @@ impl ThreadHistoryBuilder {
         payload: &codex_protocol::protocol::CollabResumeEndEvent,
     ) {
         let status = match &payload.status {
-            AgentStatus::Errored(_)
-            | AgentStatus::TerminalWithCompletion { error: Some(_), .. }
-            | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
+            AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
             _ => CollabAgentToolCallStatus::Completed,
         };
         let receiver_id = payload.receiver_thread_id.to_string();
@@ -1264,7 +1249,6 @@ impl ThreadHistoryBuilder {
             turn.status = abort_status.clone();
             turn.completed_at = payload.completed_at;
             turn.duration_ms = payload.duration_ms;
-            turn.completion = None;
             turn.timing = payload.timing.clone();
             turn.surfaced_result = None;
             ThreadHistoryTurnChange::from_pending_turn(turn)
@@ -1281,7 +1265,6 @@ impl ThreadHistoryBuilder {
                 turn.status = abort_status.clone();
                 turn.completed_at = payload.completed_at;
                 turn.duration_ms = payload.duration_ms;
-                turn.completion = None;
                 turn.timing = payload.timing.clone();
                 turn.surfaced_result = None;
                 let changed_turn = ThreadHistoryTurnChange::from_turn(turn);
@@ -1323,7 +1306,6 @@ impl ThreadHistoryBuilder {
             }
             turn.completed_at = payload.completed_at;
             turn.duration_ms = payload.duration_ms;
-            turn.completion = payload.completion.clone().map(Into::into);
             turn.timing = payload.timing.clone();
             turn.surfaced_result = payload.surfaced_result.clone();
             ThreadHistoryTurnChange::from_pending_turn(turn)
@@ -1354,7 +1336,6 @@ impl ThreadHistoryBuilder {
             }
             turn.completed_at = payload.completed_at;
             turn.duration_ms = payload.duration_ms;
-            turn.completion = payload.completion.clone().map(Into::into);
             turn.timing = payload.timing.clone();
             turn.surfaced_result = payload.surfaced_result.clone();
             let changed_turn = ThreadHistoryTurnChange::from_turn(turn);
@@ -1466,7 +1447,6 @@ impl ThreadHistoryBuilder {
             started_at: None,
             completed_at: None,
             duration_ms: None,
-            completion: None,
             timing: None,
             surfaced_result: None,
             reasoning_policy_history: None,
@@ -1652,7 +1632,6 @@ struct PendingTurn {
     started_at: Option<i64>,
     completed_at: Option<i64>,
     duration_ms: Option<i64>,
-    completion: Option<TaskCompletionGate>,
     timing: Option<TurnTiming>,
     surfaced_result: Option<SurfacedToolResult>,
     reasoning_policy_history: Option<ReasoningPolicyHistory>,
@@ -1694,7 +1673,6 @@ impl From<PendingTurn> for Turn {
             started_at: value.started_at,
             completed_at: value.completed_at,
             duration_ms: value.duration_ms,
-            completion: value.completion,
             timing: value.timing,
             surfaced_result: value.surfaced_result,
             reasoning_policy_history: value.reasoning_policy_history,
@@ -1713,7 +1691,6 @@ impl From<&PendingTurn> for Turn {
             started_at: value.started_at,
             completed_at: value.completed_at,
             duration_ms: value.duration_ms,
-            completion: value.completion.clone(),
             timing: value.timing.clone(),
             surfaced_result: value.surfaced_result.clone(),
             reasoning_policy_history: value.reasoning_policy_history.clone(),
@@ -1943,7 +1920,6 @@ mod tests {
                 turn_id: "turn-1".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2005,7 +1981,6 @@ mod tests {
                 turn_id: "turn-1".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2111,7 +2086,6 @@ mod tests {
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2166,7 +2140,6 @@ mod tests {
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2222,7 +2195,6 @@ mod tests {
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2289,7 +2261,6 @@ mod tests {
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2361,7 +2332,6 @@ mod tests {
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2443,7 +2413,6 @@ mod tests {
                 turn_id: "turn-image".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2462,7 +2431,6 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -2749,7 +2717,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2779,7 +2746,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2826,7 +2792,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2858,7 +2823,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2943,7 +2907,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -3516,7 +3479,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -3562,7 +3524,6 @@ mod tests {
                 turn_id: "turn-b".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -3622,7 +3583,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -3668,7 +3628,6 @@ mod tests {
                 turn_id: "turn-b".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -3860,7 +3819,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -3886,7 +3844,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -3902,7 +3859,6 @@ mod tests {
                 turn_id: "turn-b".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -3962,7 +3918,6 @@ mod tests {
                     message: "Selected model is at capacity. Please try a different model.".into(),
                     codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
                 }),
-                completion: None,
                 completed_at: Some(20),
                 duration_ms: Some(10_000),
                 time_to_first_token_ms: None,
@@ -4001,7 +3956,6 @@ mod tests {
                     started_at: Some(10),
                     completed_at: Some(20),
                     duration_ms: Some(10_000),
-                    completion: None,
                     timing: None,
                     surfaced_result: None,
                     reasoning_policy_history: None,
@@ -4022,7 +3976,6 @@ mod tests {
                     started_at: Some(30),
                     completed_at: None,
                     duration_ms: None,
-                    completion: None,
                     timing: None,
                     surfaced_result: None,
                     reasoning_policy_history: None,
@@ -4054,7 +4007,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -4124,7 +4076,6 @@ mod tests {
                 turn_id: "turn-compact".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -4142,7 +4093,6 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -4200,7 +4150,6 @@ mod tests {
                         status: crate::protocol::v2::CollabAgentStatus::Completed,
                         message: None,
                         surfaced_result: None,
-                        completion: None,
                         last_agent_message: None,
                     },
                 )]
@@ -4211,7 +4160,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstructs_collab_resume_end_preserves_terminal_completion_gate() {
+    fn reconstructs_collab_resume_end_preserves_completed_status() {
         let receiver_thread_id = ThreadId::try_from("00000000-0000-0000-0000-000000000002")
             .expect("valid receiver thread id");
         let events = vec![
@@ -4224,23 +4173,14 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::CollabResumeEnd(codex_protocol::protocol::CollabResumeEndEvent {
-                call_id: "resume-gated".into(),
+                call_id: "resume-completed".into(),
                 completed_at_ms: 0,
                 sender_thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000001")
                     .expect("valid sender thread id"),
                 receiver_thread_id,
                 receiver_agent_nickname: None,
                 receiver_agent_role: None,
-                status: AgentStatus::TerminalWithCompletion {
-                    last_agent_message: Some("partial result".to_string()),
-                    surfaced_result: None,
-                    error: None,
-                    completion: codex_protocol::protocol::TaskCompletionGate {
-                        status: codex_protocol::protocol::TaskCompletionStatus::Partial,
-                        reasons: vec!["validation did not pass".to_string()],
-                        evidence_path: Some("task-evidence/completion.json".to_string()),
-                    },
-                },
+                status: AgentStatus::Completed(Some("result".to_string())),
             }),
         ];
 
@@ -4257,14 +4197,9 @@ mod tests {
             agents_states.get(&receiver_thread_id.to_string()),
             Some(&CollabAgentState {
                 status: crate::protocol::v2::CollabAgentStatus::Completed,
-                message: Some("partial result".to_string()),
+                message: Some("result".to_string()),
                 surfaced_result: None,
-                completion: Some(TaskCompletionGate {
-                    status: crate::protocol::v2::TaskCompletionStatus::Partial,
-                    reasons: vec!["validation did not pass".to_string()],
-                    evidence_path: Some("task-evidence/completion.json".to_string()),
-                }),
-                last_agent_message: Some("partial result".to_string()),
+                last_agent_message: Some("result".to_string()),
             })
         );
     }
@@ -4322,7 +4257,6 @@ mod tests {
                         status: crate::protocol::v2::CollabAgentStatus::Running,
                         message: None,
                         surfaced_result: None,
-                        completion: None,
                         last_agent_message: None,
                     },
                 )]
@@ -4397,7 +4331,6 @@ mod tests {
                         status: crate::protocol::v2::CollabAgentStatus::Interrupted,
                         message: None,
                         surfaced_result: None,
-                        completion: None,
                         last_agent_message: None,
                     },
                 )]
@@ -4462,7 +4395,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -4489,7 +4421,6 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -4512,11 +4443,6 @@ mod tests {
             adapter: "code_mode_cell".to_string(),
             value: serde_json::json!({"answer": 42, "nested": [true, null]}),
             canonical_message: None,
-        };
-        let core_completion = codex_protocol::protocol::TaskCompletionGate {
-            status: codex_protocol::protocol::TaskCompletionStatus::Partial,
-            reasons: vec!["focused validation is stale".to_string()],
-            evidence_path: Some("task-evidence/thread.json".to_string()),
         };
         let timing = TurnTiming {
             schema_version: 7,
@@ -4549,7 +4475,6 @@ mod tests {
                 last_agent_message: None,
                 surfaced_result: Some(surfaced_result.clone()),
                 error: None,
-                completion: Some(core_completion.clone()),
                 completed_at: Some(12),
                 duration_ms: Some(2_500),
                 time_to_first_token_ms: Some(125),
@@ -4563,12 +4488,6 @@ mod tests {
         assert_eq!(turn.completed_at, Some(12));
         assert_eq!(turn.duration_ms, Some(2_500));
         assert_eq!(turn.surfaced_result, Some(surfaced_result));
-        assert_eq!(
-            turn.completion,
-            Some(crate::protocol::v2::TaskCompletionGate::from(
-                core_completion
-            ))
-        );
         assert_eq!(turn.timing, Some(timing));
         assert!(
             turn.items
@@ -4599,7 +4518,6 @@ mod tests {
         let turns = build_turns_from_rollout_items(&items);
         let turn = turns.first().expect("legacy materialized turn");
         assert_eq!(turn.status, TurnStatus::Completed);
-        assert_eq!(turn.completion, None);
         assert_eq!(turn.timing, None);
         assert_eq!(turn.surfaced_result, None);
     }
@@ -4635,7 +4553,6 @@ mod tests {
         assert_eq!(turn.completed_at, Some(21));
         assert_eq!(turn.duration_ms, Some(800));
         assert_eq!(turn.timing, Some(timing));
-        assert_eq!(turn.completion, None);
         assert_eq!(turn.surfaced_result, None);
     }
 
@@ -4692,7 +4609,6 @@ mod tests {
                 last_agent_message: None,
                 surfaced_result: Some(surfaced_result.clone()),
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -4712,7 +4628,6 @@ mod tests {
         assert_eq!(turns[0].surfaced_result, Some(surfaced_result));
         assert_eq!(turns[1].id, "fork-active-turn");
         assert_eq!(turns[1].status, TurnStatus::InProgress);
-        assert_eq!(turns[1].completion, None);
         assert_eq!(turns[1].timing, None);
         assert_eq!(turns[1].surfaced_result, None);
     }
@@ -4737,7 +4652,6 @@ mod tests {
                 last_agent_message: None,
                 surfaced_result: Some(surfaced_result),
                 error: None,
-                completion: None,
                 completed_at: Some(1),
                 duration_ms: Some(1_000),
                 time_to_first_token_ms: None,
@@ -4751,7 +4665,6 @@ mod tests {
         assert_eq!(turns[0].status, TurnStatus::InProgress);
         assert_eq!(turns[0].completed_at, None);
         assert_eq!(turns[0].duration_ms, None);
-        assert_eq!(turns[0].completion, None);
         assert_eq!(turns[0].timing, None);
         assert_eq!(turns[0].surfaced_result, None);
     }
@@ -4785,7 +4698,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -4841,7 +4753,6 @@ mod tests {
                     message: "Selected model is at capacity. Please try a different model.".into(),
                     codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
                 }),
-                completion: None,
                 completed_at: Some(20),
                 duration_ms: Some(10_000),
                 time_to_first_token_ms: None,
@@ -4876,7 +4787,6 @@ mod tests {
                 started_at: Some(10),
                 completed_at: Some(20),
                 duration_ms: Some(10_000),
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -4913,7 +4823,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -4998,7 +4907,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -5046,7 +4954,6 @@ mod tests {
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,
-                    completion: None,
                     timing: None,
                     surfaced_result: None,
                     reasoning_policy_history: None,
@@ -5084,7 +4991,6 @@ mod tests {
                 started_at: Some(10),
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -5186,7 +5092,6 @@ mod tests {
                     started_at: Some(10),
                     completed_at: None,
                     duration_ms: None,
-                    completion: None,
                     timing: None,
                     surfaced_result: None,
                     reasoning_policy_history: None,
@@ -5214,7 +5119,6 @@ mod tests {
                 completed_at: Some(20),
                 duration_ms: Some(123),
                 time_to_first_token_ms: None,
-                completion: None,
                 timing: None,
             }),
         ));
@@ -5230,7 +5134,6 @@ mod tests {
                     started_at: Some(10),
                     completed_at: Some(20),
                     duration_ms: Some(123),
-                    completion: None,
                     timing: None,
                     surfaced_result: None,
                     reasoning_policy_history: None,
@@ -5277,7 +5180,6 @@ mod tests {
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,
-                    completion: None,
                     timing: None,
                     surfaced_result: None,
                     reasoning_policy_history: None,
@@ -5306,7 +5208,6 @@ mod tests {
                 completed_at: Some(20),
                 duration_ms: Some(123),
                 time_to_first_token_ms: None,
-                completion: None,
                 timing: None,
             })),
         ]);
@@ -5322,7 +5223,6 @@ mod tests {
                     started_at: Some(10),
                     completed_at: Some(20),
                     duration_ms: Some(123),
-                    completion: None,
                     timing: None,
                     surfaced_result: None,
                     reasoning_policy_history: None,

@@ -1,0 +1,57 @@
+diff --git a/investigation_cases/repair_ready_signal.py b/investigation_cases/repair_ready_signal.py
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/repair_ready_signal.py
+@@ -0,0 +1,16 @@
++class ReadySignal:
++    def __init__(self):
++        self._ready = False
++        self._callbacks = []
++
++    def mark_ready(self):
++        if self._ready:
++            return
++        self._ready = True
++        callbacks = self._callbacks
++        self._callbacks = []
++        for callback in callbacks:
++            callback()
++
++    def on_ready(self, callback):
++        self._callbacks.append(callback)
+diff --git a/investigation_cases/test_repair_ready_signal.py b/investigation_cases/test_repair_ready_signal.py
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/test_repair_ready_signal.py
+@@ -0,0 +1,31 @@
++import unittest
++
++from repair_ready_signal import ReadySignal
++
++
++class ReadySignalTests(unittest.TestCase):
++    def test_subscriber_before_ready_is_notified(self):
++        signal = ReadySignal()
++        calls = []
++        signal.on_ready(lambda: calls.append("ready"))
++        signal.mark_ready()
++        self.assertEqual(calls, ["ready"])
++
++    def test_subscriber_after_ready_is_notified_immediately(self):
++        signal = ReadySignal()
++        calls = []
++        signal.mark_ready()
++        signal.on_ready(lambda: calls.append("ready"))
++        self.assertEqual(calls, ["ready"])
++
++    def test_repeated_ready_does_not_duplicate_notifications(self):
++        signal = ReadySignal()
++        calls = []
++        signal.on_ready(lambda: calls.append("ready"))
++        signal.mark_ready()
++        signal.mark_ready()
++        self.assertEqual(calls, ["ready"])
++
++
++if __name__ == "__main__":
++    unittest.main()

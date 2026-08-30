@@ -188,13 +188,8 @@ impl HistoryCell for PlanUpdateCell {
 
         let render_step = |status: &StepStatus, text: &str| -> Vec<Line<'static>> {
             let (box_str, step_style) = match status {
-                StepStatus::Passed | StepStatus::Completed => {
-                    ("✔ ", Style::default().crossed_out().dim())
-                }
+                StepStatus::Completed => ("✔ ", Style::default().crossed_out().dim()),
                 StepStatus::InProgress => ("□ ", Style::default().cyan().bold()),
-                StepStatus::Implemented => ("◇ ", Style::default().dim()),
-                StepStatus::Blocked => ("✖ ", Style::default().red().bold()),
-                StepStatus::Skipped => ("– ", Style::default().dim().italic()),
                 StepStatus::Pending => ("□ ", Style::default().dim()),
             };
 
@@ -226,12 +221,6 @@ impl HistoryCell for PlanUpdateCell {
         } else {
             for item in &self.plan {
                 indented_lines.extend(render_step(&item.status, &item.step));
-                if let Some(id) = item.id.as_deref() {
-                    indented_lines.extend(render_note(&format!("id: {id}")));
-                }
-                for criterion in &item.acceptance_criteria {
-                    indented_lines.extend(render_note(&format!("accept: {criterion}")));
-                }
             }
         }
         lines.extend(prefix_lines(indented_lines, "  └ ".dim(), "    ".into()));
@@ -253,15 +242,7 @@ impl HistoryCell for PlanUpdateCell {
             lines.push(Line::from("(no steps provided)"));
         } else {
             for item in &self.plan {
-                let id = item
-                    .id
-                    .as_deref()
-                    .map(|id| format!(" [{id}]"))
-                    .unwrap_or_default();
-                lines.push(Line::from(format!("{:?}{id}: {}", item.status, item.step)));
-                for criterion in &item.acceptance_criteria {
-                    lines.push(Line::from(format!("  accept: {criterion}")));
-                }
+                lines.push(Line::from(format!("{:?}: {}", item.status, item.step)));
             }
         }
         lines

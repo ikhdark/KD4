@@ -1,4 +1,3 @@
-use codex_agent_task_store::ValidationEvidence;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -73,6 +72,7 @@ use crate::unified_exec::process::SpawnLifecycleHandle;
 use crate::unified_exec::process::UnifiedExecProcess;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
+use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::protocol::ExecCommandSource;
@@ -93,11 +93,16 @@ const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
     ("LC_CTYPE", "C.UTF-8"),
     ("LC_ALL", "C.UTF-8"),
     ("COLORTERM", ""),
-    ("PAGER", "more.com"),
-    ("GIT_PAGER", "more.com"),
-    ("GH_PAGER", "more.com"),
+    ("PAGER", UNIFIED_EXEC_PAGER),
+    ("GIT_PAGER", UNIFIED_EXEC_PAGER),
+    ("GH_PAGER", UNIFIED_EXEC_PAGER),
     ("CODEX_CI", "1"),
 ];
+
+#[cfg(windows)]
+const UNIFIED_EXEC_PAGER: &str = "more.com";
+#[cfg(not(windows))]
+const UNIFIED_EXEC_PAGER: &str = "cat";
 const NETWORK_ACCESS_DENIED_MESSAGE: &str =
     "Network access was denied by the Codex sandbox network proxy.";
 const LATE_NETWORK_DENIAL_GRACE_PERIOD: Duration = Duration::from_millis(100);
@@ -122,8 +127,27 @@ fn should_use_deterministic_process_ids() -> bool {
     cfg!(test) || deterministic_process_ids_forced_for_tests()
 }
 
-fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
+fn apply_unified_exec_env(
+    mut env: HashMap<String, String>,
+    policy: &ShellEnvironmentPolicy,
+) -> HashMap<String, String> {
+    if policy.inherit != ShellEnvironmentPolicyInherit::All {
+        return env;
+    }
+
     for (key, value) in UNIFIED_EXEC_ENV {
+        if env
+            .keys()
+            .any(|existing_key| existing_key.eq_ignore_ascii_case(key))
+            || policy.exclude.iter().any(|pattern| pattern.matches(key))
+            || (!policy.include_only.is_empty()
+                && !policy
+                    .include_only
+                    .iter()
+                    .any(|pattern| pattern.matches(key)))
+        {
+            continue;
+        }
         env.insert(key.to_string(), value.to_string());
     }
     env
@@ -143,7 +167,13 @@ fn build_unified_exec_environment(
     );
     let active_permission_profile = context.turn.config.permissions.active_permission_profile();
     inject_permission_profile_env(&mut env, active_permission_profile.as_ref());
-    (apply_unified_exec_env(env), local_policy_env)
+    (
+        apply_unified_exec_env(
+            env,
+            &context.turn.config.permissions.shell_environment_policy,
+        ),
+        local_policy_env,
+    )
 }
 
 fn exec_env_policy_from_shell_policy(
@@ -615,11 +645,6 @@ async fn wait_for_late_network_denial(network_cancelled: Option<CancellationToke
     }
 }
 
-#[cfg(test)]
-pub(super) fn arm_validation_timeout(process: Arc<UnifiedExecProcess>, timeout_ms: Option<u64>) {
-    process.arm_validation_timeout(timeout_ms);
-}
-
 async fn finish_deferred_network_approval_after_process_exit_for_session(
     session: Option<&Arc<crate::session::session::Session>>,
     deferred: Option<DeferredNetworkApproval>,
@@ -637,7 +662,6 @@ async fn finish_deferred_network_approval_after_process_exit_for_session(
 async fn emit_failed_initial_exec_end_if_unstored(
     process_started_alive: bool,
     process: Option<&Arc<UnifiedExecProcess>>,
-    validation_started_at: Instant,
     context: &UnifiedExecContext,
     request: &ExecCommandRequest,
     cwd: PathUri,
@@ -645,32 +669,10 @@ async fn emit_failed_initial_exec_end_if_unstored(
     fallback_output: String,
     message: String,
     wall_time: Duration,
-    validation_exit_code: Option<i32>,
 ) {
     if process_started_alive {
         return;
     }
-
-    let completed_validation = if let Some(launch) = request.validation_launch.as_ref() {
-        context
-            .session
-            .services
-            .command_execution
-            .complete_inline_validation(
-                launch,
-                match process {
-                    Some(process) => process.raw_output_artifact().await,
-                    None => None,
-                },
-                validation_started_at,
-                validation_exit_code,
-                process.is_some_and(|process| process.timed_out()),
-                Some(request.process_id.to_string()),
-            )
-            .await
-    } else {
-        None
-    };
 
     emit_failed_exec_end_for_unified_exec(
         Arc::clone(&context.session),
@@ -687,116 +689,11 @@ async fn emit_failed_initial_exec_end_if_unstored(
             None => None,
         },
         message,
-        request.validation_launch.is_some() && process.is_some_and(|process| process.timed_out()),
+        false,
         wall_time,
         context.tracker.clone(),
-        completed_validation.as_ref(),
     )
     .await;
-}
-
-async fn begin_focused_validation_for_request(
-    request: &mut ExecCommandRequest,
-    context: &UnifiedExecContext,
-) {
-    let Some(validation_launch) = request.validation_launch.as_mut() else {
-        return;
-    };
-    let retained_output_ref = format!(
-        "tool-call:{}:{}",
-        context.session.thread_id, context.call_id
-    );
-    match context
-        .session
-        .services
-        .agent_control
-        .task_coordinator()
-        .begin_focused_validation_for_source_with_evidence(
-            &context.turn.session_source,
-            context.call_id.clone(),
-            request.hook_command.clone(),
-            ValidationEvidence {
-                retained_output_ref: Some(retained_output_ref),
-                ..ValidationEvidence::default()
-            },
-        )
-        .await
-    {
-        Ok(token) => validation_launch.focused_validation_token = token,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                call_id = %context.call_id,
-                "focused unified validation start evidence could not be persisted"
-            );
-        }
-    }
-}
-
-async fn emit_spawned_validation_launch_error_if_needed(
-    registration: &PendingProcessRegistration,
-    request: &mut ExecCommandRequest,
-    context: &UnifiedExecContext,
-    cwd: PathUri,
-    fallback_started_at: Instant,
-    error: &UnifiedExecError,
-) -> bool {
-    if request.validation_launch.is_none() {
-        return false;
-    }
-
-    let process = registration.pending_spawns.snapshot().into_iter().last();
-    let sandbox_denial = match error {
-        UnifiedExecError::SandboxDenied {
-            message, output, ..
-        } => Some((message, output)),
-        _ => None,
-    };
-    if process.is_none() && sandbox_denial.is_none() {
-        return false;
-    }
-
-    begin_focused_validation_for_request(request, context).await;
-    let validation_started_at = process
-        .as_ref()
-        .map_or(fallback_started_at, |process| process.started_at());
-    let (rendered_failure, sandbox_exit_code) = if let Some((message, output)) = sandbox_denial {
-        let rendered_failure = if output.aggregated_output.text.is_empty() {
-            message.clone()
-        } else {
-            output.aggregated_output.text.clone()
-        };
-        (rendered_failure, Some(output.exit_code))
-    } else if let Some(process) = process.as_ref() {
-        let output = process.snapshot_output().await;
-        let rendered_failure = if output.is_empty() {
-            error.to_string()
-        } else {
-            String::from_utf8_lossy(&output).into_owned()
-        };
-        (rendered_failure, None)
-    } else {
-        (error.to_string(), None)
-    };
-    let validation_exit_code = process
-        .as_ref()
-        .and_then(|process| process.exit_code())
-        .or(sandbox_exit_code);
-    emit_failed_initial_exec_end_if_unstored(
-        false,
-        process.as_ref(),
-        validation_started_at,
-        context,
-        request,
-        cwd,
-        Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default())),
-        String::new(),
-        rendered_failure,
-        Instant::now().saturating_duration_since(validation_started_at),
-        validation_exit_code,
-    )
-    .await;
-    true
 }
 
 fn terminate_process_on_network_denial(
@@ -932,6 +829,7 @@ impl UnifiedExecProcessManager {
         mut request: ExecCommandRequest,
         mut process_id_reservation: ProcessIdReservation,
         context: &UnifiedExecContext,
+        cancellation_token: &CancellationToken,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         debug_assert_eq!(request.process_id, process_id_reservation.process_id());
         let mut registration = PendingProcessRegistration::new(
@@ -940,15 +838,24 @@ impl UnifiedExecProcessManager {
             request.attempt_key.clone(),
             request.process_id,
         );
-        let result = self
-            .exec_command_inner(
+        let mut cancelled = false;
+        let result = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                cancelled = true;
+                Err(UnifiedExecError::process_failed(
+                    "unified exec cancelled".to_string(),
+                ))
+            }
+            result = self.exec_command_inner(
                 &mut request,
                 &mut process_id_reservation,
                 context,
                 &mut registration,
-            )
-            .await;
+            ) => result,
+        };
         if result.is_err()
+            && !cancelled
             && let Some(known_delta) = request.known_delta.as_ref()
         {
             known_delta_store::record_execution(
@@ -958,12 +865,30 @@ impl UnifiedExecProcessManager {
             )
             .await;
         }
-        if !registration.committed
-            && let Err(error) = registration.cleanup().await
-        {
-            return Err(UnifiedExecError::process_failed(format!(
-                "unified exec startup cleanup failed: {error}"
-            )));
+        if cancelled && registration.committed {
+            let terminated_processes = self
+                .terminate_unpublished_processes_for_call_ids(std::slice::from_ref(
+                    &context.call_id,
+                ))
+                .await
+                .map_err(|error| {
+                    UnifiedExecError::process_failed(format!(
+                        "unified exec cancellation cleanup failed: {error}"
+                    ))
+                })?;
+            if terminated_processes > 0 {
+                mark_exec_process_exited();
+            }
+        } else if !registration.committed {
+            let process_was_attached = registration.primary_process.is_some();
+            if let Err(error) = registration.cleanup().await {
+                return Err(UnifiedExecError::process_failed(format!(
+                    "unified exec startup cleanup failed: {error}"
+                )));
+            }
+            if cancelled && process_was_attached {
+                mark_exec_process_exited();
+            }
         }
         result
     }
@@ -989,15 +914,6 @@ impl UnifiedExecProcessManager {
         let (launch, mut deferred_network_approval) = match launch {
             Ok((launch, deferred_network_approval)) => (launch, deferred_network_approval),
             Err(err) => {
-                emit_spawned_validation_launch_error_if_needed(
-                    registration,
-                    request,
-                    context,
-                    cwd.clone(),
-                    known_delta_executor_started_at,
-                    &err,
-                )
-                .await;
                 self.release_process_id(request.process_id).await;
                 return Err(err);
             }
@@ -1048,7 +964,6 @@ impl UnifiedExecProcessManager {
                     false,
                     wall_time,
                     context.tracker.clone(),
-                    None,
                 )
                 .await;
                 self.release_process_id(request.process_id).await;
@@ -1061,6 +976,7 @@ impl UnifiedExecProcessManager {
                     max_output_tokens: request.max_output_tokens,
                     process_id: None,
                     exit_code: Some(0),
+                    process_exited: true,
                     original_token_count: Some(approx_token_count(hit.rendered_output())),
                     hook_command: Some(request.hook_command.clone()),
                     raw_output_artifact: Some(hit.raw_output_artifact().clone()),
@@ -1068,10 +984,8 @@ impl UnifiedExecProcessManager {
                 });
             }
         };
-        begin_focused_validation_for_request(request, context).await;
         registration.attach_process(Arc::clone(&process), deferred_network_approval.clone());
-        let executor_was_ready =
-            self.deferred_executor_enabled && self.executor_ready.swap(true, Ordering::AcqRel);
+        let executor_was_ready = self.mark_executor_ready(&request.turn_environment.environment_id);
         let tool_execution_timing_guard = context.turn.turn_timing_state.begin_tool_execution();
         if let Some(deferred) = deferred_network_approval.as_ref() {
             terminate_process_on_network_denial(
@@ -1098,31 +1012,7 @@ impl UnifiedExecProcessManager {
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
         let start = Instant::now();
-        let validation_started_at = request
-            .validation_launch
-            .as_ref()
-            .map_or(start, |_| process.started_at());
-        if let Err(error) = start_streaming_output(&process, context, Arc::clone(&transcript)) {
-            if request.validation_launch.is_some() {
-                let message = error.to_string();
-                let _ = process.fail_and_terminate(message.clone()).await;
-                emit_failed_initial_exec_end_if_unstored(
-                    false,
-                    Some(&process),
-                    validation_started_at,
-                    context,
-                    request,
-                    cwd.clone(),
-                    Arc::clone(&transcript),
-                    String::new(),
-                    message,
-                    start.elapsed(),
-                    None,
-                )
-                .await;
-            }
-            return Err(error);
-        }
+        start_streaming_output(&process, context, Arc::clone(&transcript))?;
         // Persist live sessions before the initial yield wait so handler cancellation cannot
         // orphan the process. Mutating sessions are explicitly terminated when their owning turn
         // reaches a terminal state; non-mutating sessions remain resumable across turns.
@@ -1138,8 +1028,7 @@ impl UnifiedExecProcessManager {
                     request.hook_command.clone(),
                     cwd.clone(),
                     request.turn_environment.environment_id.clone(),
-                    validation_started_at,
-                    request.validation_launch.clone(),
+                    start,
                     request.process_id,
                     process_id_reservation,
                     request.tty,
@@ -1156,35 +1045,7 @@ impl UnifiedExecProcessManager {
                         .map(|_| known_delta_executor_started_at),
                 )
                 .await;
-            if let Err(error) = store_result {
-                if request.validation_launch.is_some() {
-                    let message = error.to_string();
-                    if let Err(termination_error) =
-                        process.fail_and_terminate(message.clone()).await
-                    {
-                        tracing::warn!(
-                            %termination_error,
-                            process_id = request.process_id,
-                            "unstored validation process could not be terminated"
-                        );
-                    }
-                    emit_failed_initial_exec_end_if_unstored(
-                        false,
-                        Some(&process),
-                        validation_started_at,
-                        context,
-                        request,
-                        cwd.clone(),
-                        Arc::clone(&transcript),
-                        String::new(),
-                        message,
-                        start.elapsed(),
-                        None,
-                    )
-                    .await;
-                }
-                return Err(error);
-            }
+            store_result?;
             request.known_delta = None;
             Some(InitialExecCommandGuard {
                 active: initial_exec_command_active,
@@ -1252,7 +1113,6 @@ impl UnifiedExecProcessManager {
             emit_failed_initial_exec_end_if_unstored(
                 process_started_alive,
                 Some(&process),
-                validation_started_at,
                 context,
                 request,
                 cwd.clone(),
@@ -1260,7 +1120,6 @@ impl UnifiedExecProcessManager {
                 text.clone(),
                 message.clone(),
                 wall_time,
-                None,
             )
             .await;
             return Err(self
@@ -1276,7 +1135,6 @@ impl UnifiedExecProcessManager {
             emit_failed_initial_exec_end_if_unstored(
                 process_started_alive,
                 Some(&process),
-                validation_started_at,
                 context,
                 request,
                 cwd.clone(),
@@ -1284,7 +1142,6 @@ impl UnifiedExecProcessManager {
                 text.clone(),
                 message.clone(),
                 wall_time,
-                None,
             )
             .await;
             if let Err(message) = finish_result {
@@ -1297,13 +1154,18 @@ impl UnifiedExecProcessManager {
                 .await);
         }
         let process_id = request.process_id;
-        let (response_process_id, exit_code) = if process_started_alive {
+        let (response_process_id, exit_code, process_exited) = if process_started_alive {
             match self.refresh_process_state(process_id).await {
-                ProcessStatus::Alive {
+                ProcessStatus::Running {
                     exit_code,
                     process_id,
                     ..
-                } => (Some(process_id), exit_code),
+                } => (Some(process_id), exit_code, false),
+                ProcessStatus::OutputPending {
+                    exit_code,
+                    process_id,
+                    ..
+                } => (Some(process_id), exit_code, true),
                 ProcessStatus::Exited { exit_code, entry } => {
                     if let Err(message) =
                         finish_deferred_network_approval_after_process_exit_for_session(
@@ -1317,7 +1179,7 @@ impl UnifiedExecProcessManager {
                             .await);
                     }
                     process.check_for_sandbox_denial_with_text(&text).await?;
-                    (None, exit_code)
+                    (None, exit_code, true)
                 }
                 ProcessStatus::Unknown => {
                     return Err(UnifiedExecError::UnknownProcessId { process_id });
@@ -1335,7 +1197,6 @@ impl UnifiedExecProcessManager {
                 emit_failed_initial_exec_end_if_unstored(
                     process_started_alive,
                     Some(&process),
-                    validation_started_at,
                     context,
                     request,
                     cwd.clone(),
@@ -1343,7 +1204,6 @@ impl UnifiedExecProcessManager {
                     text.clone(),
                     message.clone(),
                     wall_time,
-                    None,
                 )
                 .await;
                 return Err(self
@@ -1352,23 +1212,6 @@ impl UnifiedExecProcessManager {
             }
             let exit_code = process.exit_code();
             let exit = exit_code.unwrap_or(-1);
-            let completed_validation = if let Some(launch) = request.validation_launch.as_ref() {
-                context
-                    .session
-                    .services
-                    .command_execution
-                    .complete_inline_validation(
-                        launch,
-                        process.raw_output_artifact().await,
-                        validation_started_at,
-                        exit_code,
-                        process.timed_out(),
-                        Some(process_id.to_string()),
-                    )
-                    .await
-            } else {
-                None
-            };
             emit_exec_end_for_unified_exec(
                 Arc::clone(&context.session),
                 Arc::clone(&context.turn),
@@ -1381,16 +1224,15 @@ impl UnifiedExecProcessManager {
                 text.clone(),
                 Some(process.snapshot_completion_output().await),
                 exit,
-                process.timed_out(),
+                false,
                 wall_time,
                 context.tracker.clone(),
-                completed_validation.as_ref(),
             )
             .await;
 
             self.release_process_id(request.process_id).await;
             process.check_for_sandbox_denial_with_text(&text).await?;
-            (None, exit_code)
+            (None, exit_code, true)
         };
 
         let original_token_count = approx_token_count(&text);
@@ -1403,6 +1245,7 @@ impl UnifiedExecProcessManager {
             max_output_tokens: request.max_output_tokens,
             process_id: response_process_id,
             exit_code,
+            process_exited,
             original_token_count: Some(original_token_count),
             hook_command: Some(request.hook_command.clone()),
             raw_output_artifact: process.raw_output_artifact().await,
@@ -1475,6 +1318,20 @@ impl UnifiedExecProcessManager {
             .prepare_process_handles(process_id, &locked_process)
             .await?;
         let mut status_after_write = None;
+        let yield_time_ms = {
+            // Empty polls use configurable background timeout bounds. Non-empty
+            // writes keep a fixed max cap so interactive stdin remains responsive.
+            let time_ms = request.yield_time_ms.max(MIN_YIELD_TIME_MS);
+            if request.input.is_empty() {
+                time_ms.clamp(MIN_EMPTY_YIELD_TIME_MS, self.max_write_stdin_yield_time_ms)
+            } else {
+                time_ms.min(MAX_YIELD_TIME_MS)
+            }
+        };
+        // The public yield timeout covers the entire interaction, including the
+        // write and the short process-reaction window below.
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(yield_time_ms);
 
         if !request.input.is_empty() {
             if !tty {
@@ -1485,37 +1342,7 @@ impl UnifiedExecProcessManager {
                 }
             } else {
                 match process.write(request.input.as_bytes()).await {
-                    Ok(()) => {
-                        // Give the remote process a brief window to react so that we are
-                        // more likely to capture its output in the poll below.
-                        let reaction_wait_started_at = Instant::now();
-                        let reaction_timing = active_tool_dispatch_timing();
-                        let reaction_deadline_at_ms = reaction_timing
-                            .as_ref()
-                            .and_then(|timing| timing.deadline_after_ms(100));
-                        if let Some(turn_timing) = reaction_timing
-                            .as_ref()
-                            .and_then(|timing| timing.turn_timing_state())
-                        {
-                            turn_timing.record_next_sample_block_reason(
-                                NextSampleBlockReason::WaitingForProcessCleanup,
-                            );
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        if let Some(timing) = reaction_timing {
-                            timing.record_timer_wait(ToolLifecycleTimerWait {
-                                wait_kind: "write_stdin_process_reaction".to_string(),
-                                requested_timeout_ms: Some(100),
-                                effective_timeout_ms: Some(
-                                    u64::try_from(reaction_wait_started_at.elapsed().as_millis())
-                                        .unwrap_or(u64::MAX),
-                                ),
-                                deadline_at_ms: reaction_deadline_at_ms,
-                                wake_reason: ToolLifecycleWakeReason::Timeout,
-                                sequence: 0,
-                            });
-                        }
-                    }
+                    Ok(()) => {}
                     Err(err) => {
                         let status = self.refresh_process_state(process_id).await;
                         if matches!(status, ProcessStatus::Exited { .. }) {
@@ -1532,18 +1359,6 @@ impl UnifiedExecProcessManager {
             }
         }
 
-        let yield_time_ms = {
-            // Empty polls use configurable background timeout bounds. Non-empty
-            // writes keep a fixed max cap so interactive stdin remains responsive.
-            let time_ms = request.yield_time_ms.max(MIN_YIELD_TIME_MS);
-            if request.input.is_empty() {
-                time_ms.clamp(MIN_EMPTY_YIELD_TIME_MS, self.max_write_stdin_yield_time_ms)
-            } else {
-                time_ms.min(MAX_YIELD_TIME_MS)
-            }
-        };
-        let start = Instant::now();
-        let deadline = start + Duration::from_millis(yield_time_ms);
         let collected = if request.input.is_empty() {
             // Empty stdin is an owner wait, not a fixed-cadence poll. Hold one
             // event-driven observation until meaningful output, exit, or the
@@ -1609,12 +1424,17 @@ impl UnifiedExecProcessManager {
         } else {
             self.refresh_process_state(process_id).await
         };
-        let (process_id, exit_code, event_call_id) = match status {
-            ProcessStatus::Alive {
+        let (process_id, exit_code, process_exited, event_call_id) = match status {
+            ProcessStatus::Running {
                 exit_code,
                 call_id,
                 process_id,
-            } => (Some(process_id), exit_code, call_id),
+            } => (Some(process_id), exit_code, false, call_id),
+            ProcessStatus::OutputPending {
+                exit_code,
+                call_id,
+                process_id,
+            } => (Some(process_id), exit_code, true, call_id),
             ProcessStatus::Exited { exit_code, entry } => {
                 let call_id = entry.call_id.clone();
                 if let Err(message) =
@@ -1624,11 +1444,11 @@ impl UnifiedExecProcessManager {
                         .fail_process_with_message(request.process_id, &entry.process, message)
                         .await);
                 }
-                (None, exit_code, call_id)
+                (None, exit_code, true, call_id)
             }
             ProcessStatus::Unknown => {
                 if process.has_exited() {
-                    (None, process.exit_code(), call_id)
+                    (None, process.exit_code(), true, call_id)
                 } else {
                     return Err(UnifiedExecError::UnknownProcessId {
                         process_id: request.process_id,
@@ -1648,6 +1468,7 @@ impl UnifiedExecProcessManager {
             max_output_tokens: request.max_output_tokens,
             process_id,
             exit_code,
+            process_exited,
             original_token_count: Some(original_token_count),
             hook_command: Some(hook_command),
             raw_output_artifact: process.raw_output_artifact().await,
@@ -1674,8 +1495,14 @@ impl UnifiedExecProcessManager {
                 exit_code,
                 entry: Box::new(entry),
             }
+        } else if entry.process.has_exited() {
+            ProcessStatus::OutputPending {
+                exit_code,
+                call_id: entry.call_id.clone(),
+                process_id,
+            }
         } else {
-            ProcessStatus::Alive {
+            ProcessStatus::Running {
                 exit_code,
                 call_id: entry.call_id.clone(),
                 process_id,
@@ -1738,7 +1565,6 @@ impl UnifiedExecProcessManager {
         cwd: PathUri,
         environment_id: String,
         started_at: Instant,
-        validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
         process_id: u32,
         process_id_reservation: &mut ProcessIdReservation,
         tty: bool,
@@ -1821,8 +1647,6 @@ impl UnifiedExecProcessManager {
                 process_id,
                 attempt_key,
                 raw_output_artifact.clone(),
-                validation_launch,
-                started_at,
             )
             .await
         {
@@ -1865,7 +1689,6 @@ impl UnifiedExecProcessManager {
         process_id: u32,
         command: SandboxCommand,
         options: ExecOptions,
-        validation_timeout_ms: Option<u64>,
         additional_permissions_uri: Option<
             &codex_protocol::request_permissions::UriAdditionalPermissionProfile,
         >,
@@ -1896,7 +1719,6 @@ impl UnifiedExecProcessManager {
             process_id,
             &request,
             tty,
-            validation_timeout_ms,
             spawn_lifecycle,
             raw_output_artifact,
             environment,
@@ -1920,7 +1742,6 @@ impl UnifiedExecProcessManager {
         process_id: u32,
         request: &ExecRequest,
         tty: bool,
-        validation_timeout_ms: Option<u64>,
         mut spawn_lifecycle: SpawnLifecycleHandle,
         raw_output_artifact: Option<crate::tools::command_output_artifact::RawOutputArtifact>,
         environment: &codex_exec_server::Environment,
@@ -2009,7 +1830,6 @@ impl UnifiedExecProcessManager {
                 request.sandbox,
                 spawn_lifecycle,
                 raw_output_artifact,
-                validation_timeout_ms,
                 pending_spawns,
             )
             .await;
@@ -2031,7 +1851,6 @@ impl UnifiedExecProcessManager {
             return UnifiedExecProcess::from_exec_server_started(
                 started,
                 raw_output_artifact,
-                validation_timeout_ms,
                 pending_spawns,
             )
             .await;
@@ -2080,7 +1899,6 @@ impl UnifiedExecProcessManager {
             request.sandbox,
             spawn_lifecycle,
             raw_output_artifact,
-            validation_timeout_ms,
             pending_spawns,
         )
         .await
@@ -2632,8 +2450,16 @@ impl UnifiedExecProcessManager {
             entries
         };
 
-        for (process_id, process) in processes {
-            if let Err(err) = process.terminate_confirmed().await {
+        let termination_results = futures::future::join_all(processes.into_iter().map(
+            |(process_id, process)| async move {
+                let result = process.terminate_confirmed().await;
+                (process_id, process, result)
+            },
+        ))
+        .await;
+
+        for (process_id, process, result) in termination_results {
+            if let Err(err) = result {
                 tracing::warn!(
                     process_id,
                     %err,
@@ -2792,7 +2618,12 @@ impl UnifiedExecProcessManager {
 }
 
 enum ProcessStatus {
-    Alive {
+    Running {
+        exit_code: Option<i32>,
+        call_id: String,
+        process_id: u32,
+    },
+    OutputPending {
         exit_code: Option<i32>,
         call_id: String,
         process_id: u32,

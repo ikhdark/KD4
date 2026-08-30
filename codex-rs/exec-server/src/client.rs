@@ -865,8 +865,8 @@ impl ExecServerClient {
                         }
                     }
                     Some(Err(error)) => {
-                        cleanup_process_start(&client, &process_id, &state).await;
                         let _ = result_tx.send(Err(error));
+                        cleanup_process_start(&client, &process_id, &state).await;
                     }
                 }
             };
@@ -1559,6 +1559,8 @@ async fn handle_server_notification(
 
 #[cfg(test)]
 mod tests {
+    use codex_exec_server_protocol::JSONRPCError;
+    use codex_exec_server_protocol::JSONRPCErrorError;
     use codex_exec_server_protocol::JSONRPCMessage;
     use codex_exec_server_protocol::JSONRPCNotification;
     use codex_exec_server_protocol::JSONRPCResponse;
@@ -1972,6 +1974,139 @@ mod tests {
 
         let _ = release_server_tx.send(());
         server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn process_start_error_precedes_cleanup_completion() {
+        let (client_stdin, server_reader) = duplex(1 << 20);
+        let (mut server_writer, client_stdout) = duplex(1 << 20);
+        let (cleanup_started_tx, cleanup_started_rx) = oneshot::channel();
+        let (release_cleanup_tx, release_cleanup_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_reader).lines();
+            let initialize = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request) if request.method == INITIALIZE_METHOD => request,
+                other => panic!("expected initialize request, got {other:?}"),
+            };
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: initialize.id,
+                    result: serde_json::to_value(InitializeResponse {
+                        session_id: "failed-start".to_string(),
+                    })
+                    .expect("initialize response should serialize"),
+                }),
+            )
+            .await;
+            assert!(matches!(
+                read_jsonrpc_line(&mut lines).await,
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == INITIALIZED_METHOD
+            ));
+
+            let start = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request) if request.method == EXEC_METHOD => request,
+                other => panic!("expected process start request, got {other:?}"),
+            };
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Error(JSONRPCError {
+                    id: start.id,
+                    error: JSONRPCErrorError {
+                        code: -32000,
+                        message: "process rejected".to_string(),
+                        data: None,
+                    },
+                }),
+            )
+            .await;
+
+            let terminate = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request) if request.method == EXEC_TERMINATE_METHOD => {
+                    request
+                }
+                other => panic!("expected cleanup terminate request, got {other:?}"),
+            };
+            cleanup_started_tx
+                .send(())
+                .expect("cleanup observer should remain open");
+            let _ = release_cleanup_rx.await;
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Response(JSONRPCResponse {
+                    id: terminate.id,
+                    result: serde_json::to_value(TerminateResponse { running: false })
+                        .expect("terminate response should serialize"),
+                }),
+            )
+            .await;
+        });
+
+        let client = ExecServerClient::connect(
+            JsonRpcConnection::from_stdio(
+                client_stdout,
+                client_stdin,
+                "failed-start-client".to_string(),
+            ),
+            ExecServerClientConnectOptions::default(),
+        )
+        .await
+        .expect("client should connect");
+        let process_id = ProcessId::from("failed-start-process");
+        let start_client = client.clone();
+        let start_process_id = process_id.clone();
+        let mut start_task = tokio::spawn(async move {
+            start_client
+                .start_process(ExecParams {
+                    process_id: start_process_id,
+                    argv: vec!["missing-command".to_string()],
+                    cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
+                        .expect("cwd URI"),
+                    env_policy: None,
+                    env: HashMap::new(),
+                    tty: false,
+                    pipe_stdin: false,
+                    arg0: None,
+                    sandbox: None,
+                    enforce_managed_network: false,
+                    managed_network: None,
+                })
+                .await
+        });
+
+        timeout(Duration::from_secs(1), cleanup_started_rx)
+            .await
+            .expect("cleanup should start")
+            .expect("cleanup observer should remain open");
+        let start_result = timeout(Duration::from_secs(1), &mut start_task)
+            .await
+            .expect("the original start error must not wait for cleanup")
+            .expect("start task should finish");
+        let error = match start_result {
+            Ok(_) => panic!("process start should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("process rejected"));
+
+        let _ = release_cleanup_tx.send(());
+        server.await.expect("server task should finish");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let active_process_starts = client
+                    .inner
+                    .connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active_process_starts;
+                if active_process_starts == 0 && client.inner.get_session(&process_id).is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed start cleanup should release provisional state");
     }
 
     async fn accept_websocket(listener: &TcpListener) -> WebSocketStream<TcpStream> {

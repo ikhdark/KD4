@@ -43,6 +43,7 @@ enum NextProjectRead {
 struct ControlledFileSystem {
     target: AbsolutePathBuf,
     next_project_read: StdMutex<NextProjectRead>,
+    target_metadata: StdMutex<Option<FileMetadata>>,
     target_stream_calls: AtomicUsize,
 }
 
@@ -51,6 +52,7 @@ impl ControlledFileSystem {
         Self {
             target,
             next_project_read: StdMutex::new(NextProjectRead::Normal),
+            target_metadata: StdMutex::new(None),
             target_stream_calls: AtomicUsize::new(0),
         }
     }
@@ -64,6 +66,13 @@ impl ControlledFileSystem {
 
     fn target_stream_calls(&self) -> usize {
         self.target_stream_calls.load(Ordering::SeqCst)
+    }
+
+    fn set_target_metadata(&self, metadata: FileMetadata) {
+        *self
+            .target_metadata
+            .lock()
+            .expect("project metadata control lock") = Some(metadata);
     }
 }
 
@@ -141,7 +150,18 @@ impl ExecutorFileSystem for ControlledFileSystem {
         path: &'a PathUri,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileMetadata> {
-        LOCAL_FS.get_metadata(path, sandbox)
+        Box::pin(async move {
+            if path.to_abs_path()? == self.target
+                && let Some(metadata) = self
+                    .target_metadata
+                    .lock()
+                    .expect("project metadata control lock")
+                    .clone()
+            {
+                return Ok(metadata);
+            }
+            LOCAL_FS.get_metadata(path, sandbox).await
+        })
     }
 
     fn read_directory<'a>(
@@ -250,7 +270,7 @@ async fn repository_stable_context_reuse_is_scoped_to_one_manager() {
 }
 
 #[tokio::test]
-async fn unchanged_source_metadata_skips_project_file_read() {
+async fn unchanged_source_metadata_reloads_project_file() {
     let root = tempfile::tempdir().expect("workspace");
     fs::write(root.path().join("AGENTS.md"), "stable instructions").expect("write AGENTS.md");
     let config = config_for(&root).await;
@@ -269,8 +289,42 @@ async fn unchanged_source_metadata_skips_project_file_read() {
     let second = second_observation.loaded.expect("metadata-cached load");
 
     assert_eq!(second_observation.freshness, AgentsMdFreshness::Refreshed);
-    assert_eq!(filesystem.target_stream_calls(), 1);
+    assert_eq!(filesystem.target_stream_calls(), 2);
     assert!(Arc::ptr_eq(&first, &second));
+}
+
+#[tokio::test]
+async fn same_size_same_metadata_rewrite_refreshes_project_instructions() {
+    let root = tempfile::tempdir().expect("workspace");
+    let agents_path = root.path().join("AGENTS.md");
+    fs::write(&agents_path, "version one").expect("write AGENTS.md");
+    let config = config_for(&root).await;
+    let filesystem = Arc::new(ControlledFileSystem::new(config.cwd.join("AGENTS.md")));
+    let environment = Arc::new(Environment::default_for_tests_with_filesystem(
+        filesystem.clone(),
+    ));
+    let environments = environment_snapshot_with_environment(&config.cwd, 3, environment);
+    let manager = AgentsMdManager::new(/*user_instructions*/ None);
+
+    let first = manager
+        .refresh_and_get_loaded(&config, &environments)
+        .await
+        .expect("first load");
+    let metadata = LOCAL_FS
+        .get_metadata(&PathUri::from_abs_path(&config.cwd.join("AGENTS.md")), None)
+        .await
+        .expect("AGENTS.md metadata");
+    filesystem.set_target_metadata(metadata);
+    fs::write(&agents_path, "version two").expect("replace same-size AGENTS.md");
+
+    let second = manager
+        .refresh_and_get_loaded(&config, &environments)
+        .await
+        .expect("second load");
+
+    assert_eq!(filesystem.target_stream_calls(), 2);
+    assert_eq!(second.text(), "version two");
+    assert!(!Arc::ptr_eq(&first, &second));
 }
 
 #[tokio::test]

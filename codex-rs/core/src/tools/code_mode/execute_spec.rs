@@ -71,14 +71,17 @@ SOURCE: /[\s\S]+/
     }
 
     #[test]
-    fn optimization_priority_code_mode_defaults_to_a_narrow_packet_with_an_explicit_escape_hatch() {
+    fn code_mode_defaults_to_the_hard_cap_without_forcing_a_recovery_call() {
         let exec_description = codex_code_mode::build_exec_tool_description(true, false, &[]);
 
-        assert!(exec_description.contains("defaults to 4000 tokens"));
-        assert!(codex_code_mode::build_wait_tool_description().contains("default to 4000 tokens"));
+        assert!(exec_description.contains("defaults to the 10000-token hard cap"));
+        assert!(
+            codex_code_mode::build_wait_tool_description()
+                .contains("default to the 10000-token hard cap")
+        );
         assert_eq!(
             codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
-            4_000
+            codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL
         );
         assert_eq!(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL, 10_000);
     }

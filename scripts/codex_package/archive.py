@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .layout import MANAGED_PACKAGE_PATHS
+
 ZSTD_PATH_ENV = "CODEX_ZSTD"
 ZSTD_SHA256_ENV = "CODEX_ZSTD_SHA256"
 
@@ -155,7 +156,11 @@ def write_tar_archive(
 
         with archive_path.open("wb") as raw:
             with gzip.GzipFile(
-                filename="", fileobj=raw, mode="wb", compresslevel=compresslevel, mtime=0
+                filename="",
+                fileobj=raw,
+                mode="wb",
+                compresslevel=compresslevel,
+                mtime=0,
             ) as compressed:
                 with tarfile.open(fileobj=compressed, mode="w") as archive:
                     write_tar_entries(archive, package_dir, entries=entries)
@@ -238,7 +243,7 @@ def write_zip_archive(
             member_name = f"{relative_path}/" if path.is_dir() else relative_path
             info = zipfile.ZipInfo(member_name, date_time=(1980, 1, 1, 0, 0, 0))
             info.create_system = 3
-            info.external_attr = ((0o755 if path.is_dir() else 0o644) << 16)
+            info.external_attr = (0o755 if path.is_dir() else 0o644) << 16
             archive.writestr(
                 info,
                 b"" if path.is_dir() else path.read_bytes(),

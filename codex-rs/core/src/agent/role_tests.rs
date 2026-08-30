@@ -4,7 +4,6 @@ use crate::config::ConfigBuilder;
 use crate::skills_load_input_from_config;
 use codex_config::ConfigLayerStackOrdering;
 use codex_core_plugins::PluginsManager;
-use codex_features::Feature;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -110,24 +109,6 @@ async fn apply_explorer_role_sets_read_only_permissions() {
         );
     }
     assert_eq!(session_flags_layer_count(&config), before_layers + 1);
-}
-
-#[tokio::test]
-async fn disabled_completion_review_does_not_disable_the_typed_reviewer_role() {
-    let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-    let _ = config.features.disable(Feature::TaskCompletionReviewer);
-
-    assert!(!config.features.enabled(Feature::TaskCompletionReviewer));
-    assert!(resolve_role_config(&config, "reviewer").is_some());
-    let locks = apply_role_to_config(&mut config, Some("reviewer"))
-        .await
-        .expect("the generic typed Reviewer remains available");
-
-    assert!(locks.permissions);
-    assert_eq!(
-        config.permissions.permission_profile(),
-        &PermissionProfile::read_only()
-    );
 }
 
 #[test]

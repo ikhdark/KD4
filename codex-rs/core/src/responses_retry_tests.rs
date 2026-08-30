@@ -1,5 +1,14 @@
 use super::*;
+use codex_protocol::error::ConnectionFailedError;
 use codex_protocol::error::UnexpectedResponseError;
+use codex_protocol::protocol::InternalSessionSource;
+
+fn connection_failed() -> CodexErr {
+    CodexErr::ConnectionFailed(ConnectionFailedError {
+        message: "network is unreachable".to_string(),
+        status: None,
+    })
+}
 
 fn unexpected_status(status: StatusCode) -> CodexErr {
     CodexErr::UnexpectedStatus(UnexpectedResponseError {
@@ -72,6 +81,24 @@ fn unauthorized_status_skips_every_outer_response_retry() {
 }
 
 #[test]
+fn deterministic_4xx_do_not_retry_or_fallback() {
+    for status in [
+        StatusCode::BAD_REQUEST,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+        StatusCode::METHOD_NOT_ALLOWED,
+        StatusCode::UNPROCESSABLE_ENTITY,
+    ] {
+        let error = unexpected_status(status);
+        assert!(
+            !should_retry_response_stream(ResponsesStreamRequest::Sampling, &error),
+            "status {status}"
+        );
+        assert!(!should_switch_fallback_transport(&error), "status {status}");
+    }
+}
+
+#[test]
 fn region_restricted_status_skips_every_outer_response_retry() {
     let error = CodexErr::RegionRestricted(UnexpectedResponseError {
         status: StatusCode::FORBIDDEN,
@@ -132,4 +159,72 @@ async fn retry_backoff_is_cancelled_by_owner() {
     let result = wait_for_retry_delay(Duration::from_secs(60), &cancellation_token).await;
 
     assert!(matches!(result, Err(CodexErr::TurnAborted)));
+}
+
+#[test]
+fn lost_connection_on_a_sampling_turn_waits_instead_of_spending_the_retry_budget() {
+    assert!(should_wait_for_connection_recovery(
+        ResponsesStreamRequest::Sampling,
+        &connection_failed(),
+        &SessionSource::VSCode,
+        &ModelProviderInfo::default(),
+    ));
+}
+
+#[test]
+fn connection_recovery_wait_is_limited_to_user_facing_sampling_turns() {
+    // Compaction requests stay on the bounded budget so they cannot stall a turn.
+    for request in [
+        ResponsesStreamRequest::LocalCompaction,
+        ResponsesStreamRequest::RemoteCompactionV2,
+    ] {
+        assert!(!should_wait_for_connection_recovery(
+            request,
+            &connection_failed(),
+            &SessionSource::VSCode,
+            &ModelProviderInfo::default(),
+        ));
+    }
+
+    // Internal sessions must fail fast for their callers.
+    assert!(!should_wait_for_connection_recovery(
+        ResponsesStreamRequest::Sampling,
+        &connection_failed(),
+        &SessionSource::Internal(InternalSessionSource::MemoryConsolidation),
+        &ModelProviderInfo::default(),
+    ));
+
+    // Bedrock reports unrelated failures through the same error class.
+    assert!(!should_wait_for_connection_recovery(
+        ResponsesStreamRequest::Sampling,
+        &connection_failed(),
+        &SessionSource::VSCode,
+        &ModelProviderInfo::create_amazon_bedrock_provider(None),
+    ));
+
+    // Non-connection transport errors keep the bounded retry path.
+    assert!(!should_wait_for_connection_recovery(
+        ResponsesStreamRequest::Sampling,
+        &CodexErr::RequestTimeout,
+        &SessionSource::VSCode,
+        &ModelProviderInfo::default(),
+    ));
+}
+
+#[test]
+fn connection_retry_delay_backs_off_and_is_bounded() {
+    let initial = ResponsesStreamRetryState::default().connection_retry_delay;
+    assert_eq!(initial, INITIAL_CONNECTION_RETRY_DELAY);
+
+    assert_eq!(next_connection_retry_delay(initial), initial * 2);
+    assert_eq!(
+        next_connection_retry_delay(MAX_CONNECTION_RETRY_DELAY),
+        MAX_CONNECTION_RETRY_DELAY
+    );
+
+    let mut delay = initial;
+    for _ in 0..16 {
+        delay = next_connection_retry_delay(delay);
+    }
+    assert_eq!(delay, MAX_CONNECTION_RETRY_DELAY);
 }

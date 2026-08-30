@@ -60,28 +60,44 @@ fn derive_exec_args() {
 }
 
 #[test]
-fn compatibility_shells_cannot_derive_execution_arguments() {
+fn unix_style_shells_derive_exact_script_arguments() {
     for shell_type in [ShellType::Bash, ShellType::Zsh, ShellType::Sh] {
         let shell = Shell {
             shell_type,
             shell_path: PathBuf::from(shell_type.name()),
         };
-        let error = shell
-            .derive_exec_args("echo hello", /*use_login_shell*/ false)
-            .expect_err("compatibility-only shell must not execute");
-        assert!(error.to_string().contains("cannot execute on Windows"));
+        assert_eq!(
+            shell
+                .derive_exec_args("echo hello", /*use_login_shell*/ false)
+                .expect("unix-style shell args"),
+            vec![shell_type.name(), "-c", "echo hello"]
+        );
+        assert_eq!(
+            shell
+                .derive_exec_args("echo hello", /*use_login_shell*/ true)
+                .expect("unix-style login shell args"),
+            vec![shell_type.name(), "-lc", "echo hello"]
+        );
     }
 }
 
 #[test]
-fn compatibility_environment_shells_are_rejected() {
+fn remote_environment_shells_preserve_reported_type_and_path() {
     for name in ["bash", "zsh", "sh"] {
-        let error = Shell::from_environment_shell_info(ShellInfo {
+        let path = format!("/remote/bin/{name}");
+        let shell = Shell::from_environment_shell_info(ShellInfo {
             name: name.to_string(),
-            path: format!("/{name}"),
+            path: path.clone(),
         })
-        .expect_err("compatibility-only remote shell must not be selected");
-        assert!(error.to_string().contains("cannot execute on Windows"));
+        .expect("reported remote shell must be selected");
+        assert_eq!(shell.name(), name);
+        assert_eq!(shell.shell_path, PathBuf::from(&path));
+        assert_eq!(
+            shell
+                .derive_exec_args("printf remote", /*use_login_shell*/ false)
+                .expect("remote shell args"),
+            vec![path, "-c".to_string(), "printf remote".to_string()]
+        );
     }
 }
 

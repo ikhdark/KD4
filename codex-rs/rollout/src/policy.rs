@@ -99,7 +99,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::TurnAborted(_)
         | EventMsg::TurnStarted(_)
         | EventMsg::TurnComplete(_)
-        | EventMsg::TurnTerminalizationComplete(_)
         | EventMsg::ReasoningPolicySummary(_)
         | EventMsg::ThreadSettingsApplied(_) => true,
 
@@ -187,12 +186,7 @@ mod tests {
     use codex_protocol::protocol::ReasoningPolicySnapshot;
     use codex_protocol::protocol::ReasoningPolicySource;
     use codex_protocol::protocol::ReasoningPolicyTrigger;
-    use codex_protocol::protocol::TerminalizationDeliveryState;
-    use codex_protocol::protocol::TerminalizationRecoveryState;
     use codex_protocol::protocol::ThreadHistoryMode;
-    use codex_protocol::protocol::TurnTerminalizationCompleteEvent;
-    use codex_protocol::protocol::TurnTerminalizationReceipt;
-    use codex_protocol::protocol::TurnTimingTerminalization;
 
     fn snapshot() -> ReasoningPolicySnapshot {
         ReasoningPolicySnapshot {
@@ -236,25 +230,6 @@ mod tests {
         });
         for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
             assert!(!should_persist_event_msg(&event, history_mode));
-        }
-    }
-
-    #[test]
-    fn terminalization_receipts_are_durable() {
-        let event = EventMsg::TurnTerminalizationComplete(TurnTerminalizationCompleteEvent {
-            turn_id: "turn-1".to_string(),
-            receipt: TurnTerminalizationReceipt {
-                terminal_identity: "terminal-1".to_string(),
-                terminalization: TurnTimingTerminalization::default(),
-                delivery_state: TerminalizationDeliveryState::Delivered,
-                active_turn_detached: true,
-                terminal_interaction_released: true,
-                recovery_state: TerminalizationRecoveryState::None,
-                deadline_exhausted_phase: None,
-            },
-        });
-        for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
-            assert!(should_persist_event_msg(&event, history_mode));
         }
     }
 }

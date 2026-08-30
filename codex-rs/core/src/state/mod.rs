@@ -16,7 +16,6 @@ pub(crate) use turn::PendingRequestPermissions;
 pub(crate) use turn::RunningTask;
 pub(crate) use turn::SamplingAdmission;
 pub(crate) use turn::TaskKind;
-pub(crate) use turn::TerminalDeliveryState;
 pub(crate) use turn::TerminalWakeResult;
 pub(crate) use turn::ToolCallAcceptanceGate;
 pub(crate) use turn::TurnState;

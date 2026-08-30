@@ -321,21 +321,7 @@ impl Session {
         let startup_prewarm_session = Arc::clone(self);
         let startup_transport = self.take_session_startup_transport().await;
         let startup_prewarm = tokio::spawn(async move {
-            let preconnected_session = match startup_transport {
-                Some(startup_transport) => match startup_transport.resolve().await {
-                    SessionStartupTransportResolution::Ready(client_session) => {
-                        Some(*client_session)
-                    }
-                    SessionStartupTransportResolution::Unavailable => {
-                        return Err(CodexErr::Stream(
-                            "startup websocket preconnect was unavailable; deferring transport retry to the first send boundary"
-                                .to_string(),
-                            None,
-                        ));
-                    }
-                },
-                None => None,
-            };
+            let preconnected_session = resolve_startup_transport(startup_transport).await;
             let result = schedule_startup_prewarm_inner(
                 startup_prewarm_session,
                 base_instructions,
@@ -383,6 +369,18 @@ impl Session {
     }
 }
 
+async fn resolve_startup_transport(
+    startup_transport: Option<SessionStartupTransportHandle>,
+) -> Option<ModelClientSession> {
+    match startup_transport {
+        Some(startup_transport) => match startup_transport.resolve().await {
+            SessionStartupTransportResolution::Ready(client_session) => Some(*client_session),
+            SessionStartupTransportResolution::Unavailable => None,
+        },
+        None => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -411,6 +409,17 @@ mod tests {
         SessionStartupTransportHandle::new(task).abort().await;
 
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn failed_startup_transport_is_soft_for_remaining_prewarm() {
+        let task =
+            tokio::spawn(async { Err(CodexErr::Stream("preconnect failed".to_string(), None)) });
+
+        let preconnected_session =
+            resolve_startup_transport(Some(SessionStartupTransportHandle::new(task))).await;
+
+        assert!(preconnected_session.is_none());
     }
 }
 

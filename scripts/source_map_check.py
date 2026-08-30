@@ -275,7 +275,11 @@ def sync_tracked_path_snapshot(
     root = repo_root if repo_root is not None else source_map.resolve().parent
     raw_markdown = source_map.read_bytes().decode("utf-8")
     newline = "\r\n" if "\r\n" in raw_markdown else "\n"
-    sources = source_paths if source_paths is not None else repository_tracked_source_paths(root)
+    sources = (
+        source_paths
+        if source_paths is not None
+        else repository_tracked_source_paths(root)
+    )
     snapshot = render_tracked_path_snapshot(sources, newline=newline)
     block_re = re.compile(
         rf"{re.escape(TRACKED_PATH_SNAPSHOT_BEGIN)}.*?"
@@ -392,9 +396,7 @@ def check_source_map(
                 else repository_source_paths(root)
             )
             tracked_sources = (
-                tracked_source_paths
-                if tracked_source_paths is not None
-                else sources
+                tracked_source_paths if tracked_source_paths is not None else sources
             )
     except (OSError, UnicodeError, ValueError) as exc:
         print(f"{source_map}: {exc}", file=sys.stderr)

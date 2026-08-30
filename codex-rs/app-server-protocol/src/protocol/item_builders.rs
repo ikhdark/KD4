@@ -201,7 +201,7 @@ pub fn build_item_from_guardian_event(
             Some(ThreadItem::CommandExecution {
                 id: id.clone(),
                 command,
-                cwd: cwd.clone().into(),
+                cwd: cwd.clone(),
                 process_id: None,
                 source: CommandExecutionSource::Agent,
                 status,
@@ -228,16 +228,17 @@ pub fn build_item_from_guardian_event(
                 vec![CommandAction::Unknown {
                     command: command.clone(),
                 }]
+            } else if let Some(cwd_uri) = cwd.to_inferred_path_uri() {
+                command_actions_for_path_uri(&parsed_cmd, &cwd_uri)
             } else {
-                parsed_cmd
-                    .into_iter()
-                    .map(|parsed| CommandAction::from_core_with_cwd(parsed, cwd))
-                    .collect()
+                vec![CommandAction::Unknown {
+                    command: command.clone(),
+                }]
             };
             Some(ThreadItem::CommandExecution {
                 id: id.clone(),
                 command,
-                cwd: cwd.clone().into(),
+                cwd: cwd.clone(),
                 process_id: None,
                 source: CommandExecutionSource::Agent,
                 status,

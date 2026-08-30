@@ -1,0 +1,44 @@
+diff --git a/investigation_cases/repair_dependent_failure.py b/investigation_cases/repair_dependent_failure.py
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/repair_dependent_failure.py
+@@ -0,0 +1,6 @@
++def apply_then_consume(producer, consumer):
++    try:
++        value = producer()
++    except RuntimeError:
++        return None
++    return consumer(value)
+diff --git a/investigation_cases/test_repair_dependent_failure.py b/investigation_cases/test_repair_dependent_failure.py
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/test_repair_dependent_failure.py
+@@ -0,0 +1,28 @@
++import unittest
++
++from repair_dependent_failure import apply_then_consume
++
++
++class ApplyThenConsumeTests(unittest.TestCase):
++    def test_producer_failure_propagates_without_consuming(self):
++        calls = []
++        failure = RuntimeError("write failed")
++
++        def producer():
++            raise failure
++
++        def consumer(value):
++            calls.append(value)
++
++        with self.assertRaises(RuntimeError) as raised:
++            apply_then_consume(producer, consumer)
++
++        self.assertIs(raised.exception, failure)
++        self.assertEqual(calls, [])
++
++    def test_successful_value_is_consumed(self):
++        self.assertEqual(apply_then_consume(lambda: 4, lambda value: value + 1), 5)
++
++
++if __name__ == "__main__":
++    unittest.main()

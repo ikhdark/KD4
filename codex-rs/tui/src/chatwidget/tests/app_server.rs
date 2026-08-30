@@ -87,7 +87,6 @@ fn start_safety_buffering_test_turn(
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -464,7 +463,6 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
                         status: AppServerCollabAgentStatus::PendingInit,
                         message: None,
                         surfaced_result: None,
-                        completion: None,
                         last_agent_message: None,
                     },
                 )]),
@@ -540,7 +538,6 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -580,7 +577,6 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
         ServerNotification::TurnCompleted(TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -590,7 +586,6 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -625,7 +620,6 @@ async fn live_reasoning_policy_phase_updates_the_working_status() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -663,47 +657,6 @@ async fn live_reasoning_policy_phase_updates_the_working_status() {
 }
 
 #[tokio::test]
-async fn live_app_server_turn_completed_renders_completion_gate() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    chat.handle_server_notification(
-        ServerNotification::TurnCompleted(TurnCompletedNotification {
-            surfaced_result: None,
-            thread_id: "thread-1".to_string(),
-            completion: Some(codex_app_server_protocol::TaskCompletionGate {
-                status: codex_app_server_protocol::TaskCompletionStatus::Partial,
-                reasons: vec!["focused validation is stale".to_string()],
-                evidence_path: Some("task-evidence/thread.json".to_string()),
-            }),
-            turn: AppServerTurn {
-                id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: Vec::new(),
-                status: AppServerTurnStatus::Completed,
-                error: None,
-                started_at: None,
-                completed_at: Some(0),
-                duration_ms: None,
-                completion: None,
-                timing: None,
-                surfaced_result: None,
-                reasoning_policy_history: None,
-            },
-            timing: None,
-        }),
-        /*replay_kind*/ None,
-    );
-
-    let rendered = drain_insert_history(&mut rx)
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(rendered.contains("Task completion gate: partial"));
-    assert!(rendered.contains("focused validation is stale"));
-}
-
-#[tokio::test]
 async fn live_app_server_turn_started_sets_feedback_turn_id() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -719,7 +672,6 @@ async fn live_app_server_turn_started_sets_feedback_turn_id() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1078,7 +1030,6 @@ async fn live_app_server_collab_wait_items_render_history() {
                             status: AppServerCollabAgentStatus::Completed,
                             message: Some("Done".to_string()),
                             surfaced_result: None,
-                            completion: None,
                             last_agent_message: None,
                         },
                     ),
@@ -1088,7 +1039,6 @@ async fn live_app_server_collab_wait_items_render_history() {
                             status: AppServerCollabAgentStatus::Running,
                             message: None,
                             surfaced_result: None,
-                            completion: None,
                             last_agent_message: None,
                         },
                     ),
@@ -1154,7 +1104,6 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
                         status: AppServerCollabAgentStatus::PendingInit,
                         message: None,
                         surfaced_result: None,
-                        completion: None,
                         last_agent_message: None,
                     },
                 )]),
@@ -1190,7 +1139,6 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1221,7 +1169,6 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
         ServerNotification::TurnCompleted(TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1235,7 +1182,6 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1299,7 +1245,6 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1362,7 +1307,6 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -1408,7 +1352,6 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
                 started_at: Some(0),
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,

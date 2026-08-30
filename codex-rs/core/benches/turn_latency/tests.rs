@@ -13,6 +13,65 @@ fn benchmark_cli_rejects_test_harness_only_command() {
     assert!(parse_command_from(strings(&["ab_overlay_"])).is_err());
 }
 
+#[test]
+fn benchmark_rollback_retries_the_turn_in_progress_error() {
+    let event = EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+        message: TURN_IN_PROGRESS_ROLLBACK_ERROR.to_string(),
+        codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
+    });
+
+    assert_eq!(
+        benchmark_rollback_event_action(&event).expect("turn-in-progress rollback is retryable"),
+        BenchmarkRollbackEventAction::Retry
+    );
+}
+
+#[test]
+fn benchmark_rollback_fails_other_errors_immediately() {
+    let event = EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+        message: "thread rollback requires persisted thread history".to_string(),
+        codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
+    });
+
+    let error = benchmark_rollback_event_action(&event)
+        .expect_err("non-transient rollback failures must not wait for the deadline");
+    assert!(
+        error
+            .to_string()
+            .contains("thread rollback requires persisted thread history")
+    );
+}
+
+#[test]
+fn ab_fixtures_pin_the_complete_baseline_reasoning_policy() {
+    assert_eq!(
+        ab_reasoning_phase_efforts(),
+        ReasoningPhaseEfforts {
+            orient: Some(ReasoningEffort::High),
+            inspect: Some(ReasoningEffort::Low),
+            implement: Some(ReasoningEffort::High),
+            diagnose: Some(ReasoningEffort::High),
+            verify: Some(ReasoningEffort::Low),
+            finalize: Some(ReasoningEffort::Low),
+            deterministic_continuation: Some(ReasoningEffort::Low),
+        }
+    );
+    let legacy_fixture =
+        format!("prompt=legacy_nested_dispatch\nsource={CODE_MODE_NESTED_DISPATCH_SOURCE}");
+    let policy_fixture_hash = sha256_bytes(
+        format!("reasoning_phase_efforts={AB_REASONING_PHASE_EFFORTS_ID}\n{legacy_fixture}")
+            .as_bytes(),
+    );
+    assert_eq!(
+        ab_fixture_hash(AbWorkload::CodeModeNestedDispatch),
+        policy_fixture_hash
+    );
+    assert_ne!(
+        ab_fixture_hash(AbWorkload::CodeModeNestedDispatch),
+        sha256_bytes(legacy_fixture.as_bytes())
+    );
+}
+
 fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
     let (direct_count, nested_count) = if action_first { (10, 6) } else { (19, 16) };
     let retained_exec_index = direct_count - 4;
@@ -119,7 +178,6 @@ fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
                 name: "actionable_success".to_string(),
                 logical_generations: if action_first { 4 } else { 10 },
                 terminal_event: "turn_complete".to_string(),
-                completion_status: Some("passed".to_string()),
                 application_result: "passed".to_string(),
                 typed_error_count: 0,
                 final_response_present: true,
@@ -135,7 +193,6 @@ fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
                     "error"
                 }
                 .to_string(),
-                completion_status: action_first.then(|| "passed".to_string()),
                 application_result: if action_first { "passed" } else { "failed" }.to_string(),
                 typed_error_count: u32::from(!action_first),
                 final_response_present: action_first,
@@ -146,7 +203,6 @@ fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
                 name: "retained_process_abort".to_string(),
                 logical_generations: if action_first { 3 } else { 4 },
                 terminal_event: "turn_aborted".to_string(),
-                completion_status: None,
                 application_result: "canceled".to_string(),
                 typed_error_count: 0,
                 final_response_present: false,
@@ -214,6 +270,156 @@ fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
     }
 }
 
+fn injected_replay_timing_sample(base_ns: u64) -> Sample {
+    Sample {
+        controllable_duration_ns: base_ns + 1,
+        preparation_ns: base_ns + 2,
+        sampling_to_call_ns: base_ns + 3,
+        post_tool_handoff_ns: base_ns + 4,
+        parallel_gate_wait_ns: base_ns + 5,
+        persistence_union_ns: base_ns + 6,
+        finalization_ns: base_ns + 7,
+        ..Sample::default()
+    }
+}
+
+#[test]
+fn tool_result_correctness_replay_merges_actual_failure_sample() {
+    let action = injected_replay_timing_sample(100);
+    let failure = injected_replay_timing_sample(1_000);
+    let retained_abort = injected_replay_timing_sample(10_000);
+    let expected = AbLatencyMetric::REPLAY
+        .iter()
+        .filter(|metric| metric.name() != "end_to_end")
+        .map(|metric| {
+            (
+                metric.name(),
+                metric
+                    .value(&action)
+                    .saturating_add(metric.value(&failure))
+                    .saturating_add(metric.value(&retained_abort)),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut baseline = Some(action);
+    merge_high_volume_sample(&mut baseline, failure);
+    merge_high_volume_sample(&mut baseline, retained_abort);
+    let baseline = baseline
+        .as_ref()
+        .expect("three replay turns must produce one baseline sample");
+    let actual = AbLatencyMetric::REPLAY
+        .iter()
+        .filter(|metric| metric.name() != "end_to_end")
+        .map(|metric| (metric.name(), metric.value(baseline)))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        actual, expected,
+        "every gated replay timing lane must equal the exact sum of action, required-failure, and retained-abort timing"
+    );
+}
+
+#[test]
+fn tool_result_correctness_replay_error_waits_for_turn_complete_without_cleanup_generation() {
+    let stack_size = AB_WORKER_STACK_BYTES
+        .parse::<usize>()
+        .expect("benchmark worker stack size must be valid");
+    std::thread::Builder::new()
+        .name("replay-error-terminal".to_string())
+        .stack_size(stack_size)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build replay error-terminal runtime");
+            runtime.block_on(
+                session_replay_error_waits_for_turn_complete_without_cleanup_generation_fixture(),
+            );
+        })
+        .expect("spawn replay error-terminal thread")
+        .join()
+        .expect("replay error-terminal thread must not panic");
+}
+
+async fn session_replay_error_waits_for_turn_complete_without_cleanup_generation_fixture() {
+    let server = start_mock_server().await;
+    let request_capture = HighVolumeRequestCapture::default();
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .and(request_capture.clone())
+        .respond_with(
+            wiremock::ResponseTemplate::new(500)
+                .insert_header("content-type", "application/json")
+                .set_body_string(
+                    serde_json::json!({
+                        "error": {
+                            "type": "bad_request",
+                            "message": "required replay exec failure"
+                        }
+                    })
+                    .to_string(),
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        })
+        .build(&server)
+        .await
+        .expect("start replay error-terminal fixture");
+    let fixture = ReplayActionFixture {
+        _server: server,
+        test,
+        request_capture,
+        action_response_stage: Arc::new(AtomicUsize::new(0)),
+        failure_response_stage: Arc::new(AtomicUsize::new(0)),
+    };
+
+    let (sample, requests, terminalized, turns) = fixture.turn(AB_REPLAY_FAILURE_PROMPT).await;
+
+    assert!(
+        terminalized,
+        "the provider error must terminalize the replay subturn"
+    );
+    assert_eq!(turns, 1, "terminalization must not submit a cleanup turn");
+    assert_eq!(requests.len(), 1, "the measured subturn has one request");
+    assert_eq!(
+        fixture.request_capture.request_count(),
+        1,
+        "no unmeasured provider request may follow terminalization"
+    );
+    assert_eq!(sample.terminal_event, "turn_complete");
+    assert_eq!(sample.typed_error_count, 1);
+    assert_eq!(sample.failure_terminalized_subturns, 1);
+    assert_eq!(sample.logical_generations, 1);
+    assert_eq!(sample.provider_attempts, 1);
+    assert_eq!(sample.sampling_requests, 1);
+    assert!(
+        sample.inclusive_duration_ns > 0,
+        "the sample must come from the authoritative TurnComplete timing"
+    );
+    assert!(
+        sample.failure_codes.is_empty(),
+        "{:#?}",
+        sample.failure_codes
+    );
+}
+
+#[test]
+fn tool_result_correctness_replay_error_signal_is_not_terminal() {
+    assert!(!replay_terminal_signal_is_terminal(
+        ReplayTerminalSignal::Error
+    ));
+    assert!(replay_terminal_signal_is_terminal(
+        ReplayTerminalSignal::MatchingTurnComplete
+    ));
+}
+
 fn valid_session_replay_cluster() -> AbPairedCluster {
     AbPairedCluster {
         cluster: 1,
@@ -278,7 +484,15 @@ fn accepted_batch_report_for_import() -> AbReport {
                 pairs_per_cluster,
             )
             .expect("accepted workload verdict");
-            assert!(verdict.passed);
+            assert!(
+                verdict.passed,
+                "workload `{}` must produce an accepted verdict: stop_reason={:?} gates={} diagnostics={:?} violations={:?}",
+                workload.name(),
+                verdict.stop_reason,
+                verdict.latency_gates.len(),
+                verdict.latency_diagnostics,
+                verdict.correctness_violations
+            );
             let sequential_look = AbSequentialLook {
                 pairs_per_cluster,
                 total_pairs: pairs_per_cluster * config.clusters,
@@ -673,6 +887,10 @@ fn valid_high_volume_sample(duration_ns: u64) -> Sample {
         machine_duration_ns: duration_ns,
         controllable_duration_ns: duration_ns,
         preparation_ns: duration_ns,
+        // Real high-volume samples always report a non-zero pre-first-output
+        // span, so the fixture must populate it too; leaving it zero made the
+        // metric uncomputable here while it gates fine against live samples.
+        pre_first_output_ns: duration_ns,
         sampling_to_call_ns: duration_ns,
         logical_generations: (AB_HIGH_VOLUME_SUBTURNS * 2) as u32,
         provider_attempts: (AB_HIGH_VOLUME_SUBTURNS * 2) as u32,
@@ -804,13 +1022,13 @@ fn valid_request_cache_sample(workload: AbWorkload, duration_ns: u64, sequence: 
     let direct_tool_calls = workload.expected_direct_tool_calls();
     let tool_call_graph = if direct_tool_calls == 1 {
         vec![AbToolGraphCallCompat {
-                call_id: "request-cache-direct-call".to_string(),
-                execution_id: "request-cache-execution".to_string(),
-                tool_name: "update_plan".to_string(),
-                source: Some("direct".to_string()),
-                parent_call_id: None,
-                sampling_generation_id: Some("request-cache-generation".to_string()),
-                workload_generation_index: None,
+            call_id: "request-cache-direct-call".to_string(),
+            execution_id: "request-cache-execution".to_string(),
+            tool_name: "update_plan".to_string(),
+            source: Some("direct".to_string()),
+            parent_call_id: None,
+            sampling_generation_id: Some("request-cache-generation".to_string()),
+            workload_generation_index: None,
         }]
     } else {
         Vec::new()
@@ -888,16 +1106,25 @@ fn paired_request_cache_clusters(
     a_duration_ns: u64,
     b_duration_ns: u64,
 ) -> Vec<AbPairedCluster> {
+    paired_request_cache_clusters_with_pairs(workload, a_duration_ns, b_duration_ns, AB_ITERATIONS)
+}
+
+fn paired_request_cache_clusters_with_pairs(
+    workload: AbWorkload,
+    a_duration_ns: u64,
+    b_duration_ns: u64,
+    pairs_per_cluster: usize,
+) -> Vec<AbPairedCluster> {
     (1..=AB_CLUSTERS)
         .map(|cluster| AbPairedCluster {
             cluster,
-            a_first: (0..AB_ITERATIONS)
+            a_first: (0..pairs_per_cluster)
                 .map(|index| a_runs_first(cluster, index))
                 .collect(),
-            a_samples: (0..AB_ITERATIONS)
+            a_samples: (0..pairs_per_cluster)
                 .map(|index| valid_request_cache_sample(workload, a_duration_ns, index))
                 .collect(),
-            b_samples: (0..AB_ITERATIONS)
+            b_samples: (0..pairs_per_cluster)
                 .map(|index| valid_request_cache_sample(workload, b_duration_ns, index))
                 .collect(),
             a_warmup_failures: 0,
@@ -1025,7 +1252,6 @@ fn valid_tool_gate_sample(workload: AbWorkload, duration_ns: u64) -> Sample {
             complete: true,
         }),
         terminal_event: "turn_complete".to_string(),
-        completion_status: Some("not_applicable".to_string()),
         final_response_present: true,
         sampling_requests: workload.expected_logical_generations(),
         tool_calls: direct_tool_calls,
@@ -1118,7 +1344,6 @@ fn valid_retained_exec_sample(duration_ns: u64) -> Sample {
             complete: true,
         }),
         terminal_event: "turn_complete".to_string(),
-        completion_status: Some("not_applicable".to_string()),
         typed_error_count: 0,
         final_response_present: true,
         retained_write_stdin_poll_count: 2,
@@ -1745,35 +1970,21 @@ fn ab_overlay_warmup_failure_details_retain_actionable_codes() {
     let mut coded_failure = valid_ab_sample(50);
     coded_failure.failed = true;
     coded_failure.failure_codes = vec!["tool_output_count".to_string()];
-    let detail = ab_warmup_failure_detail(
-        2,
-        "B",
-        AbWorkload::SingleDirectToolCall,
-        &coded_failure,
-    )
-    .expect("candidate failure should be retained");
+    let detail = ab_warmup_failure_detail(2, "B", AbWorkload::SingleDirectToolCall, &coded_failure)
+        .expect("candidate failure should be retained");
     assert_eq!(detail.warmup_index, 2);
     assert_eq!(detail.failure_codes, ["tool_output_count"]);
 
     let mut uncoded_failure = valid_ab_sample(50);
     uncoded_failure.failed = true;
-    let detail = ab_warmup_failure_detail(
-        1,
-        "B",
-        AbWorkload::SingleDirectToolCall,
-        &uncoded_failure,
-    )
-    .expect("uncoded failures should remain diagnosable");
+    let detail =
+        ab_warmup_failure_detail(1, "B", AbWorkload::SingleDirectToolCall, &uncoded_failure)
+            .expect("uncoded failures should remain diagnosable");
     assert_eq!(detail.failure_codes, ["failed_without_failure_code"]);
 
     assert!(
-        ab_warmup_failure_detail(
-            0,
-            "A",
-            AbWorkload::ParallelSafeTripleDirect,
-            &coded_failure,
-        )
-        .is_none(),
+        ab_warmup_failure_detail(0, "A", AbWorkload::ParallelSafeTripleDirect, &coded_failure,)
+            .is_none(),
         "declared baseline-only defects must remain diagnostic"
     );
 }
@@ -1827,6 +2038,77 @@ fn ab_overlay_hierarchical_bootstrap_preserves_pairs_and_clusters() {
 }
 
 #[test]
+fn ab_overlay_incremental_gate_accepts_non_regression_and_rejects_regression() {
+    let unchanged = hierarchical_paired_bootstrap(
+        &paired_clusters(100, 100),
+        AbLatencyMetric::ControllableTurn,
+    )
+    .expect("an unchanged incremental candidate should bootstrap");
+    assert_eq!(unchanged.target_ratio, 1.0);
+    assert_eq!(unchanged.median_ratio_ucb_limit, 1.05);
+    assert_eq!(unchanged.p95_ratio_ucb_limit, 1.10);
+    assert!(unchanged.passed);
+
+    let regressed = hierarchical_paired_bootstrap(
+        &paired_clusters(100, 120),
+        AbLatencyMetric::ControllableTurn,
+    )
+    .expect("a regressed incremental candidate should remain measurable");
+    assert!(!regressed.passed);
+}
+
+#[test]
+fn ab_overlay_final_profile_balances_independent_clusters_and_worker_repetition() {
+    let config = AbExecutionProfile::Final.config();
+
+    assert_eq!(config.warmups, 3);
+    assert_eq!(config.clusters, 14);
+    assert_eq!(config.looks, [10]);
+    assert_eq!(config.clusters * config.max_pairs_per_cluster(), 140);
+    assert_eq!(config.ucb_quantile(), 1.0 - AB_FAMILY_WISE_ALPHA);
+}
+
+#[test]
+fn ab_overlay_rejects_end_to_end_regression_when_internal_lanes_improve() {
+    let mut clusters = paired_clusters(100, 50);
+    for cluster in &mut clusters {
+        for sample in &mut cluster.a_samples {
+            sample.pre_first_output_ns = 100;
+        }
+        for sample in &mut cluster.b_samples {
+            sample.duration_ns = 200;
+            sample.pre_first_output_ns = 50;
+        }
+    }
+
+    let verdict = evaluate_ab_workload(
+        &clusters,
+        AbWorkloadClass::Latency,
+        AbWorkload::CodeModeNestedDispatch,
+    )
+    .expect("a complete-turn regression must remain measurable");
+
+    assert!(verdict.correctness_violations.is_empty());
+    assert_eq!(verdict.decision, AbSequentialDecision::Failed);
+    assert_eq!(verdict.stop_reason, AbStopReason::LatencyClearFailure);
+    let end_to_end = verdict
+        .latency_gates
+        .iter()
+        .find(|gate| gate.metric == "end_to_end")
+        .expect("the hard latency contract must include total turn duration");
+    assert!(!end_to_end.passed);
+    assert_eq!(end_to_end.point_median_ratio, 2.0);
+    assert!(
+        verdict
+            .latency_gates
+            .iter()
+            .filter(|gate| gate.metric != "end_to_end")
+            .all(|gate| gate.passed),
+        "the synthetic internal timing lanes all improve"
+    );
+}
+
+#[test]
 fn ab_overlay_zero_or_missing_a_duration_invalidates_comparison() {
     let clusters = paired_clusters(0, 1);
     let error = hierarchical_paired_bootstrap(&clusters, AbLatencyMetric::ControllableTurn)
@@ -1834,7 +2116,12 @@ fn ab_overlay_zero_or_missing_a_duration_invalidates_comparison() {
     assert!(error.to_string().contains("zero A duration"));
 
     let quick = AbExecutionProfile::Quick.config();
-    let mut advisory = paired_request_cache_clusters(AbWorkload::LongHistoryNoToolInitial, 0, 1);
+    let mut advisory = paired_request_cache_clusters_with_pairs(
+        AbWorkload::LongHistoryNoToolInitial,
+        0,
+        1,
+        quick.max_pairs_per_cluster(),
+    );
     advisory.truncate(quick.clusters);
     for cluster in &mut advisory {
         cluster.a_first.truncate(quick.max_pairs_per_cluster());
@@ -2091,7 +2378,9 @@ fn ab_overlay_high_volume_workload_shape_and_parentage_are_exact() {
     let workload = AbWorkload::CodeModeHighVolume;
     assert_eq!(workload.class(), AbWorkloadClass::CorrectnessOnly);
     assert!(!workload.allows_raw_baseline_behavior());
-    assert!(workload.latency_metrics().is_empty());
+    // Both sides run identical work, so this workload reports advisory latency
+    // gates rather than going unmeasured.
+    assert!(!workload.latency_metrics().is_empty());
     let shape = workload.report_shape();
     assert_eq!(shape.subturns_per_sample, 16);
     assert_eq!(shape.logical_generations_per_sample, 32);
@@ -2132,6 +2421,15 @@ fn ab_overlay_high_volume_workload_shape_and_parentage_are_exact() {
     assert_eq!(clusters[0].b_samples[0].logical_generations, 32);
     assert_eq!(clusters[0].b_samples[0].failure_terminalized_subturns, 0);
 
+    clusters[0].b_samples[0].convoy_count = 32;
+    assert!(
+        !ab_correctness_violations(&clusters, workload.class(), workload)
+            .iter()
+            .any(|violation| violation.contains("convoy_count")),
+        "concurrent high-volume update_plan mutations must retain their required same-workspace serialization"
+    );
+    clusters[0].b_samples[0].convoy_count = 0;
+
     let one_pair = ab_cluster_prefixes(&clusters, 1)
         .expect("high-volume correctness gate should accept one paired prefix");
     let verdict = evaluate_ab_workload_with_config(
@@ -2145,7 +2443,15 @@ fn ab_overlay_high_volume_workload_shape_and_parentage_are_exact() {
     assert!(verdict.passed);
     assert_eq!(verdict.decision, AbSequentialDecision::Passed);
     assert_eq!(verdict.stop_reason, AbStopReason::CorrectnessOnlyComplete);
-    assert!(verdict.latency_gates.is_empty());
+    // Advisory gates are recorded so a latency regression here is visible in the
+    // report, but they must not change the verdict: this workload still passes
+    // on correctness alone.
+    assert_eq!(
+        verdict.latency_gates.len(),
+        workload.latency_metrics().len(),
+        "advisory gates must be recorded for the high-volume workload: diagnostics={:?}",
+        verdict.latency_diagnostics
+    );
     assert!(verdict.latency_diagnostics.is_empty());
 
     let a = &mut clusters[0].a_samples[0];
@@ -2993,11 +3299,19 @@ fn ab_overlay_abort_direct_nested_in_flight_is_exact_and_routable() {
 
     let mut missing_handler_exit = nested_call.clone();
     missing_handler_exit.handler_exit_at_ms = None;
+    assert_eq!(
+        tool_call_lifecycle_diagnostic_for_requirement(
+            &missing_handler_exit,
+            AbToolLifecycleRequirement::TerminalAbort,
+        ),
+        None,
+        "terminal abort timing stops before supervised handler cleanup completes",
+    );
     let missing_diagnostic = tool_call_lifecycle_diagnostic_for_requirement(
         &missing_handler_exit,
-        AbToolLifecycleRequirement::TerminalAbort,
+        AbToolLifecycleRequirement::Full,
     )
-    .expect("terminal abort must still reject a missing handler-return boundary");
+    .expect("non-abort timing must reject a missing handler-return boundary");
     assert!(
         missing_diagnostic
             .missing_boundaries
@@ -3086,7 +3400,6 @@ fn ab_overlay_abort_direct_nested_in_flight_is_exact_and_routable() {
     );
     clusters[0].b_samples[0] = valid_abort_direct_nested_sample();
     clusters[0].b_samples[0].terminal_event = "turn_complete".to_string();
-    clusters[0].b_samples[0].completion_status = Some("passed".to_string());
     clusters[0].b_samples[0].forged_turn_complete_observed = true;
     assert!(
         ab_correctness_violations(&clusters, workload.class(), workload)
@@ -3282,12 +3595,91 @@ fn ab_overlay_abort_retained_process_is_exact_and_routable() {
     );
     clusters[0].b_samples[0] = valid_abort_retained_process_sample();
     clusters[0].b_samples[0].terminal_event = "turn_complete".to_string();
-    clusters[0].b_samples[0].completion_status = Some("passed".to_string());
     clusters[0].b_samples[0].forged_turn_complete_observed = true;
     assert!(
         ab_correctness_violations(&clusters, workload.class(), workload)
             .iter()
             .any(|violation| violation.contains("abort_retained_process_lifecycle"))
+    );
+}
+
+#[tokio::test]
+async fn abort_retained_process_cleanup_waits_past_the_terminal_event() {
+    let polls = AtomicUsize::new(0);
+
+    assert!(
+        wait_for_retained_process_cleanup(|| {
+            let complete = polls.fetch_add(1, Ordering::SeqCst) > 0;
+            async move { complete }
+        })
+        .await
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn retained_process_cleanup_poll_supersedes_terminal_live_process_snapshot() {
+    let mut cleaned = Sample {
+        unexpected_live_processes: 1,
+        ..Sample::default()
+    };
+    apply_retained_process_cleanup_observation(&mut cleaned, true);
+    assert!(cleaned.retained_process_cleanup_complete);
+    assert_eq!(cleaned.unexpected_live_processes, 0);
+
+    let mut still_live = Sample {
+        unexpected_live_processes: 1,
+        ..Sample::default()
+    };
+    apply_retained_process_cleanup_observation(&mut still_live, false);
+    assert!(!still_live.retained_process_cleanup_complete);
+    assert_eq!(still_live.unexpected_live_processes, 1);
+}
+
+#[test]
+fn correctness_only_workloads_report_advisory_latency_gates() {
+    // `code_mode_high_volume` runs identical work on both sides, so a silent
+    // latency regression there previously surfaced as `passed` with zero
+    // recorded gates. It must now carry measurable gates.
+    assert!(
+        !AbWorkload::CodeModeHighVolume.latency_metrics().is_empty(),
+        "code_mode_high_volume must publish latency metrics"
+    );
+    assert!(
+        AbWorkload::CodeModeHighVolume
+            .latency_metrics()
+            .iter()
+            .any(|metric| metric.name() == "end_to_end"),
+        "the workload's total turn cost must be observable"
+    );
+
+    // Workloads whose two sides do unequal work stay unmeasured: the baseline
+    // omits tool outputs the overlay restores, and the abort workloads keep raw
+    // baseline behavior, so a ratio would compare different work.
+    for workload in [
+        AbWorkload::ParallelSafeTripleDirect,
+        AbWorkload::AbortDirectNestedInFlight,
+        AbWorkload::AbortRetainedProcess,
+    ] {
+        assert!(
+            workload.latency_metrics().is_empty(),
+            "workload `{}` compares unequal work and must stay unmeasured",
+            workload.name()
+        );
+    }
+
+    // Advisory, not hard: these run at one pair per cluster, where a p95 bound
+    // is far too wide to enforce.
+    let final_config = AbExecutionProfile::Final.config();
+    assert!(final_config.latency_hard_gate);
+    assert_eq!(
+        final_config.latency_gate_mode(AbWorkloadClass::CorrectnessOnly),
+        AbLatencyGateMode::Advisory
+    );
+    assert_eq!(
+        final_config.looks_for(AbWorkload::CodeModeHighVolume),
+        AB_CORRECTNESS_ONLY_LOOKS,
+        "gating must not multiply this workload's sampling cost"
     );
 }
 
@@ -3338,8 +3730,8 @@ fn ab_overlay_execution_profiles_are_exact() {
 
     let final_config = AbExecutionProfile::Final.config();
     assert_eq!(final_config.warmups, 3);
-    assert_eq!(final_config.clusters, 3);
-    assert_eq!(final_config.looks, [10, 20, 30]);
+    assert_eq!(final_config.clusters, 14);
+    assert_eq!(final_config.looks, [10]);
     assert_eq!(final_config.cap, Duration::from_secs(30 * 60));
     assert!(final_config.latency_hard_gate);
     assert_eq!(
@@ -3348,11 +3740,9 @@ fn ab_overlay_execution_profiles_are_exact() {
     );
     assert_eq!(
         final_config.latency_gate_mode(AbWorkloadClass::CorrectnessOnly),
-        AbLatencyGateMode::Excluded
+        AbLatencyGateMode::Advisory
     );
-    assert!(
-        (final_config.ucb_quantile() - (1.0 - AB_FAMILY_WISE_ALPHA / 3.0)).abs() < f64::EPSILON
-    );
+    assert!((final_config.ucb_quantile() - (1.0 - AB_FAMILY_WISE_ALPHA)).abs() < f64::EPSILON);
     assert_eq!(
         ab_profile_workloads(AbExecutionProfile::Final, &[]).unwrap(),
         ab_controller_workloads()
@@ -3391,8 +3781,12 @@ fn ab_overlay_execution_profiles_are_exact() {
         )
     );
 
-    let mut advisory_clusters =
-        paired_request_cache_clusters(AbWorkload::LongHistoryNoToolInitial, 100, 200);
+    let mut advisory_clusters = paired_request_cache_clusters_with_pairs(
+        AbWorkload::LongHistoryNoToolInitial,
+        100,
+        200,
+        quick.max_pairs_per_cluster(),
+    );
     advisory_clusters.truncate(quick.clusters);
     for cluster in &mut advisory_clusters {
         cluster.a_first.truncate(quick.max_pairs_per_cluster());
@@ -3462,6 +3856,7 @@ fn ab_overlay_session_replay_enforces_every_pair_without_bootstrap() {
             .map(|metric| metric.name())
             .collect::<Vec<_>>(),
         vec![
+            "end_to_end",
             "controllable_turn",
             "request_preparation",
             "sampling_to_call",
@@ -3488,6 +3883,9 @@ fn ab_overlay_session_replay_enforces_every_pair_without_bootstrap() {
         gate.pairs_per_cluster == AB_REPLAY_PAIRS
             && gate.point_median_ratio == 0.5
             && gate.point_p95_ratio == 0.5
+            && gate.target_ratio == 0.75
+            && gate.median_ratio_ucb_limit == 0.75
+            && gate.p95_ratio_ucb_limit == 0.75
             && gate.lcb_quantile == 0.0
             && gate.ucb_quantile == 1.0
             && gate.median_ratio_lcb == gate.point_median_ratio
@@ -3518,6 +3916,59 @@ fn ab_overlay_session_replay_enforces_every_pair_without_bootstrap() {
     assert_eq!(worker.workload, AbWorkload::SessionReplay);
     assert_eq!(worker.warmups, 0);
     assert_eq!(worker.samples, AB_REPLAY_PAIRS);
+}
+
+#[test]
+fn ab_overlay_session_replay_requires_25_percent_improvement() {
+    assert_eq!(AB_REPLAY_REQUIRED_IMPROVEMENT_PERCENT, 25);
+    assert_eq!(AB_REPLAY_RATIO_TARGET, 0.75);
+    assert!(replay_latency_pair_passes(100, 75));
+    assert!(!replay_latency_pair_passes(100, 76));
+    assert_eq!(replay_latency_limit_ns(101), 75);
+
+    let mut clusters = vec![valid_session_replay_cluster()];
+    clusters[0].b_samples[4].preparation_ns = 76;
+    let verdict = evaluate_ab_workload_with_config(
+        &clusters,
+        AbWorkloadClass::Latency,
+        AbWorkload::SessionReplay,
+        AbExecutionProfile::Replay.config(),
+        AB_REPLAY_PAIRS,
+    )
+    .expect("a replay pair above the 25%-faster limit should produce a verdict");
+    assert!(!verdict.passed);
+    assert!(verdict.correctness_violations.iter().any(|violation| {
+        violation.contains("pair:4:request_preparation:ratio")
+            && violation.contains("25pct_faster_limit=75")
+    }));
+}
+
+#[test]
+fn ab_overlay_session_replay_rejects_complete_turn_regression_when_local_lanes_pass() {
+    let config = AbExecutionProfile::Replay.config();
+    let mut clusters = vec![valid_session_replay_cluster()];
+    for sample in &mut clusters[0].b_samples {
+        sample.duration_ns = 76;
+    }
+
+    let verdict = evaluate_ab_workload_with_config(
+        &clusters,
+        AbWorkloadClass::Latency,
+        AbWorkload::SessionReplay,
+        config,
+        AB_REPLAY_PAIRS,
+    )
+    .expect("complete-turn regression must produce a retained verdict");
+
+    assert!(!verdict.passed);
+    assert!(
+        verdict
+            .correctness_violations
+            .iter()
+            .any(|violation| violation.contains("end_to_end:ratio")),
+        "the replay gate must reject total-turn latency even when every local timing lane passes: {:#?}",
+        verdict.correctness_violations
+    );
 }
 
 #[test]
@@ -3552,7 +4003,7 @@ fn ab_overlay_session_replay_requires_retained_cleanup_and_no_avoidable_resume()
 }
 
 #[test]
-fn ab_overlay_session_replay_requires_a_terminal_defect_and_b_artifact_recovery() {
+fn tool_result_correctness_replay_requires_a_terminal_defect_and_b_artifact_recovery() {
     let mut a = valid_session_replay_sample(false, 100);
     let mut violations = Vec::new();
     replay_sample_contract_violations(1, 0, "A", &a, &mut violations);
@@ -3585,7 +4036,7 @@ fn ab_overlay_session_replay_requires_a_terminal_defect_and_b_artifact_recovery(
 fn ab_overlay_session_replay_rejects_incomplete_or_over_limit_pairs() {
     let config = AbExecutionProfile::Replay.config();
     let mut clusters = vec![valid_session_replay_cluster()];
-    clusters[0].b_samples[4].preparation_ns = 51;
+    clusters[0].b_samples[4].preparation_ns = 76;
     let verdict = evaluate_ab_workload_with_config(
         &clusters,
         AbWorkloadClass::Latency,
@@ -3774,12 +4225,6 @@ fn ab_overlay_session_replay_routes_custom_tool_output_to_follow_up() {
     let sample = valid_session_replay_sample(true, 50);
     assert_eq!(sample.replay_subturns[0].logical_generations, 4);
     assert_eq!(sample.replay_subturns[1].logical_generations, 3);
-    assert_eq!(
-        sample.replay_subturns[0].completion_status.as_deref(),
-        Some("passed")
-    );
-    assert_eq!(sample.generation_purposes.get("reviewer"), None);
-    assert_eq!(sample.generation_purposes.get("proof"), None);
     let mut violations = Vec::new();
     replay_sample_contract_violations(1, 0, "B", &sample, &mut violations);
     assert!(violations.is_empty(), "{violations:#?}");
@@ -3788,19 +4233,21 @@ fn ab_overlay_session_replay_routes_custom_tool_output_to_follow_up() {
 #[test]
 fn ab_overlay_sequential_looks_reuse_cluster_prefixes() {
     let clusters = paired_clusters(100, 50);
-    let first = ab_cluster_prefixes(&clusters, AB_FINAL_LOOKS[0]).unwrap();
-    let second = ab_cluster_prefixes(&clusters, AB_FINAL_LOOKS[1]).unwrap();
+    let first_pairs = AB_ITERATIONS / 2;
+    let second_pairs = AB_ITERATIONS;
+    let first = ab_cluster_prefixes(&clusters, first_pairs).unwrap();
+    let second = ab_cluster_prefixes(&clusters, second_pairs).unwrap();
     for (first, second) in first.iter().zip(&second) {
-        assert_eq!(first.a_first, second.a_first[..AB_FINAL_LOOKS[0]]);
-        assert_eq!(first.a_samples.len(), AB_FINAL_LOOKS[0]);
-        assert_eq!(first.b_samples.len(), AB_FINAL_LOOKS[0]);
+        assert_eq!(first.a_first, second.a_first[..first_pairs]);
+        assert_eq!(first.a_samples.len(), first_pairs);
+        assert_eq!(first.b_samples.len(), first_pairs);
         assert_eq!(
             serde_json::to_vec(&first.a_samples).unwrap(),
-            serde_json::to_vec(&second.a_samples[..AB_FINAL_LOOKS[0]]).unwrap(),
+            serde_json::to_vec(&second.a_samples[..first_pairs]).unwrap(),
         );
         assert_eq!(
             serde_json::to_vec(&first.b_samples).unwrap(),
-            serde_json::to_vec(&second.b_samples[..AB_FINAL_LOOKS[0]]).unwrap(),
+            serde_json::to_vec(&second.b_samples[..first_pairs]).unwrap(),
         );
     }
 }
@@ -4427,10 +4874,10 @@ fn ab_overlay_request_cache_noninferiority_gates() {
             "{} must preserve non-prompt request fields",
             workload.name()
         );
-        clusters[0].b_samples[0].request_components[0].envelope_sha256 =
-            clusters[0].a_samples[0].request_components[0]
-                .envelope_sha256
-                .clone();
+        clusters[0].b_samples[0].request_components[0].envelope_sha256 = clusters[0].a_samples[0]
+            .request_components[0]
+            .envelope_sha256
+            .clone();
         clusters[0].b_samples[0].request_components[0].current_input_sha256 =
             sha256_bytes(b"candidate changed current input");
         assert!(
@@ -4565,7 +5012,7 @@ fn ab_overlay_controller_routes_high_volume_worker_protocol() {
     assert_eq!(workload.expected_direct_tool_calls(), 32);
     assert_eq!(workload.expected_nested_tool_calls(), 48);
     assert_eq!(workload.class(), AbWorkloadClass::CorrectnessOnly);
-    assert!(workload.latency_metrics().is_empty());
+    assert!(!workload.latency_metrics().is_empty());
 
     let ready = AbWorkerReady {
         kind: "ready".to_string(),
@@ -4786,7 +5233,7 @@ fn ab_overlay_report_shards_and_payload_hash_are_stable() {
 #[test]
 fn ab_overlay_replay_session_audit_provenance_is_exact_and_profile_scoped() {
     let expected = replay_session_audit_evidence();
-    assert_eq!(AB_REPORT_SCHEMA_VERSION, 16);
+    assert_eq!(AB_REPORT_SCHEMA_VERSION, 19);
     assert_eq!(
         expected.schema_version,
         AB_REPLAY_SESSION_AUDIT_EVIDENCE_VERSION
@@ -4828,6 +5275,31 @@ fn ab_overlay_replay_session_audit_provenance_is_exact_and_profile_scoped() {
 }
 
 #[test]
+fn ab_plain_language_report_uses_readable_units_and_explains_technical_metrics() {
+    assert_eq!(format_duration_ns_for_humans(999_000_000.0), "999.00 ms");
+    assert_eq!(format_duration_ns_for_humans(1_000_000_000.0), "1.00 s");
+    assert_eq!(format_duration_ns_for_humans(1_250_000_000.0), "1.25 s");
+
+    assert_eq!(
+        ab_metric_plain_language_heading("end_to_end"),
+        "  Technical metric: end_to_end — Plain language: the whole turn from start to finish."
+    );
+    assert!(
+        ab_latency_gate_expectation(AbExecutionProfile::Replay, AbLatencyGateMode::Hard)
+            .contains("candidate time <= 75% of baseline")
+    );
+
+    assert_eq!(
+        ab_plain_language_report_path(Path::new("report.json")),
+        PathBuf::from("report.txt")
+    );
+    assert_eq!(
+        ab_plain_language_report_path(Path::new("report.txt")),
+        PathBuf::from("report.txt.plain.txt")
+    );
+}
+
+#[test]
 fn ab_overlay_imports_only_verified_accepted_reports() {
     let temp = tempfile::tempdir().expect("temporary import root");
     let source = temp.path().join("accepted.json");
@@ -4848,6 +5320,29 @@ fn ab_overlay_imports_only_verified_accepted_reports() {
         receipt
             .destination
             .starts_with(repo.join("docs/benchmarks/turn-latency/accepted"))
+    );
+
+    let mut stale_schema = accepted_batch_report_for_import();
+    stale_schema.schema_version = AB_REPORT_SCHEMA_VERSION - 1;
+    stale_schema.report_payload_sha256.clear();
+    stale_schema.report_payload_sha256 =
+        sha256_bytes(&serde_json::to_vec(&stale_schema).expect("hash stale-schema fixture"));
+    let stale_schema_source = temp.path().join("stale-schema.json");
+    fs::write(
+        &stale_schema_source,
+        serde_json::to_vec_pretty(&stale_schema).expect("encode stale-schema fixture"),
+    )
+    .expect("write stale-schema report fixture");
+    let stale_schema_error = import_accepted_ab_report(&AbImportReportArgs {
+        report: stale_schema_source,
+        repo: repo.clone(),
+    })
+    .expect_err("stale report schemas must not import");
+    assert!(
+        stale_schema_error
+            .to_string()
+            .contains("accepted report schema"),
+        "{stale_schema_error:#}"
     );
 
     let mut replay = accepted_batch_report_for_import();
@@ -4952,16 +5447,19 @@ fn ab_overlay_import_rejects_rehashed_report_with_failing_raw_sample() {
 
 #[test]
 fn accepted_workload_rejects_samples_collected_after_a_terminal_look() {
+    const TEST_LOOKS: [usize; 2] = [2, 4];
     let workload = AbWorkload::LongHistoryNoToolInitial;
-    let config = AbExecutionProfile::Final.config();
-    let stopped_at_pairs_per_cluster = 20;
-    let mut clusters = paired_request_cache_clusters(workload, 100, 50);
-    for cluster in &mut clusters {
-        cluster.a_first.truncate(stopped_at_pairs_per_cluster);
-        cluster.a_samples.truncate(stopped_at_pairs_per_cluster);
-        cluster.b_samples.truncate(stopped_at_pairs_per_cluster);
-    }
-    let sequential_looks = [10, stopped_at_pairs_per_cluster]
+    let config = AbExecutionConfig {
+        profile: AbExecutionProfile::Final,
+        warmups: AB_WARMUPS,
+        clusters: AB_CLUSTERS,
+        looks: &TEST_LOOKS,
+        cap: Duration::from_secs(30 * 60),
+        latency_hard_gate: true,
+    };
+    let stopped_at_pairs_per_cluster = TEST_LOOKS[1];
+    let clusters = paired_request_cache_clusters(workload, 100, 50);
+    let sequential_looks = TEST_LOOKS
         .into_iter()
         .map(|pairs_per_cluster| {
             let prefixes = ab_cluster_prefixes(&clusters, pairs_per_cluster)

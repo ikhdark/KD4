@@ -387,7 +387,26 @@ fn config_toml_source_path(layer: &ConfigLayerEntry) -> AbsolutePathBuf {
 }
 
 fn synthetic_layer_path(path: &str) -> AbsolutePathBuf {
-    AbsolutePathBuf::resolve_path_against_base(path, r"C:\")
+    #[cfg(windows)]
+    {
+        AbsolutePathBuf::resolve_path_against_base(path, r"C:\")
+    }
+    #[cfg(not(windows))]
+    {
+        AbsolutePathBuf::resolve_path_against_base(path, "/")
+    }
+}
+
+fn command_for_platform(
+    command: String,
+    command_windows: Option<String>,
+    is_windows: bool,
+) -> String {
+    if is_windows {
+        command_windows.unwrap_or(command)
+    } else {
+        command
+    }
 }
 
 fn escape_xml_text(value: &str) -> String {
@@ -460,7 +479,7 @@ fn append_matcher_groups(
                     r#async,
                     status_message,
                 } => {
-                    let command = command_windows.unwrap_or(command);
+                    let command = command_for_platform(command, command_windows, cfg!(windows));
                     if r#async {
                         warnings.push(format!(
                             "skipping async hook in {}: async hooks are not supported yet",
@@ -711,6 +730,26 @@ mod tests {
             env: std::collections::HashMap::new(),
             plugin_id: None,
         }
+    }
+
+    #[test]
+    fn command_override_is_selected_only_for_windows() {
+        assert_eq!(
+            super::command_for_platform(
+                "sh hook.sh".to_string(),
+                Some("powershell.exe -File hook.ps1".to_string()),
+                true,
+            ),
+            "powershell.exe -File hook.ps1"
+        );
+        assert_eq!(
+            super::command_for_platform(
+                "sh hook.sh".to_string(),
+                Some("powershell.exe -File hook.ps1".to_string()),
+                false,
+            ),
+            "sh hook.sh"
+        );
     }
 
     #[test]

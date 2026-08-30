@@ -132,11 +132,7 @@ impl EventProcessorWithJsonOutput {
         plan.iter()
             .map(|step| TodoItem {
                 text: step.step.clone(),
-                completed: matches!(
-                    step.status,
-                    codex_app_server_protocol::TurnPlanStepStatus::Completed
-                        | codex_app_server_protocol::TurnPlanStepStatus::Passed
-                ),
+                completed: step.status == codex_app_server_protocol::TurnPlanStepStatus::Completed,
             })
             .collect()
     }
@@ -297,7 +293,6 @@ impl EventProcessorWithJsonOutput {
                                     },
                                     message: state.message,
                                     surfaced_result: state.surfaced_result,
-                                    completion: state.completion,
                                     last_agent_message: state.last_agent_message,
                                 },
                             )

@@ -1076,7 +1076,7 @@ async fn sampling_prompt_workspace_capture_is_preserved_for_workspace_evidence()
 }
 
 #[tokio::test]
-async fn kd4_latency_deferred_tool_schema_lease_releases_only_advertised_tools() {
+async fn token_backfire_deferred_tool_schema_survives_multiple_same_turn_requests() {
     let (_, turn_context) = crate::session::tests::make_session_and_context().await;
     let advertised = codex_tools::ToolName::plain("advertised_deferred");
     let discovered_during_request = codex_tools::ToolName::plain("newly_discovered_deferred");
@@ -1090,7 +1090,10 @@ async fn kd4_latency_deferred_tool_schema_lease_releases_only_advertised_tools()
     turn_context.activate_deferred_tools(std::iter::once(discovered_during_request.clone()));
     turn_context.release_advertised_deferred_tools(&advertised_for_request);
 
-    assert!(!turn_context.deferred_tool_is_activated(&advertised));
+    assert!(
+        turn_context.deferred_tool_is_activated(&advertised),
+        "an intervening same-turn request must not discard an activated callable schema"
+    );
     assert!(
         turn_context.deferred_tool_is_activated(&discovered_during_request),
         "discovery performed during the request must remain visible to its continuation"
@@ -1098,7 +1101,7 @@ async fn kd4_latency_deferred_tool_schema_lease_releases_only_advertised_tools()
 }
 
 #[tokio::test]
-async fn deferred_tool_schema_lease_releases_on_sampling_error_exit() {
+async fn deferred_tool_schema_survives_sampling_error_exit() {
     let (_, turn_context, _) = crate::session::tests::make_session_and_context_with_rx().await;
     let advertised = codex_tools::ToolName::plain("advertised_deferred");
     let discovered_during_request = codex_tools::ToolName::plain("discovered_during_request");
@@ -1116,7 +1119,7 @@ async fn deferred_tool_schema_lease_releases_on_sampling_error_exit() {
         turn_context.activate_deferred_tools(std::iter::once(discovered_during_request.clone()));
     }
 
-    assert!(!turn_context.deferred_tool_is_activated(&advertised));
+    assert!(turn_context.deferred_tool_is_activated(&advertised));
     assert!(turn_context.deferred_tool_is_activated(&discovered_during_request));
 }
 
@@ -1484,6 +1487,68 @@ async fn workspace_evidence_coalesces_mutating_calls_at_generation_boundary() {
 }
 
 #[tokio::test]
+async fn workspace_evidence_flushes_distinct_repositories_concurrently() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let batch = Arc::new(crate::tools::parallel::WorkspaceEvidenceGenerationBatch::new());
+    let second_workspace = tempfile::tempdir().expect("create second workspace");
+    let git_init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(second_workspace.path())
+        .status()
+        .expect("run git init for second workspace");
+    assert!(git_init.success(), "initialize second Git workspace");
+
+    for (call_id, cwd) in [
+        (
+            "primary-repository-mutation",
+            turn_context.config.cwd.as_path(),
+        ),
+        ("second-repository-mutation", second_workspace.path()),
+    ] {
+        assert!(batch.register_call(call_id));
+        assert!(batch.record_mutation(
+            call_id,
+            cwd.to_path_buf(),
+            None,
+            /* observe_command_ledger */ false,
+        ));
+    }
+
+    let captures_before = session
+        .services
+        .git_workspace
+        .workspace_evidence_capture_count();
+    let pause = session
+        .services
+        .git_workspace
+        .pause_next_workspace_evidence_capture();
+    let flush = batch.flush(&session, &turn_context, &tracker);
+    tokio::pin!(flush);
+    tokio::select! {
+        started = tokio::time::timeout(Duration::from_secs(10), pause.wait_until_started()) => {
+            started.expect("the first authoritative capture should start");
+        }
+        _ = &mut flush => {
+            panic!("flush completed before the paused capture was released");
+        }
+    }
+
+    assert_eq!(
+        session
+            .services
+            .git_workspace
+            .workspace_evidence_capture_count()
+            - captures_before,
+        2,
+        "a paused repository capture must not prevent another repository capture from starting",
+    );
+    pause.release();
+    let completed = flush.await;
+    assert_eq!(completed.authoritative_capture_count, 2);
+}
+
+#[tokio::test]
 async fn workspace_evidence_flush_preserves_authoritative_non_git_identity() {
     let (session, mut turn_context) = crate::session::tests::make_session_and_context().await;
     let non_git_workspace = tempfile::tempdir().expect("create non-Git workspace");
@@ -1552,10 +1617,23 @@ fn tool_relay_reconciliation_advances_without_watchdog() {
         NextSampleBlockReason::WaitingForDelivery
     );
     timing.adjust_relay_queue_depth(-1);
+    timing.adjust_active_tools(1);
+    assert_eq!(
+        reconcile_turn_progress(&timing, 0, &mut orphan_passes),
+        NextSampleBlockReason::WaitingForTool
+    );
+    assert_eq!(
+        reconcile_turn_progress(&timing, 0, &mut orphan_passes),
+        NextSampleBlockReason::WaitingForTool,
+        "a retained or nested tool may remain active across reconciliation passes"
+    );
+    assert_eq!(orphan_passes, 2);
+    timing.adjust_active_tools(-1);
     assert_eq!(
         reconcile_turn_progress(&timing, 0, &mut orphan_passes),
         NextSampleBlockReason::ReadyToSample
     );
+    assert_eq!(orphan_passes, 0);
 }
 
 fn authoritative_wait_result(
@@ -1667,20 +1745,6 @@ fn proven_loop_terminal_generation_ends_unless_new_input_arrives() {
 }
 
 #[test]
-fn completion_review_retry_clears_stale_finalizer_diff_and_generation_request() {
-    let mut pending_generation_request = Some("repair request");
-    let mut mutating_finalizer_candidate_diff = Some("stale finalizer diff".to_string());
-
-    prepare_completion_review_retry(
-        &mut pending_generation_request,
-        &mut mutating_finalizer_candidate_diff,
-    );
-
-    assert_eq!(pending_generation_request, None);
-    assert_eq!(mutating_finalizer_candidate_diff, None);
-}
-
-#[test]
 fn convergence_directive_is_consumed_before_compaction_can_replace_the_request() {
     let mut decision = SamplingConvergenceDecision {
         continuation: ContinuationDisposition::ModelRequired,
@@ -1726,15 +1790,12 @@ fn compaction_rebases_but_preserves_a_terminal_completion_request() {
 }
 
 #[test]
-fn server_end_turn_false_is_honored_once_before_host_completion() {
-    assert!(!protocol_resample_completion_allowed(
-        /*server_resample_eligible*/ true, /*consecutive_server_resample_honored*/ false,
-    ));
+fn server_end_turn_false_completes_on_first_unchanged_signal() {
     assert!(protocol_resample_completion_allowed(
-        /*server_resample_eligible*/ true, /*consecutive_server_resample_honored*/ true,
+        /*server_resample_eligible*/ true,
     ));
     assert!(!protocol_resample_completion_allowed(
-        /*server_resample_eligible*/ false, /*consecutive_server_resample_honored*/ true,
+        /*server_resample_eligible*/ false,
     ));
 }
 
@@ -1775,7 +1836,7 @@ fn logical_generation_budget_allows_thirty_two_regular_and_one_terminal_generati
         LogicalGenerationAdmission::Terminal { forced: true }
     );
     assert!(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE.contains("final tool-free"));
-    assert!(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_REASON.contains("forced terminal"));
+    assert!(LOGICAL_GENERATION_BUDGET_FORCED_TERMINAL_DIRECTIVE.contains("forced terminal"));
     assert_eq!(
         budget.admit(/*terminal_requested*/ false),
         LogicalGenerationAdmission::Exhausted
@@ -2148,7 +2209,7 @@ fn structured_action_change_compares_the_full_generation_disposition() {
         terminal_completion_only: false,
     };
 
-    assert!(!generation_request_action_changed(&request, None));
+    assert!(generation_request_action_changed(&request, None));
     assert!(!generation_request_action_changed(&request, Some(&request)));
 
     let mut changed_state = request.clone();
@@ -4141,15 +4202,14 @@ fn pending_injection_byte_count_serializes_each_item_once_with_array_overhead() 
 }
 
 #[test]
-fn stop_hook_continuation_preserves_finalization_warning_for_the_final_response() -> Result<()> {
+fn stop_hook_continuation_reaches_the_final_response() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
-        "stop_hook_continuation_preserves_finalization_warning_for_the_final_response",
-        stop_hook_continuation_preserves_finalization_warning_for_the_final_response_impl,
+        "stop_hook_continuation_reaches_the_final_response",
+        stop_hook_continuation_reaches_the_final_response_impl,
     )
 }
 
-async fn stop_hook_continuation_preserves_finalization_warning_for_the_final_response_impl()
--> Result<()> {
+async fn stop_hook_continuation_reaches_the_final_response_impl() -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
     let response_log = responses::mount_sse_sequence(
@@ -4162,13 +4222,8 @@ async fn stop_hook_continuation_preserves_finalization_warning_for_the_final_res
                     "update_plan",
                     &serde_json::json!({
                         "plan": [{
-                            "id": "phase-68-warning",
                             "step": "exercise stop-hook continuation",
-                            "status": "implemented",
-                            "acceptance_criteria": [
-                                "warning is emitted after continuation"
-                            ],
-                            "runtime_paths": ["core/src/session/turn.rs"]
+                            "status": "in_progress"
                         }]
                     })
                     .to_string(),
@@ -4192,17 +4247,13 @@ async fn stop_hook_continuation_preserves_finalization_warning_for_the_final_res
         .with_pre_build_hook(|home| {
             write_one_shot_stop_hook(home).expect("write stop-hook fixture");
         })
-        .with_workspace_setup(|cwd, _fs| async move {
-            tokio::fs::write(cwd.join("kd4_features.toml").as_path(), "").await?;
-            Ok(())
-        })
         .with_config(trust_discovered_hooks);
     let test = builder.build(&server).await?;
 
     test.codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
-                text: "answer, then obey the stop hook".to_string(),
+                text: "answer, then continue after the stop hook".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
@@ -4213,22 +4264,12 @@ async fn stop_hook_continuation_preserves_finalization_warning_for_the_final_res
         .await?;
 
     let mut saw_final_response = false;
-    let mut saw_finalization_warning = false;
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let event = test.codex.next_event().await.expect("turn event");
             match event.msg {
                 EventMsg::AgentMessage(message) if message.message == "final answer" => {
                     saw_final_response = true;
-                }
-                EventMsg::Warning(warning)
-                    if warning.message.starts_with("KD4 task evidence is") =>
-                {
-                    assert!(
-                        saw_final_response,
-                        "the one-shot warning must not be consumed before stop-hook continuation"
-                    );
-                    saw_finalization_warning = true;
                 }
                 EventMsg::TurnComplete(_) => break,
                 _ => {}
@@ -4238,20 +4279,19 @@ async fn stop_hook_continuation_preserves_finalization_warning_for_the_final_res
     .await
     .expect("turn should finish after one stop-hook continuation");
     assert!(saw_final_response);
-    assert!(saw_finalization_warning);
     assert_eq!(response_log.requests().len(), 3);
     Ok(())
 }
 
 #[test]
-fn models_etag_refresh_does_not_block_stream_events_and_is_cancellable() -> Result<()> {
+fn models_etag_refresh_does_not_block_tool_continuation() -> Result<()> {
     run_turn_multi_thread_test_with_stack(
-        "models_etag_refresh_does_not_block_stream_events_and_is_cancellable",
-        models_etag_refresh_does_not_block_stream_events_and_is_cancellable_impl,
+        "models_etag_refresh_does_not_block_tool_continuation",
+        models_etag_refresh_does_not_block_tool_continuation_impl,
     )
 }
 
-async fn models_etag_refresh_does_not_block_stream_events_and_is_cancellable_impl() -> Result<()> {
+async fn models_etag_refresh_does_not_block_tool_continuation_impl() -> Result<()> {
     core_test_support::skip_if_no_network!(Ok(()));
     const REFRESH_ETAG: &str = "\"phase-68-models-2\"";
 
@@ -4277,21 +4317,44 @@ async fn models_etag_refresh_does_not_block_stream_events_and_is_cancellable_imp
         .up_to_n_times(1)
         .mount(&server)
         .await;
-    let response_log = responses::mount_response_once(
+    let response_log = responses::mount_response_sequence(
         &server,
-        responses::sse_response(responses::sse(vec![
-            responses::ev_response_created("etag-response"),
-            responses::ev_assistant_message("etag-message", "stream continued"),
-            responses::ev_completed("etag-response"),
-        ]))
-        .insert_header("X-Models-Etag", REFRESH_ETAG),
+        vec![
+            responses::sse_response(responses::sse(vec![
+                responses::ev_response_created("etag-tool-response"),
+                responses::ev_function_call(
+                    "etag-plan-call",
+                    "update_plan",
+                    &serde_json::json!({
+                        "plan": [{
+                            "id": "etag-continuation",
+                            "step": "continue while the model catalog refresh is pending",
+                            "status": "implemented",
+                            "acceptance_criteria": ["the second model request is dispatched"],
+                            "runtime_paths": ["core/src/session/turn.rs"]
+                        }]
+                    })
+                    .to_string(),
+                ),
+                responses::ev_completed("etag-tool-response"),
+            ]))
+            .insert_header("X-Models-Etag", REFRESH_ETAG),
+            responses::sse_response(responses::sse(vec![
+                responses::ev_response_created("etag-final-response"),
+                responses::ev_assistant_message(
+                    "etag-final-message",
+                    "tool continuation completed",
+                ),
+                responses::ev_completed("etag-final-response"),
+            ])),
+        ],
     )
     .await;
 
     test.codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
-                text: "exercise deferred ETag refresh".to_string(),
+                text: "exercise ETag refresh during a tool continuation".to_string(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
@@ -4300,20 +4363,6 @@ async fn models_etag_refresh_does_not_block_stream_events_and_is_cancellable_imp
             thread_settings: Default::default(),
         })
         .await?;
-
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let event = test.codex.next_event().await.expect("stream event");
-            if matches!(
-                event.msg,
-                EventMsg::AgentMessage(ref message) if message.message == "stream continued"
-            ) {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("assistant stream events should arrive before the delayed models refresh completes");
 
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -4331,26 +4380,27 @@ async fn models_etag_refresh_does_not_block_stream_events_and_is_cancellable_imp
         }
     })
     .await
-    .expect("deferred models refresh should start after stream post-processing");
+    .expect("background models refresh should start");
 
-    test.codex.submit(Op::Interrupt).await?;
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if matches!(
-                test.codex
-                    .next_event()
-                    .await
-                    .expect("cancellation event")
-                    .msg,
-                EventMsg::TurnAborted(_)
-            ) {
-                break;
+            let event = test.codex.next_event().await.expect("stream event");
+            match event.msg {
+                EventMsg::AgentMessage(ref message)
+                    if message.message == "tool continuation completed" =>
+                {
+                    break;
+                }
+                EventMsg::TurnComplete(_) => {
+                    panic!("turn completed without the continuation response")
+                }
+                _ => {}
             }
         }
     })
     .await
-    .expect("interrupt should cancel the delayed models refresh promptly");
-    assert_eq!(response_log.requests().len(), 1);
+    .expect("the second model request must not wait for the delayed models refresh");
+    assert_eq!(response_log.requests().len(), 2);
     Ok(())
 }
 

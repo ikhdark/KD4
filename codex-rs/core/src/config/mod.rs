@@ -185,18 +185,7 @@ pub(crate) use resolved_permission_profile::PermissionProfileState;
 fn effective_reasoning_phase_efforts(
     configured: Option<ReasoningPhaseEfforts>,
 ) -> ReasoningPhaseEfforts {
-    let configured = configured.unwrap_or_default();
-    ReasoningPhaseEfforts {
-        orient: configured.orient.or(Some(ReasoningEffort::High)),
-        inspect: configured.inspect.or(Some(ReasoningEffort::Low)),
-        implement: configured.implement.or(Some(ReasoningEffort::High)),
-        diagnose: configured.diagnose.or(Some(ReasoningEffort::High)),
-        verify: configured.verify.or(Some(ReasoningEffort::Low)),
-        finalize: configured.finalize.or(Some(ReasoningEffort::Low)),
-        deterministic_continuation: configured
-            .deterministic_continuation
-            .or(Some(ReasoningEffort::Low)),
-    }
+    configured.unwrap_or_default()
 }
 
 /// Maximum number of source bytes retained across project documentation files.
@@ -792,10 +781,6 @@ pub struct Config {
     /// Whether to inject the `<environment_context>` user block.
     pub include_environment_context: bool,
 
-    /// Explicit KD4 workflow override. `None` preserves repository-marker
-    /// detection for compatibility.
-    pub kd4_workflow_enabled: Option<bool>,
-
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
 
@@ -1021,11 +1006,9 @@ pub struct Config {
     /// global default").
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
 
-    /// Per-logical-request reasoning effort overrides. Fork defaults enable
-    /// the deterministic sampling governor even when the table is absent.
-    /// Omitted fields resolve to the compatibility defaults: high for orient,
-    /// implement, and diagnose; low for inspect, verify, finalize, and
-    /// deterministic continuation.
+    /// Per-logical-request reasoning effort overrides. The sampling governor
+    /// remains enabled when the table is absent, and omitted fields inherit
+    /// `model_reasoning_effort`.
     pub reasoning_phase_efforts: Option<ReasoningPhaseEfforts>,
 
     /// Optional value to use for `reasoning.summary` when making a request
@@ -3623,7 +3606,6 @@ impl Config {
             orchestrator_skills_enabled,
             orchestrator_mcp_enabled,
             include_environment_context,
-            kd4_workflow_enabled: cfg.kd4_workflow_enabled,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
             cli_auth_credentials_store_mode: resolve_cli_auth_credentials_store_mode(

@@ -127,7 +127,6 @@ async fn exec_command_with_tty(
             process_id,
             &request,
             tty,
-            None,
             Box::new(NoopSpawnLifecycle),
             None,
             turn.environments
@@ -216,6 +215,7 @@ async fn exec_command_with_tty(
         max_output_tokens: None,
         process_id: response_process_id,
         exit_code,
+        process_exited: exit_code.is_some(),
         original_token_count: Some(approx_token_count(&text)),
         hook_command: Some(cmd.to_string()),
         raw_output_artifact: None,
@@ -307,7 +307,6 @@ async fn blocking_terminate_unified_process(
             }),
         },
         None,
-        None,
         &PendingSpawnRegistration::default(),
     )
     .await?)
@@ -330,6 +329,60 @@ async fn write_stdin(
             truncation_policy: TruncationPolicy::Tokens(10_000),
         })
         .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn nonempty_write_stdin_yield_deadline_includes_process_reaction() -> anyhow::Result<()> {
+    let (session, turn) = test_session_and_turn().await;
+    let manager = &session.services.unified_exec_manager;
+    let process_id = manager.allocate_process_id().await;
+    let (terminate_started_tx, _terminate_started_rx) = watch::channel(false);
+    let allow_terminate = Arc::new(Notify::new());
+    let process = blocking_terminate_unified_process(
+        process_id,
+        terminate_started_tx,
+        Arc::clone(&allow_terminate),
+    )
+    .await?;
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ProcessEntry {
+            process: Arc::clone(&process),
+            command_execution_id: Default::default(),
+            parent_tool_execution_id: Default::default(),
+            call_id: "write-stdin-deadline".to_string(),
+            process_id,
+            cwd: turn.cwd().clone().into(),
+            initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hook_command: "interactive".to_string(),
+            tty: true,
+            network_approval: None,
+            session: Arc::downgrade(&session),
+            last_used: Instant::now(),
+        },
+    );
+
+    let started_at = Instant::now();
+    let output = write_stdin(
+        &session,
+        process_id,
+        "input",
+        /*yield_time_ms*/ MIN_YIELD_TIME_MS,
+    )
+    .await?;
+
+    assert_eq!(
+        Instant::now().saturating_duration_since(started_at),
+        Duration::from_millis(MIN_YIELD_TIME_MS)
+    );
+    assert_eq!(output.wall_time, Duration::from_millis(MIN_YIELD_TIME_MS));
+    assert_eq!(output.process_id, Some(process_id));
+
+    manager.release_process_id(process_id).await;
+    allow_terminate.notify_one();
+    process.terminate();
+
+    Ok(())
 }
 
 #[test]
@@ -838,7 +891,6 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
             /*process_id*/ 1234,
             &request,
             /*tty*/ false,
-            None,
             Box::new(NoopSpawnLifecycle),
             None,
             &environment,

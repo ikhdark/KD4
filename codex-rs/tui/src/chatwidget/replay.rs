@@ -22,7 +22,6 @@ impl ChatWidget {
                 started_at,
                 completed_at,
                 duration_ms,
-                completion,
                 timing,
                 surfaced_result,
                 reasoning_policy_history,
@@ -48,7 +47,6 @@ impl ChatWidget {
                     started_at,
                     completed_at,
                     duration_ms,
-                    completion,
                     timing,
                     surfaced_result,
                     reasoning_policy_history,
@@ -56,7 +54,6 @@ impl ChatWidget {
                 self.handle_turn_completed_notification(
                     TurnCompletedNotification {
                         thread_id: self.thread_id.map(|id| id.to_string()).unwrap_or_default(),
-                        completion: turn.completion.clone(),
                         timing: turn.timing.clone(),
                         surfaced_result: turn.surfaced_result.clone(),
                         turn,

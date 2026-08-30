@@ -235,6 +235,29 @@ impl ToolHistoryCandidate {
         (self.artifact_bytes, self.artifact_sha256.clone())
     }
 
+    fn artifact_pin_value(&self) -> Option<serde_json::Value> {
+        if !self.complete || !self.projection_eligible {
+            return None;
+        }
+        Some(serde_json::json!({
+            "version": 1,
+            "kind": "tool_history_artifact_pin",
+            "artifact_id": self.artifact_id,
+            "bytes": self.artifact_bytes,
+            "sha256": self.artifact_sha256,
+            "retrieval": {
+                "tool": "read_tool_output",
+                "instruction": "Call read_tool_output with artifact_id to recover the exact output."
+            }
+        }))
+    }
+
+    fn artifact_pin(&self) -> Option<(String, usize)> {
+        let rendered = serde_json::to_string(&self.artifact_pin_value()?).ok()?;
+        let tokens = approx_token_count(&rendered);
+        Some((rendered, tokens))
+    }
+
     fn receipt(&self) -> Option<(&str, &str, u64)> {
         self.render_receipt(
             /*require_consumed*/ true, /*require_savings*/ true,
@@ -991,6 +1014,7 @@ impl ToolHistoryState {
         enum AdmissionRepresentation {
             Raw,
             Receipt { receipt_id: String, text: String },
+            ArtifactPin { text: String },
             StructuredReceipt { item: ResponseItem },
             Drop,
         }
@@ -1033,7 +1057,7 @@ impl ToolHistoryState {
                 let non_text_tokens =
                     usize::try_from(candidate.preserved_non_text_tokens).unwrap_or(usize::MAX);
                 let raw_tokens = approx_token_count(&output).saturating_add(non_text_tokens);
-                candidate
+                let receipt_tokens = candidate
                     .admission_receipt()
                     .map(|(_, _, receipt_tokens)| {
                         let receipt_tokens = usize::try_from(receipt_tokens)
@@ -1041,7 +1065,15 @@ impl ToolHistoryState {
                             .saturating_add(non_text_tokens);
                         raw_tokens.min(receipt_tokens)
                     })
-                    .filter(|tokens| *tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET)
+                    .filter(|tokens| *tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+                let pin_tokens = (non_text_tokens == 0)
+                    .then(|| candidate.artifact_pin().map(|(_, tokens)| tokens))
+                    .flatten()
+                    .filter(|tokens| *tokens <= MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
+                [Some(raw_tokens), receipt_tokens, pin_tokens]
+                    .into_iter()
+                    .flatten()
+                    .min()
                     .unwrap_or(0)
             };
         let mut reserved_competing_tokens = admission_candidates
@@ -1121,6 +1153,9 @@ impl ToolHistoryState {
                             .saturating_add(non_text_tokens);
                         (receipt_id, text, tokens)
                     });
+            let artifact_pin = (non_text_tokens == 0)
+                .then(|| candidate.artifact_pin())
+                .flatten();
 
             let decision = if raw_tokens <= remaining_raw_tokens {
                 if candidate.consumed_by_generation.is_some()
@@ -1168,6 +1203,15 @@ impl ToolHistoryState {
                         false
                     },
                 }
+            } else if let Some((text, pin_tokens)) = artifact_pin {
+                // Exact recovery handles are the irreducible representation of a textual result.
+                // Treat the aggregate budget as soft for this final form: dropping the handle
+                // forces a later search or rerun and increases total turn cost.
+                remaining_tokens = remaining_tokens.saturating_sub(pin_tokens);
+                AdmissionDecision {
+                    representation: AdmissionRepresentation::ArtifactPin { text },
+                    retain_raw_fallback: false,
+                }
             } else {
                 AdmissionDecision {
                     representation: AdmissionRepresentation::Drop,
@@ -1180,9 +1224,14 @@ impl ToolHistoryState {
         let mut unreplaced_projected = projected.clone();
         unreplaced_projected.retain(|item| {
             item_call_id(item).is_none_or(|call_id| {
-                decisions
-                    .get(call_id)
-                    .is_none_or(|decision| decision.retain_raw_fallback)
+                decisions.get(call_id).is_none_or(|decision| {
+                    decision.retain_raw_fallback
+                        || matches!(
+                            &decision.representation,
+                            AdmissionRepresentation::Receipt { .. }
+                                | AdmissionRepresentation::ArtifactPin { .. }
+                        )
+                })
             })
         });
         projected.retain(|item| {
@@ -1244,6 +1293,7 @@ impl ToolHistoryState {
             matches!(
                 &decision.representation,
                 AdmissionRepresentation::Receipt { .. }
+                    | AdmissionRepresentation::ArtifactPin { .. }
             )
         }) {
             for (item_index, item) in projected.make_owned().iter_mut().enumerate() {
@@ -1260,22 +1310,65 @@ impl ToolHistoryState {
                 if exposed_output_sha256.get(call_id) != Some(&bounded_output_sha256) {
                     continue;
                 }
-                let Some(AdmissionDecision {
-                    representation: AdmissionRepresentation::Receipt { receipt_id, text },
-                    ..
-                }) = decisions.get(call_id)
-                else {
+                let Some(decision) = decisions.get(call_id) else {
                     continue;
+                };
+                let (text, receipt_id) = match &decision.representation {
+                    AdmissionRepresentation::Receipt { receipt_id, text } => {
+                        (text, Some(receipt_id))
+                    }
+                    AdmissionRepresentation::ArtifactPin { text } => (text, None),
+                    _ => continue,
                 };
                 let substituted_output_sha256 = sha256(text.as_bytes());
                 replace_model_visible_output_text(body, text.clone());
-                substitutions.push(ToolHistorySubstitution {
-                    item_index,
-                    call_id: call_id.to_string(),
-                    bounded_output_sha256,
-                    receipt_id: receipt_id.clone(),
-                    substituted_output_sha256,
-                });
+                if let Some(receipt_id) = receipt_id {
+                    substitutions.push(ToolHistorySubstitution {
+                        item_index,
+                        call_id: call_id.to_string(),
+                        bounded_output_sha256,
+                        receipt_id: receipt_id.clone(),
+                        substituted_output_sha256,
+                    });
+                }
+            }
+        }
+        if decisions.values().any(|decision| {
+            !decision.retain_raw_fallback
+                && matches!(
+                    &decision.representation,
+                    AdmissionRepresentation::Receipt { .. }
+                        | AdmissionRepresentation::ArtifactPin { .. }
+                )
+        }) {
+            for item in unreplaced_projected.make_owned().iter_mut() {
+                let Some((call_id, body)) = textual_output_body_mut(item) else {
+                    continue;
+                };
+                let Some(candidate) = self.candidates.get(call_id) else {
+                    continue;
+                };
+                if exposed_output_sha256.get(call_id)
+                    != Some(&candidate.derived.bounded_model_output_sha256)
+                {
+                    continue;
+                }
+                let Some(decision) = decisions.get(call_id) else {
+                    continue;
+                };
+                if decision.retain_raw_fallback
+                    || !matches!(
+                        &decision.representation,
+                        AdmissionRepresentation::Receipt { .. }
+                            | AdmissionRepresentation::ArtifactPin { .. }
+                    )
+                {
+                    continue;
+                }
+                let Some((text, _)) = candidate.artifact_pin() else {
+                    continue;
+                };
+                replace_model_visible_output_text(body, text);
             }
         }
         ToolHistoryProjection {
@@ -1464,6 +1557,32 @@ impl ToolHistoryState {
             .collect()
     }
 
+    /// Builds a deterministic, exact recovery sidecar for artifacts referenced by a projected
+    /// prompt. Compaction appends this separately from model-authored prose so retention does not
+    /// depend on the model copying a receipt byte-for-byte into its summary.
+    pub(crate) fn artifact_pin_payload_for_items(&self, items: &[ResponseItem]) -> Option<String> {
+        let pins = self
+            .candidates
+            .values()
+            .filter(|candidate| {
+                items
+                    .iter()
+                    .any(|item| response_item_references_artifact(item, candidate))
+            })
+            .filter_map(ToolHistoryCandidate::artifact_pin_value)
+            .collect::<Vec<_>>();
+        if pins.is_empty() {
+            return None;
+        }
+        serde_json::to_string(&serde_json::json!({
+            "version": 1,
+            "kind": "tool_history_artifact_pins",
+            "instruction": "Use read_tool_output with an artifact_id below to recover exact prior output.",
+            "artifacts": pins,
+        }))
+        .ok()
+    }
+
     fn retain_retrievable_artifacts(
         &mut self,
         expected: &BTreeMap<String, (u64, String)>,
@@ -1506,7 +1625,7 @@ fn is_true(value: &bool) -> bool {
 }
 
 fn normalized_source_path(path: &Path) -> String {
-    normalized_source_path_with_case_sensitivity(path, false)
+    normalized_source_path_with_case_sensitivity(path, cfg!(not(windows)))
 }
 
 fn normalized_source_path_with_case_sensitivity(path: &Path, case_sensitive: bool) -> String {
@@ -1955,6 +2074,8 @@ pub(crate) async fn persist_tool_history_state(
     .map_err(|err| format!("failed to serialize tool-history ledger: {err}"))?;
     #[cfg(test)]
     pause_tool_history_persistence_for_test_if_requested(thread_id).await;
+    #[cfg(test)]
+    fail_tool_history_persistence_for_test_if_requested(thread_id).await?;
     tokio::task::spawn_blocking(move || {
         let directory = path
             .parent()
@@ -2033,6 +2154,8 @@ pub(crate) async fn persist_tool_history_mutations(
     let persisted_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     #[cfg(test)]
     pause_tool_history_persistence_for_test_if_requested(thread_id).await;
+    #[cfg(test)]
+    fail_tool_history_persistence_for_test_if_requested(thread_id).await?;
     tokio::task::spawn_blocking(move || {
         let directory = path
             .parent()
@@ -2167,6 +2290,100 @@ async fn pause_tool_history_persistence_for_test_if_requested(thread_id: &str) {
         pause.reached.notify_one();
         pause.release.notified().await;
     }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ToolHistoryPersistenceFailureState {
+    thread_id: String,
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+pub(crate) struct ToolHistoryPersistenceFailure {
+    state: ToolHistoryPersistenceFailureState,
+}
+
+#[cfg(test)]
+impl ToolHistoryPersistenceFailure {
+    pub(crate) async fn wait_until_reached(&self) {
+        self.state.reached.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ToolHistoryPersistenceFailure {
+    fn drop(&mut self) {
+        let slot = tool_history_persistence_failure_slot();
+        let mut pending = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(&pending.reached, &self.state.reached))
+        {
+            *pending = None;
+        }
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+fn tool_history_persistence_failure_slot()
+-> &'static std::sync::Mutex<Option<ToolHistoryPersistenceFailureState>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<ToolHistoryPersistenceFailureState>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_tool_history_persistence_for_test(
+    thread_id: &str,
+) -> ToolHistoryPersistenceFailure {
+    let state = ToolHistoryPersistenceFailureState {
+        thread_id: thread_id.to_string(),
+        reached: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let mut pending = tool_history_persistence_failure_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        pending.is_none(),
+        "only one tool-history persistence failure may be installed at a time"
+    );
+    *pending = Some(state.clone());
+    ToolHistoryPersistenceFailure { state }
+}
+
+#[cfg(test)]
+async fn fail_tool_history_persistence_for_test_if_requested(
+    thread_id: &str,
+) -> Result<(), String> {
+    let failure = {
+        let mut pending = tool_history_persistence_failure_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.thread_id == thread_id)
+        {
+            pending.take()
+        } else {
+            None
+        }
+    };
+    if let Some(failure) = failure {
+        failure.reached.notify_one();
+        failure.release.notified().await;
+        return Err("injected tool-history persistence failure".to_string());
+    }
+    Ok(())
 }
 
 fn ledger_path(codex_home: &std::path::Path, thread_id: &str) -> std::path::PathBuf {

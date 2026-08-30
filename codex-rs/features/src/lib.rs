@@ -115,6 +115,8 @@ pub enum Feature {
     CodeModeOnly,
     /// Use the single unified PTY-backed exec tool.
     UnifiedExec,
+    /// Keep terminal completion and tool-result delivery on the authoritative runtime path.
+    DirectRuntime,
     /// Add terminal-specific visualization guidance to TUI developer instructions.
     TerminalVisualizationInstructions,
     /// Stream structured progress while apply_patch input is being generated.
@@ -162,6 +164,22 @@ pub enum Feature {
     ToolSuggest,
     /// Enable plugins.
     Plugins,
+    /// Allow the in-app chat pane in desktop apps.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    InAppChat,
+    /// Allow in-app dictation in desktop apps.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    InAppDictation,
+    /// Allow desktop apps to run local automations.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    InAppLocalAutomation,
+    /// Allow desktop apps to perform in-app updates.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    InAppUpdates,
     /// Allow the in-app browser pane in desktop apps.
     ///
     /// Requirements-only gate: this should be set from requirements, not user config.
@@ -196,8 +214,6 @@ pub enum Feature {
     DefaultModeRequestUserInput,
     /// Enable automatic review for approval prompts.
     GuardianApproval,
-    /// Run an independent KD4 completion review before eligible root turns finish.
-    TaskCompletionReviewer,
     /// Enable persisted thread goals and automatic goal continuation.
     Goals,
     /// Add current-time reminders to model-visible context.
@@ -742,6 +758,12 @@ define_features! {
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::DirectRuntime,
+        key: "direct_runtime",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::ShellSnapshot,
         key: "shell_snapshot",
         stage: Stage::Stable,
@@ -914,6 +936,34 @@ define_features! {
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::InAppChat,
+        key: "in_app_chat",
+        stage: Stage::Stable,
+        default_enabled: true,
+        consumer: FeatureConsumer::Client,
+    },
+    FeatureSpec {
+        id: Feature::InAppDictation,
+        key: "in_app_dictation",
+        stage: Stage::Stable,
+        default_enabled: true,
+        consumer: FeatureConsumer::Client,
+    },
+    FeatureSpec {
+        id: Feature::InAppLocalAutomation,
+        key: "in_app_local_automation",
+        stage: Stage::Stable,
+        default_enabled: true,
+        consumer: FeatureConsumer::Client,
+    },
+    FeatureSpec {
+        id: Feature::InAppUpdates,
+        key: "in_app_updates",
+        stage: Stage::Stable,
+        default_enabled: true,
+        consumer: FeatureConsumer::Client,
+    },
+    FeatureSpec {
         id: Feature::InAppBrowser,
         key: "in_app_browser",
         stage: Stage::Stable,
@@ -993,12 +1043,6 @@ define_features! {
     FeatureSpec {
         id: Feature::GuardianApproval,
         key: "guardian_approval",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
-        id: Feature::TaskCompletionReviewer,
-        key: "task_completion_reviewer",
         stage: Stage::Stable,
         default_enabled: true,
     },

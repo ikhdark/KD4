@@ -8,7 +8,6 @@ use codex_analytics::HookRunFact;
 use codex_analytics::build_track_events_context;
 use codex_context_fragments::ModelContextBudget;
 use codex_context_fragments::RenderedContextFragment;
-use codex_features::Feature;
 use codex_hooks::ContextInjectingHookOutcome;
 use codex_hooks::InterruptRequest;
 use codex_hooks::PermissionRequestDecision;
@@ -47,8 +46,6 @@ use tracing::instrument;
 use crate::context::ContextualUserFragment;
 use crate::context::HookAdditionalContext;
 use crate::event_mapping::parse_turn_item;
-use crate::git_workspace::GitWorkspaceCache;
-use crate::git_workspace::WorkspaceChangeObservation;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -70,14 +67,10 @@ pub(crate) enum PreToolUseHookResult {
 #[derive(Debug, Default)]
 pub(crate) struct LegacyAfterAgentHookOutcome {
     pub(crate) aborted: bool,
-    pub(crate) workspace_changed: bool,
-    pub(crate) observation_error: Option<String>,
 }
 
 pub(crate) struct TurnStopHookOutcome {
     pub(crate) stop: StopOutcome,
-    pub(crate) workspace_changed: bool,
-    pub(crate) observation_error: Option<String>,
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -289,8 +282,6 @@ pub(crate) async fn run_turn_stop_hooks(
         SessionSource::SubAgent(_) => {
             return TurnStopHookOutcome {
                 stop: StopOutcome::default(),
-                workspace_changed: false,
-                observation_error: None,
             };
         }
         _ => HookEventName::Stop,
@@ -299,13 +290,8 @@ pub(crate) async fn run_turn_stop_hooks(
     if !hooks.has_handler_for(event_name) {
         return TurnStopHookOutcome {
             stop: StopOutcome::default(),
-            workspace_changed: false,
-            observation_error: None,
         };
     }
-
-    let workspace_observation =
-        begin_completion_hook_workspace_observation(sess, turn_context, "Stop").await;
     let (target, transcript_path) = match &turn_context.session_source {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             agent_role,
@@ -361,13 +347,7 @@ pub(crate) async fn run_turn_stop_hooks(
 
     let mut outcome = hooks.run_stop(request).await;
     emit_hook_completed_events(sess, turn_context, std::mem::take(&mut outcome.hook_events)).await;
-    let (workspace_changed, observation_error) =
-        finish_completion_hook_workspace_observation(workspace_observation, "Stop").await;
-    TurnStopHookOutcome {
-        stop: outcome,
-        workspace_changed,
-        observation_error,
-    }
+    TurnStopHookOutcome { stop: outcome }
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -513,8 +493,6 @@ pub(crate) async fn run_legacy_after_agent_hook(
     input: &[ResponseItem],
     last_assistant_message: Option<String>,
 ) -> LegacyAfterAgentHookOutcome {
-    let workspace_observation =
-        begin_completion_hook_workspace_observation(sess, turn_context, "AfterAgent").await;
     let mut abort_message = None;
     let input_messages = input
         .iter()
@@ -564,83 +542,16 @@ pub(crate) async fn run_legacy_after_agent_hook(
             ));
         }
     }
-    let (workspace_changed, observation_error) =
-        finish_completion_hook_workspace_observation(workspace_observation, "AfterAgent").await;
     if let Some(message) = abort_message {
         let event = EventMsg::Error(codex_protocol::protocol::ErrorEvent {
             message,
             codex_error_info: Some(CodexErrorInfo::Other),
         });
         sess.send_event(turn_context, event).await;
-        LegacyAfterAgentHookOutcome {
-            aborted: true,
-            workspace_changed,
-            observation_error,
-        }
+        LegacyAfterAgentHookOutcome { aborted: true }
     } else {
-        LegacyAfterAgentHookOutcome {
-            aborted: false,
-            workspace_changed,
-            observation_error,
-        }
+        LegacyAfterAgentHookOutcome { aborted: false }
     }
-}
-
-struct CompletionHookWorkspaceObservationState {
-    observation: Option<WorkspaceChangeObservation>,
-    git_workspace_cache: Arc<GitWorkspaceCache>,
-}
-
-type CompletionHookWorkspaceObservation = Option<CompletionHookWorkspaceObservationState>;
-
-async fn begin_completion_hook_workspace_observation(
-    sess: &Session,
-    turn_context: &TurnContext,
-    _hook_name: &'static str,
-) -> CompletionHookWorkspaceObservation {
-    if turn_context.session_source.is_non_root_agent()
-        || !turn_context
-            .config
-            .features
-            .enabled(Feature::TaskCompletionReviewer)
-        || !sess.services.task_evidence.allows_kd4_completion()
-    {
-        return None;
-    }
-
-    let observation = sess
-        .services
-        .task_evidence
-        .repository_root()
-        .and_then(|repo_root| {
-            sess.services
-                .git_workspace
-                .begin_workspace_change_observation(&repo_root)
-        });
-    Some(CompletionHookWorkspaceObservationState {
-        observation,
-        git_workspace_cache: Arc::clone(&sess.services.git_workspace),
-    })
-}
-
-async fn finish_completion_hook_workspace_observation(
-    observation: CompletionHookWorkspaceObservation,
-    _hook_name: &'static str,
-) -> (bool, Option<String>) {
-    let Some(observation) = observation else {
-        return (false, None);
-    };
-    let workspace_changed = observation.observation.as_ref().is_none_or(|token| {
-        !observation
-            .git_workspace_cache
-            .workspace_change_observation_is_current(token)
-    });
-    if workspace_changed {
-        observation
-            .git_workspace_cache
-            .note_host_workspace_mutation();
-    }
-    (workspace_changed, None)
 }
 
 pub(crate) async fn inspect_pending_input(
@@ -850,28 +761,10 @@ fn single_developer_input_text(item: &ResponseItem) -> Option<&str> {
 }
 
 pub(crate) async fn prepare_additional_context_items(
-    sess: &Arc<Session>,
+    _sess: &Arc<Session>,
     _turn_context: &Arc<TurnContext>,
     additional_contexts: Vec<String>,
 ) -> Vec<ResponseItem> {
-    let checkpoint_generation = sess.current_window_id().await;
-    let additional_contexts = additional_contexts
-        .into_iter()
-        .filter_map(|context| {
-            match crate::continuity::normalize_hook_context(context, &checkpoint_generation) {
-                crate::continuity::ContinuityContextNormalization::Unrelated(context)
-                | crate::continuity::ContinuityContextNormalization::Valid(context) => {
-                    Some(context)
-                }
-                crate::continuity::ContinuityContextNormalization::Invalid => {
-                    tracing::warn!(
-                        "invalid KD4 continuity capsule ignored; retaining prior valid state"
-                    );
-                    None
-                }
-            }
-        })
-        .collect();
     additional_context_messages(additional_contexts)
 }
 
@@ -1027,30 +920,24 @@ fn compaction_trigger_label(value: CompactionTrigger) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use super::additional_context_messages;
+    use super::dedupe_existing_developer_contexts;
+    use super::hook_run_analytics_payload;
+    use super::hook_run_metric_tags;
+    use super::prepare_additional_context_items;
+    use crate::session::tests::make_session_and_context;
     use codex_protocol::models::ContentItem;
+    use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookExecutionMode;
     use codex_protocol::protocol::HookHandlerType;
     use codex_protocol::protocol::HookRunStatus;
+    use codex_protocol::protocol::HookRunSummary;
     use codex_protocol::protocol::HookScope;
     use codex_protocol::protocol::HookSource;
-    use pretty_assertions::assert_eq;
-    use tempfile::TempDir;
-
-    use super::CompletionHookWorkspaceObservationState;
-    use super::additional_context_messages;
-    use super::dedupe_existing_developer_contexts;
-    use super::finish_completion_hook_workspace_observation;
-    use super::hook_run_analytics_payload;
-    use super::hook_run_metric_tags;
-    use crate::git_workspace::GitWorkspaceCache;
-    use crate::session::tests::make_session_and_context;
-    use codex_protocol::protocol::HookCompletedEvent;
-    use codex_protocol::protocol::HookRunSummary;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn context_injecting_hook_outcome_preserves_runtime_fields() {
@@ -1065,40 +952,6 @@ mod tests {
         assert!(outcome.should_stop);
         assert_eq!(outcome.stop_reason.as_deref(), Some("prompt blocked"));
         assert_eq!(outcome.additional_contexts, vec!["injected"]);
-    }
-
-    #[tokio::test]
-    async fn completion_hook_workspace_observation_refreshes_on_changes_and_uncertainty() {
-        let repo = TempDir::new().expect("temp repo");
-        let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-
-        let unchanged = CompletionHookWorkspaceObservationState {
-            observation: cache.begin_workspace_change_observation(repo.path()),
-            git_workspace_cache: Arc::clone(&cache),
-        };
-        assert_eq!(
-            finish_completion_hook_workspace_observation(Some(unchanged), "Stop").await,
-            (false, None)
-        );
-
-        let changed = CompletionHookWorkspaceObservationState {
-            observation: cache.begin_workspace_change_observation(repo.path()),
-            git_workspace_cache: Arc::clone(&cache),
-        };
-        cache.note_host_workspace_mutation();
-        assert_eq!(
-            finish_completion_hook_workspace_observation(Some(changed), "AfterAgent").await,
-            (true, None)
-        );
-
-        let uncertain = CompletionHookWorkspaceObservationState {
-            observation: None,
-            git_workspace_cache: Arc::clone(&cache),
-        };
-        assert_eq!(
-            finish_completion_hook_workspace_observation(Some(uncertain), "Stop").await,
-            (true, None)
-        );
     }
 
     #[test]
@@ -1133,6 +986,21 @@ mod tests {
                 ("developer", "second tide note".to_string()),
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn retired_continuity_marker_is_plain_hook_context() {
+        let (session, turn_context) = make_session_and_context().await;
+        let session = std::sync::Arc::new(session);
+        let turn_context = std::sync::Arc::new(turn_context);
+        let legacy_context =
+            "<kd4_continuity_capsule_v1>{not-json}</kd4_continuity_capsule_v1>".to_string();
+
+        let messages =
+            prepare_additional_context_items(&session, &turn_context, vec![legacy_context.clone()])
+                .await;
+
+        assert_eq!(messages, additional_context_messages(vec![legacy_context]));
     }
 
     #[test]

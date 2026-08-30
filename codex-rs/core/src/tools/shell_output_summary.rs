@@ -8,7 +8,11 @@ const SUCCESS_HEAD_LINES: usize = 24;
 const SUCCESS_TAIL_LINES: usize = 64;
 const FAILURE_TAIL_LINES: usize = 140;
 const FOCUS_CONTEXT_LINES: usize = 3;
-const MAX_FOCUS_MATCHES: usize = 48;
+// Keep the selected ranges below the summary line ceiling even when every
+// match is disjoint and receives the full context window. This leaves room for
+// the failure tail, final statuses, separators, and summary metadata.
+const MAX_FOCUS_MATCHES: usize = 8;
+const MAX_STATUS_MATCHES: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ShellOutputSummaryOptions<'a> {
@@ -43,12 +47,12 @@ pub(crate) fn summarize_shell_output_for_model(
         .command_text
         .is_some_and(looks_like_validation_command);
     let line_states = select_line_states(&lines, failed, validation);
-    let retained_shape = if validation {
-        "failure-focused lines, final status lines, tail"
+    let selection_policy = if validation {
+        "source-ordered failure-focused lines, final status lines, tail"
     } else if failed {
-        "failure-focused lines, tail"
+        "source-ordered failure-focused lines, tail"
     } else {
-        "head, warning/error lines, tail"
+        "source-ordered head, warning/error lines, tail"
     };
 
     let mut builder = SummaryBuilder::new();
@@ -59,13 +63,13 @@ pub(crate) fn summarize_shell_output_for_model(
     if timed_out {
         builder.push_line("- timed_out: true");
     }
-    builder.push_line(format!("- retained: {retained_shape}"));
+    builder.push_line(format!("- selection_policy: {selection_policy}"));
     builder.push_line("");
     builder.push_line("Selected output lines:");
 
-    // Emit exact failure signals, their context, and the final status tail
-    // before advisory ranges. A source-ordered warning flood could otherwise
-    // consume the bounded summary before either actionable region.
+    // Candidate quotas reserve space for actionable and final regions before
+    // rendering. Emit the selected lines in source order so a diagnostic stays
+    // attached to the context that explains it.
     let ordered = ordered_line_indexes(&line_states);
     let mut previous = None;
     for index in ordered {
@@ -124,23 +128,21 @@ struct LineClassification {
 struct LineState {
     classification: LineClassification,
     selected: bool,
-    critical_priority: bool,
-    critical_context: bool,
-    tail: bool,
 }
 
 fn classify_line(line: &str) -> LineClassification {
     let lower = line.to_ascii_lowercase();
     let trimmed = lower.trim_start();
     LineClassification {
-        critical: lower.contains("error")
-            || lower.contains("failed")
-            || lower.contains("failure")
-            || lower.contains("panic")
-            || lower.contains("thread ")
-            || lower.contains("expected")
-            || lower.contains("actual")
-            || lower.contains("error["),
+        critical: starts_with_diagnostic_label(trimmed, "error")
+            || starts_with_diagnostic_label(trimmed, "failed")
+            || starts_with_diagnostic_label(trimmed, "failure")
+            || starts_with_diagnostic_label(trimmed, "panic")
+            || starts_with_diagnostic_label(trimmed, "fatal")
+            || trimmed.starts_with("failures:")
+            || trimmed.starts_with("panicked at ")
+            || lower.contains(" panicked at ")
+            || lower.contains(" error:"),
         advisory: lower.contains("warning")
             || lower.contains("warning[")
             || trimmed.starts_with("-->")
@@ -154,6 +156,15 @@ fn classify_line(line: &str) -> LineClassification {
             || lower.contains("error:")
             || lower.contains("summary:"),
     }
+}
+
+fn starts_with_diagnostic_label(line: &str, label: &str) -> bool {
+    line.strip_prefix(label).is_some_and(|remainder| {
+        matches!(
+            remainder.as_bytes().first(),
+            None | Some(b':') | Some(b'[') | Some(b'.') | Some(b' ')
+        )
+    })
 }
 
 fn select_line_states(lines: &[&str], failed: bool, validation: bool) -> Vec<LineState> {
@@ -189,21 +200,17 @@ fn add_tail(states: &mut [LineState], count: usize) {
     let start = states.len().saturating_sub(count);
     for state in &mut states[start..] {
         state.selected = true;
-        state.tail = true;
     }
 }
 
 fn add_focus_ranges(states: &mut [LineState]) {
-    let critical = states
+    let all_critical = states
         .iter()
         .enumerate()
         .filter_map(|(index, state)| state.classification.critical.then_some(index))
-        .take(MAX_FOCUS_MATCHES)
         .collect::<Vec<_>>();
-    for &index in &critical {
-        states[index].critical_priority = true;
-    }
-    add_context_ranges(states, &critical, true);
+    let critical = bounded_edge_indexes(&all_critical, MAX_FOCUS_MATCHES);
+    add_context_ranges(states, &critical);
     let remaining = MAX_FOCUS_MATCHES.saturating_sub(critical.len());
     let advisory = states
         .iter()
@@ -211,16 +218,28 @@ fn add_focus_ranges(states: &mut [LineState]) {
         .filter_map(|(index, state)| state.classification.advisory.then_some(index))
         .take(remaining)
         .collect::<Vec<_>>();
-    add_context_ranges(states, &advisory, false);
+    add_context_ranges(states, &advisory);
 }
 
-fn add_context_ranges(states: &mut [LineState], indexes: &[usize], critical_context: bool) {
+fn bounded_edge_indexes(indexes: &[usize], limit: usize) -> Vec<usize> {
+    if indexes.len() <= limit {
+        return indexes.to_vec();
+    }
+    let head = limit.div_ceil(2);
+    let tail = limit.saturating_sub(head);
+    indexes[..head]
+        .iter()
+        .chain(indexes[indexes.len() - tail..].iter())
+        .copied()
+        .collect()
+}
+
+fn add_context_ranges(states: &mut [LineState], indexes: &[usize]) {
     for &index in indexes {
         let start = index.saturating_sub(FOCUS_CONTEXT_LINES);
         let end = (index + FOCUS_CONTEXT_LINES + 1).min(states.len());
         for state in &mut states[start..end] {
             state.selected = true;
-            state.critical_context |= critical_context;
         }
     }
 }
@@ -229,8 +248,9 @@ fn add_status_lines(states: &mut [LineState]) {
     let status = states
         .iter()
         .enumerate()
+        .rev()
         .filter_map(|(index, state)| state.classification.status.then_some(index))
-        .take(MAX_FOCUS_MATCHES)
+        .take(MAX_STATUS_MATCHES)
         .collect::<Vec<_>>();
     for index in status {
         states[index].selected = true;
@@ -238,21 +258,10 @@ fn add_status_lines(states: &mut [LineState]) {
 }
 
 fn ordered_line_indexes(states: &[LineState]) -> impl Iterator<Item = usize> + '_ {
-    let critical = states
+    states
         .iter()
         .enumerate()
-        .filter_map(|(index, state)| state.critical_priority.then_some(index));
-    let critical_context = states.iter().enumerate().filter_map(|(index, state)| {
-        (state.critical_context && !state.critical_priority).then_some(index)
-    });
-    let tail = states
-        .iter()
-        .enumerate()
-        .filter_map(|(index, state)| (state.tail && !state.critical_context).then_some(index));
-    let advisory = states.iter().enumerate().filter_map(|(index, state)| {
-        (state.selected && !state.critical_context && !state.tail).then_some(index)
-    });
-    critical.chain(critical_context).chain(tail).chain(advisory)
+        .filter_map(|(index, state)| state.selected.then_some(index))
 }
 
 fn looks_like_validation_command(command: &str) -> bool {
@@ -395,7 +404,7 @@ mod optimization_tests {
     }
 
     #[test]
-    fn selection_flags_emit_each_index_once_in_priority_order() {
+    fn selection_flags_emit_each_index_once_in_source_order() {
         let lines = [
             "warning: advisory",
             "before",
@@ -409,7 +418,7 @@ mod optimization_tests {
         let states = select_line_states(&lines, true, true);
         let ordered = ordered_line_indexes(&states).collect::<Vec<_>>();
 
-        assert_eq!(ordered, vec![2, 0, 1, 3, 4, 5, 6, 7]);
+        assert_eq!(ordered, (0..lines.len()).collect::<Vec<_>>());
         let mut sorted = ordered.clone();
         sorted.sort_unstable();
         sorted.dedup();

@@ -7,5 +7,5 @@ addendum and must not include the checkpoint preamble.
 Include at least one applicable heading with a non-empty body.
 Use only the applicable standard checkpoint headings: `## Goal`,
 `## Current state`, `## Completed work`, `## Unresolved work`, `## Evidence`,
-and `## Next action`. Omit unchanged sections. Treat fresh structured harness state
-as authoritative and explicitly invalidate superseded evidence.
+and `## Next action`. Omit unchanged sections. Prefer the latest observed state
+and explicitly invalidate superseded evidence.

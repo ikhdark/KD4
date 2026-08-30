@@ -15,7 +15,7 @@ pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 10_000;
 /// ordinary yield intervals far below this value.
 pub const OWNER_HELD_STATE_CHANGE_YIELD_TIME_MS: u64 = u64::MAX;
 /// Default coherent evidence-packet budget when no per-call limit is requested.
-pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 4_000;
+pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
 /// Maximum coherent evidence-packet budget accepted from an explicit request.
 /// The core also caps this at the active model's hard output limit.
 pub const MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;

@@ -1131,7 +1131,9 @@ def main() -> int:
     if is_relative_to(runner_temp, REPO_ROOT.resolve()):
         raise ValueError("RUNNER_TEMP must be outside the repository")
     if vendor_src_arg is not None and (args.workflow_url or args.workflow_name):
-        raise ValueError("--vendor-src cannot be combined with workflow artifact options")
+        raise ValueError(
+            "--vendor-src cannot be combined with workflow artifact options"
+        )
     workflow_repo = (
         github_repo_from_workflow_url(args.workflow_url) if args.workflow_url else None
     )
@@ -1182,7 +1184,9 @@ def main() -> int:
                     raise RuntimeError(f"--vendor-src is not a directory: {vendor_src}")
                 for components, targets in native_component_sets:
                     missing_targets = [
-                        target for target in targets if not (vendor_src / target).is_dir()
+                        target
+                        for target in targets
+                        if not (vendor_src / target).is_dir()
                     ]
                     if missing_targets:
                         raise RuntimeError(
@@ -1199,13 +1203,17 @@ def main() -> int:
                     args.workflow_name,
                 )
                 if not resolved_head_sha:
-                    raise RuntimeError("native artifact workflow did not report a head SHA")
+                    raise RuntimeError(
+                        "native artifact workflow did not report a head SHA"
+                    )
                 workflow_id = workflow_id_from_url(workflow_url)
                 ensure_source_matches_workflow(resolved_head_sha)
                 print(f"Using native artifacts from {workflow_url}", flush=True)
                 if args.cache_dir is None:
                     artifacts_temp_root = Path(
-                        tempfile.mkdtemp(prefix="npm-native-artifacts-", dir=runner_temp)
+                        tempfile.mkdtemp(
+                            prefix="npm-native-artifacts-", dir=runner_temp
+                        )
                     )
                     cleanup_artifacts_root = True
                     print(
@@ -1214,7 +1222,9 @@ def main() -> int:
                     )
                 else:
                     artifacts_temp_root = (
-                        args.cache_dir / github_repo_cache_key(github_repo) / workflow_id
+                        args.cache_dir
+                        / github_repo_cache_key(github_repo)
+                        / workflow_id
                     ).resolve()
                     artifacts_temp_root.mkdir(parents=True, exist_ok=True)
                     print(

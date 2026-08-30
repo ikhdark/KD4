@@ -1,6 +1,5 @@
 #![allow(clippy::expect_used)]
 
-use codex_features::Feature;
 use codex_protocol::protocol::TurnTiming;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
@@ -218,9 +217,6 @@ async fn post_edit_batches_validation_and_git_into_three_model_requests() -> any
     .await;
     let baseline_test = test_codex()
         .with_model("test-gpt-5.1-codex")
-        .with_config(|config| {
-            let _ = config.features.disable(Feature::TaskCompletionReviewer);
-        })
         .build(&baseline_server)
         .await?;
 
@@ -269,9 +265,6 @@ async fn post_edit_batches_validation_and_git_into_three_model_requests() -> any
     .await;
     let test = test_codex()
         .with_model("test-gpt-5.1-codex")
-        .with_config(|config| {
-            let _ = config.features.disable(Feature::TaskCompletionReviewer);
-        })
         .build(&server)
         .await?;
 
@@ -349,9 +342,6 @@ async fn identical_parallel_tool_calls_reach_immediate_continuation() -> anyhow:
     .await;
     let test = test_codex()
         .with_model("test-gpt-5.1-codex")
-        .with_config(|config| {
-            let _ = config.features.disable(Feature::TaskCompletionReviewer);
-        })
         .build(&server)
         .await?;
 
@@ -482,9 +472,6 @@ async fn diagnosis_and_dynamic_validation_keep_model_boundaries() -> anyhow::Res
     .await;
     let test = test_codex()
         .with_model("test-gpt-5.1-codex")
-        .with_config(|config| {
-            let _ = config.features.disable(Feature::TaskCompletionReviewer);
-        })
         .build(&server)
         .await?;
 
@@ -534,9 +521,6 @@ async fn root_production_request_contains_bounded_orchestration_guidance() -> an
     .await;
     let test = test_codex()
         .with_model("test-gpt-5.1-codex")
-        .with_config(|config| {
-            let _ = config.features.disable(Feature::TaskCompletionReviewer);
-        })
         .build(&server)
         .await?;
 

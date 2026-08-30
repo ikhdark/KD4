@@ -309,9 +309,7 @@ def measure_scenario(
     passed = len(samples) == count and all(sample.exit_code == 0 for sample in samples)
     warm = elapsed[1:]
     p50_ms, p95_ms, min_ms, max_ms = (
-        _ordered_sample_statistics(elapsed)
-        if elapsed
-        else (None, None, None, None)
+        _ordered_sample_statistics(elapsed) if elapsed else (None, None, None, None)
     )
     return ScenarioResult(
         name=scenario.name,

@@ -455,11 +455,17 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
     assert_eq!(output_call_id, request_call_id);
     assert_eq!(status, "incomplete");
     assert_eq!(execution, "client");
-    assert!(tools.is_empty());
+    assert_eq!(
+        tools,
+        &[serde_json::json!({
+            "type": "tool_search_error",
+            "message": "failed to parse function arguments: invalid type: integer `42`, expected a string",
+        })]
+    );
 }
 
 #[tokio::test]
-async fn completed_tool_call_persistence_does_not_block_stream_and_precedes_dispatch() {
+async fn completed_tool_call_required_persistence_does_not_block_stream_and_precedes_dispatch() {
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
@@ -497,7 +503,7 @@ async fn completed_tool_call_persistence_does_not_block_stream_and_precedes_disp
     let response_item_recorder = OrderedResponseItemRecorder::default();
     let (release_persistence, persistence_blocked) = tokio::sync::oneshot::channel();
     response_item_recorder
-        .block_persistence_for_test(persistence_blocked)
+        .block_required_persistence_for_test(persistence_blocked)
         .await;
     let mut ctx = HandleOutputCtx {
         sess: Arc::clone(&session),
@@ -565,7 +571,95 @@ async fn completed_tool_call_persistence_does_not_block_stream_and_precedes_disp
 }
 
 #[tokio::test]
-async fn duplicate_same_generation_tool_call_is_rejected_before_persistence_and_dispatch() {
+async fn completed_tool_call_auxiliary_persistence_does_not_block_dispatch() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    turn_context.turn_timing_state.mark_turn_started();
+    let sampling = turn_context.turn_timing_state.begin_sampling();
+    let mut pending = None::<ContinuationCause>;
+    turn_context
+        .turn_timing_state
+        .begin_model_generation(&mut pending, &SessionSource::Cli);
+    drop(turn_context.turn_timing_state.begin_model_request_wait());
+    drop(sampling);
+    let started = Arc::new(AtomicBool::new(false));
+    let handler = Arc::new(PersistenceProbeHandler {
+        started: Arc::clone(&started),
+    }) as Arc<dyn CoreToolRuntime>;
+    let router = Arc::new(ToolRouter::from_parts(
+        ToolRegistry::from_tools([handler]),
+        Vec::new(),
+    ));
+    let step_context =
+        StepContext::for_test(Arc::clone(&turn_context)).with_tool_router_for_test(router);
+    let tool_runtime = ToolCallRuntime::new(
+        Arc::clone(&session),
+        step_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+    );
+    let item = ResponseItem::FunctionCall {
+        id: None,
+        name: "persistence_probe".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "auxiliary-read".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let response_item_recorder = OrderedResponseItemRecorder::default();
+    let recorder_for_flush = response_item_recorder.clone();
+    let (release_auxiliary, auxiliary_blocked) = tokio::sync::oneshot::channel();
+    response_item_recorder
+        .block_auxiliary_persistence_for_test(auxiliary_blocked)
+        .await;
+    let mut ctx = HandleOutputCtx {
+        sess: Arc::clone(&session),
+        turn_context: Arc::clone(&turn_context),
+        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+        tool_runtime,
+        cancellation_token: CancellationToken::new(),
+        response_item_recorder,
+    };
+    let mut eager_prefix_open = true;
+
+    let output = handle_output_item_done(
+        &mut ctx,
+        item,
+        /*previously_active_item*/ None,
+        &mut eager_prefix_open,
+    )
+    .await
+    .expect("read-safe tool call should be accepted");
+    output
+        .tool_future
+        .expect("accepted tool call should retain its lazy future")
+        .into_future()
+        .await
+        .result
+        .expect("auxiliary persistence must not delay tool dispatch");
+
+    assert!(started.load(Ordering::SeqCst));
+    let history = session.clone_history().await;
+    let [ResponseItem::FunctionCall { call_id, .. }] = history.raw_items() else {
+        panic!("completed tool call must be model-visible before dispatch")
+    };
+    assert_eq!(call_id, "auxiliary-read");
+
+    let mut flush = Box::pin(recorder_for_flush.flush());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), flush.as_mut())
+            .await
+            .is_err(),
+        "the test must keep auxiliary persistence blocked after dispatch"
+    );
+    release_auxiliary
+        .send(())
+        .expect("auxiliary persistence blocker should still be active");
+    flush.await;
+}
+
+#[tokio::test]
+async fn exact_tool_call_replay_is_deduplicated_but_conflicting_reuse_is_rejected() {
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
@@ -622,12 +716,31 @@ async fn duplicate_same_generation_tool_call_is_rejected_before_persistence_and_
 
     let second = handle_output_item_done(
         &mut ctx,
-        item,
+        item.clone(),
+        /*previously_active_item*/ None,
+        &mut eager_prefix_open,
+    )
+    .await
+    .expect("an exact provider replay should be ignored");
+    assert!(second.tool_future.is_none());
+    assert!(!second.needs_follow_up);
+
+    let conflicting = ResponseItem::FunctionCall {
+        id: None,
+        name: "persistence_probe".to_string(),
+        namespace: None,
+        arguments: r#"{"changed":true}"#.to_string(),
+        call_id: "duplicate-call".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let third = handle_output_item_done(
+        &mut ctx,
+        conflicting,
         /*previously_active_item*/ None,
         &mut eager_prefix_open,
     )
     .await;
-    assert!(matches!(second, Err(CodexErr::Fatal(message)) if message.contains("same call ID")));
+    assert!(matches!(third, Err(CodexErr::Fatal(message)) if message.contains("same call ID")));
     assert!(!started.load(Ordering::SeqCst));
 
     ctx.response_item_recorder.flush().await;

@@ -22,7 +22,6 @@ use crate::tools::handlers::McpHandler;
 use crate::tools::handlers::PlanHandler;
 use crate::tools::handlers::ReadMcpResourceHandler;
 use crate::tools::handlers::ReadToolOutputHandler;
-use crate::tools::handlers::ReadTurnTimingHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
@@ -421,15 +420,21 @@ fn apply_namespace_description_budget(planned_tools: &mut PlannedTools) {
         }
     }
 
-    let mut description_budget = ModelContextBudget::default();
-    for namespace_name in namespace_order {
-        let Some(description) = descriptions.get_mut(&namespace_name) else {
+    for namespace_name in &namespace_order {
+        let Some(description) = descriptions.get_mut(namespace_name) else {
             unreachable!("collected namespace description");
         };
         if description.trim().is_empty() {
-            *description = default_namespace_description(&namespace_name);
+            *description = default_namespace_description(namespace_name);
         }
-        *description = description_budget.take(description).unwrap_or_default();
+    }
+    let mut ordered_descriptions = namespace_order
+        .iter()
+        .map(|name| descriptions[name].clone())
+        .collect::<Vec<_>>();
+    apply_fair_description_budget(&mut ordered_descriptions);
+    for (namespace_name, description) in namespace_order.into_iter().zip(ordered_descriptions) {
+        descriptions.insert(namespace_name, description);
     }
 
     for spec in planned_tools
@@ -444,6 +449,33 @@ fn apply_namespace_description_budget(planned_tools: &mut PlannedTools) {
         if let Some(description) = descriptions.get(&namespace.name) {
             namespace.description.clone_from(description);
         }
+    }
+}
+
+fn apply_fair_description_budget(descriptions: &mut [String]) {
+    if descriptions.is_empty() {
+        return;
+    }
+    let mut budget = ModelContextBudget::default();
+    let mut lengths = descriptions.iter().map(String::len).collect::<Vec<_>>();
+    lengths.sort_unstable();
+    let mut remaining_bytes = budget.remaining_bytes();
+    let mut remaining_items = lengths.len();
+    let mut per_item_cap = usize::MAX;
+    for length in lengths {
+        let fair_share = remaining_bytes / remaining_items;
+        if length > fair_share {
+            per_item_cap = fair_share;
+            break;
+        }
+        remaining_bytes -= length;
+        remaining_items -= 1;
+    }
+
+    for description in descriptions {
+        *description = budget
+            .take_up_to(description, per_item_cap)
+            .unwrap_or_default();
     }
 }
 
@@ -721,7 +753,6 @@ fn merge_into_namespaces(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
         }
     }
 
-    let mut description_budget = ModelContextBudget::default();
     for spec in &mut merged_specs {
         let ToolSpec::Namespace(namespace) = spec else {
             continue;
@@ -737,9 +768,26 @@ fn merge_into_namespaces(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
         if namespace.description.trim().is_empty() {
             namespace.description = default_namespace_description(&namespace.name);
         }
-        namespace.description = description_budget
-            .take(&namespace.description)
-            .unwrap_or_default();
+    }
+
+    let namespace_indices = merged_specs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, spec)| matches!(spec, ToolSpec::Namespace(_)).then_some(index))
+        .collect::<Vec<_>>();
+    let mut descriptions = namespace_indices
+        .iter()
+        .map(|&index| match &merged_specs[index] {
+            ToolSpec::Namespace(namespace) => namespace.description.clone(),
+            _ => unreachable!("collected namespace index"),
+        })
+        .collect::<Vec<_>>();
+    apply_fair_description_budget(&mut descriptions);
+    for (index, description) in namespace_indices.into_iter().zip(descriptions) {
+        let ToolSpec::Namespace(namespace) = &mut merged_specs[index] else {
+            unreachable!("collected namespace index");
+        };
+        namespace.description = description;
     }
 
     merged_specs
@@ -926,16 +974,9 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
     planned_tools.add_with_authorization_class(ReadToolOutputHandler, TypedToolClass::ReadSearch);
-    if turn_context.kd4_workflow_enabled {
-        planned_tools
-            .add_with_authorization_class(ReadTurnTimingHandler, TypedToolClass::ReadSearch);
-    }
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
-        planned_tools.add_with_authorization_class(
-            PlanHandler::new(turn_context.kd4_workflow_enabled),
-            TypedToolClass::OwnTask,
-        );
+        planned_tools.add_with_authorization_class(PlanHandler, TypedToolClass::OwnTask);
     }
 
     if features.enabled(Feature::DeferredExecutor)

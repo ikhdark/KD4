@@ -34,8 +34,8 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
             command = rf"""
 . {ps_single_quote(SCRIPT)} -ImportOnly
 $entries = @(
-    [pscustomobject]@{{ Name = 'codex'; SourcePath = {ps_single_quote(source)}; TargetPath = {ps_single_quote(target)}; BackupPath = {ps_single_quote(temp_path / 'codex.bak')}; HadPreviousTarget = $true; Changed = $true }}
-    [pscustomobject]@{{ Name = 'host'; SourcePath = {ps_single_quote(missing)}; TargetPath = {ps_single_quote(install_dir / 'host.exe')}; BackupPath = {ps_single_quote(temp_path / 'host.bak')}; HadPreviousTarget = $false; Changed = $true }}
+    [pscustomobject]@{{ Name = 'codex'; SourcePath = {ps_single_quote(source)}; TargetPath = {ps_single_quote(target)}; BackupPath = {ps_single_quote(temp_path / "codex.bak")}; HadPreviousTarget = $true; Changed = $true }}
+    [pscustomobject]@{{ Name = 'host'; SourcePath = {ps_single_quote(missing)}; TargetPath = {ps_single_quote(install_dir / "host.exe")}; BackupPath = {ps_single_quote(temp_path / "host.bak")}; HadPreviousTarget = $false; Changed = $true }}
 )
 try {{
     New-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)} -InstallDir {ps_single_quote(install_dir)} -Entries $entries
@@ -47,7 +47,14 @@ catch {{
 }}
 """
             result = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                [
+                    self.shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
                 text=True,
                 capture_output=True,
                 check=False,
@@ -86,7 +93,7 @@ $transaction = [pscustomobject]@{{
     HadPreviousInstall = $true
     Entries = @([pscustomobject]@{{
         Name = 'codex'
-        StagedPath = {ps_single_quote(stage / 'codex.exe')}
+        StagedPath = {ps_single_quote(stage / "codex.exe")}
         TargetPath = {ps_single_quote(target)}
         BackupPath = {ps_single_quote(backup)}
         HadPreviousTarget = $true
@@ -98,7 +105,14 @@ Write-CodexPublishTransactionJournal -Transaction $transaction
 if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)})) {{ throw 'recovery did not run' }}
 """
             result = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                [
+                    self.shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
                 text=True,
                 capture_output=True,
                 check=False,
@@ -493,9 +507,7 @@ if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(jo
             self.assertFalse((install_dir / "codex-code-mode-host.exe").exists())
             self.assertIn("backupPath: <none: target missing>", result.stdout)
             self.assertIn("rollback: requested:", result.stdout)
-            self.assertIn(
-                "bundleTransactionRecovery: rolled back:", result.stdout
-            )
+            self.assertIn("bundleTransactionRecovery: rolled back:", result.stdout)
             self.assert_no_publish_temps(install_dir)
 
     def test_apply_closes_running_target_before_replacing(self) -> None:

@@ -320,6 +320,7 @@ keyring = { version = "3.6", default-features = false }
 # Keep SQLx's bundled SQLite on a version containing the WAL-reset corruption fix:
 # https://www.sqlite.org/wal.html#the_wal_reset_bug
 libsqlite3-sys = { version = "0.37", default-features = false }
+libc = "0.2"
 log = "0.4"
 lru = "0.16.3"
 maplit = "1.0.2"
@@ -391,6 +392,7 @@ strum_macros = "0.28.0"
 supports-color = "3.0.2"
 syntect = "5"
 sys-locale = "0.3.2"
+system-configuration = "0.7"
 tar = { version = "=0.4.45", default-features = false }
 tempfile = "3.23.0"
 test-log = "0.2.19"

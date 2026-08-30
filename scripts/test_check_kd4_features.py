@@ -162,7 +162,9 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         )
         self.assertIn("repository-intelligence", source_owner["feature_ids"])
 
-    def test_performance_sensitive_completion_requires_comparable_evidence(self) -> None:
+    def test_performance_sensitive_completion_requires_comparable_evidence(
+        self,
+    ) -> None:
         instructions = (check_kd4_features.REPO_ROOT / "AGENTS.md").read_text(
             encoding="utf-8"
         )
@@ -173,40 +175,46 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertIn("latency statistic and threshold", benchmarking)
         self.assertIn("Finish only when the quality gate passes", benchmarking)
 
-    def test_task_evidence_schema_version_is_machine_checked(self) -> None:
+    def test_task_continuity_workflow_is_retired_end_to_end(self) -> None:
         with check_kd4_features.DEFAULT_MANIFEST.open("rb") as manifest_file:
             manifest = tomllib.load(manifest_file)
+        with (check_kd4_features.REPO_ROOT / "source_owners.toml").open(
+            "rb"
+        ) as owner_file:
+            owners = tomllib.load(owner_file)
 
-        feature = next(
-            feature
-            for feature in manifest["features"]
-            if feature["id"] == "task-evidence-completion-gate"
+        self.assertNotIn(
+            "task-continuity-hooks",
+            {feature["id"] for feature in manifest["features"]},
         )
-        self.assertNotRegex(feature["summary"], r"schema-v\d+")
-        self.assertEqual(feature["contract_schema_version"], 13)
-        self.assertEqual(
-            feature["contract_schema_symbol"], "TASK_EVIDENCE_SCHEMA_VERSION"
+        self.assertNotIn(
+            "task-continuity-hooks",
+            {owner["id"] for owner in owners["owners"]},
         )
+        for retired_path in (
+            ".codex/hooks.json",
+            ".codex/hooks/task-continuity-entry.ps1",
+            ".codex/hooks/task-continuity-fast-basic.ps1",
+            ".codex/hooks/task-continuity-fast-compact.ps1",
+            ".codex/hooks/task-continuity-fast-session.ps1",
+            ".codex/hooks/task-continuity.ps1",
+            "codex-rs/core/src/continuity.rs",
+            "scripts/test_task_continuity_hook.py",
+        ):
+            with self.subTest(path=retired_path):
+                self.assertFalse((check_kd4_features.REPO_ROOT / retired_path).exists())
 
-    def test_task_continuity_workflow_is_registered_with_local_owner(self) -> None:
-        with check_kd4_features.DEFAULT_MANIFEST.open("rb") as manifest_file:
-            manifest = tomllib.load(manifest_file)
-
-        feature = next(
-            feature
-            for feature in manifest["features"]
-            if feature["id"] == "task-continuity-hooks"
-        )
-
-        self.assertEqual(feature["status"], "enabled")
-        self.assertEqual(feature["capability_kind"], "workflow")
-        self.assertEqual(feature["owner"], ".codex/hooks")
-        evidence = {(item["kind"], item["path"]) for item in feature["evidence"]}
-        self.assertIn(("registration", ".codex/hooks.json"), evidence)
-        self.assertIn(
-            ("entrypoint", ".codex/hooks/task-continuity-entry.ps1"), evidence
-        )
-        self.assertIn(("test", "scripts/test_task_continuity_hook.py"), evidence)
+        for consumer_path in (
+            "codex-rs/core/src/lib.rs",
+            "codex-rs/core/src/hook_runtime.rs",
+            "codex-rs/core/src/context_manager/history.rs",
+        ):
+            source = (check_kd4_features.REPO_ROOT / consumer_path).read_text(
+                encoding="utf-8"
+            )
+            with self.subTest(consumer=consumer_path):
+                self.assertNotIn("crate::continuity", source)
+                self.assertNotIn("mod continuity;", source)
 
     def test_valid_enabled_feature_passes(self) -> None:
         result = check_kd4_features.validate_manifest(

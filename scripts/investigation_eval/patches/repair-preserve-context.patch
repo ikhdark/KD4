@@ -1,0 +1,26 @@
+diff --git a/investigation_cases/repair_preserve_context.py b/investigation_cases/repair_preserve_context.py
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/repair_preserve_context.py
+@@ -0,0 +1,2 @@
++def model_visible_messages(messages):
++    return messages[-4:]
+diff --git a/investigation_cases/test_repair_preserve_context.py b/investigation_cases/test_repair_preserve_context.py
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/test_repair_preserve_context.py
+@@ -0,0 +1,14 @@
++import unittest
++
++from repair_preserve_context import model_visible_messages
++
++
++class ModelVisibleMessagesTests(unittest.TestCase):
++    def test_preserves_all_supplied_context(self):
++        messages = ["system", "request", "constraint", "finding", "tool", "result"]
++
++        self.assertEqual(model_visible_messages(messages), messages)
++
++
++if __name__ == "__main__":
++    unittest.main()

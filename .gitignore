@@ -78,7 +78,6 @@ coverage/
 # personal files
 personal/
 /kd-ui/
-/task-evidence/
 .codex/harness/runs/
 .codex/locks/
 

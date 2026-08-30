@@ -498,10 +498,7 @@ function existingDirs(...dirs: string[]): string[] {
   return dirs.filter(isDirectory);
 }
 
-export function prependPathDirs(
-  env: Record<string, string>,
-  pathDirs: string[],
-): void {
+export function prependPathDirs(env: Record<string, string>, pathDirs: string[]): void {
   const pathKey = pathEnvKey(env);
   for (const key of Object.keys(env)) {
     if (key.toLowerCase() === "path" && key !== pathKey) {

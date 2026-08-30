@@ -60,7 +60,6 @@ pub(crate) struct SessionState {
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
     granted_permissions_by_approval_scope_id: HashMap<String, UriAdditionalPermissionProfile>,
-    last_passed_root_completion_turn_id: Option<String>,
     next_turn_is_first: bool,
     pending_context_baseline: Option<ContextBaselineCandidate>,
 }
@@ -95,7 +94,6 @@ impl SessionState {
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
             granted_permissions_by_approval_scope_id: HashMap::new(),
-            last_passed_root_completion_turn_id: None,
             next_turn_is_first: true,
             pending_context_baseline: None,
         }
@@ -156,15 +154,6 @@ impl SessionState {
     ) -> std::collections::BTreeSet<String> {
         self.history
             .mark_tool_history_consumed_with_delta(input, generation)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn last_passed_root_completion_turn_id(&self) -> Option<String> {
-        self.last_passed_root_completion_turn_id.clone()
-    }
-
-    pub(crate) fn set_last_passed_root_completion_turn_id(&mut self, turn_id: Option<String>) {
-        self.last_passed_root_completion_turn_id = turn_id;
     }
 
     pub(crate) fn replace_history(

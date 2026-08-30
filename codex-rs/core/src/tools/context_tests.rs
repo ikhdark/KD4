@@ -886,6 +886,34 @@ fn command_semantic_evidence_preserves_diagnostics_and_non_location_numbers() {
 }
 
 #[test]
+fn command_semantic_evidence_preserves_removed_and_context_diff_lines() {
+    let first_removal =
+        b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old value\n+new value";
+    let second_removal =
+        b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-other old value\n+new value";
+    assert_ne!(
+        semantic_evidence_for_command_output(first_removal),
+        semantic_evidence_for_command_output(second_removal)
+    );
+
+    let first_context = b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,2 +1,2 @@\n first context\n-old value\n+new value";
+    let second_context = b"diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,2 +1,2 @@\n second context\n-old value\n+new value";
+    assert_ne!(
+        semantic_evidence_for_command_output(first_context),
+        semantic_evidence_for_command_output(second_context)
+    );
+}
+
+#[test]
+fn ansi_stripping_preserves_text_after_a_non_csi_escape() {
+    assert_eq!(strip_ansi_sequences("before\u{1b}Xafter"), "beforeXafter");
+    assert_eq!(
+        strip_ansi_sequences("before\u{1b}[31mred\u{1b}[0mafter"),
+        "beforeredafter"
+    );
+}
+
+#[test]
 fn command_semantic_evidence_includes_facts_after_the_old_limit() {
     let shared = (0..512)
         .map(|index| format!("shared fact {index}"))
@@ -936,6 +964,7 @@ fn token_efficiency_exec_output_omits_redundant_headers() {
         max_output_tokens: Some(20),
         process_id: None,
         exit_code: Some(0),
+        process_exited: true,
         original_token_count: Some(100),
         hook_command: None,
         raw_output_artifact: None,
@@ -972,9 +1001,10 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
         wall_time: std::time::Duration::from_millis(250),
         raw_output: b"process still running".to_vec(),
         truncation_policy: TruncationPolicy::Tokens(10_000),
-        max_output_tokens: Some(1_000),
+        max_output_tokens: None,
         process_id: Some(4242),
         exit_code: None,
+        process_exited: false,
         original_token_count: Some(3),
         hook_command: None,
         raw_output_artifact: None,
@@ -982,7 +1012,11 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
     };
 
     assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Yielded);
-    assert!(!output.success_for_logging());
+    assert!(output.success_for_logging());
+    assert_eq!(
+        output.model_output_max_tokens(),
+        codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS
+    );
     assert_eq!(
         output
             .projection_metadata()
@@ -990,6 +1024,86 @@ fn retained_exec_command_process_is_yielded_not_timed_out() {
             .outcome,
         ToolOutputOutcome::Yielded
     );
+    match output.to_response_item(
+        "retained-call",
+        &ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+    ) {
+        ResponseInputItem::FunctionCallOutput { output, .. } => {
+            assert_eq!(output.success, Some(true));
+        }
+        other => panic!("expected FunctionCallOutput, got {other:?}"),
+    }
+}
+
+#[test]
+fn tool_result_correctness_missing_exit_code_is_not_reported_as_success() {
+    let output = ExecCommandToolOutput {
+        event_call_id: "missing-exit-call".to_string(),
+        chunk_id: "missing-exit-chunk".to_string(),
+        wall_time: std::time::Duration::from_millis(10),
+        raw_output: b"exit status unavailable".to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: Some(1_000),
+        process_id: None,
+        exit_code: None,
+        process_exited: true,
+        original_token_count: Some(3),
+        hook_command: None,
+        raw_output_artifact: None,
+        repair_notice: None,
+    };
+
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+    assert!(!output.success_for_logging());
+    assert!(
+        output
+            .response_text()
+            .contains("Process exited without an available exit code")
+    );
+    let code_mode = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".to_string(),
+    });
+    assert_eq!(code_mode["process_exited"], json!(true));
+    assert_eq!(code_mode["exit_code"], JsonValue::Null);
+}
+
+#[test]
+fn tool_result_correctness_exited_process_with_pending_output_is_not_live() {
+    let output = ExecCommandToolOutput {
+        event_call_id: "pending-output-call".to_string(),
+        chunk_id: "pending-output-chunk".to_string(),
+        wall_time: std::time::Duration::from_millis(10),
+        raw_output: b"remaining output".to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: Some(1_000),
+        process_id: Some(4242),
+        exit_code: Some(7),
+        process_exited: true,
+        original_token_count: Some(2),
+        hook_command: None,
+        raw_output_artifact: None,
+        repair_notice: None,
+    };
+
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+    let metadata = output
+        .projection_metadata()
+        .expect("exec output should expose projection metadata");
+    assert_eq!(metadata.essential_inline["session_id"], json!(4242));
+    assert_eq!(metadata.essential_inline["exit_code"], json!(7));
+    assert_eq!(metadata.essential_inline["process_exited"], json!(true));
+    let code_mode = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".to_string(),
+    });
+    assert_eq!(code_mode["process_exited"], json!(true));
+    assert!(
+        output
+            .response_text()
+            .contains("Process exited with code 7")
+    );
+    assert!(!output.response_text().contains("Process running"));
 }
 
 #[test]
@@ -1004,6 +1118,7 @@ fn exec_command_projection_metadata_preserves_authoritative_first_output() {
         max_output_tokens: Some(20),
         process_id: Some(42),
         exit_code: None,
+        process_exited: false,
         original_token_count: Some(300),
         hook_command: None,
         raw_output_artifact: None,
@@ -1047,13 +1162,15 @@ fn token_efficiency_exec_projection_reports_truncation_once() {
         max_output_tokens: Some(20),
         process_id: None,
         exit_code: Some(0),
+        process_exited: true,
         original_token_count: Some(100),
         hook_command: Some("echo ok".to_string()),
         raw_output_artifact: None,
         repair_notice: None,
     };
 
-    let projected = output.projected_model_output();
+    let raw_output = String::from_utf8_lossy(&output.raw_output);
+    let projected = output.projected_model_output(raw_output.as_ref());
     assert!(projected.reduced);
     assert_eq!(
         projected.text.matches("Warning: truncated output").count(),
@@ -1073,16 +1190,46 @@ fn exec_command_projection_reports_reduction_from_per_call_limit() {
         max_output_tokens: Some(4),
         process_id: None,
         exit_code: Some(0),
+        process_exited: true,
         original_token_count: Some(10),
         hook_command: None,
         raw_output_artifact: None,
         repair_notice: None,
     };
 
-    let projected = output.projected_model_output();
+    let raw_output = String::from_utf8_lossy(&output.raw_output);
+    let projected = output.projected_model_output(raw_output.as_ref());
     assert!(projected.reduced);
     assert!(!projected.text.is_empty());
     assert!(codex_utils_string::approx_token_count(&projected.text) <= 4);
+}
+
+#[test]
+fn token_backfire_unified_exec_keeps_complete_output_that_fits_budget() {
+    let raw_output = (0..700)
+        .map(|index| format!("line-{index}: exact evidence"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let output = ExecCommandToolOutput {
+        event_call_id: "call-complete-output".to_string(),
+        chunk_id: "chunk-complete-output".to_string(),
+        wall_time: std::time::Duration::from_millis(1),
+        raw_output: raw_output.as_bytes().to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(20_000),
+        max_output_tokens: Some(20_000),
+        process_id: None,
+        exit_code: Some(0),
+        process_exited: true,
+        original_token_count: Some(codex_utils_string::approx_token_count(&raw_output)),
+        hook_command: Some("enumerate evidence".to_string()),
+        raw_output_artifact: None,
+        repair_notice: None,
+    };
+
+    let projected = output.projected_model_output(&raw_output);
+
+    assert!(!projected.reduced);
+    assert_eq!(projected.text, raw_output);
 }
 
 #[test]
@@ -1156,6 +1303,7 @@ fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() 
         max_output_tokens: Some(256),
         process_id: Some(42),
         exit_code: None,
+        process_exited: false,
         original_token_count: Some(20_000),
         hook_command: Some("cargo test".to_string()),
         raw_output_artifact: None,
@@ -1195,6 +1343,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(1),
+        process_exited: true,
         original_token_count: Some(20_000),
         hook_command: Some("cargo test".to_string()),
         raw_output_artifact: Some(RawOutputArtifact::Stored {
@@ -1256,6 +1405,7 @@ fn artifact_backed_exec_output(
             max_output_tokens,
             process_id: None,
             exit_code: Some(0),
+            process_exited: true,
             original_token_count: None,
             hook_command: None,
             raw_output_artifact: Some(RawOutputArtifact::Stored {

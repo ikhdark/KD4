@@ -51,6 +51,9 @@ std::thread_local! {
     static FUNCTION_PROJECTION_METADATA_CALLS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static EXEC_COMMAND_RESPONSE_MATERIALIZATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 pub use codex_tools::ToolOutput;
@@ -192,12 +195,6 @@ pub(crate) struct RequiredToolTerminal {
     pub(crate) call_id: String,
     pub(crate) cause: RequiredToolTerminalCause,
     pub(crate) message: String,
-}
-
-impl RequiredToolTerminal {
-    pub(crate) fn is_blocked(&self) -> bool {
-        self.cause == RequiredToolTerminalCause::Blocked
-    }
 }
 
 #[derive(Clone)]
@@ -407,6 +404,9 @@ impl ToolOutput for ToolSearchOutput {
 
 pub struct FunctionToolOutput {
     pub body: Vec<FunctionCallOutputContentItem>,
+    /// Complete provider result used only for canonical artifact admission when
+    /// `body` is a bounded model-facing projection.
+    pub canonical_body: Option<Vec<FunctionCallOutputContentItem>>,
     pub success: Option<bool>,
     pub outcome: Option<ToolOutputOutcome>,
     pub post_tool_use_response: Option<JsonValue>,
@@ -433,6 +433,7 @@ impl FunctionToolOutput {
     pub fn from_text(text: String, success: Option<bool>) -> Self {
         Self {
             body: vec![FunctionCallOutputContentItem::InputText { text }],
+            canonical_body: None,
             success,
             outcome: None,
             post_tool_use_response: None,
@@ -449,6 +450,7 @@ impl FunctionToolOutput {
     ) -> Self {
         Self {
             body: content,
+            canonical_body: None,
             success,
             outcome: None,
             post_tool_use_response: None,
@@ -461,6 +463,14 @@ impl FunctionToolOutput {
 
     pub(crate) fn with_sampling_request_signal(mut self, signal: JsonValue) -> Self {
         self.sampling_request_signal = Some(signal);
+        self
+    }
+
+    pub(crate) fn with_canonical_body(
+        mut self,
+        content: Vec<FunctionCallOutputContentItem>,
+    ) -> Self {
+        self.canonical_body = Some(content);
         self
     }
 
@@ -507,7 +517,10 @@ impl ToolOutput for FunctionToolOutput {
     }
 
     fn success_for_logging(&self) -> bool {
-        self.outcome_for_logging() == ToolOutputOutcome::Success
+        matches!(
+            self.outcome_for_logging(),
+            ToolOutputOutcome::Success | ToolOutputOutcome::Yielded
+        )
     }
 
     fn outcome_for_logging(&self) -> ToolOutputOutcome {
@@ -558,7 +571,9 @@ impl ToolOutput for FunctionToolOutput {
             diagnostic_class: ToolOutputDiagnosticClass::Normal,
             fragments: Vec::new(),
             spillable_text: self
-                .body
+                .canonical_body
+                .as_ref()
+                .unwrap_or(&self.body)
                 .iter()
                 .filter_map(|item| match item {
                     FunctionCallOutputContentItem::InputText { text } => Some(text.clone()),
@@ -574,11 +589,27 @@ impl ToolOutput for FunctionToolOutput {
     }
 
     fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
-        match self.body.as_slice() {
+        let canonical_body = self.canonical_body.as_ref().unwrap_or(&self.body);
+        match canonical_body.as_slice() {
             [FunctionCallOutputContentItem::InputText { text }] => {
                 Some(CanonicalToolResult::text(text.clone()))
             }
-            _ => Some(CanonicalToolResult::json(self.code_mode_result(payload))),
+            _ => {
+                let canonical_output = Self {
+                    body: canonical_body.clone(),
+                    canonical_body: None,
+                    success: self.success,
+                    outcome: self.outcome,
+                    post_tool_use_response: None,
+                    sampling_request_signal: None,
+                    deterministic_continuation_receipts: Vec::new(),
+                    deterministic_continuation_owner_key: None,
+                    skip_disposition: self.skip_disposition,
+                };
+                Some(CanonicalToolResult::json(
+                    canonical_output.code_mode_result(payload),
+                ))
+            }
         }
     }
 
@@ -725,6 +756,9 @@ pub struct ExecCommandToolOutput {
     pub max_output_tokens: Option<usize>,
     pub process_id: Option<u32>,
     pub exit_code: Option<i32>,
+    /// Whether the process has exited, even if its output pipe is still draining
+    /// or the platform did not provide an exit code.
+    pub process_exited: bool,
     pub original_token_count: Option<usize>,
     pub hook_command: Option<String>,
     pub raw_output_artifact: Option<RawOutputArtifact>,
@@ -733,7 +767,7 @@ pub struct ExecCommandToolOutput {
 
 impl ToolOutput for ExecCommandToolOutput {
     fn log_preview(&self) -> String {
-        telemetry_preview(&self.response_text())
+        telemetry_preview(String::from_utf8_lossy(&self.raw_output).as_ref())
     }
 
     fn success_for_logging(&self) -> bool {
@@ -741,12 +775,14 @@ impl ToolOutput for ExecCommandToolOutput {
     }
 
     fn outcome_for_logging(&self) -> ToolOutputOutcome {
-        if self.process_id.is_some() {
-            ToolOutputOutcome::Yielded
-        } else if self.exit_code.is_some_and(|code| code != 0) {
+        if self.process_exited && self.exit_code != Some(0) {
             ToolOutputOutcome::Failure
-        } else {
+        } else if self.process_id.is_some() {
+            ToolOutputOutcome::Yielded
+        } else if self.exit_code == Some(0) {
             ToolOutputOutcome::Success
+        } else {
+            ToolOutputOutcome::Failure
         }
     }
 
@@ -775,97 +811,38 @@ impl ToolOutput for ExecCommandToolOutput {
     }
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
-        let raw_output = String::from_utf8_lossy(&self.raw_output).to_string();
-        let (raw_output_artifact_id, raw_output_artifact_bytes, raw_output_artifact_error) = self
-            .raw_output_artifact
-            .as_ref()
-            .map_or((None, None, None), |artifact| {
-                let (id, bytes, error) = artifact.model_projection();
-                (id.map(|id| id.to_string()), bytes, error)
-            });
-        let raw_output_artifact_retention_limit_hit = self
-            .raw_output_artifact
-            .as_ref()
-            .is_some_and(RawOutputArtifact::retention_limit_hit);
-        let raw_output_artifact_retention_limit_reason = self
-            .raw_output_artifact
-            .as_ref()
-            .and_then(RawOutputArtifact::retention_limit_reason);
-        let outcome = self.outcome_for_logging();
-        let mut fragments = vec![
-            ToolOutputProjectionFragment::new(
-                ToolOutputProjectionFragmentKind::ProcessFinalStatus,
-                format!(
-                    "process final status: exit_code={:?}, session_id={:?}, wall_time_seconds={:.4}",
-                    self.exit_code,
-                    self.process_id,
-                    self.wall_time.as_secs_f64(),
-                ),
-            )
-            .with_id("process_status"),
-        ];
-        if let Some(repair_notice) = &self.repair_notice {
-            fragments.push(
-                ToolOutputProjectionFragment::new(
-                    ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
-                    repair_notice.clone(),
-                )
-                .with_id("repair_notice"),
-            );
-        }
-        fragments.push(
-            ToolOutputProjectionFragment::new(
-                ToolOutputProjectionFragmentKind::ContextualSpillableText,
-                raw_output.clone(),
-            )
-            .with_id("output"),
-        );
-        Some(ToolOutputProjectionMetadata {
-            outcome,
-            diagnostic_class: match classify_diagnostic(self.hook_command.as_deref(), &raw_output) {
-                codex_utils_output_truncation::OutputDiagnosticClass::Normal => {
-                    ToolOutputDiagnosticClass::Normal
-                }
-                codex_utils_output_truncation::OutputDiagnosticClass::HighSignal => {
-                    ToolOutputDiagnosticClass::HighSignal
-                }
-            },
-            fragments,
-            // Give the shared projection boundary the authoritative output so
-            // it applies the model budget exactly once. The process status is
-            // already preserved below as essential inline metadata, and the
-            // existing artifact ID lets the boundary reuse the raw artifact.
-            spillable_text: vec![raw_output.clone()],
-            essential_inline: serde_json::json!({
-                "chunk_id": &self.chunk_id,
-                "exit_code": self.exit_code,
-                "session_id": self.process_id,
-                "wall_time_seconds": self.wall_time.as_secs_f64(),
-                "original_token_count": self.original_token_count,
-                "repair_notice": &self.repair_notice,
-                "raw_output_artifact_id": raw_output_artifact_id,
-                "raw_output_artifact_bytes": raw_output_artifact_bytes,
-                "raw_output_artifact_error": raw_output_artifact_error,
-                "raw_output_artifact_retention_limit_hit": raw_output_artifact_retention_limit_hit,
-                "raw_output_artifact_retention_limit_reason": raw_output_artifact_retention_limit_reason,
-            }),
-            requested_limit: self.max_output_tokens,
-            predetermined_ranges: predetermined_validation_ranges(
-                &raw_output,
-                self.hook_command.as_deref(),
+        let raw_output = String::from_utf8_lossy(&self.raw_output);
+        Some(self.projection_metadata_from_raw(raw_output.as_ref()))
+    }
+
+    fn to_response_item_with_projection_metadata(
+        &self,
+        call_id: &str,
+        payload: &ToolPayload,
+    ) -> (ResponseInputItem, Option<ToolOutputProjectionMetadata>) {
+        let raw_output = String::from_utf8_lossy(&self.raw_output);
+        (
+            function_tool_response(
+                call_id,
+                payload,
+                vec![FunctionCallOutputContentItem::InputText {
+                    text: self.response_text_from_raw(raw_output.as_ref()),
+                }],
+                Some(self.success_for_logging()),
             ),
-            predetermined_json_pointers: Vec::new(),
-        })
+            Some(self.projection_metadata_from_raw(raw_output.as_ref())),
+        )
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        let raw_output = String::from_utf8_lossy(&self.raw_output);
         function_tool_response(
             call_id,
             payload,
             vec![FunctionCallOutputContentItem::InputText {
-                text: self.response_text(),
+                text: self.response_text_from_raw(raw_output.as_ref()),
             }],
-            Some(self.outcome_for_logging() == ToolOutputOutcome::Success),
+            Some(self.success_for_logging()),
         )
     }
 
@@ -903,6 +880,7 @@ impl ToolOutput for ExecCommandToolOutput {
             exit_code: Option<i32>,
             #[serde(skip_serializing_if = "Option::is_none")]
             session_id: Option<u32>,
+            process_exited: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count: Option<usize>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -927,17 +905,21 @@ impl ToolOutput for ExecCommandToolOutput {
                 }
                 None => (None, None, None),
             };
-        let model_output = self.projected_model_output();
+        let raw_output = String::from_utf8_lossy(&self.raw_output);
+        let model_output = self.projected_model_output(raw_output.as_ref());
         let output = self.output_with_reduction_notice(model_output);
         let output = if output.is_empty() {
-            match (self.exit_code, self.process_id) {
-                (Some(exit_code), _) => {
+            match (self.exit_code, self.process_id, self.process_exited) {
+                (Some(exit_code), _, _) => {
                     format!("Command completed with no output (exit code {exit_code}).")
                 }
-                (None, Some(_)) => {
+                (None, _, true) => {
+                    "Command exited with no output and no available exit code.".to_string()
+                }
+                (None, Some(_), false) => {
                     "Command is still running and has not produced output.".to_string()
                 }
-                (None, None) => "Command returned no output.".to_string(),
+                (None, None, false) => "Command returned no output.".to_string(),
             }
         } else {
             output
@@ -948,6 +930,7 @@ impl ToolOutput for ExecCommandToolOutput {
             wall_time_seconds: self.wall_time.as_secs_f64(),
             exit_code: self.exit_code,
             session_id: self.process_id,
+            process_exited: self.process_exited,
             original_token_count: self.original_token_count,
             raw_output_artifact_id,
             raw_output_artifact_bytes,
@@ -1007,7 +990,23 @@ pub(crate) fn semantic_evidence_for_command_output(raw_output: &[u8]) -> Vec<Str
                     }
                     continue;
                 }
-                if line.starts_with([' ', '-', '\\']) {
+                if let Some(changed_line) = line.strip_prefix('-') {
+                    if let Some(fact) = normalize_semantic_fact_line(changed_line, false) {
+                        facts.push(crate::tool_history::sha256(
+                            format!("removed:{fact}").as_bytes(),
+                        ));
+                    }
+                    continue;
+                }
+                if let Some(context_line) = line.strip_prefix(' ') {
+                    if let Some(fact) = normalize_semantic_fact_line(context_line, false) {
+                        facts.push(crate::tool_history::sha256(
+                            format!("context:{fact}").as_bytes(),
+                        ));
+                    }
+                    continue;
+                }
+                if line.starts_with('\\') {
                     continue;
                 }
             }
@@ -1210,15 +1209,16 @@ fn is_git_diff_metadata(line: &str) -> bool {
 
 fn strip_ansi_sequences(line: &str) -> String {
     let mut stripped = String::with_capacity(line.len());
-    let mut characters = line.chars();
+    let mut characters = line.chars().peekable();
     while let Some(character) = characters.next() {
         if character != '\u{1b}' {
             stripped.push(character);
             continue;
         }
-        if characters.next() != Some('[') {
+        if characters.peek() != Some(&'[') {
             continue;
         }
+        characters.next();
         for character in characters.by_ref() {
             if ('@'..='~').contains(&character) {
                 break;
@@ -1229,10 +1229,100 @@ fn strip_ansi_sequences(line: &str) -> String {
 }
 
 impl ExecCommandToolOutput {
+    fn projection_metadata_from_raw(&self, raw_output: &str) -> ToolOutputProjectionMetadata {
+        let (raw_output_artifact_id, raw_output_artifact_bytes, raw_output_artifact_error) = self
+            .raw_output_artifact
+            .as_ref()
+            .map_or((None, None, None), |artifact| {
+                let (id, bytes, error) = artifact.model_projection();
+                (id.map(|id| id.to_string()), bytes, error)
+            });
+        let raw_output_artifact_retention_limit_hit = self
+            .raw_output_artifact
+            .as_ref()
+            .is_some_and(RawOutputArtifact::retention_limit_hit);
+        let raw_output_artifact_retention_limit_reason = self
+            .raw_output_artifact
+            .as_ref()
+            .and_then(RawOutputArtifact::retention_limit_reason);
+        let outcome = self.outcome_for_logging();
+        let mut fragments = vec![
+            ToolOutputProjectionFragment::new(
+                ToolOutputProjectionFragmentKind::ProcessFinalStatus,
+                format!(
+                    "process final status: exit_code={:?}, session_id={:?}, wall_time_seconds={:.4}",
+                    self.exit_code,
+                    self.process_id,
+                    self.wall_time.as_secs_f64(),
+                ),
+            )
+            .with_id("process_status"),
+        ];
+        if let Some(repair_notice) = &self.repair_notice {
+            fragments.push(
+                ToolOutputProjectionFragment::new(
+                    ToolOutputProjectionFragmentKind::ErrorOrDiagnostic,
+                    repair_notice.clone(),
+                )
+                .with_id("repair_notice"),
+            );
+        }
+        fragments.push(
+            ToolOutputProjectionFragment::new(
+                ToolOutputProjectionFragmentKind::ContextualSpillableText,
+                raw_output.to_owned(),
+            )
+            .with_id("output"),
+        );
+        ToolOutputProjectionMetadata {
+            outcome,
+            diagnostic_class: match classify_diagnostic(self.hook_command.as_deref(), raw_output) {
+                codex_utils_output_truncation::OutputDiagnosticClass::Normal => {
+                    ToolOutputDiagnosticClass::Normal
+                }
+                codex_utils_output_truncation::OutputDiagnosticClass::HighSignal => {
+                    ToolOutputDiagnosticClass::HighSignal
+                }
+            },
+            fragments,
+            // Give the shared projection boundary the authoritative output so
+            // it applies the model budget exactly once. The process status is
+            // already preserved below as essential inline metadata, and the
+            // existing artifact ID lets the boundary reuse the raw artifact.
+            spillable_text: vec![raw_output.to_owned()],
+            essential_inline: serde_json::json!({
+                "chunk_id": &self.chunk_id,
+                "exit_code": self.exit_code,
+                "session_id": self.process_id,
+                "process_exited": self.process_exited,
+                "wall_time_seconds": self.wall_time.as_secs_f64(),
+                "original_token_count": self.original_token_count,
+                "repair_notice": &self.repair_notice,
+                "raw_output_artifact_id": raw_output_artifact_id,
+                "raw_output_artifact_bytes": raw_output_artifact_bytes,
+                "raw_output_artifact_error": raw_output_artifact_error,
+                "raw_output_artifact_retention_limit_hit": raw_output_artifact_retention_limit_hit,
+                "raw_output_artifact_retention_limit_reason": raw_output_artifact_retention_limit_reason,
+            }),
+            requested_limit: self.max_output_tokens,
+            predetermined_ranges: predetermined_validation_ranges(
+                raw_output,
+                self.hook_command.as_deref(),
+            ),
+            predetermined_json_pointers: Vec::new(),
+        }
+    }
+
     fn model_output_limits(&self, raw_output: &str) -> OutputLimitResolution {
+        let outcome = match self.outcome_for_logging() {
+            ToolOutputOutcome::Success | ToolOutputOutcome::Yielded => OutputOutcome::Success,
+            ToolOutputOutcome::Failure => OutputOutcome::Failure,
+            ToolOutputOutcome::TimedOut => OutputOutcome::TimedOut,
+            ToolOutputOutcome::Skipped => OutputOutcome::Skipped,
+        };
         resolve_projected_output_limits(
             self.max_output_tokens,
-            OutputOutcome::from_exit_status(self.exit_code, self.process_id.is_some()),
+            outcome,
             classify_diagnostic(self.hook_command.as_deref(), raw_output),
             self.truncation_policy.token_budget(),
         )
@@ -1248,23 +1338,27 @@ impl ExecCommandToolOutput {
         formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens))
     }
 
-    fn projected_model_output(&self) -> ProjectedModelOutput {
-        let raw = String::from_utf8_lossy(&self.raw_output);
-        let summarized = match (self.process_id, self.exit_code) {
-            (None, Some(exit_code)) => summarize_shell_output_for_model(
-                raw.as_ref(),
-                exit_code,
-                /*timed_out*/ false,
-                ShellOutputSummaryOptions {
-                    enabled: true,
-                    turn_cost_guard: false,
-                    command_text: self.hook_command.as_deref(),
-                },
-            ),
-            _ => None,
-        };
-        let content = summarized.as_deref().unwrap_or(raw.as_ref());
-        let limits = self.model_output_limits(raw.as_ref());
+    fn projected_model_output(&self, raw_output: &str) -> ProjectedModelOutput {
+        let limits = self.model_output_limits(raw_output);
+        let summarized =
+            if codex_utils_string::approx_token_count(raw_output) <= limits.applied_limit {
+                None
+            } else {
+                match (self.process_id, self.exit_code) {
+                    (None, Some(exit_code)) => summarize_shell_output_for_model(
+                        raw_output,
+                        exit_code,
+                        /*timed_out*/ false,
+                        ShellOutputSummaryOptions {
+                            enabled: true,
+                            turn_cost_guard: false,
+                            command_text: self.hook_command.as_deref(),
+                        },
+                    ),
+                    _ => None,
+                }
+            };
+        let content = summarized.as_deref().unwrap_or(raw_output);
         let truncated = formatted_truncate_text_with_output_limit(content, limits);
         let was_truncated = truncated.was_truncated;
         let mut projected_text = truncated.text;
@@ -1317,20 +1411,37 @@ impl ExecCommandToolOutput {
         output
     }
 
+    #[cfg(test)]
     pub(crate) fn response_text(&self) -> String {
         let raw_output = String::from_utf8_lossy(&self.raw_output);
-        let max_tokens = self.model_output_limits(raw_output.as_ref()).applied_limit;
+        self.response_text_from_raw(raw_output.as_ref())
+    }
+
+    fn response_text_from_raw(&self, raw_output: &str) -> String {
+        #[cfg(test)]
+        EXEC_COMMAND_RESPONSE_MATERIALIZATIONS.with(|calls| calls.set(calls.get() + 1));
+
+        let max_tokens = self.model_output_limits(raw_output).applied_limit;
         let mut sections = Vec::new();
 
         let wall_time_seconds = self.wall_time.as_secs_f64();
-        let process_status = match (self.exit_code, self.process_id.as_ref()) {
-            (Some(exit_code), _) => format!(
+        let process_status = match (
+            self.exit_code,
+            self.process_id.as_ref(),
+            self.process_exited,
+        ) {
+            (Some(exit_code), _, _) => format!(
                 "Process exited with code {exit_code}; wall time: {wall_time_seconds:.4} seconds"
             ),
-            (None, Some(process_id)) => format!(
+            (None, _, true) => format!(
+                "Process exited without an available exit code; wall time: {wall_time_seconds:.4} seconds"
+            ),
+            (None, Some(process_id), false) => format!(
                 "Process running with session ID {process_id}; wall time: {wall_time_seconds:.4} seconds"
             ),
-            (None, None) => format!("Wall time: {wall_time_seconds:.4} seconds"),
+            (None, None, false) => {
+                format!("Process state unavailable; wall time: {wall_time_seconds:.4} seconds")
+            }
         };
         sections.push(process_status);
 
@@ -1343,7 +1454,7 @@ impl ExecCommandToolOutput {
         }
 
         sections.push("Output:".to_string());
-        let projected = self.projected_model_output();
+        let projected = self.projected_model_output(raw_output);
         let reduction_notice = projected.reduced.then(|| {
             self.raw_output_artifact
                 .as_ref()
@@ -1375,6 +1486,16 @@ impl ExecCommandToolOutput {
             }
             response_budget = response_budget.saturating_sub(1);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_response_materialization_count() {
+        EXEC_COMMAND_RESPONSE_MATERIALIZATIONS.with(|calls| calls.set(0));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn response_materialization_count() -> usize {
+        EXEC_COMMAND_RESPONSE_MATERIALIZATIONS.with(std::cell::Cell::get)
     }
 }
 

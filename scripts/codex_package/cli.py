@@ -469,10 +469,14 @@ def validate_cli_request(
 
     compression = getattr(args, "archive_compression", "default")
     release_version = getattr(args, "release_version", None)
-    if release_version is not None and re.fullmatch(
-        r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?",
-        release_version,
-    ) is None:
+    if (
+        release_version is not None
+        and re.fullmatch(
+            r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?",
+            release_version,
+        )
+        is None
+    ):
         raise RuntimeError("--release-version must be a semantic version")
     if getattr(args, "archive_output", []) and getattr(args, "skip_validate", False):
         raise RuntimeError("--skip-validate cannot be used with --archive-output")
@@ -613,8 +617,7 @@ def write_release_manifests(
     write_text_atomically(
         checksum_path,
         "".join(
-            f"{digest}  {name}\n"
-            for name, digest in sorted(checksum_entries.items())
+            f"{digest}  {name}\n" for name, digest in sorted(checksum_entries.items())
         ),
     )
 
@@ -643,8 +646,7 @@ def source_outputs_from_existing(
         entrypoint_bin=output_dir / variant.entrypoint_name(spec),
         code_mode_host_bin=output_dir / spec.code_mode_host_name,
         codex_command_runner_bin=output_dir / "codex-command-runner.exe",
-        codex_windows_sandbox_setup_bin=output_dir
-        / "codex-windows-sandbox-setup.exe",
+        codex_windows_sandbox_setup_bin=output_dir / "codex-windows-sandbox-setup.exe",
     )
 
 

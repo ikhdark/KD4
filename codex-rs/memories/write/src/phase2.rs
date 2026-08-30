@@ -21,7 +21,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
-use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
 use codex_state::Stage1Output;
@@ -550,13 +549,6 @@ pub(super) fn is_successful_agent_status(status: &AgentStatus) -> bool {
     matches!(
         status,
         AgentStatus::Completed(_) | AgentStatus::CompletedWithSurface { .. }
-    ) || matches!(
-        status,
-        AgentStatus::TerminalWithCompletion {
-            error: None,
-            completion,
-            ..
-        } if completion.status == TaskCompletionStatus::Passed
     )
 }
 

@@ -1,7 +1,5 @@
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::TaskCompletionGate;
-use codex_protocol::protocol::TaskCompletionStatus;
 
 use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
@@ -11,25 +9,15 @@ use codex_agent_task_store::AgentTask;
 pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
     match msg {
         EventMsg::TurnStarted(_) => Some(AgentStatus::Running),
-        EventMsg::TurnComplete(ev) => Some(match ev.completion.clone() {
-            Some(completion) => AgentStatus::TerminalWithCompletion {
-                last_agent_message: ev.last_agent_message.clone(),
-                surfaced_result: ev.surfaced_result.clone(),
-                error: ev.error.as_ref().map(|error| error.message.clone()),
-                completion,
-            },
-            None => {
-                if let Some(error) = ev.error.as_ref() {
-                    AgentStatus::Errored(error.message.clone())
-                } else {
-                    match ev.surfaced_result.clone() {
-                        Some(surfaced_result) => AgentStatus::CompletedWithSurface {
-                            last_agent_message: ev.last_agent_message.clone(),
-                            surfaced_result,
-                        },
-                        None => AgentStatus::Completed(ev.last_agent_message.clone()),
-                    }
-                }
+        EventMsg::TurnComplete(ev) => Some(if let Some(error) = ev.error.as_ref() {
+            AgentStatus::Errored(error.message.clone())
+        } else {
+            match ev.surfaced_result.clone() {
+                Some(surfaced_result) => AgentStatus::CompletedWithSurface {
+                    last_agent_message: ev.last_agent_message.clone(),
+                    surfaced_result,
+                },
+                None => AgentStatus::Completed(ev.last_agent_message.clone()),
             }
         }),
         EventMsg::TurnAborted(ev) => match ev.reason {
@@ -46,68 +34,43 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
 }
 
 /// Projects the durable typed-task outcome used by parent notifications.
-/// Pending gates override a successful receipt because the assignment is not yet complete.
 pub(crate) fn agent_status_from_task(task: &AgentTask) -> Option<AgentStatus> {
     let receipt = task.receipt.as_ref()?;
     if !task.workspace_status.pending_gates.is_empty() {
-        return Some(AgentStatus::TerminalWithCompletion {
-            last_agent_message: Some(receipt.summary.clone()),
-            surfaced_result: None,
-            error: None,
-            completion: TaskCompletionGate {
-                status: TaskCompletionStatus::Blocked,
-                reasons: vec![format!(
-                    "durable typed task has pending gates: {}",
-                    task.workspace_status
-                        .pending_gates
-                        .iter()
-                        .map(|gate| format!("{gate:?}").to_ascii_lowercase())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )],
-                evidence_path: None,
-            },
-        });
+        return Some(AgentStatus::Errored(format!(
+            "durable typed task has pending gates: {}",
+            task.workspace_status
+                .pending_gates
+                .iter()
+                .map(|gate| format!("{gate:?}").to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     }
     match receipt.status {
         AgentStatusClaim::Completed => Some(AgentStatus::Completed(Some(receipt.summary.clone()))),
-        AgentStatusClaim::NeedsMain | AgentStatusClaim::Blocked => Some(receipt_terminal_status(
-            receipt,
-            TaskCompletionStatus::Blocked,
-        )),
+        AgentStatusClaim::NeedsMain | AgentStatusClaim::Blocked => {
+            Some(receipt_error_status(receipt))
+        }
         AgentStatusClaim::Failed | AgentStatusClaim::Violated | AgentStatusClaim::Abandoned => {
-            Some(receipt_terminal_status(
-                receipt,
-                TaskCompletionStatus::Partial,
-            ))
+            Some(receipt_error_status(receipt))
         }
     }
 }
 
-fn receipt_terminal_status(
-    receipt: &codex_agent_task_store::AgentReceipt,
-    status: TaskCompletionStatus,
-) -> AgentStatus {
-    AgentStatus::TerminalWithCompletion {
-        last_agent_message: Some(receipt.summary.clone()),
-        surfaced_result: None,
-        error: None,
-        completion: TaskCompletionGate {
-            status,
-            reasons: vec![format!(
-                "durable typed receipt status: {}",
-                match receipt.status {
-                    AgentStatusClaim::Completed => "completed",
-                    AgentStatusClaim::NeedsMain => "needs_main",
-                    AgentStatusClaim::Blocked => "blocked",
-                    AgentStatusClaim::Failed => "failed",
-                    AgentStatusClaim::Violated => "violated",
-                    AgentStatusClaim::Abandoned => "abandoned",
-                }
-            )],
-            evidence_path: None,
-        },
-    }
+fn receipt_error_status(receipt: &codex_agent_task_store::AgentReceipt) -> AgentStatus {
+    let status = match receipt.status {
+        AgentStatusClaim::Completed => "completed",
+        AgentStatusClaim::NeedsMain => "needs_main",
+        AgentStatusClaim::Blocked => "blocked",
+        AgentStatusClaim::Failed => "failed",
+        AgentStatusClaim::Violated => "violated",
+        AgentStatusClaim::Abandoned => "abandoned",
+    };
+    AgentStatus::Errored(format!(
+        "durable typed receipt status: {status}: {}",
+        receipt.summary
+    ))
 }
 
 pub(crate) fn is_final(status: &AgentStatus) -> bool {
@@ -147,7 +110,6 @@ mod tests {
                 message: "terminal failure".to_string(),
                 codex_error_info: None,
             }),
-            completion: None,
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
@@ -161,23 +123,17 @@ mod tests {
     }
 
     #[test]
-    fn completion_gate_survives_agent_status_conversion() {
+    fn surfaced_result_survives_agent_status_conversion() {
         let surfaced_result = SurfacedToolResult {
             adapter: "owner".to_string(),
             value: serde_json::json!({"answer": 42}),
             canonical_message: None,
         };
-        let completion = TaskCompletionGate {
-            status: TaskCompletionStatus::Passed,
-            reasons: vec!["focused test passed".to_string()],
-            evidence_path: Some("task-evidence/thread.json".to_string()),
-        };
         let status = agent_status_from_event(&EventMsg::TurnComplete(TurnCompleteEvent {
-            turn_id: "turn-gated".to_string(),
+            turn_id: "turn-surfaced".to_string(),
             last_agent_message: Some("done".to_string()),
             surfaced_result: Some(surfaced_result.clone()),
             error: None,
-            completion: Some(completion.clone()),
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
@@ -186,44 +142,9 @@ mod tests {
 
         assert_eq!(
             status,
-            Some(AgentStatus::TerminalWithCompletion {
+            Some(AgentStatus::CompletedWithSurface {
                 last_agent_message: Some("done".to_string()),
-                surfaced_result: Some(surfaced_result),
-                error: None,
-                completion,
-            })
-        );
-    }
-
-    #[test]
-    fn completion_gate_survives_embedded_error_conversion() {
-        let completion = TaskCompletionGate {
-            status: TaskCompletionStatus::Partial,
-            reasons: vec!["validation failed".to_string()],
-            evidence_path: None,
-        };
-        let status = agent_status_from_event(&EventMsg::TurnComplete(TurnCompleteEvent {
-            turn_id: "turn-partial".to_string(),
-            last_agent_message: Some("partial".to_string()),
-            surfaced_result: None,
-            error: Some(ErrorEvent {
-                message: "terminal failure".to_string(),
-                codex_error_info: None,
-            }),
-            completion: Some(completion.clone()),
-            completed_at: None,
-            duration_ms: None,
-            time_to_first_token_ms: None,
-            timing: None,
-        }));
-
-        assert_eq!(
-            status,
-            Some(AgentStatus::TerminalWithCompletion {
-                last_agent_message: Some("partial".to_string()),
-                surfaced_result: None,
-                error: Some("terminal failure".to_string()),
-                completion,
+                surfaced_result,
             })
         );
     }
@@ -314,13 +235,7 @@ mod tests {
         for status in [AgentStatusClaim::NeedsMain, AgentStatusClaim::Blocked] {
             assert!(matches!(
                 agent_status_from_task(&typed_task_with_receipt(status, false)),
-                Some(AgentStatus::TerminalWithCompletion {
-                    completion: TaskCompletionGate {
-                        status: TaskCompletionStatus::Blocked,
-                        ..
-                    },
-                    ..
-                })
+                Some(AgentStatus::Errored(message)) if message.contains("durable typed receipt status")
             ));
         }
         for status in [
@@ -330,13 +245,7 @@ mod tests {
         ] {
             assert!(matches!(
                 agent_status_from_task(&typed_task_with_receipt(status, false)),
-                Some(AgentStatus::TerminalWithCompletion {
-                    completion: TaskCompletionGate {
-                        status: TaskCompletionStatus::Partial,
-                        ..
-                    },
-                    ..
-                })
+                Some(AgentStatus::Errored(message)) if message.contains("durable typed receipt status")
             ));
         }
     }
@@ -345,13 +254,7 @@ mod tests {
     fn pending_gate_blocks_completed_receipt_projection() {
         assert!(matches!(
             agent_status_from_task(&typed_task_with_receipt(AgentStatusClaim::Completed, true)),
-            Some(AgentStatus::TerminalWithCompletion {
-                completion: TaskCompletionGate {
-                    status: TaskCompletionStatus::Blocked,
-                    ..
-                },
-                ..
-            })
+            Some(AgentStatus::Errored(message)) if message.contains("pending gates")
         ));
     }
 }

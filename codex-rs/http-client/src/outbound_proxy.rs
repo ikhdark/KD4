@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use tokio::sync::Semaphore;
 
 use http::HeaderValue;
@@ -28,8 +29,12 @@ use thiserror::Error;
 const SYSTEM_PROXY_SUCCESS_CACHE_TTL: Duration = Duration::from_secs(60);
 const SYSTEM_PROXY_UNAVAILABLE_CACHE_TTL: Duration = Duration::from_secs(5);
 const SYSTEM_PROXY_CACHE_MAX_ENTRIES: usize = 256;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 static ASYNC_SYSTEM_PROXY_RESOLUTION_PERMIT: Semaphore = Semaphore::const_new(1);
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "windows")]
 mod windows;
 
 /// Coarse semantic bucket for the HTTP or WebSocket client being constructed.
@@ -230,19 +235,25 @@ impl HttpClientFactory {
             return Ok(route);
         }
 
-        let permit = ASYNC_SYSTEM_PROXY_RESOLUTION_PERMIT
-            .acquire()
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        return Ok(self.resolve_proxy_route(&request_url));
+
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            let permit = ASYNC_SYSTEM_PROXY_RESOLUTION_PERMIT
+                .acquire()
+                .await
+                .map_err(io::Error::other)?;
+            let factory = self.clone();
+            tokio::task::spawn_blocking(move || {
+                // Keep the permit with the blocking task: cancelling the caller must not allow a
+                // second PAC/WinHTTP lookup to start while this one is still running.
+                let _permit = permit;
+                factory.resolve_proxy_route(&request_url)
+            })
             .await
-            .map_err(io::Error::other)?;
-        let factory = self.clone();
-        tokio::task::spawn_blocking(move || {
-            // Keep the permit with the blocking task: cancelling the caller must not allow a
-            // second PAC/WinHTTP lookup to start while this one is still running.
-            let _permit = permit;
-            factory.resolve_proxy_route(&request_url)
-        })
-        .await
-        .map_err(io::Error::other)
+            .map_err(io::Error::other)
+        }
     }
 
     fn cached_proxy_route(&self, request_url: &str) -> Option<OutboundProxyRoute> {
@@ -544,8 +555,24 @@ fn resolve_system_proxy_with(
     decision
 }
 
+#[cfg(target_os = "macos")]
+fn resolve_platform_system_proxy(request_url: &str, origin: &RequestOrigin) -> SystemProxyDecision {
+    macos::resolve(request_url, origin)
+}
+
+#[cfg(target_os = "windows")]
 fn resolve_platform_system_proxy(request_url: &str, origin: &RequestOrigin) -> SystemProxyDecision {
     windows::resolve(request_url, origin)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn resolve_platform_system_proxy(
+    _request_url: &str,
+    _origin: &RequestOrigin,
+) -> SystemProxyDecision {
+    SystemProxyDecision::Unavailable {
+        failure: RouteFailureClass::ProxyResolutionUnavailable,
+    }
 }
 
 #[derive(Debug, Clone)]

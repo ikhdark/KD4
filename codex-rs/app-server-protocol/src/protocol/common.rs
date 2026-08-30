@@ -1796,8 +1796,6 @@ server_notification_definitions! {
     #[delivery(required)]
     TurnCompleted => "turn/completed" (v2::TurnCompletedNotification),
     #[delivery(required)]
-    TurnTerminalizationCompleted => "turn/terminalizationCompleted" (v2::TurnTerminalizationCompletedNotification),
-    #[delivery(required)]
     HookCompleted => "hook/completed" (v2::HookCompletedNotification),
     TurnDiffUpdated => "turn/diff/updated" (v2::TurnDiffUpdatedNotification),
     TurnPlanUpdated => "turn/plan/updated" (v2::TurnPlanUpdatedNotification),
@@ -1958,27 +1956,6 @@ mod tests {
         }
 
         Ok(())
-    }
-
-    #[test]
-    fn terminalization_completed_notification_requires_delivery() {
-        let notification = ServerNotification::TurnTerminalizationCompleted(
-            v2::TurnTerminalizationCompletedNotification {
-                thread_id: "thread".to_string(),
-                turn_id: "turn".to_string(),
-                receipt: codex_protocol::protocol::TurnTerminalizationReceipt {
-                    terminal_identity: "thread:turn".to_string(),
-                    terminalization: Default::default(),
-                    delivery_state:
-                        codex_protocol::protocol::TerminalizationDeliveryState::Delivered,
-                    active_turn_detached: true,
-                    terminal_interaction_released: true,
-                    recovery_state: codex_protocol::protocol::TerminalizationRecoveryState::None,
-                    deadline_exhausted_phase: None,
-                },
-            },
-        );
-        assert!(server_notification_requires_delivery(&notification));
     }
 
     #[test]

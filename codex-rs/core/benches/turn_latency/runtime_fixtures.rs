@@ -100,7 +100,7 @@ impl RequestCacheFixture {
         let test = test_codex()
             .with_model("test-gpt-5.1-codex")
             .with_config(|config| {
-                let _ = config.features.disable(Feature::TaskCompletionReviewer);
+                pin_ab_reasoning_phase_efforts(config);
             })
             .build(&server)
             .await?;
@@ -611,15 +611,67 @@ fn history_seed_turns_visible(body: &serde_json::Value) -> u32 {
         .unwrap_or_default()
 }
 
-async fn rollback_test_turns(test: &TestCodex, num_turns: u32) -> Result<()> {
-    test.codex.submit(Op::ThreadRollback { num_turns }).await?;
-    loop {
-        let event = tokio::time::timeout(Duration::from_secs(30), test.codex.next_event())
-            .await
-            .context("timed out rolling back A/B benchmark turns")??;
-        if matches!(event.msg, EventMsg::ThreadRolledBack(_)) {
-            return Ok(());
+const AB_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(30);
+const AB_ROLLBACK_RETRY_DELAY: Duration = Duration::from_millis(10);
+const TURN_IN_PROGRESS_ROLLBACK_ERROR: &str = "Cannot rollback while a turn is in progress.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchmarkRollbackEventAction {
+    Continue,
+    Complete,
+    Retry,
+}
+
+fn benchmark_rollback_event_action(event: &EventMsg) -> Result<BenchmarkRollbackEventAction> {
+    match event {
+        EventMsg::ThreadRolledBack(_) => Ok(BenchmarkRollbackEventAction::Complete),
+        EventMsg::Error(error)
+            if error.codex_error_info == Some(CodexErrorInfo::ThreadRollbackFailed)
+                && error.message == TURN_IN_PROGRESS_ROLLBACK_ERROR =>
+        {
+            Ok(BenchmarkRollbackEventAction::Retry)
         }
+        EventMsg::Error(error) => {
+            anyhow::bail!("A/B benchmark rollback failed: {}", error.message)
+        }
+        _ => Ok(BenchmarkRollbackEventAction::Continue),
+    }
+}
+
+async fn rollback_test_turns(test: &TestCodex, num_turns: u32) -> Result<()> {
+    let deadline = Instant::now() + AB_ROLLBACK_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("timed out rolling back A/B benchmark turns");
+        }
+        tokio::time::timeout(
+            remaining,
+            test.codex.submit(Op::ThreadRollback { num_turns }),
+        )
+        .await
+        .context("timed out rolling back A/B benchmark turns")??;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("timed out rolling back A/B benchmark turns");
+            }
+            let event = tokio::time::timeout(remaining, test.codex.next_event())
+                .await
+                .context("timed out rolling back A/B benchmark turns")??;
+            match benchmark_rollback_event_action(&event.msg)? {
+                BenchmarkRollbackEventAction::Continue => {}
+                BenchmarkRollbackEventAction::Complete => return Ok(()),
+                BenchmarkRollbackEventAction::Retry => break,
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("timed out rolling back A/B benchmark turns");
+        }
+        tokio::time::sleep(AB_ROLLBACK_RETRY_DELAY.min(remaining)).await;
     }
 }
 
@@ -745,10 +797,10 @@ impl ToolGateFixture {
         let test = test_codex()
             .with_model("test-gpt-5.1-codex")
             .with_config(move |config| {
+                pin_ab_reasoning_phase_efforts(config);
                 if workload == AbWorkload::ExclusiveGateSerialization {
                     let _ = config.features.enable(Feature::UnifiedExec);
                 }
-                let _ = config.features.disable(Feature::TaskCompletionReviewer);
             })
             .build(&server)
             .await?;
@@ -798,17 +850,6 @@ impl ToolGateFixture {
                 sample.duration_ns = duration_ns;
                 sample.workload_subturns = 1;
                 sample.terminal_event = "turn_complete".to_string();
-                sample.completion_status = Some(
-                    completion
-                        .completion
-                        .as_ref()
-                        .map_or("not_applicable", |gate| match gate.status {
-                            TaskCompletionStatus::Passed => "passed",
-                            TaskCompletionStatus::Partial => "partial",
-                            TaskCompletionStatus::Blocked => "blocked",
-                        })
-                        .to_string(),
-                );
                 sample.typed_error_count = u32::from(completion.error.is_some());
                 sample.final_response_present = completion.last_agent_message.is_some();
                 if completion.error.is_some() {
@@ -1065,9 +1106,9 @@ impl AbortDirectNestedFixture {
             .with_model("test-gpt-5.1-codex")
             .with_code_mode_host_program(code_mode_host.to_path_buf())
             .with_config(|config| {
+                pin_ab_reasoning_phase_efforts(config);
                 let _ = config.features.enable(Feature::CodeMode);
                 let _ = config.features.enable(Feature::RequestPermissionsTool);
-                let _ = config.features.disable(Feature::TaskCompletionReviewer);
             })
             .build(&server)
             .await?;
@@ -1147,25 +1188,13 @@ impl AbortDirectNestedFixture {
                         return Ok((
                             "turn_aborted".to_string(),
                             Some(abort_reason_name(&event.reason).to_string()),
-                            None,
                             event.timing,
                         ));
                     }
                     EventMsg::TurnComplete(event) if event.turn_id == turn_id => {
                         forged_turn_complete_observed = true;
                         final_response_present |= event.last_agent_message.is_some();
-                        let completion_status =
-                            event.completion.as_ref().map(|gate| match gate.status {
-                                TaskCompletionStatus::Passed => "passed",
-                                TaskCompletionStatus::Partial => "partial",
-                                TaskCompletionStatus::Blocked => "blocked",
-                            });
-                        return Ok((
-                            "turn_complete".to_string(),
-                            None,
-                            completion_status.map(str::to_string),
-                            event.timing,
-                        ));
+                        return Ok(("turn_complete".to_string(), None, event.timing));
                     }
                     EventMsg::AgentMessage(_) => final_response_present = true,
                     EventMsg::Error(error) => {
@@ -1181,11 +1210,11 @@ impl AbortDirectNestedFixture {
         .and_then(|result| result);
 
         let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        let (terminal_event, abort_reason, completion_status, timing) = match terminal {
+        let (terminal_event, abort_reason, timing) = match terminal {
             Ok(terminal) => terminal,
             Err(error) => {
                 failure_codes.push(format!("abort_terminal:{error}"));
-                (String::new(), None, None, None)
+                (String::new(), None, None)
             }
         };
         let mut sample = timing
@@ -1195,7 +1224,6 @@ impl AbortDirectNestedFixture {
         sample.duration_ns = duration_ns;
         sample.workload_subturns = 1;
         sample.terminal_event = terminal_event;
-        sample.completion_status = completion_status;
         sample.abort_reason = abort_reason;
         sample.typed_error_count = typed_error_count;
         sample.final_response_present = final_response_present;
@@ -1390,8 +1418,8 @@ impl AbortRetainedProcessFixture {
         let test = test_codex()
             .with_model("test-gpt-5.1-codex")
             .with_config(|config| {
+                pin_ab_reasoning_phase_efforts(config);
                 let _ = config.features.enable(Feature::UnifiedExec);
-                let _ = config.features.disable(Feature::TaskCompletionReviewer);
             })
             .build(&server)
             .await?;
@@ -1523,25 +1551,13 @@ impl AbortRetainedProcessFixture {
                         return Ok((
                             "turn_aborted".to_string(),
                             Some(abort_reason_name(&event.reason).to_string()),
-                            None,
                             event.timing,
                         ));
                     }
                     EventMsg::TurnComplete(event) if event.turn_id == turn_id => {
                         forged_turn_complete_observed = true;
                         final_response_present |= event.last_agent_message.is_some();
-                        let completion_status =
-                            event.completion.as_ref().map(|gate| match gate.status {
-                                TaskCompletionStatus::Passed => "passed",
-                                TaskCompletionStatus::Partial => "partial",
-                                TaskCompletionStatus::Blocked => "blocked",
-                            });
-                        return Ok((
-                            "turn_complete".to_string(),
-                            None,
-                            completion_status.map(str::to_string),
-                            event.timing,
-                        ));
+                        return Ok(("turn_complete".to_string(), None, event.timing));
                     }
                     EventMsg::AgentMessage(_) => final_response_present = true,
                     EventMsg::Error(_) => {
@@ -1556,11 +1572,11 @@ impl AbortRetainedProcessFixture {
         .and_then(|result| result);
 
         let duration_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        let (terminal_event, abort_reason, completion_status, timing) = match terminal {
+        let (terminal_event, abort_reason, timing) = match terminal {
             Ok(terminal) => terminal,
             Err(error) => {
                 failure_codes.push(format!("abort_terminal:{error}"));
-                (String::new(), None, None, None)
+                (String::new(), None, None)
             }
         };
         let mut sample = timing
@@ -1570,7 +1586,6 @@ impl AbortRetainedProcessFixture {
         sample.duration_ns = duration_ns;
         sample.workload_subturns = 1;
         sample.terminal_event = terminal_event;
-        sample.completion_status = completion_status;
         sample.abort_reason = abort_reason;
         sample.final_response_present = final_response_present;
         sample.forged_turn_complete_observed = forged_turn_complete_observed;
@@ -1582,8 +1597,12 @@ impl AbortRetainedProcessFixture {
             persisted_outputs.len().min(u32::MAX as usize) as u32;
         sample.retained_abort_cancellation_observed =
             persisted_outputs.len() == 1 && persisted_outputs[0].contains("aborted");
-        sample.retained_process_cleanup_complete =
-            self.test.codex.list_background_terminals().await.is_empty();
+        let retained_process_cleanup_complete = wait_for_retained_process_cleanup(|| {
+            let codex = &self.test.codex;
+            async move { codex.list_background_terminals().await.is_empty() }
+        })
+        .await;
+        apply_retained_process_cleanup_observation(&mut sample, retained_process_cleanup_complete);
         sample.retained_process_exit_observed = timing.as_ref().is_some_and(|timing| {
             timing.tool_calls.iter().any(|call| {
                 call.call_id == call_id
@@ -1763,8 +1782,8 @@ impl RetainedExecFixture {
         let test = test_codex()
             .with_model("test-gpt-5.1-codex")
             .with_config(|config| {
+                pin_ab_reasoning_phase_efforts(config);
                 let _ = config.features.enable(Feature::UnifiedExec);
-                let _ = config.features.disable(Feature::TaskCompletionReviewer);
             })
             .build(&server)
             .await?;
@@ -1791,17 +1810,6 @@ impl RetainedExecFixture {
                 sample.duration_ns = duration_ns;
                 sample.workload_subturns = 1;
                 sample.terminal_event = "turn_complete".to_string();
-                sample.completion_status = Some(
-                    completion
-                        .completion
-                        .as_ref()
-                        .map_or("not_applicable", |gate| match gate.status {
-                            TaskCompletionStatus::Passed => "passed",
-                            TaskCompletionStatus::Partial => "partial",
-                            TaskCompletionStatus::Blocked => "blocked",
-                        })
-                        .to_string(),
-                );
                 sample.typed_error_count = u32::from(completion.error.is_some());
                 sample.final_response_present = completion.last_agent_message.is_some();
 
@@ -2058,7 +2066,10 @@ fn run_ab_replay_command(mode: &str, paths: &[PathBuf]) -> Result<()> {
             println!("{AB_REPLAY_MUTATED_MARKER}");
         }
         "artifact" => {
-            anyhow::ensure!(paths.len() == 1, "replay artifact requires the exact target");
+            anyhow::ensure!(
+                paths.len() == 1,
+                "replay artifact requires the exact target"
+            );
             fs::write(&paths[0], AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT)
                 .with_context(|| format!("write replay artifact {}", paths[0].display()))?;
             println!("{AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT}");
@@ -2207,8 +2218,8 @@ impl HighVolumeCodeModeFixture {
             .with_model("test-gpt-5.1-codex")
             .with_code_mode_host_program(code_mode_host.to_path_buf())
             .with_config(|config| {
+                pin_ab_reasoning_phase_efforts(config);
                 let _ = config.features.enable(Feature::CodeModeOnly);
-                let _ = config.features.disable(Feature::TaskCompletionReviewer);
             })
             .build(&server)
             .await?;
@@ -2432,6 +2443,33 @@ enum AbToolLifecycleRequirement {
     TerminalAbort,
 }
 
+async fn wait_for_retained_process_cleanup<F, Fut>(mut cleanup_complete: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if cleanup_complete().await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+fn apply_retained_process_cleanup_observation(sample: &mut Sample, cleanup_complete: bool) {
+    sample.retained_process_cleanup_complete = cleanup_complete;
+    if cleanup_complete {
+        // The terminal timing snapshot is intentionally frozen before supervised
+        // process cleanup finishes. A later authoritative empty-terminal poll
+        // supersedes that snapshot's transient live-process observation.
+        sample.unexpected_live_processes = 0;
+    }
+}
+
 fn sample_from_timing(timing: &TurnTiming) -> Sample {
     sample_from_timing_with_lifecycle(timing, AbToolLifecycleRequirement::Full)
 }
@@ -2529,8 +2567,6 @@ fn sample_from_timing_with_lifecycle(
             .wait
             .saturating_add(counters.generations_by_purpose.failure_diagnosis)
             .saturating_add(counters.generations_by_purpose.repair)
-            .saturating_add(counters.generations_by_reason.completion_review)
-            .saturating_add(counters.generations_by_reason.completion_repair_rereview)
             .saturating_add(counters.generations_by_reason.compaction),
         repeated_waits: counters.exact_repeated_wait_count,
         tool_router_reuse_count: counters.tool_router_reuse_count,
@@ -2914,6 +2950,7 @@ fn merge_high_volume_sample(aggregate: &mut Option<Sample>, mut next: Sample) {
         orphan_tool_calls,
         workload_subturns,
         failure_terminalized_subturns,
+        typed_error_count,
         abort_model_resumed_call_count,
         retained_write_stdin_poll_count,
         retained_process_count_before_abort,
@@ -3345,7 +3382,6 @@ fn tool_gate_execution_matches(sample: &Sample, workload: AbWorkload) -> bool {
         && sample.lifecycle_complete
         && sample.latency_eligible
         && sample.terminal_event == "turn_complete"
-        && sample.completion_status.as_deref() == Some("not_applicable")
         && sample.abort_reason.is_none()
         && sample.typed_error_count == 0
         && sample.final_response_present
@@ -3486,6 +3522,9 @@ fn tool_call_lifecycle_diagnostic_for_requirement(
         ("output_collected_at_ms", call.output_collected_at_ms),
     ]
     .into_iter()
+    .filter(|(name, _)| {
+        requirement == AbToolLifecycleRequirement::Full || *name != "handler_exit_at_ms"
+    })
     .filter_map(|(name, value)| value.is_none().then_some(name.to_string()))
     .collect::<Vec<_>>();
     // Nested CodeMode results are delivered inside their owning direct call's

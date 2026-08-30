@@ -98,7 +98,7 @@ mod tests {
             action: GuardianAssessmentAction::Command {
                 source: GuardianCommandSource::Shell,
                 command: format!("rm -rf /tmp/test-{id}"),
-                cwd: test_path_buf("/tmp").abs(),
+                cwd: test_path_buf("/tmp").abs().into(),
             },
         }
     }

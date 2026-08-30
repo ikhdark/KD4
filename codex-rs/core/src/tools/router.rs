@@ -444,6 +444,12 @@ impl ToolRouter {
             .unwrap_or(false)
     }
 
+    pub fn tool_owns_unified_exec_processes(&self, call: &ToolCall) -> bool {
+        self.registry
+            .owns_unified_exec_processes(&call.tool_name)
+            .unwrap_or(false)
+    }
+
     #[instrument(level = "trace", skip_all, err)]
     pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, ToolCallBuildError> {
         match item {
@@ -660,7 +666,7 @@ fn authorize_independent_review_tool_call(
     if allowed {
         Ok(())
     } else {
-        Err(FunctionCallError::RespondToModel(format!(
+        Err(FunctionCallError::DeniedToModel(format!(
             "{}: independent review capability denied: only read-only repository inspection tools are available",
             call.tool_name.name
         )))
@@ -690,7 +696,7 @@ async fn authorize_bound_typed_tool_call(
     if authorization.current_attempt.attempt_id != binding.attempt_id
         || authorization.current_attempt.state != AttemptState::Active
     {
-        return Err(FunctionCallError::RespondToModel(format!(
+        return Err(FunctionCallError::DeniedToModel(format!(
             "{}: the bound typed assignment attempt is no longer active",
             call.tool_name.name
         )));
@@ -704,7 +710,7 @@ async fn authorize_bound_typed_tool_call(
         );
     if !is_legacy_nested_spawn {
         authorize_typed_tool(class).map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
+            FunctionCallError::DeniedToModel(format!(
                 "{}: typed assignment capability denied: {error}",
                 call.tool_name.name
             ))
@@ -720,7 +726,7 @@ async fn authorize_bound_typed_tool_call(
             ))
         })?;
     if !heartbeated {
-        return Err(FunctionCallError::RespondToModel(format!(
+        return Err(FunctionCallError::DeniedToModel(format!(
             "{}: the bound typed assignment attempt is no longer active",
             call.tool_name.name
         )));

@@ -22,6 +22,24 @@ fn error_completion_message_stays_below_manual_review_threshold() {
 }
 
 #[test]
+fn over_truncation_error_completion_points_to_durable_exact_error() {
+    let message = format_inter_agent_completion_message(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").expect("valid agent path"),
+        &AgentStatus::Errored(format!(
+            "{}ROOT_CAUSE_AT_END",
+            "transient wrapper: ".repeat(2_000)
+        )),
+    )
+    .expect("error status should produce a completion message");
+
+    assert!(message.contains("get_agent_task"));
+    assert!(message.contains("full sealed error"));
+    assert!(message.contains("assignment id returned by spawn_agent"));
+    assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
+}
+
+#[test]
 fn legacy_error_completion_message_stays_below_manual_review_threshold() {
     let message =
         format_subagent_notification_message("worker", &AgentStatus::Errored("\0".repeat(10_000)));

@@ -60,7 +60,6 @@ use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
 const TIMING_SCHEMA_VERSION: u16 = 26;
-pub(crate) const TOOL_CLOSURE_SEAL_SCHEMA_VERSION: u16 = TIMING_SCHEMA_VERSION;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
 // These records are diagnostic histories, not the source of truth for the
@@ -132,7 +131,6 @@ pub(crate) enum ContinuationCause {
     ServerEndTurnFalse,
     PendingInput,
     StopHook,
-    CompletionReviewRepair,
     InvalidImageRecovery,
 }
 
@@ -566,12 +564,6 @@ impl TurnTimingSnapshot {
             executed_validation_duration_ns: profile.counters.executed_validation_duration_ns,
             suppressed_validation_output_count: profile.counters.suppressed_validation_output_count,
             ready_startup_prewarm_count: profile.counters.ready_startup_prewarm_count,
-            completion_review_ready_phase_count: profile
-                .counters
-                .completion_review_ready_phase_count,
-            completion_review_terminal_phase_count: profile
-                .counters
-                .completion_review_terminal_phase_count,
             purpose_aggregates,
             same_purpose_continuation_count: profile.counters.same_purpose_continuation_count,
             exact_repeated_wait_count,
@@ -867,8 +859,6 @@ pub(crate) struct TimingCounters {
     pub(crate) executed_validation_duration_ns: u64,
     pub(crate) suppressed_validation_output_count: u32,
     pub(crate) ready_startup_prewarm_count: u32,
-    pub(crate) completion_review_ready_phase_count: u32,
-    pub(crate) completion_review_terminal_phase_count: u32,
     pub(crate) same_purpose_continuation_count: u32,
     pub(crate) exact_repeated_wait_count: u32,
     pub(crate) planning_generation_count: u32,
@@ -1527,15 +1517,9 @@ impl TurnTimingState {
                 .saturating_add(1);
         }
         let reason = match (cause, session_source) {
-            (Some(ContinuationCause::CompletionReviewRepair), _) => {
-                TurnTimingGenerationReason::CompletionRepairRereview
-            }
             (Some(ContinuationCause::Compaction), _) => TurnTimingGenerationReason::Compaction,
             (_, SessionSource::SubAgent(SubAgentSource::Compact)) => {
                 TurnTimingGenerationReason::Compaction
-            }
-            (_, SessionSource::SubAgent(SubAgentSource::Review)) => {
-                TurnTimingGenerationReason::CompletionReview
             }
             (_, SessionSource::SubAgent(_)) => TurnTimingGenerationReason::Subagent,
             (Some(ContinuationCause::ToolResult), _) => {
@@ -1743,6 +1727,7 @@ impl TurnTimingState {
         assert!(self.try_record_accepted_tool_call(call_id, execution_id, source, parent_call_id,));
     }
 
+    #[cfg(test)]
     pub(crate) fn tool_closure_snapshot(&self) -> TurnTimingToolClosure {
         self.state().tool_closure.snapshot()
     }
@@ -2195,6 +2180,7 @@ impl TurnTimingState {
 
     /// Records that the terminal rollout barrier failed. This releases closure waiters without
     /// attesting that any queued result crossed the durability boundary.
+    #[cfg(test)]
     pub(crate) fn record_tool_result_persistence_barrier_failed(&self) {
         let mut state = self.state();
         if state.completed_snapshot.is_some() {
@@ -2330,6 +2316,7 @@ impl TurnTimingState {
             .saturating_add(1);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_executed_validation(&self, duration_ms: u64) {
         let mut state = self.state();
         state.counters.executed_validation_count =
@@ -2352,22 +2339,6 @@ impl TurnTimingState {
         let mut state = self.state();
         state.counters.ready_startup_prewarm_count =
             state.counters.ready_startup_prewarm_count.saturating_add(1);
-    }
-
-    pub(crate) fn record_completion_review_ready_phase(&self) {
-        let mut state = self.state();
-        state.counters.completion_review_ready_phase_count = state
-            .counters
-            .completion_review_ready_phase_count
-            .saturating_add(1);
-    }
-
-    pub(crate) fn record_completion_review_terminal_phase(&self) {
-        let mut state = self.state();
-        state.counters.completion_review_terminal_phase_count = state
-            .counters
-            .completion_review_terminal_phase_count
-            .saturating_add(1);
     }
 
     pub(crate) fn record_generation_outcome(
@@ -2583,65 +2554,6 @@ impl TurnTimingState {
             .counters
             .tool_output_recovery_retruncation_count
             .saturating_add(retruncation_count);
-    }
-
-    pub(crate) fn record_completion_review_preflight(&self, elapsed: Duration) {
-        let mut state = self.state();
-        state.terminalization.review_preflight_ns = state
-            .terminalization
-            .review_preflight_ns
-            .saturating_add(duration_to_u64_ns(elapsed));
-    }
-
-    pub(crate) fn record_completion_review(&self, elapsed: Duration) {
-        let mut state = self.state();
-        state.terminalization.review_ns = state
-            .terminalization
-            .review_ns
-            .saturating_add(duration_to_u64_ns(elapsed));
-    }
-
-    pub(crate) fn record_reviewer_infrastructure_memo_hit(&self) {
-        let mut state = self.state();
-        state.terminalization.reviewer_infrastructure_memo_hit_count = state
-            .terminalization
-            .reviewer_infrastructure_memo_hit_count
-            .saturating_add(1);
-    }
-
-    pub(crate) fn record_review_prevented_by_correctness(&self) {
-        let mut state = self.state();
-        state.terminalization.reviews_prevented_by_correctness_count = state
-            .terminalization
-            .reviews_prevented_by_correctness_count
-            .saturating_add(1);
-    }
-
-    pub(crate) fn record_final_proof_telemetry(
-        &self,
-        checkpoint_tokens: u64,
-        validation_launch_count: u32,
-        validation_process_ns: u64,
-        validation_aggregate_ns: u64,
-        validation_aggregate_count: u32,
-        diff_reuse_count: u32,
-    ) {
-        let mut state = self.state();
-        let timing = &mut state.terminalization;
-        timing.checkpoint_tokens = timing.checkpoint_tokens.max(checkpoint_tokens);
-        timing.validation_launch_count = timing
-            .validation_launch_count
-            .saturating_add(validation_launch_count);
-        timing.validation_process_ns = timing
-            .validation_process_ns
-            .saturating_add(validation_process_ns);
-        timing.validation_aggregate_ns = timing
-            .validation_aggregate_ns
-            .saturating_add(validation_aggregate_ns);
-        timing.validation_aggregate_count = timing
-            .validation_aggregate_count
-            .saturating_add(validation_aggregate_count);
-        timing.diff_reuse_count = timing.diff_reuse_count.saturating_add(diff_reuse_count);
     }
 
     pub(crate) fn record_tool_output_artifact_reread(&self) {
@@ -3008,15 +2920,6 @@ impl TurnTimingStateInner {
             TurnTimingGenerationReason::Initial => &mut self.counters.generations_by_reason.initial,
             TurnTimingGenerationReason::ToolContinuation => {
                 &mut self.counters.generations_by_reason.tool_continuation
-            }
-            TurnTimingGenerationReason::CompletionReview => {
-                &mut self.counters.generations_by_reason.completion_review
-            }
-            TurnTimingGenerationReason::CompletionRepairRereview => {
-                &mut self
-                    .counters
-                    .generations_by_reason
-                    .completion_repair_rereview
             }
             TurnTimingGenerationReason::Compaction => {
                 &mut self.counters.generations_by_reason.compaction
@@ -3571,7 +3474,6 @@ struct LegacyProfileState {
     server_end_turn_false: u32,
     pending_input: u32,
     stop_hook: u32,
-    completion_review_repair: u32,
     invalid_image_recovery: u32,
 }
 
@@ -3627,7 +3529,6 @@ impl LegacyProfileState {
             ContinuationCause::ServerEndTurnFalse => &mut self.server_end_turn_false,
             ContinuationCause::PendingInput => &mut self.pending_input,
             ContinuationCause::StopHook => &mut self.stop_hook,
-            ContinuationCause::CompletionReviewRepair => &mut self.completion_review_repair,
             ContinuationCause::InvalidImageRecovery => &mut self.invalid_image_recovery,
         };
         *counter = counter.saturating_add(1);
@@ -3678,7 +3579,6 @@ impl LegacyProfileState {
             server_end_turn_false: self.server_end_turn_false,
             pending_input: self.pending_input,
             stop_hook: self.stop_hook,
-            completion_review_repair: self.completion_review_repair,
             invalid_image_recovery: self.invalid_image_recovery,
         };
         let total_ms = self
@@ -3870,10 +3770,6 @@ fn add_saturating(target: &mut u128, value: u128, saturation_count: &mut u32) {
 
 fn duration_from_nanos(nanos: u128) -> Duration {
     Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
-}
-
-fn duration_to_u64_ns(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn u128_to_u64_ms(nanos: u128) -> u64 {

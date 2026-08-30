@@ -12,9 +12,8 @@ const COMPLETION_MESSAGE_MAX_TOKENS: usize = 1_000;
 const COMPLETION_MESSAGE_ENVELOPE_TOKEN_RESERVE: usize = 100;
 const ERROR_MAX_TOKENS: usize =
     COMPLETION_MESSAGE_MAX_TOKENS - COMPLETION_MESSAGE_ENVELOPE_TOKEN_RESERVE;
-const ERROR_NEXT_ACTION: &str = "This agent's turn failed. If you still need this agent, use the available collaboration tools to give it another task.";
+const ERROR_NEXT_ACTION: &str = "This agent's turn failed. The full sealed error remains available through get_agent_task; retrieve it with the assignment id returned by spawn_agent before deciding whether to retry. If you still need this agent, use the available collaboration tools to give it another task.";
 const TYPED_COMPLETION_NEXT_ACTION: &str = "The full sealed receipt remains available through get_agent_task; retrieve it with the assignment id returned by spawn_agent.";
-const COMPLETION_GATE_LABEL: &str = "Completion gate (machine-readable):";
 
 // Helpers for model-visible session state markers that are stored in user-role
 // messages but are not user intent.
@@ -76,29 +75,6 @@ pub(crate) fn format_inter_agent_completion_message(
             last_agent_message: None,
             ..
         } => String::new(),
-        AgentStatus::TerminalWithCompletion {
-            last_agent_message,
-            surfaced_result,
-            error,
-            completion,
-        } => {
-            let payload = if let Some(error) = error.as_deref() {
-                format!("Agent errored: {error}\n\n{ERROR_NEXT_ACTION}")
-            } else {
-                last_agent_message
-                    .as_deref()
-                    .or_else(|| {
-                        surfaced_result
-                            .as_ref()
-                            .and_then(|result| result.canonical_message.as_deref())
-                    })
-                    .unwrap_or_default()
-                    .to_string()
-            };
-            return Some(format_bounded_inter_agent_completion_with_gate(
-                task_name, sender, &payload, completion,
-            ));
-        }
         AgentStatus::Errored(error) => {
             let error = truncate_text(error, TruncationPolicy::Tokens(ERROR_MAX_TOKENS));
             format!("Agent errored: {error}\n\n{ERROR_NEXT_ACTION}")
@@ -135,59 +111,6 @@ fn format_bounded_inter_agent_completion_message(
 
         // Rendering adds the typed envelope and can expand escaped control characters. Tighten
         // the source budget until the complete model-visible notification fits the ceiling.
-        let next_budget = payload_budget
-            .saturating_mul(COMPLETION_MESSAGE_MAX_TOKENS.saturating_sub(1))
-            / message_tokens;
-        payload_budget = next_budget.min(payload_budget.saturating_sub(1));
-    }
-}
-
-fn format_bounded_inter_agent_completion_with_gate(
-    task_name: AgentPath,
-    sender: AgentPath,
-    payload: &str,
-    completion: &codex_protocol::protocol::TaskCompletionGate,
-) -> String {
-    let completion = serde_json::to_value(completion)
-        .unwrap_or_else(|error| {
-            serde_json::json!({
-                "serialization_error": error.to_string(),
-                "completion_gate": format!("{completion:?}"),
-            })
-        })
-        .to_string();
-    let completion = format!("{COMPLETION_GATE_LABEL}\n{completion}");
-    let full_payload = if payload.is_empty() {
-        completion.clone()
-    } else {
-        format!("{payload}\n\n{completion}")
-    };
-    let unabridged =
-        InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), full_payload).render();
-    if approx_token_count(&unabridged) < COMPLETION_MESSAGE_MAX_TOKENS {
-        return unabridged;
-    }
-
-    // The typed gate is authoritative, so truncation is applied only to prose.
-    // If the gate itself exceeds the normal notification ceiling, retain it
-    // intact instead of recreating the original evidence-loss bug.
-    let fixed_tokens = approx_token_count(&completion)
-        .saturating_add(approx_token_count(TYPED_COMPLETION_NEXT_ACTION));
-    let mut payload_budget = ERROR_MAX_TOKENS.saturating_sub(fixed_tokens);
-    loop {
-        let payload = truncate_text(payload, TruncationPolicy::Tokens(payload_budget));
-        let payload = if payload.is_empty() {
-            format!("{TYPED_COMPLETION_NEXT_ACTION}\n\n{completion}")
-        } else {
-            format!("{payload}\n\n{TYPED_COMPLETION_NEXT_ACTION}\n\n{completion}")
-        };
-        let message =
-            InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), payload).render();
-        let message_tokens = approx_token_count(&message);
-        if message_tokens < COMPLETION_MESSAGE_MAX_TOKENS || payload_budget == 0 {
-            return message;
-        }
-
         let next_budget = payload_budget
             .saturating_mul(COMPLETION_MESSAGE_MAX_TOKENS.saturating_sub(1))
             / message_tokens;

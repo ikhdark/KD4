@@ -40,24 +40,50 @@ impl ModelContextBudget {
 
     /// Admit text, truncating the final admitted item within the remaining budget.
     pub fn take(&mut self, text: &str) -> Option<String> {
-        if self.remaining_bytes == 0 {
+        self.take_up_to(text, self.remaining_bytes)
+    }
+
+    /// Admit text up to an item-specific byte cap while preserving the unused
+    /// aggregate budget for later fragments.
+    pub fn take_up_to(&mut self, text: &str, max_bytes: usize) -> Option<String> {
+        let budget = self.remaining_bytes.min(max_bytes);
+        if budget == 0 {
             return None;
         }
-        if text.len() <= self.remaining_bytes {
+        if text.len() <= budget {
             self.remaining_bytes -= text.len();
             return Some(text.to_string());
         }
 
-        let budget = std::mem::take(&mut self.remaining_bytes);
-        if budget <= TRUNCATION_MARKER.len() {
-            return Some(text[..text.floor_char_boundary(budget)].to_string());
-        }
+        let admitted = if budget <= TRUNCATION_MARKER.len() {
+            text[..text.floor_char_boundary(budget)].to_string()
+        } else {
+            let text_budget = budget - TRUNCATION_MARKER.len();
+            let prefix = &text[..text.floor_char_boundary(text_budget.div_ceil(2))];
+            let suffix_start = text.ceil_char_boundary(text.len().saturating_sub(text_budget / 2));
+            let suffix = &text[suffix_start..];
+            format!("{prefix}{TRUNCATION_MARKER}{suffix}")
+        };
+        self.remaining_bytes = self.remaining_bytes.saturating_sub(admitted.len());
+        Some(admitted)
+    }
+}
 
-        let text_budget = budget - TRUNCATION_MARKER.len();
-        let prefix = &text[..text.floor_char_boundary(text_budget.div_ceil(2))];
-        let suffix_start = text.ceil_char_boundary(text.len().saturating_sub(text_budget / 2));
-        let suffix = &text[suffix_start..];
-        Some(format!("{prefix}{TRUNCATION_MARKER}{suffix}"))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_cap_preserves_aggregate_budget_for_later_fragments() {
+        let mut budget = ModelContextBudget::new(10);
+        let initial_bytes = budget.remaining_bytes();
+
+        let first = budget
+            .take_up_to(&"x".repeat(100), 12)
+            .expect("capped fragment");
+        assert!(first.len() <= 12);
+        assert_eq!(budget.remaining_bytes(), initial_bytes - first.len());
+        assert_eq!(budget.take("later"), Some("later".to_string()));
     }
 }
 

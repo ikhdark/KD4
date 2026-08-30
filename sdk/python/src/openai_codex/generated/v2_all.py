@@ -3995,12 +3995,6 @@ class SurfacedToolResult(BaseModel):
     value: Any
 
 
-class TaskCompletionStatus(Enum):
-    passed = "passed"
-    partial = "partial"
-    blocked = "blocked"
-
-
 class TerminalInteractionNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -4010,19 +4004,6 @@ class TerminalInteractionNotification(BaseModel):
     stdin: str
     thread_id: Annotated[str, Field(alias="threadId")]
     turn_id: Annotated[str, Field(alias="turnId")]
-
-
-class TerminalizationDeliveryState(Enum):
-    not_attempted = "not_attempted"
-    claimed = "claimed"
-    delivered = "delivered"
-    delivery_failed = "delivery_failed"
-
-
-class TerminalizationRecoveryState(Enum):
-    none = "none"
-    pending = "pending"
-    recovered = "recovered"
 
 
 class TextElement(BaseModel):
@@ -4833,10 +4814,6 @@ class TurnModerationMetadataNotification(BaseModel):
 class TurnPlanStepStatus(Enum):
     pending = "pending"
     in_progress = "inProgress"
-    implemented = "implemented"
-    passed = "passed"
-    blocked = "blocked"
-    skipped = "skipped"
     completed = "completed"
 
 
@@ -5004,8 +4981,6 @@ class TurnTimingGenerationPurposeCounts(BaseModel):
 class TurnTimingGenerationReason(Enum):
     initial = "initial"
     tool_continuation = "tool_continuation"
-    completion_review = "completion_review"
-    completion_repair_rereview = "completion_repair_rereview"
     compaction = "compaction"
     subagent = "subagent"
     other = "other"
@@ -5016,8 +4991,6 @@ class TurnTimingGenerationReasonCounts(BaseModel):
         populate_by_name=True,
     )
     compaction: Annotated[int, Field(ge=0)]
-    completion_repair_rereview: Annotated[int, Field(alias="completionRepairRereview", ge=0)]
-    completion_review: Annotated[int, Field(alias="completionReview", ge=0)]
     initial: Annotated[int, Field(ge=0)]
     other: Annotated[int, Field(ge=0)]
     subagent: Annotated[int, Field(ge=0)]
@@ -5211,8 +5184,6 @@ class TurnTimingTerminalization(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    checkpoint_tokens: Annotated[int | None, Field(alias="checkpointTokens", ge=0)] = 0
-    completion_gate_ns: Annotated[int, Field(alias="completionGateNs", ge=0)]
     delivery_attempt_ns: Annotated[int | None, Field(alias="deliveryAttemptNs", ge=0)] = 0
     diff_refresh_count: Annotated[int | None, Field(alias="diffRefreshCount", ge=0)] = 0
     diff_reuse_count: Annotated[int | None, Field(alias="diffReuseCount", ge=0)] = 0
@@ -5225,14 +5196,6 @@ class TurnTimingTerminalization(BaseModel):
     interaction_release_ns: Annotated[int | None, Field(alias="interactionReleaseNs", ge=0)] = 0
     post_cleanup_ns: Annotated[int | None, Field(alias="postCleanupNs", ge=0)] = 0
     preparation_ns: Annotated[int | None, Field(alias="preparationNs", ge=0)] = 0
-    review_ns: Annotated[int | None, Field(alias="reviewNs", ge=0)] = 0
-    review_preflight_ns: Annotated[int | None, Field(alias="reviewPreflightNs", ge=0)] = 0
-    reviewer_infrastructure_memo_hit_count: Annotated[
-        int | None, Field(alias="reviewerInfrastructureMemoHitCount", ge=0)
-    ] = 0
-    reviews_prevented_by_correctness_count: Annotated[
-        int | None, Field(alias="reviewsPreventedByCorrectnessCount", ge=0)
-    ] = 0
     terminal_memo_hit_count: Annotated[int | None, Field(alias="terminalMemoHitCount", ge=0)] = 0
     unclassified_ns: Annotated[int | None, Field(alias="unclassifiedNs", ge=0)] = 0
     validation_aggregate_count: Annotated[
@@ -6527,6 +6490,16 @@ class CodexErrorInfo(
     ]
 
 
+class CollabAgentState(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    last_agent_message: Annotated[str | None, Field(alias="lastAgentMessage")] = None
+    message: str | None = None
+    status: CollabAgentStatus
+    surfaced_result: Annotated[SurfacedToolResult | None, Field(alias="surfacedResult")] = None
+
+
 class CollaborationMode(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -6935,7 +6908,7 @@ class CommandGuardianApprovalReviewAction(BaseModel):
         populate_by_name=True,
     )
     command: str
-    cwd: AbsolutePathBuf
+    cwd: LegacyAppPathString
     source: GuardianCommandSource
     type: Annotated[Literal["command"], Field(title="CommandGuardianApprovalReviewActionType")]
 
@@ -6945,7 +6918,7 @@ class ExecveGuardianApprovalReviewAction(BaseModel):
         populate_by_name=True,
     )
     argv: list[str]
-    cwd: AbsolutePathBuf
+    cwd: LegacyAppPathString
     program: str
     source: GuardianCommandSource
     type: Annotated[Literal["execve"], Field(title="ExecveGuardianApprovalReviewActionType")]
@@ -7763,15 +7736,6 @@ class SubAgentSource(
     root: SubAgentSourceValue | ThreadSpawnSubAgentSource | OtherSubAgentSource
 
 
-class TaskCompletionGate(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    evidence_path: Annotated[str | None, Field(alias="evidencePath")] = None
-    reasons: list[str] | None = None
-    status: TaskCompletionStatus
-
-
 class ThreadErrorData(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7897,6 +7861,54 @@ class FileChangeThreadItem(BaseModel):
     type: Annotated[Literal["fileChange"], Field(title="FileChangeThreadItemType")]
 
 
+class CollabAgentToolCallThreadItem(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    agents_states: Annotated[
+        dict[str, CollabAgentState],
+        Field(
+            alias="agentsStates",
+            description="Last known status of the target agents, when available.",
+        ),
+    ]
+    id: Annotated[str, Field(description="Unique identifier for this collab tool call.")]
+    model: Annotated[
+        str | None, Field(description="Model requested for the spawned agent, when applicable.")
+    ] = None
+    prompt: Annotated[
+        str | None,
+        Field(description="Prompt text sent as part of the collab tool call, when available."),
+    ] = None
+    reasoning_effort: Annotated[
+        ReasoningEffort | None,
+        Field(
+            alias="reasoningEffort",
+            description="Reasoning effort requested for the spawned agent, when applicable.",
+        ),
+    ] = None
+    receiver_thread_ids: Annotated[
+        list[str],
+        Field(
+            alias="receiverThreadIds",
+            description="Thread ID of the receiving agent, when applicable. In case of spawn operation, this corresponds to the newly spawned agent.",
+        ),
+    ]
+    sender_thread_id: Annotated[
+        str,
+        Field(
+            alias="senderThreadId", description="Thread ID of the agent issuing the collab request."
+        ),
+    ]
+    status: Annotated[
+        CollabAgentToolCallStatus, Field(description="Current status of the collab tool call.")
+    ]
+    tool: Annotated[CollabAgentTool, Field(description="Name of the collab tool that was invoked.")]
+    type: Annotated[
+        Literal["collabAgentToolCall"], Field(title="CollabAgentToolCallThreadItemType")
+    ]
+
+
 class WebSearchThreadItem(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7905,6 +7917,53 @@ class WebSearchThreadItem(BaseModel):
     id: str
     query: str
     type: Annotated[Literal["webSearch"], Field(title="WebSearchThreadItemType")]
+
+
+class ThreadItem(
+    RootModel[
+        UserMessageThreadItem
+        | HookPromptThreadItem
+        | AgentMessageThreadItem
+        | PlanThreadItem
+        | ReasoningThreadItem
+        | CommandExecutionThreadItem
+        | FileChangeThreadItem
+        | McpToolCallThreadItem
+        | DynamicToolCallThreadItem
+        | CollabAgentToolCallThreadItem
+        | SubAgentActivityThreadItem
+        | WebSearchThreadItem
+        | ImageViewThreadItem
+        | SleepThreadItem
+        | ImageGenerationThreadItem
+        | EnteredReviewModeThreadItem
+        | ExitedReviewModeThreadItem
+        | ContextCompactionThreadItem
+    ]
+):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    root: (
+        UserMessageThreadItem
+        | HookPromptThreadItem
+        | AgentMessageThreadItem
+        | PlanThreadItem
+        | ReasoningThreadItem
+        | CommandExecutionThreadItem
+        | FileChangeThreadItem
+        | McpToolCallThreadItem
+        | DynamicToolCallThreadItem
+        | CollabAgentToolCallThreadItem
+        | SubAgentActivityThreadItem
+        | WebSearchThreadItem
+        | ImageViewThreadItem
+        | SleepThreadItem
+        | ImageGenerationThreadItem
+        | EnteredReviewModeThreadItem
+        | ExitedReviewModeThreadItem
+        | ContextCompactionThreadItem
+    )
 
 
 class ThreadListParams(BaseModel):
@@ -8112,12 +8171,6 @@ class TurnPlanStep(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    acceptance_criteria: Annotated[list[str] | None, Field(alias="acceptanceCriteria")] = None
-    depends_on: Annotated[list[str] | None, Field(alias="dependsOn")] = None
-    generated_artifacts: Annotated[list[str] | None, Field(alias="generatedArtifacts")] = None
-    id: str | None = None
-    risks: list[str] | None = None
-    runtime_paths: Annotated[list[str] | None, Field(alias="runtimePaths")] = None
     status: TurnPlanStepStatus
     step: str
 
@@ -8227,19 +8280,6 @@ class TurnSteerParams(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
-class TurnTerminalizationReceipt(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    active_turn_detached: Annotated[bool, Field(alias="activeTurnDetached")]
-    deadline_exhausted_phase: Annotated[str | None, Field(alias="deadlineExhaustedPhase")] = None
-    delivery_state: Annotated[TerminalizationDeliveryState, Field(alias="deliveryState")]
-    recovery_state: Annotated[TerminalizationRecoveryState, Field(alias="recoveryState")]
-    terminal_identity: Annotated[str, Field(alias="terminalIdentity")]
-    terminal_interaction_released: Annotated[bool, Field(alias="terminalInteractionReleased")]
-    terminalization: TurnTimingTerminalization
-
-
 class TurnTimingCounters(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -8252,22 +8292,6 @@ class TurnTimingCounters(BaseModel):
         int | None, Field(alias="attributableRecoveryGenerationCount", ge=0)
     ] = 0
     clock_regression_count: Annotated[int, Field(alias="clockRegressionCount", ge=0)]
-    completion_review_ready_phase_count: Annotated[
-        int | None,
-        Field(
-            alias="completionReviewReadyPhaseCount",
-            description="Completion-review coordinators that observed the ready phase.",
-            ge=0,
-        ),
-    ] = 0
-    completion_review_terminal_phase_count: Annotated[
-        int | None,
-        Field(
-            alias="completionReviewTerminalPhaseCount",
-            description="Completion-review coordinators that observed the terminal phase.",
-            ge=0,
-        ),
-    ] = 0
     exact_repeated_wait_count: Annotated[
         int | None, Field(alias="exactRepeatedWaitCount", ge=0)
     ] = 0
@@ -8306,15 +8330,7 @@ class TurnTimingCounters(BaseModel):
     }
     generations_by_reason: Annotated[
         TurnTimingGenerationReasonCounts | None, Field(alias="generationsByReason")
-    ] = {
-        "compaction": 0,
-        "completionRepairRereview": 0,
-        "completionReview": 0,
-        "initial": 0,
-        "other": 0,
-        "subagent": 0,
-        "toolContinuation": 0,
-    }
+    ] = {"compaction": 0, "initial": 0, "other": 0, "subagent": 0, "toolContinuation": 0}
     internally_drained_wait_count: Annotated[
         int | None, Field(alias="internallyDrainedWaitCount", ge=0)
     ] = 0
@@ -9011,17 +9027,6 @@ class ConfigValueWriteRequest(BaseModel):
     params: ConfigValueWriteParams
 
 
-class CollabAgentState(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    completion: TaskCompletionGate | None = None
-    last_agent_message: Annotated[str | None, Field(alias="lastAgentMessage")] = None
-    message: str | None = None
-    status: CollabAgentStatus
-    surfaced_result: Annotated[SurfacedToolResult | None, Field(alias="surfacedResult")] = None
-
-
 class Config(BaseModel):
     model_config = ConfigDict(
         extra="allow",
@@ -9222,6 +9227,38 @@ class HookCompletedNotification(BaseModel):
     run: HookRunSummary
     thread_id: Annotated[str, Field(alias="threadId")]
     turn_id: Annotated[str | None, Field(alias="turnId")] = None
+
+
+class ItemCompletedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    completed_at_ms: Annotated[
+        int,
+        Field(
+            alias="completedAtMs",
+            description="Unix timestamp (in milliseconds) when this item lifecycle completed.",
+        ),
+    ]
+    item: ThreadItem
+    thread_id: Annotated[str, Field(alias="threadId")]
+    turn_id: Annotated[str, Field(alias="turnId")]
+
+
+class ItemStartedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    item: ThreadItem
+    started_at_ms: Annotated[
+        int,
+        Field(
+            alias="startedAtMs",
+            description="Unix timestamp (in milliseconds) when this item lifecycle started.",
+        ),
+    ]
+    thread_id: Annotated[str, Field(alias="threadId")]
+    turn_id: Annotated[str, Field(alias="turnId")]
 
 
 class ListMcpServerStatusResponse(BaseModel):
@@ -9479,6 +9516,22 @@ class TurnPlanUpdatedServerNotification(BaseModel):
     params: TurnPlanUpdatedNotification
 
 
+class ItemStartedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[Literal["item/started"], Field(title="Item/startedNotificationMethod")]
+    params: ItemStartedNotification
+
+
+class ItemCompletedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[Literal["item/completed"], Field(title="Item/completedNotificationMethod")]
+    params: ItemCompletedNotification
+
+
 class ItemAgentMessageDeltaServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -9569,115 +9622,11 @@ class SessionSource(RootModel[SessionSourceValue | CustomSessionSource | SubAgen
     root: SessionSourceValue | CustomSessionSource | SubAgentSessionSource
 
 
-class CollabAgentToolCallThreadItem(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    agents_states: Annotated[
-        dict[str, CollabAgentState],
-        Field(
-            alias="agentsStates",
-            description="Last known status of the target agents, when available.",
-        ),
-    ]
-    id: Annotated[str, Field(description="Unique identifier for this collab tool call.")]
-    model: Annotated[
-        str | None, Field(description="Model requested for the spawned agent, when applicable.")
-    ] = None
-    prompt: Annotated[
-        str | None,
-        Field(description="Prompt text sent as part of the collab tool call, when available."),
-    ] = None
-    reasoning_effort: Annotated[
-        ReasoningEffort | None,
-        Field(
-            alias="reasoningEffort",
-            description="Reasoning effort requested for the spawned agent, when applicable.",
-        ),
-    ] = None
-    receiver_thread_ids: Annotated[
-        list[str],
-        Field(
-            alias="receiverThreadIds",
-            description="Thread ID of the receiving agent, when applicable. In case of spawn operation, this corresponds to the newly spawned agent.",
-        ),
-    ]
-    sender_thread_id: Annotated[
-        str,
-        Field(
-            alias="senderThreadId", description="Thread ID of the agent issuing the collab request."
-        ),
-    ]
-    status: Annotated[
-        CollabAgentToolCallStatus, Field(description="Current status of the collab tool call.")
-    ]
-    tool: Annotated[CollabAgentTool, Field(description="Name of the collab tool that was invoked.")]
-    type: Annotated[
-        Literal["collabAgentToolCall"], Field(title="CollabAgentToolCallThreadItemType")
-    ]
-
-
-class ThreadItem(
-    RootModel[
-        UserMessageThreadItem
-        | HookPromptThreadItem
-        | AgentMessageThreadItem
-        | PlanThreadItem
-        | ReasoningThreadItem
-        | CommandExecutionThreadItem
-        | FileChangeThreadItem
-        | McpToolCallThreadItem
-        | DynamicToolCallThreadItem
-        | CollabAgentToolCallThreadItem
-        | SubAgentActivityThreadItem
-        | WebSearchThreadItem
-        | ImageViewThreadItem
-        | SleepThreadItem
-        | ImageGenerationThreadItem
-        | EnteredReviewModeThreadItem
-        | ExitedReviewModeThreadItem
-        | ContextCompactionThreadItem
-    ]
-):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    root: (
-        UserMessageThreadItem
-        | HookPromptThreadItem
-        | AgentMessageThreadItem
-        | PlanThreadItem
-        | ReasoningThreadItem
-        | CommandExecutionThreadItem
-        | FileChangeThreadItem
-        | McpToolCallThreadItem
-        | DynamicToolCallThreadItem
-        | CollabAgentToolCallThreadItem
-        | SubAgentActivityThreadItem
-        | WebSearchThreadItem
-        | ImageViewThreadItem
-        | SleepThreadItem
-        | ImageGenerationThreadItem
-        | EnteredReviewModeThreadItem
-        | ExitedReviewModeThreadItem
-        | ContextCompactionThreadItem
-    )
-
-
 class TurnReasoningPolicySummaryNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
     history: ReasoningPolicyHistory
-    thread_id: Annotated[str, Field(alias="threadId")]
-    turn_id: Annotated[str, Field(alias="turnId")]
-
-
-class TurnTerminalizationCompletedNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    receipt: TurnTerminalizationReceipt
     thread_id: Annotated[str, Field(alias="threadId")]
     turn_id: Annotated[str, Field(alias="turnId")]
 
@@ -9942,22 +9891,6 @@ class GuardianApprovalReviewAction(
     )
 
 
-class ItemCompletedNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    completed_at_ms: Annotated[
-        int,
-        Field(
-            alias="completedAtMs",
-            description="Unix timestamp (in milliseconds) when this item lifecycle completed.",
-        ),
-    ]
-    item: ThreadItem
-    thread_id: Annotated[str, Field(alias="threadId")]
-    turn_id: Annotated[str, Field(alias="turnId")]
-
-
 class ItemGuardianApprovalReviewCompletedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -10016,22 +9949,6 @@ class ItemGuardianApprovalReviewStartedNotification(BaseModel):
             description="Identifier for the reviewed item or tool call when one exists.\n\nIn most cases, one review maps to one target item. The exceptions are - execve reviews, where a single command may contain multiple execve calls to review - network policy reviews, where there is no target item\n\nA network call is triggered by a CommandExecution item, so having a target_item_id set to the CommandExecution item would be misleading because the review is about the network call, not the command execution. Therefore, target_item_id is set to None for network policy reviews.",
         ),
     ] = None
-    thread_id: Annotated[str, Field(alias="threadId")]
-    turn_id: Annotated[str, Field(alias="turnId")]
-
-
-class ItemStartedNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    item: ThreadItem
-    started_at_ms: Annotated[
-        int,
-        Field(
-            alias="startedAtMs",
-            description="Unix timestamp (in milliseconds) when this item lifecycle started.",
-        ),
-    ]
     thread_id: Annotated[str, Field(alias="threadId")]
     turn_id: Annotated[str, Field(alias="turnId")]
 
@@ -10109,25 +10026,6 @@ class TurnReasoningPolicySummaryServerNotification(BaseModel):
     params: TurnReasoningPolicySummaryNotification
 
 
-class TurnTerminalizationCompletedServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[
-        Literal["turn/terminalizationCompleted"],
-        Field(title="Turn/terminalizationCompletedNotificationMethod"),
-    ]
-    params: TurnTerminalizationCompletedNotification
-
-
-class ItemStartedServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[Literal["item/started"], Field(title="Item/startedNotificationMethod")]
-    params: ItemStartedNotification
-
-
 class ItemAutoApprovalReviewStartedServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -10148,14 +10046,6 @@ class ItemAutoApprovalReviewCompletedServerNotification(BaseModel):
         Field(title="Item/autoApprovalReview/completedNotificationMethod"),
     ]
     params: ItemGuardianApprovalReviewCompletedNotification
-
-
-class ItemCompletedServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[Literal["item/completed"], Field(title="Item/completedNotificationMethod")]
-    params: ItemCompletedNotification
 
 
 class TurnTiming(BaseModel):
@@ -10234,11 +10124,9 @@ class TurnTiming(BaseModel):
     terminalization: Annotated[
         TurnTimingTerminalization | None,
         Field(
-            description="Additive terminalization phase timings. Older records deserialize to zeroes; the terminalization receipt remains authoritative for phases that occur after live dispatch."
+            description="Additive terminalization phase timings captured as part of the terminal timing profile."
         ),
     ] = {
-        "checkpointTokens": 0,
-        "completionGateNs": 0,
         "deliveryAttemptNs": 0,
         "diffRefreshCount": 0,
         "diffReuseCount": 0,
@@ -10251,10 +10139,6 @@ class TurnTiming(BaseModel):
         "interactionReleaseNs": 0,
         "postCleanupNs": 0,
         "preparationNs": 0,
-        "reviewNs": 0,
-        "reviewPreflightNs": 0,
-        "reviewerInfrastructureMemoHitCount": 0,
-        "reviewsPreventedByCorrectnessCount": 0,
         "terminalMemoHitCount": 0,
         "unclassifiedNs": 0,
         "validationAggregateCount": 0,
@@ -10530,12 +10414,6 @@ class Turn(BaseModel):
             alias="completedAt", description="Unix timestamp (in seconds) when the turn completed."
         ),
     ] = None
-    completion: Annotated[
-        TaskCompletionGate | None,
-        Field(
-            description="Machine-derived completion proof persisted at the terminal turn boundary."
-        ),
-    ] = None
     duration_ms: Annotated[
         int | None,
         Field(
@@ -10581,7 +10459,6 @@ class TurnCompletedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    completion: TaskCompletionGate | None = None
     surfaced_result: Annotated[SurfacedToolResult | None, Field(alias="surfacedResult")] = None
     thread_id: Annotated[str, Field(alias="threadId")]
     timing: TurnTiming | None = None
@@ -10940,7 +10817,6 @@ class ServerNotification(
         | TurnReasoningPolicySummaryServerNotification
         | HookStartedServerNotification
         | TurnCompletedServerNotification
-        | TurnTerminalizationCompletedServerNotification
         | HookCompletedServerNotification
         | TurnDiffUpdatedServerNotification
         | TurnPlanUpdatedServerNotification
@@ -11008,7 +10884,6 @@ class ServerNotification(
         | TurnReasoningPolicySummaryServerNotification
         | HookStartedServerNotification
         | TurnCompletedServerNotification
-        | TurnTerminalizationCompletedServerNotification
         | HookCompletedServerNotification
         | TurnDiffUpdatedServerNotification
         | TurnPlanUpdatedServerNotification

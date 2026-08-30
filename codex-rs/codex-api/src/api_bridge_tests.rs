@@ -43,6 +43,19 @@ fn map_api_error_keeps_exhausted_pre_dispatch_failure_non_retryable() {
 }
 
 #[test]
+fn map_transport_build_error_non_retryable() {
+    let err = map_api_error(ApiError::Transport(TransportError::Build(
+        "invalid request header".to_string(),
+    )));
+
+    assert!(!err.is_retryable());
+    let CodexErr::RequestBuild(message) = err else {
+        panic!("expected request build error, got {err:?}");
+    };
+    assert_eq!(message, "invalid request header");
+}
+
+#[test]
 fn map_api_error_maps_server_overloaded_from_503_body() {
     let body = serde_json::json!({
         "error": {

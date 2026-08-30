@@ -35,9 +35,10 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             ([4.0, 1.0, 3.0, 2.0], (2.5, 3.85, 1.0, 4.0)),
             ([2.0, 1.0, 2.0, 1.0], (1.5, 2.0, 1.0, 2.0)),
         ):
-            with self.subTest(values=values), mock.patch(
-                "builtins.sorted", wraps=builtin_sorted
-            ) as ordering:
+            with (
+                self.subTest(values=values),
+                mock.patch("builtins.sorted", wraps=builtin_sorted) as ordering,
+            ):
                 actual = kd4_perf_snapshot._ordered_sample_statistics(values)
 
             self.assertEqual(ordering.call_count, 1)
@@ -209,9 +210,12 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
                 (None, "feature/unborn", 0),
             ),
         ):
-            with self.subTest(status=status), mock.patch.object(
-                kd4_perf_snapshot, "_git_text", return_value=status
-            ) as git_text:
+            with (
+                self.subTest(status=status),
+                mock.patch.object(
+                    kd4_perf_snapshot, "_git_text", return_value=status
+                ) as git_text,
+            ):
                 metadata = kd4_perf_snapshot._git_repository_metadata(Path.cwd())
 
             self.assertEqual(metadata, expected)

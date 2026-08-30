@@ -25,10 +25,14 @@ impl Shell {
         use_login_shell: bool,
     ) -> anyhow::Result<Vec<String>> {
         match self.shell_type {
-            ShellType::Zsh | ShellType::Bash | ShellType::Sh => anyhow::bail!(
-                "shell `{}` is retained for compatibility but cannot execute on Windows",
-                self.shell_type.name()
-            ),
+            ShellType::Zsh | ShellType::Bash | ShellType::Sh => {
+                let arg = if use_login_shell { "-lc" } else { "-c" };
+                Ok(vec![
+                    self.shell_path.to_string_lossy().to_string(),
+                    arg.to_string(),
+                    command.to_string(),
+                ])
+            }
             ShellType::PowerShell => {
                 let mut args = vec![self.shell_path.to_string_lossy().to_string()];
                 if !use_login_shell {
@@ -61,12 +65,11 @@ impl From<DetectedShell> for Shell {
 impl Shell {
     pub(crate) fn from_environment_shell_info(shell_info: ShellInfo) -> anyhow::Result<Self> {
         let shell_type = match shell_info.name.as_str() {
+            "zsh" => ShellType::Zsh,
+            "bash" => ShellType::Bash,
             "powershell" => ShellType::PowerShell,
+            "sh" => ShellType::Sh,
             "cmd" => ShellType::Cmd,
-            "zsh" | "bash" | "sh" => anyhow::bail!(
-                "shell `{}` is retained for compatibility but cannot execute on Windows",
-                shell_info.name
-            ),
             name => anyhow::bail!("unknown environment shell `{name}`"),
         };
 

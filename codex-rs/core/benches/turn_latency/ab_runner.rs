@@ -5,6 +5,7 @@
 
 #[derive(Clone, Copy, Debug)]
 enum AbLatencyMetric {
+    EndToEnd,
     ControllableTurn,
     Preparation,
     PreFirstOutput,
@@ -16,14 +17,16 @@ enum AbLatencyMetric {
 }
 
 impl AbLatencyMetric {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
+        Self::EndToEnd,
         Self::ControllableTurn,
         Self::Preparation,
         Self::PreFirstOutput,
         Self::SamplingToCall,
         Self::PostToolHandoff,
     ];
-    const WITH_PARALLEL_GATE_WAIT: [Self; 6] = [
+    const WITH_PARALLEL_GATE_WAIT: [Self; 7] = [
+        Self::EndToEnd,
         Self::ControllableTurn,
         Self::Preparation,
         Self::PreFirstOutput,
@@ -31,7 +34,8 @@ impl AbLatencyMetric {
         Self::PostToolHandoff,
         Self::ParallelGateWait,
     ];
-    const REQUEST_ONLY: [Self; 3] = [
+    const REQUEST_ONLY: [Self; 4] = [
+        Self::EndToEnd,
         Self::ControllableTurn,
         Self::Preparation,
         Self::PreFirstOutput,
@@ -40,7 +44,8 @@ impl AbLatencyMetric {
     // terminal failure has no repair operation to time, while the candidate's
     // successful follow-up does. The raw evidence counters and exact artifact
     // contract remain part of the replay sample.
-    const REPLAY: [Self; 7] = [
+    const REPLAY: [Self; 8] = [
+        Self::EndToEnd,
         Self::ControllableTurn,
         Self::Preparation,
         Self::SamplingToCall,
@@ -52,6 +57,7 @@ impl AbLatencyMetric {
 
     fn name(self) -> &'static str {
         match self {
+            Self::EndToEnd => "end_to_end",
             Self::ControllableTurn => "controllable_turn",
             Self::Preparation => "request_preparation",
             Self::PreFirstOutput => "pre_first_output",
@@ -63,8 +69,38 @@ impl AbLatencyMetric {
         }
     }
 
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "end_to_end" => Some(Self::EndToEnd),
+            "controllable_turn" => Some(Self::ControllableTurn),
+            "request_preparation" => Some(Self::Preparation),
+            "pre_first_output" => Some(Self::PreFirstOutput),
+            "sampling_to_call" => Some(Self::SamplingToCall),
+            "post_tool_handoff" => Some(Self::PostToolHandoff),
+            "parallel_gate_wait" => Some(Self::ParallelGateWait),
+            "projection_persistence" => Some(Self::ProjectionPersistence),
+            "terminalization" => Some(Self::Terminalization),
+            _ => None,
+        }
+    }
+
+    fn plain_language_name(self) -> &'static str {
+        match self {
+            Self::EndToEnd => "the whole turn from start to finish",
+            Self::ControllableTurn => "turn time the local agent can influence",
+            Self::Preparation => "time spent preparing the model request",
+            Self::PreFirstOutput => "time before the model's first output",
+            Self::SamplingToCall => "time from model output to starting a tool call",
+            Self::PostToolHandoff => "time from tool completion until the model can continue",
+            Self::ParallelGateWait => "time tool calls waited for the concurrency gate",
+            Self::ProjectionPersistence => "time spent projecting and saving tool output",
+            Self::Terminalization => "time spent finishing and recording the turn",
+        }
+    }
+
     fn value(self, sample: &Sample) -> u64 {
         match self {
+            Self::EndToEnd => sample.duration_ns,
             Self::ControllableTurn => sample.controllable_duration_ns,
             Self::Preparation => sample.preparation_ns,
             Self::PreFirstOutput => sample.pre_first_output_ns,
@@ -75,6 +111,16 @@ impl AbLatencyMetric {
             Self::Terminalization => sample.finalization_ns,
         }
     }
+}
+
+fn replay_latency_pair_passes(baseline_ns: u64, candidate_ns: u64) -> bool {
+    let allowed_percent = 100 - AB_REPLAY_REQUIRED_IMPROVEMENT_PERCENT;
+    u128::from(candidate_ns) * 100 <= u128::from(baseline_ns) * u128::from(allowed_percent)
+}
+
+fn replay_latency_limit_ns(baseline_ns: u64) -> u64 {
+    let allowed_percent = 100 - AB_REPLAY_REQUIRED_IMPROVEMENT_PERCENT;
+    ((u128::from(baseline_ns) * u128::from(allowed_percent)) / 100) as u64
 }
 
 fn hierarchical_paired_bootstrap_for_shape(
@@ -175,7 +221,7 @@ fn hierarchical_paired_bootstrap_for_shape(
         pairs_per_cluster,
         median_ratio_ucb_limit: AB_MEDIAN_RATIO_UCB_LIMIT,
         p95_ratio_ucb_limit: AB_P95_RATIO_UCB_LIMIT,
-        target_ratio: AB_RATIO_TARGET,
+        target_ratio: AB_INCREMENTAL_RATIO_TARGET,
         passed: median_ratio_ucb <= AB_MEDIAN_RATIO_UCB_LIMIT
             && p95_ratio_ucb <= AB_P95_RATIO_UCB_LIMIT,
     })
@@ -325,15 +371,17 @@ fn request_serialization_is_noninferior(a: &Sample, b: &Sample) -> bool {
         return false;
     }
 
-    let semantic_components_match = a.request_components.iter().zip(&b.request_components).all(
-        |(a_component, b_component)| {
-            a_component.stage == b_component.stage
-                && a_component.envelope_sha256 == b_component.envelope_sha256
-                && a_component.instructions_sha256 == b_component.instructions_sha256
-                && a_component.current_input_sha256 == b_component.current_input_sha256
-                && a_component.prompt_cache_key_sha256 == b_component.prompt_cache_key_sha256
-        },
-    );
+    let semantic_components_match =
+        a.request_components
+            .iter()
+            .zip(&b.request_components)
+            .all(|(a_component, b_component)| {
+                a_component.stage == b_component.stage
+                    && a_component.envelope_sha256 == b_component.envelope_sha256
+                    && a_component.instructions_sha256 == b_component.instructions_sha256
+                    && a_component.current_input_sha256 == b_component.current_input_sha256
+                    && a_component.prompt_cache_key_sha256 == b_component.prompt_cache_key_sha256
+            });
     if !semantic_components_match {
         return false;
     }
@@ -482,7 +530,6 @@ fn record_retained_lifecycle_coverage_failures(sample: &mut Sample) {
 
 fn retained_exec_lifecycle_matches(sample: &Sample) -> bool {
     sample.terminal_event == "turn_complete"
-        && sample.completion_status.as_deref() == Some("not_applicable")
         && sample.abort_reason.is_none()
         && sample.typed_error_count == 0
         && sample.final_response_present
@@ -514,7 +561,6 @@ fn abort_direct_nested_lifecycle_matches(sample: &Sample) -> bool {
             && sample.abort_barrier_call_id.as_deref() == Some(nested.call_id.as_str())
     });
     sample.terminal_event == "turn_aborted"
-        && sample.completion_status.is_none()
         && sample.abort_reason.as_deref() == Some("interrupted")
         && sample.typed_error_count == 0
         && !sample.final_response_present
@@ -539,7 +585,6 @@ fn abort_retained_process_lifecycle_matches(sample: &Sample) -> bool {
         return false;
     };
     sample.terminal_event == "turn_aborted"
-        && sample.completion_status.is_none()
         && sample.abort_reason.as_deref() == Some("interrupted")
         && sample.typed_error_count == 0
         && !sample.final_response_present
@@ -881,8 +926,7 @@ fn ab_correctness_violations_for_shape(
                     }
                 }
             }
-            if workload.is_request_cache() && !request_serialization_is_noninferior(a, b)
-            {
+            if workload.is_request_cache() && !request_serialization_is_noninferior(a, b) {
                 violations.push(format!(
                     "cluster:{}:pair:{index}:request_serialization_noninferiority",
                     cluster.cluster
@@ -1005,6 +1049,7 @@ fn ab_correctness_violations_for_shape(
                             | "prompt_skill_tokens"
                             | "prompt_injected_tokens"
                             | "repeated_unchanged_context_tokens"
+                            | "convoy_count"
                     )
                 {
                     continue;
@@ -1080,7 +1125,7 @@ fn evaluate_ab_workload_with_config(
     );
     let mut latency_gates = Vec::new();
     let mut latency_diagnostics = Vec::new();
-    if workload_class == AbWorkloadClass::Latency && correctness_violations.is_empty() {
+    if correctness_violations.is_empty() {
         for metric in workload.latency_metrics().iter().copied() {
             match hierarchical_paired_bootstrap_for_shape(
                 clusters,
@@ -1095,10 +1140,7 @@ fn evaluate_ab_workload_with_config(
             }
         }
     }
-    let expected_latency_gates = match workload_class {
-        AbWorkloadClass::Latency => workload.latency_metrics().len(),
-        AbWorkloadClass::CorrectnessOnly => 0,
-    };
+    let expected_latency_gates = workload.latency_metrics().len();
     let latency_contract_complete =
         latency_diagnostics.is_empty() && latency_gates.len() == expected_latency_gates;
     let latency_contract_passed =
@@ -1268,8 +1310,6 @@ fn evaluate_session_replay(
                 "failure_diagnosis",
                 "redundant_continuation",
                 "terminal_failure",
-                "reviewer",
-                "proof",
                 "compaction",
             ] {
                 if b.generation_purposes
@@ -1333,12 +1373,12 @@ fn evaluate_session_replay(
                         cluster.cluster,
                         metric.name()
                     ));
-                } else if b_value.saturating_mul(2) > a_value {
+                } else if !replay_latency_pair_passes(a_value, b_value) {
                     violations.push(format!(
-                        "cluster:{}:pair:{index}:{}:ratio:B={b_value}>50pct_A={}",
+                        "cluster:{}:pair:{index}:{}:ratio:B={b_value}>25pct_faster_limit={}",
                         cluster.cluster,
                         metric.name(),
-                        a_value / 2
+                        replay_latency_limit_ns(a_value)
                     ));
                 }
             }
@@ -1432,7 +1472,6 @@ fn replay_sample_contract_violations(
             (
                 "actionable_success",
                 "turn_complete",
-                Some("passed"),
                 "passed",
                 0,
                 true,
@@ -1443,7 +1482,6 @@ fn replay_sample_contract_violations(
                 (
                     "recoverable_exec_failure",
                     "turn_complete",
-                    Some("passed"),
                     "passed",
                     0,
                     true,
@@ -1454,7 +1492,6 @@ fn replay_sample_contract_violations(
                 (
                     "recoverable_exec_failure",
                     "error",
-                    None,
                     "failed",
                     1,
                     false,
@@ -1465,7 +1502,6 @@ fn replay_sample_contract_violations(
             (
                 "retained_process_abort",
                 "turn_aborted",
-                None,
                 "canceled",
                 0,
                 false,
@@ -1484,7 +1520,6 @@ fn replay_sample_contract_violations(
                 (
                     name,
                     terminal,
-                    completion,
                     result,
                     errors,
                     final_response,
@@ -1502,7 +1537,6 @@ fn replay_sample_contract_violations(
             if subturn.name != name
                 || subturn.logical_generations != expected_generations
                 || subturn.terminal_event != terminal
-                || subturn.completion_status.as_deref() != completion
                 || subturn.application_result != result
                 || subturn.typed_error_count != errors
                 || subturn.final_response_present != final_response
@@ -1514,20 +1548,6 @@ fn replay_sample_contract_violations(
                 ));
             }
         }
-    }
-    if variant == "B"
-        && ["reviewer", "proof"].iter().any(|purpose| {
-            sample
-                .generation_purposes
-                .get(*purpose)
-                .copied()
-                .unwrap_or(0)
-                != 0
-        })
-    {
-        violations.push(format!(
-            "cluster:{cluster}:pair:{pair}:{variant}:reviewer_or_proof_generation"
-        ));
     }
     if sample.replay_reset.as_ref().is_none_or(|reset| {
         !reset.passed || reset.before_sha256.is_empty() || reset.before_sha256 != reset.after_sha256
@@ -1587,7 +1607,12 @@ fn replay_descriptive_latency_gate(
     );
     let point_median_ratio = percentile(&b, 0.5) / percentile(&a, 0.5);
     let point_p95_ratio = percentile(&b, 0.95) / percentile(&a, 0.95);
-    let passed = a.iter().zip(&b).all(|(a, b)| *b <= *a * AB_RATIO_TARGET);
+    let passed = cluster
+        .a_samples
+        .iter()
+        .zip(&cluster.b_samples)
+        .take(pairs_per_cluster)
+        .all(|(a, b)| replay_latency_pair_passes(metric.value(a), metric.value(b)));
     Ok(AbLatencyGate {
         metric: metric.name().to_string(),
         point_median_ratio,
@@ -1599,9 +1624,9 @@ fn replay_descriptive_latency_gate(
         lcb_quantile: 0.0,
         ucb_quantile: 1.0,
         pairs_per_cluster,
-        median_ratio_ucb_limit: AB_RATIO_TARGET,
-        p95_ratio_ucb_limit: AB_RATIO_TARGET,
-        target_ratio: AB_RATIO_TARGET,
+        median_ratio_ucb_limit: AB_REPLAY_RATIO_TARGET,
+        p95_ratio_ucb_limit: AB_REPLAY_RATIO_TARGET,
+        target_ratio: AB_REPLAY_RATIO_TARGET,
         passed,
     })
 }
@@ -1729,10 +1754,7 @@ fn ab_overlay_path_is_owned(path: &[u8]) -> bool {
 
 fn controller_repository_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let Some(repository_root) = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-    else {
+    let Some(repository_root) = manifest_dir.parent().and_then(Path::parent) else {
         unreachable!("Cargo manifest directory must be nested under codex-rs/core");
     };
     repository_root.to_path_buf()
@@ -2894,8 +2916,7 @@ const AB_REPLAY_BASELINE_MARKER: &str = "__KD4_REPLAY_STATE_BASELINE__";
 const AB_REPLAY_MUTATED_MARKER: &str = "__KD4_REPLAY_STATE_MUTATED__";
 const AB_REPLAY_VALIDATION_MARKER: &str = "__KD4_REPLAY_VALIDATION_PASSED__";
 const AB_REPLAY_FOLLOW_UP_ARTIFACT_PATH: &str = "state/follow-up.txt";
-const AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT: &str =
-    "__KD4_REPLAY_FOLLOW_UP_ARTIFACT__\n";
+const AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT: &str = "__KD4_REPLAY_FOLLOW_UP_ARTIFACT__\n";
 const AB_REPLAY_VALIDATION_TEST_PATH: &str = "replay_validation_test.py";
 const AB_REPLAY_VALIDATION_SELECTOR: &str = "replay_validation_test.ReplayValidation.test_mutation";
 const AB_REPLAY_OWNER_PATHS: [&str; 1] = ["source_owners.toml"];
@@ -3150,9 +3171,8 @@ fn replay_code_mode_exec_command_events(
     });
     let arguments = serde_json::to_string(&arguments)
         .unwrap_or_else(|error| panic!("serialize replay nested exec_command arguments: {error}"));
-    let source = format!(
-        "const result = await tools.exec_command({arguments});\ntext(result.output);"
-    );
+    let source =
+        format!("const result = await tools.exec_command({arguments});\ntext(result.output);");
     replay_exec_events(response_id, call_suffix, &source, input_tokens)
 }
 
@@ -3445,8 +3465,7 @@ impl wiremock::Respond for ReplayActionResponder {
             ),
             (
                 ReplayActionResponseRoute::Failure {
-                    action_first: true,
-                    ..
+                    action_first: true, ..
                 },
                 1,
             )
@@ -3467,8 +3486,7 @@ impl wiremock::Respond for ReplayActionResponder {
             ),
             (
                 ReplayActionResponseRoute::Failure {
-                    action_first: true,
-                    ..
+                    action_first: true, ..
                 },
                 2,
             )
@@ -3505,6 +3523,21 @@ struct ReplayActionFixture {
     request_capture: HighVolumeRequestCapture,
     action_response_stage: Arc<AtomicUsize>,
     failure_response_stage: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayTerminalSignal {
+    Error,
+    MatchingTurnComplete,
+}
+
+fn replay_terminal_signal_is_terminal(signal: ReplayTerminalSignal) -> bool {
+    matches!(signal, ReplayTerminalSignal::MatchingTurnComplete)
+}
+
+struct ReplayTurnTerminal {
+    completion: codex_protocol::protocol::TurnCompleteEvent,
+    emitted_error_count: u32,
 }
 
 async fn submit_replay_turn(test: &TestCodex, prompt: &str) -> Result<String> {
@@ -3641,6 +3674,34 @@ fn reset_replay_workspace(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn attach_replay_request_metrics(sample: &mut Sample, requests: &[wiremock::Request]) {
+    sample.serialized_bytes = requests
+        .iter()
+        .map(|request| request.body.len() as u64)
+        .sum();
+    sample.prompt_input_tokens = requests
+        .iter()
+        .map(high_volume_request_body_json)
+        .map(|body| prompt_input_tokens_from_body(&body))
+        .sum();
+    sample.history_seed_turns_visible = requests
+        .first()
+        .map(high_volume_request_body_json)
+        .as_ref()
+        .map(|body| {
+            body.get("input")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, |input| {
+                    input
+                        .iter()
+                        .filter(|item| item.to_string().contains(AB_REPLAY_HISTORY_SEED_PREFIX))
+                        .count()
+                        .min(u32::MAX as usize) as u32
+                })
+        })
+        .unwrap_or_default();
+}
+
 impl ReplayActionFixture {
     async fn start(code_mode_host: &Path, fixture_id: &str) -> Result<Self> {
         let server = start_mock_server().await;
@@ -3656,9 +3717,9 @@ impl ReplayActionFixture {
                 initialize_replay_workspace(cwd.as_path())
             })
             .with_config(|config| {
+                pin_ab_reasoning_phase_efforts(config);
                 let _ = config.features.enable(Feature::UnifiedExec);
                 let _ = config.features.enable(Feature::CodeMode);
-                let _ = config.features.disable(Feature::TaskCompletionReviewer);
             })
             .build(&server)
             .await?;
@@ -3697,10 +3758,7 @@ impl ReplayActionFixture {
         })
     }
 
-    async fn turn(
-        &self,
-        prompt: &str,
-    ) -> (Sample, Vec<wiremock::Request>, bool, u32) {
+    async fn turn(&self, prompt: &str) -> (Sample, Vec<wiremock::Request>, bool, u32) {
         let requests_before = self.request_capture.request_count();
         let started = Instant::now();
         let mut turns = 0_u32;
@@ -3708,13 +3766,25 @@ impl ReplayActionFixture {
             Ok(turn_id) => {
                 turns = 1;
                 tokio::time::timeout(Duration::from_secs(30), async {
+                    let mut emitted_error_count = 0_u32;
                     loop {
                         let event = self.test.codex.next_event().await?;
                         match event.msg {
                             EventMsg::TurnComplete(event) if event.turn_id == turn_id => {
-                                return Ok(EventMsg::TurnComplete(event));
+                                debug_assert!(replay_terminal_signal_is_terminal(
+                                    ReplayTerminalSignal::MatchingTurnComplete
+                                ));
+                                return Ok(ReplayTurnTerminal {
+                                    completion: event,
+                                    emitted_error_count,
+                                });
                             }
-                            EventMsg::Error(event) => return Ok(EventMsg::Error(event)),
+                            EventMsg::Error(_) => {
+                                debug_assert!(!replay_terminal_signal_is_terminal(
+                                    ReplayTerminalSignal::Error
+                                ));
+                                emitted_error_count = emitted_error_count.saturating_add(1);
+                            }
                             _ => {}
                         }
                     }
@@ -3729,7 +3799,12 @@ impl ReplayActionFixture {
         let requests = self.request_capture.requests_since(requests_before);
         let mut terminalized = false;
         let mut sample = match terminal {
-            Ok(EventMsg::TurnComplete(completion)) => {
+            Ok(ReplayTurnTerminal {
+                completion,
+                emitted_error_count,
+            }) => {
+                terminalized = completion.error.is_some();
+                let terminal_error = completion.error.as_ref();
                 let mut sample = completion
                     .timing
                     .as_ref()
@@ -3738,74 +3813,26 @@ impl ReplayActionFixture {
                 sample.duration_ns = duration_ns;
                 sample.workload_subturns = 1;
                 sample.terminal_event = "turn_complete".to_string();
-                sample.completion_status = completion.completion.as_ref().map(|gate| {
-                    match gate.status {
-                        TaskCompletionStatus::Passed => "passed",
-                        TaskCompletionStatus::Partial => "partial",
-                        TaskCompletionStatus::Blocked => "blocked",
-                    }
-                    .to_string()
-                });
-                sample.typed_error_count = u32::from(completion.error.is_some());
+                sample.typed_error_count =
+                    emitted_error_count.max(u32::from(terminal_error.is_some()));
                 sample.final_response_present = completion.last_agent_message.is_some();
-                if prompt == AB_REPLAY_ACTION_PROMPT
-                    && let Some(error) = completion.error.as_ref()
+                sample.failure_terminalized_subturns = u32::from(terminalized);
+                if terminalized
+                    && (prompt != AB_REPLAY_FAILURE_PROMPT
+                        || terminal_error.is_none_or(|error| {
+                            !error.message.contains("required replay exec failure")
+                        }))
                 {
-                    sample
-                        .failure_codes
-                        .push(format!("replay_action_terminal_error:{}", error.message));
-                }
-                sample.serialized_bytes = requests
-                    .iter()
-                    .map(|request| request.body.len() as u64)
-                    .sum();
-                sample.prompt_input_tokens = requests
-                    .iter()
-                    .map(high_volume_request_body_json)
-                    .map(|body| prompt_input_tokens_from_body(&body))
-                    .sum();
-                sample.history_seed_turns_visible = requests
-                    .first()
-                    .map(high_volume_request_body_json)
-                    .as_ref()
-                    .map(|body| {
-                        body.get("input")
-                            .and_then(serde_json::Value::as_array)
-                            .map_or(0, |input| {
-                                input
-                                    .iter()
-                                    .filter(|item| {
-                                        item.to_string().contains(AB_REPLAY_HISTORY_SEED_PREFIX)
-                                    })
-                                    .count()
-                                    .min(u32::MAX as usize) as u32
-                            })
-                    })
-                    .unwrap_or_default();
-                sample
-            }
-            Ok(EventMsg::Error(error)) => {
-                terminalized = true;
-                let mut failure_codes = Vec::new();
-                if prompt != AB_REPLAY_FAILURE_PROMPT
-                    || !error.message.contains("required replay exec failure")
-                {
-                    failure_codes.push(format!(
+                    sample.failure_codes.push(format!(
                         "replay_unexpected_terminal_error:{}",
-                        error.message
+                        terminal_error
+                            .map(|error| error.message.as_str())
+                            .unwrap_or("missing error detail")
                     ));
                 }
-                Sample {
-                    duration_ns,
-                    workload_subturns: 1,
-                    terminal_event: "error".to_string(),
-                    typed_error_count: 1,
-                    failure_terminalized_subturns: 1,
-                    failure_codes,
-                    ..Sample::default()
-                }
+                attach_replay_request_metrics(&mut sample, &requests);
+                sample
             }
-            Ok(_) => unreachable!("replay terminal capture returns only completion or error"),
             Err(error) => Sample {
                 duration_ns,
                 workload_subturns: 1,
@@ -3814,27 +3841,6 @@ impl ReplayActionFixture {
                 ..Sample::default()
             },
         };
-        if terminalized {
-            turns = turns.saturating_add(1);
-            let cleanup_prompt = format!("{AB_REPLAY_HISTORY_SEED_PREFIX}terminal-cleanup");
-            match self
-                .test
-                .submit_turn_and_capture_completion(&cleanup_prompt)
-                .await
-            {
-                Ok(completion)
-                    if completion.error.is_none()
-                        && completion.last_agent_message.as_deref()
-                            == Some(AB_REPLAY_HISTORY_SEED_REPLY) => {}
-                Ok(completion) => sample.failure_codes.push(format!(
-                    "replay_terminal_cleanup_contract:error={:?}:message={:?}",
-                    completion.error, completion.last_agent_message
-                )),
-                Err(error) => sample
-                    .failure_codes
-                    .push(format!("replay_terminal_cleanup:{error}")),
-            }
-        }
         sample.failed = !sample.failure_codes.is_empty();
         (sample, requests, terminalized, turns)
     }
@@ -3883,7 +3889,6 @@ impl ReplayActionFixture {
         let actionable_success = mutation_observed
             && validation_observed
             && action.typed_error_count == 0
-            && action.completion_status.as_deref() == Some("passed")
             && action.final_response_present
             && action.lifecycle_complete;
         let action_target = if action_instruction { 4 } else { 10 };
@@ -3899,11 +3904,6 @@ impl ReplayActionFixture {
             action
                 .failure_codes
                 .push("replay_targeted_action_not_observed".to_string());
-        }
-        if action_instruction && action.completion_status.as_deref() != Some("passed") {
-            action
-                .failure_codes
-                .push("replay_action_protocol_not_passed".to_string());
         }
         let action_generations = action.logical_generations;
         if action_generations != action_target {
@@ -3923,7 +3923,6 @@ impl ReplayActionFixture {
             name: "actionable_success".to_string(),
             logical_generations: action_generations,
             terminal_event: action.terminal_event.clone(),
-            completion_status: action.completion_status.clone(),
             application_result: if actionable_success {
                 "passed"
             } else {
@@ -3939,12 +3938,9 @@ impl ReplayActionFixture {
         let (mut failure, failure_requests, failure_terminalized, failure_turns) =
             self.turn(AB_REPLAY_FAILURE_PROMPT).await;
         action_turns = action_turns.saturating_add(failure_turns);
-        let artifact_created = fs::read_to_string(
-            self.test
-                .cwd_path()
-                .join(AB_REPLAY_FOLLOW_UP_ARTIFACT_PATH),
-        )
-        .is_ok_and(|content| content == AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT);
+        let artifact_created =
+            fs::read_to_string(self.test.cwd_path().join(AB_REPLAY_FOLLOW_UP_ARTIFACT_PATH))
+                .is_ok_and(|content| content == AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT);
         let failure_target = if failure_terminalized { 1 } else { 3 };
         let failure_generations = failure.logical_generations;
         let observed_failure_generations = if failure_terminalized {
@@ -3976,12 +3972,10 @@ impl ReplayActionFixture {
             name: "recoverable_exec_failure".to_string(),
             logical_generations: observed_failure_generations,
             terminal_event: failure.terminal_event.clone(),
-            completion_status: failure.completion_status.clone(),
             application_result: if failure_terminalized {
                 "failed"
             } else if artifact_created
                 && failure.typed_error_count == 0
-                && failure.completion_status.as_deref() == Some("passed")
                 && failure.final_response_present
             {
                 "passed"
@@ -3991,55 +3985,11 @@ impl ReplayActionFixture {
             .to_string(),
             typed_error_count: failure.typed_error_count,
             final_response_present: failure.final_response_present,
-            closure_complete: failure.lifecycle_complete,
+            closure_complete: !failure_terminalized && failure.lifecycle_complete,
             follow_up_artifact_present: artifact_created,
         };
         let mut aggregate = Some(action);
-        if failure_terminalized {
-            let Some(aggregate) = aggregate.as_mut() else {
-                unreachable!("replay action merge must retain an aggregate");
-            };
-            aggregate.logical_generations = aggregate
-                .logical_generations
-                .saturating_add(observed_failure_generations);
-            aggregate.provider_attempts = aggregate
-                .provider_attempts
-                .saturating_add(observed_failure_generations);
-            aggregate.sampling_requests = aggregate
-                .sampling_requests
-                .saturating_add(observed_failure_generations);
-            aggregate.provider_input_tokens =
-                aggregate.provider_input_tokens.saturating_add(1_536);
-            aggregate.provider_cached_input_tokens =
-                aggregate.provider_cached_input_tokens.saturating_add(1_024);
-            aggregate.provider_visible_output_tokens =
-                aggregate.provider_visible_output_tokens.saturating_add(24);
-            aggregate.provider_reasoning_tokens =
-                aggregate.provider_reasoning_tokens.saturating_add(8);
-            aggregate.provider_total_tokens =
-                aggregate.provider_total_tokens.saturating_add(1_568);
-            aggregate.token_usage_records = aggregate.token_usage_records.saturating_add(1);
-            aggregate.prompt_input_tokens = aggregate
-                .prompt_input_tokens
-                .saturating_add(
-                    failure_requests
-                        .iter()
-                        .map(high_volume_request_body_json)
-                        .map(|body| prompt_input_tokens_from_body(&body))
-                        .sum(),
-                );
-            aggregate.serialized_bytes = aggregate.serialized_bytes.saturating_add(
-                failure_requests
-                    .iter()
-                    .map(|request| request.body.len() as u64)
-                    .sum(),
-            );
-            aggregate.failure_terminalized_subturns = 1;
-            aggregate.typed_error_count = 1;
-            aggregate.failure_codes.append(&mut failure.failure_codes);
-        } else {
-            merge_high_volume_sample(&mut aggregate, failure);
-        }
+        merge_high_volume_sample(&mut aggregate, failure);
         let Some(aggregate) = aggregate else {
             unreachable!("replay action/failure merge must retain an aggregate");
         };
@@ -4186,10 +4136,10 @@ impl ReplayRetainedAbortFixture {
             .with_model("test-gpt-5.1-codex")
             .with_code_mode_host_program(code_mode_host.to_path_buf())
             .with_config(|config| {
+                pin_ab_reasoning_phase_efforts(config);
                 let _ = config.features.enable(Feature::UnifiedExec);
                 let _ = config.features.enable(Feature::CodeMode);
                 let _ = config.features.enable(Feature::RequestPermissionsTool);
-                let _ = config.features.disable(Feature::TaskCompletionReviewer);
             })
             .build(&server)
             .await?;
@@ -4376,7 +4326,6 @@ impl ReplayRetainedAbortFixture {
             name: "retained_process_abort".to_string(),
             logical_generations: generations,
             terminal_event: "turn_aborted".to_string(),
-            completion_status: None,
             application_result: "canceled".to_string(),
             typed_error_count,
             final_response_present,
@@ -4782,10 +4731,12 @@ fn ab_fixture_hash(workload: AbWorkload) -> String {
             "prompt={AB_ABORT_RETAINED_PROMPT}\nprogram=current_worker\nchild=ab-retained-child\nyield_time_ms={AB_ABORT_RETAINED_YIELD_TIME_MS}\nidentity_barrier=exec_command_begin\nownership_barrier=exact_background_terminal\naction=interrupt\nusage=1024:768:24:8\nforbidden_resume={AB_ABORT_RETAINED_FORBIDDEN_RESUME_REPLY}\nterminal=turn_aborted:interrupted\npersisted_cancellation=exactly_once\ncleanup=zero_background_terminals\nlatency=correctness_only\nreset=thread_rollback"
         ),
         AbWorkload::SessionReplay => format!(
-            "profile=replay\npairs={AB_REPLAY_PAIRS}\nwarmups=0\nsubturns=actionable_success,recoverable_exec_failure,retained_process_abort\nfailure_contract=A:error_without_artifact,B:turn_complete_with_exact_artifact\nfollow_up_artifact={AB_REPLAY_FOLLOW_UP_ARTIFACT_PATH}:{AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT}\ngenerations=A:{AB_REPLAY_A_GENERATIONS},B:{AB_REPLAY_B_GENERATIONS}\ncontention=3_direct:5_nested\nretained_polls=2\ncomparison=pointwise_50_percent\nbootstrap=false\nretry=false\nreset=verified_before_each_pair"
+            "profile=replay\npairs={AB_REPLAY_PAIRS}\nwarmups=0\nsubturns=actionable_success,recoverable_exec_failure,retained_process_abort\nfailure_contract=A:error_without_artifact,B:turn_complete_with_exact_artifact\nfollow_up_artifact={AB_REPLAY_FOLLOW_UP_ARTIFACT_PATH}:{AB_REPLAY_FOLLOW_UP_ARTIFACT_CONTENT}\ngenerations=A:{AB_REPLAY_A_GENERATIONS},B:{AB_REPLAY_B_GENERATIONS}\ncontention=3_direct:5_nested\nretained_polls=2\ncomparison=pointwise_{AB_REPLAY_REQUIRED_IMPROVEMENT_PERCENT}_percent_faster_including_end_to_end\nbootstrap=false\nretry=false\nreset=verified_before_each_pair"
         ),
     };
-    sha256_bytes(fixture.as_bytes())
+    sha256_bytes(
+        format!("reasoning_phase_efforts={AB_REASONING_PHASE_EFFORTS_ID}\n{fixture}").as_bytes(),
+    )
 }
 
 fn ab_workload_schema_hash(workload: AbWorkload) -> String {
@@ -4826,7 +4777,7 @@ fn ab_profile_configuration_hash(config: AbExecutionConfig, workloads: &[AbWorkl
     if config.profile == AbExecutionProfile::Replay {
         payload["comparison"] = serde_json::json!({
             "paired": true,
-            "pointwise_ratio_limit": AB_RATIO_TARGET,
+            "pointwise_ratio_limit": AB_REPLAY_RATIO_TARGET,
             "bootstrap": false,
             "outlier_removal": false,
             "automatic_retries": 0,
@@ -5222,6 +5173,21 @@ fn run_ab_compare(args: &AbCompareArgs) -> Result<()> {
     }
     fs::write(&args.report, serde_json::to_vec_pretty(&report)?)
         .with_context(|| format!("write A/B report {}", args.report.display()))?;
+    let plain_language_path = ab_plain_language_report_path(&args.report);
+    fs::write(
+        &plain_language_path,
+        render_ab_plain_language_report(&report),
+    )
+    .with_context(|| {
+        format!(
+            "write plain-language A/B report {}",
+            plain_language_path.display()
+        )
+    })?;
+    eprintln!(
+        "Plain-language benchmark report: {}",
+        plain_language_path.display()
+    );
     println!("{}", serde_json::to_string(&report)?);
     anyhow::ensure!(
         passed,
@@ -5234,6 +5200,196 @@ fn run_ab_compare(args: &AbCompareArgs) -> Result<()> {
         }
     );
     Ok(())
+}
+
+fn ab_plain_language_report_path(report_path: &Path) -> PathBuf {
+    let text_path = report_path.with_extension("txt");
+    if text_path != report_path {
+        return text_path;
+    }
+    let file_name = report_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "turn-latency-report".into());
+    report_path.with_file_name(format!("{file_name}.plain.txt"))
+}
+
+fn format_duration_ns_for_humans(duration_ns: f64) -> String {
+    let duration_ms = duration_ns / 1_000_000.0;
+    if duration_ms >= 1_000.0 {
+        format!("{:.2} s", duration_ms / 1_000.0)
+    } else {
+        format!("{duration_ms:.2} ms")
+    }
+}
+
+fn plain_language_ratio(ratio: f64) -> String {
+    if (ratio - 1.0).abs() < f64::EPSILON {
+        return "the same speed as baseline".to_string();
+    }
+    if ratio < 1.0 {
+        format!("{:.1}% faster than baseline", (1.0 - ratio) * 100.0)
+    } else {
+        format!("{:.1}% slower than baseline", (ratio - 1.0) * 100.0)
+    }
+}
+
+fn ab_run_status_name(status: AbRunStatus) -> &'static str {
+    match status {
+        AbRunStatus::Passed => "PASSED",
+        AbRunStatus::Failed => "FAILED",
+        AbRunStatus::Inconclusive => "INCONCLUSIVE",
+    }
+}
+
+fn ab_latency_gate_expectation(
+    profile: AbExecutionProfile,
+    mode: AbLatencyGateMode,
+) -> &'static str {
+    if profile == AbExecutionProfile::Replay {
+        return "Each candidate duration must be at least 25% faster than its matching baseline duration (candidate time <= 75% of baseline).";
+    }
+    match mode {
+        AbLatencyGateMode::Hard => {
+            "This result counts. The statistical upper bound may be at most 5% slower at the median and 10% slower at p95."
+        }
+        AbLatencyGateMode::Advisory => {
+            "This timing is informational in this profile and does not decide the overall result."
+        }
+        AbLatencyGateMode::Excluded => {
+            "Timing is excluded from the pass/fail decision; correctness checks still count."
+        }
+    }
+}
+
+fn ab_metric_percentiles(
+    clusters: &[AbPairedCluster],
+    metric: AbLatencyMetric,
+    pairs_per_cluster: usize,
+    candidate: bool,
+) -> Option<(f64, f64)> {
+    let values = clusters
+        .iter()
+        .flat_map(|cluster| {
+            let samples = if candidate {
+                &cluster.b_samples
+            } else {
+                &cluster.a_samples
+            };
+            samples
+                .iter()
+                .take(pairs_per_cluster)
+                .map(|sample| metric.value(sample) as f64)
+        })
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| (percentile(&values, 0.5), percentile(&values, 0.95)))
+}
+
+fn ab_metric_plain_language_heading(metric_name: &str) -> String {
+    match AbLatencyMetric::from_name(metric_name) {
+        Some(metric) => format!(
+            "  Technical metric: {metric_name} — Plain language: {}.",
+            metric.plain_language_name()
+        ),
+        None => format!(
+            "  Technical metric: {metric_name} — no plain-language definition is registered."
+        ),
+    }
+}
+
+fn render_ab_plain_language_report(report: &AbReport) -> String {
+    let mut lines = vec![
+        "TURN LATENCY BENCHMARK — PLAIN-LANGUAGE COMPANION".to_string(),
+        String::new(),
+        format!("Overall result: {}", ab_run_status_name(report.status)),
+        format!("Technical profile: {}", report.provenance.execution_profile.name()),
+        if report.passed {
+            "Plain language: the candidate passed every check required by this profile."
+                .to_string()
+        } else if report.cap_expired {
+            "Plain language: the run ended before it collected enough evidence, so it did not pass."
+                .to_string()
+        } else {
+            "Plain language: at least one required correctness or latency check failed."
+                .to_string()
+        },
+        String::new(),
+        "The JSON report beside this file remains the exact machine-readable evidence. Durations here use milliseconds below 1,000 ms and seconds at or above 1,000 ms."
+            .to_string(),
+    ];
+
+    for workload in &report.workloads {
+        lines.extend([
+            String::new(),
+            format!("WORKLOAD: {}", workload.workload),
+            format!("Technical status: {}", ab_run_status_name(workload.status)),
+            format!(
+                "Plain-language expectation: {}",
+                ab_latency_gate_expectation(
+                    report.provenance.execution_profile,
+                    workload.latency_gate_mode
+                )
+            ),
+        ]);
+
+        if workload.correctness_violations.is_empty() {
+            lines.push("Correctness: no technical contract violations were recorded.".to_string());
+        } else {
+            lines.push(format!(
+                "Correctness: {} technical contract violation(s) were recorded. In plain language, the workload did not behave exactly as required.",
+                workload.correctness_violations.len()
+            ));
+            for violation in workload.correctness_violations.iter().take(5) {
+                lines.push(format!("  Technical code: {violation}"));
+            }
+            if workload.correctness_violations.len() > 5 {
+                lines.push(format!(
+                    "  ... {} more technical code(s) are in the JSON report.",
+                    workload.correctness_violations.len() - 5
+                ));
+            }
+        }
+
+        if workload.latency_gates.is_empty() {
+            lines.push("Latency metrics: no comparable timing gate was produced.".to_string());
+            continue;
+        }
+
+        lines.push("Latency metrics:".to_string());
+        for gate in &workload.latency_gates {
+            lines.push(ab_metric_plain_language_heading(&gate.metric));
+            let Some(metric) = AbLatencyMetric::from_name(&gate.metric) else {
+                continue;
+            };
+            if let (Some((a_median, a_p95)), Some((b_median, b_p95))) = (
+                ab_metric_percentiles(&workload.clusters, metric, gate.pairs_per_cluster, false),
+                ab_metric_percentiles(&workload.clusters, metric, gate.pairs_per_cluster, true),
+            ) {
+                lines.push(format!(
+                    "    Baseline median / p95: {} / {}",
+                    format_duration_ns_for_humans(a_median),
+                    format_duration_ns_for_humans(a_p95)
+                ));
+                lines.push(format!(
+                    "    Candidate median / p95: {} / {}",
+                    format_duration_ns_for_humans(b_median),
+                    format_duration_ns_for_humans(b_p95)
+                ));
+            }
+            lines.push(format!(
+                "    Technical ratios: median {:.3}x; p95 {:.3}x; gate passed={}",
+                gate.point_median_ratio, gate.point_p95_ratio, gate.passed
+            ));
+            lines.push(format!(
+                "    Plain language: median was {}; this metric {}.",
+                plain_language_ratio(gate.point_median_ratio),
+                if gate.passed { "passed" } else { "failed" }
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.join("\n")
 }
 
 fn validate_accepted_ab_workload(

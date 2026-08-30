@@ -7,6 +7,7 @@ use super::resolve_aggregated_output;
 use super::split_valid_utf8_prefix_with_max;
 use super::wait_for_process_output_drain;
 use super::wait_for_process_output_finalization;
+use super::wait_for_process_output_for_result;
 
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
@@ -39,8 +40,6 @@ async fn exit_before_watcher_registration_is_observed_once() {
             73,
             CommandAttemptKey::new("exec_command", "local", "C:/repo", &["exit".to_string()]),
             RawOutputArtifact::unavailable("late watcher fixture"),
-            None,
-            tokio::time::Instant::now(),
         )
         .await
         .expect("track running process");
@@ -113,6 +112,31 @@ async fn transcript_drain_does_not_overtake_raw_output_finalization() {
         .await
         .expect("artifact finalization should release the completion waiter")
         .expect("completion waiter should not panic");
+}
+
+#[tokio::test]
+async fn direct_runtime_result_does_not_wait_for_raw_output_finalization() {
+    let output_drained = CancellationToken::new();
+    let output_closed = AtomicBool::new(false);
+    let output_closed_notify = Notify::new();
+    output_drained.cancel();
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_process_output_for_result(
+            /*direct_runtime*/ true,
+            &output_drained,
+            &output_closed,
+            &output_closed_notify,
+        ),
+    )
+    .await
+    .expect("direct runtime should deliver after transcript drain");
+
+    assert!(
+        !output_closed.load(Ordering::Acquire),
+        "the result must be deliverable while artifact finalization is still pending"
+    );
 }
 
 fn run_git(cwd: &std::path::Path, args: &[&str]) -> String {

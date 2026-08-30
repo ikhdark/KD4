@@ -484,6 +484,21 @@ pub trait ToolOutput: Send {
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem;
 
+    /// Materializes the provider response and projection metadata together.
+    ///
+    /// Producers whose response and metadata share an expensive source buffer
+    /// can override this to decode or classify that buffer once.
+    fn to_response_item_with_projection_metadata(
+        &self,
+        call_id: &str,
+        payload: &ToolPayload,
+    ) -> (ResponseInputItem, Option<ToolOutputProjectionMetadata>) {
+        (
+            self.to_response_item(call_id, payload),
+            self.projection_metadata(),
+        )
+    }
+
     /// Returns the tool call id exposed to `PostToolUse` hooks for this output.
     fn post_tool_use_id(&self, call_id: &str) -> String {
         call_id.to_string()
@@ -566,6 +581,14 @@ where
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
         (**self).to_response_item(call_id, payload)
+    }
+
+    fn to_response_item_with_projection_metadata(
+        &self,
+        call_id: &str,
+        payload: &ToolPayload,
+    ) -> (ResponseInputItem, Option<ToolOutputProjectionMetadata>) {
+        (**self).to_response_item_with_projection_metadata(call_id, payload)
     }
 
     fn post_tool_use_id(&self, call_id: &str) -> String {

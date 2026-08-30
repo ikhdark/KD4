@@ -1,7 +1,6 @@
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadHistoryBuilder;
@@ -15,7 +14,6 @@ use codex_app_server_protocol::TurnStatus;
 use codex_core::CodexThread;
 use codex_core::OutOfBandElicitationLeaseId;
 use codex_core::ThreadConfigSnapshot;
-use codex_core::terminal_event_fingerprint;
 use codex_file_watcher::WatchRegistration;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
@@ -191,37 +189,6 @@ pub(crate) struct TurnSummary {
     pub(crate) origin_connection_id: Option<ConnectionId>,
 }
 
-#[derive(Clone)]
-pub(crate) struct TerminalNotificationReplay {
-    pub(crate) fingerprint: String,
-    pub(crate) notification: ServerNotification,
-    pub(crate) origin_connection_id: Option<ConnectionId>,
-    pub(crate) target_connection_ids: Vec<ConnectionId>,
-}
-
-pub(crate) enum TerminalEventDisposition {
-    NotTerminal,
-    Apply { fingerprint: String },
-    ProjectNotification { fingerprint: String },
-    RetryNotification(Box<TerminalNotificationReplay>),
-    Acknowledge { fingerprint: String },
-    SuppressAcknowledged,
-    RejectConflict,
-    RejectStale,
-}
-
-#[derive(Clone)]
-struct TerminalLedgerEntry {
-    fingerprint: String,
-    state_reduced: bool,
-    retained_turn_summary: Option<TurnSummary>,
-    notification: Option<ServerNotification>,
-    origin_connection_id: Option<ConnectionId>,
-    accepted_connection_ids: HashSet<ConnectionId>,
-    notification_accepted: bool,
-    acknowledged_queued: bool,
-}
-
 #[derive(Debug)]
 pub(crate) struct IndexedTurnPage {
     pub(crate) turns: Vec<Turn>,
@@ -320,7 +287,6 @@ impl ThreadTurnIndex {
         turn.started_at = change.started_at;
         turn.completed_at = change.completed_at;
         turn.duration_ms = change.duration_ms;
-        turn.completion = change.completion;
         turn.timing = change.timing;
         turn.surfaced_result = change.surfaced_result;
         turn.reasoning_policy_history = change.reasoning_policy_history;
@@ -353,7 +319,6 @@ impl ThreadTurnIndex {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -554,7 +519,6 @@ pub(crate) struct ThreadState {
     pub(crate) pending_interrupts: PendingInterruptQueue,
     pub(crate) pending_rollbacks: Option<ConnectionRequestId>,
     pub(crate) turn_summary: TurnSummary,
-    terminal_ledger: HashMap<String, TerminalLedgerEntry>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
@@ -685,148 +649,10 @@ impl ThreadState {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn classify_terminal_event(
-        &mut self,
-        event_turn_id: &str,
-        event: &EventMsg,
-        current_connection_ids: &[ConnectionId],
-    ) -> TerminalEventDisposition {
-        self.classify_terminal_event_with_durable_acknowledgement(
-            event_turn_id,
-            event,
-            current_connection_ids,
-            None,
-        )
-    }
-
-    pub(crate) fn classify_terminal_event_with_durable_acknowledgement(
-        &mut self,
-        event_turn_id: &str,
-        event: &EventMsg,
-        current_connection_ids: &[ConnectionId],
-        durably_acknowledged_fingerprint: Option<&str>,
-    ) -> TerminalEventDisposition {
-        let Some(fingerprint) = terminal_event_fingerprint(event) else {
-            return TerminalEventDisposition::NotTerminal;
-        };
-        if terminal_turn_id(event) != Some(event_turn_id) {
-            return TerminalEventDisposition::RejectConflict;
-        }
-        if let Some(acknowledged_fingerprint) = durably_acknowledged_fingerprint {
-            if acknowledged_fingerprint != fingerprint.as_str() {
-                return TerminalEventDisposition::RejectConflict;
-            }
-            self.terminal_ledger.remove(event_turn_id);
-            return TerminalEventDisposition::SuppressAcknowledged;
-        }
-        if let Some(entry) = self.terminal_ledger.get_mut(event_turn_id) {
-            if entry.fingerprint != fingerprint {
-                return TerminalEventDisposition::RejectConflict;
-            }
-            if !entry.state_reduced {
-                return TerminalEventDisposition::Apply { fingerprint };
-            }
-            if entry.notification_accepted {
-                return TerminalEventDisposition::Acknowledge { fingerprint };
-            }
-            let Some(notification) = entry.notification.clone() else {
-                return TerminalEventDisposition::ProjectNotification { fingerprint };
-            };
-            let mut targets = current_connection_ids
-                .iter()
-                .copied()
-                .filter(|connection_id| !entry.accepted_connection_ids.contains(connection_id))
-                .collect::<Vec<_>>();
-            targets.sort_unstable_by_key(|connection_id| connection_id.0);
-            targets.dedup();
-            if targets.is_empty() {
-                entry.notification_accepted = true;
-                return TerminalEventDisposition::Acknowledge { fingerprint };
-            }
-            return TerminalEventDisposition::RetryNotification(Box::new(
-                TerminalNotificationReplay {
-                    fingerprint,
-                    notification,
-                    origin_connection_id: entry.origin_connection_id,
-                    target_connection_ids: targets,
-                },
-            ));
-        }
-        if self
-            .in_progress_turn_id()
-            .is_some_and(|active_turn_id| active_turn_id != event_turn_id)
-        {
-            return TerminalEventDisposition::RejectStale;
-        }
-        self.terminal_ledger.insert(
-            event_turn_id.to_string(),
-            TerminalLedgerEntry {
-                fingerprint: fingerprint.clone(),
-                state_reduced: false,
-                retained_turn_summary: None,
-                notification: None,
-                origin_connection_id: None,
-                accepted_connection_ids: HashSet::new(),
-                notification_accepted: false,
-                acknowledged_queued: false,
-            },
-        );
-        TerminalEventDisposition::Apply { fingerprint }
-    }
-
-    /// Reconstructs exactly-once terminal state application from retained rollout history.
-    /// Notification acceptance is intentionally not inferred: core must replay the exact event
-    /// so the notification can be handed to the current outbound owner.
-    #[cfg(test)]
-    pub(crate) fn seed_terminal_ledger_from_history(&mut self, items: &[RolloutItem]) {
-        self.seed_terminal_ledger_from_history_for_replay(items, None);
-    }
-
-    fn seed_terminal_ledger_from_history_for_replay(
-        &mut self,
-        items: &[RolloutItem],
-        replay_fingerprints: Option<&HashMap<String, String>>,
-    ) {
+    fn seed_current_turn_history(&mut self, items: &[RolloutItem]) {
         self.current_turn_history.reset();
-        let mut retained_turn_summaries = HashMap::new();
         for item in items {
             self.current_turn_history.handle_rollout_item(item);
-            if let Some(turn) = self.current_turn_history.active_turn_change_snapshot() {
-                retained_turn_summaries.insert(
-                    turn.turn_id.clone(),
-                    TurnSummary {
-                        started_at: turn.started_at,
-                        last_error: turn.error,
-                        ..Default::default()
-                    },
-                );
-            }
-            let RolloutItem::EventMsg(event) = item else {
-                continue;
-            };
-            let (Some(turn_id), Some(fingerprint)) =
-                (terminal_turn_id(event), terminal_event_fingerprint(event))
-            else {
-                continue;
-            };
-            if replay_fingerprints.is_some_and(|replay_fingerprints| {
-                replay_fingerprints.get(turn_id) != Some(&fingerprint)
-            }) {
-                continue;
-            }
-            self.terminal_ledger
-                .entry(turn_id.to_string())
-                .or_insert(TerminalLedgerEntry {
-                    fingerprint,
-                    state_reduced: true,
-                    retained_turn_summary: retained_turn_summaries.get(turn_id).cloned(),
-                    notification: None,
-                    origin_connection_id: None,
-                    accepted_connection_ids: HashSet::new(),
-                    notification_accepted: false,
-                    acknowledged_queued: false,
-                });
         }
     }
 
@@ -834,118 +660,13 @@ impl ThreadState {
         &mut self,
         items: &[RolloutItem],
         listener_generation: u64,
-        replay_fingerprints: Option<&HashMap<String, String>>,
     ) -> bool {
         if self.listener_generation != listener_generation || self.listener_command_tx.is_none() {
             return false;
         }
-        self.seed_terminal_ledger_from_history_for_replay(items, replay_fingerprints);
+        self.seed_current_turn_history(items);
         self.resume_history_seeded_generation = Some(listener_generation);
         true
-    }
-
-    pub(crate) fn retained_terminal_turn_summary(
-        &self,
-        turn_id: &str,
-        fingerprint: &str,
-    ) -> Option<TurnSummary> {
-        self.terminal_ledger
-            .get(turn_id)
-            .filter(|entry| entry.state_reduced && entry.fingerprint == fingerprint)
-            .and_then(|entry| entry.retained_turn_summary.clone())
-    }
-
-    pub(crate) fn mark_terminal_state_reduced(&mut self, turn_id: &str, fingerprint: &str) {
-        if let Some(entry) = self.terminal_ledger.get_mut(turn_id)
-            && entry.fingerprint == fingerprint
-        {
-            entry.state_reduced = true;
-            self.queue_acknowledged_terminal_tombstone(turn_id);
-        }
-    }
-
-    pub(crate) fn record_terminal_notification_attempt(
-        &mut self,
-        turn_id: &str,
-        fingerprint: &str,
-        notification: ServerNotification,
-        origin_connection_id: Option<ConnectionId>,
-        targeted_connection_ids: &[ConnectionId],
-        accepted_connection_ids: &[ConnectionId],
-    ) -> bool {
-        let Some(entry) = self.terminal_ledger.get_mut(turn_id) else {
-            return false;
-        };
-        if entry.fingerprint != fingerprint || !entry.state_reduced {
-            return false;
-        }
-        entry.notification = Some(notification);
-        entry.origin_connection_id = origin_connection_id;
-        entry
-            .accepted_connection_ids
-            .extend(accepted_connection_ids.iter().copied());
-        entry.notification_accepted = targeted_connection_ids
-            .iter()
-            .all(|connection_id| entry.accepted_connection_ids.contains(connection_id));
-        entry.notification_accepted
-    }
-
-    pub(crate) fn cache_terminal_notification(
-        &mut self,
-        turn_id: &str,
-        fingerprint: &str,
-        notification: ServerNotification,
-        origin_connection_id: Option<ConnectionId>,
-    ) -> bool {
-        let Some(entry) = self.terminal_ledger.get_mut(turn_id) else {
-            return false;
-        };
-        if entry.fingerprint != fingerprint || !entry.state_reduced {
-            return false;
-        }
-        if entry.notification.is_some() {
-            return true;
-        }
-        entry.notification = Some(notification);
-        entry.origin_connection_id = origin_connection_id;
-        true
-    }
-
-    pub(crate) fn mark_terminal_acknowledged(&mut self, turn_id: &str, fingerprint: &str) {
-        if let Some(entry) = self.terminal_ledger.get_mut(turn_id)
-            && entry.fingerprint == fingerprint
-        {
-            entry.notification_accepted = true;
-            entry.retained_turn_summary = None;
-            entry.notification = None;
-            entry.origin_connection_id = None;
-            entry.accepted_connection_ids.clear();
-            self.queue_acknowledged_terminal_tombstone(turn_id);
-        }
-    }
-
-    pub(crate) fn mark_terminal_durably_acknowledged(&mut self, turn_id: &str, fingerprint: &str) {
-        if self
-            .terminal_ledger
-            .get(turn_id)
-            .is_some_and(|entry| entry.fingerprint == fingerprint)
-        {
-            self.terminal_ledger.remove(turn_id);
-        }
-    }
-
-    fn queue_acknowledged_terminal_tombstone(&mut self, turn_id: &str) {
-        let Some(entry) = self.terminal_ledger.get_mut(turn_id) else {
-            return;
-        };
-        if !entry.state_reduced
-            || !entry.notification_accepted
-            || entry.notification.is_some()
-            || entry.acknowledged_queued
-        {
-            return;
-        }
-        entry.acknowledged_queued = true;
     }
 
     pub(crate) fn turn_origin_tracker(&self) -> TurnOriginTracker {
@@ -957,38 +678,6 @@ impl ThreadState {
         self.last_thread_settings = Some(thread_settings);
         changed
     }
-}
-
-fn terminal_turn_id(event: &EventMsg) -> Option<&str> {
-    match event {
-        EventMsg::TurnComplete(event) => Some(event.turn_id.as_str()),
-        EventMsg::TurnAborted(event) => event.turn_id.as_deref(),
-        _ => None,
-    }
-}
-
-pub(crate) async fn acknowledge_terminal_notification(
-    conversation: &CodexThread,
-    thread_state: &Arc<Mutex<ThreadState>>,
-    turn_id: &str,
-    fingerprint: &str,
-) -> bool {
-    if !conversation
-        .acknowledge_terminal_event(turn_id, fingerprint)
-        .await
-    {
-        return false;
-    }
-    let durable_fingerprint = conversation
-        .durably_acknowledged_terminal_fingerprint(turn_id)
-        .await;
-    let mut state = thread_state.lock().await;
-    if durable_fingerprint.as_deref() == Some(fingerprint) {
-        state.mark_terminal_durably_acknowledged(turn_id, fingerprint);
-    } else {
-        state.mark_terminal_acknowledged(turn_id, fingerprint);
-    }
-    true
 }
 
 pub(crate) async fn resolve_server_request_on_thread_listener(
@@ -1047,7 +736,6 @@ mod tests {
     use codex_app_server_protocol::ApprovalsReviewer;
     use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::SandboxPolicy;
-    use codex_app_server_protocol::ThreadGoalClearedNotification;
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
@@ -1076,17 +764,10 @@ mod tests {
             last_agent_message: Some(message.to_string()),
             surfaced_result: None,
             error: None,
-            completion: None,
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
             timing: None,
-        })
-    }
-
-    fn cached_notification() -> ServerNotification {
-        ServerNotification::ThreadGoalCleared(ThreadGoalClearedNotification {
-            thread_id: "thread-1".to_string(),
         })
     }
 
@@ -1316,143 +997,6 @@ mod tests {
     }
 
     #[test]
-    fn identical_terminal_replay_retries_only_pending_notification_targets() {
-        let mut state = ThreadState::default();
-        let event = terminal_event("turn-1", "done");
-        let fingerprint = terminal_event_fingerprint(&event).expect("terminal fingerprint");
-        assert!(matches!(
-            state.classify_terminal_event("turn-1", &event, &[ConnectionId(7), ConnectionId(8)]),
-            TerminalEventDisposition::Apply { .. }
-        ));
-        state.mark_terminal_state_reduced("turn-1", &fingerprint);
-        assert!(matches!(
-            state.classify_terminal_event("turn-1", &event, &[ConnectionId(7), ConnectionId(8)]),
-            TerminalEventDisposition::ProjectNotification { .. }
-        ));
-
-        assert!(!state.record_terminal_notification_attempt(
-            "turn-1",
-            &fingerprint,
-            cached_notification(),
-            None,
-            &[ConnectionId(7), ConnectionId(8)],
-            &[ConnectionId(7)],
-        ));
-        let TerminalEventDisposition::RetryNotification(replay) =
-            state.classify_terminal_event("turn-1", &event, &[ConnectionId(7), ConnectionId(8)])
-        else {
-            panic!("pending terminal notification should be retried");
-        };
-        assert_eq!(replay.target_connection_ids, vec![ConnectionId(8)]);
-        assert!(state.record_terminal_notification_attempt(
-            "turn-1",
-            &fingerprint,
-            replay.notification,
-            None,
-            &[ConnectionId(8)],
-            &[ConnectionId(8)],
-        ));
-        assert!(matches!(
-            state.classify_terminal_event("turn-1", &event, &[ConnectionId(7), ConnectionId(8)]),
-            TerminalEventDisposition::Acknowledge { .. }
-        ));
-    }
-
-    #[test]
-    fn terminal_acknowledgement_discards_retry_payload_but_retains_deduplication() {
-        let mut state = ThreadState::default();
-        let event = terminal_event("turn-1", "done");
-        let fingerprint = terminal_event_fingerprint(&event).expect("terminal fingerprint");
-        assert!(matches!(
-            state.classify_terminal_event("turn-1", &event, &[ConnectionId(7)]),
-            TerminalEventDisposition::Apply { .. }
-        ));
-        state.mark_terminal_state_reduced("turn-1", &fingerprint);
-        assert!(state.record_terminal_notification_attempt(
-            "turn-1",
-            &fingerprint,
-            cached_notification(),
-            Some(ConnectionId(7)),
-            &[ConnectionId(7)],
-            &[ConnectionId(7)],
-        ));
-
-        state.mark_terminal_acknowledged("turn-1", &fingerprint);
-
-        let entry = state.terminal_ledger.get("turn-1").expect("ledger entry");
-        assert!(entry.notification.is_none());
-        assert!(entry.origin_connection_id.is_none());
-        assert!(entry.accepted_connection_ids.is_empty());
-        assert!(matches!(
-            state.classify_terminal_event("turn-1", &event, &[ConnectionId(7)]),
-            TerminalEventDisposition::Acknowledge { .. }
-        ));
-    }
-
-    #[test]
-    fn durable_terminal_acknowledgement_evicts_tombstone_and_suppresses_replay() {
-        let mut state = ThreadState::default();
-        let event = terminal_event("turn-1", "done");
-        let fingerprint = terminal_event_fingerprint(&event).expect("terminal fingerprint");
-        assert!(matches!(
-            state.classify_terminal_event("turn-1", &event, &[]),
-            TerminalEventDisposition::Apply { .. }
-        ));
-        state.mark_terminal_state_reduced("turn-1", &fingerprint);
-        state.mark_terminal_durably_acknowledged("turn-1", &fingerprint);
-        assert!(state.terminal_ledger.is_empty());
-
-        assert!(matches!(
-            state.classify_terminal_event_with_durable_acknowledgement(
-                "turn-1",
-                &event,
-                &[],
-                Some(&fingerprint),
-            ),
-            TerminalEventDisposition::SuppressAcknowledged
-        ));
-        assert!(state.terminal_ledger.is_empty());
-        assert!(matches!(
-            state.classify_terminal_event_with_durable_acknowledgement(
-                "turn-1",
-                &terminal_event("turn-1", "conflict"),
-                &[],
-                Some(&fingerprint),
-            ),
-            TerminalEventDisposition::RejectConflict
-        ));
-    }
-
-    #[test]
-    fn terminal_ledger_rejects_conflicts_and_stale_turns() {
-        let mut state = ThreadState::default();
-        let first = terminal_event("turn-1", "done");
-        assert!(matches!(
-            state.classify_terminal_event("turn-1", &first, &[]),
-            TerminalEventDisposition::Apply { .. }
-        ));
-        assert!(matches!(
-            state.classify_terminal_event("turn-1", &terminal_event("turn-1", "different"), &[]),
-            TerminalEventDisposition::RejectConflict
-        ));
-
-        state.track_current_turn_event(
-            "turn-2",
-            &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
-                turn_id: "turn-2".to_string(),
-                trace_id: None,
-                started_at: None,
-                model_context_window: None,
-                collaboration_mode_kind: ModeKind::Default,
-            }),
-        );
-        assert!(matches!(
-            state.classify_terminal_event("old-turn", &terminal_event("old-turn", "done"), &[]),
-            TerminalEventDisposition::RejectStale
-        ));
-    }
-
-    #[test]
     fn interrupted_history_snapshot_is_not_live_turn_state() {
         let mut state = ThreadState::default();
         state.track_current_turn_event(
@@ -1610,20 +1154,14 @@ mod tests {
     }
 
     #[test]
-    fn retained_terminal_history_requires_notification_projection_after_restart() {
-        let event = terminal_event("turn-1", "done");
-        let mut state = ThreadState::default();
-        state.seed_terminal_ledger_from_history(&[RolloutItem::EventMsg(event.clone())]);
-
-        assert!(matches!(
-            state.classify_terminal_event("turn-1", &event, &[ConnectionId(7)]),
-            TerminalEventDisposition::ProjectNotification { .. }
-        ));
-    }
-
-    #[test]
     fn resume_history_seed_is_scoped_to_listener_generation() {
-        let event = terminal_event("turn-1", "done");
+        let event = EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        });
         let mut state = ThreadState::default();
         let (listener_command_tx, _listener_command_rx) = thread_listener_command_channel();
         state.listener_command_tx = Some(listener_command_tx);
@@ -1634,38 +1172,13 @@ mod tests {
         assert!(state.seed_resume_history_for_listener(
             &[RolloutItem::EventMsg(event)],
             listener_generation,
-            None,
         ));
         assert!(state.resume_history_is_seeded_for_current_listener());
+        assert_eq!(state.in_progress_turn_id(), Some("turn-1"));
 
         state.listener_generation += 1;
         assert!(!state.resume_history_is_seeded_for_current_listener());
-        assert!(!state.seed_resume_history_for_listener(&[], 7, None));
-    }
-
-    #[test]
-    fn resume_history_only_retains_terminals_that_still_require_replay() {
-        let mut state = ThreadState::default();
-        let (listener_command_tx, _listener_command_rx) = thread_listener_command_channel();
-        state.listener_command_tx = Some(listener_command_tx);
-        state.listener_generation = 3;
-        let acknowledged = terminal_event("acknowledged", "done");
-        let pending = terminal_event("pending", "done");
-        let pending_fingerprint =
-            terminal_event_fingerprint(&pending).expect("terminal fingerprint");
-        let replay_fingerprints = HashMap::from([("pending".to_string(), pending_fingerprint)]);
-
-        assert!(state.seed_resume_history_for_listener(
-            &[
-                RolloutItem::EventMsg(acknowledged),
-                RolloutItem::EventMsg(pending),
-            ],
-            3,
-            Some(&replay_fingerprints),
-        ));
-
-        assert!(!state.terminal_ledger.contains_key("acknowledged"));
-        assert!(state.terminal_ledger.contains_key("pending"));
+        assert!(!state.seed_resume_history_for_listener(&[], 7));
     }
 
     fn thread_settings(model: &str) -> ThreadSettings {

@@ -270,6 +270,8 @@ pub struct ThrottledWatchReceiver {
     rx: Receiver,
     interval: Duration,
     next_allowed: Option<Instant>,
+    changed_paths: BTreeSet<PathBuf>,
+    rescan_required: bool,
 }
 
 impl ThrottledWatchReceiver {
@@ -279,21 +281,81 @@ impl ThrottledWatchReceiver {
             rx,
             interval,
             next_allowed: None,
+            changed_paths: BTreeSet::new(),
+            rescan_required: false,
         }
     }
 
-    /// Receives the next event, enforcing the configured minimum delay after
-    /// the previous emission.
+    /// Receives the next event immediately, then coalesces later events until
+    /// the configured interval has elapsed since the previous emission.
     pub async fn recv(&mut self) -> Option<FileWatcherEvent> {
-        if let Some(next_allowed) = self.next_allowed {
-            sleep_until(next_allowed).await;
+        self.recv_with_observer(|_| {}).await
+    }
+
+    /// Receives throttled events while exposing each raw event as soon as it is
+    /// observed. This lets callers invalidate state immediately without also
+    /// emitting externally visible notifications more than once per interval.
+    pub async fn recv_with_observer(
+        &mut self,
+        mut observe: impl FnMut(&FileWatcherEvent),
+    ) -> Option<FileWatcherEvent> {
+        loop {
+            let Some(next_allowed) = self.next_allowed else {
+                let event = self.rx.recv().await?;
+                observe(&event);
+                self.next_allowed = Some(Instant::now() + self.interval);
+                return Some(event);
+            };
+
+            tokio::select! {
+                biased;
+                _ = sleep_until(next_allowed) => {
+                    self.next_allowed = None;
+                    if let Some(event) = self.take_pending() {
+                        self.next_allowed = Some(Instant::now() + self.interval);
+                        return Some(event);
+                    }
+                },
+                event = self.rx.recv() => match event {
+                    Some(event) => {
+                        observe(&event);
+                        self.merge_event(event);
+                    }
+                    None => return self.take_pending(),
+                },
+            }
+        }
+    }
+
+    fn merge_event(&mut self, event: FileWatcherEvent) {
+        self.rescan_required |= event.rescan_required;
+        if self.rescan_required {
+            self.changed_paths.clear();
+        } else {
+            for path in event.paths {
+                if self.changed_paths.len() >= SUBSCRIBER_PATH_BUFFER_CAPACITY
+                    && !self.changed_paths.contains(&path)
+                {
+                    self.changed_paths.clear();
+                    self.rescan_required = true;
+                    break;
+                }
+                self.changed_paths.insert(path);
+            }
+        }
+    }
+
+    fn take_pending(&mut self) -> Option<FileWatcherEvent> {
+        if self.changed_paths.is_empty() && !self.rescan_required {
+            return None;
         }
 
-        let event = self.rx.recv().await;
-        if event.is_some() {
-            self.next_allowed = Some(Instant::now() + self.interval);
-        }
-        event
+        Some(FileWatcherEvent {
+            paths: std::mem::take(&mut self.changed_paths)
+                .into_iter()
+                .collect(),
+            rescan_required: std::mem::take(&mut self.rescan_required),
+        })
     }
 }
 

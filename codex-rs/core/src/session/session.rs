@@ -24,7 +24,6 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
-use tokio::sync::SemaphorePermit;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
@@ -35,6 +34,25 @@ enum ToolHistoryPersistenceCommand {
     Mutation(Box<crate::tool_history::ToolHistoryMutation>),
     Checkpoint,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ToolHistoryPersistenceEnqueueError {
+    SequenceOverflow,
+    WorkerClosed,
+}
+
+impl std::fmt::Display for ToolHistoryPersistenceEnqueueError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SequenceOverflow => {
+                formatter.write_str("tool-history persistence sequence overflowed")
+            }
+            Self::WorkerClosed => formatter.write_str("tool-history persistence worker is closed"),
+        }
+    }
+}
+
+impl std::error::Error for ToolHistoryPersistenceEnqueueError {}
 
 struct PendingToolHistoryPersistence {
     sequence: u64,
@@ -104,10 +122,9 @@ impl ToolHistoryPersistenceQueue {
                     let completed = requests.last().map(|request| request.sequence).unwrap_or(0);
                     let Ok(_permit) = Arc::clone(&io_gate).acquire_owned().await else {
                         tracing::warn!(
-                            "completed-tool history I/O gate closed before queued persistence"
+                            "completed-tool history I/O gate closed before queued persistence; queued writes will remain unacknowledged"
                         );
-                        completed_sequence_tx.send_replace(completed);
-                        continue;
+                        return;
                     };
                     let mut mutations = Vec::new();
                     let mut checkpoint_requested = false;
@@ -127,6 +144,7 @@ impl ToolHistoryPersistenceQueue {
                             }
                         }
                     }
+                    let mut journal_persist_failed = false;
                     if !mutations.is_empty() {
                         let sequenced_mutations = mutations
                             .into_iter()
@@ -163,11 +181,41 @@ impl ToolHistoryPersistenceQueue {
                             }
                             Err(err) => {
                                 tracing::warn!("failed to persist {description}: {err}");
+                                journal_persist_failed = true;
                             }
                         }
                     }
-                    if checkpoint_requested
-                        || journal_records >= TOOL_HISTORY_JOURNAL_COMPACTION_RECORDS
+                    if journal_persist_failed || checkpoint_requested {
+                        let mirror = worker_mirror.lock().await.clone();
+                        let mut retry_delay = std::time::Duration::from_millis(25);
+                        loop {
+                            match crate::tool_history::persist_tool_history_state(
+                                &codex_home,
+                                &thread_id,
+                                &mirror,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    journal_records = 0;
+                                    journal_bytes = 0;
+                                    #[cfg(test)]
+                                    worker_persisted_batch_count
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    break;
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "failed to checkpoint {description}; queued writes remain unacknowledged and will be retried: {err}"
+                                    );
+                                    tokio::time::sleep(retry_delay).await;
+                                    retry_delay = retry_delay
+                                        .saturating_mul(2)
+                                        .min(std::time::Duration::from_secs(1));
+                                }
+                            }
+                        }
+                    } else if journal_records >= TOOL_HISTORY_JOURNAL_COMPACTION_RECORDS
                         || journal_bytes >= TOOL_HISTORY_JOURNAL_COMPACTION_BYTES
                     {
                         let mirror = worker_mirror.lock().await.clone();
@@ -208,29 +256,30 @@ impl ToolHistoryPersistenceQueue {
         &self,
         mutation: crate::tool_history::ToolHistoryMutation,
         description: &'static str,
-    ) {
+    ) -> Result<(), ToolHistoryPersistenceEnqueueError> {
         self.enqueue_command(
             ToolHistoryPersistenceCommand::Mutation(Box::new(mutation)),
             description,
-        );
+        )
+        .map(|_| ())
     }
 
     fn enqueue_command(
         &self,
         command: ToolHistoryPersistenceCommand,
         description: &'static str,
-    ) -> u64 {
-        let mut enqueued_sequence = 0;
+    ) -> Result<u64, ToolHistoryPersistenceEnqueueError> {
+        if self.wake_tx.is_closed() {
+            return Err(ToolHistoryPersistenceEnqueueError::WorkerClosed);
+        }
+        let enqueued_sequence;
         {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(sequence) = next_tool_history_persistence_sequence(state.next_sequence) else {
-                tracing::error!(
-                    "tool-history persistence sequence overflowed; refusing to enqueue mutation"
-                );
-                return enqueued_sequence;
+                return Err(ToolHistoryPersistenceEnqueueError::SequenceOverflow);
             };
             state.next_sequence = sequence;
             enqueued_sequence = sequence;
@@ -243,10 +292,10 @@ impl ToolHistoryPersistenceQueue {
         match self.wake_tx.try_send(()) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
             Err(mpsc::error::TrySendError::Closed(())) => {
-                tracing::warn!("completed-tool history persistence queue closed unexpectedly");
+                return Err(ToolHistoryPersistenceEnqueueError::WorkerClosed);
             }
         }
-        enqueued_sequence
+        Ok(enqueued_sequence)
     }
 
     pub(super) async fn drain(&self) {
@@ -255,10 +304,18 @@ impl ToolHistoryPersistenceQueue {
     }
 
     pub(super) async fn checkpoint(&self) {
-        let target_sequence = self.enqueue_command(
+        let target_sequence = match self.enqueue_command(
             ToolHistoryPersistenceCommand::Checkpoint,
             "completed-tool history checkpoint",
-        );
+        ) {
+            Ok(target_sequence) => target_sequence,
+            Err(err) => {
+                tracing::warn!(
+                    "completed-tool history checkpoint could not be enqueued; durability cannot be acknowledged: {err}"
+                );
+                return std::future::pending().await;
+            }
+        };
         self.wait_for_sequence(target_sequence).await;
     }
 
@@ -276,8 +333,10 @@ impl ToolHistoryPersistenceQueue {
                 return;
             }
             if completed_sequence.changed().await.is_err() {
-                tracing::warn!("completed-tool history persistence queue ended during flush");
-                return;
+                tracing::warn!(
+                    "completed-tool history persistence queue ended during flush; durability cannot be acknowledged"
+                );
+                std::future::pending::<()>().await;
             }
         }
     }
@@ -291,37 +350,15 @@ impl ToolHistoryPersistenceQueue {
         self.persisted_batch_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    #[cfg(test)]
+    pub(super) async fn wait_until_worker_closed_for_test(&self) {
+        self.wake_tx.closed().await;
+    }
 }
 
 pub(super) fn next_tool_history_persistence_sequence(current: u64) -> Option<u64> {
     current.checked_add(1)
-}
-
-pub(super) async fn load_session_persistent_ledgers<
-    TaskEvidence,
-    CommandExecution,
-    TaskLoad,
-    CommandLoad,
->(
-    task_evidence_load: TaskLoad,
-    command_execution_load: CommandLoad,
-) -> (TaskEvidence, CommandExecution)
-where
-    TaskLoad: std::future::Future<Output = TaskEvidence>,
-    CommandLoad: std::future::Future<Output = CommandExecution>,
-{
-    tokio::join!(task_evidence_load, command_execution_load)
-}
-
-pub(super) fn task_evidence_is_disabled_for_session(
-    ephemeral: bool,
-    session_source: &SessionSource,
-) -> bool {
-    ephemeral
-        && matches!(
-            session_source,
-            SessionSource::SubAgent(SubAgentSource::Review)
-        )
 }
 
 /// Context for an initialized model agent
@@ -372,10 +409,6 @@ pub(crate) struct Session {
     pub(super) queued_tool_manifest_hash: std::sync::Mutex<Option<String>>,
     /// Owns terminal coordinators so request cancellation cannot strand a claimed turn.
     pub(crate) terminal_tasks: tokio_util::task::TaskTracker,
-    /// Process-local redelivery cache. It is never an authority for the terminal
-    /// event; durable task evidence owns that decision and this cache only avoids
-    /// duplicate live handoffs within the current process.
-    pub(crate) terminal_delivery_cache: Mutex<TerminalDeliveryCache>,
     /// Admission stays closed while the prior turn is between terminal claim and the
     /// interaction-released milestone, even if its raw active-turn slot is being detached.
     pub(crate) terminal_interaction_pending: std::sync::atomic::AtomicBool,
@@ -383,8 +416,6 @@ pub(crate) struct Session {
     pub(crate) shutting_down: std::sync::atomic::AtomicBool,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
-    /// Independent one-shot completion reviews never consume normal agent capacity.
-    pub(super) completion_review_slot: Semaphore,
     pub(crate) services: SessionServices,
     pub(super) next_internal_sub_id: AtomicU64,
 }
@@ -392,18 +423,6 @@ pub(crate) struct Session {
 #[derive(Default)]
 pub(crate) struct TaskStartState {
     pub(crate) pending_start_only_admissions: HashMap<String, oneshot::Sender<CodexResult<()>>>,
-}
-
-#[derive(Default)]
-pub(crate) struct TerminalDeliveryCache {
-    pub(crate) by_identity: HashMap<String, TerminalDeliveryCacheEntry>,
-}
-
-pub(crate) struct TerminalDeliveryCacheEntry {
-    pub(crate) fingerprint: String,
-    pub(crate) acknowledged: bool,
-    pub(crate) redelivery_scheduled: bool,
-    pub(crate) recovery_notified: bool,
 }
 
 #[derive(Clone)]
@@ -846,14 +865,6 @@ impl Session {
     /// Returns the identity shared by the root thread and all descendant threads.
     pub(crate) fn session_id(&self) -> SessionId {
         self.services.agent_control.session_id()
-    }
-
-    pub(crate) fn try_acquire_completion_review_slot(&self) -> Option<SemaphorePermit<'_>> {
-        self.completion_review_slot.try_acquire().ok()
-    }
-
-    pub(crate) fn completion_review_capacity_available(&self) -> bool {
-        self.completion_review_slot.available_permits() > 0
     }
 
     pub(crate) async fn originator(&self) -> String {
@@ -1507,33 +1518,13 @@ impl Session {
                 config.features.enabled(Feature::DeferredExecutor),
             );
             drop(executor_readiness_timing_guard);
-            let task_evidence_load = async {
-                if task_evidence_is_disabled_for_session(
-                    config.ephemeral,
-                    &session_configuration.session_source,
-                ) {
-                    crate::task_evidence::TaskEvidenceLedger::disabled()
-                } else {
-                    crate::task_evidence::TaskEvidenceLedger::load_or_new(
-                        config.codex_home.to_path_buf(),
-                        thread_id,
-                        session_configuration.cwd().as_path(),
-                    )
-                    .await
-                }
-            };
-            let command_execution_load =
+            let command_execution =
                 crate::tools::command_execution::CommandExecutionLedger::load_or_new(
                     config.codex_home.to_path_buf(),
                     thread_id.to_string(),
                     session_configuration.cwd().as_path(),
-                );
-            let (task_evidence, command_execution) =
-                load_session_persistent_ledgers(task_evidence_load, command_execution_load).await;
-            let kd4_repository_context =
-                crate::task_evidence::Kd4RepositoryContext::from_repository_root(
-                    task_evidence.repository_root(),
-                );
+                )
+                .await;
             let services = SessionServices {
                 // Initialize the MCP connection manager with an uninitialized
                 // instance. It will be replaced with one created via
@@ -1549,8 +1540,6 @@ impl Session {
                 unified_exec_manager,
                 command_execution,
                 plan_store: crate::plan_store::PlanStore::default(),
-                task_evidence,
-                kd4_repository_context: std::sync::RwLock::new(kd4_repository_context),
                 elicitations: crate::elicitation::ElicitationService::new(),
                 analytics_events_client,
                 hooks: arc_swap::ArcSwap::from_pointee(hooks),
@@ -1656,12 +1645,10 @@ impl Session {
                 turn_config_cache: Default::default(),
                 queued_tool_manifest_hash: Default::default(),
                 terminal_tasks: tokio_util::task::TaskTracker::new(),
-                terminal_delivery_cache: Mutex::new(TerminalDeliveryCache::default()),
                 terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
-                completion_review_slot: Semaphore::new(/*permits*/ 1),
                 services,
                 next_internal_sub_id: AtomicU64::new(0),
             });
@@ -1672,11 +1659,7 @@ impl Session {
             sess.schedule_startup_transport_preconnect().await;
             // Dispatch the SessionConfiguredEvent first and then report any errors.
             // If resuming, include converted initial messages in the payload so UIs can render them immediately.
-            let mut startup_rollout_facts =
-                StartupRolloutFacts::reduce(thread_id, &initial_history);
-            let terminal_recovery_turn_id = startup_rollout_facts.terminal_recovery_turn_id.take();
-            sess.adopt_terminal_authority(startup_rollout_facts.terminal_authority.take())
-                .await;
+            let mut startup_rollout_facts = StartupRolloutFacts::reduce(&initial_history);
             sess.input_queue
                 .seed_seen_mailbox_communication_ids_from_ids(std::mem::take(
                     &mut startup_rollout_facts.mailbox_communication_ids,
@@ -1797,9 +1780,6 @@ impl Session {
                     tool_history_fork_source,
                 )
                 .await;
-            }
-            if let Some(turn_id) = terminal_recovery_turn_id {
-                sess.recover_bound_terminal_intent(turn_id).await;
             }
             {
                 let mut state = sess.state.lock().await;

@@ -193,10 +193,9 @@ pub struct UnifiedExecRuntime<'a> {
 }
 
 fn unified_exec_options(
-    timeout_ms: Option<u64>,
     network_denial_cancellation_token: Option<CancellationToken>,
 ) -> ExecOptions {
-    let mut expiration = timeout_ms.map_or(ExecExpiration::DefaultTimeout, ExecExpiration::from);
+    let mut expiration = ExecExpiration::DefaultTimeout;
     if let Some(cancellation) = network_denial_cancellation_token {
         expiration = expiration.with_cancellation(cancellation);
     }
@@ -318,15 +317,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
         req: &UnifiedExecRequest,
         ctx: &ApprovalCtx<'_>,
     ) -> std::io::Result<ApprovalAction> {
-        Ok(ApprovalAction::ExecCommand {
-            id: ctx.call_id.to_string(),
-            command: req.command_for_approval.clone(),
-            cwd: req.cwd.to_abs_path()?,
-            sandbox_permissions: req.sandbox_permissions,
-            additional_permissions: req.additional_permissions.clone(),
-            justification: req.justification.clone(),
-            tty: req.tty,
-        })
+        Ok(Self::build_guardian_review_request(req, ctx.call_id))
     }
 
     fn exec_approval_requirement(
@@ -348,6 +339,20 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
 
     fn sandbox_permissions(&self, req: &UnifiedExecRequest) -> SandboxPermissions {
         req.sandbox_permissions
+    }
+}
+
+impl UnifiedExecRuntime<'_> {
+    fn build_guardian_review_request(req: &UnifiedExecRequest, call_id: &str) -> ApprovalAction {
+        ApprovalAction::ExecCommand {
+            id: call_id.to_string(),
+            command: req.command_for_approval.clone(),
+            cwd: req.cwd.clone(),
+            sandbox_permissions: req.sandbox_permissions,
+            additional_permissions: req.additional_permissions.clone(),
+            justification: req.justification.clone(),
+            tty: req.tty,
+        }
     }
 }
 
@@ -490,18 +495,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
             | ToolError::Codex(_)
             | ToolError::ValidationSkipped(_)) => error,
         })?;
-        let validation_timeout_ms = req
-            .validation_launch
-            .as_ref()
-            .and_then(|launch| launch.structured_route.as_ref())
-            .and_then(|route| match route.leaves.as_slice() {
-                [leaf] => Some(leaf.timeout_ms),
-                _ => None,
-            });
-        let options = unified_exec_options(
-            validation_timeout_ms,
-            attempt.network_denial_cancellation_token.clone(),
-        );
+        let options = unified_exec_options(attempt.network_denial_cancellation_token.clone());
         let spawn_lifecycle =
             validation_spawn_lifecycle(req, ctx, Box::new(NoopSpawnLifecycle)).await?;
         self.manager
@@ -509,7 +503,6 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
                 req.process_id,
                 command,
                 options,
-                validation_timeout_ms,
                 req.additional_permissions_uri.as_ref(),
                 attempt,
                 managed_network,
@@ -551,7 +544,7 @@ mod tests {
     #[test]
     fn unified_exec_options_combines_default_timeout_with_network_denial_cancellation() {
         let cancellation = CancellationToken::new();
-        let options = unified_exec_options(None, Some(cancellation.clone()));
+        let options = unified_exec_options(Some(cancellation.clone()));
 
         assert_eq!(options.capture_policy, ExecCapturePolicy::ShellTool);
         match options.expiration {
@@ -571,13 +564,25 @@ mod tests {
     }
 
     #[test]
-    fn unified_exec_options_honors_validation_timeout() {
-        let options = unified_exec_options(Some(300_000), None);
+    fn guardian_review_request_preserves_foreign_cwd() {
+        let foreign_cwd =
+            PathUri::parse("file:///tmp/remote-workspace").expect("POSIX remote workspace URI");
+        let mut request = test_request(
+            SandboxPermissions::RequireEscalated,
+            ExecApprovalRequirement::NeedsApproval {
+                reason: None,
+                proposed_execpolicy_amendment: None,
+            },
+        );
+        request.cwd = foreign_cwd.clone();
 
-        assert_eq!(options.capture_policy, ExecCapturePolicy::ShellTool);
+        let action =
+            UnifiedExecRuntime::build_guardian_review_request(&request, "remote-exec-call");
+
         assert!(matches!(
-            options.expiration,
-            ExecExpiration::Timeout(timeout) if timeout == Duration::from_millis(300_000)
+            action,
+            ApprovalAction::ExecCommand { id, cwd, .. }
+                if id == "remote-exec-call" && cwd == foreign_cwd
         ));
     }
 

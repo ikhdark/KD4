@@ -24,6 +24,90 @@ fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_dir(target, link)
 }
 
+#[tokio::test(start_paused = true)]
+async fn throttled_receiver_emits_the_leading_event_without_advancing_time() {
+    let (tx, rx) = watch_channel();
+    let mut throttled = ThrottledWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
+    let started_at = Instant::now();
+
+    tx.add_changed_paths(&[path("a")]).await;
+    let event = throttled.recv().await;
+
+    assert_eq!(Instant::now() - started_at, Duration::ZERO);
+    assert_eq!(
+        event,
+        Some(FileWatcherEvent {
+            paths: vec![path("a")],
+            rescan_required: false,
+        })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn throttled_receiver_observes_changes_before_the_notification_window() {
+    let (tx, rx) = watch_channel();
+    let mut throttled = ThrottledWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
+    let observed = Arc::new(AtomicUsize::new(0));
+
+    tx.add_changed_paths(&[path("a")]).await;
+    let first_observed = Arc::clone(&observed);
+    let first = throttled
+        .recv_with_observer(|_| {
+            first_observed.fetch_add(1, Ordering::AcqRel);
+        })
+        .await;
+    assert!(first.is_some());
+    assert_eq!(observed.load(Ordering::Acquire), 1);
+
+    tx.add_changed_paths(&[path("b")]).await;
+    let second_observed = Arc::clone(&observed);
+    let mut second = Box::pin(throttled.recv_with_observer(|_| {
+        second_observed.fetch_add(1, Ordering::AcqRel);
+    }));
+    tokio::select! {
+        biased;
+        event = &mut second => panic!("notification emitted before throttle elapsed: {event:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+    assert_eq!(observed.load(Ordering::Acquire), 2);
+
+    tokio::time::advance(TEST_THROTTLE_INTERVAL).await;
+    assert_eq!(
+        second.await,
+        Some(FileWatcherEvent {
+            paths: vec![path("b")],
+            rescan_required: false,
+        })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn throttled_receiver_emits_elapsed_pending_event_before_ready_raw_events() {
+    let (tx, rx) = watch_channel();
+    let mut throttled = ThrottledWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
+
+    tx.add_changed_paths(&[path("a")]).await;
+    assert!(throttled.recv().await.is_some());
+
+    tx.add_changed_paths(&[path("b")]).await;
+    let mut pending = Box::pin(throttled.recv());
+    tokio::select! {
+        biased;
+        event = &mut pending => panic!("notification emitted before throttle elapsed: {event:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+
+    tokio::time::advance(TEST_THROTTLE_INTERVAL).await;
+    tx.add_changed_paths(&[path("c")]).await;
+    assert_eq!(
+        pending.await,
+        Some(FileWatcherEvent {
+            paths: vec![path("b")],
+            rescan_required: false,
+        })
+    );
+}
+
 #[tokio::test]
 async fn throttled_receiver_coalesces_within_interval() {
     let (tx, rx) = watch_channel();

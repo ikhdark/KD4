@@ -467,6 +467,7 @@ class PublishLocalCodexTestBase(unittest.TestCase):
                 )
             publish_args.extend(["-BackupDir", str(backup_dir)])
         if "-SkipBuild" in publish_args and "-SourceBundleManifest" not in publish_args:
+
             def argument_path(name: str, default: Path) -> Path:
                 if name not in publish_args:
                     return default

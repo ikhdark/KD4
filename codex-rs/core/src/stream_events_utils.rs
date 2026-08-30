@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -297,12 +298,36 @@ pub(crate) struct HandleOutputCtx {
 
 type ResponseItemPersistenceBarrier = Shared<BoxFuture<'static, ()>>;
 
+#[derive(Default)]
+struct OrderedResponseItemRecorderState {
+    required_tail: Option<ResponseItemPersistenceBarrier>,
+    auxiliary_tail: Option<ResponseItemPersistenceBarrier>,
+    accepted_tool_calls: BTreeMap<String, ToolCall>,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct OrderedResponseItemRecorder {
-    tail: Arc<Mutex<Option<ResponseItemPersistenceBarrier>>>,
+    state: Arc<Mutex<OrderedResponseItemRecorderState>>,
 }
 
 impl OrderedResponseItemRecorder {
+    async fn accepted_tool_call_replay(&self, call: &ToolCall) -> Option<bool> {
+        self.state
+            .lock()
+            .await
+            .accepted_tool_calls
+            .get(&call.call_id)
+            .map(|accepted| accepted == call)
+    }
+
+    async fn record_accepted_tool_call(&self, call: ToolCall) {
+        self.state
+            .lock()
+            .await
+            .accepted_tool_calls
+            .insert(call.call_id.clone(), call);
+    }
+
     async fn enqueue(
         &self,
         sess: Arc<Session>,
@@ -311,21 +336,35 @@ impl OrderedResponseItemRecorder {
         following_items: Vec<ResponseItem>,
         finalized_facts: Option<FinalizedTurnItemFacts>,
     ) -> ResponseItemPersistenceBarrier {
-        let mut tail = self.tail.lock().await;
-        let preceding = tail.clone();
-        let barrier = async move {
-            if let Some(preceding) = preceding {
+        let mut state = self.state.lock().await;
+        let preceding_required = state.required_tail.clone();
+        let preceding_auxiliary = state.auxiliary_tail.clone();
+        let primary = item.clone();
+        let required_sess = Arc::clone(&sess);
+        let required_turn_context = Arc::clone(&turn_context);
+        let required_barrier = async move {
+            if let Some(preceding) = preceding_required {
                 preceding.await;
             }
             let mut items = Vec::with_capacity(1 + following_items.len());
             items.push(item);
             items.extend(following_items);
-            sess.record_conversation_items(&turn_context, &items).await;
-            let primary = &items[0];
+            required_sess
+                .record_conversation_items(&required_turn_context, &items)
+                .await;
+        }
+        .boxed()
+        .shared();
+        let required_for_auxiliary = required_barrier.clone();
+        let auxiliary_barrier = async move {
+            if let Some(preceding) = preceding_auxiliary {
+                preceding.await;
+            }
+            required_for_auxiliary.await;
             let defers_mailbox_delivery = finalized_facts.as_ref().map_or_else(
                 || {
                     completed_item_defers_mailbox_delivery_to_next_turn(
-                        primary,
+                        &primary,
                         turn_context.collaboration_mode.mode == ModeKind::Plan,
                     )
                 },
@@ -339,7 +378,7 @@ impl OrderedResponseItemRecorder {
             mark_thread_memory_mode_polluted_if_external_context(
                 sess.as_ref(),
                 turn_context.as_ref(),
-                primary,
+                &primary,
             )
             .await;
             let has_memory_citation = if let Some(memory_citation) = finalized_facts
@@ -354,7 +393,7 @@ impl OrderedResponseItemRecorder {
             } else {
                 record_stage1_output_usage_and_detect_memory_citation(
                     sess.services.state_db.as_ref(),
-                    primary,
+                    &primary,
                 )
                 .await
             };
@@ -365,20 +404,22 @@ impl OrderedResponseItemRecorder {
         }
         .boxed()
         .shared();
-        *tail = Some(barrier.clone());
-        drop(tokio::spawn(barrier.clone()));
-        barrier
+        state.required_tail = Some(required_barrier.clone());
+        state.auxiliary_tail = Some(auxiliary_barrier.clone());
+        drop(tokio::spawn(required_barrier.clone()));
+        drop(tokio::spawn(auxiliary_barrier));
+        required_barrier
     }
 
     pub(crate) async fn flush(&self) {
-        let tail = self.tail.lock().await.clone();
+        let tail = self.state.lock().await.auxiliary_tail.clone();
         if let Some(tail) = tail {
             tail.await;
         }
     }
 
     #[cfg(test)]
-    pub(crate) async fn block_persistence_for_test(
+    pub(crate) async fn block_required_persistence_for_test(
         &self,
         release: tokio::sync::oneshot::Receiver<()>,
     ) {
@@ -387,7 +428,20 @@ impl OrderedResponseItemRecorder {
         }
         .boxed()
         .shared();
-        *self.tail.lock().await = Some(barrier);
+        self.state.lock().await.required_tail = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn block_auxiliary_persistence_for_test(
+        &self,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let barrier = async move {
+            let _ = release.await;
+        }
+        .boxed()
+        .shared();
+        self.state.lock().await.auxiliary_tail = Some(barrier);
     }
 }
 
@@ -486,6 +540,20 @@ pub(crate) async fn handle_output_item_done(
                 .turn_timing_state
                 .record_model_emitted_tool_call();
 
+            if ctx
+                .response_item_recorder
+                .accepted_tool_call_replay(&call)
+                .await
+                == Some(true)
+            {
+                tracing::debug!(
+                    call_id = %call.call_id,
+                    tool_name = %call.tool_name,
+                    "ignored exact replay of an accepted tool call"
+                );
+                return Ok(output);
+            }
+
             output.eager_read_eligible = ctx
                 .tool_runtime
                 .take_eager_read_eligibility(&call, earlier_tool_calls_eligible);
@@ -521,6 +589,9 @@ pub(crate) async fn handle_output_item_done(
                     "refusing tool call `{call_id}` because acceptance was sealed or the same call ID was already accepted in this model generation"
                 )));
             }
+            ctx.response_item_recorder
+                .record_accepted_tool_call(call.clone())
+                .await;
             ctx.sess
                 .input_queue
                 .accept_mailbox_delivery_for_current_turn(

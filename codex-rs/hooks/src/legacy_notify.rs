@@ -141,6 +141,7 @@ mod tests {
     }
 
     fn delayed_marker_command(directory: &std::path::Path) -> Vec<String> {
+        #[cfg(windows)]
         {
             let script = directory.join("delayed-marker.ps1");
             std::fs::write(
@@ -157,6 +158,16 @@ mod tests {
                 "-NoProfile".to_string(),
                 "-File".to_string(),
                 script.to_string_lossy().into_owned(),
+            ]
+        }
+        #[cfg(not(windows))]
+        {
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "touch \"$1/started.txt\"; sleep 2; touch \"$1/escaped.txt\"".to_string(),
+                "codex-hook-test".to_string(),
+                directory.to_string_lossy().into_owned(),
             ]
         }
     }

@@ -2,6 +2,8 @@ use crate::legacy_core::config::Config;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -97,20 +99,60 @@ fn collect_with_discovery(
     contexts
 }
 
-fn truncate_context(mut content: String, max_bytes: usize) -> String {
+fn truncate_context(content: String, max_bytes: usize) -> String {
     if content.len() <= max_bytes {
         return content;
     }
-    const MARKER: &str = "\n<selected path context truncated>\n";
-    let mut end = max_bytes.saturating_sub(MARKER.len()).min(content.len());
-    while end > 0 && !content.is_char_boundary(end) {
-        end -= 1;
+    let original_bytes = content.len();
+    let mut marker = format!(
+        "\n<selected_path_context_omission original_bytes={original_bytes} omitted_bytes=0 \
+         recovery=\"read the original local path; do not infer missing content\">\n"
+    );
+    let mut bounded = String::new();
+    for _ in 0..3 {
+        let retained_budget = max_bytes.saturating_sub(marker.len());
+        let prefix_budget = retained_budget / 2;
+        let suffix_budget = retained_budget.saturating_sub(prefix_budget);
+        let prefix_end = floor_char_boundary(&content, prefix_budget);
+        let suffix_start = ceil_char_boundary(
+            &content,
+            content.len().saturating_sub(suffix_budget).max(prefix_end),
+        );
+        let omitted_bytes = suffix_start.saturating_sub(prefix_end);
+        let next_marker = format!(
+            "\n<selected_path_context_omission original_bytes={original_bytes} \
+             omitted_bytes={omitted_bytes} recovery=\"read the original local path; \
+             do not infer missing content\">\n"
+        );
+        bounded = format!(
+            "{}{}{}",
+            &content[..prefix_end],
+            next_marker,
+            &content[suffix_start..]
+        );
+        if next_marker.len() == marker.len() {
+            break;
+        }
+        marker = next_marker;
     }
-    content.truncate(end);
-    if max_bytes >= MARKER.len() {
-        content.push_str(MARKER);
+    bounded.truncate(floor_char_boundary(&bounded, max_bytes));
+    bounded
+}
+
+fn floor_char_boundary(value: &str, target: usize) -> usize {
+    let mut boundary = target.min(value.len());
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
     }
-    content
+    boundary
+}
+
+fn ceil_char_boundary(value: &str, target: usize) -> usize {
+    let mut boundary = target.min(value.len());
+    while boundary < value.len() && !value.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+    boundary
 }
 
 fn path_tokens(text: &str) -> Vec<String> {
@@ -294,33 +336,52 @@ fn append_file(output: &mut String, path: &Path, label: &str, max_bytes: usize) 
         return;
     }
     append_bounded(output, &format!("\n[{label}]\n"));
-    match read_prefix(path, max_bytes) {
-        Ok((bytes, _)) if bytes.contains(&0) => {
+    match read_head_and_tail(path, max_bytes) {
+        Ok((head, tail, _)) if head.contains(&0) || tail.contains(&0) => {
             append_bounded(output, "<binary content omitted>\n");
         }
-        Ok((bytes, truncated)) => {
-            append_bounded(output, &String::from_utf8_lossy(&bytes));
-            append_bounded(
-                output,
-                if truncated {
-                    "\n<content truncated>\n"
-                } else {
-                    "\n"
-                },
-            );
+        Ok((head, tail, original_bytes)) => {
+            append_bounded(output, &String::from_utf8_lossy(&head));
+            if tail.is_empty() {
+                append_bounded(output, "\n");
+            } else {
+                let retained_bytes = head.len().saturating_add(tail.len());
+                let omitted_bytes = original_bytes.saturating_sub(retained_bytes as u64);
+                append_bounded(
+                    output,
+                    &format!(
+                        "\n<file_content_omission original_bytes={original_bytes} \
+                         omitted_bytes={omitted_bytes} recovery=\"read the original path \
+                         {path:?}; do not infer missing content\">\n"
+                    ),
+                );
+                append_bounded(output, &String::from_utf8_lossy(&tail));
+                append_bounded(output, "\n");
+            }
         }
         Err(error) => append_bounded(output, &format!("<unreadable: {error}>\n")),
     }
 }
 
-fn read_prefix(path: &Path, max_bytes: usize) -> std::io::Result<(Vec<u8>, bool)> {
-    let file = fs::File::open(path)?;
-    let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)?;
-    let truncated = bytes.len() > max_bytes;
-    bytes.truncate(max_bytes);
-    Ok((bytes, truncated))
+fn read_head_and_tail(path: &Path, max_bytes: usize) -> std::io::Result<(Vec<u8>, Vec<u8>, u64)> {
+    let mut file = fs::File::open(path)?;
+    let original_bytes = file.metadata()?.len();
+    if original_bytes <= max_bytes as u64 {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        return Ok((bytes, Vec::new(), original_bytes));
+    }
+
+    let head_budget = max_bytes / 2;
+    let tail_budget = max_bytes.saturating_sub(head_budget);
+    let mut head = Vec::with_capacity(head_budget);
+    file.by_ref()
+        .take(head_budget as u64)
+        .read_to_end(&mut head)?;
+    file.seek(SeekFrom::End(-(tail_budget as i64)))?;
+    let mut tail = Vec::with_capacity(tail_budget);
+    file.take(tail_budget as u64).read_to_end(&mut tail)?;
+    Ok((head, tail, original_bytes))
 }
 
 fn append_bounded(output: &mut String, value: &str) {
@@ -358,6 +419,46 @@ mod tests {
         );
         assert_eq!(contexts.len(), 1);
         assert!(contexts[0].1.contains("selected contents"));
+    }
+
+    #[test]
+    fn over_truncation_selected_file_keeps_tail_failure_and_recovery() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let selected = temp.path().join("large.log");
+        let file_content = format!(
+            "BEGIN\n{}\nROOT_CAUSE_AT_END",
+            "ordinary output\n".repeat(MAX_FILE_BYTES)
+        );
+        fs::write(&selected, file_content).expect("write file");
+
+        let contexts = collect_with_discovery(
+            selected.to_str().expect("utf8 path"),
+            temp.path(),
+            &default_discovery(temp.path()),
+        );
+        let content = &contexts[0].1;
+
+        assert!(content.contains("BEGIN"));
+        assert!(content.contains("ROOT_CAUSE_AT_END"));
+        assert!(content.contains("file_content_omission"));
+        assert!(content.contains("omitted_bytes="));
+        assert!(content.contains("recovery=\"read the original path"));
+        assert!(content.contains("do not infer missing content"));
+    }
+
+    #[test]
+    fn over_truncation_total_context_cap_keeps_tail_and_recovery() {
+        let content = format!("BEGIN{}ROOT_CAUSE_AT_END", "middle".repeat(1_000));
+
+        let bounded = truncate_context(content, 512);
+
+        assert!(bounded.len() <= 512);
+        assert!(bounded.starts_with("BEGIN"));
+        assert!(bounded.ends_with("ROOT_CAUSE_AT_END"));
+        assert!(bounded.contains("selected_path_context_omission"));
+        assert!(bounded.contains("original_bytes="));
+        assert!(bounded.contains("omitted_bytes="));
+        assert!(bounded.contains("recovery=\"read the original local path"));
     }
 
     #[test]

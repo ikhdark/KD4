@@ -37,6 +37,14 @@ REQUIRED_FIELDS = {
     "forbidden_findings",
     "notes",
 }
+REPAIR_CONTRACT_FIELDS = {
+    "allowed_paths",
+    "forbidden_added_text",
+    "max_changed_lines",
+    "max_repeated_equivalent_actions",
+    "max_tool_calls",
+    "validation_script",
+}
 CASE_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 
 
@@ -142,6 +150,83 @@ def _validate_expected_findings(case: dict[str, Any]) -> None:
             len(set(locators)) == len(locators),
             f"{prefix}.required_locators must not contain duplicates",
         )
+
+
+def _validate_repair_contract(case: dict[str, Any], fixture_paths: set[str]) -> None:
+    case_id = case["id"]
+    contract = case.get("repair_contract")
+    if contract is None:
+        return
+    _require(
+        isinstance(contract, dict), f"{case_id}: repair_contract must be an object"
+    )
+    _require(
+        set(contract) == REPAIR_CONTRACT_FIELDS,
+        f"{case_id}: repair_contract fields must be exactly {sorted(REPAIR_CONTRACT_FIELDS)}",
+    )
+
+    allowed_paths = contract["allowed_paths"]
+    _require(
+        isinstance(allowed_paths, list) and allowed_paths,
+        f"{case_id}: allowed_paths must be a non-empty array",
+    )
+    _require(
+        all(isinstance(path, str) and path for path in allowed_paths),
+        f"{case_id}: allowed_paths must contain non-empty strings",
+    )
+    normalized_allowed = [path.replace("\\", "/") for path in allowed_paths]
+    _require(
+        normalized_allowed == allowed_paths,
+        f"{case_id}: allowed_paths must use repository-relative forward-slash paths",
+    )
+    _require(
+        len(set(allowed_paths)) == len(allowed_paths),
+        f"{case_id}: allowed_paths must not contain duplicates",
+    )
+    _require(
+        set(allowed_paths) <= fixture_paths,
+        f"{case_id}: allowed_paths must name files owned by the fixture",
+    )
+
+    validation_script = contract["validation_script"]
+    _require(
+        isinstance(validation_script, str) and validation_script in fixture_paths,
+        f"{case_id}: validation_script must name a file owned by the fixture",
+    )
+    _require(
+        validation_script not in allowed_paths,
+        f"{case_id}: validation_script must not be editable by the repair",
+    )
+
+    max_changed_lines = contract["max_changed_lines"]
+    _require(
+        type(max_changed_lines) is int and max_changed_lines > 0,
+        f"{case_id}: max_changed_lines must be a positive integer",
+    )
+    for field in ("max_tool_calls", "max_repeated_equivalent_actions"):
+        value = contract[field]
+        _require(
+            type(value) is int and value >= 0,
+            f"{case_id}: {field} must be a non-negative integer",
+        )
+
+    forbidden = contract["forbidden_added_text"]
+    _require(
+        isinstance(forbidden, list),
+        f"{case_id}: forbidden_added_text must be an array",
+    )
+    _require(
+        all(isinstance(fragment, str) and fragment for fragment in forbidden),
+        f"{case_id}: forbidden_added_text must contain non-empty strings",
+    )
+    _require(
+        len(set(forbidden)) == len(forbidden),
+        f"{case_id}: forbidden_added_text must not contain duplicates",
+    )
+    _require(
+        not case["expected_findings"] and not case["forbidden_findings"],
+        f"{case_id}: repair cases must not declare audit findings",
+    )
 
 
 def _scan_unified_diff(
@@ -287,9 +372,13 @@ def validate_cases(cases: list[dict[str, Any]]) -> None:
     category_counts: Counter[str] = Counter()
 
     for case in cases:
+        is_repair = "repair_contract" in case
+        expected_fields = REQUIRED_FIELDS | (
+            {"repair_contract"} if is_repair else set()
+        )
         _require(
-            set(case) == REQUIRED_FIELDS,
-            f"record fields must be exactly {sorted(REQUIRED_FIELDS)}",
+            set(case) == expected_fields,
+            f"record fields must be exactly {sorted(expected_fields)}",
         )
         case_id = case["id"]
         _require(
@@ -311,18 +400,24 @@ def validate_cases(cases: list[dict[str, Any]]) -> None:
         prompt = _repo_relative_file(case["prompt"], field="prompt", case_id=case_id)
         _require(prompt.suffix == ".md", f"{case_id}: prompt must be Markdown")
         patch_value = case["patch"]
+        fixture_paths: set[str] = set()
         if patch_value is not None:
             patch = _repo_relative_file(patch_value, field="patch", case_id=case_id)
             _require(
                 patch.suffix == ".patch", f"{case_id}: patch must use the .patch suffix"
             )
-            for fixture_path in _validate_patch(patch, case_id=case_id):
+            fixture_paths = _validate_patch(patch, case_id=case_id)
+            for fixture_path in fixture_paths:
                 previous_owner = fixture_owners.get(fixture_path)
                 _require(
                     previous_owner is None,
                     f"{case_id}: fixture path {fixture_path!r} is also owned by {previous_owner}",
                 )
                 fixture_owners[fixture_path] = case_id
+        _require(
+            not is_repair or patch_value is not None,
+            f"{case_id}: repair cases require a fixture patch",
+        )
 
         _validate_expected_findings(case)
         forbidden = case["forbidden_findings"]
@@ -346,6 +441,7 @@ def validate_cases(cases: list[dict[str, Any]]) -> None:
             f"{case_id}: finding kinds cannot be both expected and forbidden: {sorted(contradictory)}",
         )
         _require(isinstance(case["notes"], str), f"{case_id}: notes must be a string")
+        _validate_repair_contract(case, fixture_paths)
 
     _require(
         category_counts["clean-control"] >= 2,

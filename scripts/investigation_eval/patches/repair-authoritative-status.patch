@@ -1,0 +1,27 @@
+diff --git a/investigation_cases/repair_authoritative_status.py b/investigation_cases/repair_authoritative_status.py
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/repair_authoritative_status.py
+@@ -0,0 +1,2 @@
++def command_succeeded(exit_code, stdout, stderr):
++    return "success" in stdout.casefold()
+diff --git a/investigation_cases/test_repair_authoritative_status.py b/investigation_cases/test_repair_authoritative_status.py
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/test_repair_authoritative_status.py
+@@ -0,0 +1,15 @@
++import unittest
++
++from repair_authoritative_status import command_succeeded
++
++
++class CommandSucceededTests(unittest.TestCase):
++    def test_exit_code_is_authoritative(self):
++        self.assertTrue(command_succeeded(0, "", "error-looking diagnostic"))
++        self.assertTrue(command_succeeded(0, "done", ""))
++        self.assertFalse(command_succeeded(1, "success", ""))
++        self.assertFalse(command_succeeded(2, "", ""))
++
++
++if __name__ == "__main__":
++    unittest.main()

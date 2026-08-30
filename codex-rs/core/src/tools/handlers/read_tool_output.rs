@@ -12,6 +12,9 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::context::semantic_evidence_for_command_output;
+use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_BYTES;
+use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_LEGACY_RANGES;
+use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_MAX_SELECTORS;
 use crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_TOOL_NAME;
 use crate::tools::handlers::read_tool_output_spec::create_read_tool_output_tool;
 use crate::tools::registry::CoreToolRuntime;
@@ -32,9 +35,7 @@ use serde_json::Value;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_MAX_BYTES: usize = 16_384;
 const DEFAULT_LINE_COUNT: usize = 200;
-const MAX_LEGACY_RANGES: usize = 16;
 const MAX_AGGREGATE_LINES: usize = 2_000;
 // A nested result is serialized into a code-mode cell and then into the outer
 // exec result. Reserve enough space for that outer envelope so a fitting exact
@@ -69,6 +70,8 @@ struct RecoveryContinuationStopV1 {
     reason: ContinuationStopReason,
     selector: Option<ToolOutputSelector>,
     resumable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,10 +116,23 @@ impl RecoveryContinuationState {
             selector,
             resumable: matches!(
                 reason,
-                ContinuationStopReason::Budget
-                    | ContinuationStopReason::Cancelled
-                    | ContinuationStopReason::PageReadError
+                ContinuationStopReason::Budget | ContinuationStopReason::Cancelled
             ),
+            message: None,
+        });
+    }
+
+    fn record_page_read_error(
+        &mut self,
+        error: &ReadToolOutputError,
+        selector: ToolOutputSelector,
+    ) {
+        self.continuation_stop = Some(RecoveryContinuationStopV1 {
+            version: 1,
+            reason: ContinuationStopReason::PageReadError,
+            selector: Some(selector),
+            resumable: matches!(error, ReadToolOutputError::StillWriting),
+            message: Some(error.for_model()),
         });
     }
 
@@ -266,7 +282,7 @@ struct ReadToolOutputArgs {
     #[serde(default)]
     end_line: Option<usize>,
     #[serde(default)]
-    ranges: Vec<ReadToolOutputRangeArgs>,
+    ranges: Option<Vec<ReadToolOutputRangeArgs>>,
     #[serde(default)]
     max_bytes: Option<usize>,
 }
@@ -598,8 +614,8 @@ async fn execute_recovery_transaction_with_continuations(
         }
         let (page, page_reused) = match page {
             Ok(page) => page,
-            Err(_) => {
-                state.record_stop(ContinuationStopReason::PageReadError, Some(selector));
+            Err(error) => {
+                state.record_page_read_error(&error, selector);
                 break;
             }
         };
@@ -663,31 +679,35 @@ fn resolved_selectors(
                 "selectors must contain at least one selector".to_string(),
             ));
         }
-        if selectors.len() > 64 {
-            return Err(FunctionCallError::RespondToModel(
-                "selectors may contain at most 64 entries".to_string(),
-            ));
+        if selectors.len() > READ_TOOL_OUTPUT_MAX_SELECTORS {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "selectors may contain at most {READ_TOOL_OUTPUT_MAX_SELECTORS} entries"
+            )));
         }
-        if args.start_line.is_some() || args.end_line.is_some() || !args.ranges.is_empty() {
+        if args.start_line.is_some() || args.end_line.is_some() || args.ranges.is_some() {
             return Err(FunctionCallError::RespondToModel(
                 "selectors cannot be combined with legacy line arguments".to_string(),
             ));
         }
         return Ok(selectors.clone());
     }
-    if !args.ranges.is_empty() {
+    if let Some(ranges) = &args.ranges {
         if args.start_line.is_some() || args.end_line.is_some() {
             return Err(FunctionCallError::RespondToModel(
                 "ranges is mutually exclusive with start_line/end_line".to_string(),
             ));
         }
-        if args.ranges.len() > MAX_LEGACY_RANGES {
+        if ranges.is_empty() {
+            return Err(FunctionCallError::RespondToModel(
+                "ranges must contain at least one range".to_string(),
+            ));
+        }
+        if ranges.len() > READ_TOOL_OUTPUT_MAX_LEGACY_RANGES {
             return Err(FunctionCallError::RespondToModel(format!(
-                "ranges may contain at most {MAX_LEGACY_RANGES} entries"
+                "ranges may contain at most {READ_TOOL_OUTPUT_MAX_LEGACY_RANGES} entries"
             )));
         }
-        let ranges = args
-            .ranges
+        let ranges = ranges
             .iter()
             .map(|range| {
                 if range.start_line == 0 || range.end_line < range.start_line {
@@ -737,13 +757,13 @@ fn resolved_line_range(args: &ReadToolOutputArgs) -> Result<(usize, usize), Func
 
 fn resolved_max_bytes(max_bytes: Option<usize>) -> Result<usize, FunctionCallError> {
     match max_bytes {
-        Some(max_bytes) if max_bytes == 0 || max_bytes > DEFAULT_MAX_BYTES => {
+        Some(max_bytes) if max_bytes == 0 || max_bytes > READ_TOOL_OUTPUT_MAX_BYTES => {
             Err(FunctionCallError::RespondToModel(format!(
-                "max_bytes must be between 1 and {DEFAULT_MAX_BYTES}"
+                "max_bytes must be between 1 and {READ_TOOL_OUTPUT_MAX_BYTES}"
             )))
         }
         Some(max_bytes) => Ok(max_bytes),
-        None => Ok(DEFAULT_MAX_BYTES),
+        None => Ok(READ_TOOL_OUTPUT_MAX_BYTES),
     }
 }
 
@@ -1263,10 +1283,47 @@ mod tests {
         assert_eq!(stop.reason, ContinuationStopReason::Budget);
         assert_eq!(stop.selector, Some(selector));
         assert!(stop.resumable);
+        assert_eq!(stop.message, None);
         assert_eq!(
             serde_json::to_value(stop).expect("serialize stop")["reason"],
             "budget"
         );
+    }
+
+    #[test]
+    fn continuation_page_error_preserves_retryability_and_cause() {
+        let selector = search_selector(10);
+        let cases = [
+            (ReadToolOutputError::InvalidArtifactId, false),
+            (
+                ReadToolOutputError::InvalidRange("invalid continuation range".to_string()),
+                false,
+            ),
+            (ReadToolOutputError::Expired, false),
+            (ReadToolOutputError::StillWriting, true),
+            (
+                ReadToolOutputError::Io("artifact storage unavailable".to_string()),
+                false,
+            ),
+        ];
+
+        for (error, resumable) in cases {
+            let expected_message = error.for_model();
+            let mut state = RecoveryContinuationState::new(
+                recovery_output(vec![selector_result(ToolOutputSelectorStatus::Ok)]),
+                false,
+                usize::MAX,
+            );
+            state.record_page_read_error(&error, selector.clone());
+            let stop = state
+                .finish()
+                .continuation_stop
+                .expect("page error stop receipt");
+            assert_eq!(stop.reason, ContinuationStopReason::PageReadError);
+            assert_eq!(stop.selector, Some(selector.clone()));
+            assert_eq!(stop.resumable, resumable);
+            assert_eq!(stop.message.as_deref(), Some(expected_message.as_str()));
+        }
     }
 
     #[test]
@@ -1285,7 +1342,7 @@ mod tests {
             selectors: None,
             start_line: Some(17),
             end_line: None,
-            ranges: Vec::new(),
+            ranges: None,
             max_bytes: None,
         };
         assert_eq!(resolved_line_range(&args).unwrap(), (17, 216));
@@ -1299,7 +1356,7 @@ mod tests {
                 selectors: None,
                 start_line: Some(start_line),
                 end_line,
-                ranges: Vec::new(),
+                ranges: None,
                 max_bytes: None,
             };
             assert!(resolved_selectors(&args).is_err());
@@ -1310,7 +1367,7 @@ mod tests {
             selectors: None,
             start_line: Some(3),
             end_line: Some(3),
-            ranges: Vec::new(),
+            ranges: None,
             max_bytes: None,
         };
         assert_eq!(
@@ -1326,6 +1383,72 @@ mod tests {
         assert_eq!(resolved_max_bytes(Some(16_384)).unwrap(), 16_384);
         for invalid in [0, 16_385, usize::MAX] {
             assert!(resolved_max_bytes(Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn read_tool_output_schema_matches_runtime_bounds() {
+        let tool = serde_json::to_value(create_read_tool_output_tool())
+            .expect("serialize read_tool_output tool");
+        let validator = jsonschema::validator_for(&tool["parameters"])
+            .expect("compile read_tool_output schema");
+        let line_selector = serde_json::json!({
+            "kind": "lines",
+            "start": 1,
+            "end": 1,
+        });
+        let selector_args = |count: usize, max_bytes: usize| {
+            serde_json::json!({
+                "artifact_id": "artifact",
+                "selectors": vec![line_selector.clone(); count],
+                "max_bytes": max_bytes,
+            })
+        };
+        let range_args = |count: usize| {
+            serde_json::json!({
+                "artifact_id": "artifact",
+                "ranges": (1..=count)
+                    .map(|line| serde_json::json!({
+                        "start_line": line,
+                        "end_line": line,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        };
+        let runtime_accepts = |value: &Value| {
+            parse_read_tool_output_args(&value.to_string())
+                .ok()
+                .is_some_and(|args| {
+                    resolved_max_bytes(args.max_bytes).is_ok() && resolved_selectors(&args).is_ok()
+                })
+        };
+        let cases = [
+            (selector_args(1, 1), true),
+            (
+                selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS, READ_TOOL_OUTPUT_MAX_BYTES),
+                true,
+            ),
+            (selector_args(0, 1), false),
+            (selector_args(READ_TOOL_OUTPUT_MAX_SELECTORS + 1, 1), false),
+            (selector_args(1, 0), false),
+            (selector_args(1, READ_TOOL_OUTPUT_MAX_BYTES + 1), false),
+            (range_args(1), true),
+            (range_args(READ_TOOL_OUTPUT_MAX_LEGACY_RANGES), true),
+            (range_args(0), false),
+            (range_args(READ_TOOL_OUTPUT_MAX_LEGACY_RANGES + 1), false),
+        ];
+
+        for (arguments, expected) in cases {
+            assert_eq!(
+                validator.is_valid(&arguments),
+                expected,
+                "schema verdict for {arguments}"
+            );
+            assert_eq!(
+                runtime_accepts(&arguments),
+                expected,
+                "runtime verdict for {arguments}"
+            );
         }
     }
 
@@ -1351,7 +1474,7 @@ mod tests {
             selectors: None,
             start_line: None,
             end_line: None,
-            ranges: vec![
+            ranges: Some(vec![
                 ReadToolOutputRangeArgs {
                     start_line: 2,
                     end_line: 4,
@@ -1364,7 +1487,7 @@ mod tests {
                     start_line: 21,
                     end_line: 25,
                 },
-            ],
+            ]),
             max_bytes: None,
         };
 
@@ -1385,7 +1508,7 @@ mod tests {
             selectors: None,
             start_line: None,
             end_line: None,
-            ranges: vec![
+            ranges: Some(vec![
                 ReadToolOutputRangeArgs {
                     start_line: 10,
                     end_line: 12,
@@ -1402,7 +1525,7 @@ mod tests {
                     start_line: 7,
                     end_line: 9,
                 },
-            ],
+            ]),
             max_bytes: None,
         };
 
@@ -1411,23 +1534,30 @@ mod tests {
             vec![ToolOutputSelector::Lines { start: 2, end: 12 }]
         );
 
-        args.ranges = (1..=MAX_LEGACY_RANGES)
-            .map(|line| ReadToolOutputRangeArgs {
-                start_line: line * 2,
-                end_line: line * 2,
-            })
-            .collect();
-        assert_eq!(resolved_selectors(&args).unwrap().len(), MAX_LEGACY_RANGES);
+        args.ranges = Some(
+            (1..=READ_TOOL_OUTPUT_MAX_LEGACY_RANGES)
+                .map(|line| ReadToolOutputRangeArgs {
+                    start_line: line * 2,
+                    end_line: line * 2,
+                })
+                .collect(),
+        );
+        assert_eq!(
+            resolved_selectors(&args).unwrap().len(),
+            READ_TOOL_OUTPUT_MAX_LEGACY_RANGES
+        );
 
-        args.ranges = (1..=MAX_LEGACY_RANGES + 1)
-            .map(|line| ReadToolOutputRangeArgs {
-                start_line: line * 2,
-                end_line: line * 2,
-            })
-            .collect();
+        args.ranges = Some(
+            (1..=READ_TOOL_OUTPUT_MAX_LEGACY_RANGES + 1)
+                .map(|line| ReadToolOutputRangeArgs {
+                    start_line: line * 2,
+                    end_line: line * 2,
+                })
+                .collect(),
+        );
         assert!(resolved_selectors(&args).is_err());
 
-        args.ranges = vec![
+        args.ranges = Some(vec![
             ReadToolOutputRangeArgs {
                 start_line: 1,
                 end_line: 1_000,
@@ -1436,7 +1566,7 @@ mod tests {
                 start_line: 2_000,
                 end_line: 3_000,
             },
-        ];
+        ]);
         assert!(resolved_selectors(&args).is_err());
     }
 }

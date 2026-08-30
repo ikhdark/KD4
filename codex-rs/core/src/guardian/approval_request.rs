@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use codex_analytics::GuardianReviewedAction;
 use codex_protocol::approvals::GuardianAssessmentAction;
 use codex_protocol::approvals::GuardianCommandSource;
@@ -27,7 +25,7 @@ pub(crate) enum GuardianApprovalRequest {
     ExecCommand {
         id: String,
         command: Vec<String>,
-        cwd: AbsolutePathBuf,
+        cwd: PathUri,
         sandbox_permissions: crate::sandboxing::SandboxPermissions,
         additional_permissions: Option<AdditionalPermissionProfile>,
         justification: Option<String>,
@@ -96,10 +94,10 @@ pub(crate) struct GuardianMcpAnnotations {
 }
 
 #[derive(Serialize)]
-struct CommandApprovalAction<'a> {
+struct CommandApprovalAction<'a, C: Serialize + ?Sized> {
     tool: &'a str,
     command: &'a [String],
-    cwd: &'a Path,
+    cwd: &'a C,
     sandbox_permissions: crate::sandboxing::SandboxPermissions,
     #[serde(skip_serializing_if = "Option::is_none")]
     additional_permissions: Option<&'a AdditionalPermissionProfile>,
@@ -157,10 +155,10 @@ fn serialize_guardian_action(value: impl Serialize) -> serde_json::Result<Value>
     serde_json::to_value(value)
 }
 
-fn serialize_command_guardian_action(
+fn serialize_command_guardian_action<C: Serialize + ?Sized>(
     tool: &'static str,
     command: &[String],
-    cwd: &Path,
+    cwd: &C,
     sandbox_permissions: crate::sandboxing::SandboxPermissions,
     additional_permissions: Option<&AdditionalPermissionProfile>,
     justification: Option<&String>,
@@ -180,12 +178,12 @@ fn serialize_command_guardian_action(
 fn command_assessment_action(
     source: GuardianCommandSource,
     command: &[String],
-    cwd: &AbsolutePathBuf,
+    cwd: codex_utils_path_uri::LegacyAppPathString,
 ) -> GuardianAssessmentAction {
     GuardianAssessmentAction::Command {
         source,
         command: codex_shell_command::parse_command::shlex_join(command),
-        cwd: cwd.clone(),
+        cwd,
     }
 }
 
@@ -377,11 +375,13 @@ pub(crate) fn guardian_assessment_action(
 ) -> GuardianAssessmentAction {
     match action {
         GuardianApprovalRequest::Shell { command, cwd, .. } => {
-            command_assessment_action(GuardianCommandSource::Shell, command, cwd)
+            command_assessment_action(GuardianCommandSource::Shell, command, cwd.clone().into())
         }
-        GuardianApprovalRequest::ExecCommand { command, cwd, .. } => {
-            command_assessment_action(GuardianCommandSource::UnifiedExec, command, cwd)
-        }
+        GuardianApprovalRequest::ExecCommand { command, cwd, .. } => command_assessment_action(
+            GuardianCommandSource::UnifiedExec,
+            command,
+            cwd.clone().into(),
+        ),
 
         GuardianApprovalRequest::ApplyPatch { cwd, files, .. } => {
             GuardianAssessmentAction::ApplyPatch {

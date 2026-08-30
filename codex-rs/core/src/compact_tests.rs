@@ -339,29 +339,6 @@ do things
 }
 
 #[test]
-fn compaction_retains_authoritative_task_evidence_while_stripping_other_startup_entries() {
-    let task_evidence =
-        "<kd4_task_state_v1>\nauthoritative continuation checkpoint\n</kd4_task_state_v1>";
-    let items = vec![
-        user_message(&crate::context::TaskModelGuidance.render()),
-        user_message("<environment_context>\n<cwd>/stale</cwd>\n</environment_context>"),
-        user_message(task_evidence),
-        user_message("real user message"),
-    ];
-
-    let compactable = strip_compaction_startup_envelopes(items);
-    let collected = collect_user_messages(&compactable);
-
-    assert_eq!(
-        collected,
-        vec![
-            compacted_user_message(task_evidence),
-            compacted_user_message("real user message"),
-        ]
-    );
-}
-
-#[test]
 fn compaction_keeps_only_current_developer_startup_and_preserves_ordinary_developer_text() {
     let old_instructions = crate::context_manager::updates::build_developer_update_item(
         crate::stable_context::configured_developer_instructions_sections(Some(
@@ -817,6 +794,50 @@ fn unresolved_text_omission_reports_stable_provenance_and_exact_counts() {
 }
 
 #[test]
+fn over_truncation_moderate_unresolved_user_text_is_retained_without_a_retry() {
+    let sentinel = "ROOT_CONSTRAINT_SENTINEL";
+    let text = format!(
+        "{}{}{}",
+        "exact ".repeat(2_000),
+        sentinel,
+        " tail".repeat(2_000)
+    );
+    assert!(approx_token_count(&text) > 4_000);
+    assert!(approx_token_count(&text) < COMPACT_USER_MESSAGE_MAX_TOKENS);
+
+    let (history, _, _, omitted_user_text) =
+        build_bounded_unresolved_input_history(&[user_message(&text)]);
+    let rendered = serde_json::to_string(&history).expect("history serializes");
+
+    assert!(!omitted_user_text);
+    assert!(rendered.contains(sentinel));
+    assert!(!rendered.contains(COMPACT_TEXT_OMISSION_MARKER));
+}
+
+#[test]
+fn over_truncation_large_unresolved_text_gets_exact_artifact_recovery_payload() {
+    let sentinel = "CENTRAL_EXACT_CONSTRAINT_SENTINEL";
+    let text = format!(
+        "{}{}{}",
+        "leading constraint ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS),
+        sentinel,
+        " trailing constraint".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS)
+    );
+    let items = vec![user_message(&text)];
+    let (bounded, _, _, omitted_user_text) = build_bounded_unresolved_input_history(&items);
+
+    assert!(omitted_user_text);
+    let canonical = compaction_text_recovery_canonical(&items, &bounded)
+        .expect("omitted unresolved text must get a canonical recovery payload");
+    assert!(String::from_utf8_lossy(&canonical.bytes).contains(sentinel));
+    assert_eq!(
+        canonical.value.as_ref().unwrap()["kind"],
+        "local_compaction_text_recovery"
+    );
+    assert!(canonical.complete);
+}
+
+#[test]
 fn bounded_agent_history_emits_text_omission_receipt() {
     let items = vec![
         ResponseItem::Message {
@@ -909,6 +930,38 @@ fn summary_can_be_reused_when_only_new_user_input_follows_it() {
     ];
     assert_eq!(latest_summary_message(&items), Some(summary_text.as_str()));
     assert!(history_after_latest_summary_is_user_only(&items));
+}
+
+#[test]
+fn token_backfire_compaction_summary_keeps_artifact_pin_sidecar_separate() {
+    let summary_text = format!("{SUMMARY_PREFIX}\nsettled state");
+    let pin_payload = serde_json::json!({
+        "version": 1,
+        "kind": "tool_history_artifact_pins",
+        "artifacts": [{
+            "version": 1,
+            "kind": "tool_history_artifact_pin",
+            "artifact_id": "artifact-1",
+            "bytes": 96_000,
+            "sha256": "abc123"
+        }]
+    })
+    .to_string();
+
+    let item =
+        compaction_summary_item_with_artifact_pins(summary_text.clone(), Some(pin_payload.clone()));
+
+    assert_eq!(compaction_summary_text(&item), Some(summary_text.as_str()));
+    let ResponseItem::Message { content, .. } = item else {
+        panic!("compaction summary must remain a message");
+    };
+    assert_eq!(
+        content,
+        vec![
+            ContentItem::InputText { text: summary_text },
+            ContentItem::InputText { text: pin_payload },
+        ]
+    );
 }
 
 #[test]

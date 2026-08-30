@@ -118,7 +118,6 @@ pub struct TurnProfile {
     pub server_end_turn_false: u32,
     pub pending_input: u32,
     pub stop_hook: u32,
-    pub completion_review_repair: u32,
     pub invalid_image_recovery: u32,
 }
 
@@ -180,6 +179,7 @@ pub enum CodexErrKind {
     TurnAborted,
     Stream,
     PreDispatchRetryExhausted,
+    RequestBuild,
     ContextWindowExceeded,
     ThreadNotFound,
     AgentLimitReached,
@@ -232,6 +232,7 @@ impl From<&CodexErr> for CodexErrKind {
             CodexErr::TurnAborted => CodexErrKind::TurnAborted,
             CodexErr::Stream(..) => CodexErrKind::Stream,
             CodexErr::PreDispatchRetryExhausted(_) => CodexErrKind::PreDispatchRetryExhausted,
+            CodexErr::RequestBuild(_) => CodexErrKind::RequestBuild,
             CodexErr::ContextWindowExceeded => CodexErrKind::ContextWindowExceeded,
             CodexErr::ThreadNotFound(_) => CodexErrKind::ThreadNotFound,
             CodexErr::AgentLimitReached { .. } => CodexErrKind::AgentLimitReached,
@@ -658,6 +659,16 @@ mod tests {
         assert_eq!(
             serde_json::to_value(kind).expect("serialize error kind"),
             serde_json::json!("pre_dispatch_retry_exhausted")
+        );
+    }
+
+    #[test]
+    fn request_build_has_distinct_analytics_kind() {
+        let kind = CodexErrKind::from(&CodexErr::RequestBuild("invalid header".to_string()));
+
+        assert_eq!(
+            serde_json::to_value(kind).expect("serialize error kind"),
+            serde_json::json!("request_build")
         );
     }
 

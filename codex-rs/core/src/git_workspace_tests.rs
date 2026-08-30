@@ -152,58 +152,51 @@ async fn create_clean_git_repo() -> (TempDir, AbsolutePathBuf) {
 }
 
 #[test]
-fn duplicate_repository_reads_combined_diff_preserves_only_the_patch() {
-    let capture = b":100644 100644 aaaaaaa bbbbbbb M\0src/lib.rs\0\
-:100644 100644 aaaaaaa bbbbbbb R100\0old name.rs\0new name.rs\0\0\
-diff --git a/src/lib.rs b/src/lib.rs\npatch body\n";
+fn ordinary_workspace_identity_does_not_request_patch_or_content_materialization() {
+    let args = workspace_generation_status_args();
 
-    let (paths, patch) = candidate_diff_and_paths(capture.to_vec()).expect("combined diff capture");
-
-    assert_eq!(
-        paths,
-        vec![
-            "src/lib.rs".to_string(),
-            "old name.rs".to_string(),
-            "new name.rs".to_string(),
-        ]
-    );
-    assert_eq!(patch, b"diff --git a/src/lib.rs b/src/lib.rs\npatch body\n");
-}
-
-#[test]
-fn duplicate_repository_reads_untracked_paths_are_owned_in_one_parse() {
-    assert_eq!(
-        candidate_untracked_paths(b"z.txt\0a file.txt\0\0"),
-        Some(vec!["z.txt".to_string(), "a file.txt".to_string()])
-    );
-    assert_eq!(candidate_untracked_paths(b"valid\0\xff\0"), None);
-}
-
-#[test]
-fn workspace_evidence_timeout_attribution_names_each_git_dependency() {
-    let timed_out = CandidateGitOutput::TimedOut;
-    let completed = CandidateGitOutput::Output(Vec::new());
-
-    let dependencies = candidate_git_timeouts(&timed_out, &completed, &timed_out, &timed_out)
-        .into_iter()
-        .map(WorkspaceEvidenceGitDependency::as_str)
-        .collect::<Vec<_>>();
-
-    assert_eq!(dependencies, vec!["head", "worktree", "untracked"]);
+    assert!(args.contains(&"status"));
+    assert!(args.contains(&"--porcelain=v2"));
+    for expensive_arg in ["diff", "--patch", "--binary", "ls-files", "hash-object"] {
+        assert!(!args.contains(&expensive_arg));
+    }
 }
 
 #[tokio::test]
-async fn duplicate_repository_reads_require_two_matching_captures() {
-    let mut observations = [Some(1), Some(2), Some(2)].into_iter();
-    assert_eq!(
-        stable_workspace_capture(|| std::future::ready(observations.next().flatten())).await,
-        Some(2)
+async fn workspace_generation_capture_has_one_absolute_deadline() {
+    let result = within_workspace_generation_deadline(
+        Duration::from_millis(10),
+        std::future::pending::<()>(),
+    )
+    .await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn workspace_generation_metadata_fails_closed_at_resource_bounds() {
+    let temp = TempDir::new().expect("metadata fixture");
+    let paths = (0..=WORKSPACE_GENERATION_MAX_PATHS)
+        .map(|index| format!("path-{index:04}.txt"))
+        .collect::<Vec<_>>();
+    for path in &paths {
+        std::fs::write(temp.path().join(path), []).expect("write metadata fixture");
+    }
+    assert!(
+        workspace_generation_metadata(temp.path().to_path_buf(), paths)
+            .await
+            .is_none()
     );
 
-    let mut changing = [Some(1), Some(2), Some(3)].into_iter();
-    assert_eq!(
-        stable_workspace_capture(|| std::future::ready(changing.next().flatten())).await,
-        None
+    let large_path = temp.path().join("large.bin");
+    let large = std::fs::File::create(&large_path).expect("create sparse large fixture");
+    large
+        .set_len(WORKSPACE_GENERATION_MAX_DECLARED_BYTES.saturating_add(1))
+        .expect("size sparse large fixture");
+    assert!(
+        workspace_generation_metadata(temp.path().to_path_buf(), vec!["large.bin".to_string()])
+            .await
+            .is_none()
     );
 }
 
@@ -234,46 +227,40 @@ async fn failed_workspace_refresh_invalidates_the_latest_identity() {
 }
 
 #[tokio::test]
-async fn duplicate_repository_reads_candidate_diff_uses_combined_layer_observations() {
+async fn ordinary_workspace_identity_tracks_dirty_content_when_status_is_unchanged() {
     let (_temp, repo) = create_clean_git_repo().await;
-    std::fs::write(repo.join("staged.txt"), "staged\n").expect("write staged file");
-    run_git(repo.as_path(), &["add", "staged.txt"]).await;
-    std::fs::write(repo.join("README.md"), "worktree\n").expect("write worktree file");
-    std::fs::write(repo.join("untracked.txt"), "untracked\n").expect("write untracked file");
-
-    let capture = capture_candidate_diff(repo.as_path())
+    let readme = repo.join("README.md");
+    std::fs::write(&readme, "first dirty value\n").expect("first dirty write");
+    let original_modified = std::fs::metadata(&readme)
+        .expect("first dirty metadata")
+        .modified()
+        .expect("first dirty modified time");
+    let first_status =
+        workspace_generation_git_output(repo.as_path(), workspace_generation_status_args())
+            .await
+            .expect("first status");
+    let first = capture_workspace_evidence_identity(repo.as_path())
         .await
-        .expect("candidate diff capture");
-    let identity = capture.workspace_evidence_identity();
-    let identity_only = capture_workspace_evidence_identity(repo.as_path())
-        .await
-        .expect("identity-only capture");
+        .expect("first identity");
 
-    assert_eq!(
-        capture.changed_paths,
-        vec![
-            "README.md".to_string(),
-            "staged.txt".to_string(),
-            "untracked.txt".to_string(),
-        ]
-    );
-    let raw_diff = String::from_utf8(capture.raw_diff).expect("UTF-8 fixture diff");
-    assert!(raw_diff.contains("diff --git a/staged.txt b/staged.txt"));
-    assert!(raw_diff.contains("diff --git a/README.md b/README.md"));
-    assert!(raw_diff.contains("untracked.txt\0"));
-    assert_eq!(identity.head_identity, capture.head_identity);
-    assert_eq!(identity.index_identity, capture.index_identity);
-    assert_eq!(identity.worktree_identity, capture.worktree_identity);
-    assert_eq!(identity_only, identity);
-    assert_eq!(
-        identity.repository_root,
-        Some(
-            dunce::canonicalize(repo.as_path())
-                .expect("canonical repo")
-                .to_string_lossy()
-                .into_owned()
-        )
-    );
+    std::fs::write(&readme, "other dirty value\n").expect("second dirty write");
+    std::fs::File::options()
+        .write(true)
+        .open(&readme)
+        .expect("open second dirty value")
+        .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+        .expect("restore dirty modified time");
+    let second_status =
+        workspace_generation_git_output(repo.as_path(), workspace_generation_status_args())
+            .await
+            .expect("second status");
+    let second = capture_workspace_evidence_identity(repo.as_path())
+        .await
+        .expect("second identity");
+
+    assert_eq!(first_status, second_status);
+    assert_eq!(first.index_identity, second.index_identity);
+    assert_ne!(first.worktree_identity, second.worktree_identity);
 }
 
 #[tokio::test]
@@ -758,32 +745,6 @@ async fn watcher_failure_clears_and_disables_cached_identity() {
 }
 
 #[tokio::test]
-async fn workspace_change_observation_fails_open_on_changes_or_watcher_uncertainty() {
-    let root = TempDir::new().expect("observation root");
-    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
-    let unchanged = cache
-        .begin_workspace_change_observation(root.path())
-        .expect("reliable watcher observation");
-    assert!(cache.workspace_change_observation_is_current(&unchanged));
-
-    cache.note_host_workspace_mutation();
-    assert!(!cache.workspace_change_observation_is_current(&unchanged));
-
-    let changed = cache
-        .begin_workspace_change_observation(root.path())
-        .expect("refreshed observation");
-    cache.watcher_generation.fetch_add(1, Ordering::AcqRel);
-    assert!(!cache.workspace_change_observation_is_current(&changed));
-
-    let unavailable = GitWorkspaceCache::with_watcher(None);
-    assert!(
-        unavailable
-            .begin_workspace_change_observation(root.path())
-            .is_none()
-    );
-}
-
-#[tokio::test]
 async fn workspace_evidence_identity_recaptures_without_waiting_for_watcher_delivery() {
     let (_temp, repo) = create_clean_git_repo().await;
     let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
@@ -878,22 +839,6 @@ async fn workspace_evidence_identity_excludes_codex_eval_artifacts() {
         .expect("second identity");
 
     assert_eq!(second, first);
-}
-
-#[test]
-fn generated_eval_host_mutations_do_not_advance_workspace_observations() {
-    let root = TempDir::new().expect("workspace observation root");
-    let cache = GitWorkspaceCache::with_watcher(Some(Arc::new(FileWatcher::noop())));
-    let observation = cache
-        .begin_workspace_change_observation(root.path())
-        .expect("workspace observation");
-
-    cache.note_host_workspace_mutation_paths(
-        root.path(),
-        &[".codex/evals/generated.jsonl".to_string()],
-    );
-
-    assert!(cache.workspace_change_observation_is_current(&observation));
 }
 
 #[tokio::test]

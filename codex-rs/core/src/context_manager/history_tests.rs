@@ -479,52 +479,6 @@ fn user_input_text_msg(text: &str) -> ResponseItem {
     }
 }
 
-#[test]
-fn finalization_projection_keeps_startup_checkpoint_and_only_requested_exact_artifact() {
-    let startup = crate::context::ContextualUserFragment::into(UserInstructions {
-        directory: None,
-        text: "stable startup instructions".to_string(),
-    });
-    let mut items = vec![startup];
-    for index in 0..200 {
-        items.push(user_msg(&format!("historical user message {index}")));
-        items.push(assistant_msg(&format!(
-            "historical assistant message {index}"
-        )));
-    }
-    for call_id in ["artifact-a", "artifact-b"] {
-        items.push(ResponseItem::FunctionCall {
-            id: None,
-            name: crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_TOOL_NAME
-                .to_string(),
-            namespace: None,
-            arguments: format!(r#"{{"artifact_id":"{call_id}"}}"#),
-            call_id: call_id.to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        });
-        items.push(ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: call_id.to_string(),
-            output: FunctionCallOutputPayload::from_text(format!("exact output {call_id}")),
-            internal_chat_message_metadata_passthrough: None,
-        });
-    }
-    let history = create_history_with_items(items);
-    let prepared = history.prepare_for_finalization(
-        &default_input_modalities(),
-        CompletionCheckpointContext::new("checkpoint-required-material"),
-        &BTreeSet::from(["artifact-a".to_string()]),
-    );
-    let rendered = serde_json::to_string(prepared.items()).expect("projected prompt serializes");
-    assert!(rendered.contains("stable startup instructions"));
-    assert!(rendered.contains("checkpoint-required-material"));
-    assert!(rendered.contains("artifact-a"));
-    assert!(rendered.contains("exact output artifact-a"));
-    assert!(!rendered.contains("artifact-b"));
-    assert!(!rendered.contains("historical user message"));
-    assert!(!rendered.contains("historical assistant message"));
-}
-
 fn developer_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -945,6 +899,39 @@ fn total_token_usage_keeps_server_snapshot_plus_same_group_tool_tail_in_both_mod
             100 + estimate_item_token_count(&added_tool_output)
         );
     }
+}
+
+#[test]
+fn total_token_usage_restores_earlier_reasoning_when_server_omits_it() {
+    let earlier_reasoning = reasoning_with_encrypted_content(/*len*/ 2_000);
+    let current_reasoning = reasoning_with_encrypted_content(/*len*/ 1_000);
+    let mut history = create_history_with_items(vec![
+        user_input_text_msg("first instruction"),
+        earlier_reasoning.clone(),
+        assistant_msg("first response"),
+        user_input_text_msg("second instruction"),
+        current_reasoning,
+        assistant_msg("second response"),
+    ]);
+    history.update_token_info(
+        &TokenUsage {
+            total_tokens: 100,
+            ..Default::default()
+        },
+        /*model_context_window*/ None,
+    );
+    let base_instructions = BaseInstructions {
+        text: "base instructions".to_string(),
+    };
+
+    assert_eq!(
+        history.get_total_token_usage(/*server_reasoning_included*/ true, &base_instructions),
+        100
+    );
+    assert_eq!(
+        history.get_total_token_usage(/*server_reasoning_included*/ false, &base_instructions),
+        100 + estimate_item_token_count(&earlier_reasoning)
+    );
 }
 
 #[test]

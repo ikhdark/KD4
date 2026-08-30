@@ -291,6 +291,57 @@ async fn aggregate_recovery_reserves_space_for_later_ranges_and_returns_continua
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
+async fn over_truncation_marginal_aggregate_overage_returns_exact_results_without_retry() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = CanonicalToolResult::text("alpha recovery\nbeta recovery\n");
+    let artifact = create_canonical_output_artifact(temp.path(), "thread", &canonical).await;
+    let artifact_id = artifact.artifact_id().expect("canonical artifact ID");
+    let selectors = vec![
+        ToolOutputSelector::Lines { start: 1, end: 1 },
+        ToolOutputSelector::Lines { start: 2, end: 2 },
+    ];
+    let full = read_tool_output_selectors_with_ceiling(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        selectors.clone(),
+        usize::MAX,
+    )
+    .await
+    .expect("measure complete response");
+    let full_tokens =
+        approx_token_count(&serde_json::to_string(&full).expect("serialize response"));
+    let marginal_ceiling = full_tokens.saturating_sub(1);
+
+    let recovered = read_tool_output_selectors_with_ceiling(
+        temp.path(),
+        "thread",
+        &artifact_id,
+        selectors,
+        marginal_ceiling,
+    )
+    .await
+    .expect("admit a marginal overage instead of forcing another read");
+
+    assert!(!response_fits_recovery_token_ceiling(
+        &recovered,
+        marginal_ceiling
+    ));
+    assert!(response_fits_recovery_retry_avoidance_ceiling(
+        &recovered,
+        marginal_ceiling
+    ));
+    assert!(recovered.complete);
+    assert!(
+        recovered
+            .results
+            .iter()
+            .all(|result| { result.status == ToolOutputSelectorStatus::Ok && result.complete })
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
 async fn exact_three_kib_section_is_complete_in_one_transaction() {
     let temp = tempfile::tempdir().expect("tempdir");
     let text = (0..48)
@@ -1054,16 +1105,29 @@ async fn global_retention_bounds_artifacts_across_threads() {
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
-async fn protected_evidence_artifact_survives_per_thread_retention_without_reducing_generic_limit()
+async fn active_tool_history_artifact_survives_per_thread_retention_without_reducing_generic_limit()
 {
     let temp = tempfile::tempdir().expect("tempdir");
-    let artifact = create_evidence_output_artifact(temp.path(), "thread", b"durable evidence")
-        .await
-        .expect("pending evidence")
-        .mark_durable();
-    let RawOutputArtifact::Stored { path, .. } = &artifact else {
+    let output = b"active tool output";
+    let artifact = create_raw_output_artifact(temp.path(), "thread", output).await;
+    let RawOutputArtifact::Stored {
+        id, path, bytes, ..
+    } = &artifact
+    else {
         panic!("expected stored artifact");
     };
+    let id = id.to_string();
+    let path = path.clone();
+    protect_active_tool_history_artifact(
+        temp.path(),
+        "thread",
+        &id,
+        *bytes,
+        &format!("{:x}", Sha256::digest(output)),
+    )
+    .await
+    .expect("protect active tool-history artifact");
+    drop(artifact);
 
     for index in 0..(max_retained_artifacts_per_thread() + 5) {
         create_raw_output_artifact(temp.path(), "thread", format!("generic-{index}").as_bytes())
@@ -1071,7 +1135,7 @@ async fn protected_evidence_artifact_survives_per_thread_retention_without_reduc
     }
 
     assert!(path.exists());
-    assert!(evidence_protection_path(path).exists());
+    assert!(active_tool_history_protection_path(&path).exists());
     let mut generic_logs = 0;
     let mut total_logs = 0;
     let mut entries = tokio::fs::read_dir(path.parent().expect("thread directory"))
@@ -1080,7 +1144,7 @@ async fn protected_evidence_artifact_survives_per_thread_retention_without_reduc
     while let Some(entry) = entries.next_entry().await.expect("artifact entry") {
         if entry.path().extension().and_then(|value| value.to_str()) == Some("log") {
             total_logs += 1;
-            if entry.path() != *path {
+            if entry.path() != path {
                 generic_logs += 1;
             }
         }
@@ -1091,213 +1155,28 @@ async fn protected_evidence_artifact_survives_per_thread_retention_without_reduc
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
-async fn evidence_creation_holds_retention_permit_until_marker_is_durable() {
+async fn global_retention_skips_active_tool_history_without_broadening_generic_limit() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
-    let evidence_barrier = Arc::clone(&barrier);
-    let codex_home = temp.path().to_path_buf();
-    let evidence_task = tokio::spawn(async move {
-        create_evidence_output_artifact_inner(
-            &codex_home,
-            "thread",
-            b"durable evidence",
-            Some(evidence_barrier.as_ref()),
-        )
-        .await
-    });
-
-    barrier.wait().await;
-    let directory = temp.path().join("tool-output").join("thread");
-    let mut entries = tokio::fs::read_dir(&directory)
-        .await
-        .expect("thread artifacts");
-    let log_path = loop {
-        let entry = entries
-            .next_entry()
-            .await
-            .expect("artifact entry")
-            .expect("evidence log");
-        if entry.path().extension().and_then(|value| value.to_str()) == Some("log") {
-            break entry.path();
-        }
-    };
-    assert_eq!(
-        tokio::fs::symlink_metadata(&log_path)
-            .await
-            .expect("synced evidence log")
-            .len(),
-        b"durable evidence".len() as u64
-    );
-    assert!(!evidence_protection_path(&log_path).exists());
-
-    let mut churn = tokio::task::JoinSet::new();
-    for index in 0..(max_retained_artifacts_per_thread() + 1) {
-        let codex_home = temp.path().to_path_buf();
-        churn.spawn(async move {
-            create_raw_output_artifact(&codex_home, "thread", format!("generic-{index}").as_bytes())
-                .await
-        });
-    }
-
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let mut log_count = 0;
-            let mut entries = tokio::fs::read_dir(&directory)
-                .await
-                .expect("thread artifacts");
-            while let Some(entry) = entries.next_entry().await.expect("artifact entry") {
-                if entry.path().extension().and_then(|value| value.to_str()) == Some("log") {
-                    log_count += 1;
-                }
-            }
-            if log_count == max_retained_artifacts_per_thread() + 2 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("generic artifacts should reach the retention gate");
-
-    barrier.wait().await;
-    let artifact = evidence_task
-        .await
-        .expect("evidence creation task")
-        .expect("pending evidence")
-        .mark_durable();
-    while let Some(result) = churn.join_next().await {
-        result.expect("generic artifact task");
-    }
-
-    let RawOutputArtifact::Stored { path, .. } = artifact else {
-        panic!("expected protected evidence artifact");
-    };
-    assert!(path.exists());
-    assert!(evidence_protection_path(&path).exists());
-}
-
-#[tokio::test]
-#[serial_test::serial(command_output_artifact)]
-async fn active_reader_trim_unprotects_artifact_before_eventual_retention_cleanup() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let artifact = create_evidence_output_artifact(temp.path(), "thread", b"durable evidence")
-        .await
-        .expect("pending evidence")
-        .mark_durable();
-    let RawOutputArtifact::Stored { id, path, .. } = &artifact else {
-        panic!("expected stored evidence");
-    };
-    let reader = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .expect("open evidence reader");
-    reader.try_lock().expect("lock evidence reader");
-
-    assert!(
-        delete_evidence_artifact(temp.path(), "thread", &id.to_string())
-            .await
-            .is_err()
-    );
-    assert!(path.exists());
-    assert!(!evidence_protection_path(path).exists());
-    drop(reader);
-
-    for index in 0..(max_retained_artifacts_per_thread() + 5) {
-        create_raw_output_artifact(temp.path(), "thread", format!("generic-{index}").as_bytes())
-            .await;
-    }
-    assert!(!path.exists());
-}
-
-#[tokio::test]
-#[serial_test::serial(command_output_artifact)]
-async fn cancelled_evidence_creation_leaves_no_protected_orphan() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
-    let creation_barrier = Arc::clone(&barrier);
-    let codex_home = temp.path().to_path_buf();
-    let creation_task = tokio::spawn(async move {
-        create_evidence_output_artifact_inner(
-            &codex_home,
-            "thread",
-            b"durable evidence",
-            Some(creation_barrier.as_ref()),
-        )
-        .await
-    });
-    barrier.wait().await;
-    creation_task.abort();
-    assert!(matches!(
-        creation_task.await,
-        Err(err) if err.is_cancelled()
-    ));
-
-    let directory = temp.path().join("tool-output").join("thread");
-    let mut entries = tokio::fs::read_dir(directory)
-        .await
-        .expect("thread artifacts");
-    while let Some(entry) = entries.next_entry().await.expect("artifact entry") {
-        let path = entry.path();
-        let extension = path.extension().and_then(|value| value.to_str());
-        assert_ne!(extension, Some("log"));
-        assert_ne!(extension, Some(EVIDENCE_PROTECTION_EXTENSION));
-    }
-}
-
-#[tokio::test]
-#[serial_test::serial(command_output_artifact)]
-async fn cancelled_pending_evidence_lease_cleans_up_but_durable_lease_survives() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let pending = create_evidence_output_artifact(temp.path(), "thread", b"pending evidence")
-        .await
-        .expect("pending evidence");
-    let pending_path = pending.path.clone();
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
-    let persistence_barrier = Arc::clone(&barrier);
-    let persistence_task = tokio::spawn(async move {
-        persistence_barrier.wait().await;
-        persistence_barrier.wait().await;
-        pending.mark_durable()
-    });
-    barrier.wait().await;
-    persistence_task.abort();
-    assert!(
-        persistence_task
-            .await
-            .expect_err("persistence should be cancelled")
-            .is_cancelled()
-    );
-    assert!(!pending_path.exists());
-    assert!(!evidence_protection_path(&pending_path).exists());
-
-    let durable = create_evidence_output_artifact(temp.path(), "thread", b"durable evidence")
-        .await
-        .expect("pending durable evidence")
-        .mark_durable();
-    let RawOutputArtifact::Stored { path, .. } = durable else {
-        panic!("expected durable evidence");
-    };
-    assert!(path.exists());
-    assert!(evidence_protection_path(&path).exists());
-}
-
-#[tokio::test]
-#[serial_test::serial(command_output_artifact)]
-async fn global_retention_skips_protected_evidence_without_broadening_generic_limit() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let artifact =
-        create_evidence_output_artifact(temp.path(), "evidence-thread", b"durable evidence")
-            .await
-            .expect("pending evidence")
-            .mark_durable();
+    let output = b"active tool output";
+    let artifact = create_raw_output_artifact(temp.path(), "active-thread", output).await;
     let RawOutputArtifact::Stored {
-        path: evidence_path,
-        ..
+        id, path, bytes, ..
     } = &artifact
     else {
         panic!("expected stored artifact");
     };
+    let id = id.to_string();
+    let protected_path = path.clone();
+    protect_active_tool_history_artifact(
+        temp.path(),
+        "active-thread",
+        &id,
+        *bytes,
+        &format!("{:x}", Sha256::digest(output)),
+    )
+    .await
+    .expect("protect active tool-history artifact");
+    drop(artifact);
     let root = temp.path().join("tool-output");
     for index in 0..(max_retained_artifacts_total() + 5) {
         let directory = root.join(format!("generic-thread-{}", index % 16));
@@ -1319,7 +1198,7 @@ async fn global_retention_skips_protected_evidence_without_broadening_generic_li
     );
     enforce_global_retention(&root, &keep_path).await;
 
-    assert!(evidence_path.exists());
+    assert!(protected_path.exists());
     let mut generic_logs = 0;
     let mut directories = tokio::fs::read_dir(&root).await.expect("tool output root");
     while let Some(directory) = directories.next_entry().await.expect("thread directory") {
@@ -1328,7 +1207,7 @@ async fn global_retention_skips_protected_evidence_without_broadening_generic_li
             .expect("thread artifacts");
         while let Some(entry) = entries.next_entry().await.expect("artifact entry") {
             if entry.path().extension().and_then(|value| value.to_str()) == Some("log")
-                && entry.path() != *evidence_path
+                && entry.path() != protected_path
             {
                 generic_logs += 1;
             }
@@ -1349,7 +1228,10 @@ async fn retention_sweeps_are_serialized() {
     tokio::fs::write(&keep_path, b"keep")
         .await
         .expect("keep artifact");
-    let retention_permit = retention_sweep_permit().await;
+    let root = tool_output_root_for_directory(&directory);
+    let retention_permit = retention_sweep_permit(&root)
+        .await
+        .expect("retention permit");
     let mut sweep = tokio::spawn({
         let directory = directory.clone();
         let keep_path = keep_path.clone();
@@ -1367,6 +1249,62 @@ async fn retention_sweeps_are_serialized() {
         .await
         .expect("retention sweep should resume after lock release")
         .expect("retention sweep task");
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn independent_retention_roots_acquire_in_parallel() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first_root = temp.path().join("first").join("tool-output");
+    let second_root = temp.path().join("second").join("tool-output");
+
+    let first_permit = retention_sweep_permit(&first_root)
+        .await
+        .expect("first retention permit");
+    let second_permit = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        retention_sweep_permit(&second_root),
+    )
+    .await
+    .expect("an independent artifact root must not wait for the first root")
+    .expect("second retention permit");
+
+    drop(second_permit);
+    drop(first_permit);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn artifact_creation_fails_open_when_retention_lock_acquisition_fails() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let failures_before = retention_sweep_permit_failures_for_test();
+    inject_retention_sweep_permit_failure_for_test(1);
+
+    let artifact = create_raw_output_artifact(temp.path(), "thread", b"durable output").await;
+
+    assert!(matches!(artifact, RawOutputArtifact::Stored { .. }));
+    assert_eq!(
+        retention_sweep_permit_failures_for_test(),
+        failures_before + 1,
+        "the skipped sweep must remain observable"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn artifact_creation_fails_open_when_retention_lock_task_fails() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let failures_before = retention_sweep_permit_failures_for_test();
+    inject_retention_sweep_permit_failure_for_test(2);
+
+    let artifact = create_raw_output_artifact(temp.path(), "thread", b"durable output").await;
+
+    assert!(matches!(artifact, RawOutputArtifact::Stored { .. }));
+    assert_eq!(
+        retention_sweep_permit_failures_for_test(),
+        failures_before + 1,
+        "the failed lock task must remain observable"
+    );
 }
 
 #[test]
@@ -1441,9 +1379,13 @@ fn audit_output_artifact_unavailable_ranges_preserve_canonical_gaps() {
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
 async fn audit_output_artifact_retention_permit_uses_interprocess_lock() {
-    let permit = retention_sweep_permit().await;
-    retention_interprocess_index_stale().store(false, Ordering::Release);
-    let generation_path = retention_interprocess_lock_target();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("tool-output");
+    let permit = retention_sweep_permit(&root)
+        .await
+        .expect("retention permit");
+    let _ = take_retention_interprocess_index_stale(&root);
+    let generation_path = retention_interprocess_lock_target(&root);
     let lock_path =
         codex_file_system::atomic_write_lock_path(&generation_path).expect("retention lock path");
     let contender = std::fs::OpenOptions::new()
@@ -1472,9 +1414,11 @@ async fn audit_output_artifact_retention_permit_uses_interprocess_lock() {
         .expect("simulate another process mutation");
     fs2::FileExt::unlock(&contender).expect("unlock contender");
 
-    let next_permit = retention_sweep_permit().await;
+    let next_permit = retention_sweep_permit(&root)
+        .await
+        .expect("next retention permit");
     assert!(
-        retention_interprocess_index_stale().swap(false, Ordering::AcqRel),
+        take_retention_interprocess_index_stale(&root),
         "a generation advanced by another process must invalidate the local index"
     );
     drop(next_permit);
@@ -1489,13 +1433,11 @@ fn malformed_or_overflowed_retention_generation_is_reinitialized() {
         ("overflowed", u64::MAX.to_string()),
     ] {
         let generation_path = temp.path().join(name);
+        let root = temp.path().join(format!("{name}-root"));
         std::fs::write(&generation_path, contents).expect("write invalid generation");
-        *retention_interprocess_generation()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(0);
-        retention_interprocess_index_stale().store(false, Ordering::Release);
+        let _ = take_retention_interprocess_index_stale(&root);
 
-        advance_retention_interprocess_generation(&generation_path)
+        advance_retention_interprocess_generation(&root, &generation_path)
             .expect("invalid generation should be recoverable");
 
         assert_eq!(
@@ -1503,7 +1445,7 @@ fn malformed_or_overflowed_retention_generation_is_reinitialized() {
             "1"
         );
         assert!(
-            retention_interprocess_index_stale().load(Ordering::Acquire),
+            take_retention_interprocess_index_stale(&root),
             "repairing shared generation metadata must invalidate the local index"
         );
     }
@@ -1566,6 +1508,29 @@ async fn streaming_chunks_update_bytes_but_count_as_one_logical_mutation() {
     );
     assert_eq!(after.logical_mutations - before.logical_mutations, 1);
     assert_eq!(after.scans, before.scans);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn streaming_finish_does_not_publish_success_when_file_sync_fails() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let artifact = create_raw_output_artifact(temp.path(), "thread", b"").await;
+    let state = Arc::new(Mutex::new(artifact));
+    let mut writer = RawOutputArtifactWriter::open(Some(&state))
+        .await
+        .expect("streaming writer");
+    writer.write_chunk(Some(&state), b"durable output").await;
+
+    inject_streaming_finalize_sync_failure_for_test();
+    writer.finish(Some(&state)).await;
+
+    let artifact = state.lock().await;
+    assert!(matches!(
+        &*artifact,
+        RawOutputArtifact::Failed { message, .. }
+            if message.contains("failed to sync")
+                && message.contains("injected streaming output sync failure")
+    ));
 }
 
 #[tokio::test]
@@ -1669,7 +1634,7 @@ async fn every_indexed_mutation_publisher_rejects_a_stale_generation() {
         LogicalRetentionMutation::Create,
         LogicalRetentionMutation::AppendReplace,
         LogicalRetentionMutation::Protection,
-        LogicalRetentionMutation::EvidenceReconcile,
+        LogicalRetentionMutation::ProtectionReconcile,
     ] {
         let stale = capture_retention_token(path.parent().expect("artifact directory"));
         assert_eq!(
@@ -1830,8 +1795,11 @@ async fn invalid_protection_marker_fails_reconciliation_open() {
     let RawOutputArtifact::Stored { path, .. } = artifact else {
         panic!("expected stored artifact");
     };
-    std::fs::write(evidence_protection_path(&path), b"invalid marker")
-        .expect("write invalid marker");
+    std::fs::write(
+        active_tool_history_protection_path(&path),
+        b"invalid marker",
+    )
+    .expect("write invalid marker");
     let root = temp.path().join("tool-output");
 
     assert_eq!(

@@ -38,6 +38,25 @@ fn large_success_output_keeps_head_tail_and_warning_lines() {
 }
 
 #[test]
+fn large_success_output_preserves_source_order() {
+    let mut lines = (0..700)
+        .map(|index| format!("ordinary line {index}"))
+        .collect::<Vec<_>>();
+    lines[0] = "UNIQUE_HEAD".to_string();
+    lines[200] = "warning: UNIQUE_MIDDLE".to_string();
+    lines[699] = "UNIQUE_TAIL".to_string();
+    let output = lines.join("\n");
+
+    let summary =
+        summarize_shell_output_for_model(&output, 0, false, options(None, false)).unwrap();
+    let head = summary.find("UNIQUE_HEAD").unwrap();
+    let middle = summary.find("UNIQUE_MIDDLE").unwrap();
+    let tail = summary.find("UNIQUE_TAIL").unwrap();
+
+    assert!(head < middle && middle < tail);
+}
+
+#[test]
 fn failed_output_keeps_exact_error_lines() {
     let mut lines = Vec::new();
     for index in 0..700 {
@@ -84,6 +103,46 @@ fn critical_error_survives_earlier_warning_flood() {
 }
 
 #[test]
+fn benign_keywords_do_not_hide_the_first_real_error() {
+    let mut lines = (0..900)
+        .map(|index| format!("ordinary line {index}"))
+        .collect::<Vec<_>>();
+    for keyword_index in 0..48 {
+        let line_index = 20 + keyword_index * 8;
+        lines[line_index] = format!("expected benign value; actual benign value {keyword_index}");
+    }
+    lines[500] = "error: REAL_ERROR_SENTINEL".to_string();
+    let output = lines.join("\n");
+
+    let summary =
+        summarize_shell_output_for_model(&output, 1, false, options(None, false)).unwrap();
+
+    assert!(summary.contains("error: REAL_ERROR_SENTINEL"));
+    assert!(summary.contains("ordinary line 499"));
+    assert!(summary.contains("ordinary line 501"));
+}
+
+#[test]
+fn over_truncation_failure_focus_keeps_late_root_cause_after_early_error_flood() {
+    let mut lines = (0..900)
+        .map(|index| format!("ordinary line {index}"))
+        .collect::<Vec<_>>();
+    for error_index in 0..20 {
+        lines[20 + error_index * 8] = format!("error: noisy precursor {error_index}");
+    }
+    lines[610] = "fatal: ROOT_CAUSE_SENTINEL".to_string();
+    let output = lines.join("\n");
+
+    let summary =
+        summarize_shell_output_for_model(&output, 1, false, options(None, false)).unwrap();
+
+    assert!(summary.contains("ROOT_CAUSE_SENTINEL"));
+    assert!(summary.contains("ordinary line 609"));
+    assert!(summary.contains("ordinary line 611"));
+    assert!(summary.contains("ordinary line 899"));
+}
+
+#[test]
 fn validation_output_keeps_failure_status_and_tail() {
     let mut lines = Vec::new();
     for index in 0..700 {
@@ -106,6 +165,30 @@ fn validation_output_keeps_failure_status_and_tail() {
     assert!(summary.contains("failures: parser::tests::keeps_error"));
     assert!(summary.contains("test result: FAILED. 12 passed; 1 failed"));
     assert!(summary.contains("test log 699"));
+}
+
+#[test]
+fn validation_output_keeps_the_authoritative_final_status() {
+    let mut lines = (0..900)
+        .map(|index| format!("ordinary line {index}"))
+        .collect::<Vec<_>>();
+    for status_index in 0..48 {
+        let line_index = 20 + status_index * 8;
+        lines[line_index] = format!("test case {status_index} passed");
+    }
+    lines[500] = "FINAL_STATUS_SENTINEL test result: ok".to_string();
+    let output = lines.join("\n");
+
+    let summary = summarize_shell_output_for_model(
+        &output,
+        0,
+        false,
+        options(Some("cargo test -p codex-core"), false),
+    )
+    .unwrap();
+
+    assert!(summary.contains("failure-focused lines, final status lines, tail"));
+    assert!(summary.contains("FINAL_STATUS_SENTINEL test result: ok"));
 }
 
 #[test]

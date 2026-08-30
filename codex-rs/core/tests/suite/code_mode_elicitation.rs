@@ -10,7 +10,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
-use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnTimingToolCallSource;
 use codex_protocol::request_permissions::PermissionGrantScope;
@@ -255,19 +254,14 @@ await tools.request_permissions({
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_nested_denial_completes_blocked_without_follow_up_or_error() -> Result<()> {
+async fn code_mode_nested_denial_completes_without_follow_up_or_error() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = CodeModeElicitationHarness::start(
         r#"// @exec: {"yield_time_ms": 1000}
 await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_denied_patch.txt\n+denied\n*** End Patch\n");"#,
         PermissionProfile::read_only(),
-        |config| {
-            config
-                .features
-                .enable(Feature::TaskCompletionReviewer)
-                .expect("enable completion reviewer to prove blocked outcome bypasses it");
-        },
+        |_| {},
     )
     .await?;
     let approval = wait_for_event_match(&harness.test.codex, |event| match event {
@@ -309,22 +303,17 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_denied_patch.t
         }
     })
     .await
-    .expect("timed out waiting for blocked completion");
+    .expect("timed out waiting for completion");
 
     assert!(
         errors.is_empty(),
-        "blocked completion must not emit a typed error: {errors:?}"
+        "denied nested tool call must not emit a typed error: {errors:?}"
     );
     assert!(completed.error.is_none());
-    let completion = completed
-        .completion
-        .expect("blocked tool outcome must carry semantic completion status");
-    assert_eq!(completion.status, TaskCompletionStatus::Blocked);
-    assert!(!completion.reasons.is_empty());
 
     let timing = completed
         .timing
-        .expect("blocked completion must carry the closed timing profile");
+        .expect("completion must carry the closed timing profile");
     assert!(timing.profile_valid);
     assert!(timing.classification_complete);
     assert_eq!(timing.exclusive.unclassified_ns, 0);

@@ -2616,8 +2616,8 @@ async fn code_mode_wait_uses_its_own_max_tokens_budget() -> Result<()> {
         let _ = config.features.enable(Feature::CodeMode);
     });
     let test = builder.build(&server).await?;
-    let completion_gate = test.workspace_path("code-mode-max-tokens.ready");
-    let completion_wait = wait_for_file_source(&completion_gate)?;
+    let completion_signal = test.workspace_path("code-mode-max-tokens.ready");
+    let completion_wait = wait_for_file_source(&completion_signal)?;
 
     let code = format!(
         r#"// @exec: {{"max_output_tokens": 100}}
@@ -2654,7 +2654,7 @@ text("token one token two token three token four token five token six token seve
     assert_eq!(text_item(&first_items, /*index*/ 1), "phase 1");
     let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
 
-    fs::write(&completion_gate, "ready")?;
+    fs::write(&completion_signal, "ready")?;
     responses::mount_sse_once(
         &server,
         sse(vec![

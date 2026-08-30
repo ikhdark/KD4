@@ -1,0 +1,27 @@
+diff --git a/investigation_cases/repair_advisory_warning.py b/investigation_cases/repair_advisory_warning.py
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/repair_advisory_warning.py
+@@ -0,0 +1,2 @@
++def completion_allowed(operation_succeeded, advisory_messages):
++    return operation_succeeded and not advisory_messages
+diff --git a/investigation_cases/test_repair_advisory_warning.py b/investigation_cases/test_repair_advisory_warning.py
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/test_repair_advisory_warning.py
+@@ -0,0 +1,15 @@
++import unittest
++
++from repair_advisory_warning import completion_allowed
++
++
++class CompletionAllowedTests(unittest.TestCase):
++    def test_advisories_do_not_override_operation_status(self):
++        self.assertTrue(completion_allowed(True, []))
++        self.assertTrue(completion_allowed(True, ["style warning"]))
++        self.assertFalse(completion_allowed(False, []))
++        self.assertFalse(completion_allowed(False, ["style warning"]))
++
++
++if __name__ == "__main__":
++    unittest.main()

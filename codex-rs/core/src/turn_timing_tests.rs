@@ -1357,7 +1357,6 @@ fn legacy_profile_projection_preserves_existing_phase_breakdown() {
             server_end_turn_false: 0,
             pending_input: 0,
             stop_hook: 0,
-            completion_review_repair: 0,
             invalid_image_recovery: 0,
         }
     );
@@ -1375,7 +1374,6 @@ fn continuation_counters_are_consumed_once_and_retries_are_not_recounted() {
         ContinuationCause::ServerEndTurnFalse,
         ContinuationCause::PendingInput,
         ContinuationCause::StopHook,
-        ContinuationCause::CompletionReviewRepair,
         ContinuationCause::InvalidImageRecovery,
     ];
     for cause in causes {
@@ -1394,14 +1392,12 @@ fn continuation_counters_are_consumed_once_and_retries_are_not_recounted() {
     assert_eq!(profile.server_end_turn_false, 1);
     assert_eq!(profile.pending_input, 1);
     assert_eq!(profile.stop_hook, 1);
-    assert_eq!(profile.completion_review_repair, 1);
     assert_eq!(profile.invalid_image_recovery, 1);
     let continuation_sum = profile.compaction
         + profile.tool_result
         + profile.server_end_turn_false
         + profile.pending_input
         + profile.stop_hook
-        + profile.completion_review_repair
         + profile.invalid_image_recovery;
     assert_eq!(
         continuation_sum + profile.sampling_retry_count,
@@ -1809,113 +1805,6 @@ fn continuation_receipts_aggregate_saturate_and_bound_distinct_groups() {
 }
 
 #[test]
-fn controlled_final_proof_fixture_reports_request_and_token_reduction() {
-    fn record_request(
-        state: &Arc<TurnTimingState>,
-        purpose: TurnTimingGenerationPurpose,
-        usage: TokenUsage,
-    ) {
-        let mut pending = None;
-        state.begin_model_generation_with_metadata(
-            &mut pending,
-            &SessionSource::Cli,
-            Some(purpose),
-            TurnTimingGenerationDisposition::DecisionBearing,
-            Some(format!("final-proof-{purpose:?}")),
-        );
-        drop(state.begin_model_request_wait());
-        state.record_generation_token_usage(Some(&usage));
-        state.record_generation_outcome(Vec::new(), true, false);
-    }
-
-    let (_clock, legacy) = timing();
-    legacy.mark_turn_started();
-    record_request(
-        &legacy,
-        TurnTimingGenerationPurpose::ImplementationDecision,
-        TokenUsage {
-            input_tokens: 300,
-            cached_input_tokens: 100,
-            output_tokens: 30,
-            reasoning_output_tokens: 15,
-            total_tokens: 330,
-        },
-    );
-    record_request(
-        &legacy,
-        TurnTimingGenerationPurpose::ValidationInterpretation,
-        TokenUsage {
-            input_tokens: 340,
-            cached_input_tokens: 120,
-            output_tokens: 32,
-            reasoning_output_tokens: 16,
-            total_tokens: 372,
-        },
-    );
-    record_request(
-        &legacy,
-        TurnTimingGenerationPurpose::TerminalCompletionReasoning,
-        TokenUsage {
-            input_tokens: 500,
-            cached_input_tokens: 180,
-            output_tokens: 40,
-            reasoning_output_tokens: 20,
-            total_tokens: 540,
-        },
-    );
-    let legacy = legacy.complete_snapshot().protocol_timing();
-
-    let (_clock, final_proof) = timing();
-    final_proof.mark_turn_started();
-    record_request(
-        &final_proof,
-        TurnTimingGenerationPurpose::TerminalCompletionReasoning,
-        TokenUsage {
-            input_tokens: 220,
-            cached_input_tokens: 80,
-            output_tokens: 36,
-            reasoning_output_tokens: 18,
-            total_tokens: 256,
-        },
-    );
-    let final_proof = final_proof.complete_snapshot().protocol_timing();
-
-    assert_eq!(legacy.counters.model_request_count, 3);
-    assert_eq!(final_proof.counters.model_request_count, 1);
-    assert_eq!(
-        legacy
-            .model_requests
-            .iter()
-            .filter_map(|request| request.token_usage.as_ref())
-            .map(|usage| usage.total_tokens)
-            .sum::<u64>(),
-        1_242
-    );
-    assert_eq!(
-        final_proof
-            .model_requests
-            .iter()
-            .filter_map(|request| request.token_usage.as_ref())
-            .map(|usage| usage.total_tokens)
-            .sum::<u64>(),
-        256
-    );
-    let finalization = final_proof
-        .counters
-        .purpose_aggregates
-        .iter()
-        .find(|aggregate| {
-            aggregate.purpose == TurnTimingGenerationPurpose::TerminalCompletionReasoning
-        })
-        .expect("completion finalization aggregate");
-    assert_eq!(finalization.input_tokens, 220);
-    assert_eq!(finalization.cached_input_tokens, 80);
-    assert_eq!(finalization.visible_output_tokens, 18);
-    assert_eq!(finalization.reasoning_output_tokens, 18);
-    assert_eq!(finalization.total_tokens, 256);
-}
-
-#[test]
 fn validation_failure_diagnosis_repair_and_rereview_remain_decision_bearing() {
     let (_clock, state) = timing();
     state.mark_turn_started();
@@ -1928,11 +1817,7 @@ fn validation_failure_diagnosis_repair_and_rereview_remain_decision_bearing() {
     .into_iter()
     .enumerate()
     {
-        let mut pending = (index > 0).then_some(if index == 2 {
-            ContinuationCause::CompletionReviewRepair
-        } else {
-            ContinuationCause::ToolResult
-        });
+        let mut pending = (index > 0).then_some(ContinuationCause::ToolResult);
         state.begin_model_generation_with_metadata(
             &mut pending,
             &SessionSource::Cli,
@@ -1981,10 +1866,6 @@ fn logical_generations_are_classified_by_workflow_purpose() {
     let cases = [
         (None, SessionSource::Cli),
         (Some(ContinuationCause::ToolResult), SessionSource::Cli),
-        (
-            Some(ContinuationCause::CompletionReviewRepair),
-            SessionSource::Cli,
-        ),
         (None, SessionSource::SubAgent(SubAgentSource::Review)),
         (
             None,
@@ -2001,19 +1882,11 @@ fn logical_generations_are_classified_by_workflow_purpose() {
     drop(state.begin_model_request_wait());
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.counters.logical_generation_count, 7);
+    assert_eq!(timing.counters.logical_generation_count, 6);
     assert_eq!(timing.counters.generations_by_reason.initial, 1);
     assert_eq!(timing.counters.generations_by_reason.tool_continuation, 1);
-    assert_eq!(timing.counters.generations_by_reason.completion_review, 1);
-    assert_eq!(
-        timing
-            .counters
-            .generations_by_reason
-            .completion_repair_rereview,
-        1
-    );
     assert_eq!(timing.counters.generations_by_reason.compaction, 1);
-    assert_eq!(timing.counters.generations_by_reason.subagent, 1);
+    assert_eq!(timing.counters.generations_by_reason.subagent, 2);
     assert_eq!(timing.counters.generations_by_reason.other, 1);
     assert_eq!(
         timing
@@ -2024,8 +1897,7 @@ fn logical_generations_are_classified_by_workflow_purpose() {
         vec![
             TurnTimingGenerationReason::Initial,
             TurnTimingGenerationReason::ToolContinuation,
-            TurnTimingGenerationReason::CompletionRepairRereview,
-            TurnTimingGenerationReason::CompletionReview,
+            TurnTimingGenerationReason::Subagent,
             TurnTimingGenerationReason::Subagent,
             TurnTimingGenerationReason::Other,
             TurnTimingGenerationReason::Compaction,
@@ -2140,7 +2012,7 @@ fn repeated_wait_uses_exact_purpose() {
     );
     drop(state.begin_model_request_wait());
 
-    let mut pending = Some(ContinuationCause::CompletionReviewRepair);
+    let mut pending = Some(ContinuationCause::ToolResult);
     state.begin_model_generation_with_metadata(
         &mut pending,
         &SessionSource::Cli,
@@ -2357,8 +2229,6 @@ fn wait_and_tool_output_counters_are_additive() {
     state.record_executed_validation(125);
     state.record_suppressed_validation_output();
     state.record_ready_startup_prewarm();
-    state.record_completion_review_ready_phase();
-    state.record_completion_review_terminal_phase();
     state.record_no_progress_directive();
     state.record_proven_loop_activation();
     state.record_tool_output_projection_facts(1_000, 250, 400, 100, true, false, true, 3, true);
@@ -2376,8 +2246,6 @@ fn wait_and_tool_output_counters_are_additive() {
     assert_eq!(counters.executed_validation_duration_ns, 125_000_000);
     assert_eq!(counters.suppressed_validation_output_count, 1);
     assert_eq!(counters.ready_startup_prewarm_count, 1);
-    assert_eq!(counters.completion_review_ready_phase_count, 1);
-    assert_eq!(counters.completion_review_terminal_phase_count, 1);
     assert_eq!(counters.suppressed_deterministic_continuation_count, 0);
     assert_eq!(counters.no_progress_directive_count, 1);
     assert_eq!(counters.proven_loop_activation_count, 1);
@@ -2481,7 +2349,7 @@ fn named_local_phases_record_union_time_without_disturbing_partition() {
 }
 
 #[test]
-fn ordered_persistence_pause_is_excluded_from_request_preparation() {
+fn ordered_persistence_is_excluded_from_request_preparation_without_a_timing_gap() {
     let (clock, state) = timing();
     state.mark_turn_started();
     let mut preparation = Some(state.begin_local_phase(TurnLocalPhase::Preparation));
@@ -2501,7 +2369,7 @@ fn ordered_persistence_pause_is_excluded_from_request_preparation() {
 }
 
 #[test]
-fn startup_prewarm_wait_is_excluded_from_request_preparation() {
+fn startup_prewarm_wait_is_excluded_from_request_preparation_without_a_timing_gap() {
     let (clock, state) = timing();
     state.mark_turn_started();
     let mut preparation = Some(state.begin_local_phase(TurnLocalPhase::Preparation));
@@ -2521,7 +2389,7 @@ fn startup_prewarm_wait_is_excluded_from_request_preparation() {
 }
 
 #[test]
-fn request_preparation_begins_after_planning_and_restarts_for_each_generation() {
+fn request_preparation_begins_at_history_snapshot_and_restarts_for_each_generation() {
     let (clock, state) = timing();
     state.mark_turn_started();
     let mut preparation = None;
@@ -2530,8 +2398,12 @@ fn request_preparation_begins_after_planning_and_restarts_for_each_generation() 
     clock.set_ms(5);
     drop(planning);
 
-    state.begin_request_preparation(&mut preparation);
     clock.set_ms(10);
+    state.begin_request_preparation(&mut preparation);
+    let history_snapshot = state.begin_local_phase(TurnLocalPhase::HistorySnapshot);
+    clock.set_ms(12);
+    drop(history_snapshot);
+    clock.set_ms(15);
     state.finish_request_preparation(&mut preparation);
 
     clock.set_ms(20);
@@ -2566,7 +2438,7 @@ fn predispatch_failure_closes_request_preparation_before_error_lifecycle() {
 }
 
 #[test]
-fn ordered_persistence_transitions_have_no_unattributed_gap() {
+fn persistence_outside_preparation_has_no_unattributed_gap() {
     let clock = Arc::new(AdvancingClock::every_ms(1));
     let state = Arc::new(TurnTimingState::with_clock(clock));
     state.mark_turn_started();
@@ -2587,8 +2459,8 @@ fn ordered_persistence_transitions_have_no_unattributed_gap() {
         .expect("model output freezes pre-output attribution");
     assert_eq!(profile.local.preparation_ns, 2 * NS_PER_MS);
     assert_eq!(profile.local.persistence_ns, NS_PER_MS);
-    // One millisecond precedes the outer preparation guard and one follows it.
-    // Switching preparation to persistence and back adds no unattributed interval.
+    // One millisecond precedes request preparation and one follows it. Persistence
+    // replaces preparation for its interval, so every pre-output interval stays owned.
     assert_eq!(pre_output.unattributed_pre_output_ns, 2 * NS_PER_MS);
     assert_eq!(pre_output.attributed_client_union_ns, 3 * NS_PER_MS);
     assert_eq!(pre_output.client_critical_path_ns, 5 * NS_PER_MS);

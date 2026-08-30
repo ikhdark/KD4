@@ -148,7 +148,9 @@ def windows_msvc_linker_env(
     *,
     which: Callable[[str], str | None],
 ) -> dict[str, str]:
-    missing_env_vars = [name for name in WINDOWS_MSVC_LINKER_ENV_VARS if not env.get(name)]
+    missing_env_vars = [
+        name for name in WINDOWS_MSVC_LINKER_ENV_VARS if not env.get(name)
+    ]
     if not missing_env_vars:
         return {}
 

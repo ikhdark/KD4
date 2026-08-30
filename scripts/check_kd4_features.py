@@ -105,7 +105,9 @@ def execute_runtime_verification(
     for feature in matching:
         current_feature_id = feature.get("id")
         verification = feature.get("runtime_verification")
-        command = verification.get("command") if isinstance(verification, dict) else None
+        command = (
+            verification.get("command") if isinstance(verification, dict) else None
+        )
         if (
             not isinstance(current_feature_id, str)
             or not isinstance(command, list)
@@ -979,7 +981,10 @@ def _source_owner_evidence(
         if path_error is not None:
             findings.append(
                 Finding(
-                    "error", "invalid-source-owner-evidence", f"{label}: {path_error}", feature_id
+                    "error",
+                    "invalid-source-owner-evidence",
+                    f"{label}: {path_error}",
+                    feature_id,
                 )
             )
             return False
@@ -1047,7 +1052,10 @@ def _source_owner_evidence(
     relationships = owner.get("relationships")
     if isinstance(relationships, list):
         for index, relationship in enumerate(relationships):
-            if not isinstance(relationship, dict) or relationship.get("category") != "runtime_registration":
+            if (
+                not isinstance(relationship, dict)
+                or relationship.get("category") != "runtime_registration"
+            ):
                 continue
             evidence = relationship.get("evidence")
             if not isinstance(evidence, list) or not evidence:
@@ -1061,7 +1069,9 @@ def _source_owner_evidence(
                 )
                 continue
             if all(
-                marker_is_live(marker, f"relationships[{index}].evidence[{marker_index}]")
+                marker_is_live(
+                    marker, f"relationships[{index}].evidence[{marker_index}]"
+                )
                 for marker_index, marker in enumerate(evidence)
             ):
                 kinds["registration"] += 1
@@ -1329,7 +1339,9 @@ def validate_manifest(
         )
 
         source_owner = feature.get("source_owner")
-        if status == "planned" and (source_owner is not None or feature.get("evidence")):
+        if status == "planned" and (
+            source_owner is not None or feature.get("evidence")
+        ):
             findings.append(
                 Finding(
                     "error",

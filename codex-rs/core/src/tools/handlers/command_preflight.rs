@@ -10,12 +10,11 @@ use super::command_search::RgSearchBreadth;
 #[cfg(test)]
 use super::command_search::classify_rg_search_narrowing;
 #[cfg(test)]
-use super::command_search::reject_rg_search_without_native_scope;
+use super::command_search::classify_rg_search_narrowing_without_native_scope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandPreflightIssueCode {
     UnbalancedQuotes,
-    UnparseableCommand,
     ShellMismatch,
     WindowsLiteralPathRequired,
     DirectArgvPowerShellCmdlet,
@@ -110,7 +109,6 @@ impl CommandPreflightIssueCode {
     fn tool_error_kind(self) -> &'static str {
         match self {
             Self::UnbalancedQuotes => "command_preflight_unbalanced_quotes",
-            Self::UnparseableCommand => "command_preflight_unparseable_command",
             Self::ShellMismatch => "command_preflight_shell_mismatch",
             Self::WindowsLiteralPathRequired => "windows_literal_path_required",
             Self::DirectArgvPowerShellCmdlet => "direct_argv_powershell_cmdlet",
@@ -168,22 +166,10 @@ fn preflight_command_issue(
     shell_type: Option<ShellType>,
 ) -> Result<Vec<Vec<String>>, CommandPreflightIssue> {
     let preflight_shell_type = shell_type.or_else(|| infer_direct_shell_type(command));
-    let Some(argv_commands) = argv_commands(command, preflight_shell_type) else {
-        let rejected = shell_script(command, preflight_shell_type)
-            .map(|script| CommandPreflightRejected::Script(script.into_owned()))
-            .unwrap_or_else(|| CommandPreflightRejected::Argv(command.to_vec()));
-        return Err(CommandPreflightIssue::reject(
-            CommandPreflightIssueCode::UnparseableCommand,
-            rejected,
-            "the shell command could not be parsed precisely enough to validate every invoked command."
-                .to_string(),
-            Some(
-                "use structured argv for a single native command, or rewrite the script into a statically parseable form."
-                    .to_string(),
-            ),
-            None,
-        ));
-    };
+    // Static parsing supports the targeted preflight lints below, but it is not
+    // an execution-safety boundary. Dynamic shell constructs remain valid and
+    // still receive every lint that can operate on the original script.
+    let argv_commands = argv_commands(command, preflight_shell_type).unwrap_or_default();
 
     if let Some(script) = shell_script(command, preflight_shell_type) {
         let script = script.as_ref();
@@ -226,6 +212,22 @@ pub(crate) async fn preflight_invocation_with_equivalent_repair_async(
     })
     .await
     .map_err(|error| format!("command preflight worker failed: {error}"))?
+}
+
+pub(crate) async fn preflight_invocation_for_runtime(
+    direct_runtime: bool,
+    invocation: &CommandInvocation,
+    command: &[String],
+    shell_type: Option<ShellType>,
+) -> Result<CommandPreflightOutcome, String> {
+    if direct_runtime {
+        return Ok(CommandPreflightOutcome {
+            invocation: invocation.clone(),
+            validation_invocations: Vec::new(),
+            repair_notice: None,
+        });
+    }
+    preflight_invocation_with_equivalent_repair_async(invocation, command, shell_type).await
 }
 
 fn preflight_invocation_with_equivalent_repair_detailed(
@@ -694,10 +696,13 @@ fn lint_shell_mismatch(
 ) -> Result<(), CommandPreflightIssue> {
     match shell_type {
         Some(ShellType::PowerShell)
-            if contains_any(
-                script,
-                &["2>/dev/null", "export ", "source ", " && \\", " || \\"],
-            ) =>
+            if argv_commands.iter().any(|argv| {
+                argv.first().is_some_and(|program| {
+                    matches_ignore_ascii_case(program_name(program), &["export", "source"])
+                })
+            }) || powershell_contains_active_marker(script, "2>/dev/null")
+                || powershell_contains_active_marker(script, " && \\")
+                || powershell_contains_active_marker(script, " || \\") =>
         {
             Err(CommandPreflightIssue::reject(
                 CommandPreflightIssueCode::ShellMismatch,
@@ -753,12 +758,11 @@ fn lint_windows_path_shape(
     let has_literal_path_parameter = argv_commands
         .iter()
         .any(|argv| has_powershell_parameter(argv, "LiteralPath"));
-    let has_path_parameter = argv_commands
-        .iter()
-        .any(|argv| has_powershell_parameter(argv, "Path"));
     if has_filesystem_cmdlet
         && !has_literal_path_parameter
-        && (has_path_parameter || script.contains('[') || script.contains(']'))
+        && argv_commands
+            .iter()
+            .any(|argv| powershell_path_parameter_requires_literal(argv))
     {
         let example_path = Path::new("C:\\path with spaces\\[name]");
         let powershell_example = powershell_literal_path_arg(example_path).join(" ");
@@ -776,6 +780,77 @@ fn lint_windows_path_shape(
     }
 
     Ok(())
+}
+
+fn powershell_contains_active_marker(script: &str, marker: &str) -> bool {
+    let mut characters = script.char_indices().peekable();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_comment = false;
+    let mut escaped = false;
+
+    while let Some((index, character)) = characters.next() {
+        if in_comment {
+            if matches!(character, '\r' | '\n') {
+                in_comment = false;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '`' && !in_single_quote {
+            escaped = true;
+            continue;
+        }
+        if character == '\'' && !in_double_quote {
+            if in_single_quote && characters.peek().is_some_and(|(_, next)| *next == '\'') {
+                characters.next();
+            } else {
+                in_single_quote = !in_single_quote;
+            }
+            continue;
+        }
+        if character == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        if character == '#' && !in_single_quote && !in_double_quote {
+            in_comment = true;
+            continue;
+        }
+        if !in_single_quote && !in_double_quote && script[index..].starts_with(marker) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn powershell_path_parameter_requires_literal(argv: &[String]) -> bool {
+    let mut index = 1;
+    while let Some(argument) = argv.get(index) {
+        let Some(rest) = argument.trim_start().strip_prefix('-') else {
+            index += 1;
+            continue;
+        };
+        let (name, inline_value) = rest
+            .split_once(':')
+            .or_else(|| rest.split_once('='))
+            .map_or((rest, None), |(name, value)| (name, Some(value)));
+        if name.eq_ignore_ascii_case("Path") {
+            let value = inline_value.or_else(|| argv.get(index + 1).map(String::as_str));
+            return value.is_some_and(|value| {
+                value
+                    .chars()
+                    .any(|character| matches!(character, '*' | '?' | '[' | ']'))
+            });
+        }
+        index += 1;
+    }
+
+    false
 }
 
 fn lint_powershell_measure_object_scriptblock_property(
@@ -857,6 +932,9 @@ fn lint_known_flag_typos(argv: &[String]) -> Result<(), CommandPreflightIssue> {
     };
 
     for arg in argv.iter().skip(1) {
+        if arg == "--" {
+            break;
+        }
         if !arg.starts_with('-') {
             continue;
         }
@@ -885,6 +963,9 @@ fn lint_rg_glob_path_separators(argv: &[String]) -> Result<(), CommandPreflightI
 
     let mut index = 1;
     while let Some(arg) = argv.get(index) {
+        if arg == "--" {
+            break;
+        }
         let glob = if arg == "--glob" || arg == "-g" {
             argv.get(index + 1).map(|next| (index + 1, next.as_str()))
         } else if let Some((flag, value)) = arg.split_once('=') {
@@ -935,20 +1016,25 @@ fn lint_rg_literal_glob_paths(
         return Ok(());
     }
 
-    let files_mode = argv.iter().skip(1).any(|arg| {
-        matches!(
-            arg.as_str(),
-            "--files" | "--files-with-matches" | "--files-without-match"
-        )
-    });
+    let files_mode = argv
+        .iter()
+        .skip(1)
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--files");
     let mut positional = 0usize;
     let mut index = 1usize;
+    let mut options_terminated = false;
     while let Some(arg) = argv.get(index) {
-        if rg_option_consumes_next(arg) {
+        if !options_terminated && arg == "--" {
+            options_terminated = true;
+            index += 1;
+            continue;
+        }
+        if !options_terminated && rg_option_consumes_next(arg) {
             index += 2;
             continue;
         }
-        if arg.starts_with('-') {
+        if !options_terminated && arg.starts_with('-') {
             index += 1;
             continue;
         }
@@ -997,7 +1083,11 @@ fn lint_direct_argv_powershell_cmdlet(
         return Ok(());
     };
 
-    if is_powershell_cmdlet_or_alias(program) {
+    // Direct argv can legitimately target an executable whose name happens to
+    // have PowerShell's Verb-Noun shape. Reject only names that are actually in
+    // the cmdlet/alias allowlist; the broader shape heuristic is useful only
+    // while diagnosing a script for the wrong shell.
+    if is_known_powershell_cmdlet(program) || is_known_powershell_alias(program) {
         return Err(CommandPreflightIssue::reject(
             CommandPreflightIssueCode::DirectArgvPowerShellCmdlet,
             CommandPreflightRejected::Argv(argv.to_vec()),
@@ -1165,10 +1255,6 @@ fn strip_matching_quotes(value: &str) -> &str {
 
 fn is_windows_executable_extension(extension: &str) -> bool {
     matches_ignore_ascii_case(extension, &["bat", "cmd", "com", "exe", "ps1", "psm1"])
-}
-
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {

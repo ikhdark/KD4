@@ -1030,12 +1030,16 @@ impl AgentControl {
         );
         agent_metadata.agent_id = Some(new_thread.thread_id);
 
-        self.persist_thread_spawn_edge_for_source(
-            new_thread.thread.as_ref(),
-            new_thread.thread_id,
-            notification_source.as_ref(),
-        )
-        .await;
+        if let Err(error) = self
+            .persist_thread_spawn_edge_for_source(
+                new_thread.thread.as_ref(),
+                new_thread.thread_id,
+                notification_source.as_ref(),
+            )
+            .await
+        {
+            return Err(pending_cleanup.rollback(error).await);
+        }
 
         if let Some(mut binding) = options.typed_task_binding.clone() {
             let spawned_agent_path = agent_metadata.agent_path.as_ref().map(ToString::to_string);
@@ -1523,21 +1527,17 @@ impl AgentControl {
         let mut resume_queue = VecDeque::from([(thread_id, root_depth)]);
         let mut seen_thread_ids = HashSet::from([thread_id]);
         while let Some((parent_thread_id, parent_depth)) = resume_queue.pop_front() {
-            let child_ids = match agent_graph_store
+            let child_ids = agent_graph_store
                 .list_thread_spawn_children(
                     parent_thread_id,
                     Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
                 )
                 .await
-            {
-                Ok(child_ids) => child_ids,
-                Err(err) => {
-                    warn!(
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
                         "failed to load persisted thread-spawn children for {parent_thread_id}: {err}"
-                    );
-                    continue;
-                }
-            };
+                    ))
+                })?;
 
             for child_thread_id in child_ids {
                 if !seen_thread_ids.insert(child_thread_id) {
@@ -1713,12 +1713,25 @@ impl AgentControl {
                 agent_metadata.agent_path.clone(),
             );
         }
-        self.persist_thread_spawn_edge_for_source(
-            resumed_thread.thread.as_ref(),
-            resumed_thread.thread_id,
-            Some(&notification_source),
-        )
-        .await;
+        if let Err(error) = self
+            .persist_thread_spawn_edge_for_source(
+                resumed_thread.thread.as_ref(),
+                resumed_thread.thread_id,
+                Some(&notification_source),
+            )
+            .await
+        {
+            let shutdown_result = self.shutdown_live_agent(resumed_thread.thread_id).await;
+            return match shutdown_result {
+                Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => {
+                    Err(error)
+                }
+                Err(shutdown_error) => Err(CodexErr::Fatal(format!(
+                    "{error}; cleanup of resumed agent {} failed: {shutdown_error}",
+                    resumed_thread.thread_id
+                ))),
+            };
+        }
 
         Ok((resumed_thread.thread_id, multi_agent_version))
     }

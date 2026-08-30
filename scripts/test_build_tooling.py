@@ -1037,5 +1037,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertIn("just deps-duplicates-check {args}", recipe)
         self.assertNotIn("just deps-duplicates {args}", recipe)
 
+
 if __name__ == "__main__":
     unittest.main()

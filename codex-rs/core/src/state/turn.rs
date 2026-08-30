@@ -107,10 +107,8 @@ pub(crate) struct TurnTerminalCoordinator {
     terminal_decision_gate: std::sync::Mutex<()>,
     claimed: AtomicBool,
     analytics_emission_claimed: AtomicBool,
-    durable_terminal_committed: AtomicBool,
     interaction_released: AtomicBool,
     cleanup_completed: AtomicBool,
-    delivery_state: AtomicU8,
     completion_notify: Notify,
     cleanup_completion_notify: Notify,
     interrupt_fence_state: AtomicU8,
@@ -125,15 +123,6 @@ pub(crate) struct TurnTerminalCoordinator {
     sampling_admission_waiters: AtomicU32,
     #[cfg(test)]
     panic_before_worker_cancellation: AtomicBool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub(crate) enum TerminalDeliveryState {
-    NotAttempted = 0,
-    Claimed = 1,
-    Delivered = 2,
-    DeliveryFailed = 3,
 }
 
 /// The interrupt durability fence is one state machine, not three independent
@@ -175,14 +164,6 @@ impl ToolCallAcceptanceGate {
             record_seal();
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn is_sealed(&self) -> bool {
-        *self
-            .sealed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,17 +203,6 @@ impl Drop for TerminalWaiterGuard<'_> {
     }
 }
 
-impl TerminalDeliveryState {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::Claimed,
-            2 => Self::Delivered,
-            3 => Self::DeliveryFailed,
-            _ => Self::NotAttempted,
-        }
-    }
-}
-
 impl InterruptFenceState {
     fn from_u8(value: u8) -> Self {
         match value {
@@ -267,10 +237,8 @@ impl TurnTerminalCoordinator {
             terminal_decision_gate: std::sync::Mutex::new(()),
             claimed: AtomicBool::new(false),
             analytics_emission_claimed: AtomicBool::new(false),
-            durable_terminal_committed: AtomicBool::new(false),
             interaction_released: AtomicBool::new(false),
             cleanup_completed: AtomicBool::new(false),
-            delivery_state: AtomicU8::new(TerminalDeliveryState::NotAttempted as u8),
             completion_notify: Notify::new(),
             cleanup_completion_notify: Notify::new(),
             interrupt_fence_state: AtomicU8::new(InterruptFenceState::Open as u8),
@@ -337,10 +305,6 @@ impl TurnTerminalCoordinator {
         })
     }
 
-    pub(crate) fn delivery_state(&self) -> TerminalDeliveryState {
-        TerminalDeliveryState::from_u8(self.delivery_state.load(Ordering::Acquire))
-    }
-
     pub(crate) fn interaction_released(&self) -> bool {
         self.interaction_released.load(Ordering::Acquire)
     }
@@ -348,10 +312,6 @@ impl TurnTerminalCoordinator {
     pub(crate) fn mark_interaction_released(&self) {
         self.interaction_released.store(true, Ordering::Release);
         self.completion_notify.notify_waiters();
-    }
-
-    pub(crate) fn durable_terminal_committed(&self) -> bool {
-        self.durable_terminal_committed.load(Ordering::Acquire)
     }
 
     /// Establish a pre-terminal fence. This deliberately does not claim or
@@ -528,70 +488,15 @@ impl TurnTerminalPermit {
             .is_ok()
     }
 
-    pub(crate) fn mark_durable_commit(&self, committed: bool) {
-        self.coordinator
-            .durable_terminal_committed
-            .store(committed, Ordering::Release);
-    }
-
-    pub(crate) fn mark_delivery_claimed(&self) -> bool {
-        if self
-            .coordinator
-            .delivery_state
-            .compare_exchange(
-                TerminalDeliveryState::NotAttempted as u8,
-                TerminalDeliveryState::Claimed as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            return true;
-        }
-        self.coordinator
-            .delivery_state
-            .compare_exchange(
-                TerminalDeliveryState::DeliveryFailed as u8,
-                TerminalDeliveryState::Claimed as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    pub(crate) fn mark_delivery_attempted(&self, delivered: bool) {
-        debug_assert_eq!(
-            self.coordinator.delivery_state(),
-            TerminalDeliveryState::Claimed
-        );
-        let state = if delivered {
-            TerminalDeliveryState::Delivered
-        } else {
-            TerminalDeliveryState::DeliveryFailed
-        };
-        self.coordinator
-            .delivery_state
-            .store(state as u8, Ordering::Release);
-    }
-
     pub(crate) fn mark_interaction_released(&self) {
         self.coordinator.mark_interaction_released();
     }
 
     pub(crate) fn complete_cleanup(mut self) {
-        // Cleanup cannot release a durably authoritative turn whose live handoff is still
-        // claimed or failed. The at-least-once delivery loop releases that fence after a later
-        // successful handoff. A turn with no authoritative attempt keeps the legacy cleanup
-        // fallback; an already delivered turn is safe to wake.
-        if matches!(
-            self.coordinator.delivery_state(),
-            TerminalDeliveryState::NotAttempted | TerminalDeliveryState::Delivered
-        ) {
-            self.coordinator
-                .interaction_released
-                .store(true, Ordering::Release);
-            self.coordinator.completion_notify.notify_waiters();
-        }
+        self.coordinator
+            .interaction_released
+            .store(true, Ordering::Release);
+        self.coordinator.completion_notify.notify_waiters();
         self.coordinator
             .cleanup_completed
             .store(true, Ordering::Release);
@@ -603,9 +508,7 @@ impl TurnTerminalPermit {
 
 impl Drop for TurnTerminalPermit {
     fn drop(&mut self) {
-        if !self.cleanup_completed
-            && self.coordinator.delivery_state() == TerminalDeliveryState::NotAttempted
-        {
+        if !self.cleanup_completed {
             let _decision = self
                 .coordinator
                 .terminal_decision_gate
@@ -631,7 +534,6 @@ pub(crate) struct TurnState {
     pub(crate) tool_calls: u64,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
-    completion_review_partial_reasons: Vec<String>,
 }
 
 pub(crate) struct PendingRequestPermissions {
@@ -779,15 +681,5 @@ impl TurnState {
 
     pub(crate) fn strict_auto_review_enabled(&self) -> bool {
         self.strict_auto_review_enabled
-    }
-
-    pub(crate) fn record_completion_review_partial_reason(&mut self, reason: String) {
-        if !self.completion_review_partial_reasons.contains(&reason) {
-            self.completion_review_partial_reasons.push(reason);
-        }
-    }
-
-    pub(crate) fn completion_review_partial_reasons(&self) -> Vec<String> {
-        self.completion_review_partial_reasons.clone()
     }
 }

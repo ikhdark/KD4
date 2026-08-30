@@ -106,7 +106,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
             rust_root / "cli" / "build.rs",
             rust_root / "rollout" / "build.rs",
         ):
-            self.assertFalse(retired_path.exists(), f"retired build input: {retired_path}")
+            self.assertFalse(
+                retired_path.exists(), f"retired build input: {retired_path}"
+            )
 
         cli_manifest = load_toml(rust_root / "cli" / "Cargo.toml")
         self.assertNotIn("build", cli_manifest["package"])
@@ -286,7 +288,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("\n## Repository identity and runtime boundary\n", text)
         section = text.split("\n## Repository identity and runtime boundary\n", 1)[1]
         section = section.split("\n## ", 1)[0]
-        self.assertIn("Source changes become Desktop-visible only after rebuilding", section)
+        self.assertIn(
+            "Source changes become Desktop-visible only after rebuilding", section
+        )
         self.assertIn("replacing or updating the local binary", section)
 
     def test_agents_validation_map_matches_current_layout(self) -> None:
@@ -847,7 +851,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         expected_kinds = {
             ".codex/environments/setup.py": "python",
-            ".codex/hooks/task-continuity.ps1": "powershell",
             "codex-cli/bin/codex.js": "javascript",
             "codex-cli/scripts/build_npm_package.py": "python",
             "codex-rs/app-server-test-client/scripts/live_elicitation_hold.ps1": "powershell",
@@ -868,7 +871,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
             root_maintenance.python_unittest_targets(),
         )
 
-    def test_root_maintenance_routes_every_task_continuity_owner(self) -> None:
+    def test_root_maintenance_does_not_route_retired_task_continuity_paths(self) -> None:
         root_maintenance = load_root_maintenance_module()
 
         for target in (
@@ -880,10 +883,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
             ".codex/hooks/task-continuity.ps1",
         ):
             with self.subTest(target=target):
-                self.assertEqual(
-                    root_maintenance.test_modules_for_changed_path(target),
-                    ("scripts.test_task_continuity_hook",),
-                )
+                self.assertNotIn(target, root_maintenance.SCRIPT_TEST_MODULES)
 
     def test_obsolete_developer_tooling_residue_is_absent(self) -> None:
         obsolete_paths = (
@@ -1027,13 +1027,14 @@ class BuildToolingPolicyTest(unittest.TestCase):
         )
         retired_harness_variables: list[str] = []
         for path in repository_paths:
-            if path.resolve() == policy_path or path.suffix.lower() not in source_suffixes:
+            if (
+                path.resolve() == policy_path
+                or path.suffix.lower() not in source_suffixes
+            ):
                 continue
             source = path.read_text(encoding="utf-8")
             if retired_harness_pattern.search(source):
-                retired_harness_variables.append(
-                    path.relative_to(REPO_ROOT).as_posix()
-                )
+                retired_harness_variables.append(path.relative_to(REPO_ROOT).as_posix())
         self.assertEqual(sorted(retired_harness_variables), [])
 
         compatibility_parser_roots = (
@@ -1052,7 +1053,10 @@ class BuildToolingPolicyTest(unittest.TestCase):
         posix_runtime_launchers: list[str] = []
         for path in repository_paths:
             resolved_path = path.resolve()
-            if resolved_path == policy_path or path.suffix.lower() not in source_suffixes:
+            if (
+                resolved_path == policy_path
+                or path.suffix.lower() not in source_suffixes
+            ):
                 continue
             if any(
                 resolved_path == root or root in resolved_path.parents
@@ -1061,9 +1065,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 continue
             source = path.read_text(encoding="utf-8")
             if posix_runtime_launcher_pattern.search(source):
-                posix_runtime_launchers.append(
-                    path.relative_to(REPO_ROOT).as_posix()
-                )
+                posix_runtime_launchers.append(path.relative_to(REPO_ROOT).as_posix())
         self.assertEqual(sorted(posix_runtime_launchers), [])
 
         runtime_docs = "\n".join(
@@ -1749,9 +1751,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
         )[0]
         self.assertIn("cargo clippy --tests @forwarded_args", clippy_recipe)
         self.assertNotIn("--workspace", clippy_recipe)
-        self.assertIn(
-            "-Analyzer clippy --workspace @forwarded_args", workspace_recipe
-        )
+        self.assertIn("-Analyzer clippy --workspace @forwarded_args", workspace_recipe)
 
     def test_windows_process_suite_cannot_silently_skip_required_coverage(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1762,9 +1762,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn(
-            "[windows]\ntest-windows-sandbox-processes *args:", justfile
-        )
+        self.assertIn("[windows]\ntest-windows-sandbox-processes *args:", justfile)
         self.assertGreaterEqual(justfile.count("--no-tests=fail"), 3)
         self.assertIn("-p codex-utils-pty", justfile)
         self.assertIn("CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS", justfile)

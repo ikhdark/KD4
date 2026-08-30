@@ -1,6 +1,5 @@
 use super::CodexErrorInfo;
 use super::SurfacedToolResult;
-use super::TaskCompletionGate;
 use super::ThreadItem;
 use super::ThreadStatus;
 use super::TurnStatus;
@@ -166,10 +165,6 @@ pub struct Turn {
     /// Duration between turn start and completion in milliseconds, if known.
     #[ts(type = "number | null")]
     pub duration_ms: Option<i64>,
-    /// Machine-derived completion proof persisted at the terminal turn boundary.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub completion: Option<TaskCompletionGate>,
     /// Immutable wall-clock profile persisted at the terminal turn boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

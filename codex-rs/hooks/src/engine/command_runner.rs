@@ -21,11 +21,14 @@ use super::dispatcher::hook_scope_label;
 use super::dispatcher::scope_for_event;
 use codex_protocol::protocol::HookExecutionMode;
 use codex_protocol::protocol::HookHandlerType;
+#[cfg(windows)]
 use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
+#[cfg(windows)]
 use codex_utils_pty::run_windows_process_operation;
 
 const HOOK_STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
 const HOOK_STREAM_READ_BUFFER_BYTES: usize = 16 * 1024;
+const HOOK_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub(crate) struct CommandRunResult {
@@ -89,8 +92,13 @@ async fn run_command_with_reservation(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .creation_flags(WINDOWS_CREATE_SUSPENDED);
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(WINDOWS_CREATE_SUSPENDED);
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(codex_utils_pty::process_group::detach_from_tty);
+    }
 
     let managed = match timeout_at(timeout_deadline, reservation).await {
         Ok(Ok(managed)) => managed,
@@ -114,7 +122,9 @@ async fn run_command_with_reservation(
         return finish_timeout(started_at, started, handler.timeout_sec);
     }
 
+    #[cfg(windows)]
     let spawn_timeout = timeout_deadline.saturating_duration_since(tokio::time::Instant::now());
+    #[cfg(windows)]
     let mut child =
         match run_windows_process_operation(spawn_timeout, move || command.spawn()).await {
             Ok(child) => child,
@@ -135,7 +145,25 @@ async fn run_command_with_reservation(
                 );
             }
         };
+    #[cfg(not(windows))]
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return finish_command_run(
+                started_at,
+                started,
+                CommandRunCompletion {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some(err.to_string()),
+                    outcome: "spawn_error",
+                },
+            );
+        }
+    };
 
+    #[cfg(windows)]
     {
         let Some(process_id) = child.id() else {
             terminate_command_tree(&mut child, &managed).await;
@@ -280,21 +308,41 @@ async fn terminate_command_tree(
     child: &mut tokio::process::Child,
     managed: &codex_utils_pty::ManagedRootProcess,
 ) {
+    #[cfg(windows)]
     if let Err(err) = managed.terminate() {
         tracing::warn!("failed to terminate hook process Job Object: {err:?}");
     }
+    #[cfg(not(windows))]
+    let _ = managed;
 
     if let Some(process_group_id) = child.id()
         && let Err(err) = codex_utils_pty::process_group::kill_process_group(process_group_id)
     {
         tracing::warn!("failed to kill hook process group {process_group_id}: {err:?}");
     }
-    if let Err(err) = child.kill().await
-        && err.kind() != io::ErrorKind::InvalidInput
-        && err.kind() != io::ErrorKind::NotFound
-    {
-        tracing::warn!("failed to kill hook process: {err:?}");
+    match terminate_with_timeout(HOOK_TERMINATION_TIMEOUT, child.kill()).await {
+        Ok(Err(err))
+            if err.kind() != io::ErrorKind::InvalidInput
+                && err.kind() != io::ErrorKind::NotFound =>
+        {
+            tracing::warn!("failed to kill hook process: {err:?}");
+        }
+        Err(_) => tracing::warn!(
+            "timed out after {:?} while killing hook process",
+            HOOK_TERMINATION_TIMEOUT
+        ),
+        _ => {}
     }
+}
+
+async fn terminate_with_timeout<F>(
+    duration: Duration,
+    termination: F,
+) -> Result<io::Result<()>, tokio::time::error::Elapsed>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    tokio::time::timeout(duration, termination).await
 }
 
 enum CommandRunError {
@@ -416,27 +464,51 @@ fn build_command(shell: &CommandShell, handler: &ConfiguredHandler) -> Command {
         Command::new(&shell.program)
     };
     if shell.program.is_empty() {
-        command.raw_arg(format!(r#""{}""#, handler.command));
+        append_shell_command(&mut command, &handler.command, true);
     } else {
         command.args(&shell.args);
 
-        if shell.args.iter().any(|arg| arg.eq_ignore_ascii_case("/c")) {
-            command.raw_arg(format!(r#""{}""#, handler.command));
-        } else {
-            command.arg(&handler.command);
-        }
+        append_shell_command(
+            &mut command,
+            &handler.command,
+            shell.args.iter().any(|arg| arg.eq_ignore_ascii_case("/c")),
+        );
     }
     command.envs(&handler.env);
     command
 }
 
-fn default_shell_command() -> Command {
-    {
-        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-        let mut command = Command::new(comspec);
-        command.arg("/C");
-        command
+#[cfg(windows)]
+fn append_shell_command(command: &mut Command, script: &str, use_raw_argument: bool) {
+    if use_raw_argument {
+        command.raw_arg(format!(r#""{script}""#));
+    } else {
+        command.arg(script);
     }
+}
+
+#[cfg(not(windows))]
+fn append_shell_command(command: &mut Command, script: &str, _use_raw_argument: bool) {
+    command.arg(script);
+}
+
+#[cfg(windows)]
+fn default_shell_command() -> Command {
+    let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    let mut command = Command::new(comspec);
+    command.arg("/C");
+    command
+}
+
+#[cfg(not(windows))]
+fn default_shell_command() -> Command {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string());
+    let mut command = Command::new(shell);
+    command.arg("-c");
+    command
 }
 
 #[cfg(test)]
@@ -444,11 +516,39 @@ mod tests {
     use std::collections::HashMap;
 
     use codex_protocol::protocol::HookEventName;
+
+    #[tokio::test]
+    async fn hook_process_kill_has_an_independent_timeout() {
+        let started = tokio::time::Instant::now();
+        let result = terminate_with_timeout(
+            Duration::from_millis(10),
+            std::future::pending::<io::Result<()>>(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
     use codex_protocol::protocol::HookSource;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn default_hook_shell_uses_the_platform_command_flag() {
+        let command = default_shell_command();
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        #[cfg(windows)]
+        assert_eq!(args, vec!["/C"]);
+        #[cfg(not(windows))]
+        assert_eq!(args, vec!["-c"]);
+    }
 
     fn test_handler(command: String, timeout_sec: u64, cwd: &AbsolutePathBuf) -> ConfiguredHandler {
         ConfiguredHandler {
@@ -464,6 +564,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn explicit_test_shell() -> CommandShell {
         CommandShell {
             program: "powershell.exe".to_string(),
@@ -471,11 +572,22 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
+    fn explicit_test_shell() -> CommandShell {
+        CommandShell {
+            program: "/bin/sh".to_string(),
+            args: vec!["-lc".to_string()],
+        }
+    }
+
     #[tokio::test]
     async fn timeout_covers_a_blocked_stdin_write() {
         let cwd = AbsolutePathBuf::current_dir().expect("current directory");
 
+        #[cfg(windows)]
         let command = "Start-Sleep -Seconds 60".to_string();
+        #[cfg(not(windows))]
+        let command = "sleep 60".to_string();
 
         let handler = test_handler(command, 1, &cwd);
         let input_json = "x".repeat(4 * 1024 * 1024);
@@ -505,9 +617,15 @@ mod tests {
         let marker = temp_dir.path().join("spawned-after-admission-timeout.txt");
         let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("absolute cwd");
 
+        #[cfg(windows)]
         let command = {
             let marker = marker.to_string_lossy().replace('\'', "''");
             format!("Set-Content -LiteralPath '{marker}' -Value spawned")
+        };
+        #[cfg(not(windows))]
+        let command = {
+            let marker = marker.to_string_lossy().replace('\'', "'\\''");
+            format!("printf spawned > '{marker}'")
         };
 
         let handler = test_handler(command, 1, &cwd);
@@ -537,11 +655,17 @@ mod tests {
         let marker = temp_dir.path().join("escaped-descendant.txt");
         let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("absolute cwd");
 
+        #[cfg(windows)]
         let command = {
             let marker = marker.to_string_lossy().replace('\'', "''");
             format!(
                 "Start-Job -ScriptBlock {{ Start-Sleep -Seconds 3; Set-Content -LiteralPath '{marker}' -Value done }} | Out-Null; Start-Sleep -Seconds 60"
             )
+        };
+        #[cfg(not(windows))]
+        let command = {
+            let marker = marker.to_string_lossy().replace('\'', "'\\''");
+            format!("(sleep 3; printf done > '{marker}') & sleep 60")
         };
 
         let handler = test_handler(command, 1, &cwd);
@@ -566,6 +690,7 @@ mod tests {
     async fn drains_output_while_writing_stdin() {
         let cwd = AbsolutePathBuf::current_dir().expect("current directory");
 
+        #[cfg(windows)]
         let command = concat!(
             "$stdout = [Console]::OpenStandardOutput(); ",
             "$bytes = New-Object byte[] (2 * 1024 * 1024); ",
@@ -574,6 +699,8 @@ mod tests {
             "[Console]::In.ReadToEnd() | Out-Null"
         )
         .to_string();
+        #[cfg(not(windows))]
+        let command = "dd if=/dev/zero bs=65536 count=32 2>/dev/null; cat >/dev/null".to_string();
 
         let handler = test_handler(command, 5, &cwd);
         let input_json = "x".repeat(4 * 1024 * 1024);

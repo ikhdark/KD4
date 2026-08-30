@@ -6,14 +6,18 @@ use crate::client::ModelClientSession;
 use crate::retry::backoff;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::WarningEvent;
 use http::StatusCode;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const MAX_RESPONSE_STREAM_RETRY_DELAY: Duration = Duration::from_secs(5);
+const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
@@ -22,11 +26,32 @@ pub(crate) enum ResponsesStreamRequest {
     RemoteCompactionV2,
 }
 
+/// Retry bookkeeping for one Responses stream loop.
+///
+/// `retries` tracks the bounded provider retry budget. Connection-loss waits are
+/// tracked separately because they must not consume that budget.
+#[derive(Debug)]
+pub(crate) struct ResponsesStreamRetryState {
+    retries: u64,
+    connection_retries: u64,
+    connection_retry_delay: Duration,
+}
+
+impl Default for ResponsesStreamRetryState {
+    fn default() -> Self {
+        Self {
+            retries: 0,
+            connection_retries: 0,
+            connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
+        }
+    }
+}
+
 /// Handles a retryable stream error and returns `Ok(())` when the caller should
 /// retry the request loop.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_retryable_response_stream_error(
-    retries: &mut u64,
+    retry_state: &mut ResponsesStreamRetryState,
     max_retries: u64,
     err: CodexErr,
     client_session: &mut ModelClientSession,
@@ -39,7 +64,33 @@ pub(crate) async fn handle_retryable_response_stream_error(
         return Err(err);
     }
 
-    if *retries >= max_retries
+    if should_wait_for_connection_recovery(
+        request,
+        &err,
+        &turn_context.session_source,
+        turn_context.provider.info(),
+    ) {
+        let retry_delay = retry_state.connection_retry_delay;
+        retry_state.connection_retries = retry_state.connection_retries.saturating_add(1);
+        warn!(
+            turn_id = %turn_context.sub_id,
+            connection_retries = retry_state.connection_retries,
+            ?retry_delay,
+            sampling_error = %err,
+            "stream connection failed; waiting for the network to recover"
+        );
+        // Deliberately does not touch `retry_state.retries`: a lost connection must not
+        // burn the bounded provider retry budget, so the turn survives sleep/wake and
+        // VPN churn instead of failing after `max_retries` quick attempts.
+        sess.notify_stream_error(turn_context, "Reconnecting... waiting for network", err)
+            .await;
+        let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
+        wait_for_retry_delay(retry_delay, cancellation_token).await?;
+        retry_state.connection_retry_delay = next_connection_retry_delay(retry_delay);
+        return Ok(());
+    }
+
+    if retry_state.retries >= max_retries
         && should_switch_fallback_transport(&err)
         && client_session.try_switch_fallback_transport(&turn_context.session_telemetry)
     {
@@ -53,13 +104,13 @@ pub(crate) async fn handle_retryable_response_stream_error(
         .await;
         // The loop itself supplies one immediate HTTPS fallback attempt. Keep the provider retry
         // budget exhausted so a failed fallback does not start a second full retry window.
-        exhaust_retry_budget_for_http_fallback(retries, max_retries);
+        exhaust_retry_budget_for_http_fallback(&mut retry_state.retries, max_retries);
         return Ok(());
     }
 
-    if *retries < max_retries {
-        *retries += 1;
-        let retry_count = *retries;
+    if retry_state.retries < max_retries {
+        retry_state.retries += 1;
+        let retry_count = retry_state.retries;
         let delay = response_stream_retry_delay(&err, retry_count);
         log_retry(request, turn_context, &err, retry_count, max_retries, delay);
 
@@ -82,6 +133,28 @@ fn exhaust_retry_budget_for_http_fallback(retries: &mut u64, max_retries: u64) {
     *retries = max_retries;
 }
 
+/// Decides whether a failed stream should wait for the network instead of
+/// spending the bounded provider retry budget.
+///
+/// Restricted to user-facing sampling turns: compaction requests stay bounded so
+/// they cannot stall a turn, internal sessions must fail fast for their callers,
+/// and Amazon Bedrock reports unrelated failures through the same error class.
+fn should_wait_for_connection_recovery(
+    request: ResponsesStreamRequest,
+    err: &CodexErr,
+    session_source: &SessionSource,
+    provider: &ModelProviderInfo,
+) -> bool {
+    matches!(request, ResponsesStreamRequest::Sampling)
+        && matches!(err, CodexErr::ConnectionFailed(_))
+        && !session_source.is_internal()
+        && !provider.is_amazon_bedrock()
+}
+
+fn next_connection_retry_delay(delay: Duration) -> Duration {
+    delay.saturating_mul(2).min(MAX_CONNECTION_RETRY_DELAY)
+}
+
 async fn wait_for_retry_delay(
     delay: Duration,
     cancellation_token: &CancellationToken,
@@ -102,13 +175,13 @@ fn should_retry_response_stream(request: ResponsesStreamRequest, err: &CodexErr)
 }
 
 fn should_switch_fallback_transport(err: &CodexErr) -> bool {
-    matches!(
-        err,
+    match err {
         CodexErr::RequestTimeout
-            | CodexErr::ConnectionFailed(_)
-            | CodexErr::ResponseStreamFailed(_)
-            | CodexErr::UnexpectedStatus(_)
-    )
+        | CodexErr::ConnectionFailed(_)
+        | CodexErr::ResponseStreamFailed(_) => true,
+        CodexErr::UnexpectedStatus(error) => error.status.is_server_error(),
+        _ => false,
+    }
 }
 
 fn response_stream_retry_delay(err: &CodexErr, retry_count: u64) -> Duration {

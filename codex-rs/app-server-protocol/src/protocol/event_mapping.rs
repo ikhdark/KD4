@@ -112,10 +112,6 @@ pub fn item_event_to_server_notification(
             let has_receiver = end_event.new_thread_id.is_some();
             let status = match &end_event.status {
                 codex_protocol::protocol::AgentStatus::Errored(_)
-                | codex_protocol::protocol::AgentStatus::TerminalWithCompletion {
-                    error: Some(_),
-                    ..
-                }
                 | codex_protocol::protocol::AgentStatus::NotFound => {
                     CollabAgentToolCallStatus::Failed
                 }
@@ -174,10 +170,6 @@ pub fn item_event_to_server_notification(
         EventMsg::CollabAgentInteractionEnd(end_event) => {
             let status = match &end_event.status {
                 codex_protocol::protocol::AgentStatus::Errored(_)
-                | codex_protocol::protocol::AgentStatus::TerminalWithCompletion {
-                    error: Some(_),
-                    ..
-                }
                 | codex_protocol::protocol::AgentStatus::NotFound => {
                     CollabAgentToolCallStatus::Failed
                 }
@@ -246,10 +238,6 @@ pub fn item_event_to_server_notification(
                 matches!(
                     status,
                     codex_protocol::protocol::AgentStatus::Errored(_)
-                        | codex_protocol::protocol::AgentStatus::TerminalWithCompletion {
-                            error: Some(_),
-                            ..
-                        }
                         | codex_protocol::protocol::AgentStatus::NotFound
                 )
             }) {
@@ -303,10 +291,6 @@ pub fn item_event_to_server_notification(
         EventMsg::CollabCloseEnd(end_event) => {
             let status = match &end_event.status {
                 codex_protocol::protocol::AgentStatus::Errored(_)
-                | codex_protocol::protocol::AgentStatus::TerminalWithCompletion {
-                    error: Some(_),
-                    ..
-                }
                 | codex_protocol::protocol::AgentStatus::NotFound => {
                     CollabAgentToolCallStatus::Failed
                 }
@@ -359,10 +343,6 @@ pub fn item_event_to_server_notification(
         EventMsg::CollabResumeEnd(end_event) => {
             let status = match &end_event.status {
                 codex_protocol::protocol::AgentStatus::Errored(_)
-                | codex_protocol::protocol::AgentStatus::TerminalWithCompletion {
-                    error: Some(_),
-                    ..
-                }
                 | codex_protocol::protocol::AgentStatus::NotFound => {
                     CollabAgentToolCallStatus::Failed
                 }
@@ -661,25 +641,18 @@ mod tests {
     }
 
     #[test]
-    fn collab_resume_end_preserves_terminal_completion_gate() {
+    fn collab_resume_end_preserves_completed_status() {
         let receiver_thread_id = ThreadId::new();
         let event = CollabResumeEndEvent {
-            call_id: "call-gated".to_string(),
+            call_id: "call-completed".to_string(),
             completed_at_ms: 789,
             sender_thread_id: ThreadId::new(),
             receiver_thread_id,
             receiver_agent_nickname: None,
             receiver_agent_role: None,
-            status: codex_protocol::protocol::AgentStatus::TerminalWithCompletion {
-                last_agent_message: Some("implemented".to_string()),
-                surfaced_result: None,
-                error: None,
-                completion: codex_protocol::protocol::TaskCompletionGate {
-                    status: codex_protocol::protocol::TaskCompletionStatus::Partial,
-                    reasons: vec!["validation did not pass".to_string()],
-                    evidence_path: Some("task-evidence/completion.json".to_string()),
-                },
-            },
+            status: codex_protocol::protocol::AgentStatus::Completed(Some(
+                "implemented".to_string(),
+            )),
         };
 
         let notification = item_event_to_server_notification(
@@ -702,11 +675,6 @@ mod tests {
                 status: CollabAgentStatus::Completed,
                 message: Some("implemented".to_string()),
                 surfaced_result: None,
-                completion: Some(crate::protocol::v2::TaskCompletionGate {
-                    status: crate::protocol::v2::TaskCompletionStatus::Partial,
-                    reasons: vec!["validation did not pass".to_string()],
-                    evidence_path: Some("task-evidence/completion.json".to_string()),
-                }),
                 last_agent_message: Some("implemented".to_string()),
             })
         );

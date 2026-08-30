@@ -994,9 +994,7 @@ def _cargo_command_with_target_dir(
 
 
 def _requires_core_test_helpers(arguments: Sequence[str]) -> bool:
-    return "codex-core" in arguments and (
-        "-p" in arguments or "--package" in arguments
-    )
+    return "codex-core" in arguments and ("-p" in arguments or "--package" in arguments)
 
 
 def _direct_reserved_lane_command(

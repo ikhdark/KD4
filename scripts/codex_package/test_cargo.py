@@ -214,9 +214,7 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                 Path(target_dir_arg),
                 codex_rs / "target" / "package" / "x86_64-pc-windows-msvc-release",
             )
-            self.assertNotIn(
-                "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS", call.env
-            )
+            self.assertNotIn("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS", call.env)
             self.assertEqual(
                 call.env["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"],
                 "C:/LLVM/bin/lld-link.exe",

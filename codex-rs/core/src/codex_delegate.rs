@@ -326,16 +326,6 @@ impl PreparedCodexOneShot {
             session_loop_termination,
         })
     }
-
-    pub(crate) async fn shutdown(self) {
-        let _ = self.io.submit(Op::Shutdown {}).await;
-        self.child_cancel.cancel();
-        let _ = timeout(
-            Duration::from_secs(5),
-            self.io.session_loop_termination.clone(),
-        )
-        .await;
-    }
 }
 
 async fn bridge_one_shot_events(

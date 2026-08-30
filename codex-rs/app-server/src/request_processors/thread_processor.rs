@@ -2404,7 +2404,6 @@ impl ThreadRequestProcessor {
                                 started_at: stored.started_at,
                                 completed_at: stored.completed_at,
                                 duration_ms: stored.duration_ms,
-                                completion: None,
                                 timing: None,
                                 surfaced_result: None,
                                 reasoning_policy_history: None,

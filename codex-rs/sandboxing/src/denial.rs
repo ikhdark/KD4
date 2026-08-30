@@ -11,12 +11,13 @@ pub fn is_likely_sandbox_denied(
         return false;
     }
 
-    const SANDBOX_DENIED_KEYWORDS: [&str; 5] = [
+    // Limit fallback text detection to diagnostics emitted by the operating
+    // system. Application prose that merely mentions a sandbox or a failed
+    // write is not evidence that the sandbox denied the process.
+    const SANDBOX_DENIED_KEYWORDS: [&str; 3] = [
         "permission denied",
         "operation not permitted",
         "read-only file system",
-        "sandbox",
-        "failed to write file",
     ];
 
     let has_sandbox_keyword = [

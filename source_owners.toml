@@ -1,66 +1,6 @@
 schema_version = 2
 
 [[owners]]
-id = "task-continuity-hooks"
-feature_ids = ["task-continuity-hooks"]
-concern_ids = ["task-continuity", "lifecycle-hooks", "capsule-retention"]
-aliases = ["task continuity hooks", "continuity capsules"]
-phrases = ["persist compact restore and retain bounded task continuity capsules"]
-roots = [
-    ".codex/hooks.json",
-    ".codex/hooks/task-continuity-entry.ps1",
-    ".codex/hooks/task-continuity-fast-basic.ps1",
-    ".codex/hooks/task-continuity-fast-compact.ps1",
-    ".codex/hooks/task-continuity-fast-session.ps1",
-    ".codex/hooks/task-continuity.ps1",
-    "scripts/test_task_continuity_hook.py",
-]
-primary_entries = [{ path = ".codex/hooks/task-continuity-entry.ps1", symbol = "param(", ambiguous = true }]
-instructions = ["AGENTS.md"]
-consumers = [".codex/hooks/task-continuity.ps1"]
-contracts = [".codex/hooks.json"]
-generated_mirrors = []
-tests = ["scripts/test_task_continuity_hook.py"]
-
-[owners.facet_exclusions]
-configuration_and_gates = "Hook selection is registered directly in .codex/hooks.json; the PowerShell entrypoint has no separate runtime configuration gate."
-generated_artifacts = "Continuity capsules are bounded local runtime state rather than checked-in generated mirrors."
-
-[[owners.relationships]]
-category = "runtime_registration"
-kind = "registers"
-target = "path:.codex/hooks/task-continuity-entry.ps1"
-confidence = "declared"
-evidence = [{ path = ".codex/hooks.json", symbol = "task-continuity-entry.ps1" }]
-
-[[owners.relationships]]
-category = "control_flow"
-kind = "calls"
-target = "path:.codex/hooks/task-continuity.ps1"
-confidence = "declared"
-evidence = [{ path = ".codex/hooks/task-continuity-fast-basic.ps1", symbol = "task-continuity.ps1" }]
-
-[[owners.relationships]]
-category = "tests_contracts"
-kind = "validated_by"
-target = "path:scripts/test_task_continuity_hook.py"
-confidence = "declared"
-evidence = [{ path = "scripts/test_task_continuity_hook.py", symbol = "class TaskContinuityHookTest" }]
-
-[[owners.invariants]]
-id = "hook-fail-open"
-kind = "semantic"
-statement = "Every registered lifecycle hook must emit the canonical empty object and exit successfully when routing or continuity processing fails."
-evidence = [{ path = ".codex/hooks/task-continuity-entry.ps1", symbol = "$emptyOutput = '{}'" }]
-tests = ["scripts/test_task_continuity_hook.py"]
-
-[[owners.validation]]
-id = "task-continuity-hooks-focused"
-cwd = "."
-argv = ["python", "-m", "unittest", "scripts.test_task_continuity_hook"]
-role = "focused_tests"
-
-[[owners]]
 id = "app-server-runtime"
 concern_ids = ["app-server", "desktop-protocol"]
 aliases = ["app server", "desktop app server"]
@@ -540,30 +480,23 @@ role = "focused_tests"
 
 [[owners]]
 id = "planning-architecture-runtime"
-concern_ids = ["planning", "plan-store", "validation-route"]
-aliases = ["update plan runtime", "durable plan store"]
-phrases = ["durable plan state and validation before implementation"]
+concern_ids = ["planning", "plan-store"]
+aliases = ["update plan runtime", "session plan store"]
+phrases = ["session checklist state"]
 roots = ["codex-rs/core/src/plan_store.rs", "codex-rs/core/src/tools/handlers/plan.rs", "codex-rs/core/src/tools/handlers/plan_tests.rs", "codex-rs/core/src/tools/spec_plan.rs", "codex-rs/core/src/session/reasoning_governor.rs"]
 primary_entries = [
     { path = "codex-rs/core/src/tools/handlers/plan.rs", symbol = "PlanHandler" },
     { path = "codex-rs/core/src/plan_store.rs", symbol = "PlanStore" },
 ]
 instructions = ["AGENTS.md"]
-consumers = ["codex-rs/core/src/task_evidence.rs", "codex-rs/core/src/session/reasoning_governor.rs"]
+consumers = ["codex-rs/core/src/session/reasoning_governor.rs"]
 contracts = ["codex-rs/core/src/plan_store.rs", "codex-rs/core/src/tools/handlers/plan.rs"]
 generated_mirrors = []
 tests = ["codex-rs/core/src/tools/handlers/plan_tests.rs"]
 
 [owners.facet_exclusions]
-configuration_and_gates = "Planning tier and validation behavior are runtime state, not a repository or feature configuration gate."
+configuration_and_gates = "Checklist state is session-local runtime state, not a repository or feature configuration gate."
 generated_artifacts = "The update_plan schema is constructed at runtime and has no checked-in generated mirror."
-
-[[owners.relationships]]
-category = "control_flow"
-kind = "calls"
-target = "path:codex-rs/core/src/task_evidence.rs"
-confidence = "compiler_resolved"
-evidence = [{ path = "codex-rs/core/src/tools/handlers/plan.rs", symbol = "impl ToolExecutor<ToolInvocation> for PlanHandler" }]
 
 [[owners.relationships]]
 category = "callers_consumers"
@@ -584,12 +517,12 @@ category = "tests_contracts"
 kind = "validated_by"
 target = "path:codex-rs/core/src/tools/handlers/plan_tests.rs"
 confidence = "declared"
-evidence = [{ path = "codex-rs/core/src/tools/handlers/plan_tests.rs", symbol = "cancellation_after_plan_commit_boundary_waits_for_durable_update" }]
+evidence = [{ path = "codex-rs/core/src/tools/handlers/plan_tests.rs", symbol = "cancellation_after_plan_commit_boundary_waits_for_session_update" }]
 
 [[owners.invariants]]
-id = "durable-plan-update"
+id = "session-plan-update"
 kind = "semantic"
-statement = "Committed plan updates reach durable task evidence before the tool response is emitted; cancellation before the commit boundary emits no plan update."
+statement = "Accepted plan updates commit to the session checklist before the tool response is emitted; cancellation before the commit boundary emits no plan update."
 evidence = [{ path = "codex-rs/core/src/tools/handlers/plan.rs", symbol = "impl ToolExecutor<ToolInvocation> for PlanHandler" }]
 tests = ["codex-rs/core/src/tools/handlers/plan_tests.rs"]
 
@@ -597,65 +530,6 @@ tests = ["codex-rs/core/src/tools/handlers/plan_tests.rs"]
 id = "planning-focused"
 cwd = "codex-rs"
 argv = ["cargo", "test", "-p", "codex-core", "tools::handlers::plan_tests"]
-role = "focused_tests"
-
-[[owners]]
-id = "task-evidence-runtime"
-concern_ids = ["task-evidence", "completion-gate", "validation-receipts"]
-feature_ids = ["task-evidence-completion-gate"]
-aliases = ["task evidence ledger", "completion evidence"]
-phrases = ["durable task evidence and completion admission"]
-roots = ["codex-rs/core/src/task_evidence.rs", "codex-rs/core/src/task_evidence"]
-primary_entries = [{ path = "codex-rs/core/src/task_evidence.rs", symbol = "TaskEvidenceLedger" }]
-instructions = ["AGENTS.md"]
-consumers = ["codex-rs/core/src/session", "codex-rs/core/src/tools/handlers/mcp.rs", "codex-rs/core/src/codex_thread.rs"]
-contracts = ["codex-rs/core/src/task_evidence/external_evidence.rs", "codex-rs/core/src/task_evidence/source_owner_index.rs"]
-generated_mirrors = []
-tests = ["codex-rs/core/src/task_evidence_tests.rs"]
-
-[owners.facet_exclusions]
-configuration_and_gates = "KD4 completion evidence is activated by repository identity rather than a user-selectable feature gate."
-generated_artifacts = "Evidence documents and oversized payload artifacts are runtime state under CODEX_HOME, not checked-in generated mirrors."
-
-[[owners.relationships]]
-category = "control_flow"
-kind = "calls"
-target = "owner:planning-architecture-runtime"
-confidence = "compiler_resolved"
-evidence = [{ path = "codex-rs/core/src/task_evidence.rs", symbol = "pub(crate) async fn record_planning_update(" }]
-
-[[owners.relationships]]
-category = "callers_consumers"
-kind = "consumed_by"
-target = "path:codex-rs/core/src/tools/handlers/mcp.rs"
-confidence = "compiler_resolved"
-evidence = [{ path = "codex-rs/core/src/tools/handlers/mcp.rs", symbol = "impl ToolExecutor<ToolInvocation> for McpHandler" }]
-
-[[owners.relationships]]
-category = "runtime_registration"
-kind = "constructs"
-target = "path:codex-rs/core/src/session/session.rs"
-confidence = "compiler_resolved"
-evidence = [{ path = "codex-rs/core/src/session/session.rs", symbol = "TaskEvidenceLedger::load_or_new" }]
-
-[[owners.relationships]]
-category = "tests_contracts"
-kind = "validated_by"
-target = "path:codex-rs/core/src/task_evidence_tests.rs"
-confidence = "declared"
-evidence = [{ path = "codex-rs/core/src/task_evidence_tests.rs", symbol = "source_owner_is_derived_from_implementation_surfaces" }]
-
-[[owners.invariants]]
-id = "current-evidence-completion"
-kind = "semantic"
-statement = "Completion admission uses current, repository-contained evidence and reopens after relevant mutations or stale validation."
-evidence = [{ path = "codex-rs/core/src/task_evidence.rs", symbol = "pub(crate) async fn completion_gate(" }]
-tests = ["codex-rs/core/src/task_evidence_tests.rs"]
-
-[[owners.validation]]
-id = "task-evidence-focused"
-cwd = "codex-rs"
-argv = ["cargo", "test", "-p", "codex-core", "task_evidence_tests"]
 role = "focused_tests"
 
 [[owners]]
@@ -793,7 +667,7 @@ phrases = ["recover exact omitted tool output"]
 roots = ["codex-rs/core/src/tools/command_output_artifact.rs", "codex-rs/core/src/tools/handlers/read_tool_output.rs"]
 primary_entries = [{ path = "codex-rs/core/src/tools/handlers/read_tool_output.rs", symbol = "ReadToolOutputHandler" }]
 instructions = ["AGENTS.md"]
-consumers = ["codex-rs/core/src/context_manager/history.rs"]
+consumers = []
 contracts = ["codex-rs/core/src/tools/handlers/read_tool_output_spec.rs"]
 generated_mirrors = []
 tests = ["codex-rs/core/src/tools/command_output_artifact_tests.rs"]
@@ -808,13 +682,6 @@ kind = "calls"
 target = "path:codex-rs/core/src/tools/command_output_artifact.rs"
 confidence = "compiler_resolved"
 evidence = [{ path = "codex-rs/core/src/tools/handlers/read_tool_output.rs", symbol = "handle_read_tool_output" }]
-
-[[owners.relationships]]
-category = "callers_consumers"
-kind = "consumed_by"
-target = "path:codex-rs/core/src/context_manager/history.rs"
-confidence = "compiler_resolved"
-evidence = [{ path = "codex-rs/core/src/context_manager/history.rs", symbol = "read_tool_output" }]
 
 [[owners.relationships]]
 category = "runtime_registration"

@@ -12,7 +12,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 #[cfg(test)]
@@ -39,17 +42,15 @@ use sha2::Digest;
 use sha2::Sha256;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
-use tokio::sync::SemaphorePermit;
 
 const ARTIFACT_EXPIRED_MESSAGE: &str = "artifact expired or does not belong to this thread; rerun the command if the output is still needed";
 const ARTIFACT_WRITING_MESSAGE: &str =
     "artifact is still being written; retry after the command yields or exits";
-const EVIDENCE_PROTECTION_EXTENSION: &str = "evidence-protected";
-const EVIDENCE_PROTECTION_MARKER_BYTES: &[u8; 34] = b"KD4_EXTERNAL_EVIDENCE_ARTIFACT_V1\n";
 const ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION: &str = "active-tool-history";
 const ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES: &[u8] = b"KD4_ACTIVE_TOOL_HISTORY_ARTIFACT_V1\n";
-const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 const LAZY_RAW_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 4 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
@@ -59,6 +60,7 @@ const RETENTION_RECONCILIATION_INTERVAL: u64 = 128;
 const RETENTION_BYTE_GUARD_BAND: u64 = MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64;
 pub(crate) const RECOVERY_AGGREGATE_TOKEN_CEILING: usize = 10_000;
 const RECOVERY_FRAGMENT_TOKEN_CEILING: usize = 1_000;
+const RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN: usize = 128;
 const MAX_AUTOMATIC_SUBDIVISIONS: u64 = 64;
 const MAX_AUTOMATIC_SUBDIVISION_BYTES: u64 = 64 * 1_024;
 pub(crate) const ARTIFACT_SEARCH_DEFAULT_MAX_RESULTS: usize = 20;
@@ -427,7 +429,7 @@ enum LogicalRetentionMutation {
     AppendReplace,
     Protection,
     #[cfg(test)]
-    EvidenceReconcile,
+    ProtectionReconcile,
     #[cfg(test)]
     StreamComplete,
     Cleanup,
@@ -771,16 +773,12 @@ async fn artifact_retention_record_with_bytes(
             "artifact path is not a regular file",
         ));
     }
-    let evidence_marker = evidence_protection_path(path);
     let tool_history_marker = active_tool_history_protection_path(path);
     let protected = tokio::task::spawn_blocking(move || {
-        let evidence =
-            retention_protection_marker_status(&evidence_marker, EVIDENCE_PROTECTION_MARKER_BYTES)?;
-        let tool_history = retention_protection_marker_status(
+        retention_protection_marker_status(
             &tool_history_marker,
             ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
-        )?;
-        Ok::<_, std::io::Error>(evidence || tool_history)
+        )
     })
     .await
     .map_err(std::io::Error::other)??;
@@ -1057,6 +1055,25 @@ pub(crate) struct RawOutputArtifactWriter {
     pending_output: Vec<u8>,
 }
 
+#[cfg(test)]
+static STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST: AtomicU8 = AtomicU8::new(0);
+
+async fn sync_streaming_output_file(file: &tokio::fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST.swap(0, Ordering::AcqRel) != 0 {
+        return Err(std::io::Error::other(
+            "injected streaming output sync failure",
+        ));
+    }
+
+    file.sync_all().await
+}
+
+#[cfg(test)]
+fn inject_streaming_finalize_sync_failure_for_test() {
+    STREAMING_FINALIZE_SYNC_FAILURE_FOR_TEST.store(1, Ordering::Release);
+}
+
 impl RawOutputArtifactWriter {
     pub(crate) async fn open(state: Option<&Arc<Mutex<RawOutputArtifact>>>) -> Option<Self> {
         let state = state?;
@@ -1273,6 +1290,18 @@ impl RawOutputArtifactWriter {
             self.lifecycle_completed = true;
             return;
         }
+        if let Err(err) = sync_streaming_output_file(&file).await {
+            let _ = unlock_output_file(file).await;
+            *state.lock().await = failed_with_owned_path(
+                path.clone(),
+                self.bytes,
+                format!("failed to sync `{}`: {err}", path.display()),
+                self.retention_token.as_ref(),
+            )
+            .await;
+            self.lifecycle_completed = true;
+            return;
+        }
         let metadata = file.metadata().await.and_then(|metadata| {
             metadata
                 .modified()
@@ -1283,6 +1312,19 @@ impl RawOutputArtifactWriter {
                 path.clone(),
                 self.bytes,
                 format!("failed to unlock `{}`: {err}", path.display()),
+                self.retention_token.as_ref(),
+            )
+            .await;
+            self.lifecycle_completed = true;
+            return;
+        }
+        let sync_path = path.clone();
+        if let Err(err) = run_blocking_artifact_io(move || sync_parent_directory(&sync_path)).await
+        {
+            *state.lock().await = failed_with_owned_path(
+                path.clone(),
+                self.bytes,
+                format!("failed to sync the parent of `{}`: {err}", path.display()),
                 self.retention_token.as_ref(),
             )
             .await;
@@ -1461,33 +1503,6 @@ impl RawOutputArtifact {
     pub(crate) fn retention_limit_reason(&self) -> Option<&'static str> {
         self.retention_limit_hit()
             .then_some("per_artifact_safety_limit")
-    }
-
-    pub(crate) async fn validation_integrity_with_output(
-        &self,
-    ) -> Option<(String, String, Vec<u8>)> {
-        let Self::Stored {
-            id, bytes, path, ..
-        } = self
-        else {
-            return None;
-        };
-        let expected_bytes = *bytes;
-        let id = id.to_string();
-        let (mut file, _) = open_regular_artifact(path).ok()?;
-        tokio::task::spawn_blocking(move || {
-            file.seek(SeekFrom::Start(0)).ok()?;
-            let mut retained = Vec::with_capacity(
-                usize::try_from(expected_bytes)
-                    .ok()?
-                    .min(MAX_RAW_OUTPUT_ARTIFACT_BYTES),
-            );
-            file.read_to_end(&mut retained).ok()?;
-            (u64::try_from(retained.len()).ok()? == expected_bytes)
-                .then(|| (id, format!("{:x}", Sha256::digest(&retained)), retained))
-        })
-        .await
-        .ok()?
     }
 }
 
@@ -2010,6 +2025,16 @@ fn response_fits_recovery_token_ceiling(value: &impl Serialize, token_ceiling: u
         .is_ok_and(|rendered| approx_token_count(&rendered) <= token_ceiling)
 }
 
+fn response_fits_recovery_retry_avoidance_ceiling(
+    value: &impl Serialize,
+    token_ceiling: usize,
+) -> bool {
+    serde_json::to_string(value).is_ok_and(|rendered| {
+        approx_token_count(&rendered)
+            <= token_ceiling.saturating_add(RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN)
+    })
+}
+
 fn successful_byte_selector_result(
     range: CanonicalByteRange,
     bytes: &[u8],
@@ -2169,7 +2194,7 @@ async fn create_canonical_output_artifact_with_id(
     // permit only while admitting the retained bytes and installing the staged
     // family, so independent tool completions can persist their output in
     // parallel without racing retention accounting.
-    let _retention_permit = retention_sweep_permit().await;
+    let _retention_permit = retention_sweep_permit_for_directory(&directory).await;
     let path = directory.join(format!("{id}.log"));
     if let Err(err) = reconcile_logical_artifact_transactions(&directory) {
         return CanonicalOutputArtifact {
@@ -2371,7 +2396,7 @@ pub(crate) async fn attach_canonical_output_artifact(
             }
         };
     let _staged_cleanup = StagedLogicalSegmentCleanup::new(&staged_segments);
-    let _retention_permit = retention_sweep_permit().await;
+    let _retention_permit = retention_sweep_permit_for_directory(&directory).await;
     if let Err(err) = reconcile_logical_artifact_transactions(&directory) {
         return CanonicalOutputArtifact {
             id: Some(id),
@@ -2701,214 +2726,6 @@ fn remove_logical_artifact_files(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-pub(crate) async fn create_evidence_output_artifact(
-    codex_home: &Path,
-    thread_id: &str,
-    output: &[u8],
-) -> Result<PendingEvidenceArtifact, String> {
-    if output.len() > MAX_RAW_OUTPUT_ARTIFACT_BYTES {
-        return Err(format!(
-            "evidence output exceeds the {MAX_RAW_OUTPUT_ARTIFACT_BYTES} byte artifact safety limit"
-        ));
-    }
-    create_evidence_output_artifact_inner(codex_home, thread_id, output, None).await
-}
-
-async fn create_evidence_output_artifact_inner(
-    codex_home: &Path,
-    thread_id: &str,
-    output: &[u8],
-    pre_marker_barrier: Option<&tokio::sync::Barrier>,
-) -> Result<PendingEvidenceArtifact, String> {
-    if output.len() > MAX_RAW_OUTPUT_ARTIFACT_BYTES {
-        return Err(format!(
-            "evidence output exceeds the {MAX_RAW_OUTPUT_ARTIFACT_BYTES} byte artifact safety limit"
-        ));
-    }
-    let directory = codex_home.join("tool-output").join(thread_id);
-    let retention_permit = retention_sweep_permit().await;
-    let initial_directory = directory.clone();
-    let _initial_retention_token = run_blocking_artifact_io(move || {
-        std::fs::create_dir_all(&initial_directory)?;
-        Ok(capture_retention_token(&initial_directory))
-    })
-    .await
-    .map_err(|err| format!("failed to create `{}`: {err}", directory.display()))?;
-    // Make room before rejecting the reservation. Expired and inactive ordinary command output
-    // should not cause durable evidence creation to fail spuriously.
-    enforce_retention_locked(&directory, Path::new(""), output.len() as u64, 1).await;
-    let usage = retention_usage_locked(&directory).await;
-    if usage.thread_bytes.saturating_add(output.len() as u64)
-        > MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
-        || usage.global_bytes.saturating_add(output.len() as u64)
-            > MAX_RETAINED_ARTIFACT_BYTES_TOTAL
-    {
-        return Err("evidence artifact retention budget is exhausted".to_string());
-    }
-    // The reservation above may have installed a replacement generation. Artifact creation starts
-    // against the post-reservation state so its eventual durable record can never update the
-    // generation that preceded reconciliation.
-    let token_directory = directory.clone();
-    let retention_token = run_blocking_artifact_io(move || {
-        Ok::<_, std::io::Error>(capture_retention_token(&token_directory))
-    })
-    .await
-    .map_err(|err| format!("failed to inspect artifact retention state: {err}"))?;
-
-    let id = ToolOutputArtifactId::new();
-    let path = directory.join(format!("{id}.log"));
-    let create_path = path.clone();
-    let file = match run_blocking_artifact_io(move || {
-        std::fs::OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&create_path)
-    })
-    .await
-    {
-        Ok(file) => file,
-        Err(err) => {
-            reject_stale_delta(&retention_token);
-            return Err(format!("failed to create `{}`: {err}", path.display()));
-        }
-    };
-    let cleanup = PendingEvidenceArtifactCleanup::new(path.clone(), retention_token.clone());
-    let lock_path = path.clone();
-    let file = run_blocking_artifact_io(move || {
-        file.try_lock()?;
-        Ok(file)
-    })
-    .await
-    .map_err(|err| {
-        format!(
-            "failed to lock `{}` for creation: {err}",
-            lock_path.display()
-        )
-    })?;
-    let mut file = tokio::fs::File::from_std(file);
-    file.write_all(output)
-        .await
-        .map_err(|err| format!("failed to write `{}`: {err}", path.display()))?;
-    file.flush()
-        .await
-        .map_err(|err| format!("failed to flush `{}`: {err}", path.display()))?;
-    file.sync_all()
-        .await
-        .map_err(|err| format!("failed to sync `{}`: {err}", path.display()))?;
-
-    #[cfg(test)]
-    if let Some(barrier) = pre_marker_barrier {
-        barrier.wait().await;
-        barrier.wait().await;
-    }
-    #[cfg(not(test))]
-    let _ = pre_marker_barrier;
-
-    let marker = evidence_protection_path(&path);
-    let marker_path = marker.clone();
-    run_blocking_artifact_io(move || create_new_evidence_protection_marker(&marker_path))
-        .await
-        .map_err(|err| format!("failed to protect `{}` as evidence: {err}", path.display()))?;
-    let sync_path = path.clone();
-    run_blocking_artifact_io(move || sync_parent_directory(&sync_path))
-        .await
-        .map_err(|err| format!("failed to sync evidence directory: {err}"))?;
-
-    let record = artifact_retention_record(&path)
-        .await
-        .map_err(|err| format!("failed to index evidence artifact: {err}"))?
-        .ok_or_else(|| "evidence artifact disappeared before indexing".to_string())?;
-    publish_known_record(&retention_token, record, LogicalRetentionMutation::Create);
-
-    let file = file.into_std().await;
-    let _ = file.unlock();
-    let handle = Arc::new(file);
-    Ok(PendingEvidenceArtifact {
-        id,
-        path,
-        bytes: output.len() as u64,
-        handle,
-        cleanup,
-        retention_permit: Some(retention_permit),
-    })
-}
-
-pub(crate) struct PendingEvidenceArtifact {
-    id: ToolOutputArtifactId,
-    path: PathBuf,
-    bytes: u64,
-    handle: Arc<File>,
-    cleanup: PendingEvidenceArtifactCleanup,
-    retention_permit: Option<RetentionSweepPermit>,
-}
-
-impl PendingEvidenceArtifact {
-    pub(crate) fn id(&self) -> ToolOutputArtifactId {
-        self.id
-    }
-
-    pub(crate) fn mark_durable(mut self) -> RawOutputArtifact {
-        self.cleanup.disarm();
-        drop(self.retention_permit.take());
-        RawOutputArtifact::Stored {
-            id: self.id,
-            path: self.path.clone(),
-            bytes: self.bytes,
-            truncated: false,
-            handle: self.handle.clone(),
-        }
-    }
-}
-
-struct PendingEvidenceArtifactCleanup {
-    path: PathBuf,
-    retention_token: RetentionIndexToken,
-    armed: bool,
-}
-
-impl PendingEvidenceArtifactCleanup {
-    fn new(path: PathBuf, retention_token: RetentionIndexToken) -> Self {
-        Self {
-            path,
-            retention_token,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PendingEvidenceArtifactCleanup {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let log_removed = match std::fs::remove_file(&self.path) {
-            Ok(()) => true,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-            Err(_) => false,
-        };
-        let marker_removed = match std::fs::remove_file(evidence_protection_path(&self.path)) {
-            Ok(()) => true,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-            Err(_) => false,
-        };
-        if log_removed && marker_removed {
-            publish_known_remove(
-                &self.retention_token,
-                &self.path,
-                LogicalRetentionMutation::Cleanup,
-                false,
-            );
-        } else {
-            reject_stale_delta(&self.retention_token);
-        }
-    }
-}
-
 fn create_new_protection_marker(marker: &Path, contents: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)
@@ -2922,167 +2739,8 @@ fn create_new_protection_marker(marker: &Path, contents: &[u8]) -> std::io::Resu
     Ok(())
 }
 
-fn create_new_evidence_protection_marker(marker: &Path) -> std::io::Result<()> {
-    create_new_protection_marker(marker, EVIDENCE_PROTECTION_MARKER_BYTES)
-}
-
-pub(crate) async fn delete_evidence_artifact(
-    codex_home: &Path,
-    thread_id: &str,
-    artifact_id: &str,
-) -> std::io::Result<()> {
-    let id = artifact_id.parse::<ToolOutputArtifactId>().map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid artifact id")
-    })?;
-    if id.to_string() != artifact_id {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "non-canonical artifact id",
-        ));
-    }
-    let path = codex_home
-        .join("tool-output")
-        .join(thread_id)
-        .join(format!("{id}.log"));
-    let marker = evidence_protection_path(&path);
-    let retention_token = capture_retention_token(path.parent().unwrap_or_else(|| Path::new(".")));
-    let _retention_permit = retention_sweep_permit().await;
-    if let Err(err) = sync_parent_directory(&marker) {
-        reject_stale_delta(&retention_token);
-        return Err(err);
-    }
-    match tokio::fs::remove_file(&marker).await {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            reject_stale_delta(&retention_token);
-            return Err(err);
-        }
-    }
-    if let Err(err) = sync_parent_directory(&marker) {
-        reject_stale_delta(&retention_token);
-        return Err(err);
-    }
-    match remove_inactive_output_path(path.clone()).await {
-        InactiveRemovalOutcome::RemovedOrAbsent => {
-            if let Err(err) = sync_parent_directory(&path) {
-                reject_stale_delta(&retention_token);
-                return Err(err);
-            }
-            publish_known_remove(
-                &retention_token,
-                &path,
-                LogicalRetentionMutation::Delete,
-                false,
-            );
-            Ok(())
-        }
-        InactiveRemovalOutcome::Active => {
-            match artifact_retention_record(&path).await {
-                Ok(Some(record)) => publish_known_record(
-                    &retention_token,
-                    record,
-                    LogicalRetentionMutation::Protection,
-                ),
-                Ok(None) | Err(_) => reject_stale_delta(&retention_token),
-            }
-            Err(std::io::Error::other(
-                "evidence artifact is still active and could not be deleted",
-            ))
-        }
-        InactiveRemovalOutcome::Ambiguous(err) => {
-            reject_stale_delta(&retention_token);
-            Err(err)
-        }
-    }
-}
-
-pub(crate) async fn reconcile_evidence_artifact_protection(
-    codex_home: &Path,
-    thread_id: &str,
-    referenced_artifact_ids: &std::collections::BTreeSet<String>,
-) -> std::collections::BTreeSet<String> {
-    let directory = codex_home.join("tool-output").join(thread_id);
-    let retention_token = capture_retention_token(&directory);
-    let _retention_permit = retention_sweep_permit().await;
-    let mut live_artifact_ids = std::collections::BTreeSet::new();
-    for artifact_id in referenced_artifact_ids {
-        let Ok(id) = artifact_id.parse::<ToolOutputArtifactId>() else {
-            continue;
-        };
-        if id.to_string() != *artifact_id {
-            continue;
-        }
-        let path = directory.join(format!("{id}.log"));
-        let marker = evidence_protection_path(&path);
-        let marker_is_valid = tokio::task::spawn_blocking(move || {
-            let Ok((_log_file, _)) = open_regular_artifact(&path) else {
-                return false;
-            };
-            match std::fs::symlink_metadata(&marker) {
-                Ok(_) => evidence_protection_marker_is_valid(&marker),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    create_new_evidence_protection_marker(&marker).is_ok()
-                }
-                Err(_) => false,
-            }
-        })
-        .await
-        .unwrap_or(false);
-        if marker_is_valid {
-            live_artifact_ids.insert(artifact_id.clone());
-        }
-    }
-
-    let Ok(mut entries) = tokio::fs::read_dir(&directory).await else {
-        reject_stale_delta(&retention_token);
-        return live_artifact_ids;
-    };
-    loop {
-        let entry = match entries.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => break,
-            Err(_) => {
-                reject_stale_delta(&retention_token);
-                return live_artifact_ids;
-            }
-        };
-        let marker = entry.path();
-        if marker.extension().and_then(|extension| extension.to_str())
-            != Some(EVIDENCE_PROTECTION_EXTENSION)
-        {
-            continue;
-        }
-        let Some(artifact_id) = marker.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        if live_artifact_ids.contains(artifact_id) {
-            continue;
-        }
-        let path = directory.join(format!("{artifact_id}.log"));
-        match tokio::fs::remove_file(marker).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => reject_stale_delta(&retention_token),
-        }
-        if matches!(
-            remove_inactive_output_path(path).await,
-            InactiveRemovalOutcome::Ambiguous(_)
-        ) {
-            reject_stale_delta(&retention_token);
-        }
-    }
-    if sync_parent_directory(&directory.join("retention-sync")).is_err() {
-        reject_stale_delta(&retention_token);
-        return live_artifact_ids;
-    }
-    let installed_mode = reconcile_retention_root(&retention_token.root).await;
-    note_completed_evidence_reconciliation(&retention_token.root, installed_mode);
-    live_artifact_ids
-}
-
 /// Ensures an exact artifact referenced by an active completed-tool receipt is
-/// protected independently from task-evidence ownership. The marker is only
+/// protected independently from tool-history retention. The marker is only
 /// created after thread confinement, regular-file, byte-count, and digest
 /// checks all succeed.
 pub(crate) async fn protect_active_tool_history_artifact(
@@ -3102,7 +2760,7 @@ pub(crate) async fn protect_active_tool_history_artifact(
     let path = directory.join(format!("{id}.log"));
     let marker = active_tool_history_protection_path(&path);
     let retention_token = capture_retention_token(&directory);
-    let _retention_permit = retention_sweep_permit().await;
+    let _retention_permit = retention_sweep_permit_for_directory(&directory).await;
     let expected_sha256 = expected_sha256.to_string();
     let path_for_check = path.clone();
     let marker_for_check = marker.clone();
@@ -3176,7 +2834,7 @@ pub(crate) async fn protect_active_tool_history_artifact(
 }
 
 /// Reconciles the `active_tool_history` owner after resume, fork, compaction,
-/// or history replacement. Evidence protection remains untouched.
+/// or history replacement.
 pub(crate) async fn reconcile_active_tool_history_artifact_protection(
     codex_home: &Path,
     thread_id: &str,
@@ -3200,7 +2858,7 @@ pub(crate) async fn reconcile_active_tool_history_artifact_protection(
 
     let directory = codex_home.join("tool-output").join(thread_id);
     let retention_token = capture_retention_token(&directory);
-    let _retention_permit = retention_sweep_permit().await;
+    let _retention_permit = retention_sweep_permit_for_directory(&directory).await;
     let mut entries = match tokio::fs::read_dir(&directory).await {
         Ok(entries) => entries,
         Err(_) => {
@@ -3240,32 +2898,8 @@ pub(crate) async fn reconcile_active_tool_history_artifact_protection(
         return live;
     }
     let installed_mode = reconcile_retention_root(&retention_token.root).await;
-    note_completed_evidence_reconciliation(&retention_token.root, installed_mode);
+    note_completed_protection_reconciliation(&retention_token.root, installed_mode);
     live
-}
-
-fn evidence_protection_marker_is_valid(marker: &Path) -> bool {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    configure_no_follow_open(&mut options);
-    let Ok(mut file) = options.open(marker) else {
-        return false;
-    };
-    let Ok(metadata) = file.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() || metadata_is_reparse_point(&metadata) {
-        return false;
-    }
-    if metadata.len() != EVIDENCE_PROTECTION_MARKER_BYTES.len() as u64 {
-        return false;
-    }
-    let mut bytes = [0_u8; EVIDENCE_PROTECTION_MARKER_BYTES.len()];
-    if file.read_exact(&mut bytes).is_err() || bytes != *EVIDENCE_PROTECTION_MARKER_BYTES {
-        return false;
-    }
-    let mut trailing = [0_u8; 1];
-    matches!(file.read(&mut trailing), Ok(0))
 }
 
 pub(crate) async fn append_raw_output_artifact(
@@ -4403,8 +4037,11 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
                 individual_candidate.results.clear();
                 individual_candidate.results.push(completed.clone());
                 individual_candidate.complete = true;
-                if response_fits_recovery_token_ceiling(&candidate, token_ceiling)
-                    || response_fits_recovery_token_ceiling(&individual_candidate, token_ceiling)
+                if response_fits_recovery_retry_avoidance_ceiling(&candidate, token_ceiling)
+                    || response_fits_recovery_retry_avoidance_ceiling(
+                        &individual_candidate,
+                        token_ceiling,
+                    )
                 {
                     selected = completed;
                 }
@@ -4413,7 +4050,7 @@ pub(crate) async fn read_tool_output_selectors_with_ceiling_and_reuse(
             response.complete = response.results.iter().all(|result| {
                 result.status == ToolOutputSelectorStatus::Ok && result.complete
             });
-            if response_fits_recovery_token_ceiling(&response, token_ceiling) {
+            if response_fits_recovery_retry_avoidance_ceiling(&response, token_ceiling) {
                 continue;
             }
             let Some(selected) = response.results.last_mut() else {
@@ -4499,7 +4136,7 @@ pub(crate) async fn read_tool_output_artifact(
 }
 
 /// Read the exact retained artifact bytes for crate-private deterministic
-/// evidence replay. This keeps the same UUID, thread confinement, regular-file,
+/// tool-history replay. This keeps the same UUID, thread confinement, regular-file,
 /// retention, and writer-lock protections as the model-visible line reader.
 #[cfg(test)]
 pub(crate) async fn read_exact_tool_output_artifact(
@@ -4685,6 +4322,7 @@ fn map_artifact_open_error(error: std::io::Error) -> ReadToolOutputError {
     }
 }
 
+#[cfg(windows)]
 fn configure_no_follow_open(options: &mut std::fs::OpenOptions) {
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -4692,15 +4330,42 @@ fn configure_no_follow_open(options: &mut std::fs::OpenOptions) {
     options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
+#[cfg(unix)]
+fn configure_no_follow_open(options: &mut std::fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_no_follow_open(_options: &mut std::fs::OpenOptions) {}
+
+#[cfg(windows)]
 fn is_no_follow_error(_raw_os_error: i32) -> bool {
     false
 }
 
+#[cfg(unix)]
+fn is_no_follow_error(raw_os_error: i32) -> bool {
+    raw_os_error == libc::ELOOP
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_no_follow_error(_raw_os_error: i32) -> bool {
+    false
+}
+
+#[cfg(windows)]
 fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -4712,26 +4377,13 @@ fn push_bounded(output: &mut Vec<u8>, byte: u8, max_bytes: usize, clamped: &mut 
     }
 }
 
-fn evidence_protection_path(artifact_path: &Path) -> PathBuf {
-    artifact_path.with_extension(EVIDENCE_PROTECTION_EXTENSION)
-}
-
 fn active_tool_history_protection_path(artifact_path: &Path) -> PathBuf {
     artifact_path.with_extension(ACTIVE_TOOL_HISTORY_PROTECTION_EXTENSION)
 }
 
 fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let result = {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(parent)
-            .and_then(|directory| directory.sync_all())
-    };
+    let result = sync_directory(parent);
     match result {
         Ok(()) => Ok(()),
         Err(error)
@@ -4748,6 +4400,23 @@ fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .and_then(|directory| directory.sync_all())
+}
+
+#[cfg(not(windows))]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    File::open(path).and_then(|directory| directory.sync_all())
+}
+
 async fn run_blocking_artifact_io<T, F>(operation: F) -> std::io::Result<T>
 where
     T: Send + 'static,
@@ -4759,16 +4428,12 @@ where
 }
 
 async fn artifact_is_protected(artifact_path: &Path) -> std::io::Result<bool> {
-    let evidence_marker = evidence_protection_path(artifact_path);
     let tool_history_marker = active_tool_history_protection_path(artifact_path);
     tokio::task::spawn_blocking(move || {
-        let evidence =
-            retention_protection_marker_status(&evidence_marker, EVIDENCE_PROTECTION_MARKER_BYTES)?;
-        let tool_history = retention_protection_marker_status(
+        retention_protection_marker_status(
             &tool_history_marker,
             ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
-        )?;
-        Ok::<_, std::io::Error>(evidence || tool_history)
+        )
     })
     .await
     .map_err(std::io::Error::other)?
@@ -4787,14 +4452,14 @@ fn note_logical_mutation_diagnostics(
         LogicalRetentionMutation::Delete | LogicalRetentionMutation::Cleanup => {
             diagnostics.deletes = diagnostics.deletes.saturating_add(1);
         }
-        LogicalRetentionMutation::Protection | LogicalRetentionMutation::EvidenceReconcile => {
+        LogicalRetentionMutation::Protection | LogicalRetentionMutation::ProtectionReconcile => {
             diagnostics.protection_changes = diagnostics.protection_changes.saturating_add(1);
         }
         LogicalRetentionMutation::AppendReplace | LogicalRetentionMutation::StreamComplete => {}
     }
 }
 
-fn note_completed_evidence_reconciliation(root: &Path, installed_mode: RetentionModeKind) {
+fn note_completed_protection_reconciliation(root: &Path, installed_mode: RetentionModeKind) {
     let mut registry = lock_retention_registry();
     let Some(state) = registry.roots.get_mut(root) else {
         return;
@@ -4802,7 +4467,7 @@ fn note_completed_evidence_reconciliation(root: &Path, installed_mode: Retention
     record_retention_diagnostics! {
         note_logical_mutation_diagnostics(
             &mut state.diagnostics,
-            LogicalRetentionMutation::EvidenceReconcile,
+            LogicalRetentionMutation::ProtectionReconcile,
         );
     }
     if installed_mode != RetentionModeKind::Indexed
@@ -5312,7 +4977,8 @@ async fn enforce_indexed_thread_retention(
             InactiveRemovalOutcome::Active => {
                 skipped.insert(path);
             }
-            InactiveRemovalOutcome::Ambiguous(_) => {
+            InactiveRemovalOutcome::Ambiguous(error) => {
+                tracing::debug!(%error, "artifact removal remained ambiguous");
                 invalidate_root_after_ambiguous_failure(root);
                 return false;
             }
@@ -5368,7 +5034,8 @@ async fn enforce_indexed_global_retention(
             InactiveRemovalOutcome::Active => {
                 skipped.insert(path);
             }
-            InactiveRemovalOutcome::Ambiguous(_) => {
+            InactiveRemovalOutcome::Ambiguous(error) => {
+                tracing::debug!(%error, "artifact removal remained ambiguous");
                 invalidate_root_after_ambiguous_failure(root);
                 return false;
             }
@@ -5378,7 +5045,7 @@ async fn enforce_indexed_global_retention(
 
 async fn enforce_retention(directory: &Path, keep_path: &Path) {
     let token = capture_retention_token(directory);
-    let _retention_permit = retention_sweep_permit().await;
+    let _retention_permit = retention_sweep_permit_for_directory(directory).await;
     publish_observed_path(&token, keep_path).await;
     enforce_retention_locked(directory, keep_path, 0, 0).await;
 }
@@ -5388,7 +5055,7 @@ async fn enforce_retention_after_observation(
     path: &Path,
     token: &RetentionIndexToken,
 ) {
-    let _retention_permit = retention_sweep_permit().await;
+    let _retention_permit = retention_sweep_permit(&token.root).await;
     publish_observed_path(token, path).await;
     enforce_retention_locked(directory, path, 0, 0).await;
 }
@@ -5399,7 +5066,7 @@ async fn enforce_retention_after_upsert(
     token: &RetentionIndexToken,
     mutation: LogicalRetentionMutation,
 ) {
-    let _retention_permit = retention_sweep_permit().await;
+    let _retention_permit = retention_sweep_permit(&token.root).await;
     match artifact_retention_record(path).await {
         Ok(Some(record)) => publish_known_record(token, record, mutation),
         Ok(None) => publish_known_remove(token, path, mutation, false),
@@ -5458,8 +5125,7 @@ async fn enforce_retention_locked(
         transition_current_root_to_dirty(&mut registry, &root);
         return;
     }
-    let external_generation_changed =
-        retention_interprocess_index_stale().swap(false, Ordering::AcqRel);
+    let external_generation_changed = take_retention_interprocess_index_stale(&root);
     if external_generation_changed
         && reconcile_logical_artifact_transactions_in_root(&root).is_err()
     {
@@ -5602,7 +5268,10 @@ async fn enforce_retention_scan_locked(
                 total_bytes = total_bytes.saturating_sub(bytes);
             }
             InactiveRemovalOutcome::Active => {}
-            InactiveRemovalOutcome::Ambiguous(_) => return progress,
+            InactiveRemovalOutcome::Ambiguous(error) => {
+                tracing::debug!(%error, "artifact removal remained ambiguous");
+                return progress;
+            }
         }
     }
     progress.complete = true;
@@ -5611,8 +5280,8 @@ async fn enforce_retention_scan_locked(
 
 #[cfg(test)]
 async fn enforce_global_retention(tool_output_root: &Path, keep_path: &Path) {
-    let _retention_permit = retention_sweep_permit().await;
     let root = normalized_tool_output_root(tool_output_root);
+    let _retention_permit = retention_sweep_permit(&root).await;
     match prepare_retention_mode(&root, true).await {
         RetentionModeKind::Indexed => {
             let _ = enforce_indexed_global_retention(&root, keep_path, 0, 0).await;
@@ -5697,7 +5366,10 @@ async fn enforce_global_retention_scan_locked(
                     total_bytes = total_bytes.saturating_sub(bytes);
                 }
                 InactiveRemovalOutcome::Active => {}
-                InactiveRemovalOutcome::Ambiguous(_) => return progress,
+                InactiveRemovalOutcome::Ambiguous(error) => {
+                    tracing::debug!(%error, "artifact removal remained ambiguous");
+                    return progress;
+                }
             }
         }
     }
@@ -5774,25 +5446,63 @@ async fn log_bytes_in_tool_output_root(root: &Path) -> std::io::Result<u64> {
 }
 
 struct RetentionSweepPermit {
-    _process_permit: SemaphorePermit<'static>,
+    _process_permit: OwnedSemaphorePermit,
     _interprocess_lock: AtomicWriteLock,
 }
 
-fn retention_interprocess_lock_target() -> PathBuf {
-    std::env::temp_dir().join("openai-codex-tool-output-retention-v1")
+static RETENTION_SWEEP_PERMIT_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static RETENTION_SWEEP_PERMIT_FAILURE_FOR_TEST: AtomicU8 = AtomicU8::new(0);
+
+fn record_retention_sweep_permit_failure(root: &Path, error: &dyn fmt::Display) {
+    RETENTION_SWEEP_PERMIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        root = %root.display(),
+        %error,
+        "skipping artifact retention bookkeeping because its shared lock is unavailable"
+    );
 }
 
-fn retention_interprocess_index_stale() -> &'static AtomicBool {
-    static STALE: AtomicBool = AtomicBool::new(true);
-    &STALE
+#[derive(Default)]
+struct RetentionInterprocessRootState {
+    generation: Option<u64>,
+    index_stale: bool,
 }
 
-fn retention_interprocess_generation() -> &'static StdMutex<Option<u64>> {
-    static GENERATION: OnceLock<StdMutex<Option<u64>>> = OnceLock::new();
-    GENERATION.get_or_init(|| StdMutex::new(None))
+fn retention_interprocess_lock_target(root: &Path) -> PathBuf {
+    let normalized_root = normalized_tool_output_root(root);
+    let identity = Sha256::digest(normalized_root.to_string_lossy().as_bytes());
+    std::env::temp_dir().join(format!(
+        "openai-codex-tool-output-retention-v2-{identity:x}"
+    ))
 }
 
-fn advance_retention_interprocess_generation(lock_target: &Path) -> std::io::Result<()> {
+fn retention_interprocess_states()
+-> &'static StdMutex<BTreeMap<PathBuf, RetentionInterprocessRootState>> {
+    static STATES: OnceLock<StdMutex<BTreeMap<PathBuf, RetentionInterprocessRootState>>> =
+        OnceLock::new();
+    STATES.get_or_init(|| StdMutex::new(BTreeMap::new()))
+}
+
+fn take_retention_interprocess_index_stale(root: &Path) -> bool {
+    let root = normalized_tool_output_root(root);
+    let mut states = retention_interprocess_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = states
+        .entry(root)
+        .or_insert_with(|| RetentionInterprocessRootState {
+            generation: None,
+            index_stale: true,
+        });
+    std::mem::take(&mut state.index_stale)
+}
+
+fn advance_retention_interprocess_generation(
+    root: &Path,
+    lock_target: &Path,
+) -> std::io::Result<()> {
     let (previous, next, recovered) = match std::fs::read_to_string(lock_target) {
         Ok(value) => match value
             .trim()
@@ -5807,42 +5517,104 @@ fn advance_retention_interprocess_generation(lock_target: &Path) -> std::io::Res
         Err(err) => return Err(err),
     };
     write_bytes_atomically(lock_target, next.to_string().as_bytes())?;
-    let mut observed = retention_interprocess_generation()
+    let root = normalized_tool_output_root(root);
+    let mut states = retention_interprocess_states()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if recovered || observed.is_none_or(|observed| observed != previous) {
-        retention_interprocess_index_stale().store(true, Ordering::Release);
+    if !states.contains_key(&root)
+        && states.len() >= MAX_RETENTION_INDEX_ROOTS
+        && let Some(evicted) = states.keys().next().cloned()
+    {
+        states.remove(&evicted);
     }
-    *observed = Some(next);
+    let state = states
+        .entry(root)
+        .or_insert_with(|| RetentionInterprocessRootState {
+            generation: None,
+            index_stale: true,
+        });
+    if recovered || state.generation.is_none_or(|observed| observed != previous) {
+        state.index_stale = true;
+    }
+    state.generation = Some(next);
     Ok(())
 }
 
-async fn retention_sweep_permit() -> RetentionSweepPermit {
-    let process_permit = match retention_sweep_semaphore().acquire().await {
+async fn retention_sweep_permit(root: &Path) -> Option<RetentionSweepPermit> {
+    let root = normalized_tool_output_root(root);
+    let process_permit = match retention_sweep_semaphore(&root).acquire_owned().await {
         Ok(permit) => permit,
-        Err(_) => unreachable!("the process-wide retention sweep semaphore is never closed"),
+        Err(error) => {
+            record_retention_sweep_permit_failure(&root, &error);
+            return None;
+        }
     };
-    let lock_target = retention_interprocess_lock_target();
+    let lock_target = retention_interprocess_lock_target(&root);
+    let lock_root = root.clone();
     let interprocess_lock = match tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        match RETENTION_SWEEP_PERMIT_FAILURE_FOR_TEST.swap(0, Ordering::AcqRel) {
+            1 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected retention lock acquisition failure",
+                ));
+            }
+            2 => panic!("injected retention lock task failure"),
+            _ => {}
+        }
         let lock = acquire_atomic_write_lock(&lock_target)?;
-        advance_retention_interprocess_generation(&lock_target)?;
+        advance_retention_interprocess_generation(&lock_root, &lock_target)?;
         Ok::<_, std::io::Error>(lock)
     })
     .await
     {
         Ok(Ok(lock)) => lock,
-        Ok(Err(error)) => panic!("shared artifact retention lock must be available: {error}"),
-        Err(error) => panic!("retention lock task must complete: {error}"),
+        Ok(Err(error)) => {
+            record_retention_sweep_permit_failure(&root, &error);
+            return None;
+        }
+        Err(error) => {
+            record_retention_sweep_permit_failure(&root, &error);
+            return None;
+        }
     };
-    RetentionSweepPermit {
+    Some(RetentionSweepPermit {
         _process_permit: process_permit,
         _interprocess_lock: interprocess_lock,
-    }
+    })
 }
 
-fn retention_sweep_semaphore() -> &'static Semaphore {
-    static RETENTION_SWEEP_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
-    RETENTION_SWEEP_SEMAPHORE.get_or_init(|| Semaphore::new(1))
+async fn retention_sweep_permit_for_directory(directory: &Path) -> Option<RetentionSweepPermit> {
+    let root = tool_output_root_for_directory(directory);
+    retention_sweep_permit(&root).await
+}
+
+#[cfg(test)]
+fn inject_retention_sweep_permit_failure_for_test(kind: u8) {
+    RETENTION_SWEEP_PERMIT_FAILURE_FOR_TEST.store(kind, Ordering::Release);
+}
+
+#[cfg(test)]
+fn retention_sweep_permit_failures_for_test() -> u64 {
+    RETENTION_SWEEP_PERMIT_FAILURES.load(Ordering::Relaxed)
+}
+
+fn retention_sweep_semaphore(root: &Path) -> Arc<Semaphore> {
+    static RETENTION_SWEEP_SEMAPHORES: OnceLock<StdMutex<BTreeMap<PathBuf, Weak<Semaphore>>>> =
+        OnceLock::new();
+    let semaphores = RETENTION_SWEEP_SEMAPHORES.get_or_init(|| StdMutex::new(BTreeMap::new()));
+    let root = normalized_tool_output_root(root);
+    let mut semaphores = semaphores
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    semaphores.retain(|_, semaphore| semaphore.strong_count() > 0);
+    if let Some(semaphore) = semaphores.get(&root).and_then(Weak::upgrade) {
+        return semaphore;
+    }
+    let semaphore = Arc::new(Semaphore::new(1));
+    semaphores.insert(root, Arc::downgrade(&semaphore));
+    semaphore
 }
 
 #[cfg(test)]
@@ -5919,7 +5691,7 @@ fn retention_registry_mutex_is_available_for_test() -> bool {
 
 #[cfg(test)]
 async fn force_retention_reconciliation_for_test(root: &Path) -> RetentionModeKind {
-    let _permit = retention_sweep_permit().await;
+    let _permit = retention_sweep_permit(root).await;
     reconcile_retention_root(root).await
 }
 
@@ -6098,19 +5870,26 @@ mod tests {
     }
 
     #[test]
-    fn evidence_protection_marker_rejects_oversized_contents() {
+    fn active_tool_history_protection_marker_rejects_oversized_contents() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let marker = temp.path().join("artifact.evidence-protected");
-        create_new_evidence_protection_marker(&marker).expect("create evidence marker");
-        assert!(evidence_protection_marker_is_valid(&marker));
+        let marker = temp.path().join("artifact.active-tool-history");
+        create_new_protection_marker(&marker, ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES)
+            .expect("create active tool-history marker");
+        assert!(
+            protection_marker_status(&marker, ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES)
+                .expect("read active tool-history marker")
+        );
 
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&marker)
-            .expect("open evidence marker for append");
+            .expect("open active tool-history marker for append");
         file.write_all(b"x").expect("append trailing marker byte");
 
-        assert!(!evidence_protection_marker_is_valid(&marker));
+        assert!(
+            !protection_marker_status(&marker, ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES)
+                .expect("read oversized active tool-history marker")
+        );
     }
 
     fn stored_id(artifact: &RawOutputArtifact) -> ToolOutputArtifactId {
@@ -6174,6 +5953,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn read_rejects_uuid_named_reparse_point_outside_thread_directory() {
         use std::os::windows::fs::symlink_file;
@@ -6196,6 +5976,26 @@ mod tests {
         let error = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
             .await
             .expect_err("reparse artifact should fail");
+
+        assert_eq!(error, ReadToolOutputError::Expired);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_rejects_uuid_named_symlink_outside_thread_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let thread_directory = temp.path().join("tool-output").join("thread");
+        std::fs::create_dir_all(&thread_directory).expect("create thread directory");
+        let outside = temp.path().join("outside.log");
+        std::fs::write(&outside, b"outside secret\n").expect("write outside artifact");
+        let id = ToolOutputArtifactId::new();
+        symlink(&outside, thread_directory.join(format!("{id}.log"))).expect("create file symlink");
+
+        let error = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
+            .await
+            .expect_err("symlink artifact should fail");
 
         assert_eq!(error, ReadToolOutputError::Expired);
     }

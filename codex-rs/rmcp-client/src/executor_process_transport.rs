@@ -39,7 +39,6 @@ use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
 use serde_json::from_slice;
 use serde_json::to_vec;
-use tokio::runtime::Handle;
 use tokio::sync::broadcast;
 use tracing::debug;
 use tracing::info;
@@ -127,8 +126,8 @@ struct LineLimitExceeded;
 pub(super) struct ExecutorProcessTransport {
     /// Logical process handle returned by the executor process API.
     ///
-    /// `write` forwards stdin bytes. `terminate` stops the child when rmcp
-    /// closes the transport.
+    /// `write` forwards stdin bytes. The wrapping `StdioServerProcessHandle`
+    /// owns process termination.
     process: Arc<dyn ExecProcess>,
 
     /// Pushed output/lifecycle stream for the process.
@@ -153,10 +152,6 @@ pub(super) struct ExecutorProcessTransport {
     /// flushed once and then rmcp receives EOF.
     closed: bool,
 
-    /// Whether this transport already asked the executor to terminate the MCP
-    /// server process.
-    terminated: bool,
-
     /// Highest executor process event sequence observed by this transport.
     ///
     /// When the pushed event stream lags, use this as the retained-output read
@@ -178,7 +173,6 @@ impl ExecutorProcessTransport {
             stdout: LineBuffer::default(),
             stderr: LineBuffer::default(),
             closed: false,
-            terminated: false,
             last_seq: 0,
         }
     }
@@ -227,8 +221,8 @@ impl Transport<RoleClient> for ExecutorProcessTransport {
     }
 
     async fn close(&mut self) -> std::result::Result<(), Self::Error> {
-        self.process.terminate().await.map_err(io::Error::other)?;
-        self.terminated = true;
+        // `StdioServerTransport` terminates through its shared process handle
+        // before closing this byte adapter.
         Ok(())
     }
 }
@@ -434,29 +428,3 @@ impl ExecutorProcessTransport {
 #[cfg(test)]
 #[path = "executor_process_transport_tests.rs"]
 mod tests;
-
-impl Drop for ExecutorProcessTransport {
-    fn drop(&mut self) {
-        if self.terminated {
-            return;
-        }
-
-        let process = Arc::clone(&self.process);
-        let program_name = self.program_name.clone();
-        let Ok(handle) = Handle::try_current() else {
-            warn!(
-                "Could not schedule remote MCP server process termination on drop ({}): no Tokio runtime is available",
-                self.program_name
-            );
-            return;
-        };
-
-        std::mem::drop(handle.spawn(async move {
-            if let Err(error) = process.terminate().await {
-                warn!(
-                    "Failed to terminate remote MCP server process on drop ({program_name}): {error}"
-                );
-            }
-        }));
-    }
-}

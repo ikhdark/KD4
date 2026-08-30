@@ -219,11 +219,6 @@ pub const CONFIG_OPTION_DOCS: &[ConfigOptionDoc] = &[
         "Include the environment-context user block.",
     ),
     doc(
-        "kd4_workflow_enabled",
-        "Repository workflow",
-        "Explicitly enable or disable the KD4 workflow; omit to use repository-marker detection.",
-    ),
-    doc(
         "forced_chatgpt_workspace_id",
         "Auth and login",
         "Restrict ChatGPT login to one or more workspace IDs.",

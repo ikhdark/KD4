@@ -17,8 +17,6 @@ use codex_protocol::protocol::SamplingBoundaryItem;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
-use codex_protocol::protocol::TaskCompletionGate;
-use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TurnContextProvenance;
 use codex_protocol::protocol::WorldStateItem;
 use pretty_assertions::assert_eq;
@@ -125,7 +123,6 @@ async fn reconstruct_history_ignores_tool_manifest_records() {
         first_window_id: _,
         previous_window_id: _,
         window_id: _,
-        last_passed_root_completion_turn_id: _,
     } = reconstructed;
     assert_eq!(history, vec![user]);
 }
@@ -170,55 +167,10 @@ fn completed_user_turn_rollout(
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
-            completion: None,
             timing: None,
         },
     )));
     rollout_items
-}
-
-fn completed_turn_with_status(
-    turn_id: &str,
-    status: Option<TaskCompletionStatus>,
-) -> Vec<RolloutItem> {
-    vec![
-        RolloutItem::EventMsg(EventMsg::TurnStarted(
-            codex_protocol::protocol::TurnStartedEvent {
-                turn_id: turn_id.to_string(),
-                trace_id: None,
-                started_at: None,
-                model_context_window: Some(128_000),
-                collaboration_mode_kind: ModeKind::Default,
-            },
-        )),
-        RolloutItem::EventMsg(EventMsg::UserMessage(
-            codex_protocol::protocol::UserMessageEvent {
-                client_id: None,
-                message: turn_id.to_string(),
-                images: None,
-                local_images: Vec::new(),
-                text_elements: Vec::new(),
-                ..Default::default()
-            },
-        )),
-        RolloutItem::EventMsg(EventMsg::TurnComplete(
-            codex_protocol::protocol::TurnCompleteEvent {
-                surfaced_result: None,
-                turn_id: turn_id.to_string(),
-                last_agent_message: None,
-                error: None,
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-                completion: status.map(|status| TaskCompletionGate {
-                    status,
-                    reasons: Vec::new(),
-                    evidence_path: None,
-                }),
-                timing: None,
-            },
-        )),
-    ]
 }
 
 async fn resume_rollout(session: &Session, rollout_items: Vec<RolloutItem>) {
@@ -299,103 +251,6 @@ async fn durability_regression_resume_invalidates_unified_exec_session() {
     assert_eq!(invalidations.len(), 1);
     assert!(invalidations[0].contains("- 1000"));
     assert!(invalidations[0].contains("Do not call write_stdin"));
-}
-
-#[tokio::test]
-async fn record_initial_history_restores_newest_passed_completion_boundary() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let mut rollout_items = completed_turn_with_status("older", Some(TaskCompletionStatus::Passed));
-    rollout_items.extend(completed_turn_with_status(
-        "newer",
-        Some(TaskCompletionStatus::Passed),
-    ));
-
-    resume_rollout(&session, rollout_items).await;
-
-    assert_eq!(
-        session.last_passed_root_completion_turn_id().await,
-        Some("newer".to_string())
-    );
-}
-
-#[tokio::test]
-async fn record_initial_history_rollback_reveals_prior_passed_completion_boundary() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let mut rollout_items = completed_turn_with_status("older", Some(TaskCompletionStatus::Passed));
-    rollout_items.extend(completed_turn_with_status(
-        "rolled-back",
-        Some(TaskCompletionStatus::Passed),
-    ));
-    rollout_items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
-        codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
-    )));
-
-    resume_rollout(&session, rollout_items).await;
-
-    assert_eq!(
-        session.last_passed_root_completion_turn_id().await,
-        Some("older".to_string())
-    );
-}
-
-#[tokio::test]
-async fn record_initial_history_without_passed_completion_clears_boundary() {
-    let (session, _turn_context) = make_session_and_context().await;
-    session
-        .set_last_passed_root_completion_turn_id(Some("stale".to_string()))
-        .await;
-
-    resume_rollout(
-        &session,
-        completed_turn_with_status("partial", Some(TaskCompletionStatus::Partial)),
-    )
-    .await;
-
-    assert_eq!(session.last_passed_root_completion_turn_id().await, None);
-}
-
-#[tokio::test]
-async fn record_initial_history_ignores_partial_and_blocked_completion_boundaries() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let mut rollout_items =
-        completed_turn_with_status("partial", Some(TaskCompletionStatus::Partial));
-    rollout_items.extend(completed_turn_with_status(
-        "blocked",
-        Some(TaskCompletionStatus::Blocked),
-    ));
-
-    resume_rollout(&session, rollout_items).await;
-
-    assert_eq!(session.last_passed_root_completion_turn_id().await, None);
-}
-
-#[tokio::test]
-async fn replacement_checkpoint_does_not_hide_older_passed_completion_boundary() {
-    let (session, turn_context) = make_session_and_context().await;
-    let mut rollout_items = completed_turn_with_status(
-        "passed-before-compaction",
-        Some(TaskCompletionStatus::Passed),
-    );
-    let mut compacting_context = accepted_context(turn_context.to_turn_context_item());
-    compacting_context.turn_id = Some("compacting-turn".to_string());
-    rollout_items.extend(completed_user_turn_rollout(
-        compacting_context,
-        vec![RolloutItem::Compacted(CompactedItem {
-            message: "summary".to_string(),
-            replacement_history: Some(vec![user_message("replacement")]),
-            window_number: Some(2),
-            first_window_id: Some(Uuid::now_v7().to_string()),
-            previous_window_id: Some(Uuid::now_v7().to_string()),
-            window_id: Some(Uuid::now_v7().to_string()),
-        })],
-    ));
-
-    resume_rollout(&session, rollout_items).await;
-
-    assert_eq!(
-        session.last_passed_root_completion_turn_id().await,
-        Some("passed-before-compaction".to_string())
-    );
 }
 
 #[tokio::test]
@@ -566,7 +421,6 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
                 turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -644,7 +498,6 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_com
                 turn_id: first_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -682,7 +535,6 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_com
                 turn_id: rolled_back_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -764,7 +616,6 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_inc
                 turn_id: first_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -952,7 +803,6 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
                 turn_id: first_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -986,7 +836,6 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
                 turn_id: second_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1009,7 +858,6 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
                 turn_id: standalone_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1089,7 +937,6 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
                 turn_id: first_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1114,7 +961,6 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
                 turn_id: assistant_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1189,7 +1035,6 @@ async fn reconstruct_history_rollback_clears_history_and_metadata_when_exceeding
                 turn_id: only_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1246,7 +1091,6 @@ async fn record_initial_history_resumed_rollback_skips_only_user_turns() {
                 turn_id: user_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1269,7 +1113,6 @@ async fn record_initial_history_resumed_rollback_skips_only_user_turns() {
                 turn_id: standalone_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1334,7 +1177,6 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
                 turn_id: previous_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1755,7 +1597,6 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
                 turn_id: current_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1837,7 +1678,6 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
                 turn_id: previous_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -1948,7 +1788,6 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
                 turn_id: previous_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2072,7 +1911,6 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
                 turn_id: previous_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2114,7 +1952,6 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
                 turn_id: current_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2205,7 +2042,6 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
                 turn_id: previous_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2374,7 +2210,6 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
                 turn_id: previous_turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,

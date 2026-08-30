@@ -166,16 +166,6 @@
     },
     "CollabAgentState": {
       "properties": {
-        "completion": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/TaskCompletionGate"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "lastAgentMessage": {
           "type": [
             "string",
@@ -1004,37 +994,6 @@
         "value"
       ],
       "type": "object"
-    },
-    "TaskCompletionGate": {
-      "properties": {
-        "evidencePath": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "reasons": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "status": {
-          "$ref": "#/definitions/TaskCompletionStatus"
-        }
-      },
-      "required": [
-        "status"
-      ],
-      "type": "object"
-    },
-    "TaskCompletionStatus": {
-      "enum": [
-        "passed",
-        "partial",
-        "blocked"
-      ],
-      "type": "string"
     },
     "TextElement": {
       "properties": {
@@ -2205,17 +2164,6 @@
             "null"
           ]
         },
-        "completion": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/TaskCompletionGate"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Machine-derived completion proof persisted at the terminal turn boundary."
-        },
         "durationMs": {
           "description": "Duration between turn start and completion in milliseconds, if known.",
           "format": "int64",
@@ -2491,8 +2439,6 @@
             }
           ],
           "default": {
-            "checkpointTokens": 0,
-            "completionGateNs": 0,
             "deliveryAttemptNs": 0,
             "diffRefreshCount": 0,
             "diffReuseCount": 0,
@@ -2505,10 +2451,6 @@
             "interactionReleaseNs": 0,
             "postCleanupNs": 0,
             "preparationNs": 0,
-            "reviewNs": 0,
-            "reviewPreflightNs": 0,
-            "reviewerInfrastructureMemoHitCount": 0,
-            "reviewsPreventedByCorrectnessCount": 0,
             "terminalMemoHitCount": 0,
             "unclassifiedNs": 0,
             "validationAggregateCount": 0,
@@ -2516,7 +2458,7 @@
             "validationLaunchCount": 0,
             "validationProcessNs": 0
           },
-          "description": "Additive terminalization phase timings. Older records deserialize to zeroes; the terminalization receipt remains authoritative for phases that occur after live dispatch."
+          "description": "Additive terminalization phase timings captured as part of the terminal timing profile."
         },
         "toolCallTimingOverflow": {
           "default": 0,
@@ -2636,20 +2578,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "completionReviewReadyPhaseCount": {
-          "default": 0,
-          "description": "Completion-review coordinators that observed the ready phase.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "completionReviewTerminalPhaseCount": {
-          "default": 0,
-          "description": "Completion-review coordinators that observed the terminal phase.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "exactRepeatedWaitCount": {
           "default": 0,
           "format": "uint32",
@@ -2721,8 +2649,6 @@
           ],
           "default": {
             "compaction": 0,
-            "completionRepairRereview": 0,
-            "completionReview": 0,
             "initial": 0,
             "other": 0,
             "subagent": 0,
@@ -3413,8 +3339,6 @@
       "enum": [
         "initial",
         "tool_continuation",
-        "completion_review",
-        "completion_repair_rereview",
         "compaction",
         "subagent",
         "other"
@@ -3424,16 +3348,6 @@
     "TurnTimingGenerationReasonCounts": {
       "properties": {
         "compaction": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "completionRepairRereview": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "completionReview": {
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -3461,8 +3375,6 @@
       },
       "required": [
         "compaction",
-        "completionRepairRereview",
-        "completionReview",
         "initial",
         "other",
         "subagent",
@@ -4133,17 +4045,6 @@
     },
     "TurnTimingTerminalization": {
       "properties": {
-        "checkpointTokens": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "completionGateNs": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "deliveryAttemptNs": {
           "default": 0,
           "format": "uint64",
@@ -4216,30 +4117,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "reviewNs": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "reviewPreflightNs": {
-          "default": 0,
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "reviewerInfrastructureMemoHitCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "reviewsPreventedByCorrectnessCount": {
-          "default": 0,
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
         "terminalMemoHitCount": {
           "default": 0,
           "format": "uint32",
@@ -4277,7 +4154,6 @@
         }
       },
       "required": [
-        "completionGateNs",
         "validationProcessNs"
       ],
       "type": "object"

@@ -17,7 +17,6 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::SurfacedToolResult;
-use codex_app_server_protocol::TaskCompletionGate;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
@@ -58,8 +57,6 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ReasoningPolicyHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
-use codex_protocol::protocol::TaskCompletionGate as CoreTaskCompletionGate;
-use codex_protocol::protocol::TaskCompletionStatus as CoreTaskCompletionStatus;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -250,7 +247,6 @@ async fn thread_read_reasoning_policy_history_follows_initialize_capability() ->
                 last_agent_message: None,
                 surfaced_result: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -310,7 +306,7 @@ async fn thread_read_reasoning_policy_history_follows_initialize_capability() ->
 }
 
 #[tokio::test]
-async fn terminal_outcome_matches_across_read_cold_resume_and_fork() -> Result<()> {
+async fn terminal_metadata_matches_across_read_cold_resume_and_fork() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -331,12 +327,6 @@ async fn terminal_outcome_matches_across_read_cold_resume_and_fork() -> Result<(
         value: json!({"answer": 42, "nested": [true, null]}),
         canonical_message: None,
     };
-    let core_completion = CoreTaskCompletionGate {
-        status: CoreTaskCompletionStatus::Partial,
-        reasons: vec!["focused validation is stale".to_string()],
-        evidence_path: Some("task-evidence/thread.json".to_string()),
-    };
-    let expected_completion = TaskCompletionGate::from(core_completion.clone());
     let timing = TurnTiming {
         schema_version: 7,
         profile_valid: true,
@@ -370,7 +360,6 @@ async fn terminal_outcome_matches_across_read_cold_resume_and_fork() -> Result<(
             last_agent_message: None,
             surfaced_result: Some(surfaced_result.clone()),
             error: None,
-            completion: Some(core_completion),
             completed_at: Some(12),
             duration_ms: Some(2_500),
             time_to_first_token_ms: Some(125),
@@ -406,7 +395,6 @@ async fn terminal_outcome_matches_across_read_cold_resume_and_fork() -> Result<(
         .iter()
         .find(|turn| turn.id != terminal_turn_id)
         .expect("legacy turn");
-    assert_eq!(legacy_turn.completion, None);
     assert_eq!(legacy_turn.timing, None);
     assert_eq!(legacy_turn.surfaced_result, None);
     let read_terminal = read_thread
@@ -418,7 +406,6 @@ async fn terminal_outcome_matches_across_read_cold_resume_and_fork() -> Result<(
     assert_eq!(read_terminal.status, TurnStatus::Completed);
     assert_eq!(read_terminal.completed_at, Some(12));
     assert_eq!(read_terminal.duration_ms, Some(2_500));
-    assert_eq!(read_terminal.completion, Some(expected_completion.clone()));
     assert_eq!(read_terminal.timing, Some(timing.clone()));
     assert_eq!(read_terminal.surfaced_result, Some(surfaced_result.clone()));
     assert!(
@@ -449,7 +436,6 @@ async fn terminal_outcome_matches_across_read_cold_resume_and_fork() -> Result<(
         .iter()
         .find(|turn| turn.id == terminal_turn_id)
         .expect("terminal turn from cold thread/resume");
-    assert_eq!(resumed_terminal.completion, read_terminal.completion);
     assert_eq!(resumed_terminal.timing, read_terminal.timing);
     assert_eq!(
         resumed_terminal.surfaced_result,
@@ -479,7 +465,6 @@ async fn terminal_outcome_matches_across_read_cold_resume_and_fork() -> Result<(
         .iter()
         .find(|turn| turn.id == terminal_turn_id)
         .expect("historical terminal turn in fork");
-    assert_eq!(forked_terminal.completion, read_terminal.completion);
     assert_eq!(forked_terminal.timing, read_terminal.timing);
     assert_eq!(
         forked_terminal.surfaced_result,
@@ -505,7 +490,6 @@ async fn terminal_outcome_matches_across_read_cold_resume_and_fork() -> Result<(
     let TurnStartResponse { turn: active_turn } =
         to_response::<TurnStartResponse>(turn_start_resp)?;
     assert_eq!(active_turn.status, TurnStatus::InProgress);
-    assert_eq!(active_turn.completion, None);
     assert_eq!(active_turn.timing, None);
     assert_eq!(active_turn.surfaced_result, None);
     timeout(

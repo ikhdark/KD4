@@ -24,7 +24,6 @@ use crate::session::turn::reconcile_turn_progress_event;
 use crate::session::turn_context::TurnContext;
 use crate::tools::command_execution::CommandExecutionId;
 use crate::tools::command_execution::CommandExecutionLedger;
-use crate::tools::command_execution::CompletedValidation;
 use crate::tools::command_execution::CompletionApplyResult;
 use crate::tools::command_output_artifact::append_raw_output_artifact;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -37,7 +36,7 @@ use crate::tools::known_delta_store::KnownDeltaExecutionObservation;
 use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
-use codex_agent_task_store::ValidationCallStatus;
+use codex_features::Feature;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::protocol::Event;
@@ -274,6 +273,77 @@ pub(super) async fn wait_for_process_output_finalization(
     closed.await;
 }
 
+pub(super) async fn wait_for_process_output_for_result(
+    direct_runtime: bool,
+    output_drained: &CancellationToken,
+    output_closed: &AtomicBool,
+    output_closed_notify: &Notify,
+) {
+    if direct_runtime {
+        wait_for_process_output_drain(output_drained).await;
+    } else {
+        wait_for_process_output_finalization(output_drained, output_closed, output_closed_notify)
+            .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_process_terminal_event(
+    process: &Arc<UnifiedExecProcess>,
+    session_ref: &Arc<Session>,
+    turn_ref: &Arc<TurnContext>,
+    call_id: &str,
+    command: &[String],
+    cwd: &PathUri,
+    environment_id: &str,
+    process_id: u32,
+    transcript: &Arc<Mutex<HeadTailBuffer>>,
+    failure_message: Option<&str>,
+    exit_code: i32,
+    timed_out: bool,
+    duration: Duration,
+    tracker: Option<&SharedTurnDiffTracker>,
+) {
+    let process_output = Some(process.snapshot_completion_output().await);
+    if let Some(message) = failure_message {
+        emit_failed_exec_end_for_unified_exec(
+            Arc::clone(session_ref),
+            Arc::clone(turn_ref),
+            call_id.to_string(),
+            command.to_vec(),
+            cwd.clone(),
+            environment_id.to_string(),
+            Some(process_id.to_string()),
+            Arc::clone(transcript),
+            String::new(),
+            process_output,
+            message.to_string(),
+            timed_out,
+            duration,
+            tracker.cloned(),
+        )
+        .await;
+    } else {
+        emit_exec_end_for_unified_exec(
+            Arc::clone(session_ref),
+            Arc::clone(turn_ref),
+            call_id.to_string(),
+            command.to_vec(),
+            cwd.clone(),
+            environment_id.to_string(),
+            Some(process_id.to_string()),
+            Arc::clone(transcript),
+            String::new(),
+            process_output,
+            exit_code,
+            timed_out,
+            duration,
+            tracker.cloned(),
+        )
+        .await;
+    }
+}
+
 impl Drop for ProcessOutputWaiterGuard {
     fn drop(&mut self) {
         self.0.adjust_process_output_waiters(-1);
@@ -303,70 +373,6 @@ pub(crate) fn spawn_exit_watcher(
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_token();
-    let validation_timeout_terminalization = process.validation_timeout_terminalization_token();
-    let terminal_event_claimed = Arc::new(AtomicBool::new(false));
-    let terminal_event_delivered = CancellationToken::new();
-    {
-        let process = Arc::clone(&process);
-        let session_ref = Arc::clone(&session_ref);
-        let turn_ref = Arc::clone(&turn_ref);
-        let call_id = call_id.clone();
-        let command = command.clone();
-        let cwd = cwd.clone();
-        let environment_id = environment_id.clone();
-        let transcript = Arc::clone(&transcript);
-        let tracker = tracker.clone();
-        let exit_token = exit_token.clone();
-        let terminal_event_claimed = Arc::clone(&terminal_event_claimed);
-        let terminal_event_delivered = terminal_event_delivered.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = exit_token.cancelled() => return,
-                _ = validation_timeout_terminalization.cancelled() => {}
-            }
-            if terminal_event_claimed
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return;
-            }
-
-            let duration = Instant::now().saturating_duration_since(started_at);
-            let message = process.failure_message().unwrap_or_else(|| {
-                "validation timed out and the process could not be terminated".to_string()
-            });
-            let completed_validation = session_ref
-                .services
-                .command_execution
-                .complete_timed_out_running_validation(process_id)
-                .await;
-            emit_failed_exec_end_for_unified_exec(
-                Arc::clone(&session_ref),
-                Arc::clone(&turn_ref),
-                call_id,
-                command,
-                cwd,
-                environment_id,
-                Some(process_id.to_string()),
-                transcript,
-                String::new(),
-                Some(process.snapshot_completion_output().await),
-                message,
-                /*timed_out*/ true,
-                duration,
-                tracker,
-                completed_validation.as_ref(),
-            )
-            .await;
-            reconcile_turn_progress_event(
-                &turn_ref.turn_timing_state,
-                0,
-                "validation timeout terminalization",
-            );
-            terminal_event_delivered.cancel();
-        });
-    }
     tokio::spawn(async move {
         turn_ref.turn_timing_state.record_next_sample_block_reason(
             codex_protocol::protocol::NextSampleBlockReason::WaitingForProcessCleanup,
@@ -374,9 +380,6 @@ pub(crate) fn spawn_exit_watcher(
         let exit_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
         wait_for_sticky_lifecycle_signal(&exit_token).await;
         let exit_observed_at = Instant::now();
-        let owns_terminal_event = terminal_event_claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
         let duration = exit_observed_at.saturating_duration_since(started_at);
         let failure_message = process.failure_message();
         let exit_code = if failure_message.is_some() {
@@ -424,7 +427,9 @@ pub(crate) fn spawn_exit_watcher(
         );
         let output_wait_started_at_ms = turn_ref.turn_timing_state.monotonic_offset_ms();
         let output_handles = process.output_handles();
-        wait_for_process_output_finalization(
+        let direct_runtime = turn_ref.config.features.enabled(Feature::DirectRuntime);
+        wait_for_process_output_for_result(
+            direct_runtime,
             &output_drained,
             output_handles.output_closed.as_ref(),
             output_handles.output_closed_notify.as_ref(),
@@ -443,6 +448,35 @@ pub(crate) fn spawn_exit_watcher(
                 wake_reason: ToolLifecycleWakeReason::Completed,
                 ..Default::default()
             });
+        }
+
+        let mut delivered_at = None;
+        if direct_runtime {
+            emit_process_terminal_event(
+                &process,
+                &session_ref,
+                &turn_ref,
+                &call_id,
+                &command,
+                &cwd,
+                &environment_id,
+                process_id,
+                &transcript,
+                failure_message.as_deref(),
+                exit_code,
+                false,
+                duration,
+                tracker.as_ref(),
+            )
+            .await;
+            delivered_at = Some(Instant::now());
+
+            wait_for_process_output_finalization(
+                &output_drained,
+                output_handles.output_closed.as_ref(),
+                output_handles.output_closed_notify.as_ref(),
+            )
+            .await;
         }
 
         if !tracked {
@@ -491,55 +525,25 @@ pub(crate) fn spawn_exit_watcher(
                 .update_running_artifact(process_id, finalized_artifact)
                 .await;
         }
-        let timed_out = process.timed_out();
-        if owns_terminal_event {
-            let completed_validation = session_ref
-                .services
-                .command_execution
-                .complete_running_validation(process_id, timed_out)
-                .await;
-
-            if let Some(message) = failure_message.as_ref() {
-                emit_failed_exec_end_for_unified_exec(
-                    Arc::clone(&session_ref),
-                    Arc::clone(&turn_ref),
-                    call_id.clone(),
-                    command.clone(),
-                    cwd.clone(),
-                    environment_id.clone(),
-                    Some(process_id.to_string()),
-                    Arc::clone(&transcript),
-                    String::new(),
-                    Some(process.snapshot_completion_output().await),
-                    message.clone(),
-                    timed_out,
-                    duration,
-                    tracker.clone(),
-                    completed_validation.as_ref(),
-                )
-                .await;
-            } else {
-                emit_exec_end_for_unified_exec(
-                    Arc::clone(&session_ref),
-                    Arc::clone(&turn_ref),
-                    call_id.clone(),
-                    command.clone(),
-                    cwd.clone(),
-                    environment_id.clone(),
-                    Some(process_id.to_string()),
-                    Arc::clone(&transcript),
-                    String::new(),
-                    Some(process.snapshot_completion_output().await),
-                    exit_code,
-                    timed_out,
-                    duration,
-                    tracker.clone(),
-                    completed_validation.as_ref(),
-                )
-                .await;
-            }
-        } else {
-            wait_for_sticky_lifecycle_signal(&terminal_event_delivered).await;
+        if !direct_runtime {
+            emit_process_terminal_event(
+                &process,
+                &session_ref,
+                &turn_ref,
+                &call_id,
+                &command,
+                &cwd,
+                &environment_id,
+                process_id,
+                &transcript,
+                failure_message.as_deref(),
+                exit_code,
+                false,
+                duration,
+                tracker.as_ref(),
+            )
+            .await;
+            delivered_at = Some(Instant::now());
         }
         let finalization = session_ref
             .services
@@ -567,7 +571,7 @@ pub(crate) fn spawn_exit_watcher(
                 .observe_repository_revision(&turn_ref.sub_id, observed_mutation_revision)
                 .await;
         }
-        let delivered_at = Instant::now();
+        let delivered_at = delivered_at.unwrap_or_else(Instant::now);
         let lifecycle = tool_dispatch_timing
             .as_ref()
             .map(|timing| timing.snapshot(delivered_at));
@@ -577,7 +581,7 @@ pub(crate) fn spawn_exit_watcher(
             turn_id = %turn_ref.sub_id,
             call_id,
             process_id,
-            terminal_event_delivered = owns_terminal_event,
+            terminal_event_delivered = true,
             request_to_spawn_ms = lifecycle
                 .as_ref()
                 .and_then(|snapshot| snapshot.exec_request_to_spawn_ms)
@@ -860,9 +864,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     timed_out: bool,
     duration: Duration,
     tracker: Option<SharedTurnDiffTracker>,
-    completed_validation: Option<&CompletedValidation>,
 ) {
-    finish_focused_validation_result(&session_ref, completed_validation).await;
     let (aggregated_output, stdout, stderr) = if let Some(output) = process_output {
         (
             String::from_utf8_lossy(&output.aggregated_output).into_owned(),
@@ -886,8 +888,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         turn_ref.as_ref(),
         &call_id,
         tracker.as_ref(),
-    )
-    .with_completed_validation(completed_validation);
+    );
     let emitter = ToolEmitter::unified_exec(
         &command,
         cwd,
@@ -923,9 +924,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     timed_out: bool,
     duration: Duration,
     tracker: Option<SharedTurnDiffTracker>,
-    completed_validation: Option<&CompletedValidation>,
 ) {
-    finish_focused_validation_result(&session_ref, completed_validation).await;
     let (stdout, process_stderr, process_aggregated_output) = if let Some(output) = process_output {
         (
             String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -963,8 +962,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         turn_ref.as_ref(),
         &call_id,
         tracker.as_ref(),
-    )
-    .with_completed_validation(completed_validation);
+    );
     let emitter = ToolEmitter::unified_exec(
         &command,
         cwd,
@@ -981,50 +979,6 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
             }),
         )
         .await;
-}
-
-async fn finish_focused_validation_result(
-    session: &Arc<Session>,
-    completed_validation: Option<&CompletedValidation>,
-) {
-    let Some(completed_validation) = completed_validation else {
-        return;
-    };
-    let Some(token) = completed_validation.focused_validation_token.clone() else {
-        return;
-    };
-    let result = &completed_validation.result;
-    let status = if result.status.is_success() {
-        ValidationCallStatus::Succeeded
-    } else {
-        ValidationCallStatus::Failed
-    };
-    let retained_output_ref = result.raw_artifact_ref.clone().or_else(|| {
-        Some(format!(
-            "tool-call:{}:{}",
-            session.thread_id, result.call_id
-        ))
-    });
-    let validation_result = serde_json::to_value(result).ok();
-    if let Err(error) = session
-        .services
-        .agent_control
-        .task_coordinator()
-        .finish_focused_validation_with_result(
-            token,
-            status,
-            retained_output_ref,
-            result.summary.clone(),
-            validation_result,
-        )
-        .await
-    {
-        tracing::warn!(
-            %error,
-            call_id = %result.call_id,
-            "focused unified validation result evidence could not be persisted"
-        );
-    }
 }
 
 fn split_valid_utf8_prefix_with_max(

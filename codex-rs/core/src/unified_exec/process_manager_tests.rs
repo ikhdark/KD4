@@ -5,6 +5,7 @@ use crate::unified_exec::async_watcher::resolve_aggregated_output;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::clamp_yield_time_for_readiness;
 use codex_network_proxy::ManagedNetworkSandboxContext;
+use codex_protocol::config_types::EnvironmentVariablePattern;
 use codex_utils_output_truncation::DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS;
 use codex_utils_output_truncation::DEFAULT_FAILURE_OUTPUT_TOKENS;
 use codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS;
@@ -109,7 +110,7 @@ fn coherent_packet_budget_uses_bounded_defaults_and_honors_override() {
 
 #[test]
 fn unified_exec_env_injects_defaults() {
-    let env = apply_unified_exec_env(HashMap::new());
+    let env = apply_unified_exec_env(HashMap::new(), &ShellEnvironmentPolicy::default());
     let expected = HashMap::from([
         ("NO_COLOR".to_string(), "1".to_string()),
         ("TERM".to_string(), "dumb".to_string()),
@@ -117,9 +118,9 @@ fn unified_exec_env_injects_defaults() {
         ("LC_CTYPE".to_string(), "C.UTF-8".to_string()),
         ("LC_ALL".to_string(), "C.UTF-8".to_string()),
         ("COLORTERM".to_string(), String::new()),
-        ("PAGER".to_string(), "more.com".to_string()),
-        ("GIT_PAGER".to_string(), "more.com".to_string()),
-        ("GH_PAGER".to_string(), "more.com".to_string()),
+        ("PAGER".to_string(), UNIFIED_EXEC_PAGER.to_string()),
+        ("GIT_PAGER".to_string(), UNIFIED_EXEC_PAGER.to_string()),
+        ("GH_PAGER".to_string(), UNIFIED_EXEC_PAGER.to_string()),
         ("CODEX_CI".to_string(), "1".to_string()),
     ]);
 
@@ -127,15 +128,53 @@ fn unified_exec_env_injects_defaults() {
 }
 
 #[test]
-fn unified_exec_env_overrides_existing_values() {
+fn unified_exec_env_preserves_existing_values() {
     let mut base = HashMap::new();
-    base.insert("NO_COLOR".to_string(), "0".to_string());
+    base.insert("no_color".to_string(), "0".to_string());
     base.insert("PATH".to_string(), "/usr/bin".to_string());
 
-    let env = apply_unified_exec_env(base);
+    let env = apply_unified_exec_env(base, &ShellEnvironmentPolicy::default());
 
-    assert_eq!(env.get("NO_COLOR"), Some(&"1".to_string()));
+    assert_eq!(env.get("no_color"), Some(&"0".to_string()));
+    assert!(!env.contains_key("NO_COLOR"));
     assert_eq!(env.get("PATH"), Some(&"/usr/bin".to_string()));
+}
+
+#[test]
+fn unified_exec_env_respects_shell_environment_policy() {
+    let mut policy = ShellEnvironmentPolicy {
+        include_only: vec![
+            EnvironmentVariablePattern::new_case_insensitive("NO_COLOR"),
+            EnvironmentVariablePattern::new_case_insensitive("KEEP"),
+        ],
+        exclude: vec![EnvironmentVariablePattern::new_case_insensitive("PAGER")],
+        ..Default::default()
+    };
+    policy.r#set.insert("NO_COLOR".to_string(), "0".to_string());
+    policy.r#set.insert("KEEP".to_string(), "yes".to_string());
+
+    let env = apply_unified_exec_env(create_env(&policy, None), &policy);
+
+    assert_eq!(
+        env,
+        HashMap::from([
+            ("NO_COLOR".to_string(), "0".to_string()),
+            ("KEEP".to_string(), "yes".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn unified_exec_env_inherit_none_does_not_add_defaults() {
+    let policy = ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::None,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        apply_unified_exec_env(create_env(&policy, None), &policy),
+        HashMap::new()
+    );
 }
 
 #[tokio::test]
@@ -368,6 +407,35 @@ async fn initial_output_quiet_yield_is_clamped_to_hard_deadline() {
     .await;
 
     assert_eq!(collected, b"ready\n");
+    assert_eq!(Instant::now() - started_at, Duration::from_millis(100));
+}
+
+#[tokio::test(start_paused = true)]
+async fn nonempty_write_collection_honors_the_requested_deadline() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started_at = Instant::now();
+
+    output_buffer
+        .lock()
+        .await
+        .push_chunk(b"progress\n".to_vec());
+
+    let collected = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started_at + Duration::from_millis(100),
+    )
+    .await;
+
+    assert_eq!(collected, b"progress\n");
     assert_eq!(Instant::now() - started_at, Duration::from_millis(100));
 }
 
@@ -719,12 +787,17 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
 }
 
 #[test]
-fn initial_exec_yield_time_uses_windows_floor() {
+fn initial_exec_yield_time_uses_platform_floor() {
     let above_max_yield_time_ms = crate::unified_exec::MAX_YIELD_TIME_MS + 1;
+    let expected_initial_yield_time_ms = if cfg!(windows) {
+        crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
+    } else {
+        1_000
+    };
 
     assert_eq!(
         clamp_yield_time(/*yield_time_ms*/ 1_000),
-        crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
+        expected_initial_yield_time_ms
     );
     assert_eq!(clamp_yield_time(/*yield_time_ms*/ 10_000), 10_000);
     assert_eq!(
@@ -739,10 +812,27 @@ fn warm_executor_yield_time_does_not_reapply_windows_cold_floor() {
         clamp_yield_time_for_readiness(/*yield_time_ms*/ 250, /*executor_ready*/ true),
         crate::unified_exec::MIN_YIELD_TIME_MS
     );
+    let expected_cold_yield_time_ms = if cfg!(windows) {
+        crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
+    } else {
+        crate::unified_exec::MIN_YIELD_TIME_MS
+    };
     assert_eq!(
         clamp_yield_time_for_readiness(/*yield_time_ms*/ 250, /*executor_ready*/ false),
-        crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
+        expected_cold_yield_time_ms
     );
+}
+
+#[test]
+fn executor_readiness_is_scoped_to_environment() {
+    let manager = UnifiedExecProcessManager::new_with_deferred_executor(
+        DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
+        /*deferred_executor_enabled*/ false,
+    );
+
+    assert!(!manager.mark_executor_ready("environment-a"));
+    assert!(manager.mark_executor_ready("environment-a"));
+    assert!(!manager.mark_executor_ready("environment-b"));
 }
 
 #[tokio::test]
@@ -834,7 +924,6 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
     emit_failed_initial_exec_end_if_unstored(
         /*process_started_alive*/ false,
         None,
-        Instant::now(),
         &context,
         &request,
         turn.cwd().clone().into(),
@@ -842,7 +931,6 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         "PRE_DENIAL_MARKER".to_string(),
         "Network access denied".to_string(),
         Duration::from_millis(7),
-        None,
     )
     .await;
 
@@ -867,307 +955,6 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         item.aggregated_output.as_deref(),
         Some("PRE_DENIAL_MARKER\nNetwork access denied")
     );
-}
-
-#[tokio::test]
-async fn spawned_sandbox_denied_validation_publishes_failed_result() {
-    let (session, turn, rx_event) = crate::session::tests::make_session_and_context_with_rx().await;
-    let context = UnifiedExecContext::new(
-        Arc::clone(&session),
-        Arc::clone(&turn),
-        "call-unified-validation-denied".to_string(),
-    );
-    let mut request = ExecCommandRequest {
-        command: vec!["cargo".to_string(), "test".to_string()],
-        command_for_safety: vec!["cargo".to_string(), "test".to_string()],
-        attempt_key: crate::tools::command_execution::CommandAttemptKey::new(
-            "exec_command",
-            "test",
-            "test-cwd",
-            &["cargo".to_string(), "test".to_string()],
-        ),
-        raw_output_artifact: crate::tools::command_output_artifact::RawOutputArtifact::Failed {
-            id: None,
-            message: "test fixture".to_string(),
-            owned_path: None,
-            bytes: 0,
-        },
-        shell_type: crate::shell::ShellType::Sh,
-        shell_wrapper_is_owned: false,
-        hook_command: "cargo test".to_string(),
-        process_id: 124,
-        yield_time_ms: 1_000,
-        max_output_tokens: None,
-        cwd: turn.cwd().clone().into(),
-        normalization_cwd: None,
-        sandbox_cwd: turn.cwd().clone().into(),
-        turn_environment: turn
-            .environments
-            .primary()
-            .cloned()
-            .expect("primary environment"),
-        network: None,
-        tty: true,
-        sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
-        additional_permissions: None,
-        additional_permissions_uri: None,
-        additional_permissions_preapproved: false,
-        justification: None,
-        prefix_rule: None,
-        validation_launch: Some(crate::validation_admission::ValidationLaunchPlan {
-            classification: crate::validation_admission::classify_validation(
-                &crate::tools::handlers::command_shape::CommandInvocation::Argv {
-                    program: "cargo".to_string(),
-                    args: vec!["test".to_string()],
-                },
-            ),
-            authorization_revision: 0,
-            explicitly_tagged: true,
-            structured_route: Some(codex_protocol::plan_tool::ValidationRoute {
-                leaves: vec![codex_protocol::plan_tool::ValidationRouteLeaf {
-                    argv: vec!["cargo".to_string(), "test".to_string()],
-                    covered_paths: vec!["core/src/lib.rs".to_string()],
-                    timeout_ms: 30_000,
-                }],
-                ordering: Default::default(),
-            }),
-            bound_plan_step: None,
-            bound_work_unit: None,
-            validation_call_id: Some("validation-call-id".to_string()),
-            turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
-            focused_validation_token: None,
-        }),
-        known_delta: None,
-    };
-    let manager = UnifiedExecProcessManager::default();
-    let registration = PendingProcessRegistration::new(
-        Arc::clone(&manager.process_store),
-        &context,
-        request.attempt_key.clone(),
-        request.process_id,
-    );
-    let error = UnifiedExecError::sandbox_denied(
-        "sandbox denied".to_string(),
-        codex_protocol::exec_output::ExecToolCallOutput {
-            exit_code: 126,
-            aggregated_output: codex_protocol::exec_output::StreamOutput::new(
-                "SANDBOX_DENIED_MARKER".to_string(),
-            ),
-            ..Default::default()
-        },
-    );
-
-    assert!(
-        emit_spawned_validation_launch_error_if_needed(
-            &registration,
-            &mut request,
-            &context,
-            turn.cwd().clone().into(),
-            Instant::now(),
-            &error,
-        )
-        .await
-    );
-
-    let event = tokio::time::timeout(Duration::from_secs(1), rx_event.recv())
-        .await
-        .expect("timed out waiting for failed validation command item")
-        .expect("event channel closed");
-    let codex_protocol::protocol::EventMsg::ItemCompleted(completed_event) = event.msg else {
-        panic!("expected ItemCompleted event");
-    };
-    let codex_protocol::items::TurnItem::CommandExecution(item) = completed_event.item else {
-        panic!("expected CommandExecution item");
-    };
-    assert_eq!(item.id, "call-unified-validation-denied");
-    assert_eq!(
-        item.status,
-        codex_protocol::items::CommandExecutionStatus::Failed
-    );
-    assert_eq!(
-        item.aggregated_output.as_deref(),
-        Some("SANDBOX_DENIED_MARKER")
-    );
-    assert_eq!(
-        turn.turn_timing_state
-            .complete_snapshot()
-            .protocol_timing()
-            .counters
-            .executed_validation_count,
-        1,
-        "the spawned validation must publish exactly one terminal result",
-    );
-}
-
-#[tokio::test]
-async fn spawned_validation_survives_a_later_retry_launch_error() {
-    let (session, turn, rx_event) = crate::session::tests::make_session_and_context_with_rx().await;
-    let context = UnifiedExecContext::new(
-        Arc::clone(&session),
-        Arc::clone(&turn),
-        "call-unified-validation-retry-error".to_string(),
-    );
-    let command = vec![
-        "cmd.exe".to_string(),
-        "/D".to_string(),
-        "/S".to_string(),
-        "/C".to_string(),
-        "exit /b 126".to_string(),
-    ];
-    let mut request = ExecCommandRequest {
-        command: command.clone(),
-        command_for_safety: command.clone(),
-        attempt_key: crate::tools::command_execution::CommandAttemptKey::new(
-            "exec_command",
-            "test",
-            "test-cwd",
-            &command,
-        ),
-        raw_output_artifact: crate::tools::command_output_artifact::RawOutputArtifact::Failed {
-            id: None,
-            message: "test fixture".to_string(),
-            owned_path: None,
-            bytes: 0,
-        },
-        shell_type: crate::shell::ShellType::PowerShell,
-        shell_wrapper_is_owned: false,
-        hook_command: command.join(" "),
-        process_id: 125,
-        yield_time_ms: 1_000,
-        max_output_tokens: None,
-        cwd: turn.cwd().clone().into(),
-        normalization_cwd: None,
-        sandbox_cwd: turn.cwd().clone().into(),
-        turn_environment: turn
-            .environments
-            .primary()
-            .cloned()
-            .expect("primary environment"),
-        network: None,
-        tty: false,
-        sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
-        additional_permissions: None,
-        additional_permissions_uri: None,
-        additional_permissions_preapproved: false,
-        justification: None,
-        prefix_rule: None,
-        validation_launch: Some(crate::validation_admission::ValidationLaunchPlan {
-            classification: crate::validation_admission::classify_validation(
-                &crate::tools::handlers::command_shape::CommandInvocation::Argv {
-                    program: command[0].clone(),
-                    args: command[1..].to_vec(),
-                },
-            ),
-            authorization_revision: 0,
-            explicitly_tagged: true,
-            structured_route: Some(codex_protocol::plan_tool::ValidationRoute {
-                leaves: vec![codex_protocol::plan_tool::ValidationRouteLeaf {
-                    argv: command.clone(),
-                    covered_paths: vec!["core/src/lib.rs".to_string()],
-                    timeout_ms: 30_000,
-                }],
-                ordering: Default::default(),
-            }),
-            bound_plan_step: None,
-            bound_work_unit: None,
-            validation_call_id: Some("validation-retry-call-id".to_string()),
-            turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
-            focused_validation_token: None,
-        }),
-        known_delta: None,
-    };
-    let manager = UnifiedExecProcessManager::default();
-    let mut registration = PendingProcessRegistration::new(
-        Arc::clone(&manager.process_store),
-        &context,
-        request.attempt_key.clone(),
-        request.process_id,
-    );
-    let exec_request = ExecRequest::new(
-        command,
-        turn.config.codex_home.clone(),
-        turn.cwd().clone(),
-        std::env::vars().collect(),
-        None,
-        None,
-        crate::exec::ExecExpiration::DefaultTimeout,
-        crate::exec::ExecCapturePolicy::ShellTool,
-        codex_sandboxing::SandboxType::None,
-        turn.config.effective_workspace_roots(),
-        turn.windows_sandbox_level,
-        false,
-        turn.permission_profile(),
-        None,
-    );
-    let process = manager
-        .open_session_with_prepared_exec_env(
-            request.process_id,
-            &exec_request,
-            false,
-            None,
-            Box::new(crate::unified_exec::NoopSpawnLifecycle),
-            None,
-            turn.environments
-                .primary()
-                .expect("turn environment")
-                .environment
-                .as_ref(),
-            &registration.pending_spawns(),
-        )
-        .await
-        .expect("the initial validation attempt must spawn");
-    if !process.has_exited() {
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            process.cancellation_token().cancelled(),
-        )
-        .await
-        .expect("the validation fixture must exit");
-    }
-    assert_eq!(process.exit_code(), Some(126));
-
-    let error = UnifiedExecError::create_process("retry approval was denied".to_string());
-    assert!(
-        emit_spawned_validation_launch_error_if_needed(
-            &registration,
-            &mut request,
-            &context,
-            turn.cwd().clone().into(),
-            Instant::now(),
-            &error,
-        )
-        .await,
-        "the terminal retry error must retain the already executed validation attempt",
-    );
-
-    let event = tokio::time::timeout(Duration::from_secs(1), rx_event.recv())
-        .await
-        .expect("timed out waiting for failed validation command item")
-        .expect("event channel closed");
-    let codex_protocol::protocol::EventMsg::ItemCompleted(completed_event) = event.msg else {
-        panic!("expected ItemCompleted event");
-    };
-    let codex_protocol::items::TurnItem::CommandExecution(item) = completed_event.item else {
-        panic!("expected CommandExecution item");
-    };
-    assert_eq!(item.id, "call-unified-validation-retry-error");
-    assert_eq!(
-        item.status,
-        codex_protocol::items::CommandExecutionStatus::Failed
-    );
-    // The ordinary tool event still reports the later launch error, while the
-    // validation result is completed from the earlier spawned process.
-    assert_eq!(item.exit_code, Some(-1));
-    assert_eq!(
-        turn.turn_timing_state
-            .complete_snapshot()
-            .protocol_timing()
-            .counters
-            .executed_validation_count,
-        1,
-        "the executed validation call must publish exactly one terminal result",
-    );
-    registration.cleanup().await.expect("cleanup succeeds");
 }
 
 #[test]

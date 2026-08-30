@@ -220,7 +220,6 @@ fn completed_runtime_mechanisms_are_stable_and_enabled_by_default() {
         Feature::ExecPermissionApprovals,
         Feature::RequestPermissionsTool,
         Feature::MultiAgentV2,
-        Feature::TaskCompletionReviewer,
     ] {
         assert_eq!(feature.stage(), Stage::Stable, "{feature:?}");
         assert_eq!(feature.default_enabled(), true, "{feature:?}");
@@ -254,6 +253,30 @@ fn secret_auth_storage_defaults_to_enabled() {
         feature_for_key("secret_auth_storage"),
         Some(Feature::SecretAuthStorage)
     );
+}
+
+#[test]
+fn in_app_desktop_gates_are_stable_and_enabled_by_default() {
+    for (feature, key) in [
+        (Feature::InAppChat, "in_app_chat"),
+        (Feature::InAppDictation, "in_app_dictation"),
+        (Feature::InAppLocalAutomation, "in_app_local_automation"),
+        (Feature::InAppUpdates, "in_app_updates"),
+    ] {
+        assert_eq!(feature.stage(), Stage::Stable, "{key}");
+        assert_eq!(feature.default_enabled(), true, "{key}");
+        assert_eq!(feature.consumer(), FeatureConsumer::Client, "{key}");
+        assert_eq!(feature_for_key(key), Some(feature), "{key}");
+
+        // The desktop shell discovers these gates through the app-server catalog,
+        // so they must survive the `Stage::Internal` filter applied there.
+        assert_eq!(user_settable_feature_for_key(key), Some(feature), "{key}");
+
+        assert!(
+            Features::with_defaults().enabled(feature),
+            "{key} must be enabled in the default feature set"
+        );
+    }
 }
 
 #[test]
@@ -754,6 +777,16 @@ fn unified_exec_is_stable_and_enabled_by_default() {
     assert_eq!(Feature::UnifiedExec.stage(), Stage::Stable);
     assert_eq!(Feature::UnifiedExec.default_enabled(), true);
     assert_eq!(feature_for_key("unified_exec"), Some(Feature::UnifiedExec));
+}
+
+#[test]
+fn direct_runtime_is_user_settable_and_disabled_by_default() {
+    assert_eq!(Feature::DirectRuntime.stage(), Stage::UnderDevelopment);
+    assert_eq!(Feature::DirectRuntime.default_enabled(), false);
+    assert_eq!(
+        user_settable_feature_for_key("direct_runtime"),
+        Some(Feature::DirectRuntime)
+    );
 }
 
 #[test]

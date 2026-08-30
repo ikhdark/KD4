@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -15,6 +16,7 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::exec::is_likely_sandbox_denied;
+use crate::tools::command_output_artifact::MAX_RAW_OUTPUT_ARTIFACT_BYTES;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::command_output_artifact::RawOutputArtifactWriter;
 use codex_exec_server::ExecProcess;
@@ -42,6 +44,90 @@ use super::process_state::ProcessState;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
 const CONFIRMED_TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);
+const RAW_OUTPUT_ARTIFACT_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(2);
+const MISSING_LOCAL_EXIT_STATUS_MESSAGE: &str = "local process exit status channel closed";
+
+/// Persists the retained raw-output prefix without putting filesystem I/O on
+/// the process reader's live-output path. The producer accepts at most one byte
+/// beyond the artifact cap so the writer can preserve its truncation marker
+/// while the in-memory queue remains bounded.
+struct RawOutputArtifactTask {
+    sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    task: JoinHandle<()>,
+    state: Arc<Mutex<RawOutputArtifact>>,
+    accepted_bytes: usize,
+}
+
+impl RawOutputArtifactTask {
+    fn spawn(state: Option<Arc<Mutex<RawOutputArtifact>>>) -> Option<Self> {
+        let state = state?;
+        let (sender, mut receiver) = mpsc::unbounded_channel::<Vec<u8>>();
+        let task_state = Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            let mut writer = RawOutputArtifactWriter::open(Some(&task_state)).await;
+            while let Some(output) = receiver.recv().await {
+                if let Some(writer) = writer.as_mut() {
+                    writer.write_chunk(Some(&task_state), &output).await;
+                }
+            }
+            if let Some(writer) = writer.as_mut() {
+                writer.finish(Some(&task_state)).await;
+            }
+        });
+        Some(Self {
+            sender: Some(sender),
+            task,
+            state,
+            accepted_bytes: 0,
+        })
+    }
+
+    fn write_chunk(&mut self, output: &[u8]) {
+        let queue_limit = MAX_RAW_OUTPUT_ARTIFACT_BYTES.saturating_add(1);
+        let remaining = queue_limit.saturating_sub(self.accepted_bytes);
+        if remaining == 0 {
+            return;
+        }
+        let retained = &output[..output.len().min(remaining)];
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        if sender.send(retained.to_vec()).is_ok() {
+            self.accepted_bytes = self.accepted_bytes.saturating_add(retained.len());
+        } else {
+            self.sender = None;
+        }
+    }
+
+    async fn finish(mut self) {
+        self.sender.take();
+        if matches!(
+            tokio::time::timeout(RAW_OUTPUT_ARTIFACT_FINALIZATION_TIMEOUT, &mut self.task).await,
+            Ok(Ok(()))
+        ) {
+            return;
+        }
+
+        self.task.abort();
+        let mut artifact = self.state.lock().await;
+        let failed = match &*artifact {
+            RawOutputArtifact::Pending { .. } => {
+                RawOutputArtifact::unavailable("raw output artifact finalization timed out")
+            }
+            RawOutputArtifact::Stored {
+                id, path, bytes, ..
+            } => RawOutputArtifact::Failed {
+                id: Some(*id),
+                message: "raw output artifact finalization timed out".to_string(),
+                owned_path: Some(path.clone()),
+                bytes: *bytes,
+            },
+            RawOutputArtifact::Failed { .. } => return,
+        };
+        *artifact = failed;
+    }
+}
+
 pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
     /// Returns file descriptors that must stay open across the child `exec()`.
     ///
@@ -123,10 +209,7 @@ pub(crate) struct UnifiedExecProcess {
     output_closed_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
     termination_requested: AtomicBool,
-    timed_out: AtomicBool,
-    validation_timeout_terminalization: CancellationToken,
     termination_lock: Semaphore,
-    started_at: tokio::time::Instant,
     output_drained: CancellationToken,
     interaction_lock: Arc<Mutex<()>>,
     state_tx: watch::Sender<ProcessState>,
@@ -179,10 +262,7 @@ impl UnifiedExecProcess {
             output_closed_notify,
             cancellation_token,
             termination_requested: AtomicBool::new(false),
-            timed_out: AtomicBool::new(false),
-            validation_timeout_terminalization: CancellationToken::new(),
             termination_lock: Semaphore::new(1),
-            started_at: tokio::time::Instant::now(),
             output_drained,
             interaction_lock: Arc::new(Mutex::new(())),
             state_tx,
@@ -249,10 +329,6 @@ impl UnifiedExecProcess {
 
     pub(super) fn output_drained_token(&self) -> CancellationToken {
         self.output_drained.clone()
-    }
-
-    pub(super) fn validation_timeout_terminalization_token(&self) -> CancellationToken {
-        self.validation_timeout_terminalization.clone()
     }
 
     pub(super) fn interaction_lock(&self) -> Arc<Mutex<()>> {
@@ -434,46 +510,6 @@ impl UnifiedExecProcess {
         self.termination_requested.load(Ordering::Acquire)
     }
 
-    pub(super) fn timed_out(&self) -> bool {
-        self.timed_out.load(Ordering::Acquire)
-    }
-
-    pub(super) fn started_at(&self) -> tokio::time::Instant {
-        self.started_at
-    }
-
-    pub(super) fn arm_validation_timeout(self: &Arc<Self>, timeout_ms: Option<u64>) {
-        let Some(timeout_ms) = timeout_ms else {
-            return;
-        };
-        let process = Arc::clone(self);
-        let process_exited = process.cancellation_token();
-        tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = process_exited.cancelled() => {}
-                _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => {
-                    if process.has_exited() {
-                        return;
-                    }
-                    let message = format!("validation timed out after {timeout_ms} ms");
-                    if let Err(error) = process.timeout_and_terminate(message).await {
-                        tracing::warn!(%error, "timed-out validation process could not be terminated");
-                        process.validation_timeout_terminalization.cancel();
-                    }
-                }
-            }
-        });
-    }
-
-    pub(super) async fn timeout_and_terminate(
-        &self,
-        message: String,
-    ) -> Result<(), UnifiedExecError> {
-        self.timed_out.store(true, Ordering::Release);
-        self.fail_and_terminate(message).await
-    }
-
     pub(super) async fn fail_and_terminate(&self, message: String) -> Result<(), UnifiedExecError> {
         let mut state = self.state_rx.borrow().clone();
         if state.failure_message.is_none() {
@@ -561,7 +597,6 @@ impl UnifiedExecProcess {
         sandbox_type: SandboxType,
         spawn_lifecycle: SpawnLifecycleHandle,
         raw_output_artifact: Option<RawOutputArtifact>,
-        validation_timeout_ms: Option<u64>,
         pending_spawns: &PendingSpawnRegistration,
     ) -> Result<Arc<Self>, UnifiedExecError> {
         let SpawnedPty {
@@ -586,7 +621,6 @@ impl UnifiedExecProcess {
         ));
         let managed = Arc::new(managed);
         pending_spawns.register(Arc::clone(&managed));
-        managed.arm_validation_timeout(validation_timeout_ms);
 
         match exit_rx.try_recv() {
             Ok(exit_code) => {
@@ -596,29 +630,41 @@ impl UnifiedExecProcess {
                 return Ok(managed);
             }
             Err(TryRecvError::Closed) => {
-                managed.signal_exit(/*exit_code*/ None);
+                managed.signal_exit_failure(MISSING_LOCAL_EXIT_STATUS_MESSAGE.to_string());
                 managed.finish_termination();
-                managed.check_for_sandbox_denial().await?;
-                return Ok(managed);
+                return Err(UnifiedExecError::process_failed(
+                    MISSING_LOCAL_EXIT_STATUS_MESSAGE.to_string(),
+                ));
             }
             Err(TryRecvError::Empty) => {}
         }
 
-        if let Ok(exit_result) = tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, &mut exit_rx).await {
-            managed.signal_exit(exit_result.ok());
-            managed.finish_termination();
-            managed.check_for_sandbox_denial().await?;
-            return Ok(managed);
+        match tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, &mut exit_rx).await {
+            Ok(Ok(exit_code)) => {
+                managed.signal_exit(Some(exit_code));
+                managed.finish_termination();
+                managed.check_for_sandbox_denial().await?;
+                return Ok(managed);
+            }
+            Ok(Err(_)) => {
+                managed.signal_exit_failure(MISSING_LOCAL_EXIT_STATUS_MESSAGE.to_string());
+                managed.finish_termination();
+                return Err(UnifiedExecError::process_failed(
+                    MISSING_LOCAL_EXIT_STATUS_MESSAGE.to_string(),
+                ));
+            }
+            Err(_) => {}
         }
 
         tokio::spawn({
-            let state_tx = managed.state_tx.clone();
-            let cancellation_token = managed.cancellation_token.clone();
+            let managed = Arc::clone(&managed);
             async move {
-                let exit_code = exit_rx.await.ok();
-                let state = state_tx.borrow().clone();
-                let _ = state_tx.send_replace(state.exited(exit_code));
-                cancellation_token.cancel();
+                match exit_rx.await {
+                    Ok(exit_code) => managed.signal_exit(Some(exit_code)),
+                    Err(_) => {
+                        managed.signal_exit_failure(MISSING_LOCAL_EXIT_STATUS_MESSAGE.to_string())
+                    }
+                }
             }
         });
 
@@ -628,7 +674,6 @@ impl UnifiedExecProcess {
     pub(super) async fn from_exec_server_started(
         started: StartedExecProcess,
         raw_output_artifact: Option<RawOutputArtifact>,
-        validation_timeout_ms: Option<u64>,
         pending_spawns: &PendingSpawnRegistration,
     ) -> Result<Arc<Self>, UnifiedExecError> {
         let process_handle = ProcessHandle::ExecServer(Arc::clone(&started.process));
@@ -648,23 +693,9 @@ impl UnifiedExecProcess {
         ));
         let managed = Arc::new(managed);
         pending_spawns.register(Arc::clone(&managed));
-        managed.arm_validation_timeout(validation_timeout_ms);
 
-        let mut state_rx = managed.state_rx.clone();
-        if tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, async {
-            loop {
-                let state = state_rx.borrow().clone();
-                if state.has_exited || state.failure_message.is_some() {
-                    break;
-                }
-                if state_rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        })
-        .await
-        .is_ok()
-        {
+        let state = managed.state_rx.borrow().clone();
+        if state.has_exited || state.failure_message.is_some() {
             managed.check_for_sandbox_denial().await?;
         }
 
@@ -691,8 +722,7 @@ impl UnifiedExecProcess {
         let process = started.process;
         let mut events = process.subscribe_events();
         tokio::spawn(async move {
-            let mut artifact_writer =
-                RawOutputArtifactWriter::open(raw_output_artifact.as_ref()).await;
+            let mut artifact_task = RawOutputArtifactTask::spawn(raw_output_artifact);
             let mut last_seq: u64 = 0;
             loop {
                 let event = match events.recv().await {
@@ -750,10 +780,8 @@ impl UnifiedExecProcess {
                     } = response;
                     for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
                         let bytes = chunk.chunk.into_inner();
-                        if let Some(writer) = artifact_writer.as_mut() {
-                            writer
-                                .write_chunk(raw_output_artifact.as_ref(), &bytes)
-                                .await;
+                        if let Some(task) = artifact_task.as_mut() {
+                            task.write_chunk(&bytes);
                         }
                         {
                             output_buffer.lock().await.push_chunk(bytes.clone());
@@ -803,10 +831,8 @@ impl UnifiedExecProcess {
                         }
                         last_seq = chunk.seq;
                         let bytes = chunk.chunk.into_inner();
-                        if let Some(writer) = artifact_writer.as_mut() {
-                            writer
-                                .write_chunk(raw_output_artifact.as_ref(), &bytes)
-                                .await;
+                        if let Some(task) = artifact_task.as_mut() {
+                            task.write_chunk(&bytes);
                         }
                         {
                             output_buffer.lock().await.push_chunk(bytes.clone());
@@ -849,8 +875,8 @@ impl UnifiedExecProcess {
                     }
                 }
             }
-            if let Some(writer) = artifact_writer.as_mut() {
-                writer.finish(raw_output_artifact.as_ref()).await;
+            if let Some(task) = artifact_task {
+                task.finish().await;
             }
             output_closed.store(true, Ordering::Release);
             output_closed_notify.notify_waiters();
@@ -876,8 +902,7 @@ impl UnifiedExecProcess {
             cancellation_token: _,
         } = output_handles;
         tokio::spawn(async move {
-            let mut artifact_writer =
-                RawOutputArtifactWriter::open(raw_output_artifact.as_ref()).await;
+            let mut artifact_task = RawOutputArtifactTask::spawn(raw_output_artifact);
             let mut stdout_open = true;
             let mut stderr_open = true;
             loop {
@@ -905,10 +930,8 @@ impl UnifiedExecProcess {
                     else => break,
                 };
                 if let Some(output) = output {
-                    if let Some(writer) = artifact_writer.as_mut() {
-                        writer
-                            .write_chunk(raw_output_artifact.as_ref(), &output.bytes)
-                            .await;
+                    if let Some(task) = artifact_task.as_mut() {
+                        task.write_chunk(&output.bytes);
                     }
                     {
                         output_buffer.lock().await.push_chunk(output.bytes.clone());
@@ -929,8 +952,8 @@ impl UnifiedExecProcess {
                     output_notify.notify_waiters();
                 }
             }
-            if let Some(writer) = artifact_writer.as_mut() {
-                writer.finish(raw_output_artifact.as_ref()).await;
+            if let Some(task) = artifact_task {
+                task.finish().await;
             }
             output_closed.store(true, Ordering::Release);
             output_closed_notify.notify_waiters();
@@ -940,6 +963,12 @@ impl UnifiedExecProcess {
     fn signal_exit(&self, exit_code: Option<i32>) {
         let state = self.state_rx.borrow().clone();
         let _ = self.state_tx.send_replace(state.exited(exit_code));
+        self.cancellation_token.cancel();
+    }
+
+    fn signal_exit_failure(&self, message: String) {
+        let state = self.state_rx.borrow().clone();
+        let _ = self.state_tx.send_replace(state.failed(message));
         self.cancellation_token.cancel();
     }
 

@@ -239,7 +239,7 @@ async fn initialize_response_includes_local_runtime_metadata() -> Result<()> {
     fs_wait::wait_for_path_exists(&receipt_path, Duration::from_secs(5)).await?;
     let receipt: Value = serde_json::from_slice(&std::fs::read(receipt_path)?)?;
     assert_eq!(receipt["schemaVersion"], 1);
-    assert_eq!(receipt["clientName"], "Codex Desktop");
+    assert_eq!(receipt["clientName"], "codex_desktop");
     assert_eq!(
         receipt["codexHome"],
         codex_home.path().to_string_lossy().as_ref()
@@ -251,6 +251,11 @@ async fn initialize_response_includes_local_runtime_metadata() -> Result<()> {
         receipt["executablePath"]
             .as_str()
             .is_some_and(|path| !path.is_empty())
+    );
+    assert!(
+        receipt["executableSha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64 && hash.chars().all(|ch| ch.is_ascii_hexdigit()))
     );
 
     Ok(())

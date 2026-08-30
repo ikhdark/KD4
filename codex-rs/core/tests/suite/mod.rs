@@ -40,7 +40,6 @@ mod collaboration_instructions;
 mod compact;
 mod compact_remote;
 mod compact_resume_fork;
-mod completion_review;
 mod current_time_reminder;
 mod deprecation_notice;
 mod exec_policy;

@@ -1,4 +1,3 @@
-use super::super::shell::validation_repository_root;
 use super::exec_command::attach_powershell_failure_advisory;
 use super::exec_command::finalize_sandbox_denial_artifact;
 use super::exec_command::validate_and_consume_remote_shell;
@@ -29,6 +28,102 @@ use tokio::sync::Mutex;
 
 const TEST_TRUNCATION_POLICY: TruncationPolicy = TruncationPolicy::Tokens(10_000);
 
+#[test]
+fn exec_command_runtime_declares_confirmed_cancellation_cleanup() {
+    let handler = ExecCommandHandler::default();
+
+    assert!(handler.waits_for_runtime_cancellation());
+    assert!(handler.owns_unified_exec_processes());
+}
+
+#[tokio::test]
+async fn exec_command_cancellation_waits_for_confirmed_process_cleanup() {
+    let python = which::which("python")
+        .or_else(|_| which::which("python3"))
+        .expect("Python is required by the unified-exec cancellation test");
+    let temp = tempfile::tempdir().expect("temporary cancellation directory");
+    let started_path = temp.path().join("started");
+    let finished_path = temp.path().join("finished");
+    let started_literal = serde_json::to_string(&started_path.to_string_lossy()).unwrap();
+    let finished_literal = serde_json::to_string(&finished_path.to_string_lossy()).unwrap();
+    let script = format!(
+        "import pathlib,time; pathlib.Path({started_literal}).write_text('started'); time.sleep(30); pathlib.Path({finished_literal}).write_text('finished')"
+    );
+    let program = python.to_string_lossy().into_owned();
+    let command = vec![program.clone(), "-c".to_string(), script.clone()];
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
+    session
+        .services
+        .exec_policy
+        .append_amendment_and_update(
+            turn.config.codex_home.as_path(),
+            &codex_protocol::protocol::ExecPolicyAmendment::new(command),
+        )
+        .await
+        .expect("allow the bounded cancellation test command");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let cancellation_token = tokio_util::sync::CancellationToken::new();
+    let invocation = ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        cancellation_token: cancellation_token.clone(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "cancel-confirmed-cleanup".to_string(),
+        tool_name: codex_tools::ToolName::plain("exec_command"),
+        source: ToolCallSource::Direct,
+        payload: ToolPayload::Function {
+            arguments: serde_json::json!({
+                "kind": "argv",
+                "program": program,
+                "args": ["-c", script],
+                "yield_time_ms": 20_000
+            })
+            .to_string(),
+        },
+    };
+    let task = tokio::spawn(async move { ExecCommandHandler::default().handle(invocation).await });
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while tokio::fs::metadata(&started_path).await.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("test process should start");
+    cancellation_token.cancel();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("cancellation cleanup should be bounded")
+        .expect("handler task should join");
+    let error = match result {
+        Ok(_) => panic!("cancelled exec_command should not publish ordinary output"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("unified exec cancelled"));
+    assert!(
+        tokio::fs::metadata(&finished_path).await.is_err(),
+        "the child must be terminated before cancellation returns"
+    );
+
+    let process_id = session
+        .services
+        .unified_exec_manager
+        .allocate_process_id()
+        .await;
+    assert_eq!(
+        process_id, 1000,
+        "the cancelled reservation must be released"
+    );
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id(process_id)
+        .await;
+}
+
 #[tokio::test]
 async fn sandbox_denial_preserves_the_process_raw_output_artifact() {
     let temp = tempfile::tempdir().expect("temporary codex home");
@@ -48,97 +143,6 @@ async fn sandbox_denial_preserves_the_process_raw_output_artifact() {
     .await;
 
     assert_eq!(finalized, preserved);
-}
-
-fn create_validation_cwd_alias(target: &std::path::Path, alias: &std::path::Path) {
-    {
-        let output = std::process::Command::new("cmd")
-            .args(["/c", "mklink", "/J"])
-            .arg(alias)
-            .arg(target)
-            .output()
-            .expect("junction command starts");
-        assert!(
-            output.status.success(),
-            "junction is created: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-fn remove_validation_cwd_alias(alias: &std::path::Path) {
-    std::fs::remove_dir(alias).expect("junction removes without touching its target");
-}
-
-#[test]
-fn direct_validation_repository_discovery_rejects_non_repo_cwd() {
-    let temp = tempfile::tempdir().expect("temporary workspace");
-    let outside = temp.path().join("outside");
-    std::fs::create_dir_all(&outside).expect("outside directory");
-    assert_eq!(validation_repository_root(&outside, &outside), None);
-
-    let repository = temp.path().join("repository");
-    let nested = repository.join("nested");
-    std::fs::create_dir_all(repository.join(".git")).expect("git marker");
-    std::fs::create_dir_all(&nested).expect("nested repository directory");
-    assert_eq!(
-        validation_repository_root(&nested, &repository),
-        Some(std::fs::canonicalize(repository).expect("repository canonicalizes"))
-    );
-}
-
-#[tokio::test]
-async fn token_efficiency_unified_validation_without_metadata_executes_as_non_proof() {
-    let (session, turn) = make_session_and_context().await;
-    {
-        let mut authorization = turn.validation_authorization.write().await;
-        *authorization = crate::validation_admission::ValidationAuthorization::enabled();
-    }
-    let turn = Arc::new(turn);
-    let payload = ToolPayload::Function {
-        arguments: serde_json::json!({
-            "kind": "argv",
-            "program": "cargo",
-            "args": ["test", "--help"]
-        })
-        .to_string(),
-    };
-    super::super::shell::reset_validation_repository_discovery_count();
-    crate::tools::handlers::reset_repository_root_resolution_count();
-
-    let result = ExecCommandHandler::default()
-        .handle(ToolInvocation {
-            session: session.into(),
-            step_context: StepContext::for_test(turn),
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-            call_id: "unified-validation-missing-metadata".to_string(),
-            tool_name: codex_tools::ToolName::plain("exec_command"),
-            source: ToolCallSource::Direct,
-            payload: payload.clone(),
-        })
-        .await;
-    let response = result
-        .expect("recognized validation without metadata should execute")
-        .to_response_item("unified-validation-missing-metadata", &payload);
-    let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
-    else {
-        panic!("expected function output");
-    };
-    let message = output.body.to_text().expect("text output");
-
-    assert!(
-        message.contains("treated as an ordinary command"),
-        "{message}"
-    );
-    assert!(
-        message.contains("cannot be recorded as direct validation proof"),
-        "{message}"
-    );
-    assert_eq!(
-        super::super::shell::validation_repository_discovery_count(),
-        0
-    );
 }
 
 #[tokio::test]
@@ -211,31 +215,6 @@ async fn late_unified_validation_denial_records_suppressed_timing() {
     );
 }
 
-#[test]
-fn direct_validation_repository_discovery_resolves_cwd_alias_containment() {
-    let temp = tempfile::tempdir().expect("temporary workspace");
-    let repository = temp.path().join("repository");
-    let nested = repository.join("nested");
-    let outside = temp.path().join("outside");
-    std::fs::create_dir_all(repository.join(".git")).expect("git marker");
-    std::fs::create_dir_all(&nested).expect("nested repository directory");
-    std::fs::create_dir_all(&outside).expect("outside directory");
-
-    let inside_alias = repository.join("inside-alias");
-    let escape_alias = repository.join("escape-alias");
-    create_validation_cwd_alias(&nested, &inside_alias);
-    create_validation_cwd_alias(&outside, &escape_alias);
-
-    assert_eq!(
-        validation_repository_root(&inside_alias, &repository),
-        std::fs::canonicalize(&repository).ok()
-    );
-    assert_eq!(validation_repository_root(&escape_alias, &repository), None);
-
-    remove_validation_cwd_alias(&inside_alias);
-    remove_validation_cwd_alias(&escape_alias);
-}
-
 async fn run_exec_command_for_test(
     session: &Arc<crate::session::session::Session>,
     turn: &Arc<crate::session::turn_context::TurnContext>,
@@ -303,6 +282,7 @@ fn terminal_powershell_failure_keeps_recovery_advisory_out_of_raw_output() {
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(1),
+        process_exited: true,
         original_token_count: None,
         hook_command: Some("broken command".to_string()),
         raw_output_artifact: None,
@@ -686,7 +666,7 @@ async fn known_delta_unified_exec_reuses_third_exact_git_show_and_force_fresh_la
     let repo_root =
         get_git_repo_root(turn.cwd().as_path()).expect("test cwd is in a git repository");
     let blob_output = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD:codex-rs/core/src/task_evidence.rs"])
+        .args(["rev-parse", "HEAD:codex-rs/core/src/lib.rs"])
         .current_dir(&repo_root)
         .output()
         .expect("resolve committed test blob");
@@ -1788,6 +1768,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
+        process_exited: true,
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
@@ -1820,6 +1801,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
+        process_exited: true,
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
@@ -1853,6 +1835,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         max_output_tokens: None,
         process_id: Some(45),
         exit_code: None,
+        process_exited: false,
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
@@ -1881,6 +1864,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
+        process_exited: true,
         original_token_count: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
         raw_output_artifact: None,
@@ -1944,6 +1928,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
+        process_exited: true,
         original_token_count: None,
         hook_command: Some("sleep 2; echo alpha".to_string()),
         raw_output_artifact: None,
@@ -1958,6 +1943,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
+        process_exited: true,
         original_token_count: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
         raw_output_artifact: None,

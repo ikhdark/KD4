@@ -34,22 +34,17 @@ class SourceOwnersTest(unittest.TestCase):
         self.assertIn("source_owners.py slice --owner <owner-id>", catalog["next"])
         self.assertLess(len(emit.call_args.args[0]), 10_000)
 
-    def test_task_continuity_workflow_has_a_dedicated_source_owner(self) -> None:
+    def test_retired_task_continuity_workflow_has_no_source_owner(self) -> None:
         manifest, _ = source_owners.load_and_validate(
             source_owners.DEFAULT_MANIFEST, source_owners.REPO_ROOT
         )
         owners = {owner["id"]: owner for owner in manifest["owners"]}
 
-        owner = owners["task-continuity-hooks"]
-        self.assertEqual(owner["feature_ids"], ["task-continuity-hooks"])
-        self.assertIn(".codex/hooks.json", owner["roots"])
-        self.assertIn(".codex/hooks/task-continuity-entry.ps1", owner["roots"])
-        self.assertEqual(
-            owner["validation"][0]["argv"],
-            ["python", "-m", "unittest", "scripts.test_task_continuity_hook"],
-        )
+        self.assertNotIn("task-continuity-hooks", owners)
 
-    def test_source_owners_slice_recipe_allows_relationship_limit_override(self) -> None:
+    def test_source_owners_slice_recipe_allows_relationship_limit_override(
+        self,
+    ) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         recipe = justfile.split("source-owners-slice owner *args:", 1)[1].split(
             "\n\n", 1
@@ -209,7 +204,9 @@ evidence = [{ path = "source.rs", symbol = "live_symbol" }]
             }
 
             first = source_owners.repository_revision(root, "manifest", manifest)
-            source.write_text("fn live_symbol() { println!(\"changed\"); }\n", encoding="utf-8")
+            source.write_text(
+                'fn live_symbol() { println!("changed"); }\n', encoding="utf-8"
+            )
             second = source_owners.repository_revision(root, "manifest", manifest)
 
             self.assertNotEqual(first, second)
@@ -314,9 +311,7 @@ invariants = [{ id = "stable", kind = "semantic", statement = "Stable.", evidenc
             original_stat = Path.stat
             source_stat_calls = 0
 
-            def tracked_stat(
-                path: Path, *args: object, **kwargs: object
-            ) -> object:
+            def tracked_stat(path: Path, *args: object, **kwargs: object) -> object:
                 nonlocal source_stat_calls
                 if path == source:
                     source_stat_calls += 1
@@ -502,9 +497,7 @@ primary_entries = [{ path = "source.rs", symbol = "locate" }]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "src").mkdir()
-            (root / "src" / "lib.rs").write_text(
-                "fn locate() {}\n", encoding="utf-8"
-            )
+            (root / "src" / "lib.rs").write_text("fn locate() {}\n", encoding="utf-8")
             manifest_path = root / "source_owners.toml"
             manifest_path.write_text(
                 """schema_version = 2
@@ -799,9 +792,7 @@ evidence = [{ path = "src/lib.rs", symbol = "item" }]
 
             retained = slice_["control_and_data_flow"]["relationships"]
             self.assertEqual(retained[0]["target"], "path:src/zz_critical_cache.rs")
-            self.assertEqual(
-                slice_["omitted_relationships"], len(relationships) - 1
-            )
+            self.assertEqual(slice_["omitted_relationships"], len(relationships) - 1)
 
     def test_query_deduplicates_relationships_before_bounding(self) -> None:
         relationship = {

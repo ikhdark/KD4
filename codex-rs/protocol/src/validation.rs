@@ -44,12 +44,19 @@ impl<'de> Deserialize<'de> for ValidationCommandContext {
 #[ts(rename_all = "snake_case", export_to = "v2/")]
 pub enum ValidationTerminalStatus {
     Succeeded,
+    Unverified,
     Failed,
 }
 
 impl ValidationTerminalStatus {
+    /// Whether this result is sufficient validation proof.
     pub fn is_success(self) -> bool {
         self == Self::Succeeded
+    }
+
+    /// Whether the validation command itself completed successfully.
+    pub fn is_command_success(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Unverified)
     }
 }
 
@@ -185,6 +192,7 @@ mod tests {
     fn terminal_status_wire_contract_is_lean_and_exact() {
         let statuses = [
             ValidationTerminalStatus::Succeeded,
+            ValidationTerminalStatus::Unverified,
             ValidationTerminalStatus::Failed,
         ];
         assert_eq!(
@@ -192,8 +200,15 @@ mod tests {
                 .into_iter()
                 .map(|status| serde_json::to_value(status).expect("status serialization"))
                 .collect::<Vec<_>>(),
-            vec![serde_json::json!("succeeded"), serde_json::json!("failed"),]
+            vec![
+                serde_json::json!("succeeded"),
+                serde_json::json!("unverified"),
+                serde_json::json!("failed"),
+            ]
         );
+        assert!(ValidationTerminalStatus::Succeeded.is_success());
+        assert!(!ValidationTerminalStatus::Unverified.is_success());
+        assert!(ValidationTerminalStatus::Unverified.is_command_success());
         assert!(serde_json::from_value::<ValidationTerminalStatus>(json!("superseded")).is_err());
         assert!(serde_json::from_value::<ValidationTerminalStatus>(json!("timed_out")).is_err());
     }

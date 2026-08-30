@@ -24,6 +24,7 @@ use crate::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_image::ImageProcessingError;
 use codex_utils_path_uri::PathUri;
+use codex_utils_string::approx_token_count;
 use codex_utils_string::truncate_middle_with_token_budget;
 use schemars::JsonSchema;
 
@@ -1790,10 +1791,43 @@ impl From<Vec<UserInput>> for ResponseInputItem {
 }
 
 const LOCAL_PATH_CONTEXT_TOKEN_BUDGET: usize = 10_000;
+const LOCAL_PATH_CONTEXT_RETRY_AVOIDANCE_TOKEN_MARGIN: usize = 128;
 
 fn render_local_path_context(path: &Path, content: &str) -> String {
     let rendered = format!("<local_path_context path={path:?}>\n{content}\n</local_path_context>");
-    truncate_middle_with_token_budget(&rendered, LOCAL_PATH_CONTEXT_TOKEN_BUDGET).0
+    let original_tokens = approx_token_count(&rendered);
+    if original_tokens
+        <= LOCAL_PATH_CONTEXT_TOKEN_BUDGET
+            .saturating_add(LOCAL_PATH_CONTEXT_RETRY_AVOIDANCE_TOKEN_MARGIN)
+    {
+        return rendered;
+    }
+
+    let content_tokens = approx_token_count(content);
+    let omission = format!(
+        "<local_path_context_omission original_content_tokens={content_tokens} \
+         recovery=\"read the original local path {path:?}; do not infer missing content\" />"
+    );
+    let empty_envelope =
+        format!("<local_path_context path={path:?}>\n\n{omission}\n</local_path_context>");
+    let mut content_budget =
+        LOCAL_PATH_CONTEXT_TOKEN_BUDGET.saturating_sub(approx_token_count(&empty_envelope));
+
+    loop {
+        let bounded_content = truncate_middle_with_token_budget(content, content_budget).0;
+        let bounded = format!(
+            "<local_path_context path={path:?}>\n{bounded_content}\n{omission}\n</local_path_context>"
+        );
+        let bounded_tokens = approx_token_count(&bounded);
+        if bounded_tokens <= LOCAL_PATH_CONTEXT_TOKEN_BUDGET || content_budget == 0 {
+            return bounded;
+        }
+        content_budget = content_budget.saturating_sub(
+            bounded_tokens
+                .saturating_sub(LOCAL_PATH_CONTEXT_TOKEN_BUDGET)
+                .max(1),
+        );
+    }
 }
 
 impl ResponseInputItem {
@@ -2372,7 +2406,7 @@ mod tests {
     fn local_path_context_respects_model_item_ceiling() {
         let item = ResponseInputItem::from(vec![UserInput::LocalPath {
             path: std::path::PathBuf::from("large-context.txt"),
-            content: "{}[](),".repeat(20_000),
+            content: format!("BEGIN\n{}\nROOT_CAUSE_AT_END", "{}[](),".repeat(20_000)),
         }]);
         let ResponseInputItem::Message { content, .. } = item else {
             panic!("expected user message");
@@ -2384,6 +2418,27 @@ mod tests {
         assert!(codex_utils_string::approx_token_count(text) <= LOCAL_PATH_CONTEXT_TOKEN_BUDGET);
         assert!(text.starts_with("<local_path_context"));
         assert!(text.ends_with("</local_path_context>"));
+        assert!(text.contains("ROOT_CAUSE_AT_END"));
+        assert!(text.contains("local_path_context_omission"));
+        assert!(text.contains("original_content_tokens="));
+        assert!(text.contains("recovery=\"read the original local path"));
+        assert!(text.contains("do not infer missing content"));
+    }
+
+    #[test]
+    fn over_truncation_marginal_local_path_overage_stays_exact() {
+        let path = std::path::PathBuf::from("marginal-context.txt");
+        let content = "a ".repeat(LOCAL_PATH_CONTEXT_TOKEN_BUDGET);
+        let exact = format!("<local_path_context path={path:?}>\n{content}\n</local_path_context>");
+        let exact_tokens = codex_utils_string::approx_token_count(&exact);
+        assert!(exact_tokens > LOCAL_PATH_CONTEXT_TOKEN_BUDGET);
+        assert!(
+            exact_tokens
+                <= LOCAL_PATH_CONTEXT_TOKEN_BUDGET
+                    + LOCAL_PATH_CONTEXT_RETRY_AVOIDANCE_TOKEN_MARGIN
+        );
+
+        assert_eq!(render_local_path_context(&path, &content), exact);
     }
 
     #[test]

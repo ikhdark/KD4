@@ -407,7 +407,6 @@ async fn mark_thread_completed(thread: &CodexThread) {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
-                completion: None,
                 timing: None,
             }),
         )

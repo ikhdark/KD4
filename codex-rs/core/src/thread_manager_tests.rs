@@ -2034,7 +2034,6 @@ fn markerless_sampling_boundary_fork_preserves_completed_rounds_and_drops_active
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
-            completion: None,
             timing: None,
         },
     ));

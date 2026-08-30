@@ -448,7 +448,6 @@ impl LocalThreadProjection {
             started_at: metadata.and_then(|metadata| metadata.started_at),
             completed_at: metadata.and_then(|metadata| metadata.completed_at),
             duration_ms: metadata.and_then(|metadata| metadata.duration_ms),
-            completion: metadata.and_then(|metadata| metadata.completion.clone()),
             timing: metadata.and_then(|metadata| metadata.timing.clone()),
             surfaced_result: metadata.and_then(|metadata| metadata.surfaced_result.clone()),
             reasoning_policy_history: metadata

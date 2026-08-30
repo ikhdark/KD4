@@ -40,6 +40,7 @@ use crate::tools::tool_dispatch_trace::record_pre_tool_hook;
 use crate::turn_timing::TurnTimingState;
 use codex_config::schema::canonicalize as canonicalize_json;
 use codex_extension_api::ToolCallOutcome;
+use codex_hooks::PostToolUseOutcome;
 use codex_otel::TOOL_LIFECYCLE_PHASE_DURATION_METRIC;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -144,6 +145,13 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
     /// Whether cancellation should let the handler finish teardown before the
     /// host returns an aborted tool response.
     fn waits_for_runtime_cancellation(&self) -> bool {
+        false
+    }
+
+    /// Whether this runtime can retain processes in the unified-exec manager.
+    /// Routing cleanup by runtime capability keeps aliases and namespaced
+    /// registrations on the same cancellation path as the canonical name.
+    fn owns_unified_exec_processes(&self) -> bool {
         false
     }
 
@@ -657,6 +665,31 @@ struct PostToolUseFeedbackOutput {
     model_visible: FunctionToolOutput,
 }
 
+fn apply_post_tool_use_outcome(
+    result: &mut AnyToolResult,
+    outcome: PostToolUseOutcome,
+) -> Vec<String> {
+    // A post hook observes a call whose side effects have already happened. Its
+    // block decision cannot undo the call, so returning a failed tool result
+    // would only invite the model to repeat the mutation. Likewise, context
+    // from a rejecting hook must not influence the next sampling request.
+    if outcome.should_block {
+        return Vec::new();
+    }
+    if let Some(feedback_message) = outcome.feedback_message {
+        let model_visible = FunctionToolOutput::from_text(feedback_message, /*success*/ None);
+        result.code_mode_feedback = model_visible.body.clone();
+        result.result = Box::new(PostToolUseFeedbackOutput {
+            original: std::mem::replace(
+                &mut result.result,
+                Box::new(FunctionToolOutput::from_text(String::new(), None)),
+            ),
+            model_visible,
+        });
+    }
+    outcome.additional_contexts
+}
+
 impl ToolOutput for PostToolUseFeedbackOutput {
     fn log_preview(&self) -> String {
         self.original.log_preview()
@@ -728,11 +761,11 @@ impl ToolOutput for UnavailableModelProjectionOutput {
     }
 
     fn success_for_logging(&self) -> bool {
-        self.original.success_for_logging()
+        false
     }
 
     fn outcome_for_logging(&self) -> ToolOutputOutcome {
-        self.original.outcome_for_logging()
+        ToolOutputOutcome::Failure
     }
 
     fn outcome_context(&self) -> codex_tools::ToolOutputOutcomeContext {
@@ -1051,6 +1084,11 @@ impl ToolRegistry {
         Some(tool.waits_for_runtime_cancellation())
     }
 
+    pub(crate) fn owns_unified_exec_processes(&self, name: &ToolName) -> Option<bool> {
+        let tool = self.tool(name)?;
+        Some(tool.owns_unified_exec_processes())
+    }
+
     #[cfg(test)]
     pub(crate) fn code_mode_argument_preflight_counts(
         &self,
@@ -1328,18 +1366,6 @@ impl ToolRegistry {
             )
             .await;
         record_lifecycle_phase(&invocation, "handler", phase_started);
-        // Handler completion is the first point where an ordinary result can
-        // own the terminal outcome. Claim it before hooks or projection so a
-        // concurrent abort can never publish a second representation. If the
-        // abort already owns the terminal outcome, this handler was awaited
-        // only for cooperative cleanup and must not run post-processing.
-        if !dispatch_state.try_complete() {
-            let err = FunctionCallError::RespondToModel(
-                "tool cancelled after runtime cleanup".to_string(),
-            );
-            dispatch_trace.record_failed(&err).await;
-            return Err(err);
-        }
         let success = match &result {
             Ok(result) => result.success_for_logging(),
             Err(_) => false,
@@ -1393,13 +1419,14 @@ impl ToolRegistry {
             } else {
                 None
             };
-        if let Some(outcome) = &post_tool_use_outcome {
+        if let (Ok(result), Some(outcome)) = (&mut result, post_tool_use_outcome) {
             let phase_started = Instant::now();
+            let additional_contexts = apply_post_tool_use_outcome(result, outcome);
             if matches!(&invocation.source, ToolCallSource::Direct) {
                 let contexts = prepare_additional_context_items(
                     &invocation.session,
                     &invocation.step_context.turn,
-                    outcome.additional_contexts.clone(),
+                    additional_contexts,
                 )
                 .await;
                 invocation
@@ -1411,11 +1438,22 @@ impl ToolRegistry {
                 record_additional_contexts(
                     &invocation.session,
                     &invocation.step_context.turn,
-                    outcome.additional_contexts.clone(),
+                    additional_contexts,
                 )
                 .await;
             }
             record_lifecycle_phase(&invocation, "additional_context", phase_started);
+        }
+
+        // A cooperative runtime can finish teardown after cancellation has
+        // already claimed the terminal outcome. Do not continue into
+        // projection, persistence, or finish notification for that result.
+        if dispatch_state.is_aborted() {
+            let err = FunctionCallError::RespondToModel(
+                "tool cancelled after runtime cleanup".to_string(),
+            );
+            dispatch_trace.record_failed(&err).await;
+            return Err(err);
         }
 
         // A PostToolUse block rejects the result, not the already-completed tool execution.
@@ -1435,28 +1473,6 @@ impl ToolRegistry {
         };
         match result {
             Ok(mut result) => {
-                if let Some(outcome) = post_tool_use_outcome {
-                    if outcome.should_block {
-                        let message = outcome.feedback_message.unwrap_or_else(|| {
-                            "PostToolUse hook blocked the tool result".to_string()
-                        });
-                        let err = FunctionCallError::RespondToModel(message);
-                        let phase_started = Instant::now();
-                        notify_tool_finish(&invocation, lifecycle_outcome).await;
-                        record_lifecycle_phase(&invocation, "notify_finish", phase_started);
-                        dispatch_trace.record_failed(&err).await;
-                        return Err(err);
-                    }
-                    if let Some(feedback_message) = outcome.feedback_message {
-                        let model_visible =
-                            FunctionToolOutput::from_text(feedback_message, /*success*/ None);
-                        result.code_mode_feedback = model_visible.body.clone();
-                        result.result = Box::new(PostToolUseFeedbackOutput {
-                            original: result.result,
-                            model_visible,
-                        });
-                    }
-                }
                 let force_inline_carrier = result
                     .deterministic_continuation_owner_key()
                     .is_some_and(|owner_key| {
@@ -1509,7 +1525,7 @@ impl ToolRegistry {
                     let model_visible = FunctionToolOutput::from_text(
                         "Tool execution completed, but its full result could not be preserved for model delivery."
                             .to_string(),
-                        Some(result.success_for_logging()),
+                        Some(false),
                     );
                     result.result = Box::new(UnavailableModelProjectionOutput {
                         original: result.result,
@@ -1556,14 +1572,26 @@ impl ToolRegistry {
                         result.result.as_ref(),
                     )
                     .await;
-                Ok(result)
+                if dispatch_state.try_complete() {
+                    Ok(result)
+                } else {
+                    Err(FunctionCallError::RespondToModel(
+                        "tool cancelled after runtime cleanup".to_string(),
+                    ))
+                }
             }
             Err(err) => {
                 let phase_started = Instant::now();
                 notify_tool_finish(&invocation, lifecycle_outcome).await;
                 record_lifecycle_phase(&invocation, "notify_finish", phase_started);
                 dispatch_trace.record_failed(&err).await;
-                Err(err)
+                if dispatch_state.try_complete() {
+                    Err(err)
+                } else {
+                    Err(FunctionCallError::RespondToModel(
+                        "tool cancelled after runtime cleanup".to_string(),
+                    ))
+                }
             }
         }
     }
@@ -1592,12 +1620,12 @@ async fn notify_tool_finish_if_unclaimed(
     dispatch_state: &ToolDispatchState,
     outcome: ToolCallOutcome,
 ) -> bool {
-    if !dispatch_state.try_complete() {
+    if dispatch_state.is_aborted() {
         return false;
     }
 
     notify_tool_finish(invocation, outcome).await;
-    true
+    dispatch_state.try_complete()
 }
 
 async fn handle_any_tool(
@@ -1777,11 +1805,10 @@ fn prepare_model_projection(
         return None;
     }
 
-    let mut original_response = result
+    let (mut original_response, producer_metadata) = result
         .result
-        .to_response_item(&result.call_id, &result.payload);
+        .to_response_item_with_projection_metadata(&result.call_id, &result.payload);
     let preserved_content = preserved_non_text_content(&original_response);
-    let producer_metadata = result.result.projection_metadata();
     let using_admission_fallback = producer_metadata.is_none();
     let metadata = producer_metadata.or_else(|| {
         track_for_admission.then(|| {

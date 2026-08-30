@@ -15,8 +15,6 @@ use crate::session::emit_subagent_session_started;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
-use crate::task_evidence::ChildEvidenceProvenance;
-use crate::task_evidence::TaskEvidenceLedger;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
@@ -161,7 +159,6 @@ struct AgentControlTestHooks {
     before_initial_submission: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
     before_v2_cold_load: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
     after_execution_reservation: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
-    inter_agent_communication_attempts: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Debug)]
@@ -225,63 +222,6 @@ impl AgentControl {
 
     pub(crate) fn has_live_agents(&self) -> bool {
         self.state.has_live_agents()
-    }
-
-    pub(crate) async fn completion_evidence_target(
-        &self,
-        session_source: &SessionSource,
-        source_thread_id: ThreadId,
-        own_ledger: &TaskEvidenceLedger,
-    ) -> (TaskEvidenceLedger, Option<ChildEvidenceProvenance>) {
-        let Some(agent_path) = session_source.get_agent_path() else {
-            return (own_ledger.clone(), None);
-        };
-        if !session_source.is_non_root_agent()
-            || self
-                .task_coordinator()
-                .binding_for_agent_path(&agent_path)
-                .is_some()
-        {
-            return (own_ledger.clone(), None);
-        }
-        let Some(root_thread_id) = self.state.agent_id_for_path(&AgentPath::root()) else {
-            return (own_ledger.clone(), None);
-        };
-        let Ok(manager) = self.upgrade() else {
-            return (own_ledger.clone(), None);
-        };
-        let Ok(root_thread) = manager.get_thread(root_thread_id).await else {
-            return (own_ledger.clone(), None);
-        };
-        (
-            root_thread.codex.session.services.task_evidence.clone(),
-            Some(ChildEvidenceProvenance {
-                source_thread_id: source_thread_id.to_string(),
-                source_agent_path: agent_path.to_string(),
-            }),
-        )
-    }
-
-    pub(crate) async fn default_children_quiescence(&self) -> (bool, Vec<String>) {
-        let mut active = Vec::new();
-        for metadata in self.state.live_agents() {
-            let (Some(agent_path), Some(thread_id)) = (metadata.agent_path, metadata.agent_id)
-            else {
-                continue;
-            };
-            if self
-                .task_coordinator()
-                .binding_for_agent_path(&agent_path)
-                .is_some()
-            {
-                continue;
-            }
-            let status = self.get_status(thread_id).await;
-            if !is_final(&status) {
-                active.push(format!("{agent_path} ({status:?})"));
-            }
-        }
-        (active.is_empty(), active)
     }
 
     pub(crate) fn start_typed_actor_heartbeat_watcher(
@@ -446,10 +386,6 @@ impl AgentControl {
         communication: InterAgentCommunication,
         agent_communication_context: AgentCommunicationContext,
     ) -> CodexResult<String> {
-        #[cfg(test)]
-        self.test_hooks
-            .inter_agent_communication_attempts
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let state = self.upgrade()?;
         let execution_guard = self
             .reserve_execution_capacity_for_turn_start(agent_id, communication.trigger_turn)
@@ -462,13 +398,6 @@ impl AgentControl {
             execution_guard,
         )
         .await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inter_agent_communication_attempt_count(&self) -> usize {
-        self.test_hooks
-            .inter_agent_communication_attempts
-            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn send_inter_agent_communication_after_capacity_check(
@@ -1034,30 +963,26 @@ impl AgentControl {
         child_thread: &crate::CodexThread,
         child_thread_id: ThreadId,
         session_source: Option<&SessionSource>,
-    ) {
+    ) -> CodexResult<()> {
         let Some(parent_thread_id) = session_source.and_then(SessionSource::parent_thread_id)
         else {
-            return;
+            return Ok(());
         };
         if child_thread.config_snapshot().await.ephemeral {
-            return;
+            return Ok(());
         }
-        let Ok(state) = self.upgrade() else {
-            return;
-        };
+        let state = self.upgrade()?;
         let Some(agent_graph_store) = state.agent_graph_store() else {
-            return;
+            return Ok(());
         };
-        if let Err(err) = agent_graph_store
+        agent_graph_store
             .upsert_thread_spawn_edge(
                 parent_thread_id,
                 child_thread_id,
                 codex_agent_graph_store::ThreadSpawnEdgeStatus::Open,
             )
             .await
-        {
-            warn!("failed to persist thread-spawn edge: {err}");
-        }
+            .map_err(|err| CodexErr::Fatal(format!("failed to persist thread-spawn edge: {err}")))
     }
 
     async fn live_thread_spawn_descendants(

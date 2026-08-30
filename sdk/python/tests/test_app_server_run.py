@@ -29,9 +29,7 @@ def test_agent_message_mapping_requires_generated_thread_item_root() -> None:
         type="agentMessage",
     )
 
-    assert (
-        _agent_message_item_from_thread_item(ThreadItem(root=agent_message)) is agent_message
-    )
+    assert _agent_message_item_from_thread_item(ThreadItem(root=agent_message)) is agent_message
     with pytest.raises(AttributeError):
         _agent_message_item_from_thread_item(agent_message)  # type: ignore[arg-type]
 

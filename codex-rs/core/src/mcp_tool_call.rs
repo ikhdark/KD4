@@ -118,38 +118,15 @@ const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
 // currently provide an acknowledgement that the remote server stopped too.
 const MCP_TOOL_CALL_CANCELLED_MESSAGE: &str =
     "MCP tool call cancellation requested; remote completion status is unknown";
-const REPO_ATLAS_SERVER_NAME: &str = "repo-atlas";
-const REPO_ATLAS_NORMALIZED_SERVER_NAME: &str = "repo_atlas";
-const REPO_ATLAS_TASK_TOOL_NAME: &str = "task";
-const REPO_ATLAS_TASK_MAX_TOKENS: u64 = 4_000;
 
-fn normalize_mcp_tool_arguments_before_execution(
-    server: &str,
-    tool_name: &str,
-    arguments: &mut Option<JsonValue>,
-) {
-    if !matches!(
-        server,
-        REPO_ATLAS_SERVER_NAME | REPO_ATLAS_NORMALIZED_SERVER_NAME
-    ) || tool_name != REPO_ATLAS_TASK_TOOL_NAME
-    {
-        return;
+fn parse_mcp_tool_arguments_before_execution(
+    arguments: &str,
+) -> serde_json::Result<Option<JsonValue>> {
+    if arguments.trim().is_empty() {
+        Ok(None)
+    } else {
+        serde_json::from_str(arguments).map(Some)
     }
-
-    let Some(arguments) = arguments.as_mut().and_then(JsonValue::as_object_mut) else {
-        return;
-    };
-    let Some(max_tokens) = arguments.get("maxTokens").and_then(JsonValue::as_u64) else {
-        return;
-    };
-    if max_tokens <= REPO_ATLAS_TASK_MAX_TOKENS {
-        return;
-    }
-
-    arguments.insert(
-        "maxTokens".to_string(),
-        JsonValue::from(REPO_ATLAS_TASK_MAX_TOKENS),
-    );
 }
 
 /// Handles the specified tool call and dispatches the appropriate MCP tool-call
@@ -169,31 +146,20 @@ pub(crate) async fn handle_mcp_tool_call(
     let sampled_tool_name = live_tool_info.tool.name.to_string();
     // Parse the `arguments` as JSON. An empty string is OK, but invalid JSON
     // is not.
-    let mut arguments_value = if arguments.trim().is_empty() {
-        None
-    } else {
-        match serde_json::from_str::<serde_json::Value>(&arguments) {
-            Ok(value) => Some(value),
-            Err(e) => {
-                error!("failed to parse tool call arguments: {e}");
-                return HandledMcpToolCall {
-                    result: CallToolResult::from_error_text(format!("err: {e}")),
-                    raw_server_result: None,
-                    tool_input: JsonValue::Object(serde_json::Map::new()),
-                };
-            }
+    let arguments_value = match parse_mcp_tool_arguments_before_execution(&arguments) {
+        Ok(value) => value,
+        Err(e) => {
+            error!("failed to parse tool call arguments: {e}");
+            return HandledMcpToolCall {
+                result: CallToolResult::from_error_text(format!("err: {e}")),
+                tool_input: JsonValue::Object(serde_json::Map::new()),
+            };
         }
     };
-    normalize_mcp_tool_arguments_before_execution(
-        &sampled_server,
-        &sampled_tool_name,
-        &mut arguments_value,
-    );
 
     if cancellation_token.is_cancelled() {
         return HandledMcpToolCall {
             result: CallToolResult::from_error_text(MCP_TOOL_CALL_CANCELLED_MESSAGE.to_string()),
-            raw_server_result: None,
             tool_input: arguments_value
                 .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
         };
@@ -229,7 +195,6 @@ pub(crate) async fn handle_mcp_tool_call(
         );
         return HandledMcpToolCall {
             result: CallToolResult::from_result(result),
-            raw_server_result: None,
             tool_input: arguments_value
                 .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
         };
@@ -250,7 +215,6 @@ pub(crate) async fn handle_mcp_tool_call(
                 result: CallToolResult::from_error_text(
                     MCP_TOOL_CALL_CANCELLED_MESSAGE.to_string(),
                 ),
-                raw_server_result: None,
                 tool_input: arguments_value
                     .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
             };
@@ -307,7 +271,6 @@ pub(crate) async fn handle_mcp_tool_call(
         );
         return HandledMcpToolCall {
             result: CallToolResult::from_result(result),
-            raw_server_result: None,
             tool_input: arguments_value
                 .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
         };
@@ -428,7 +391,6 @@ pub(crate) async fn handle_mcp_tool_call(
 
     HandledMcpToolCall {
         result: CallToolResult::from_result(outcome.result),
-        raw_server_result: outcome.raw_server_result,
         tool_input: outcome.tool_input,
     }
 }
@@ -452,13 +414,11 @@ fn live_mcp_hook_tool_name(tool_info: &ToolInfo) -> HookToolName {
 
 pub(crate) struct HandledMcpToolCall {
     pub(crate) result: CallToolResult,
-    pub(crate) raw_server_result: Option<CallToolResult>,
     pub(crate) tool_input: JsonValue,
 }
 
 struct McpToolCallOutcome {
     result: Result<CallToolResult, String>,
-    raw_server_result: Option<CallToolResult>,
     tool_input: JsonValue,
     duration: Duration,
     metric_duration: Option<Duration>,
@@ -469,7 +429,6 @@ impl McpToolCallOutcome {
     fn skipped(message: String, tool_input: JsonValue) -> Self {
         Self {
             result: Err(message),
-            raw_server_result: None,
             tool_input,
             duration: Duration::ZERO,
             metric_duration: None,
@@ -480,7 +439,6 @@ impl McpToolCallOutcome {
     fn cancelled(tool_input: JsonValue, duration: Duration) -> Self {
         Self {
             result: Err(MCP_TOOL_CALL_CANCELLED_MESSAGE.to_string()),
-            raw_server_result: None,
             tool_input,
             duration,
             metric_duration: Some(duration),
@@ -590,7 +548,7 @@ async fn execute_approved_mcp_tool_call(
         },
     ))
     .await;
-    let (result, raw_server_result) = split_mcp_tool_call_execution(execution);
+    let result = execution.map(|execution| execution.model_result);
     record_mcp_result_span_telemetry(&Span::current(), &result);
     if let Err(error) = &result {
         tracing::warn!("MCP tool call error: {error:?}");
@@ -598,7 +556,6 @@ async fn execute_approved_mcp_tool_call(
     let duration = start.elapsed();
     McpToolCallOutcome {
         result,
-        raw_server_result,
         tool_input,
         duration,
         metric_duration: Some(duration),
@@ -713,20 +670,7 @@ fn truncate_str_to_char_boundary(value: &str, max_chars: usize) -> &str {
 }
 
 struct ExecutedMcpToolCall {
-    raw_server_result: Option<CallToolResult>,
     model_result: CallToolResult,
-}
-
-fn split_mcp_tool_call_execution(
-    execution: Result<ExecutedMcpToolCall, String>,
-) -> (Result<CallToolResult, String>, Option<CallToolResult>) {
-    match execution {
-        Ok(ExecutedMcpToolCall {
-            raw_server_result,
-            model_result,
-        }) => (Ok(model_result), raw_server_result),
-        Err(error) => (Err(error), None),
-    }
 }
 
 async fn execute_mcp_tool_call(
@@ -767,12 +711,12 @@ async fn execute_mcp_tool_call(
         .await;
     drop(tool_execution_timing_guard);
     let raw_server_result = result.map_err(|e| format!("tool call error: {e:?}"))?;
-    let (raw_server_result, model_result) = preserve_raw_mcp_tool_result_for_evidence(
+    let model_result = sanitize_mcp_tool_result_for_model(
         turn_context
             .model_info
             .input_modalities
             .contains(&InputModality::Image),
-        raw_server_result,
+        Ok(raw_server_result),
     )?;
     let model_result = maybe_request_codex_apps_auth_elicitation(
         sess,
@@ -784,10 +728,7 @@ async fn execute_mcp_tool_call(
         model_result,
     )
     .await;
-    Ok(ExecutedMcpToolCall {
-        raw_server_result,
-        model_result,
-    })
+    Ok(ExecutedMcpToolCall { model_result })
 }
 
 async fn maybe_request_codex_apps_auth_elicitation(
@@ -985,25 +926,6 @@ fn sanitize_mcp_tool_result_for_model(
         is_error: call_tool_result.is_error,
         meta: call_tool_result.meta,
     })
-}
-
-fn preserve_raw_mcp_tool_result_for_evidence(
-    supports_image_input: bool,
-    raw_server_result: CallToolResult,
-) -> Result<(Option<CallToolResult>, CallToolResult), String> {
-    let has_evidence_metadata = raw_server_result
-        .structured_content
-        .as_ref()
-        .is_some_and(|structured| structured.get("evidenceMeta").is_some());
-    if !has_evidence_metadata {
-        let model_result =
-            sanitize_mcp_tool_result_for_model(supports_image_input, Ok(raw_server_result))?;
-        return Ok((None, model_result));
-    }
-
-    let model_result =
-        sanitize_mcp_tool_result_for_model(supports_image_input, Ok(raw_server_result.clone()))?;
-    Ok((Some(raw_server_result), model_result))
 }
 
 fn truncate_mcp_tool_result_for_event(

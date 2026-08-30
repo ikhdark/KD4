@@ -1,22 +1,42 @@
 //! Agent-turn lifecycle state for `ChatWidget`.
 
 use std::collections::HashSet;
+#[cfg(windows)]
 use std::ffi::OsStr;
+#[cfg(windows)]
 use std::iter::once;
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(not(windows))]
+use std::process::Child;
+#[cfg(not(windows))]
+use std::process::Command;
+#[cfg(not(windows))]
+use std::process::Stdio;
 use std::time::Instant;
 
 use tracing::warn;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+#[cfg(windows)]
 use windows_sys::Win32::System::Power::POWER_REQUEST_TYPE;
+#[cfg(windows)]
 use windows_sys::Win32::System::Power::PowerClearRequest;
+#[cfg(windows)]
 use windows_sys::Win32::System::Power::PowerCreateRequest;
+#[cfg(windows)]
 use windows_sys::Win32::System::Power::PowerRequestSystemRequired;
+#[cfg(windows)]
 use windows_sys::Win32::System::Power::PowerSetRequest;
+#[cfg(windows)]
 use windows_sys::Win32::System::SystemServices::POWER_REQUEST_CONTEXT_VERSION;
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::REASON_CONTEXT;
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::REASON_CONTEXT_0;
 
 const SLEEP_INHIBITOR_REASON: &str = "Codex is running an active turn";
@@ -52,7 +72,7 @@ impl SleepInhibitor {
             Err(error) => {
                 warn!(
                     reason = %error,
-                    "Failed to acquire Windows sleep-prevention request"
+                    "Failed to acquire sleep-prevention request"
                 );
             }
         }
@@ -64,12 +84,14 @@ impl SleepInhibitor {
     }
 }
 
+#[cfg(windows)]
 #[derive(Debug)]
 struct PowerRequest {
     handle: windows_sys::Win32::Foundation::HANDLE,
     request_type: POWER_REQUEST_TYPE,
 }
 
+#[cfg(windows)]
 impl PowerRequest {
     fn new_system_required(reason: &str) -> Result<Self, String> {
         let mut wide_reason: Vec<u16> = OsStr::new(reason).encode_wide().chain(once(0)).collect();
@@ -106,6 +128,7 @@ impl PowerRequest {
     }
 }
 
+#[cfg(windows)]
 impl Drop for PowerRequest {
     fn drop(&mut self) {
         // SAFETY: `self.handle` is the handle owned by this `PowerRequest`, and
@@ -126,6 +149,61 @@ impl Drop for PowerRequest {
                 "Failed to close Windows sleep-prevention request handle"
             );
         }
+    }
+}
+
+#[cfg(not(windows))]
+#[derive(Debug)]
+struct PowerRequest {
+    child: Child,
+}
+
+#[cfg(not(windows))]
+impl PowerRequest {
+    fn new_system_required(reason: &str) -> Result<Self, String> {
+        let (program, args) = external_sleep_inhibitor_command(std::env::consts::OS)
+            .ok_or_else(|| "sleep prevention is unsupported on this platform".to_string())?;
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if program == "systemd-inhibit" {
+            command
+                .arg(format!("--why={reason}"))
+                .args(["sleep", "2147483647"]);
+        }
+        let child = command
+            .spawn()
+            .map_err(|error| format!("failed to start {program}: {error}"))?;
+        Ok(Self { child })
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for PowerRequest {
+    fn drop(&mut self) {
+        if let Err(error) = self.child.kill()
+            && error.kind() != std::io::ErrorKind::InvalidInput
+        {
+            warn!(reason = %error, "Failed to release sleep-prevention request");
+        }
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn external_sleep_inhibitor_command(
+    target_os: &str,
+) -> Option<(&'static str, &'static [&'static str])> {
+    match target_os {
+        "linux" => Some((
+            "systemd-inhibit",
+            &["--what=idle", "--mode=block", "--who=codex"],
+        )),
+        "macos" => Some(("caffeinate", &["-i"])),
+        _ => None,
     }
 }
 
@@ -228,5 +306,18 @@ mod tests {
 
         assert!(state.agent_turn_running);
         assert!(state.sleep_inhibitor.is_turn_running());
+    }
+
+    #[test]
+    fn external_sleep_inhibitor_commands_are_platform_specific() {
+        assert_eq!(
+            external_sleep_inhibitor_command("linux").map(|(program, _)| program),
+            Some("systemd-inhibit")
+        );
+        assert_eq!(
+            external_sleep_inhibitor_command("macos").map(|(program, _)| program),
+            Some("caffeinate")
+        );
+        assert_eq!(external_sleep_inhibitor_command("windows"), None);
     }
 }

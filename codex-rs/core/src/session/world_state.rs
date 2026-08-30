@@ -6,7 +6,6 @@ use crate::context::world_state::AgentsMdState;
 use crate::context::world_state::AppsInstructionsState;
 use crate::context::world_state::EnvironmentsState;
 use crate::context::world_state::PluginsInstructionsState;
-use crate::context::world_state::TaskEvidenceState;
 use crate::context::world_state::WorldState;
 use codex_extension_api::WorldStateContributionInput;
 use futures::StreamExt;
@@ -79,9 +78,6 @@ impl Session {
         world_state.add_section(AppsInstructionsState::new(apps_available));
         world_state.add_section(PluginsInstructionsState::new(
             step_context.mcp.plugins_available(),
-        ));
-        world_state.add_section(TaskEvidenceState::new(
-            self.services.task_evidence.compaction_task_state().await,
         ));
         let environments = step_context.environments.to_selections();
         let ready_selected_capability_roots = step_context

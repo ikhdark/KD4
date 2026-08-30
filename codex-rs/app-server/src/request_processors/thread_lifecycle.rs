@@ -1,6 +1,4 @@
 use super::*;
-use crate::thread_state::TerminalEventDisposition;
-use crate::thread_state::acknowledge_terminal_notification;
 use crate::thread_status::ThreadStatusSubscription;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
@@ -612,7 +610,8 @@ pub(super) async fn ensure_listener_task_running(
             listener_task_context.thread_manager.as_ref(),
             &environments,
         )
-        .await;
+        .await
+        .map_err(|err| internal_error(format!("failed to register skills watcher: {err}")))?;
     let thread_settings_baseline =
         thread_settings_from_config_snapshot(&conversation.config_snapshot().await);
     let (mut listener_command_rx, listener_generation) = {
@@ -684,116 +683,10 @@ pub(super) async fn ensure_listener_task_running(
                         }
                     };
 
-                    let subscribed_connection_ids = thread_state_manager
-                        .subscribed_connection_ids(conversation_id)
-                        .await;
-                    let durable_terminal_fingerprint = if matches!(
-                        &event.msg,
-                        EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
-                    ) {
-                        conversation
-                            .durably_acknowledged_terminal_fingerprint(&event.id)
-                            .await
-                    } else {
-                        None
-                    };
-                    let terminal_disposition = thread_state
+                    thread_state
                         .lock()
                         .await
-                        .classify_terminal_event_with_durable_acknowledgement(
-                            &event.id,
-                            &event.msg,
-                            &subscribed_connection_ids,
-                            durable_terminal_fingerprint.as_deref(),
-                        );
-                    match terminal_disposition {
-                        TerminalEventDisposition::RetryNotification(replay) => {
-                            let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
-                                outgoing_for_task.clone(),
-                                subscribed_connection_ids,
-                                conversation_id,
-                            );
-                            let dispatch = thread_outgoing
-                                .retry_terminal_notification_with_receipts(
-                                    replay.notification.clone(),
-                                    replay.origin_connection_id,
-                                    replay.target_connection_ids,
-                                )
-                                .await;
-                            let accepted = thread_state.lock().await.record_terminal_notification_attempt(
-                                &event.id,
-                                &replay.fingerprint,
-                                replay.notification,
-                                replay.origin_connection_id,
-                                &dispatch.targeted_connection_ids,
-                                &dispatch.accepted_connection_ids,
-                            );
-                            if accepted {
-                                acknowledge_terminal_notification(
-                                    conversation.as_ref(),
-                                    &thread_state,
-                                    &event.id,
-                                    &replay.fingerprint,
-                                )
-                                .await;
-                            }
-                            continue;
-                        }
-                        TerminalEventDisposition::ProjectNotification { fingerprint } => {
-                            crate::bespoke_event_handling::project_terminal_notification_only(
-                                event.clone(),
-                                conversation_id,
-                                conversation.clone(),
-                                ThreadScopedOutgoingMessageSender::new(
-                                    outgoing_for_task.clone(),
-                                    subscribed_connection_ids,
-                                    conversation_id,
-                                ),
-                                thread_state.clone(),
-                                &fingerprint,
-                            )
-                            .await;
-                            continue;
-                        }
-                        TerminalEventDisposition::Acknowledge { fingerprint } => {
-                            acknowledge_terminal_notification(
-                                conversation.as_ref(),
-                                &thread_state,
-                                &event.id,
-                                &fingerprint,
-                            )
-                            .await;
-                            continue;
-                        }
-                        TerminalEventDisposition::SuppressAcknowledged => {
-                            continue;
-                        }
-                        TerminalEventDisposition::RejectConflict => {
-                            tracing::error!(
-                                turn_id = %event.id,
-                                "rejected conflicting terminal event for an already terminal turn"
-                            );
-                            continue;
-                        }
-                        TerminalEventDisposition::RejectStale => {
-                            tracing::warn!(
-                                turn_id = %event.id,
-                                "suppressed stale terminal event while a newer turn is active"
-                            );
-                            continue;
-                        }
-                        TerminalEventDisposition::Apply { fingerprint } => {
-                            let mut state = thread_state.lock().await;
-                            state.track_current_turn_event(&event.id, &event.msg);
-                            state.mark_terminal_state_reduced(&event.id, &fingerprint);
-                        }
-                        TerminalEventDisposition::NotTerminal => {
-                            thread_state
-                                .lock()
-                                .await
-                                .track_current_turn_event(&event.id, &event.msg);
-                        }
-                    }
+                        .track_current_turn_event(&event.id, &event.msg);
                     let active_turn_id = thread_state
                         .lock()
                         .await
@@ -811,6 +704,9 @@ pub(super) async fn ensure_listener_task_running(
                     if matches!(&event.msg, EventMsg::RawResponseItem(_)) && !raw_events_enabled {
                         continue;
                     }
+                    let subscribed_connection_ids = thread_state_manager
+                        .subscribed_connection_ids(conversation_id)
+                        .await;
                     let experimental_api_connection_ids = thread_state_manager
                         .experimental_api_connection_ids(conversation_id)
                         .await;
@@ -1215,14 +1111,11 @@ pub(super) async fn handle_pending_thread_resume_request(
     pending: crate::thread_state::PendingThreadResumeRequest,
 ) {
     if let Some(history_items) = pending.history_items.as_deref() {
-        let replay_fingerprints = conversation
-            .terminal_events_requiring_app_server_acknowledgement()
-            .await;
-        if !thread_state.lock().await.seed_resume_history_for_listener(
-            history_items,
-            pending.listener_generation,
-            replay_fingerprints.as_ref(),
-        ) {
+        if !thread_state
+            .lock()
+            .await
+            .seed_resume_history_for_listener(history_items, pending.listener_generation)
+        {
             outgoing
                 .send_error(
                     pending.request_id,
@@ -1800,14 +1693,39 @@ mod tests {
         .expect("matching listener should already be running");
 
         assert_eq!(skills_watcher.thread_config_registration_count(), 0);
-        skills_watcher.register_runtime_extra_roots(&[]);
+        skills_watcher
+            .register_runtime_extra_roots(&[])
+            .expect("empty runtime roots should not need a watcher");
         assert!(
             !skills_watcher.is_initialized(),
             "construction and empty roots must not allocate a skills file watcher"
         );
-        skills_watcher.register_runtime_extra_roots(std::slice::from_ref(&config.cwd));
-        skills_watcher.register_runtime_extra_roots(std::slice::from_ref(&config.cwd));
+        skills_watcher
+            .register_runtime_extra_roots(std::slice::from_ref(&config.cwd))
+            .expect("runtime root should register");
+        skills_watcher
+            .register_runtime_extra_roots(std::slice::from_ref(&config.cwd))
+            .expect("runtime root should re-register");
         assert!(skills_watcher.is_initialized());
+        assert_eq!(skills_watcher.initialization_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_skill_root_registration_surfaces_watcher_initialization_failure() {
+        let fixture = LateShutdownFixture::new().await;
+        let config = fixture.thread.config().await;
+        let skills_watcher = SkillsWatcher::new_with_file_watcher_result(
+            fixture.thread_manager.skills_service(),
+            Arc::clone(&fixture.outgoing),
+            Err("injected watcher initialization failure".to_string()),
+        );
+
+        let error = skills_watcher
+            .register_runtime_extra_roots(std::slice::from_ref(&config.cwd))
+            .expect_err("a missing watcher must not acknowledge runtime skill roots");
+
+        assert!(error.contains("injected watcher initialization failure"));
+        assert!(!skills_watcher.is_initialized());
         assert_eq!(skills_watcher.initialization_count(), 1);
     }
 

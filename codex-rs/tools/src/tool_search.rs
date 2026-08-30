@@ -4,6 +4,7 @@ use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
 use crate::ToolSearchSourceInfo;
 use crate::ToolSpec;
+use crate::code_mode_name_for_tool_name;
 use crate::default_namespace_description;
 
 #[derive(Clone, PartialEq)]
@@ -84,6 +85,13 @@ fn default_tool_search_text(spec: &ToolSpec) -> String {
             push_search_part(&mut parts, namespace.description.clone());
             for tool in &namespace.tools {
                 let ResponsesApiNamespaceTool::Function(tool) = tool;
+                push_search_part(
+                    &mut parts,
+                    code_mode_name_for_tool_name(&crate::ToolName::namespaced(
+                        namespace.name.clone(),
+                        tool.name.clone(),
+                    )),
+                );
                 append_function_search_text(tool, &mut parts);
             }
         }
@@ -110,9 +118,40 @@ fn append_function_search_text(tool: &ResponsesApiTool, parts: &mut Vec<String>)
     append_schema_search_text(&tool.parameters, parts);
 }
 
+pub fn schema_search_text(schema: &JsonSchema) -> String {
+    let mut parts = Vec::new();
+    append_schema_search_text(schema, &mut parts);
+    parts.join(" ")
+}
+
 fn append_schema_search_text(schema: &JsonSchema, parts: &mut Vec<String>) {
+    if let Some(schema_ref) = &schema.schema_ref {
+        push_search_part(parts, schema_ref.clone());
+    }
     if let Some(description) = &schema.description {
         push_search_part(parts, description.clone());
+    }
+    if let Some(required) = &schema.required {
+        for name in required {
+            push_search_part(parts, name.clone());
+        }
+    }
+    if let Some(values) = &schema.enum_values {
+        for value in values {
+            append_json_search_text(value, parts);
+        }
+    }
+    for value in [
+        schema.minimum.as_ref(),
+        schema.maximum.as_ref(),
+        schema.exclusive_minimum.as_ref(),
+        schema.exclusive_maximum.as_ref(),
+        schema.multiple_of.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        push_search_part(parts, value.to_string());
     }
     if let Some(properties) = &schema.properties {
         for (name, schema) in properties {
@@ -123,9 +162,41 @@ fn append_schema_search_text(schema: &JsonSchema, parts: &mut Vec<String>) {
     if let Some(items) = &schema.items {
         append_schema_search_text(items, parts);
     }
-    if let Some(variants) = &schema.any_of {
+    if let Some(crate::AdditionalProperties::Schema(schema)) = &schema.additional_properties {
+        append_schema_search_text(schema, parts);
+    }
+    for variants in [&schema.any_of, &schema.one_of, &schema.all_of]
+        .into_iter()
+        .flatten()
+    {
         for variant in variants {
             append_schema_search_text(variant, parts);
+        }
+    }
+    for definitions in [&schema.defs, &schema.definitions].into_iter().flatten() {
+        for (name, schema) in definitions {
+            push_search_part(parts, name.clone());
+            append_schema_search_text(schema, parts);
+        }
+    }
+}
+
+fn append_json_search_text(value: &serde_json::Value, parts: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Null => push_search_part(parts, "null".to_string()),
+        serde_json::Value::Bool(value) => push_search_part(parts, value.to_string()),
+        serde_json::Value::Number(value) => push_search_part(parts, value.to_string()),
+        serde_json::Value::String(value) => push_search_part(parts, value.clone()),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                append_json_search_text(value, parts);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (name, value) in values {
+                push_search_part(parts, name.clone());
+                append_json_search_text(value, parts);
+            }
         }
     }
 }

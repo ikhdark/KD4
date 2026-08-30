@@ -69,6 +69,64 @@ fn direct_recovery_is_exempt_from_recursive_generic_projection() {
 }
 
 #[tokio::test]
+async fn exec_output_logging_and_projection_materialize_response_once() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let call_id = "exec-materialization";
+    let invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        call_id,
+        ToolName::plain("shell"),
+    );
+    let output = crate::tools::context::ExecCommandToolOutput {
+        event_call_id: call_id.to_string(),
+        chunk_id: "chunk-materialization".to_string(),
+        wall_time: Duration::from_millis(1),
+        raw_output: "large command output ".repeat(2_000).into_bytes(),
+        truncation_policy: codex_protocol::protocol::TruncationPolicy::Tokens(10_000),
+        max_output_tokens: Some(64),
+        process_id: None,
+        exit_code: Some(0),
+        process_exited: true,
+        original_token_count: None,
+        hook_command: None,
+        raw_output_artifact: None,
+        repair_notice: None,
+    };
+    crate::tools::context::ExecCommandToolOutput::reset_response_materialization_count();
+    let result = AnyToolResult {
+        call_id: call_id.to_string(),
+        payload: invocation.payload.clone(),
+        result: Box::new(output),
+        model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
+    };
+
+    let preview = result.result.log_preview();
+    assert!(preview.starts_with("large command output"));
+    assert_eq!(
+        crate::tools::context::ExecCommandToolOutput::response_materialization_count(),
+        0
+    );
+    assert!(
+        prepare_model_projection(
+            &invocation,
+            &result,
+            /*parsed_function_arguments*/ None,
+            /*source_dependencies_override*/ None,
+            /*force_inline_carrier*/ false,
+            /*track_for_admission*/ true,
+        )
+        .is_some()
+    );
+    assert_eq!(
+        crate::tools::context::ExecCommandToolOutput::response_materialization_count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let call_id = "registry-discovery";
@@ -2081,6 +2139,69 @@ fn post_tool_feedback_wrapper_preserves_original_control_metadata() {
     assert_eq!(metadata.essential_inline["omitted_result_count"], 5);
     assert!(metadata.essential_inline.get("payload").is_none());
     assert_eq!(metadata.spillable_text, vec!["hook feedback"]);
+}
+
+#[test]
+fn blocking_post_tool_hook_preserves_completed_result_and_discards_context() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let mut result = AnyToolResult {
+        call_id: "call-1".to_string(),
+        payload: payload.clone(),
+        result: Box::new(FunctionToolOutput::from_text(
+            "mutation completed".to_string(),
+            Some(true),
+        )),
+        model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
+    };
+
+    let contexts = apply_post_tool_use_outcome(
+        &mut result,
+        codex_hooks::PostToolUseOutcome {
+            hook_events: Vec::new(),
+            should_block: true,
+            additional_contexts: vec!["must not be injected".to_string()],
+            feedback_message: Some("reject completed mutation".to_string()),
+        },
+    );
+
+    assert!(contexts.is_empty());
+    assert!(result.result.success_for_logging());
+    assert_eq!(
+        result.result.to_response_item("call-1", &payload),
+        FunctionToolOutput::from_text("mutation completed".to_string(), Some(true))
+            .to_response_item("call-1", &payload)
+    );
+}
+
+#[test]
+fn unavailable_model_projection_is_not_reported_as_success() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let output = UnavailableModelProjectionOutput {
+        original: Box::new(FunctionToolOutput::from_text(
+            "unavailable canonical result".to_string(),
+            Some(true),
+        )),
+        model_visible: FunctionToolOutput::from_text(
+            "Tool execution completed, but its full result could not be preserved for model delivery."
+                .to_string(),
+            Some(false),
+        ),
+    };
+
+    assert!(!output.success_for_logging());
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+    let ResponseInputItem::FunctionCallOutput { output, .. } =
+        output.to_response_item("call-1", &payload)
+    else {
+        panic!("expected function-call output");
+    };
+    assert_eq!(output.success, Some(false));
 }
 
 #[test]

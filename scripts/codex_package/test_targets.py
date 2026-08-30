@@ -66,7 +66,9 @@ class TargetMetadataTest(unittest.TestCase):
             {"codex-win32-x64", "codex-win32-arm64"},
         )
         self.assertTrue(
-            all(target.executable_name == "codex.exe" for target in NPM_TARGETS.values())
+            all(
+                target.executable_name == "codex.exe" for target in NPM_TARGETS.values()
+            )
         )
 
     def test_entrypoint_name_uses_precomputed_variant_target_names(self) -> None:
@@ -103,7 +105,9 @@ class TargetMetadataTest(unittest.TestCase):
         self.assertEqual(normalize_machine("arm64"), "aarch64")
         self.assertEqual(normalize_machine("mips64"), "mips64")
 
-    def test_unsupported_architecture_is_sampled_once_for_consistent_error(self) -> None:
+    def test_unsupported_architecture_is_sampled_once_for_consistent_error(
+        self,
+    ) -> None:
         default_target.cache_clear()
         with (
             patch.object(targets.platform, "machine", return_value="mips64") as machine,
@@ -164,6 +168,7 @@ class ResolveInputPathTest(unittest.TestCase):
 
         with patch.object(targets.platform, "system", lambda: "Windows"):
             self.assertTrue(is_executable(fake_path))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -129,9 +129,14 @@ impl ApplyPatchRuntime {
             }
         };
         let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
-        let repo_paths = native_mutation_repo_paths(&repo_root, &req.file_paths)?;
+        let mutation_paths = native_mutation_repo_paths(
+            &repo_root,
+            &req.file_paths,
+            /*require_complete*/ binding.is_some(),
+        )?;
+        let repo_paths = mutation_paths.paths;
 
-        if repo_paths.is_empty() {
+        if repo_paths.is_empty() || !mutation_paths.complete {
             ctx.session
                 .services
                 .git_workspace
@@ -246,25 +251,43 @@ impl ApplyPatchRuntime {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct NativeMutationRepoPaths {
+    paths: Vec<String>,
+    complete: bool,
+}
+
 fn native_mutation_repo_paths(
     repo_root: &std::path::Path,
     file_paths: &[PathUri],
-) -> Result<Vec<String>, ToolError> {
-    file_paths
-        .iter()
-        .map(|path| {
-            let native_path = path.to_abs_path().map_err(|error| {
-                ToolError::Rejected(format!(
+    require_complete: bool,
+) -> Result<NativeMutationRepoPaths, ToolError> {
+    let mut paths = Vec::new();
+    let mut complete = true;
+    for path in file_paths {
+        let native_path = match path.to_abs_path() {
+            Ok(path) => path,
+            Err(error) if require_complete => {
+                return Err(ToolError::Rejected(format!(
                     "apply_patch: mutation evidence cannot represent `{path}` on this host: {error}"
-                ))
-            })?;
-            normalize_absolute_repo_path(repo_root, native_path.as_path()).map_err(|error| {
-                ToolError::Rejected(format!(
+                )));
+            }
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        match normalize_absolute_repo_path(repo_root, native_path.as_path()) {
+            Ok(path) => paths.push(path),
+            Err(error) if require_complete => {
+                return Err(ToolError::Rejected(format!(
                     "apply_patch: mutation path `{path}` is outside the evidence workspace: {error}"
-                ))
-            })
-        })
-        .collect()
+                )));
+            }
+            Err(_) => complete = false,
+        }
+    }
+    Ok(NativeMutationRepoPaths { paths, complete })
 }
 
 impl Sandboxable for ApplyPatchRuntime {

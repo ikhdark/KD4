@@ -57,6 +57,7 @@ use super::ToolCallBuildError;
 use super::ToolCallSource;
 use super::ToolRouter;
 use super::ToolRouterParams;
+use super::authorize_bound_typed_tool_call;
 use super::authorize_independent_review_tool_call;
 use super::extension_tool_executors;
 
@@ -893,17 +894,65 @@ fn independent_review_policy_allows_inspection_and_denies_mutation() {
                     arguments: "{}".to_string(),
                 },
             };
-            assert!(
+            assert!(matches!(
                 authorize_independent_review_tool_call(
                     &source,
                     class,
                     &call,
                     ExternalMutationIntent::MayMutate,
-                )
-                .is_err()
-            );
+                ),
+                Err(crate::FunctionCallError::DeniedToModel(_))
+            ));
         }
     }
+}
+
+#[tokio::test]
+async fn inactive_typed_assignment_is_a_blocked_tool_call() {
+    let temp = tempfile::tempdir().expect("temporary repository");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repository");
+    let (mut session, mut turn) = make_session_and_context().await;
+    let (_, store) = enable_typed_router_task(&mut session, &mut turn, &repo, "tracked.txt").await;
+    let assignment_id = session
+        .services
+        .agent_control
+        .task_coordinator()
+        .binding_for_source(&turn.session_source)
+        .expect("typed task binding")
+        .assignment_id;
+    store
+        .abandon_agent_task(
+            codex_agent_task_store::TaskActor::Root,
+            assignment_id,
+            "test terminal assignment".to_string(),
+        )
+        .await
+        .expect("abandon typed assignment");
+
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let error = authorize_bound_typed_tool_call(
+        &session,
+        step_context.as_ref(),
+        TypedToolClass::ReadSearch,
+        &ToolCall {
+            tool_name: ToolName::plain("read_tool_output"),
+            call_id: "inactive-read".to_string(),
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+        },
+        ExternalMutationIntent::ProvenReadOnly,
+    )
+    .await
+    .expect_err("inactive typed assignments must be blocked before dispatch");
+
+    assert!(matches!(
+        error,
+        crate::FunctionCallError::DeniedToModel(message)
+            if message.contains("no longer active")
+    ));
 }
 
 #[tokio::test]

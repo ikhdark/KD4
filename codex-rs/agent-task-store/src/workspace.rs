@@ -5,6 +5,7 @@ use sqlx::Row;
 use sqlx::Sqlite;
 use sqlx::SqlitePool;
 use sqlx::Transaction;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read;
@@ -472,7 +473,7 @@ fn collect_manifest_entries(root: &Path, paths: &[String]) -> StoreResult<Manife
             continue;
         }
         let absolute = absolute_repo_path(root, path);
-        if absolute.is_dir() {
+        if is_unfollowed_directory(&absolute)? {
             collect_directory_files(root, &absolute, &mut files)?;
         } else {
             files.insert(path.clone());
@@ -566,7 +567,7 @@ fn collect_repository_overlay_files_with(
             }
             let path = git_relative_path_identity(raw_path)?;
             let absolute = absolute_repo_path(root, &path);
-            if absolute.is_dir() {
+            if is_unfollowed_directory(&absolute)? {
                 collect_directory_files(root, &absolute, files)?;
             } else {
                 files.insert(path);
@@ -593,6 +594,37 @@ fn collect_repository_overlay_files_with(
         ignored_path_count: 0,
         excluded_path_count,
     })
+}
+
+fn is_unfollowed_directory(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && !metadata_is_reparse_point(&metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn directory_entry_is_unfollowed_directory(entry: &std::fs::DirEntry) -> std::io::Result<bool> {
+    let file_type = entry.file_type()?;
+    if !file_type.is_dir() || file_type.is_symlink() {
+        return Ok(false);
+    }
+    Ok(!metadata_is_reparse_point(&entry.metadata()?))
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
 }
 
 fn git_relative_path_identity(raw_path: &[u8]) -> StoreResult<String> {
@@ -632,7 +664,7 @@ fn collect_repository_files_fallback(
         children.sort_by_key(std::fs::DirEntry::file_name);
         for child in children {
             let path = child.path();
-            if child.file_type()?.is_dir() {
+            if directory_entry_is_unfollowed_directory(&child)? {
                 if child.file_name() == ".git" {
                     *excluded_path_count = excluded_path_count.saturating_add(1);
                     continue;
@@ -663,7 +695,7 @@ fn collect_directory_files(
         children.sort_by_key(std::fs::DirEntry::file_name);
         for child in children {
             let path = child.path();
-            if child.file_type()?.is_dir() {
+            if directory_entry_is_unfollowed_directory(&child)? {
                 directories.push(path);
             } else {
                 let relative = path.strip_prefix(root).map_err(|_| {
@@ -692,7 +724,7 @@ fn snapshot_file(root: &Path, path: String) -> StoreResult<WorkspaceManifestEntr
         }
         Err(error) => return Err(error.into()),
     };
-    if link_metadata.file_type().is_symlink() {
+    if link_metadata.file_type().is_symlink() || metadata_is_reparse_point(&link_metadata) {
         let target = std::fs::read_link(&absolute)?;
         let target_identity = relative_path_identity(&target);
         let target_state = match std::fs::metadata(&absolute) {
@@ -836,20 +868,35 @@ async fn reconcile_entries_tx(
     )
     .await?;
     let current = current_epoch_tx(transaction, &repository.workspace_id).await?;
+    let stored_rows = sqlx::query(
+        "SELECT path, content_hash, existed FROM workspace_paths WHERE workspace_id = ?",
+    )
+    .bind(&repository.workspace_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let stored_by_key = stored_rows
+        .into_iter()
+        .map(|row| {
+            let path = row.get::<String, _>("path");
+            (
+                path_comparison_key(&path),
+                (
+                    path,
+                    row.get::<Option<String>, _>("content_hash"),
+                    row.get::<i64, _>("existed") != 0,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut drift = Vec::new();
     for entry in entries.iter() {
-        let row = sqlx::query(
-            "SELECT content_hash, existed FROM workspace_paths
-             WHERE workspace_id = ? AND path = ?",
-        )
-        .bind(&repository.workspace_id)
-        .bind(&entry.path)
-        .fetch_optional(&mut **transaction)
-        .await?;
-        if let Some(row) = row {
-            let hash = row.get::<Option<String>, _>("content_hash");
-            let existed = row.get::<i64, _>("existed") != 0;
-            if hash != entry.content_hash || existed != entry.existed {
+        if let Some((stored_path, hash, existed)) =
+            stored_by_key.get(&path_comparison_key(&entry.path))
+        {
+            if stored_path != &entry.path
+                || hash != &entry.content_hash
+                || *existed != entry.existed
+            {
                 drift.push(entry.path.clone());
             }
         } else if repository_wide_baseline && entry.path != REPOSITORY_WIDE_PATH {
@@ -949,7 +996,28 @@ async fn update_workspace_entries_tx(
     entries: &[WorkspaceManifestEntry],
 ) -> StoreResult<()> {
     let now = Utc::now();
+    let mut stored_paths =
+        sqlx::query_scalar::<_, String>("SELECT path FROM workspace_paths WHERE workspace_id = ?")
+            .bind(workspace_id)
+            .fetch_all(&mut **transaction)
+            .await?;
     for entry in entries {
+        let comparison_key = path_comparison_key(&entry.path);
+        let conflicting_paths = stored_paths
+            .iter()
+            .filter(|path| {
+                path.as_str() != entry.path && path_comparison_key(path) == comparison_key
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in conflicting_paths {
+            sqlx::query("DELETE FROM workspace_paths WHERE workspace_id = ? AND path = ?")
+                .bind(workspace_id)
+                .bind(&path)
+                .execute(&mut **transaction)
+                .await?;
+            stored_paths.retain(|stored| stored != &path);
+        }
         sqlx::query(
             "INSERT INTO workspace_paths (
                 workspace_id, path, content_hash, existed, last_epoch, last_actor_id,
@@ -973,6 +1041,9 @@ async fn update_workspace_entries_tx(
         .bind(json(&now)?)
         .execute(&mut **transaction)
         .await?;
+        if !stored_paths.iter().any(|path| path == &entry.path) {
+            stored_paths.push(entry.path.clone());
+        }
     }
     Ok(())
 }

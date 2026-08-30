@@ -1,9 +1,8 @@
 You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary
 for another language model that will resume the task.
 
-Produce a self-contained recovery checkpoint. Use structured harness state such
-as `<kd4_task_state_v1>` as authoritative for durable work, evidence, failures,
-and freshness; preserve the conversation's exact goal and unresolved context.
+Produce a self-contained recovery checkpoint. Preserve the conversation's exact
+goal, implementation state, observed results, failures, and unresolved context.
 
 Do not turn assumptions into facts. Do not claim that an edit, check, or result
 occurred unless the conversation or tool state establishes it. Preserve

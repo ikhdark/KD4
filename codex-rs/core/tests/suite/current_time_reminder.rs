@@ -258,17 +258,13 @@ async fn current_time_reminders_can_follow_only_user_or_tool_outputs() -> Result
         .await?;
 
     let requests = responses.requests();
-    // Honor one decision-bearing end_turn=false resample. If the unchanged
-    // protocol signal repeats, host completion prevents a fourth request.
-    // The resample has no new user/tool output, so it receives no new reminder.
-    assert_eq!(requests.len(), 3);
+    // The tool result gets one shared follow-up. A subsequent end_turn=false
+    // with no new user input, tool output, or mutation is host-completable and
+    // must not trigger a redundant third request.
+    assert_eq!(requests.len(), 2);
     assert_eq!(current_time_reminders(&requests[0]), vec![FIRST_REMINDER]);
     assert_eq!(
         current_time_reminders(&requests[1]),
-        vec![FIRST_REMINDER, SECOND_REMINDER]
-    );
-    assert_eq!(
-        current_time_reminders(&requests[2]),
         vec![FIRST_REMINDER, SECOND_REMINDER]
     );
     Ok(())

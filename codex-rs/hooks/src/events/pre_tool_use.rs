@@ -217,7 +217,13 @@ fn parse_completed(
                         });
                     }
                     if let Some(invalid_reason) = parsed.invalid_reason {
-                        status = HookRunStatus::Failed;
+                        if parsed.should_block {
+                            status = HookRunStatus::Blocked;
+                            should_block = true;
+                            block_reason = Some(invalid_reason.clone());
+                        } else {
+                            status = HookRunStatus::Failed;
+                        }
                         entries.push(HookOutputEntry {
                             kind: HookOutputEntryKind::Error,
                             text: invalid_reason,
@@ -487,6 +493,35 @@ mod tests {
             vec![HookOutputEntry {
                 kind: HookOutputEntryKind::Feedback,
                 text: "do not run that".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn block_decision_without_reason_fails_closed() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(Some(0), r#"{"decision":"block"}"#, ""),
+            Some("turn-1".to_string()),
+        );
+
+        let reason =
+            "PreToolUse hook returned decision:block without a non-empty reason".to_string();
+        assert_eq!(
+            parsed.data,
+            PreToolUseHandlerData {
+                should_block: true,
+                block_reason: Some(reason.clone()),
+                additional_contexts_for_model: Vec::new(),
+                updated_input: None,
+            }
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Blocked);
+        assert_eq!(
+            parsed.completed.run.entries,
+            vec![HookOutputEntry {
+                kind: HookOutputEntryKind::Error,
+                text: reason,
             }]
         );
     }

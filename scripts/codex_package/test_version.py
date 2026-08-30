@@ -125,5 +125,6 @@ class VersionDiscoveryTest(unittest.TestCase):
 
         read_uncached.assert_called_once_with(expected)
 
+
 if __name__ == "__main__":
     unittest.main()

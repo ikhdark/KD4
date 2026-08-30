@@ -666,7 +666,6 @@ mod tests {
         ServerNotification::TurnCompleted(TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             turn: Turn {
                 id: turn_id.to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -676,7 +675,6 @@ mod tests {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: Some(1),
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,

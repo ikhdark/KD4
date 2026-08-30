@@ -689,6 +689,20 @@ fn create_audit_symlink(target: &std::path::Path, link: &std::path::Path) {
     std::os::windows::fs::symlink_file(target, link).expect("file symlink creates");
 }
 
+fn create_audit_directory_junction(target: &std::path::Path, link: &std::path::Path) {
+    let output = Command::new("cmd")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .expect("junction command starts");
+    assert!(
+        output.status.success(),
+        "junction creates: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn audit_workspace_symlink_target_identity_affects_manifest() {
     let fixture = Fixture::new().await;
@@ -731,6 +745,63 @@ async fn audit_workspace_broken_symlink_differs_from_absent_path() {
     assert!(broken.files[0].existed);
     assert!(!absent.files[0].existed);
     assert_ne!(broken.manifest_hash, absent.manifest_hash);
+}
+
+#[tokio::test]
+async fn audit_workspace_directory_junction_is_snapshotted_without_traversing_its_target() {
+    let fixture = Fixture::new().await;
+    let outside = TempDir::new().expect("outside tempdir");
+    std::fs::write(outside.path().join("outside.txt"), "outside").expect("outside file");
+    create_audit_directory_junction(outside.path(), &fixture.repo.path().join("linked"));
+
+    let revision = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["linked".to_string()])
+        .await
+        .expect("directory junction captures");
+
+    assert_eq!(revision.files.len(), 1);
+    assert_eq!(revision.files[0].path, "linked");
+    assert!(revision.files[0].existed);
+    assert!(
+        revision
+            .files
+            .iter()
+            .all(|entry| entry.path != "linked/outside.txt")
+    );
+}
+
+#[tokio::test]
+async fn audit_workspace_case_only_rename_replaces_the_stored_display_path() {
+    let fixture = Fixture::new().await;
+    let upper = fixture.repo.path().join("CaseOnly.txt");
+    let intermediate = fixture.repo.path().join("case-rename.tmp");
+    let lower = fixture.repo.path().join("caseonly.txt");
+    std::fs::write(&upper, "same bytes").expect("initial file");
+    let baseline = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["CaseOnly.txt".to_string()])
+        .await
+        .expect("baseline captures");
+
+    std::fs::rename(&upper, &intermediate).expect("first rename");
+    std::fs::rename(&intermediate, &lower).expect("case-only rename");
+    let renamed = fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["caseonly.txt".to_string()])
+        .await
+        .expect("renamed path captures");
+
+    assert!(renamed.epoch > baseline.epoch);
+    assert_eq!(renamed.files[0].path, "caseonly.txt");
+    let pool = coordination_pool(&fixture).await;
+    let stored_paths =
+        sqlx::query_scalar::<_, String>("SELECT path FROM workspace_paths WHERE workspace_id = ?")
+            .bind(&renamed.workspace_id)
+            .fetch_all(&pool)
+            .await
+            .expect("stored workspace paths read");
+    assert_eq!(stored_paths, vec!["caseonly.txt".to_string()]);
 }
 
 #[tokio::test]
@@ -1271,9 +1342,11 @@ async fn migration_removes_workspace_mutation_blocking_schema() {
                     'actor_supporting_reads',
                     'workspace_manifest_payloads',
                     'workspace_mutation_leases',
-                    'workspace_finalization_fences'
+                    'workspace_finalization_fences',
+                    'validation_evidence_revisions'
                 ))
             OR (type = 'trigger' AND name LIKE 'finalization_blocks_%')
+            OR (type = 'trigger' AND name LIKE 'validation_evidence_revision_%')
          ORDER BY type, name",
     )
     .fetch_all(&pool)

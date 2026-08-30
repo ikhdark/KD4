@@ -591,31 +591,10 @@ def _terminal_record(
 ) -> dict[str, Any]:
     payload_type = payload.get("type")
     abort_reason = str(payload.get("reason") or "").casefold()
-    completion = payload.get("completion")
-    completion_gate = None
-    completion_status = None
-    if isinstance(completion, dict):
-        completion_status = completion.get("status")
-        completion_reasons = completion.get("reasons")
-        if not isinstance(completion_reasons, list):
-            completion_reasons = []
-        completion_gate = {
-            "status": completion_status,
-            "reasons": [
-                reason
-                for reason in completion_reasons
-                if isinstance(reason, str)
-            ],
-            "evidencePath": completion.get(
-                "evidence_path", completion.get("evidencePath")
-            ),
-        }
     if payload_type == "turn_aborted":
         lifecycle = "abandoned" if abort_reason == "replaced" else "canceled"
     elif payload.get("error"):
         lifecycle = "failed"
-    elif completion_status in ("partial", "blocked"):
-        lifecycle = completion_status
     else:
         lifecycle = "completed"
     return {
@@ -625,7 +604,6 @@ def _terminal_record(
         "turn_id": payload.get("turn_id"),
         "status": payload.get("type"),
         "lifecycle": lifecycle,
-        "completion_gate": completion_gate,
         "cwd": cwd,
         "timing": payload.get("timing"),
     }
@@ -1766,8 +1744,6 @@ def _turn_report(
         signals.append("incomplete_tool_lifecycle")
     if record.get("unresolvedTools"):
         signals.append("terminal_with_unresolved_tool_call")
-    if record["lifecycle"] == "partial":
-        signals.append("partial_completion")
     if requests and tokens["providerUsageAttempts"] < len(requests):
         signals.append("partial_token_coverage")
     if int(nonprogress.get("logicalGenerations", 0)):
@@ -1780,7 +1756,6 @@ def _turn_report(
         "turnId": record["turn_id"],
         "status": record["status"],
         "lifecycle": record["lifecycle"],
-        "completionGate": record.get("completion_gate"),
         "timestamp": record["timestamp"],
         "file": record["file"],
         "line": record["line"],
@@ -1859,8 +1834,6 @@ def _behavior_report(
         "abortedTurns": sum(turn["status"] == "turn_aborted" for turn in per_turn),
         "canceledTurns": sum(turn["lifecycle"] == "canceled" for turn in per_turn),
         "failedTurns": sum(turn["lifecycle"] == "failed" for turn in per_turn),
-        "partialTurns": sum(turn["lifecycle"] == "partial" for turn in per_turn),
-        "blockedTurns": sum(turn["lifecycle"] == "blocked" for turn in per_turn),
         "abandonedTurns": sum(turn["lifecycle"] == "abandoned" for turn in per_turn),
         "terminalTurnsWithUnresolvedToolCalls": coverage.get(
             "terminalTurnsWithUnresolvedToolCalls", 0
@@ -2588,10 +2561,8 @@ def render_report(report: dict[str, Any]) -> str:
     lines.append(
         "behavior signals: "
         f"active-excluded={behavior['activeTurnsExcluded']} "
-        f"canceled/failed/partial/blocked/abandoned="
+        f"canceled/failed/abandoned="
         f"{behavior['canceledTurns']}/{behavior['failedTurns']}/"
-        f"{behavior['partialTurns']}/"
-        f"{behavior['blockedTurns']}/"
         f"{behavior['abandonedTurns']} "
         f"unresolved-tool/user-waiting/no-pending="
         f"{behavior['unresolvedToolCallTurns']}/{behavior['userWaitingTurns']}/"
@@ -2709,7 +2680,6 @@ def bounded_summary(report: dict[str, Any]) -> dict[str, Any]:
                 "turnId",
                 "status",
                 "lifecycle",
-                "completionGate",
                 "startedAt",
                 "completedAt",
                 "boundarySource",

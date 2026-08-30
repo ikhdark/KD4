@@ -6,18 +6,15 @@ use super::UnifiedExecContext;
 use super::UnifiedExecProcessManager;
 use super::async_watcher::omitted_output_marker;
 use super::async_watcher::resolve_aggregated_output;
-use super::async_watcher::spawn_exit_watcher;
 use super::async_watcher::start_streaming_output;
 use super::head_tail_buffer::HeadTailBuffer;
 use super::process::OutputHandles;
 use super::process::UnifiedExecProcess;
 use super::process_manager::PendingProcessRegistration;
-use super::process_manager::arm_validation_timeout;
 use crate::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
-use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
@@ -38,12 +35,11 @@ use codex_exec_server::ReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
 use codex_exec_server::WriteStatus;
-use codex_protocol::protocol::Event;
-use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecOutputStream;
-use codex_protocol::protocol::WarningEvent;
 use codex_sandboxing::SandboxType;
 use codex_tools::ToolExecutor;
+use codex_tools::ToolOutputOutcome;
+use codex_utils_pty::SpawnedProcess;
 use codex_utils_pty::spawn_pipe_process_no_stdin;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
@@ -169,14 +165,13 @@ async fn remote_process_with_termination_control(
     terminate_error: Option<String>,
     termination_control: Option<Arc<TerminationControl>>,
 ) -> Arc<UnifiedExecProcess> {
-    remote_process_with_options(write_status, terminate_error, termination_control, None).await
+    remote_process_with_options(write_status, terminate_error, termination_control).await
 }
 
 async fn remote_process_with_options(
     write_status: WriteStatus,
     terminate_error: Option<String>,
     termination_control: Option<Arc<TerminationControl>>,
-    validation_timeout_ms: Option<u64>,
 ) -> Arc<UnifiedExecProcess> {
     let (wake_tx, _wake_rx) = watch::channel(0);
     let started = StartedExecProcess {
@@ -195,7 +190,6 @@ async fn remote_process_with_options(
     UnifiedExecProcess::from_exec_server_started(
         started,
         None,
-        validation_timeout_ms,
         &PendingSpawnRegistration::default(),
     )
     .await
@@ -235,6 +229,16 @@ fn write_stdin_invocation(
     call_id: &str,
     process_id: u32,
 ) -> ToolInvocation {
+    write_stdin_invocation_with_chars(session, turn, call_id, process_id, "")
+}
+
+fn write_stdin_invocation_with_chars(
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    call_id: &str,
+    process_id: u32,
+    chars: &str,
+) -> ToolInvocation {
     ToolInvocation {
         session,
         step_context: StepContext::for_test(Arc::clone(&turn)),
@@ -246,12 +250,59 @@ fn write_stdin_invocation(
         payload: ToolPayload::Function {
             arguments: serde_json::json!({
                 "session_id": process_id,
-                "chars": "",
+                "chars": chars,
                 "yield_time_ms": 60_000,
             })
             .to_string(),
         },
     }
+}
+
+fn hold_artifact_lock(
+    artifact: Arc<Mutex<RawOutputArtifact>>,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let lock_thread = std::thread::spawn(move || {
+        let _artifact_guard = artifact.blocking_lock();
+        acquired_tx.send(()).expect("signal held artifact lock");
+        release_rx.recv().expect("wait to release artifact lock");
+    });
+    acquired_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("artifact lock thread should acquire the lock");
+    (release_tx, lock_thread)
+}
+
+#[tokio::test(start_paused = true)]
+async fn non_empty_write_stdin_returns_on_observable_output_without_a_reaction_sleep() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let manager = &session.services.unified_exec_manager;
+    let process = remote_process(WriteStatus::Accepted, None).await;
+    let process_id = 1_004;
+    store_process_for_test(manager, &session, &turn, process_id, Arc::clone(&process)).await;
+    process.publish_output_for_test(b"ready\n".to_vec()).await;
+
+    let invocation = write_stdin_invocation_with_chars(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "write-with-output",
+        process_id,
+        "hello\n",
+    );
+    let started_at = Instant::now();
+    let output = WriteStdinHandler
+        .handle(invocation.clone())
+        .await
+        .expect("write_stdin should succeed");
+
+    assert_eq!(Instant::now() - started_at, Duration::ZERO);
+    assert_eq!(
+        output.code_mode_result(&invocation.payload)["output"],
+        "ready\n"
+    );
 }
 
 async fn wait_for_process_clones(process: &Arc<UnifiedExecProcess>, minimum: usize) {
@@ -310,39 +361,131 @@ async fn fail_and_terminate_preserves_failure_message() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn validation_timeout_terminates_live_process() {
-    let process = remote_process(WriteStatus::Accepted, /*terminate_error*/ None).await;
+#[tokio::test]
+async fn tool_result_correctness_exited_process_with_open_output_is_not_running() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let manager = &session.services.unified_exec_manager;
+    let process = remote_process(WriteStatus::Accepted, None).await;
+    let process_id = 1_006;
+    store_process_for_test(manager, &session, &turn, process_id, Arc::clone(&process)).await;
+    process
+        .publish_output_for_test(b"remaining output\n".to_vec())
+        .await;
+    process.signal_exit_for_test(Some(7));
 
-    arm_validation_timeout(Arc::clone(&process), Some(25));
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_millis(25)).await;
-    tokio::task::yield_now().await;
-
-    assert!(process.timed_out());
-    assert!(process.has_exited());
-    assert_eq!(
-        process.failure_message(),
-        Some("validation timed out after 25 ms".to_string())
+    let invocation = write_stdin_invocation(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "poll-exited-open-output",
+        process_id,
     );
+    let output = WriteStdinHandler
+        .handle(invocation.clone())
+        .await
+        .expect("exited process output should remain readable");
+    let result = output.code_mode_result(&invocation.payload);
+
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+    assert_eq!(result["session_id"], process_id);
+    assert_eq!(result["exit_code"], 7);
+    assert_eq!(result["process_exited"], true);
 }
 
-#[tokio::test(start_paused = true)]
-async fn validation_timeout_starts_before_early_exit_grace_finishes() {
-    let process = remote_process_with_options(
-        WriteStatus::Accepted,
-        /*terminate_error*/ None,
-        /*termination_control*/ None,
-        Some(25),
-    )
-    .await;
+#[tokio::test]
+async fn tool_result_correctness_closed_local_exit_channel_is_a_failure() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let args = [
+        "/D".to_string(),
+        "/S".to_string(),
+        "/C".to_string(),
+        "ping -n 30 127.0.0.1 >nul".to_string(),
+    ];
+    let spawned =
+        spawn_pipe_process_no_stdin("cmd.exe", &args, temp.path(), &HashMap::new(), &None)
+            .await
+            .expect("local fixture process should spawn");
+    let SpawnedProcess {
+        session,
+        stdout_rx,
+        stderr_rx,
+        exit_rx: actual_exit_rx,
+    } = spawned;
+    drop(actual_exit_rx);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    drop(exit_tx);
 
-    assert!(process.timed_out());
-    assert!(process.has_exited());
-    assert_eq!(
-        process.failure_message(),
-        Some("validation timed out after 25 ms".to_string())
+    let error = UnifiedExecProcess::from_spawned(
+        SpawnedProcess {
+            session,
+            stdout_rx,
+            stderr_rx,
+            exit_rx,
+        },
+        SandboxType::None,
+        Box::new(NoopSpawnLifecycle),
+        None,
+        &PendingSpawnRegistration::default(),
+    )
+    .await
+    .expect_err("missing local exit status must fail process registration");
+
+    assert!(matches!(
+        error,
+        UnifiedExecError::ProcessFailed { message }
+            if message.contains("local process exit status channel closed")
+    ));
+}
+
+#[tokio::test]
+async fn local_process_constructor_observes_an_exit_during_the_grace_period() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let args = [
+        "/D".to_string(),
+        "/S".to_string(),
+        "/C".to_string(),
+        "ping -n 30 127.0.0.1 >nul".to_string(),
+    ];
+    let spawned =
+        spawn_pipe_process_no_stdin("cmd.exe", &args, temp.path(), &HashMap::new(), &None)
+            .await
+            .expect("local fixture process should spawn");
+    let SpawnedProcess {
+        session,
+        stdout_rx,
+        stderr_rx,
+        exit_rx: actual_exit_rx,
+    } = spawned;
+    drop(actual_exit_rx);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let _ = exit_tx.send(0);
+    });
+
+    let started_at = Instant::now();
+    let process = UnifiedExecProcess::from_spawned(
+        SpawnedProcess {
+            session,
+            stdout_rx,
+            stderr_rx,
+            exit_rx,
+        },
+        SandboxType::None,
+        Box::new(NoopSpawnLifecycle),
+        None,
+        &PendingSpawnRegistration::default(),
+    )
+    .await
+    .expect("an exit inside the grace period should finish registration");
+
+    assert!(
+        started_at.elapsed() >= Duration::from_millis(20),
+        "constructor returned before the controlled exit became observable"
     );
+    assert!(process.has_exited());
+    process.terminate();
 }
 
 #[tokio::test]
@@ -377,222 +520,6 @@ async fn unified_exec_termination_failure_retains_process_owner() {
             .get(&process_id)
             .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process)),
         "the manager must retain the process owner when termination is unconfirmed"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn validation_timeout_termination_failure_terminalizes_once_and_retains_process_owner() {
-    let manager = UnifiedExecProcessManager::default();
-    let (session, turn, rx_event) = make_session_and_context_with_rx().await;
-    let process = remote_process(
-        WriteStatus::Accepted,
-        Some("terminate unavailable".to_string()),
-    )
-    .await;
-    let process_id = 1_002;
-    let call_id = "exec-call-validation-timeout".to_string();
-    let command = vec!["cargo".to_string(), "test".to_string()];
-    let context = UnifiedExecContext::new(Arc::clone(&session), Arc::clone(&turn), call_id.clone());
-    let transcript = Arc::new(Mutex::new(HeadTailBuffer::default()));
-    start_streaming_output(&process, &context, Arc::clone(&transcript))
-        .expect("streaming output should start");
-
-    let command_execution_id = session.services.command_execution.allocate_execution_id();
-    let parent_tool_execution_id = codex_protocol::protocol::ToolExecutionId::default();
-    let attempt_key = crate::tools::command_execution::CommandAttemptKey::new(
-        "exec_command",
-        "test",
-        "test-cwd",
-        &command,
-    );
-    session
-        .services
-        .command_execution
-        .begin_attempt(&attempt_key, false)
-        .await
-        .expect("begin validation attempt");
-    let started_at = Instant::now();
-    let validation_launch = crate::validation_admission::ValidationLaunchPlan {
-        classification: crate::validation_admission::classify_validation(
-            &crate::tools::handlers::command_shape::CommandInvocation::Argv {
-                program: "cargo".to_string(),
-                args: vec!["test".to_string()],
-            },
-        ),
-        authorization_revision: 0,
-        explicitly_tagged: true,
-        structured_route: Some(codex_protocol::plan_tool::ValidationRoute {
-            leaves: vec![codex_protocol::plan_tool::ValidationRouteLeaf {
-                argv: command.clone(),
-                covered_paths: vec!["core/src/unified_exec/process.rs".to_string()],
-                timeout_ms: 25,
-            }],
-            ordering: Default::default(),
-        }),
-        bound_plan_step: None,
-        bound_work_unit: None,
-        validation_call_id: Some("validation-timeout-call".to_string()),
-        turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
-        focused_validation_token: None,
-    };
-    session
-        .services
-        .command_execution
-        .track_running_process_with_execution_id(
-            command_execution_id,
-            parent_tool_execution_id.clone(),
-            process_id,
-            attempt_key,
-            RawOutputArtifact::unavailable("validation timeout fixture"),
-            Some(validation_launch),
-            started_at,
-        )
-        .await
-        .expect("track validation process");
-
-    manager.process_store.lock().await.processes.insert(
-        process_id,
-        ProcessEntry {
-            process: Arc::clone(&process),
-            command_execution_id,
-            parent_tool_execution_id: parent_tool_execution_id.clone(),
-            call_id: call_id.clone(),
-            process_id,
-            cwd: turn.cwd().clone().into(),
-            initial_exec_command_active: Arc::new(AtomicBool::new(false)),
-            hook_command: command.join(" "),
-            tty: true,
-            network_approval: None,
-            session: Arc::downgrade(&session),
-            last_used: started_at,
-        },
-    );
-    spawn_exit_watcher(
-        Arc::clone(&process),
-        Arc::clone(&session),
-        Arc::clone(&turn),
-        call_id.clone(),
-        command.clone(),
-        turn.cwd().clone().into(),
-        "test".to_string(),
-        process_id,
-        command_execution_id,
-        parent_tool_execution_id,
-        transcript,
-        started_at,
-        /*tracker*/ None,
-        /*known_delta*/ None,
-        /*known_delta_executor_started_at*/ None,
-        /*tool_dispatch_timing*/ None,
-    );
-
-    arm_validation_timeout(Arc::clone(&process), Some(25));
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_millis(25)).await;
-
-    let completed_item = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let event = rx_event
-                .recv()
-                .await
-                .expect("event channel should remain open");
-            if let codex_protocol::protocol::EventMsg::ItemCompleted(event) = event.msg
-                && let codex_protocol::items::TurnItem::CommandExecution(item) = event.item
-                && item.id == call_id
-            {
-                break item;
-            }
-        }
-    })
-    .await
-    .expect("timed-out validation should publish a terminal command item");
-
-    assert_eq!(
-        completed_item.status,
-        codex_protocol::items::CommandExecutionStatus::Failed
-    );
-    assert_eq!(completed_item.process_id.as_deref(), Some("1002"));
-    assert!(
-        completed_item
-            .aggregated_output
-            .as_deref()
-            .is_some_and(|output| output.contains("validation timed out after 25 ms"))
-    );
-    assert!(process.timed_out());
-    assert!(!process.has_exited());
-    assert!(
-        manager
-            .process_store
-            .lock()
-            .await
-            .processes
-            .get(&process_id)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process)),
-        "an unconfirmed remote process must remain owned after validation terminalization"
-    );
-    assert!(
-        session
-            .services
-            .command_execution
-            .running_process(process_id)
-            .await
-            .is_some(),
-        "process bookkeeping must remain live until an actual exit"
-    );
-    assert!(
-        session
-            .services
-            .command_execution
-            .complete_timed_out_running_validation(process_id)
-            .await
-            .is_none(),
-        "the timeout path must consume the validation terminal exactly once"
-    );
-    assert_eq!(
-        turn.turn_timing_state
-            .complete_snapshot()
-            .protocol_timing()
-            .counters
-            .executed_validation_count,
-        1
-    );
-
-    process.signal_exit_for_test(Some(0));
-    process.finish_termination();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if session
-                .services
-                .command_execution
-                .process_execution_identity(process_id)
-                .await
-                .is_none()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("actual exit should release command bookkeeping");
-
-    let mut duplicate_terminal_items = 0;
-    while let Ok(event) = rx_event.try_recv() {
-        if let codex_protocol::protocol::EventMsg::ItemCompleted(event) = event.msg
-            && let codex_protocol::items::TurnItem::CommandExecution(item) = event.item
-            && item.id == call_id
-        {
-            duplicate_terminal_items += 1;
-        }
-    }
-    assert_eq!(duplicate_terminal_items, 0);
-    assert_eq!(
-        turn.turn_timing_state
-            .complete_snapshot()
-            .protocol_timing()
-            .counters
-            .executed_validation_count,
-        1
     );
 }
 
@@ -654,6 +581,37 @@ async fn remote_terminate_confirmed_has_a_total_deadline_and_remains_retryable()
     assert_eq!(termination_control.calls.load(Ordering::Acquire), 2);
 }
 
+#[tokio::test(start_paused = true)]
+async fn terminate_all_processes_uses_one_shared_confirmation_window() {
+    let manager = UnifiedExecProcessManager::default();
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let first_control = Arc::new(TerminationControl::new());
+    let second_control = Arc::new(TerminationControl::new());
+    let first = remote_process_with_termination_control(
+        WriteStatus::Accepted,
+        /*terminate_error*/ None,
+        Some(Arc::clone(&first_control)),
+    )
+    .await;
+    let second = remote_process_with_termination_control(
+        WriteStatus::Accepted,
+        /*terminate_error*/ None,
+        Some(Arc::clone(&second_control)),
+    )
+    .await;
+    store_process_for_test(&manager, &session, &turn, 1_101, first).await;
+    store_process_for_test(&manager, &session, &turn, 1_102, second).await;
+
+    let started_at = Instant::now();
+    manager.terminate_all_processes().await;
+
+    assert_eq!(started_at.elapsed(), Duration::from_secs(30));
+    assert_eq!(first_control.calls.load(Ordering::Acquire), 1);
+    assert_eq!(second_control.calls.load(Ordering::Acquire), 1);
+    assert_eq!(manager.process_store.lock().await.processes.len(), 2);
+}
+
 #[tokio::test]
 async fn dropping_confirmed_remote_process_does_not_terminate_twice() {
     let termination_control = Arc::new(TerminationControl::new());
@@ -704,7 +662,6 @@ async fn spawned_process_is_retained_when_constructor_future_is_cancelled() {
     let pending_spawns = PendingSpawnRegistration::default();
     let mut constructor = Box::pin(UnifiedExecProcess::from_exec_server_started(
         started,
-        None,
         None,
         &pending_spawns,
     ));
@@ -1085,56 +1042,6 @@ async fn closure_before_streaming_subscription_drains_lagged_split_utf8_output()
 }
 
 #[tokio::test]
-async fn saturated_live_event_queue_does_not_block_output_drain_or_completion_snapshot() {
-    let process = remote_process(WriteStatus::Accepted, /*terminate_error*/ None).await;
-    let expected = format!("{}é", "x".repeat(64));
-    for _ in 0..64 {
-        process.publish_output_for_test(b"x".to_vec()).await;
-    }
-    process.publish_output_for_test(vec![0xc3]).await;
-    process.publish_output_for_test(vec![0xa9]).await;
-    process.terminate();
-
-    let (session, turn, _rx_event) = make_session_and_context_with_rx().await;
-    let mut queued_events = 0;
-    loop {
-        let accepted = session.try_send_live_event_accepted(Event {
-            id: turn.sub_id.clone(),
-            msg: EventMsg::Warning(WarningEvent {
-                message: format!("fill live event queue {queued_events}"),
-            }),
-        });
-        if !accepted {
-            break;
-        }
-        queued_events += 1;
-    }
-    assert!(
-        queued_events > 0,
-        "test must saturate a bounded event queue"
-    );
-
-    let context = UnifiedExecContext::new(
-        Arc::clone(&session),
-        Arc::clone(&turn),
-        "saturated-live-event-queue".to_string(),
-    );
-    let transcript = Arc::new(Mutex::new(HeadTailBuffer::default()));
-    let output_drained = process.output_drained_token();
-    start_streaming_output(&process, &context, transcript).expect("start output streaming");
-
-    tokio::time::timeout(Duration::from_secs(2), output_drained.cancelled())
-        .await
-        .expect("a full live event queue must not block output drain");
-    let snapshot = process.snapshot_completion_output().await;
-    assert_eq!(
-        String::from_utf8(snapshot.aggregated_output).expect("completion output is UTF-8"),
-        expected
-    );
-    assert!(snapshot.aggregated_output_is_exact);
-}
-
-#[tokio::test]
 async fn closure_after_streaming_subscription_wakes_all_drain_waiters() {
     let process = remote_process(WriteStatus::Accepted, /*terminate_error*/ None).await;
     let transcript = Arc::new(Mutex::new(HeadTailBuffer::default()));
@@ -1169,6 +1076,74 @@ async fn closure_after_streaming_subscription_wakes_all_drain_waiters() {
     tokio::time::timeout(Duration::from_millis(150), output_drained.cancelled())
         .await
         .expect("output drain should remain observable to future waiters");
+}
+
+#[tokio::test]
+async fn local_output_is_published_while_artifact_state_is_busy() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let artifact = Arc::new(Mutex::new(
+        create_raw_output_artifact(temp.path(), "nonblocking-artifact", b"").await,
+    ));
+    let (artifact_release, artifact_lock_thread) = hold_artifact_lock(Arc::clone(&artifact));
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_handles = OutputHandles {
+        output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        completion_output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        stdout_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        stderr_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        output_notify: Arc::new(Notify::new()),
+        output_closed: Arc::clone(&output_closed),
+        output_closed_notify: Arc::new(Notify::new()),
+        cancellation_token: CancellationToken::new(),
+    };
+    let (output_tx, mut output_rx) = tokio::sync::broadcast::channel(8);
+    let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel(1);
+    let (stderr_tx, stderr_rx) = tokio::sync::mpsc::channel(1);
+
+    let output_task = UnifiedExecProcess::spawn_local_output_task(
+        stdout_rx,
+        stderr_rx,
+        output_handles,
+        output_tx,
+        Some(Arc::clone(&artifact)),
+    );
+    stdout_tx
+        .send(b"live-output".to_vec())
+        .await
+        .expect("stdout remains open");
+
+    let output = tokio::time::timeout(Duration::from_secs(1), output_rx.recv())
+        .await
+        .expect("artifact persistence must not block live output")
+        .expect("stdout broadcast");
+    assert_eq!(output.stream, ExecOutputStream::Stdout);
+    assert_eq!(output.bytes, b"live-output");
+
+    artifact_release
+        .send(())
+        .expect("release held artifact lock");
+    artifact_lock_thread
+        .join()
+        .expect("artifact lock thread should finish");
+    drop(stdout_tx);
+    drop(stderr_tx);
+    tokio::time::timeout(Duration::from_secs(2), output_task)
+        .await
+        .expect("local output task should finish")
+        .expect("local output task should not panic");
+    assert!(output_closed.load(Ordering::Acquire));
+
+    let path = match &*artifact.lock().await {
+        RawOutputArtifact::Stored { path, .. } => path.clone(),
+        RawOutputArtifact::Pending { .. } => panic!("artifact remained pending"),
+        RawOutputArtifact::Failed { message, .. } => panic!("artifact failed: {message}"),
+    };
+    assert_eq!(
+        tokio::fs::read(path)
+            .await
+            .expect("read finalized artifact"),
+        b"live-output"
+    );
 }
 
 #[tokio::test]
@@ -1242,6 +1217,69 @@ async fn local_output_artifact_is_flushed_and_unlocked_before_output_closed() {
     output_task.await.expect("local output task should finish");
 }
 
+#[tokio::test(start_paused = true)]
+async fn local_output_waits_for_terminal_artifact_state_after_finalization_stalls() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let artifact = Arc::new(Mutex::new(
+        create_raw_output_artifact(temp.path(), "stalled-finalization", b"").await,
+    ));
+    let (artifact_release, artifact_lock_thread) = hold_artifact_lock(Arc::clone(&artifact));
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let output_handles = OutputHandles {
+        output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        completion_output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        stdout_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        stderr_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+        output_notify: Arc::new(Notify::new()),
+        output_closed: Arc::clone(&output_closed),
+        output_closed_notify: Arc::clone(&output_closed_notify),
+        cancellation_token: CancellationToken::new(),
+    };
+    let (output_tx, _output_rx) = tokio::sync::broadcast::channel(8);
+    let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel(1);
+    let (stderr_tx, stderr_rx) = tokio::sync::mpsc::channel(1);
+    let closed = output_closed_notify.notified();
+    tokio::pin!(closed);
+    closed.as_mut().enable();
+
+    let output_task = UnifiedExecProcess::spawn_local_output_task(
+        stdout_rx,
+        stderr_rx,
+        output_handles,
+        output_tx,
+        Some(Arc::clone(&artifact)),
+    );
+    drop(stdout_tx);
+    drop(stderr_tx);
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut closed)
+            .await
+            .is_err(),
+        "output closure must not publish while the artifact remains pending"
+    );
+    assert!(!output_closed.load(Ordering::Acquire));
+
+    artifact_release
+        .send(())
+        .expect("release held artifact lock");
+    artifact_lock_thread
+        .join()
+        .expect("artifact lock thread should finish");
+    tokio::time::timeout(Duration::from_secs(1), &mut closed)
+        .await
+        .expect("output should close after the artifact becomes terminal");
+    assert!(output_closed.load(Ordering::Acquire));
+    output_task.await.expect("local output task should finish");
+    assert!(matches!(
+        &*artifact.lock().await,
+        RawOutputArtifact::Failed { message, .. }
+            if message == "raw output artifact finalization timed out"
+    ));
+}
+
 #[tokio::test]
 async fn terminating_local_process_finalizes_pending_raw_output_artifact() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1265,7 +1303,6 @@ async fn terminating_local_process_finalizes_pending_raw_output_artifact() {
             temp.path(),
             "termination-finalization",
         )),
-        None,
         &PendingSpawnRegistration::default(),
     )
     .await
@@ -1309,7 +1346,6 @@ async fn local_process_exited_before_registration_closes_output_before_denial_ch
             spawned,
             SandboxType::None,
             Box::new(NoopSpawnLifecycle),
-            None,
             None,
             &PendingSpawnRegistration::default(),
         ),

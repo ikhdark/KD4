@@ -27,8 +27,7 @@ export type TurnTiming = { schemaVersion: number, profileValid: boolean, classif
  */
 machineDurationNs: bigint, machineDurationMs: bigint, exclusive: TurnTimingExclusive, unions: TurnTimingUnions, local: TurnTimingLocal, milestones: TurnTimingMilestones, counters: TurnTimingCounters,
 /**
- * Additive terminalization phase timings. Older records deserialize to zeroes; the
- * terminalization receipt remains authoritative for phases that occur after live dispatch.
+ * Additive terminalization phase timings captured as part of the terminal timing profile.
  */
 terminalization: TurnTimingTerminalization,
 /**

@@ -1,26 +1,18 @@
-use codex_agent_task_store::ValidationCallStatus;
-use codex_agent_task_store::ValidationEvidence;
 use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
-use codex_protocol::validation::ValidationResult;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::future::Future;
-use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::FunctionCallError;
 use crate::agent::task_capabilities::validate_independent_review_shell;
-use crate::agent::task_coordinator::AgentTaskCoordinator;
-use crate::agent::task_coordinator::FocusedValidationToken;
 use crate::exec::ExecParams;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::session::session::Session;
@@ -53,10 +45,8 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 
 use crate::tools::sandboxing::same_exec_authorization_envelope;
-use crate::validation_admission::ValidationLaunchPlan;
 use crate::validation_admission::ValidationSkippedToolOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
-use codex_protocol::plan_tool::ValidationRouteLeaf;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 
@@ -72,11 +62,6 @@ mod shell_command;
 
 pub use shell_command::ShellCommandHandler;
 pub(crate) use shell_command::ShellCommandHandlerOptions;
-
-const MAX_VALIDATION_TIMEOUT_MS: u64 =
-    codex_protocol::plan_tool::MAX_STRUCTURED_VALIDATION_TIMEOUT_MS;
-const FOCUSED_VALIDATION_HEARTBEAT_INTERVAL: Duration =
-    Duration::from_secs(codex_agent_task_store::MAX_VALIDATION_LEASE_SECONDS as u64 / 4);
 
 #[derive(Debug, Deserialize)]
 struct ShellCommandHookArgs {
@@ -187,29 +172,6 @@ pub(super) enum ValidationExecutionOutcome {
     NotExecuted,
 }
 
-fn focused_validation_status(
-    result: &Result<RunExecLikeResult, FunctionCallError>,
-    cancellation_requested: bool,
-    has_structured_validation_result: bool,
-) -> ValidationCallStatus {
-    if cancellation_requested {
-        return ValidationCallStatus::Cancelled;
-    }
-    match result {
-        Ok(result) => match result.validation_execution_outcome() {
-            ValidationExecutionOutcome::ExecutedSuccess => ValidationCallStatus::Succeeded,
-            ValidationExecutionOutcome::ExecutedFailure => ValidationCallStatus::Failed,
-            ValidationExecutionOutcome::NotExecuted => ValidationCallStatus::NotExecuted,
-        },
-        Err(FunctionCallError::DeniedToModel(_)) => ValidationCallStatus::Cancelled,
-        Err(FunctionCallError::RespondToModel(message)) if message.contains("rejected by user") => {
-            ValidationCallStatus::Cancelled
-        }
-        Err(_) if has_structured_validation_result => ValidationCallStatus::Failed,
-        Err(_) => ValidationCallStatus::NotExecuted,
-    }
-}
-
 impl ValidationExecutionOutcome {
     pub(super) fn success(self) -> Option<bool> {
         match self {
@@ -262,54 +224,6 @@ pub(super) fn validation_structured_output(value: serde_json::Value) -> Function
     }
     output.post_tool_use_response = Some(value);
     output
-}
-
-pub(super) struct ValidationLaunchPreparationArgs<'a> {
-    pub(super) session: &'a Session,
-    pub(super) validation_launch: &'a mut Option<ValidationLaunchPlan>,
-    pub(super) direct_validation_route: Option<&'a DirectValidationRoute>,
-    pub(super) call_id: &'a str,
-}
-
-const UNATTRIBUTED_VALIDATION_ADVISORY: &str = "Validation metadata was omitted; this invocation is treated as an ordinary command and cannot be recorded as direct validation proof.";
-
-pub(super) fn downgrade_unattributed_validation(
-    validation_launch: &mut Option<ValidationLaunchPlan>,
-    validation_metadata_present: bool,
-    repair_notice: &mut Option<String>,
-) {
-    if validation_launch.is_none() || validation_metadata_present {
-        return;
-    }
-
-    *validation_launch = None;
-    *repair_notice = Some(match repair_notice.take() {
-        Some(existing) => format!("{existing}\n\n{UNATTRIBUTED_VALIDATION_ADVISORY}"),
-        None => UNATTRIBUTED_VALIDATION_ADVISORY.to_string(),
-    });
-}
-
-pub(super) async fn prepare_validation_launch(
-    args: ValidationLaunchPreparationArgs<'_>,
-) -> Result<(), FunctionCallError> {
-    if let (Some(launch), Some(route)) = (
-        args.validation_launch.as_mut(),
-        args.direct_validation_route,
-    ) {
-        let leaf = route.leaf();
-        let (bound_plan_step, bound_work_unit) = args
-            .session
-            .services
-            .task_evidence
-            .direct_validation_bindings_for_leaf(leaf)
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
-        launch.bound_plan_step = bound_plan_step;
-        launch.bound_work_unit = bound_work_unit;
-        launch.structured_route = Some(route.route().clone());
-        launch.validation_call_id = Some(args.call_id.to_string());
-    }
-    Ok(())
 }
 
 pub(super) struct LegacyShellToolOutput {
@@ -424,12 +338,6 @@ impl ToolOutput for LegacyShellToolOutput {
     }
 }
 
-impl RunExecLikeResult {
-    pub(super) fn validation_execution_outcome(&self) -> ValidationExecutionOutcome {
-        self.validation_execution_outcome
-    }
-}
-
 pub(super) async fn run_exec_like(
     args: RunExecLikeArgs,
 ) -> Result<LegacyShellToolOutput, FunctionCallError> {
@@ -473,12 +381,6 @@ fn validation_diagnostic_range(
 pub(super) async fn run_exec_like_with_exit_code(
     args: RunExecLikeArgs,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
-    let coordinator = args
-        .session
-        .services
-        .agent_control
-        .task_coordinator()
-        .clone();
     let session_source = args.turn.session_source.clone();
     let inspection_command = is_known_safe_command(&args.safety_command);
     validate_independent_review_shell(
@@ -516,120 +418,9 @@ pub(super) async fn run_exec_like_with_exit_code(
     }
 
     let repository_root = resolve_repository_root(args.exec_params.cwd.as_path());
-    let call_id = args.call_id.clone();
-    let cancellation_token = args.cancellation_token.clone();
-    let retained_output_ref = format!("tool-call:{}:{call_id}", args.session.thread_id);
     let is_validation = args.validation_launch.is_some();
-    let focused_validation = if is_validation {
-        let command_summary = args.hook_command.clone();
-        match coordinator
-            .begin_focused_validation_for_source_with_evidence(
-                &session_source,
-                call_id.clone(),
-                command_summary,
-                ValidationEvidence {
-                    retained_output_ref: Some(retained_output_ref.clone()),
-                    ..ValidationEvidence::default()
-                },
-            )
-            .await
-        {
-            Ok(token) => token,
-            Err(error) => {
-                tracing::warn!(%error, %call_id, "focused validation start evidence could not be persisted");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let mut terminal_validation_result = None;
-    let operation = run_exec_like_with_exit_code_inner(
-        args,
-        is_validation,
-        inspection_command,
-        repository_root,
-        &mut terminal_validation_result,
-    );
-    let result = if let Some(token) = focused_validation.as_ref() {
-        run_with_focused_validation_heartbeat(&coordinator, token, &call_id, operation).await
-    } else {
-        operation.await
-    };
-
-    if let Some(token) = focused_validation {
-        let status = focused_validation_status(
-            &result,
-            cancellation_token.is_cancelled(),
-            terminal_validation_result.is_some(),
-        );
-        let output_summary = validation_output_summary(&result);
-        let structured_validation_result =
-            terminal_validation_result.and_then(|result| serde_json::to_value(result).ok());
-        if let Err(error) = coordinator
-            .finish_focused_validation_with_result(
-                token,
-                status,
-                Some(retained_output_ref),
-                output_summary,
-                structured_validation_result,
-            )
-            .await
-        {
-            tracing::warn!(%error, %call_id, "focused validation result evidence could not be persisted");
-        }
-    }
-
-    result
-}
-
-async fn run_with_focused_validation_heartbeat<F>(
-    coordinator: &AgentTaskCoordinator,
-    token: &FocusedValidationToken,
-    call_id: &str,
-    operation: F,
-) -> F::Output
-where
-    F: Future,
-{
-    run_with_periodic_heartbeat(operation, FOCUSED_VALIDATION_HEARTBEAT_INTERVAL, || async {
-        match coordinator.heartbeat_focused_validation(token).await {
-            Ok(true) => {}
-            Ok(false) => tracing::warn!(
-                %call_id,
-                "focused validation heartbeat was rejected"
-            ),
-            Err(error) => tracing::warn!(
-                %error,
-                %call_id,
-                "focused validation heartbeat could not be persisted"
-            ),
-        }
-    })
-    .await
-}
-
-async fn run_with_periodic_heartbeat<F, H, HFut>(
-    operation: F,
-    heartbeat_interval: Duration,
-    mut heartbeat: H,
-) -> F::Output
-where
-    F: Future,
-    H: FnMut() -> HFut,
-    HFut: Future<Output = ()>,
-{
-    tokio::pin!(operation);
-    let mut ticker = tokio::time::interval(heartbeat_interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-    loop {
-        tokio::select! {
-            result = &mut operation => return result,
-            _ = ticker.tick() => heartbeat().await,
-        }
-    }
+    run_exec_like_with_exit_code_inner(args, is_validation, inspection_command, repository_root)
+        .await
 }
 
 pub(in crate::tools::handlers) fn validation_environment_hash(
@@ -645,226 +436,6 @@ pub(in crate::tools::handlers) fn validation_environment_hash(
         digest.update([0xff]);
     }
     format!("{:x}", digest.finalize())
-}
-
-fn validation_output_summary(
-    result: &Result<RunExecLikeResult, FunctionCallError>,
-) -> Option<String> {
-    const MAX_SUMMARY_CHARS: usize = 4_096;
-    let text = match result {
-        Ok(result) => result
-            .output
-            .body
-            .iter()
-            .filter_map(|item| match item {
-                codex_protocol::models::FunctionCallOutputContentItem::InputText { text } => {
-                    Some(text.as_str())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Err(FunctionCallError::RespondToModel(message)) => message.clone(),
-        Err(_) => return None,
-    };
-    if text.is_empty() {
-        return None;
-    }
-    let mut chars = text.chars();
-    let summary = chars.by_ref().take(MAX_SUMMARY_CHARS).collect::<String>();
-    Some(if chars.next().is_some() {
-        format!("{summary}\n[validation output truncated]")
-    } else {
-        summary
-    })
-}
-
-/// Enforces the repository boundary shared by planned and directly tagged
-/// validation commands. Runner flags are left to the ordinary command preflight.
-#[cfg(test)]
-pub(crate) fn validate_structured_validation_leaf(
-    leaf: &ValidationRouteLeaf,
-    repo_root: &Path,
-) -> Result<String, String> {
-    let leaf = normalize_structured_validation_leaf(leaf.clone(), repo_root)?;
-    let program = &leaf.argv[0];
-    let args = &leaf.argv[1..];
-    let invocation = CommandInvocation::Argv {
-        program: program.clone(),
-        args: args.to_vec(),
-    };
-    Ok(invocation.display_command())
-}
-
-pub(crate) fn normalize_structured_validation_leaf(
-    mut leaf: ValidationRouteLeaf,
-    repo_root: &Path,
-) -> Result<ValidationRouteLeaf, String> {
-    if leaf.argv.is_empty() || leaf.argv.iter().any(|arg| arg.trim().is_empty()) {
-        return Err("validation argv must contain non-empty direct arguments".to_string());
-    }
-    leaf.covered_paths = normalize_covered_paths(&leaf.covered_paths, repo_root)?;
-    if leaf.timeout_ms == 0 || leaf.timeout_ms > MAX_VALIDATION_TIMEOUT_MS {
-        return Err(format!(
-            "validation timeout_ms must be between 1 and {MAX_VALIDATION_TIMEOUT_MS}"
-        ));
-    }
-    Ok(leaf)
-}
-
-pub(crate) fn normalize_structured_validation_route(
-    route: &mut codex_protocol::plan_tool::ValidationRoute,
-    repo_root: &Path,
-) -> Result<(), String> {
-    for leaf in &mut route.leaves {
-        *leaf = normalize_structured_validation_leaf(leaf.clone(), repo_root)?;
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-pub(crate) struct DirectValidationRoute {
-    leaf: ValidationRouteLeaf,
-    route: codex_protocol::plan_tool::ValidationRoute,
-}
-
-impl DirectValidationRoute {
-    pub(crate) fn leaf(&self) -> &ValidationRouteLeaf {
-        &self.leaf
-    }
-
-    pub(crate) fn route(&self) -> &codex_protocol::plan_tool::ValidationRoute {
-        &self.route
-    }
-}
-
-pub(crate) fn direct_validation_route(
-    context: &codex_protocol::validation::ValidationCommandContext,
-    invocation: &CommandInvocation,
-    repo_root: &Path,
-    timeout_ms: u64,
-) -> Result<DirectValidationRoute, String> {
-    let CommandInvocation::Argv { program, args } = invocation else {
-        return Err(
-            "validation commands must use direct argv mode and provide covered_paths".to_string(),
-        );
-    };
-    if timeout_ms == 0 || timeout_ms > MAX_VALIDATION_TIMEOUT_MS {
-        return Err(format!(
-            "validation timeout_ms must be between 1 and {MAX_VALIDATION_TIMEOUT_MS}"
-        ));
-    }
-    let leaf = normalize_structured_validation_leaf(
-        ValidationRouteLeaf {
-            argv: std::iter::once(program.clone())
-                .chain(args.iter().cloned())
-                .collect(),
-            covered_paths: context.covered_paths.clone(),
-            timeout_ms,
-        },
-        repo_root,
-    )?;
-    let route = codex_protocol::plan_tool::ValidationRoute {
-        leaves: vec![leaf.clone()],
-        ordering: codex_protocol::plan_tool::ValidationRouteOrdering::StopOnFailure,
-    };
-    Ok(DirectValidationRoute { leaf, route })
-}
-
-pub(crate) fn normalize_covered_paths(
-    covered_paths: &[String],
-    repo_root: &Path,
-) -> Result<Vec<String>, String> {
-    #[cfg(test)]
-    VALIDATION_PATH_NORMALIZATION_COUNT.with(|count| count.set(count.get() + 1));
-    if covered_paths.is_empty() {
-        return Err("validation must declare non-empty covered_paths".to_string());
-    }
-    #[cfg(test)]
-    VALIDATION_ROOT_CANONICALIZATION_COUNT.with(|count| count.set(count.get() + 1));
-    let canonical_root = std::fs::canonicalize(repo_root)
-        .map_err(|error| format!("repository root could not be canonicalized: {error}"))?;
-    let mut normalized = covered_paths
-        .iter()
-        .map(|path| normalize_repo_relative_path(path, "validation covered path", &canonical_root))
-        .collect::<Result<Vec<_>, _>>()?;
-    normalized.sort_by_key(|path| path.to_ascii_lowercase());
-    normalized.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-    Ok(normalized)
-}
-
-fn normalize_repo_relative_path(
-    value: &str,
-    label: &str,
-    repo_root: &Path,
-) -> Result<String, String> {
-    let value = value.trim();
-    if !safe_repo_relative_path(value) {
-        return Err(format!("{label} must stay within the repository: {value}"));
-    }
-
-    let canonical_root = repo_root;
-    let candidate = canonical_root.join(value);
-    let mut existing_ancestor = candidate.as_path();
-    let mut missing_suffix = Vec::new();
-    loop {
-        match std::fs::symlink_metadata(existing_ancestor) {
-            Ok(_) => {
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let component = existing_ancestor.file_name().ok_or_else(|| {
-                    format!("{label} has no inspectable repository ancestor: {value}")
-                })?;
-                missing_suffix.push(component.to_os_string());
-                existing_ancestor = existing_ancestor.parent().ok_or_else(|| {
-                    format!("{label} has no inspectable repository ancestor: {value}")
-                })?;
-            }
-            Err(error) => {
-                return Err(format!(
-                    "{label} could not be inspected safely ({value}): {error}"
-                ));
-            }
-        }
-    }
-    let canonical_candidate = std::fs::canonicalize(existing_ancestor)
-        .map_err(|error| format!("{label} could not be canonicalized safely ({value}): {error}"))?;
-    if !path_has_component_prefix(&canonical_candidate, canonical_root) {
-        return Err(format!("{label} resolves outside the repository: {value}"));
-    }
-
-    let root_component_count = canonical_root.components().count();
-    let mut relative_components = canonical_candidate
-        .components()
-        .skip(root_component_count)
-        .filter_map(|component| match component {
-            std::path::Component::Normal(component) => Some(component.to_os_string()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    relative_components.extend(missing_suffix.into_iter().rev());
-    if relative_components.is_empty() {
-        return Ok(".".to_string());
-    }
-    Ok(relative_components
-        .iter()
-        .map(|component| component.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/"))
-}
-
-fn path_has_component_prefix(path: &Path, prefix: &Path) -> bool {
-    let mut path_components = path.components();
-    prefix.components().all(|expected| {
-        let Some(actual) = path_components.next() else {
-            return false;
-        };
-        actual
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
-    })
 }
 
 async fn finish_validation_skip_after_begin(
@@ -940,96 +511,19 @@ fn record_retained_validation_skip(
     }
 }
 
-pub(crate) fn validation_repository_root(
-    effective_cwd: &Path,
-    repository_anchor: &Path,
-) -> Option<std::path::PathBuf> {
-    #[cfg(test)]
-    VALIDATION_REPOSITORY_DISCOVERY_COUNT.with(|count| count.set(count.get() + 1));
-    let canonical_anchor = std::fs::canonicalize(repository_anchor).ok()?;
-    let canonical_root = std::fs::canonicalize(codex_git_utils::get_git_repo_root(
-        canonical_anchor.as_path(),
-    )?)
-    .ok()?;
-    let canonical_cwd = std::fs::canonicalize(effective_cwd).ok()?;
-    path_has_component_prefix(&canonical_cwd, &canonical_root).then_some(canonical_root)
-}
-
-pub(crate) fn validation_repository_root_if_needed(
-    validation_requested: bool,
-    effective_cwd: &Path,
-    repository_anchor: &Path,
-) -> Option<std::path::PathBuf> {
-    validation_requested
-        .then(|| validation_repository_root(effective_cwd, repository_anchor))
-        .flatten()
-}
-
 pub(crate) fn workspace_operation_root_if_needed(
-    focused_validation: bool,
+    is_validation: bool,
     inspection_command: bool,
     repository_root: std::path::PathBuf,
 ) -> Option<std::path::PathBuf> {
-    (focused_validation || !inspection_command).then_some(repository_root)
-}
-
-#[cfg(test)]
-thread_local! {
-    static VALIDATION_PATH_NORMALIZATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static VALIDATION_ROOT_CANONICALIZATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static VALIDATION_REPOSITORY_DISCOVERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_validation_path_normalization_count() {
-    VALIDATION_PATH_NORMALIZATION_COUNT.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn validation_path_normalization_count() -> usize {
-    VALIDATION_PATH_NORMALIZATION_COUNT.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
-pub(crate) fn reset_validation_root_canonicalization_count() {
-    VALIDATION_ROOT_CANONICALIZATION_COUNT.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn validation_root_canonicalization_count() -> usize {
-    VALIDATION_ROOT_CANONICALIZATION_COUNT.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
-pub(crate) fn reset_validation_repository_discovery_count() {
-    VALIDATION_REPOSITORY_DISCOVERY_COUNT.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn validation_repository_discovery_count() -> usize {
-    VALIDATION_REPOSITORY_DISCOVERY_COUNT.with(std::cell::Cell::get)
-}
-
-fn safe_repo_relative_path(value: &str) -> bool {
-    if value.is_empty()
-        || value
-            .as_bytes()
-            .first()
-            .is_some_and(|byte| matches!(byte, b'/' | b'\\' | b'~'))
-        || value.as_bytes().get(1) == Some(&b':')
-        || Path::new(value).is_absolute()
-    {
-        return false;
-    }
-    !value.split(['/', '\\']).any(|component| component == "..")
+    (is_validation || !inspection_command).then_some(repository_root)
 }
 
 async fn run_exec_like_with_exit_code_inner(
     args: RunExecLikeArgs,
-    focused_validation: bool,
+    is_validation: bool,
     inspection_command: bool,
     repository_root: std::path::PathBuf,
-    terminal_validation_result: &mut Option<ValidationResult>,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
         tool_name,
@@ -1111,7 +605,7 @@ async fn run_exec_like_with_exit_code_inner(
         attempt_key.map(|key| key.with_permission_context(&effective_permission_context));
 
     let known_delta = if turn.config.features.enabled(Feature::KnownDeltaStore)
-        && !focused_validation
+        && !is_validation
         && !exec_params.command.is_empty()
         && known_delta_store::is_immutable_git_show_candidate(
             &exec_params.command[0],
@@ -1321,7 +815,7 @@ async fn run_exec_like_with_exit_code_inner(
     };
 
     let workspace_operation_root =
-        workspace_operation_root_if_needed(focused_validation, inspection_command, repository_root);
+        workspace_operation_root_if_needed(is_validation, inspection_command, repository_root);
     let req = ShellRequest {
         command: exec_params.command.clone(),
         command_for_approval: safety_command,
@@ -1347,7 +841,6 @@ async fn run_exec_like_with_exit_code_inner(
     };
     let mut orchestrator = ToolOrchestrator::new();
     let mut runtime = ShellRuntime::for_shell_command();
-    let validation_started_at = tokio::time::Instant::now();
     let tool_ctx = ToolCtx {
         session: session.clone(),
         turn: turn.clone(),
@@ -1460,36 +953,10 @@ async fn run_exec_like_with_exit_code_inner(
     } else {
         None
     };
-    let validation_attempt_output =
-        shell_validation_execution_output(&out, retained_validation_attempt.as_ref());
-    let completed_validation = if let Some(launch) = req.validation_launch.as_ref()
-        && shell_validation_was_executed(&out, validation_attempt_started)
-    {
-        let validation_exit_code = validation_attempt_output.map(|output| output.exit_code);
-        let timed_out = validation_attempt_output.is_some_and(|output| output.timed_out);
-        session
-            .services
-            .command_execution
-            .complete_inline_validation(
-                launch,
-                raw_output_artifact.clone(),
-                validation_started_at,
-                validation_exit_code,
-                timed_out,
-                None,
-            )
-            .await
-    } else {
-        None
-    };
-    *terminal_validation_result = completed_validation
-        .as_ref()
-        .map(|completed| completed.result.clone());
     let canonical_output = canonical_exec_output_bytes(&out);
     let output_bearing_result = shell_result_has_execution_output(&out);
     let tool_outcome = shell_tool_outcome(&out);
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
-        .with_completed_validation(completed_validation.as_ref());
+    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
     let finish_result = emitter
         .finish(event_ctx, out, /*applied_patch_delta*/ None)
         .await;
@@ -1533,6 +1000,7 @@ async fn run_exec_like_with_exit_code_inner(
         body: vec![
             codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },
         ],
+        canonical_body: None,
         success: Some(tool_outcome == codex_tools::ToolOutputOutcome::Success),
         outcome: Some(tool_outcome),
         post_tool_use_response,
@@ -1605,13 +1073,6 @@ fn retry_exit_code(out: &Result<ExecToolCallOutput, ToolError>) -> Option<i32> {
         Err(ToolError::Rejected(_)) => Some(-1),
         Err(ToolError::ValidationSkipped(_)) => None,
     }
-}
-
-fn shell_validation_was_executed(
-    out: &Result<ExecToolCallOutput, ToolError>,
-    retained_validation_attempt: bool,
-) -> bool {
-    retained_validation_attempt || shell_validation_execution_output(out, None).is_some()
 }
 
 fn shell_validation_execution_output<'a>(

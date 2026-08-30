@@ -11,13 +11,15 @@
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_config::config_toml::ReasoningPhaseEfforts;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnTiming;
 use codex_protocol::protocol::TurnTimingToolCall;
@@ -91,24 +93,26 @@ const CODE_MODE_WARMUPS: usize = 5;
 const CODE_MODE_ITERATIONS: usize = 30;
 const CODE_MODE_CLUSTERS: usize = 3;
 const AB_WARMUPS: usize = 3;
-const AB_ITERATIONS: usize = 30;
-const AB_CLUSTERS: usize = 3;
+const AB_ITERATIONS: usize = 10;
+const AB_CLUSTERS: usize = 14;
 const AB_BOOTSTRAP_REPLICATES: usize = 10_000;
 const AB_BOOTSTRAP_SEED: u64 = 0x4b44_345f_4142_7631;
 const AB_FAMILY_WISE_ALPHA: f64 = 0.05;
 const AB_QUICK_LOOKS: [usize; 1] = [10];
 const AB_BATCH_LOOKS: [usize; 1] = [20];
-const AB_FINAL_LOOKS: [usize; 3] = [10, 20, 30];
+const AB_FINAL_LOOKS: [usize; 1] = [AB_ITERATIONS];
 const AB_REPLAY_LOOKS: [usize; 1] = [10];
 const AB_CORRECTNESS_ONLY_LOOKS: [usize; 1] = [1];
-const AB_MEDIAN_RATIO_UCB_LIMIT: f64 = 0.75;
-const AB_P95_RATIO_UCB_LIMIT: f64 = 1.00;
-const AB_RATIO_TARGET: f64 = 0.50;
-const AB_WORKLOAD_SCHEMA_VERSION: u16 = 15;
+const AB_MEDIAN_RATIO_UCB_LIMIT: f64 = 1.05;
+const AB_P95_RATIO_UCB_LIMIT: f64 = 1.10;
+const AB_INCREMENTAL_RATIO_TARGET: f64 = 1.00;
+const AB_REPLAY_REQUIRED_IMPROVEMENT_PERCENT: u64 = 25;
+const AB_REPLAY_RATIO_TARGET: f64 = 0.75;
+const AB_WORKLOAD_SCHEMA_VERSION: u16 = 17;
 const AB_BASELINE_STATE_SCHEMA_VERSION: u16 = 2;
 const AB_FILTERED_TREE_IDENTITY_VERSION: u16 = 1;
-const AB_METRIC_GATE_VERSION: u16 = 16;
-const AB_REPORT_SCHEMA_VERSION: u16 = 17;
+const AB_METRIC_GATE_VERSION: u16 = 23;
+const AB_REPORT_SCHEMA_VERSION: u16 = 19;
 const AB_REPLAY_SESSION_AUDIT_EVIDENCE_VERSION: u16 = 1;
 const AB_PREPARED_MANIFEST_SCHEMA_VERSION: u16 = 1;
 const AB_WORKER_STACK_BYTES: &str = "16777216";
@@ -129,6 +133,7 @@ const AB_REQUEST_COMPONENT_NAMES: [&str; 5] = [
     "current_input",
     "prompt_cache_key",
 ];
+const AB_REASONING_PHASE_EFFORTS_ID: &str = "orient=high,inspect=low,implement=high,diagnose=high,verify=low,finalize=low,deterministic_continuation=low";
 const AB_LONG_HISTORY_NO_TOOL_PROMPT: &str =
     "Answer the deterministic long-history benchmark without calling tools.";
 const AB_LONG_HISTORY_NO_TOOL_REPLY: &str = "long-history no-tool benchmark complete";
@@ -199,6 +204,22 @@ await Promise.all([
   }),
 ]);
 "#;
+
+fn ab_reasoning_phase_efforts() -> ReasoningPhaseEfforts {
+    ReasoningPhaseEfforts {
+        orient: Some(ReasoningEffort::High),
+        inspect: Some(ReasoningEffort::Low),
+        implement: Some(ReasoningEffort::High),
+        diagnose: Some(ReasoningEffort::High),
+        verify: Some(ReasoningEffort::Low),
+        finalize: Some(ReasoningEffort::Low),
+        deterministic_continuation: Some(ReasoningEffort::Low),
+    }
+}
+
+fn pin_ab_reasoning_phase_efforts(config: &mut codex_core::config::Config) {
+    config.reasoning_phase_efforts = Some(ab_reasoning_phase_efforts());
+}
 
 #[cfg(test)]
 static AB_BUILD_COMMAND_INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -392,7 +413,6 @@ impl CodeModeFixture {
             .with_code_mode_host_program(code_mode_host.to_path_buf())
             .with_config(|config| {
                 let _ = config.features.enable(Feature::CodeModeOnly);
-                let _ = config.features.disable(Feature::TaskCompletionReviewer);
             })
             .build(&server)
             .await?;

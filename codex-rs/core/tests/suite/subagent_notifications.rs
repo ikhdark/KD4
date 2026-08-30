@@ -1332,7 +1332,7 @@ enum CompletionScenario {
 #[test_case(CompletionScenario::Completed ; "completed")]
 #[test_case(CompletionScenario::TerminalError ; "terminal_error")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn plaintext_multi_agent_v2_completion_without_receipt_sends_blocked_agent_message(
+async fn plaintext_multi_agent_v2_completion_without_receipt_sends_error_message(
     scenario: CompletionScenario,
 ) -> Result<()> {
     let server = start_mock_server().await;
@@ -1391,7 +1391,7 @@ async fn plaintext_multi_agent_v2_completion_without_receipt_sends_blocked_agent
         CompletionScenario::TerminalError => (format!("Errored(\"{error}\")"), error),
     };
     let payload = format!(
-        "typed agent /root/worker finished with status {status} without submitting a receipt\n\nCompletion gate (machine-readable):\n{{\"status\":\"blocked\",\"reasons\":[\"durable typed receipt status: needs_main\"]}}"
+        "durable typed receipt status: needs_main: typed agent /root/worker finished with status {status} without submitting a receipt"
     );
     let notification = format!(
         "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n{payload}"

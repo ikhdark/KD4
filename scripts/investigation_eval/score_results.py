@@ -6,8 +6,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -48,6 +51,10 @@ FROZEN_EXECUTION = {
     "sandbox": "read-only",
     "session_persistence": "ephemeral",
     "user_configuration": "ignored",
+}
+FROZEN_REPAIR_EXECUTION = {
+    **FROZEN_EXECUTION,
+    "sandbox": "workspace-write",
 }
 
 
@@ -125,6 +132,213 @@ def _derive_event_metrics(raw_events: list[Any], *, path: Path) -> dict[str, Any
     }
 
 
+def _candidate_patch_observation(patch_text: str) -> dict[str, Any]:
+    _require(bool(patch_text.strip()), "candidate_patch must not be empty")
+    old_paths: list[str] = []
+    new_paths: list[str] = []
+    added_lines: list[str] = []
+    added = 0
+    removed = 0
+    in_hunk = False
+    diff_sections = 0
+    section_old_path: str | None = None
+    section_new_path: str | None = None
+    section_hunks = 0
+
+    def finish_section() -> None:
+        if diff_sections == 0:
+            return
+        _require(
+            section_old_path is not None
+            and section_new_path is not None
+            and section_hunks > 0,
+            "candidate_patch must contain paired file headers and a hunk for every diff",
+        )
+        old_paths.append(section_old_path)
+        new_paths.append(section_new_path)
+
+    for line in patch_text.splitlines():
+        if line.startswith("diff --git "):
+            finish_section()
+            diff_sections += 1
+            section_old_path = None
+            section_new_path = None
+            section_hunks = 0
+            in_hunk = False
+        elif line == "GIT binary patch" or line.startswith("Binary files "):
+            raise ValidationError("candidate_patch must not contain binary diffs")
+        elif line.startswith("@@ "):
+            _require(
+                diff_sections > 0
+                and section_old_path is not None
+                and section_new_path is not None,
+                "candidate_patch hunk must follow paired file headers",
+            )
+            section_hunks += 1
+            in_hunk = True
+        elif not in_hunk and line.startswith("--- "):
+            _require(
+                diff_sections > 0
+                and section_old_path is None
+                and section_new_path is None,
+                "candidate_patch contains invalid old file headers",
+            )
+            section_old_path = line.removeprefix("--- ")
+        elif not in_hunk and line.startswith("+++ "):
+            _require(
+                section_old_path is not None and section_new_path is None,
+                "candidate_patch contains invalid new file headers",
+            )
+            section_new_path = line.removeprefix("+++ ")
+        elif in_hunk and line.startswith("+"):
+            added += 1
+            added_lines.append(line[1:])
+        elif in_hunk and line.startswith("-"):
+            removed += 1
+
+    finish_section()
+    _require(
+        diff_sections > 0 and len(old_paths) == diff_sections,
+        "candidate_patch must contain at least one complete text diff",
+    )
+    changed_paths: list[str] = []
+    for old_path, new_path in zip(old_paths, new_paths, strict=True):
+        _require(
+            old_path.startswith("a/") and new_path.startswith("b/"),
+            "candidate_patch must modify existing files",
+        )
+        old_relative = old_path.removeprefix("a/").replace("\\", "/")
+        new_relative = new_path.removeprefix("b/").replace("\\", "/")
+        _require(
+            old_relative == new_relative,
+            "candidate_patch must not add, delete, move, or rename files",
+        )
+        _require(
+            new_relative.startswith("investigation_cases/")
+            and ".." not in Path(new_relative).parts,
+            "candidate_patch path escapes investigation_cases/",
+        )
+        changed_paths.append(new_relative)
+    _require(
+        len(set(changed_paths)) == len(changed_paths),
+        "candidate_patch must contain at most one diff per file",
+    )
+    return {
+        "added_lines": added_lines,
+        "changed_lines": added + removed,
+        "changed_paths": changed_paths,
+    }
+
+
+def _evaluate_repair(
+    case: dict[str, Any],
+    candidate_patch: str,
+    event_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    contract = case["repair_contract"]
+    violations: list[str] = []
+    observation: dict[str, Any]
+    try:
+        observation = _candidate_patch_observation(candidate_patch)
+    except ValidationError as exc:
+        return {
+            "passed": False,
+            "violations": [f"invalid_candidate_patch:{exc}"],
+            "validation_exit_code": None,
+        }
+
+    changed_paths = observation["changed_paths"]
+    unexpected_paths = sorted(set(changed_paths) - set(contract["allowed_paths"]))
+    if unexpected_paths:
+        violations.append(f"out_of_scope_paths:{','.join(unexpected_paths)}")
+    if observation["changed_lines"] > contract["max_changed_lines"]:
+        violations.append(
+            "changed_line_limit:"
+            f"{observation['changed_lines']}>{contract['max_changed_lines']}"
+        )
+    added_text = "\n".join(observation["added_lines"]).casefold()
+    for fragment in contract["forbidden_added_text"]:
+        if fragment.casefold() in added_text:
+            violations.append(f"forbidden_added_text:{fragment}")
+    if event_metrics["tool_calls"] > contract["max_tool_calls"]:
+        violations.append(
+            f"tool_call_limit:{event_metrics['tool_calls']}>{contract['max_tool_calls']}"
+        )
+    if (
+        event_metrics["repeated_equivalent_actions"]
+        > contract["max_repeated_equivalent_actions"]
+    ):
+        violations.append(
+            "repeated_equivalent_action_limit:"
+            f"{event_metrics['repeated_equivalent_actions']}>"
+            f"{contract['max_repeated_equivalent_actions']}"
+        )
+
+    validation_exit_code: int | None = None
+    if not violations:
+        with tempfile.TemporaryDirectory(prefix="investigation-repair-") as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir()
+            isolated_env = os.environ.copy()
+            isolated_env["GIT_CONFIG_NOSYSTEM"] = "1"
+            isolated_env["GIT_CONFIG_GLOBAL"] = os.devnull
+            initialized = subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=repo,
+                env=isolated_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            _require(
+                initialized.returncode == 0,
+                f"{case['id']}: could not initialize repair validation repository",
+            )
+            fixture_patch = (REPO_ROOT / case["patch"]).resolve()
+            fixture = subprocess.run(
+                ["git", "apply", "--whitespace=error-all"],
+                cwd=repo,
+                env=isolated_env,
+                input=fixture_patch.read_text(encoding="utf-8").encode("utf-8"),
+                capture_output=True,
+                check=False,
+            )
+            _require(
+                fixture.returncode == 0,
+                f"{case['id']}: validated fixture patch no longer applies",
+            )
+            applied = subprocess.run(
+                ["git", "apply", "--whitespace=error-all"],
+                cwd=repo,
+                env=isolated_env,
+                input=candidate_patch.encode("utf-8"),
+                capture_output=True,
+                check=False,
+            )
+            if applied.returncode != 0:
+                violations.append("candidate_patch_does_not_apply")
+            else:
+                validation = subprocess.run(
+                    [sys.executable, contract["validation_script"]],
+                    cwd=repo,
+                    env=isolated_env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                validation_exit_code = validation.returncode
+                if validation_exit_code != 0:
+                    violations.append("validation_failed")
+
+    return {
+        "passed": not violations,
+        "violations": violations,
+        "validation_exit_code": validation_exit_code,
+        "changed_lines": observation["changed_lines"],
+        "changed_paths": changed_paths,
+    }
+
+
 def _is_rfc3339_timestamp(value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -154,6 +368,7 @@ def _load_result(
     except json.JSONDecodeError as exc:
         raise ValidationError(f"{path}: invalid JSON: {exc.msg}") from exc
     _require(isinstance(result, dict), f"{path}: result must be an object")
+    is_repair = "repair_contract" in case
     required = {
         "case_id",
         "case_fingerprint",
@@ -164,6 +379,8 @@ def _load_result(
         "reported_findings",
         "raw_events",
     }
+    if is_repair:
+        required.add("candidate_patch")
     _require(
         set(result) == required,
         f"{path}: result fields must be exactly {sorted(required)}",
@@ -217,8 +434,9 @@ def _load_result(
 
     execution = result["execution"]
     _require(isinstance(execution, dict), f"{path}: execution must be an object")
+    expected_execution = FROZEN_REPAIR_EXECUTION if is_repair else FROZEN_EXECUTION
     _require(
-        execution == FROZEN_EXECUTION,
+        execution == expected_execution,
         f"{path}: execution settings do not match the frozen baseline",
     )
 
@@ -257,6 +475,14 @@ def _load_result(
             ),
             f"{prefix}: every structured locator must appear in final_output",
         )
+    if is_repair:
+        _require(
+            isinstance(result["candidate_patch"], str),
+            f"{path}: candidate_patch must be a string",
+        )
+        result["_repair"] = _evaluate_repair(
+            case, result["candidate_patch"], derived_metrics
+        )
     result["_derived_metrics"] = derived_metrics
     return result
 
@@ -292,6 +518,8 @@ def score(
     deferred_or_uncertain = 0
     tool_calls = 0
     repeated_actions = 0
+    repair_cases = 0
+    repair_cases_passed = 0
     case_scores: list[dict[str, Any]] = []
 
     for case in cases:
@@ -338,17 +566,22 @@ def score(
         metrics = result["_derived_metrics"]
         tool_calls += metrics["tool_calls"]
         repeated_actions += metrics["repeated_equivalent_actions"]
+        repair = result.get("_repair")
+        if repair is not None:
+            repair_cases += 1
+            repair_cases_passed += int(repair["passed"])
 
-        case_scores.append(
-            {
-                "id": case["id"],
-                "expected": len(case["expected_findings"]),
-                "matched": case_matches,
-                "confirmed_reported": len(confirmed),
-                "false_positives": case_false_positives,
-                "forbidden_confirmed": case_forbidden,
-            }
-        )
+        case_score = {
+            "id": case["id"],
+            "expected": len(case["expected_findings"]),
+            "matched": case_matches,
+            "confirmed_reported": len(confirmed),
+            "false_positives": case_false_positives,
+            "forbidden_confirmed": case_forbidden,
+        }
+        if repair is not None:
+            case_score["repair"] = repair
+        case_scores.append(case_score)
 
     return {
         "cases": len(cases),
@@ -363,6 +596,9 @@ def score(
         "deferred_or_uncertain_findings": deferred_or_uncertain,
         "tool_calls": tool_calls,
         "repeated_equivalent_actions": repeated_actions,
+        "repair_cases": repair_cases,
+        "repair_cases_passed": repair_cases_passed,
+        "repair_contract_pass_rate": _ratio(repair_cases_passed, repair_cases),
         "case_scores": case_scores,
     }
 

@@ -1,7 +1,12 @@
+use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
+use codex_app_server_protocol::DESKTOP_CLIENT_NAME;
+use codex_app_server_protocol::DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH;
+use codex_app_server_protocol::DesktopRuntimeReceipt;
 use codex_app_server_protocol::ServerPackageLayout;
 use codex_app_server_protocol::ServerRuntimeInfo;
 use codex_app_server_protocol::ServerRuntimeWarning;
@@ -11,56 +16,54 @@ use codex_install_context::InstallMethod;
 use codex_utils_absolute_path as path_utils;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_build_info::BuildInfo;
-use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 
 const LOCAL_PUBLISH_DIR_ENV: &str = "CODEX_LOCAL_PUBLISH_DIR";
 const LOCAL_CLI_PATH_ENV: &str = "CODEX_CLI_PATH";
 const ACTION_PUBLISH_LOCAL_CODEX: &str = "publishLocalCodex";
 const ACTION_RESTART_CODEX_DESKTOP: &str = "restartCodexDesktop";
-pub(crate) const DESKTOP_CLIENT_NAME: &str = "Codex Desktop";
-pub(crate) const DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH: &str =
-    "runtime/desktop-app-server-runtime.json";
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DesktopRuntimeReceipt<'a> {
-    schema_version: u32,
-    pid: u32,
-    executable_path: &'a Path,
-    codex_home: &'a Path,
-    client_name: &'a str,
-    build_version: &'static str,
-    build_commit: &'static str,
-    build_dirty: &'static str,
-    build_profile: &'static str,
-    build_built: &'static str,
-}
-
 pub(crate) fn write_desktop_runtime_receipt(
     codex_home: &Path,
     client_name: &str,
 ) -> io::Result<Option<PathBuf>> {
-    if client_name != DESKTOP_CLIENT_NAME {
+    if !matches!(client_name, DESKTOP_CLIENT_NAME | "Codex Desktop") {
         return Ok(None);
     }
     let executable_path = std::env::current_exe()?;
+    let executable_sha256 = file_sha256(&executable_path)?;
     let build_info = BuildInfo::current();
     let receipt = DesktopRuntimeReceipt {
         schema_version: 1,
         pid: std::process::id(),
-        executable_path: &executable_path,
-        codex_home,
-        client_name: DESKTOP_CLIENT_NAME,
-        build_version: build_info.version,
-        build_commit: build_info.commit,
-        build_dirty: build_info.dirty,
-        build_profile: build_info.profile,
-        build_built: build_info.built,
+        executable_path,
+        executable_sha256,
+        codex_home: codex_home.to_path_buf(),
+        client_name: DESKTOP_CLIENT_NAME.to_string(),
+        build_version: build_info.version.to_string(),
+        build_commit: build_info.commit.to_string(),
+        build_dirty: build_info.dirty.to_string(),
+        build_profile: build_info.profile.to_string(),
+        build_built: build_info.built.to_string(),
     };
     let contents = serde_json::to_string_pretty(&receipt).map_err(io::Error::other)?;
     let receipt_path = codex_home.join(DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH);
     codex_file_system::write_atomically(&receipt_path, &contents)?;
     Ok(Some(receipt_path))
+}
+
+fn file_sha256(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 pub(crate) fn current() -> ServerRuntimeInfo {
@@ -124,13 +127,19 @@ fn expected_local_binary_path_for_target(
     local_publish_dir: Option<PathBuf>,
     default_home: Option<PathBuf>,
 ) -> Option<AbsolutePathBuf> {
-    expected_local_binary_path_from_inputs(local_cli_path, local_publish_dir, default_home)
+    expected_local_binary_path_from_inputs(
+        local_cli_path,
+        local_publish_dir,
+        default_home,
+        cfg!(windows),
+    )
 }
 
 fn expected_local_binary_path_from_inputs(
     local_cli_path: Option<PathBuf>,
     local_publish_dir: Option<PathBuf>,
     default_home: Option<PathBuf>,
+    is_windows: bool,
 ) -> Option<AbsolutePathBuf> {
     if let Some(path) =
         local_cli_path.and_then(|path| AbsolutePathBuf::from_absolute_path(path).ok())
@@ -140,9 +149,11 @@ fn expected_local_binary_path_from_inputs(
 
     let install_dir = match local_publish_dir {
         Some(path) => path,
-        None => default_home?.join("Desktop").join("LOCAL-KD"),
+        None if is_windows => default_home?.join("Desktop").join("LOCAL-KD").join("bin"),
+        None => return None,
     };
-    AbsolutePathBuf::from_absolute_path(install_dir.join("codex.exe")).ok()
+    let executable_name = if is_windows { "codex.exe" } else { "codex" };
+    AbsolutePathBuf::from_absolute_path(install_dir.join(executable_name)).ok()
 }
 
 fn package_layout_info(layout: &CodexPackageLayout) -> ServerPackageLayout {
@@ -156,11 +167,19 @@ fn package_layout_info(layout: &CodexPackageLayout) -> ServerPackageLayout {
 
 fn install_method_label(method: &InstallMethod) -> &'static str {
     match method {
-        InstallMethod::Standalone { .. } => "standalone-windows",
+        InstallMethod::Standalone { .. } => standalone_install_method_label(cfg!(windows)),
         InstallMethod::Npm => "npm",
         InstallMethod::Bun => "bun",
         InstallMethod::Pnpm => "pnpm",
         InstallMethod::Other => "other",
+    }
+}
+
+fn standalone_install_method_label(is_windows: bool) -> &'static str {
+    if is_windows {
+        "standalone-windows"
+    } else {
+        "standalone-unix"
     }
 }
 
@@ -239,6 +258,8 @@ mod tests {
         assert_eq!(install_method_label(&InstallMethod::Npm), "npm");
         assert_eq!(install_method_label(&InstallMethod::Bun), "bun");
         assert_eq!(install_method_label(&InstallMethod::Pnpm), "pnpm");
+        assert_eq!(standalone_install_method_label(true), "standalone-windows");
+        assert_eq!(standalone_install_method_label(false), "standalone-unix");
     }
 
     #[test]
@@ -345,6 +366,7 @@ mod tests {
                 Some(explicit_cli.clone()),
                 Some(publish_dir.clone()),
                 Some(home.clone()),
+                false,
             )
             .map(AbsolutePathBuf::into_path_buf),
             Some(explicit_cli)
@@ -354,14 +376,25 @@ mod tests {
                 None,
                 Some(publish_dir.clone()),
                 Some(home.clone()),
+                false,
             )
             .map(AbsolutePathBuf::into_path_buf),
-            Some(publish_dir.join("codex.exe"))
+            Some(publish_dir.join("codex"))
         );
         assert_eq!(
-            expected_local_binary_path_from_inputs(None, None, Some(home.clone()))
+            expected_local_binary_path_from_inputs(None, None, Some(home.clone()), false)
                 .map(AbsolutePathBuf::into_path_buf),
-            Some(home.join("Desktop").join("LOCAL-KD").join("codex.exe"))
+            None
+        );
+        assert_eq!(
+            expected_local_binary_path_from_inputs(None, None, Some(home.clone()), true)
+                .map(AbsolutePathBuf::into_path_buf),
+            Some(
+                home.join("Desktop")
+                    .join("LOCAL-KD")
+                    .join("bin")
+                    .join("codex.exe")
+            )
         );
     }
 
@@ -377,14 +410,26 @@ mod tests {
             Some(home.clone()),
         )
         .map(AbsolutePathBuf::into_path_buf);
-        assert_eq!(explicit_publish, Some(publish_dir.join("codex.exe")));
+        assert_eq!(
+            explicit_publish,
+            Some(publish_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" }))
+        );
 
         let default_install = expected_local_binary_path_for_target(None, None, Some(home.clone()))
             .map(AbsolutePathBuf::into_path_buf);
-        assert_eq!(
-            default_install,
-            Some(home.join("Desktop").join("LOCAL-KD").join("codex.exe"))
-        );
+        if cfg!(windows) {
+            assert_eq!(
+                default_install,
+                Some(
+                    home.join("Desktop")
+                        .join("LOCAL-KD")
+                        .join("bin")
+                        .join("codex.exe")
+                )
+            );
+        } else {
+            assert_eq!(default_install, None);
+        }
     }
 
     #[test]
@@ -403,5 +448,34 @@ mod tests {
         assert_eq!(info.bin_dir, layout.bin_dir);
         assert_eq!(info.resources_dir, layout.resources_dir);
         assert_eq!(info.path_dir, layout.path_dir);
+    }
+
+    #[test]
+    fn desktop_runtime_receipt_uses_the_protocol_client_name() {
+        let temp_dir = TempDir::new().expect("temp dir");
+
+        let receipt_path = write_desktop_runtime_receipt(temp_dir.path(), "Codex Desktop")
+            .expect("Desktop display name should be recognized")
+            .expect("desktop receipt path");
+        let receipt: DesktopRuntimeReceipt = serde_json::from_str(
+            &std::fs::read_to_string(&receipt_path).expect("read desktop receipt"),
+        )
+        .expect("parse desktop receipt");
+
+        assert_eq!(receipt.client_name, DESKTOP_CLIENT_NAME);
+        assert_eq!(
+            receipt.executable_sha256,
+            file_sha256(&receipt.executable_path).expect("hash receipt executable")
+        );
+        assert_eq!(
+            receipt_path,
+            temp_dir.path().join(DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH)
+        );
+
+        assert!(
+            write_desktop_runtime_receipt(temp_dir.path(), DESKTOP_CLIENT_NAME)
+                .expect("canonical protocol name should be recognized")
+                .is_some()
+        );
     }
 }

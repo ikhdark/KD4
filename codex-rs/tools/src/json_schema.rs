@@ -63,6 +63,10 @@ pub struct JsonSchema {
     pub multiple_of: Option<Number>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items: Option<Box<JsonSchema>>,
+    #[serde(rename = "minItems", skip_serializing_if = "Option::is_none")]
+    pub min_items: Option<u64>,
+    #[serde(rename = "maxItems", skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub properties: Option<BTreeMap<String, JsonSchema>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -248,7 +252,12 @@ fn compact_large_tool_schema(value: &mut JsonValue) {
 
 type LargeSchemaCompactionPass = fn(&mut JsonValue);
 
-const LARGE_SCHEMA_COMPACTION_PASSES: &[LargeSchemaCompactionPass] = &[strip_schema_descriptions];
+const MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES: usize = 512;
+const SCHEMA_DESCRIPTION_TRUNCATION_MARKER: &str = " [... truncated ...]";
+const LARGE_SCHEMA_COMPACTION_PASSES: &[LargeSchemaCompactionPass] = &[
+    strip_root_schema_description,
+    truncate_long_schema_descriptions,
+];
 
 fn compact_schema_fits_budget(value: &JsonValue) -> bool {
     compact_normalized_schema_len(value) <= MAX_COMPACT_TOOL_SCHEMA_BYTES
@@ -305,17 +314,30 @@ fn for_each_schema_child(
     }
 }
 
-fn strip_schema_descriptions(value: &mut JsonValue) {
+fn strip_root_schema_description(value: &mut JsonValue) {
+    if let JsonValue::Object(map) = value {
+        map.remove("description");
+    }
+}
+
+fn truncate_long_schema_descriptions(value: &mut JsonValue) {
     match value {
         JsonValue::Array(values) => {
             for value in values {
-                strip_schema_descriptions(value);
+                truncate_long_schema_descriptions(value);
             }
         }
         JsonValue::Object(map) => {
-            map.remove("description");
+            if let Some(JsonValue::String(description)) = map.get_mut("description")
+                && description.len() > MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES
+            {
+                let prefix_budget = MAX_COMPACT_SCHEMA_DESCRIPTION_BYTES
+                    .saturating_sub(SCHEMA_DESCRIPTION_TRUNCATION_MARKER.len());
+                description.truncate(description.floor_char_boundary(prefix_budget));
+                description.push_str(SCHEMA_DESCRIPTION_TRUNCATION_MARKER);
+            }
             for_each_schema_child_mut(map, DefinitionTraversal::Include, &mut |value| {
-                strip_schema_descriptions(value);
+                truncate_long_schema_descriptions(value);
             });
         }
         _ => {}

@@ -465,7 +465,7 @@ async fn load_config_resolves_experimental_request_user_input_enabled() -> std::
 }
 
 #[tokio::test]
-async fn load_config_defaults_phase_tracking_to_compatibility_efforts() -> std::io::Result<()> {
+async fn load_config_defaults_phase_tracking_to_global_reasoning_effort() -> std::io::Result<()> {
     let codex_home = tempdir()?;
     let config = Config::load_from_base_config_with_overrides(
         ConfigToml {
@@ -480,15 +480,7 @@ async fn load_config_defaults_phase_tracking_to_compatibility_efforts() -> std::
     assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(
         config.reasoning_phase_efforts,
-        Some(ReasoningPhaseEfforts {
-            orient: Some(ReasoningEffort::High),
-            inspect: Some(ReasoningEffort::Low),
-            implement: Some(ReasoningEffort::High),
-            diagnose: Some(ReasoningEffort::High),
-            verify: Some(ReasoningEffort::Low),
-            finalize: Some(ReasoningEffort::Low),
-            deterministic_continuation: Some(ReasoningEffort::Low),
-        })
+        Some(ReasoningPhaseEfforts::default())
     );
     Ok(())
 }
@@ -513,13 +505,9 @@ async fn load_config_preserves_explicit_reasoning_phase_effort_overrides() -> st
     assert_eq!(
         config.reasoning_phase_efforts,
         Some(ReasoningPhaseEfforts {
-            orient: Some(ReasoningEffort::High),
             inspect: Some(ReasoningEffort::Medium),
-            implement: Some(ReasoningEffort::High),
-            diagnose: Some(ReasoningEffort::High),
             verify: Some(ReasoningEffort::High),
-            finalize: Some(ReasoningEffort::Low),
-            deterministic_continuation: Some(ReasoningEffort::Low),
+            ..ReasoningPhaseEfforts::default()
         })
     );
     Ok(())
@@ -553,22 +541,6 @@ direct_only_tool_namespaces = ["mcp__history", "mcp__notes"]
         vec!["mcp__history".to_string(), "mcp__notes".to_string()]
     );
     assert!(config.features.enabled(Feature::CodeMode));
-    Ok(())
-}
-
-#[tokio::test]
-async fn load_config_preserves_explicit_kd4_workflow_override() -> std::io::Result<()> {
-    let codex_home = tempdir()?;
-    let config_toml: ConfigToml = toml::from_str("kd4_workflow_enabled = false")
-        .expect("TOML deserialization should succeed");
-    let config = Config::load_from_base_config_with_overrides(
-        config_toml,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
-    assert_eq!(config.kd4_workflow_enabled, Some(false));
     Ok(())
 }
 

@@ -39,10 +39,23 @@ $fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefin
 Invoke-Expression $fn.Extent.Text
 try { Remove-OldCodexBackups -BackupDir %s -Keep 0; exit 9 } catch { }
 if (-not (Test-Path -LiteralPath %s -PathType Leaf)) { exit 10 }
-""" % (ps_single_quote(SCRIPT), ps_single_quote(Path(temp_dir)), ps_single_quote(backup))
+""" % (
+                ps_single_quote(SCRIPT),
+                ps_single_quote(Path(temp_dir)),
+                ps_single_quote(backup),
+            )
             completed = subprocess.run(
-                [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-                text=True, capture_output=True, check=False,
+                [
+                    shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
             )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
@@ -103,7 +116,9 @@ if (-not (Test-Path -LiteralPath %s -PathType Leaf)) { exit 10 }
         self.assertIn("LastWriteTimeUtcTicks", publish_script)
         self.assertIn("$Before.Length -ne $after.Length", publish_script)
 
-    def test_cached_hash_reuses_verified_observation_without_nested_file_hash(self) -> None:
+    def test_cached_hash_reuses_verified_observation_without_nested_file_hash(
+        self,
+    ) -> None:
         shell = powershell()
         if shell is None:
             self.skipTest("PowerShell is not available")
@@ -135,7 +150,14 @@ $second = Get-CachedLocalPublishFileSha256 -Path {ps_single_quote(payload)}
 [pscustomobject]@{{ first = $first; second = $second }} | ConvertTo-Json -Compress
 """
             result = subprocess.run(
-                [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                [
+                    shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=RUN_TIMEOUT_SECONDS,
@@ -234,7 +256,14 @@ $snapshot = Get-LocalPublishBuildInputSnapshot -RepoRoot {ps_single_quote(repo)}
 }} | ConvertTo-Json -Compress
 """
             result = subprocess.run(
-                [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                [
+                    shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
                 cwd=SCRIPT.parent.parent,
                 capture_output=True,
                 text=True,
@@ -651,9 +680,7 @@ catch {{
             "$publishedCodeModeHost = $false", 1
         )[0]
 
-        self.assertIn(
-            "Publish committed but Desktop restart failed", noop_branch
-        )
+        self.assertIn("Publish committed but Desktop restart failed", noop_branch)
         self.assertLess(
             noop_branch.index("Publish committed but Desktop restart failed"),
             noop_branch.index("exit 0"),

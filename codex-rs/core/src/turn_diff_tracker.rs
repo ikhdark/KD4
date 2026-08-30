@@ -10,10 +10,6 @@ use std::time::Duration;
 
 use codex_utils_absolute_path::normalize_for_path_comparison;
 use sha1::digest::Output;
-#[cfg(test)]
-use sha2::Digest;
-#[cfg(test)]
-use sha2::Sha256;
 
 use codex_apply_patch::AppliedPatchChange;
 use codex_apply_patch::AppliedPatchDelta;
@@ -25,77 +21,6 @@ const REGULAR_FILE_MODE: &str = "100644";
 // Normal edits finish well within 100 ms; pathological inputs fall back to a coarse,
 // content-exact diff without stalling tool completion.
 const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
-#[cfg(test)]
-const POST_EDIT_BUNDLE_MAX_DIFF_BYTES: usize = 8 * 1024;
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CoherentImplementationBoundary {
-    pub(crate) candidate_identity: String,
-    pub(crate) batch_closed: bool,
-    pub(crate) implementation_obligations_satisfied: bool,
-    pub(crate) pending_mutation_obligations: bool,
-    pub(crate) typed_children_quiescent: bool,
-    pub(crate) default_children_quiescent: bool,
-}
-
-#[cfg(test)]
-impl CoherentImplementationBoundary {
-    fn trustworthy_quiescence(&self) -> bool {
-        self.batch_closed
-            && self.implementation_obligations_satisfied
-            && !self.pending_mutation_obligations
-            && self.typed_children_quiescent
-            && self.default_children_quiescent
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PostEditInspectionDependencies {
-    pub(crate) requirement_manifest_identity: String,
-    pub(crate) proof_route_identity: String,
-    pub(crate) validation_identity: String,
-    pub(crate) rendered_gate_identity: String,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PostEditInspectionOutcome {
-    AcceptForFocusedValidation,
-    RequestRepairBatch { repair_identity: String },
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PostEditBundleSection {
-    Diff,
-    Requirements,
-    ProofAndValidation,
-    CompletionGates,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PostEditInspectionBundle {
-    pub(crate) fingerprint: String,
-    pub(crate) candidate_identity: String,
-    pub(crate) final_mutation_revision: u64,
-    pub(crate) diff_identity: String,
-    pub(crate) bounded_diff: String,
-    pub(crate) dependencies: PostEditInspectionDependencies,
-    pub(crate) rebuilt_sections: Vec<PostEditBundleSection>,
-    pub(crate) outcome: Option<PostEditInspectionOutcome>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PostEditInspectionPreparation {
-    FailOpen,
-    Ready(Box<PostEditInspectionBundle>),
-    Suppressed(PostEditInspectionOutcome),
-}
-
 struct TrackedContent {
     content: String,
     mode: Option<String>,
@@ -171,8 +96,6 @@ pub struct TurnDiffTracker {
     workspace_evidence_generation_batch:
         Option<Weak<crate::tools::parallel::WorkspaceEvidenceGenerationBatch>>,
     #[cfg(test)]
-    post_edit_inspection_bundle: Option<PostEditInspectionBundle>,
-    #[cfg(test)]
     rendered_diff_count: std::cell::Cell<usize>,
 }
 
@@ -190,8 +113,6 @@ impl Default for TurnDiffTracker {
             unified_diff: None,
             last_emitted_unified_diff: None,
             workspace_evidence_generation_batch: None,
-            #[cfg(test)]
-            post_edit_inspection_bundle: None,
             #[cfg(test)]
             rendered_diff_count: std::cell::Cell::new(0),
         }
@@ -307,7 +228,7 @@ impl TurnDiffTracker {
     ) {
         // A command can write before failing or timing out, so every observed
         // mutation advances the generic turn revision and invalidates exact
-        // diff state. Validation currency is owned by task-evidence receipts.
+        // diff state.
         match mutation {
             CommandMutation::KnownMutation { paths: Some(_) } => {
                 self.record_mutation();
@@ -325,104 +246,6 @@ impl TurnDiffTracker {
     }
 
     #[cfg(test)]
-    pub(crate) fn prepare_post_edit_inspection(
-        &mut self,
-        boundary: Option<&CoherentImplementationBoundary>,
-        dependencies: PostEditInspectionDependencies,
-    ) -> PostEditInspectionPreparation {
-        let Some(boundary) = boundary.filter(|boundary| boundary.trustworthy_quiescence()) else {
-            return PostEditInspectionPreparation::FailOpen;
-        };
-        let diff = self.unified_diff.clone().unwrap_or_default();
-        let diff_identity = format!("{:x}", Sha256::digest(diff.as_bytes()));
-        let fingerprint = post_edit_fingerprint(
-            boundary,
-            self.mutation_revision,
-            &diff_identity,
-            &dependencies,
-        );
-        if let Some(existing) = self.post_edit_inspection_bundle.as_ref()
-            && existing.fingerprint == fingerprint
-        {
-            return existing.outcome.clone().map_or_else(
-                || PostEditInspectionPreparation::Ready(Box::new(existing.clone())),
-                PostEditInspectionPreparation::Suppressed,
-            );
-        }
-        let bounded_diff = if diff.len() <= POST_EDIT_BUNDLE_MAX_DIFF_BYTES {
-            diff
-        } else {
-            let mut end = POST_EDIT_BUNDLE_MAX_DIFF_BYTES;
-            while end > 0 && !diff.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}\n[diff truncated]", &diff[..end])
-        };
-        let rebuilt_sections = self.post_edit_inspection_bundle.as_ref().map_or_else(
-            || {
-                vec![
-                    PostEditBundleSection::Diff,
-                    PostEditBundleSection::Requirements,
-                    PostEditBundleSection::ProofAndValidation,
-                    PostEditBundleSection::CompletionGates,
-                ]
-            },
-            |existing| {
-                let mut sections = Vec::new();
-                if existing.candidate_identity != boundary.candidate_identity
-                    || existing.final_mutation_revision != self.mutation_revision
-                    || existing.diff_identity != diff_identity
-                {
-                    sections.push(PostEditBundleSection::Diff);
-                }
-                if existing.dependencies.requirement_manifest_identity
-                    != dependencies.requirement_manifest_identity
-                {
-                    sections.push(PostEditBundleSection::Requirements);
-                }
-                if existing.dependencies.proof_route_identity != dependencies.proof_route_identity
-                    || existing.dependencies.validation_identity != dependencies.validation_identity
-                {
-                    sections.push(PostEditBundleSection::ProofAndValidation);
-                }
-                if existing.dependencies.rendered_gate_identity
-                    != dependencies.rendered_gate_identity
-                {
-                    sections.push(PostEditBundleSection::CompletionGates);
-                }
-                sections
-            },
-        );
-        let bundle = PostEditInspectionBundle {
-            fingerprint,
-            candidate_identity: boundary.candidate_identity.clone(),
-            final_mutation_revision: self.mutation_revision,
-            diff_identity,
-            bounded_diff,
-            dependencies,
-            rebuilt_sections,
-            outcome: None,
-        };
-        self.post_edit_inspection_bundle = Some(bundle.clone());
-        PostEditInspectionPreparation::Ready(Box::new(bundle))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_post_edit_inspection_outcome(
-        &mut self,
-        fingerprint: &str,
-        outcome: PostEditInspectionOutcome,
-    ) -> bool {
-        let Some(bundle) = self.post_edit_inspection_bundle.as_mut() else {
-            return false;
-        };
-        if bundle.fingerprint != fingerprint {
-            return false;
-        }
-        bundle.outcome = Some(outcome);
-        true
-    }
-
     pub fn get_unified_diff(&self) -> Option<String> {
         self.unified_diff.clone()
     }
@@ -770,26 +593,6 @@ impl TurnDiffTracker {
     }
 }
 
-#[cfg(test)]
-fn post_edit_fingerprint(
-    boundary: &CoherentImplementationBoundary,
-    mutation_revision: u64,
-    diff_identity: &str,
-    dependencies: &PostEditInspectionDependencies,
-) -> String {
-    let canonical = format!(
-        "candidate={}\nmutation={}\ndiff={}\nrequirements={}\nproof={}\nvalidation={}\ngate={}",
-        boundary.candidate_identity,
-        mutation_revision,
-        diff_identity,
-        dependencies.requirement_manifest_identity,
-        dependencies.proof_route_identity,
-        dependencies.validation_identity,
-        dependencies.rendered_gate_identity,
-    );
-    format!("{:x}", Sha256::digest(canonical.as_bytes()))
-}
-
 fn normalize_tracked_path(path: &Path) -> PathBuf {
     let lexical = lexically_normalize_path(path);
     let normalized = if lexical.is_relative() {
@@ -873,6 +676,20 @@ fn is_format_only_command(command: &[String]) -> bool {
     )
 }
 
+fn is_validation_only_command(command: &[String], unwrapped: &[String]) -> bool {
+    if command
+        .iter()
+        .any(|token| token.contains([';', '&', '|', '>', '<', '`', '$']))
+    {
+        return false;
+    }
+    matches!(
+        unwrapped,
+        [first, second, ..]
+            if command_basename(first) == "cargo" && matches!(second.as_str(), "check" | "test")
+    )
+}
+
 fn looks_like_mutating_command(command: &[String]) -> bool {
     let normalized = normalized_command_tokens(command);
     let unwrapped = unwrap_command_tokens(&normalized);
@@ -911,7 +728,10 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
             return false;
         }
     }
-    if format_check || codex_shell_command::is_safe_command::is_known_safe_command(command) {
+    if format_check
+        || is_validation_only_command(command, unwrapped)
+        || codex_shell_command::is_safe_command::is_known_safe_command(command)
+    {
         return false;
     }
 

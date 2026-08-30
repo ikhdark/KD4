@@ -1,6 +1,14 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+fn foreign_cwd() -> PathUri {
+    let uri = match PathConvention::native() {
+        PathConvention::Windows => "file:///usr/local/src",
+        PathConvention::Posix => "file:///C:/workspace/src",
+    };
+    PathUri::parse(uri).expect("valid foreign cwd")
+}
+
 #[test]
 fn windows_absolute_program_paths_use_windows_display_quoting() {
     for (program, expected) in [
@@ -66,7 +74,7 @@ fn windows_display_preserves_the_existing_nul_placeholder() {
 
 #[test]
 fn foreign_read_is_omitted_without_dropping_other_command_actions() {
-    let cwd = PathUri::parse("file:///usr/local/src").expect("valid foreign POSIX cwd");
+    let cwd = foreign_cwd();
 
     let parsed_cmd = vec![
         ParsedCommand::Read {
@@ -98,5 +106,47 @@ fn foreign_read_is_omitted_without_dropping_other_command_actions() {
                 path: Some("src".to_string()),
             },
         ]
+    );
+}
+
+#[test]
+fn guardian_execve_preserves_foreign_cwd_without_native_conversion() {
+    let cwd = foreign_cwd();
+    let assessment = GuardianAssessmentEvent {
+        id: "review-1".to_string(),
+        target_item_id: Some("call-1".to_string()),
+        turn_id: "turn-1".to_string(),
+        started_at_ms: 1,
+        completed_at_ms: None,
+        status: codex_protocol::protocol::GuardianAssessmentStatus::InProgress,
+        risk_level: None,
+        user_authorization: None,
+        rationale: None,
+        decision_source: None,
+        action: GuardianAssessmentAction::Execve {
+            source: codex_protocol::protocol::GuardianCommandSource::UnifiedExec,
+            program: "cat".to_string(),
+            argv: vec!["cat".to_string(), "file.txt".to_string()],
+            cwd: cwd.clone().into(),
+        },
+    };
+
+    let item = build_item_from_guardian_event(&assessment, CommandExecutionStatus::InProgress)
+        .expect("guardian execve maps to a command item");
+
+    assert_eq!(
+        item,
+        ThreadItem::CommandExecution {
+            id: "call-1".to_string(),
+            command: "cat file.txt".to_string(),
+            cwd: cwd.into(),
+            process_id: None,
+            source: CommandExecutionSource::Agent,
+            status: CommandExecutionStatus::InProgress,
+            command_actions: Vec::new(),
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+        }
     );
 }

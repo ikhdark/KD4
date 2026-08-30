@@ -1,14 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use codex_exec_server::Environment;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::ShellCommandToolCallParams;
-use codex_protocol::plan_tool::ValidationRouteLeaf;
-use codex_protocol::validation::ValidationCommandContext;
 use pretty_assertions::assert_eq;
 
 use crate::config::PermissionProfileSnapshot;
@@ -50,84 +45,6 @@ use super::parse_shell_command_hook_invocation;
 use super::shell_command::effective_stall_timeout_ms;
 use super::shell_failure_sampling_signal;
 use super::shell_sampling_signal;
-
-fn structured_cargo_leaf() -> ValidationRouteLeaf {
-    ValidationRouteLeaf {
-        argv: vec![
-            "cargo".into(),
-            "test".into(),
-            "-p".into(),
-            "codex-core".into(),
-            "focused_case".into(),
-            "--".into(),
-            "--exact".into(),
-        ],
-        covered_paths: vec!["core/src/task_evidence.rs".into()],
-        timeout_ms: 30_000,
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn focused_validation_heartbeat_covers_only_the_pending_operation() {
-    let heartbeats = Arc::new(AtomicUsize::new(0));
-    let observed_heartbeats = Arc::clone(&heartbeats);
-    let operation = async {
-        tokio::time::sleep(Duration::from_secs(95)).await;
-        "finished"
-    };
-
-    let result =
-        super::run_with_periodic_heartbeat(operation, Duration::from_secs(30), move || {
-            observed_heartbeats.fetch_add(1, Ordering::SeqCst);
-            std::future::ready(())
-        })
-        .await;
-
-    assert_eq!(result, "finished");
-    assert_eq!(heartbeats.load(Ordering::SeqCst), 3);
-    tokio::time::advance(Duration::from_secs(60)).await;
-    assert_eq!(heartbeats.load(Ordering::SeqCst), 3);
-}
-
-fn create_directory_alias(target: &std::path::Path, alias: &std::path::Path) {
-    {
-        let output = std::process::Command::new("cmd")
-            .args(["/c", "mklink", "/J"])
-            .arg(alias)
-            .arg(target)
-            .output()
-            .expect("junction command starts");
-        assert!(
-            output.status.success(),
-            "junction is created: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-fn remove_directory_alias(alias: &std::path::Path) {
-    std::fs::remove_dir(alias).expect("junction removes without touching its target");
-}
-
-#[test]
-fn formerly_forbidden_runner_flags_use_ordinary_preflight() {
-    let repo = std::path::Path::new(".");
-    for argv in [
-        vec!["cargo".into(), "test".into(), "--all-targets".into()],
-        vec!["cargo".into(), "check".into(), "--workspace".into()],
-        vec!["python".into(), "-m".into(), "pytest".into(), "-q".into()],
-        ["just", "config-schema-regenerate", "validation-test"]
-            .map(str::to_string)
-            .to_vec(),
-    ] {
-        let mut leaf = structured_cargo_leaf();
-        leaf.argv = argv;
-        assert!(
-            super::validate_structured_validation_leaf(&leaf, repo).is_ok(),
-            "runner-specific flags are not a validation admission grammar"
-        );
-    }
-}
 
 #[tokio::test]
 async fn late_validation_denial_finishes_the_started_shell_event() {
@@ -227,125 +144,6 @@ fn orchestration_correctness_stall_timeout_is_opt_in() {
 }
 
 #[test]
-fn structured_validation_checks_paths_argv_and_effective_timeout() {
-    let mut leaf = structured_cargo_leaf();
-    leaf.timeout_ms = codex_protocol::plan_tool::MAX_STRUCTURED_VALIDATION_TIMEOUT_MS + 1;
-
-    assert!(
-        super::validate_structured_validation_leaf(&leaf, std::path::Path::new(".")).is_err(),
-        "the effective timeout is checked again at launch"
-    );
-
-    let encoded = serde_json::to_value(&leaf).expect("validation leaf serializes");
-    let error = serde_json::from_value::<ValidationRouteLeaf>(encoded)
-        .expect_err("wire deserialization must reject an out-of-bounds timeout");
-    assert!(error.to_string().contains("timeout_ms must be between"));
-
-    let mut missing_coverage = structured_cargo_leaf();
-    missing_coverage.covered_paths.clear();
-    assert!(
-        super::validate_structured_validation_leaf(&missing_coverage, std::path::Path::new("."))
-            .expect_err("coverage is required")
-            .contains("covered_paths")
-    );
-
-    let mut blank_argv = structured_cargo_leaf();
-    blank_argv.argv.push(" ".to_string());
-    assert!(
-        super::validate_structured_validation_leaf(&blank_argv, std::path::Path::new("."))
-            .expect_err("blank argv is rejected")
-            .contains("non-empty direct arguments")
-    );
-
-    let mut escaped = structured_cargo_leaf();
-    escaped.covered_paths = vec!["../outside.rs".to_string()];
-    assert!(
-        super::validate_structured_validation_leaf(&escaped, std::path::Path::new("."))
-            .expect_err("path traversal is rejected")
-            .contains("within the repository")
-    );
-}
-
-#[test]
-fn direct_validation_requires_covered_paths_and_direct_argv() {
-    let context = ValidationCommandContext {
-        covered_paths: vec!["core/src/task_evidence.rs".to_string()],
-    };
-    let invocation = CommandInvocation::Argv {
-        program: "cargo".to_string(),
-        args: vec![
-            "test".to_string(),
-            "-p".to_string(),
-            "codex-core".to_string(),
-            "direct_validation".to_string(),
-            "--".to_string(),
-            "--exact".to_string(),
-        ],
-    };
-    let route =
-        super::direct_validation_route(&context, &invocation, std::path::Path::new("."), 45_000)
-            .expect("focused direct validation route");
-    assert_eq!(route.route().leaves.len(), 1);
-    assert_eq!(route.leaf(), &route.route().leaves[0]);
-    assert_eq!(route.leaf().covered_paths, context.covered_paths);
-
-    let script =
-        CommandInvocation::Script("cargo test -p codex-core direct_validation".to_string());
-    assert!(
-        super::direct_validation_route(&context, &script, std::path::Path::new("."), 45_000)
-            .expect_err("shell validation must not infer coverage from a script")
-            .contains("direct argv")
-    );
-}
-
-#[test]
-fn confirmed_performance_direct_validation_normalizes_covered_paths_once() {
-    let repository = tempfile::tempdir().expect("repository tempdir");
-    let actual = repository.path().join("actual");
-    std::fs::create_dir_all(&actual).expect("actual coverage directory");
-    std::fs::write(actual.join("covered.rs"), b"covered\n").expect("covered fixture writes");
-    let alias = repository.path().join("alias");
-    create_directory_alias(&actual, &alias);
-
-    let context = ValidationCommandContext {
-        covered_paths: vec![
-            "alias//./covered.rs".to_string(),
-            "actual/covered.rs".to_string(),
-        ],
-    };
-    let invocation = CommandInvocation::Argv {
-        program: "cargo".to_string(),
-        args: vec!["test".to_string()],
-    };
-    super::reset_validation_path_normalization_count();
-    super::reset_validation_root_canonicalization_count();
-    let route = super::direct_validation_route(&context, &invocation, repository.path(), 30_000)
-        .expect("internal aliases normalize to their canonical repository path");
-
-    assert_eq!(route.leaf().covered_paths, vec!["actual/covered.rs"]);
-    assert_eq!(super::validation_path_normalization_count(), 1);
-    assert_eq!(super::validation_root_canonicalization_count(), 1);
-    remove_directory_alias(&alias);
-}
-
-#[test]
-fn confirmed_performance_non_validation_launch_skips_repository_discovery() {
-    let missing = std::path::Path::new("definitely-missing-validation-repository");
-    super::reset_validation_repository_discovery_count();
-    assert_eq!(
-        super::validation_repository_root_if_needed(false, missing, missing),
-        None
-    );
-    assert_eq!(super::validation_repository_discovery_count(), 0);
-
-    assert_eq!(
-        super::validation_repository_root_if_needed(true, missing, missing),
-        None
-    );
-    assert_eq!(super::validation_repository_discovery_count(), 1);
-}
-
-#[test]
 fn workspace_operation_root_reuses_the_preclassified_inspection_result() {
     let root = std::path::PathBuf::from("repo");
 
@@ -361,57 +159,6 @@ fn workspace_operation_root_reuses_the_preclassified_inspection_result() {
         super::workspace_operation_root_if_needed(true, true, root.clone()),
         Some(root)
     );
-}
-
-#[tokio::test]
-async fn token_efficiency_shell_validation_without_metadata_executes_as_non_proof() {
-    let (session, turn) = make_session_and_context().await;
-    {
-        let mut authorization = turn.validation_authorization.write().await;
-        *authorization = crate::validation_admission::ValidationAuthorization::enabled();
-    }
-    let turn = Arc::new(turn);
-    let payload = ToolPayload::Function {
-        arguments: json!({
-            "kind": "argv",
-            "program": "cargo",
-            "args": ["test", "--help"]
-        })
-        .to_string(),
-    };
-    super::reset_validation_repository_discovery_count();
-    crate::tools::handlers::reset_repository_root_resolution_count();
-
-    let result = ShellCommandHandler::default()
-        .handle(ToolInvocation {
-            session: session.into(),
-            step_context: StepContext::for_test(turn),
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-            call_id: "shell-validation-missing-metadata".to_string(),
-            tool_name: codex_tools::ToolName::plain("shell_command"),
-            source: ToolCallSource::Direct,
-            payload: payload.clone(),
-        })
-        .await;
-    let response = result
-        .expect("recognized validation without metadata should execute")
-        .to_response_item("shell-validation-missing-metadata", &payload);
-    let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
-    else {
-        panic!("expected function output");
-    };
-    let message = output.body.to_text().expect("text output");
-
-    assert!(
-        message.contains("treated as an ordinary command"),
-        "{message}"
-    );
-    assert!(
-        message.contains("cannot be recorded as direct validation proof"),
-        "{message}"
-    );
-    assert_eq!(super::validation_repository_discovery_count(), 0);
 }
 
 #[tokio::test]
@@ -451,34 +198,6 @@ async fn shell_pipeline_validation_is_denied_before_execution() {
     assert_eq!(structured["reason"], "user_prohibited_validation");
     assert_eq!(structured["operation"], "test");
     assert_eq!(structured["command_was_executed"], false);
-}
-
-#[test]
-fn direct_validation_rejects_covered_path_junction_escape() {
-    let repository = tempfile::tempdir().expect("repository tempdir");
-    let outside = tempfile::tempdir().expect("outside tempdir");
-    std::fs::write(outside.path().join("outside.rs"), b"outside\n")
-        .expect("outside fixture writes");
-    let linked = repository.path().join("linked");
-    let status = std::process::Command::new("cmd")
-        .args(["/c", "mklink", "/J"])
-        .arg(&linked)
-        .arg(outside.path())
-        .status()
-        .expect("junction command starts");
-    assert!(status.success(), "junction is created");
-
-    let context = ValidationCommandContext {
-        covered_paths: vec!["linked/outside.rs".to_string()],
-    };
-    let invocation = CommandInvocation::Argv {
-        program: "cargo".to_string(),
-        args: vec!["test".to_string(), "--all-targets".to_string()],
-    };
-    let error = super::direct_validation_route(&context, &invocation, repository.path(), 30_000)
-        .expect_err("covered path junction escape must fail");
-    std::fs::remove_dir(&linked).expect("junction removes without touching its target");
-    assert!(error.contains("outside the repository"));
 }
 
 #[test]
@@ -676,57 +395,17 @@ fn nonzero_shell_output_has_failure_outcome() {
 }
 
 #[test]
-fn approval_denied_validation_is_not_an_executed_call() {
-    let approved: Result<
-        codex_protocol::exec_output::ExecToolCallOutput,
-        crate::tools::sandboxing::ToolError,
-    > = Ok(codex_protocol::exec_output::ExecToolCallOutput::default());
+fn retained_validation_attempt_preserves_output_and_late_skip_timing() {
+    let retained_attempt = codex_protocol::exec_output::ExecToolCallOutput {
+        exit_code: 126,
+        ..Default::default()
+    };
     let user_declined: Result<
         codex_protocol::exec_output::ExecToolCallOutput,
         crate::tools::sandboxing::ToolError,
     > = Err(crate::tools::sandboxing::ToolError::Denied(
         "rejected by user".to_string(),
     ));
-    let preflight_rejected: Result<
-        codex_protocol::exec_output::ExecToolCallOutput,
-        crate::tools::sandboxing::ToolError,
-    > = Err(crate::tools::sandboxing::ToolError::Rejected(
-        "approval unavailable".to_string(),
-    ));
-    let pre_spawn_failure: Result<
-        codex_protocol::exec_output::ExecToolCallOutput,
-        crate::tools::sandboxing::ToolError,
-    > = Err(crate::tools::sandboxing::ToolError::Codex(
-        codex_protocol::error::CodexErr::Fatal("sandbox setup failed".to_string()),
-    ));
-
-    assert!(super::shell_validation_was_executed(&approved, false));
-    assert!(!super::shell_validation_was_executed(&user_declined, false));
-    assert!(!super::shell_validation_was_executed(
-        &preflight_rejected,
-        false
-    ));
-    assert!(!super::shell_validation_was_executed(
-        &pre_spawn_failure,
-        false
-    ));
-    let post_spawn_failure: Result<
-        codex_protocol::exec_output::ExecToolCallOutput,
-        crate::tools::sandboxing::ToolError,
-    > = Err(crate::tools::sandboxing::ToolError::Codex(
-        codex_protocol::error::CodexErr::Io(std::io::Error::other("output reader failed")),
-    ));
-    assert!(super::shell_validation_was_executed(
-        &post_spawn_failure,
-        true
-    ));
-    assert!(super::shell_validation_execution_output(&post_spawn_failure, None).is_none());
-
-    let retained_attempt = codex_protocol::exec_output::ExecToolCallOutput {
-        exit_code: 126,
-        ..Default::default()
-    };
-    assert!(super::shell_validation_was_executed(&user_declined, true));
     assert_eq!(
         super::shell_validation_execution_output(&user_declined, Some(&retained_attempt))
             .map(|output| output.exit_code),
@@ -742,14 +421,12 @@ fn approval_denied_validation_is_not_an_executed_call() {
     assert!(authorization.update_from_user_input("do not run tests"));
     let skipped = prohibited_skip_for(&authorization, &invocation, true)
         .expect("test denial suppresses the validation");
-    let late_skip: Result<
-        codex_protocol::exec_output::ExecToolCallOutput,
-        crate::tools::sandboxing::ToolError,
-    > = Err(crate::tools::sandboxing::ToolError::ValidationSkipped(
+    let late_skip = Err(crate::tools::sandboxing::ToolError::ValidationSkipped(
         skipped,
     ));
     let timing = crate::turn_timing::TurnTimingState::default();
     super::record_retained_validation_skip(&timing, &late_skip, Some(&retained_attempt));
+
     assert_eq!(
         timing
             .complete_snapshot()
@@ -757,60 +434,14 @@ fn approval_denied_validation_is_not_an_executed_call() {
             .counters
             .suppressed_validation_output_count,
         1,
-        "the denied retry retains suppressed-by-user timing",
     );
     assert!(super::unexecuted_validation_skip(&late_skip, false).is_some());
-    assert!(
-        super::unexecuted_validation_skip(&late_skip, true).is_none(),
-        "a late denial must not erase an already executed sandbox attempt",
-    );
-    assert!(super::shell_validation_was_executed(&late_skip, true));
-    let restored_late_skip =
-        super::restore_retained_validation_attempt(late_skip, Some(&retained_attempt));
+    assert!(super::unexecuted_validation_skip(&late_skip, true).is_none());
     assert_eq!(
-        restored_late_skip
+        super::restore_retained_validation_attempt(late_skip, Some(&retained_attempt))
             .expect("retained attempt becomes the terminal output")
             .exit_code,
         126,
-        "the executed attempt, not the later skip, is the terminal shell result",
-    );
-
-    let retained_user_decline: Result<
-        codex_protocol::exec_output::ExecToolCallOutput,
-        crate::tools::sandboxing::ToolError,
-    > = Err(crate::tools::sandboxing::ToolError::Denied(
-        "rejected by user".to_string(),
-    ));
-    assert_eq!(
-        super::restore_retained_validation_attempt(retained_user_decline, Some(&retained_attempt),)
-            .expect("retained attempt becomes the terminal output")
-            .exit_code,
-        126,
-        "a retry denial must not replace an already executed attempt",
-    );
-
-    let user_declined = Err(crate::FunctionCallError::DeniedToModel(
-        "exec command rejected by user".to_string(),
-    ));
-    assert_eq!(
-        super::focused_validation_status(&user_declined, false, false),
-        codex_agent_task_store::ValidationCallStatus::Cancelled
-    );
-
-    let preflight_rejected = Err(crate::FunctionCallError::RespondToModel(
-        "approval unavailable".to_string(),
-    ));
-    assert_eq!(
-        super::focused_validation_status(&preflight_rejected, false, false),
-        codex_agent_task_store::ValidationCallStatus::NotExecuted
-    );
-
-    let executed_failure = Err(crate::FunctionCallError::RespondToModel(
-        "sandbox denied the spawned process".to_string(),
-    ));
-    assert_eq!(
-        super::focused_validation_status(&executed_failure, false, true),
-        codex_agent_task_store::ValidationCallStatus::Failed
     );
 }
 
@@ -1575,6 +1206,7 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
     };
     let output = FunctionToolOutput {
         body: vec![],
+        canonical_body: None,
         success: Some(true),
         outcome: None,
         post_tool_use_response: Some(json!("shell output")),

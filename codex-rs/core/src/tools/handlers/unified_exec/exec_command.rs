@@ -17,9 +17,10 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::apply_granted_turn_permissions_uri;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
-use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair_async;
+use crate::tools::handlers::command_preflight::preflight_invocation_for_runtime;
 use crate::tools::handlers::command_search::classify_rg_search_narrowing;
-use crate::tools::handlers::command_search::reject_rg_search_without_native_scope;
+use crate::tools::handlers::command_search::classify_rg_search_narrowing_without_native_scope;
+use crate::tools::handlers::command_search::observe_rg_search_scope_state;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
@@ -58,8 +59,6 @@ use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathConvention;
 use serde::Deserialize;
 
-use super::super::shell::ValidationLaunchPreparationArgs;
-use super::super::shell::prepare_validation_launch;
 use super::super::shell::validation_environment_hash;
 use super::super::shell::validation_structured_output;
 use super::super::shell_spec::CommandToolOptions;
@@ -245,7 +244,7 @@ impl ExecCommandHandler {
             step_context,
             tracker,
             call_id,
-            cancellation_token: _,
+            cancellation_token,
             payload,
             ..
         } = invocation;
@@ -362,7 +361,9 @@ impl ExecCommandHandler {
         )
         .map_err(FunctionCallError::RespondToModel)?;
         let original_safety_command = original_resolved_command.safety_command.clone();
-        let preflight = preflight_invocation_with_equivalent_repair_async(
+        let direct_runtime = turn.config.features.enabled(Feature::DirectRuntime);
+        let preflight = preflight_invocation_for_runtime(
+            direct_runtime,
             &original_invocation,
             &original_safety_command,
             original_resolved_command.preflight_shell_type,
@@ -376,7 +377,7 @@ impl ExecCommandHandler {
         let repaired = preflight.repaired();
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
-        let mut repair_notice = preflight.repair_notice;
+        let repair_notice = preflight.repair_notice;
         if repaired {
             args.replace_command_invocation(&command_invocation);
         }
@@ -391,95 +392,59 @@ impl ExecCommandHandler {
         } else {
             original_resolved_command
         };
-        let mut validation_launch = match admit_validation_invocations(
-            &turn.validation_authorization,
-            &validation_invocations,
-            args.validation.is_some(),
-        )
-        .await
-        {
-            ValidationAdmission::Skip(skipped) => {
-                if matches!(
-                    skipped.skip_disposition,
-                    codex_tools::ToolOutputSkipDisposition::Suppressed
-                ) {
-                    turn.turn_timing_state.record_suppressed_validation_output();
-                }
-                tracing::info!(reason = ?skipped.reason, "validation command skipped");
-                return Ok(boxed_tool_output(validation_structured_output(
-                    serde_json::to_value(skipped).unwrap_or_default(),
-                )));
-            }
-            ValidationAdmission::Execute {
-                authorization_revision,
-                is_validation,
-                classification,
-            } => is_validation.then(|| ValidationLaunchPlan {
-                classification,
-                authorization_revision,
-                explicitly_tagged: args.validation.is_some(),
-                structured_route: None,
-                bound_plan_step: None,
-                bound_work_unit: None,
-                validation_call_id: None,
-                turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
-                focused_validation_token: None,
-            }),
-        };
-        super::super::shell::downgrade_unattributed_validation(
-            &mut validation_launch,
-            args.validation.is_some(),
-            &mut repair_notice,
-        );
-        let direct_validation_route = if validation_launch.is_some() {
-            let context = args.validation.as_ref().ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "validation commands require `validation` metadata with nonempty covered_paths"
-                        .to_string(),
-                )
-            })?;
-            let validation_repository = native_cwd.as_ref().and_then(|cwd| {
-                super::super::shell::validation_repository_root_if_needed(
-                    true,
-                    cwd.as_path(),
-                    turn.config.cwd.as_path(),
-                )
-            });
-            let repository = validation_repository.as_ref().ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "direct validation coverage requires a host-native repository path".to_string(),
-                )
-            })?;
-            Some(
-                super::super::shell::direct_validation_route(
-                    context,
-                    &command_invocation,
-                    repository,
-                    300_000,
-                )
-                .map_err(FunctionCallError::RespondToModel)?,
-            )
-        } else {
+        let validation_launch = if direct_runtime {
             None
+        } else {
+            match admit_validation_invocations(
+                &turn.validation_authorization,
+                &validation_invocations,
+                args.validation.is_some(),
+            )
+            .await
+            {
+                ValidationAdmission::Skip(skipped) => {
+                    if matches!(
+                        skipped.skip_disposition,
+                        codex_tools::ToolOutputSkipDisposition::Suppressed
+                    ) {
+                        turn.turn_timing_state.record_suppressed_validation_output();
+                    }
+                    tracing::info!(reason = ?skipped.reason, "validation command skipped");
+                    return Ok(boxed_tool_output(validation_structured_output(
+                        serde_json::to_value(skipped).unwrap_or_default(),
+                    )));
+                }
+                ValidationAdmission::Execute {
+                    authorization_revision,
+                    is_validation,
+                    classification,
+                } => is_validation.then(|| ValidationLaunchPlan {
+                    classification,
+                    authorization_revision,
+                    explicitly_tagged: args.validation.is_some(),
+                }),
+            }
         };
         let search_narrowing = if validation_launch.is_none() {
             if let Some(native_cwd) = native_cwd.as_ref() {
                 let repository_root = resolve_repository_root(native_cwd.as_path());
-                let search = classify_rg_search_narrowing(
+                let mut search = classify_rg_search_narrowing(
                     &resolved_command.safety_command,
                     resolved_command.preflight_shell_type,
                     native_cwd.as_path(),
                     &repository_root,
                 )
                 .map_err(FunctionCallError::RespondToModel)?;
+                if let Some(search) = search.as_mut() {
+                    observe_rg_search_scope_state(search).await;
+                }
                 search.map(|search| (repository_root.to_string_lossy().into_owned(), search))
             } else {
-                reject_rg_search_without_native_scope(
+                classify_rg_search_narrowing_without_native_scope(
                     &resolved_command.safety_command,
                     resolved_command.preflight_shell_type,
                 )
-                .map_err(FunctionCallError::RespondToModel)?;
-                None
+                .map(|search| (String::new(), search))
             }
         } else {
             None
@@ -689,13 +654,6 @@ impl ExecCommandHandler {
         let known_delta_hit = known_delta
             .as_ref()
             .is_some_and(crate::tools::known_delta_store::PreparedKnownDelta::is_hit);
-        prepare_validation_launch(ValidationLaunchPreparationArgs {
-            session: session.as_ref(),
-            validation_launch: &mut validation_launch,
-            direct_validation_route: direct_validation_route.as_ref(),
-            call_id: &call_id,
-        })
-        .await?;
         let validation_attempt = validation_launch.is_some();
         if !known_delta_hit && !validation_attempt {
             session
@@ -751,6 +709,7 @@ impl ExecCommandHandler {
                     max_output_tokens,
                     process_id: None,
                     exit_code: Some(0),
+                    process_exited: true,
                     original_token_count: None,
                     hook_command: Some(hook_command),
                     raw_output_artifact: Some(raw_output_artifact),
@@ -814,6 +773,7 @@ impl ExecCommandHandler {
                 },
                 process_id_reservation,
                 &context,
+                &cancellation_token,
             )
             .await;
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
@@ -927,6 +887,7 @@ impl ExecCommandHandler {
                     // process for write_stdin to resume.
                     process_id: None,
                     exit_code: Some(output.exit_code),
+                    process_exited: true,
                     original_token_count: Some(original_token_count),
                     hook_command: Some(hook_command),
                     raw_output_artifact: Some(finalized_artifact),
@@ -984,9 +945,7 @@ impl ExecCommandHandler {
                 let repair = repair_notice
                     .as_deref()
                     .map_or(String::new(), |notice| format!("\n{notice}"));
-                Err(FunctionCallError::RespondToModel(format!(
-                    "exec_command failed for `{command_for_display}`: {err:?}{repair}"
-                )))
+                exec_command_error_output(&command_for_display, &err, &repair)
             }
         };
         let running_process_after_cleanup = session
@@ -1010,6 +969,14 @@ impl CoreToolRuntime for ExecCommandHandler {
 
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
+    }
+
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
+    }
+
+    fn owns_unified_exec_processes(&self) -> bool {
+        true
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
@@ -1066,4 +1033,13 @@ fn emit_unified_exec_tty_metric(session_telemetry: &SessionTelemetry, tty: bool)
         /*inc*/ 1,
         &[("tty", if tty { "true" } else { "false" })],
     );
+}
+
+fn exec_command_error_output(
+    command_for_display: &str,
+    error: &UnifiedExecError,
+    repair: &str,
+) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+    let message = format!("exec_command failed for `{command_for_display}`: {error:?}{repair}");
+    Err(FunctionCallError::RespondToModel(message))
 }

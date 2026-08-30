@@ -683,6 +683,18 @@ impl ThreadManager {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_agent_graph_store_for_tests(
+        mut self,
+        agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
+    ) -> Self {
+        let Some(state) = Arc::get_mut(&mut self.state) else {
+            unreachable!("new thread manager state should not be shared");
+        };
+        state.agent_graph_store = agent_graph_store;
+        self
+    }
+
     /// Construct with a dummy AuthManager containing the provided CodexAuth.
     /// Used for integration tests: should not be used by ordinary business logic.
     pub(crate) fn with_models_provider_for_tests(

@@ -32,7 +32,6 @@ fn failed_turn_does_not_overwrite_output_last_message_file() {
         codex_app_server_protocol::TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             timing: None,
             turn: codex_app_server_protocol::Turn {
                 id: "turn-1".to_string(),
@@ -47,7 +46,6 @@ fn failed_turn_does_not_overwrite_output_last_message_file() {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,

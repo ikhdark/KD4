@@ -18,6 +18,7 @@
   those activation steps only when the request includes them.
 
 <!-- SHARED-OPERATING-POLICY: START -->
+
 ## Shared operating policy
 
 ### Scope and workspace
@@ -32,11 +33,12 @@
 - Preserve concurrent work and every unrelated hunk. Compare an overlapping
   target and its diff once, then keep or merge the version that satisfies every
   affected contract and direct test.
-- Ask only when unresolved intent, incompatible user-visible outcomes, a
-  required compatibility break, an unrequested destructive or external action,
-  or conflicting validation criteria would materially change the solution.
-  State the conflict and consequences; otherwise make the narrowest reasonable
-  assumption, preserve existing behavior, and avoid over-engineering.
+- Ask when unresolved intent
+- When you encounter overlapping edits, choose the best version. Implement your
+  version when it is better, keep the current or concurrently changing version
+  when it is better, and combine them when that produces the best result. If
+  the existing version is already better than your proposed edit, leave it
+  unchanged and move on.
 
 ### Bug checks
 
@@ -74,13 +76,14 @@
 - Do not rerun validation while concurrent edits continue. After the same
   blocker occurs twice, finish and report it.
 - Preserve narrower passing results despite broader failures.
+
 <!-- SHARED-OPERATING-POLICY: END -->
 
 ## Routing and task scope
 
 - Before reading `SOURCEMAP.md` broadly, query the smallest named owner slice:
   `python scripts/source_owners.py slice --owner <owner-id> --focus "<task
-  description>" --max-relationships 32`. Require an untruncated result with no
+description>" --max-relationships 32`. Require an untruncated result with no
   omitted relationships or material unknowns, then read its exact evidence
   locations. Read the broad map only when no owner matches or the slice leaves
   an unresolved boundary.
@@ -121,19 +124,3 @@
 - For a script edit, follow the validation route named in `SOURCEMAP.md`. If no
   route is named, run the sibling unit test. If none exists, run the interpreter
   syntax check and configured formatter or linter.
-
-## Sessions and rollout audits
-
-- Use `C:\Users\kuh\Desktop\LOCAL-KD\sessions` for fork rollouts and
-  `C:\Users\kuh\.codex\sessions` for official upstream rollouts.
-- For a live rollout, use `python scripts/rollout_snapshot.py <path> [--output
-  <snapshot>]`. It opens the exact `.jsonl` path with shared access, reads the
-  fixed length observed at open, and reports its SHA-256 identity.
-- For a session or turn latency audit, run
-  `python scripts/kd4_turn_latency_audit.py <session-uuid-or-path>
-  --sessions-root C:\Users\kuh\Desktop\LOCAL-KD\sessions --repo-root <repo>` as
-  the only lookup and analysis pass. It resolves the exact UUID and performs the
-  fixed-length snapshot internally; do not add file searches or ad hoc JSONL
-  parsers before or after it.
-- `audit decision: finalize` or `auditDecision.readyToFinalize=true` ends the
-  audit. Answer from that report; continue only for blocker codes it lists.

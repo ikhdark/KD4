@@ -42,3 +42,25 @@ fn shell_projection_complete_envelope_respects_requested_limit() {
     assert!(projected.reduced);
     assert!(approx_token_count(&projected.text) <= 64);
 }
+
+#[test]
+fn token_backfire_shell_projection_keeps_complete_output_that_fits_budget() {
+    let body = (0..700)
+        .map(|index| format!("line-{index}: exact evidence"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let output = ExecToolCallOutput {
+        aggregated_output: StreamOutput::new(body.clone()),
+        ..ExecToolCallOutput::default()
+    };
+
+    let projected = project_exec_output_text_with_budget(
+        &output,
+        TruncationPolicy::Tokens(20_000),
+        Some(20_000),
+        Some("enumerate evidence"),
+    );
+
+    assert!(!projected.reduced);
+    assert_eq!(projected.text, body);
+}

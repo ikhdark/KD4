@@ -301,6 +301,7 @@ fn unavailable_system_route_preserves_wss_http_proxy_fallback() {
 }
 
 #[tokio::test]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn async_resolution_uses_cached_route_before_global_permit() {
     let request_url = "https://cached-fast-path.test/request";
     cache_system_proxy_decision(request_url, SystemProxyDecision::Direct);
@@ -320,6 +321,20 @@ async fn async_resolution_uses_cached_route_before_global_permit() {
     drop(permit);
 
     assert_eq!(route, OutboundProxyRoute::Direct);
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[test]
+fn unsupported_platform_system_proxy_falls_back_explicitly() {
+    let origin = RequestOrigin::parse("https://api.openai.com/v1/responses")
+        .expect("request origin should parse");
+
+    assert_eq!(
+        resolve_platform_system_proxy("https://api.openai.com/v1/responses", &origin),
+        SystemProxyDecision::Unavailable {
+            failure: RouteFailureClass::ProxyResolutionUnavailable,
+        }
+    );
 }
 
 #[tokio::test]

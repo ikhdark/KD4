@@ -98,7 +98,6 @@ pub(crate) enum StableContextKind {
     MultiAgent,
     MultiAgentUsageHint,
     TaskModelGuidance,
-    TaskEvidence,
     ToolSchemas,
     RequestUserInput,
     Wait,
@@ -128,7 +127,6 @@ impl StableContextKind {
             Self::MultiAgent => "multi_agent",
             Self::MultiAgentUsageHint => "multi_agent_usage_hint",
             Self::TaskModelGuidance => "task_model_guidance",
-            Self::TaskEvidence => "task_evidence",
             Self::ToolSchemas => "tool_schemas",
             Self::RequestUserInput => "request_user_input",
             Self::Wait => "wait",
@@ -397,7 +395,6 @@ enum StableContextSlot {
     RecommendedPlugins,
     Environment,
     TaskModelGuidance,
-    TaskEvidence,
     Permissions,
     Memory,
     ModelSwitch,
@@ -424,7 +421,6 @@ impl StableContextSlot {
             Self::RecommendedPlugins => StableContextKind::RecommendedPlugins,
             Self::Environment => StableContextKind::Environment,
             Self::TaskModelGuidance => StableContextKind::TaskModelGuidance,
-            Self::TaskEvidence => StableContextKind::TaskEvidence,
             Self::Permissions => StableContextKind::EnvironmentPermissions,
             Self::Memory => StableContextKind::Memory,
             Self::ModelSwitch => StableContextKind::ModelSwitch,
@@ -451,7 +447,6 @@ impl StableContextSlot {
             Self::RecommendedPlugins => "recommended_plugins",
             Self::Environment => "environment",
             Self::TaskModelGuidance => "task_model_guidance",
-            Self::TaskEvidence => "task_evidence",
             Self::Permissions => "environment_permissions",
             Self::Memory => "memory",
             Self::ModelSwitch => "model_switch",
@@ -475,7 +470,6 @@ impl StableContextSlot {
             Self::MultiAgent => 4,
             Self::MultiAgentUsageHint => 5,
             Self::TaskModelGuidance => 6,
-            Self::TaskEvidence => 7,
             Self::Permissions => 8,
             Self::Memory => 9,
             Self::SkillUsage => 10,
@@ -504,7 +498,6 @@ impl StableContextSlot {
                 | Self::AppContext
                 | Self::ModelSwitch
                 | Self::Environment
-                | Self::TaskEvidence
                 | Self::RecommendedPlugins
         )
     }
@@ -1128,11 +1121,6 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassificati
             StableContextSlot::TaskModelGuidance,
         ));
     }
-    if role == "user" && marked(text, "<kd4_task_state_v1>", "</kd4_task_state_v1>") {
-        return Some(StableTextClassification::inline(
-            StableContextSlot::TaskEvidence,
-        ));
-    }
     if role == "user" && marked(text, "<recommended_plugins>", "</recommended_plugins>") {
         return Some(StableTextClassification::inline(
             StableContextSlot::RecommendedPlugins,
@@ -1261,7 +1249,6 @@ fn contains_known_open_marker(text: &str) -> bool {
         SKILL_OPEN_TAG,
         "<environment_context>",
         "<task_model_guidance>",
-        "<kd4_task_state_v1>",
         "<recommended_plugins>",
         APPS_INSTRUCTIONS_OPEN_TAG,
         "<app-context>",

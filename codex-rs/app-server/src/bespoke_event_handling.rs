@@ -1,7 +1,6 @@
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::outgoing_message::ClientRequestResult;
-use crate::outgoing_message::TerminalNotificationDispatch;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::request_processors::populate_thread_turns_from_history;
 use crate::request_processors::thread_from_stored_thread;
@@ -9,7 +8,6 @@ use crate::request_processors::thread_settings_from_core_snapshot;
 use crate::server_request_error::is_turn_transition_server_request_error;
 use crate::thread_state::ThreadState;
 use crate::thread_state::TurnSummary;
-use crate::thread_state::acknowledge_terminal_notification;
 use crate::thread_state::resolve_server_request_on_thread_listener;
 use crate::thread_status::ThreadWatchActiveGuard;
 use crate::thread_status::ThreadWatchManager;
@@ -55,7 +53,6 @@ use codex_app_server_protocol::RawResponseItemCompletedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestPayload;
-use codex_app_server_protocol::TaskCompletionGate;
 use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadRollbackResponse;
@@ -78,7 +75,6 @@ use codex_app_server_protocol::TurnPlanStep;
 use codex_app_server_protocol::TurnPlanUpdatedNotification;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
-use codex_app_server_protocol::TurnTerminalizationCompletedNotification;
 use codex_app_server_protocol::TurnTiming;
 use codex_app_server_protocol::WarningNotification;
 use codex_app_server_protocol::build_item_from_guardian_event;
@@ -161,7 +157,6 @@ pub(crate) async fn apply_bespoke_event_handling(
         id: event_turn_id,
         msg,
     } = event;
-    let terminal_fingerprint = codex_core::terminal_event_fingerprint(&msg);
     match msg {
         EventMsg::TurnStarted(payload) => {
             // While not technically necessary as it was already done on TurnComplete, be extra cautios and abort any pending server requests.
@@ -180,7 +175,6 @@ pub(crate) async fn apply_bespoke_event_handling(
                     started_at: payload.started_at,
                     completed_at: None,
                     duration_ms: None,
-                    completion: None,
                     timing: None,
                     surfaced_result: None,
                     reasoning_policy_history: None,
@@ -206,25 +200,14 @@ pub(crate) async fn apply_bespoke_event_handling(
             thread_watch_manager
                 .note_turn_completed(&conversation_id.to_string(), turn_failed)
                 .await;
-            let attempt = handle_turn_complete(
+            handle_turn_complete(
                 conversation_id,
-                event_turn_id.clone(),
+                event_turn_id,
                 turn_complete_event,
                 &outgoing,
                 &thread_state,
-                terminal_fingerprint.as_deref(),
             )
             .await;
-            if let Some(fingerprint) = terminal_fingerprint.as_deref() {
-                finish_terminal_notification_attempt(
-                    &conversation,
-                    &thread_state,
-                    &event_turn_id,
-                    fingerprint,
-                    attempt,
-                )
-                .await;
-            }
         }
         EventMsg::McpStartupUpdate(update) => {
             let (status, error, failure_reason) = match update.status {
@@ -972,36 +955,14 @@ pub(crate) async fn apply_bespoke_event_handling(
             thread_watch_manager
                 .note_turn_aborted(&conversation_id.to_string(), &turn_aborted_event.reason)
                 .await;
-            let attempt = handle_turn_interrupted(
+            handle_turn_interrupted(
                 conversation_id,
-                event_turn_id.clone(),
+                event_turn_id,
                 turn_aborted_event,
                 &outgoing,
                 &thread_state,
-                terminal_fingerprint.as_deref(),
             )
             .await;
-            if let Some(fingerprint) = terminal_fingerprint.as_deref() {
-                finish_terminal_notification_attempt(
-                    &conversation,
-                    &thread_state,
-                    &event_turn_id,
-                    fingerprint,
-                    attempt,
-                )
-                .await;
-            }
-        }
-        EventMsg::TurnTerminalizationComplete(payload) => {
-            outgoing
-                .send_server_notification(ServerNotification::TurnTerminalizationCompleted(
-                    TurnTerminalizationCompletedNotification {
-                        thread_id: conversation_id.to_string(),
-                        turn_id: payload.turn_id,
-                        receipt: payload.receipt,
-                    },
-                ))
-                .await;
         }
         EventMsg::ThreadRolledBack(_rollback_event) => {
             let pending = {
@@ -1131,59 +1092,6 @@ pub(crate) async fn apply_bespoke_event_handling(
     }
 }
 
-/// Rebuilds and dispatches only the cached terminal client projection for a terminal event whose
-/// app-server state was already reduced. This deliberately skips request cancellation, thread
-/// history reduction, watch-state transitions, and every other terminal side effect.
-pub(crate) async fn project_terminal_notification_only(
-    event: Event,
-    conversation_id: ThreadId,
-    conversation: Arc<CodexThread>,
-    outgoing: ThreadScopedOutgoingMessageSender,
-    thread_state: Arc<tokio::sync::Mutex<ThreadState>>,
-    expected_fingerprint: &str,
-) {
-    if codex_core::terminal_event_fingerprint(&event.msg).as_deref() != Some(expected_fingerprint) {
-        tracing::error!(
-            turn_id = %event.id,
-            "refusing to project a terminal notification with a mismatched fingerprint"
-        );
-        return;
-    }
-    let attempt = match event.msg {
-        EventMsg::TurnComplete(payload) => {
-            handle_turn_complete(
-                conversation_id,
-                event.id.clone(),
-                payload,
-                &outgoing,
-                &thread_state,
-                Some(expected_fingerprint),
-            )
-            .await
-        }
-        EventMsg::TurnAborted(payload) => {
-            handle_turn_interrupted(
-                conversation_id,
-                event.id.clone(),
-                payload,
-                &outgoing,
-                &thread_state,
-                Some(expected_fingerprint),
-            )
-            .await
-        }
-        _ => return,
-    };
-    finish_terminal_notification_attempt(
-        &conversation,
-        &thread_state,
-        &event.id,
-        expected_fingerprint,
-        attempt,
-    )
-    .await;
-}
-
 async fn handle_turn_diff(
     conversation_id: ThreadId,
     event_turn_id: &str,
@@ -1225,7 +1133,6 @@ async fn handle_turn_plan_update(
 struct TurnCompletionMetadata {
     status: TurnStatus,
     error: Option<TurnError>,
-    completion: Option<TaskCompletionGate>,
     started_at: Option<i64>,
     completed_at: Option<i64>,
     duration_ms: Option<i64>,
@@ -1234,23 +1141,15 @@ struct TurnCompletionMetadata {
     origin_connection_id: Option<crate::outgoing_message::ConnectionId>,
 }
 
-struct TerminalNotificationAttempt {
-    notification: ServerNotification,
-    origin_connection_id: Option<crate::outgoing_message::ConnectionId>,
-    dispatch: TerminalNotificationDispatch,
-}
-
 async fn emit_turn_completed_with_status(
     conversation_id: ThreadId,
     event_turn_id: String,
     turn_completion_metadata: TurnCompletionMetadata,
     outgoing: &ThreadScopedOutgoingMessageSender,
-    thread_state: &Arc<Mutex<ThreadState>>,
-    terminal_fingerprint: Option<&str>,
-) -> TerminalNotificationAttempt {
+) {
     let origin_connection_id = turn_completion_metadata.origin_connection_id;
     let turn = Turn {
-        id: event_turn_id.clone(),
+        id: event_turn_id,
         items: vec![],
         items_view: TurnItemsView::NotLoaded,
         error: turn_completion_metadata.error,
@@ -1258,64 +1157,22 @@ async fn emit_turn_completed_with_status(
         started_at: turn_completion_metadata.started_at,
         completed_at: turn_completion_metadata.completed_at,
         duration_ms: turn_completion_metadata.duration_ms,
-        completion: turn_completion_metadata.completion,
         timing: turn_completion_metadata.timing,
         surfaced_result: turn_completion_metadata.surfaced_result,
         reasoning_policy_history: None,
     };
     let notification = TurnCompletedNotification {
         thread_id: conversation_id.to_string(),
-        completion: turn.completion.clone(),
         timing: turn.timing.clone(),
         surfaced_result: turn.surfaced_result.clone(),
         turn,
     };
-    let notification = ServerNotification::TurnCompleted(notification);
-    if let Some(fingerprint) = terminal_fingerprint {
-        let _ = thread_state.lock().await.cache_terminal_notification(
-            &event_turn_id,
-            fingerprint,
-            notification.clone(),
+    outgoing
+        .send_server_notification_with_receipts(
+            ServerNotification::TurnCompleted(notification),
             origin_connection_id,
-        );
-    }
-    let dispatch = outgoing
-        .send_server_notification_with_receipts(notification.clone(), origin_connection_id)
-        .await;
-    TerminalNotificationAttempt {
-        notification,
-        origin_connection_id,
-        dispatch,
-    }
-}
-
-async fn finish_terminal_notification_attempt(
-    conversation: &Arc<CodexThread>,
-    thread_state: &Arc<Mutex<ThreadState>>,
-    turn_id: &str,
-    fingerprint: &str,
-    attempt: TerminalNotificationAttempt,
-) {
-    let notification_accepted = thread_state
-        .lock()
-        .await
-        .record_terminal_notification_attempt(
-            turn_id,
-            fingerprint,
-            attempt.notification,
-            attempt.origin_connection_id,
-            &attempt.dispatch.targeted_connection_ids,
-            &attempt.dispatch.accepted_connection_ids,
-        );
-    if notification_accepted {
-        acknowledge_terminal_notification(
-            conversation.as_ref(),
-            thread_state,
-            turn_id,
-            fingerprint,
         )
         .await;
-    }
 }
 
 async fn apply_canonical_item_completed_side_effects(
@@ -1473,16 +1330,9 @@ async fn maybe_emit_raw_response_item_completed(
 
 async fn find_and_remove_turn_summary(
     _conversation_id: ThreadId,
-    event_turn_id: &str,
-    terminal_fingerprint: Option<&str>,
     thread_state: &Arc<Mutex<ThreadState>>,
 ) -> TurnSummary {
     let mut state = thread_state.lock().await;
-    if let Some(fingerprint) = terminal_fingerprint
-        && let Some(summary) = state.retained_terminal_turn_summary(event_turn_id, fingerprint)
-    {
-        return summary;
-    }
     std::mem::take(&mut state.turn_summary)
 }
 
@@ -1492,15 +1342,8 @@ async fn handle_turn_complete(
     turn_complete_event: TurnCompleteEvent,
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
-    terminal_fingerprint: Option<&str>,
-) -> TerminalNotificationAttempt {
-    let turn_summary = find_and_remove_turn_summary(
-        conversation_id,
-        &event_turn_id,
-        terminal_fingerprint,
-        thread_state,
-    )
-    .await;
+) {
+    let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
 
     let embedded_error = turn_complete_event.error.as_ref().map(|error| TurnError {
         message: error.message.clone(),
@@ -1519,7 +1362,6 @@ async fn handle_turn_complete(
         TurnCompletionMetadata {
             status,
             error,
-            completion: turn_complete_event.completion.map(Into::into),
             started_at: turn_summary.started_at,
             completed_at: turn_complete_event.completed_at,
             duration_ms: turn_complete_event.duration_ms,
@@ -1528,8 +1370,6 @@ async fn handle_turn_complete(
             origin_connection_id: turn_summary.origin_connection_id,
         },
         outgoing,
-        thread_state,
-        terminal_fingerprint,
     )
     .await
 }
@@ -1540,15 +1380,8 @@ async fn handle_turn_interrupted(
     turn_aborted_event: TurnAbortedEvent,
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
-    terminal_fingerprint: Option<&str>,
-) -> TerminalNotificationAttempt {
-    let turn_summary = find_and_remove_turn_summary(
-        conversation_id,
-        &event_turn_id,
-        terminal_fingerprint,
-        thread_state,
-    )
-    .await;
+) {
+    let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
     let internal_error =
         turn_aborted_event.reason == codex_protocol::protocol::TurnAbortReason::InternalError;
     let status = if internal_error {
@@ -1568,7 +1401,6 @@ async fn handle_turn_interrupted(
         TurnCompletionMetadata {
             status,
             error,
-            completion: None,
             started_at: turn_summary.started_at,
             completed_at: turn_aborted_event.completed_at,
             duration_ms: turn_aborted_event.duration_ms,
@@ -1577,8 +1409,6 @@ async fn handle_turn_interrupted(
             origin_connection_id: turn_summary.origin_connection_id,
         },
         outgoing,
-        thread_state,
-        terminal_fingerprint,
     )
     .await
 }
@@ -2470,7 +2300,6 @@ mod tests {
             completed_at: Some(TEST_TURN_COMPLETED_AT),
             duration_ms: Some(TEST_TURN_DURATION_MS),
             time_to_first_token_ms: None,
-            completion: None,
             timing: None,
         }
     }
@@ -2579,7 +2408,7 @@ mod tests {
         let action = codex_protocol::protocol::GuardianAssessmentAction::Command {
             source: codex_protocol::protocol::GuardianCommandSource::Shell,
             command: "rm -rf /tmp/example.sqlite".to_string(),
-            cwd: test_path_buf("/tmp").abs(),
+            cwd: test_path_buf("/tmp").abs().into(),
         };
         let notification = guardian_auto_approval_review_notification(
             &conversation_id,
@@ -2625,7 +2454,7 @@ mod tests {
         let action = codex_protocol::protocol::GuardianAssessmentAction::Command {
             source: codex_protocol::protocol::GuardianCommandSource::Shell,
             command: "rm -rf /tmp/example.sqlite".to_string(),
-            cwd: test_path_buf("/tmp").abs(),
+            cwd: test_path_buf("/tmp").abs().into(),
         };
         let notification = guardian_auto_approval_review_notification(
             &conversation_id,
@@ -3439,8 +3268,7 @@ mod tests {
         )
         .await;
 
-        let turn_summary =
-            find_and_remove_turn_summary(conversation_id, "turn-1", None, &thread_state).await;
+        let turn_summary = find_and_remove_turn_summary(conversation_id, &thread_state).await;
         assert_eq!(
             turn_summary.last_error,
             Some(TurnError {
@@ -3750,11 +3578,6 @@ mod tests {
             ..Default::default()
         };
         completion_event.timing = Some(expected_timing.clone());
-        completion_event.completion = Some(codex_protocol::protocol::TaskCompletionGate {
-            status: codex_protocol::protocol::TaskCompletionStatus::Partial,
-            reasons: vec!["focused validation is stale".to_string()],
-            evidence_path: Some("task-evidence/thread.json".to_string()),
-        });
         let surfaced_result = codex_protocol::protocol::SurfacedToolResult {
             adapter: "code_mode_cell".to_string(),
             value: json!({"answer": 42}),
@@ -3785,7 +3608,6 @@ mod tests {
             completion_event,
             &outgoing,
             &thread_state,
-            None,
         )
         .await;
 
@@ -3800,16 +3622,9 @@ mod tests {
                 assert_eq!(n.turn.started_at, Some(42));
                 assert_eq!(n.turn.completed_at, Some(TEST_TURN_COMPLETED_AT));
                 assert_eq!(n.turn.duration_ms, Some(TEST_TURN_DURATION_MS));
-                assert_eq!(n.turn.completion.as_ref(), n.completion.as_ref());
                 assert_eq!(n.turn.timing.as_ref(), n.timing.as_ref());
                 assert_eq!(n.turn.surfaced_result.as_ref(), n.surfaced_result.as_ref());
                 assert_eq!(n.turn.surfaced_result, Some(surfaced_result));
-                let completion = n.completion.expect("completion gate");
-                assert_eq!(
-                    completion.status,
-                    codex_app_server_protocol::TaskCompletionStatus::Partial
-                );
-                assert_eq!(completion.reasons, ["focused validation is stale"]);
                 assert_eq!(n.timing, Some(expected_timing));
             }
             other => bail!("unexpected message: {other:?}"),
@@ -3850,7 +3665,6 @@ mod tests {
             turn_aborted_event(&event_turn_id),
             &outgoing,
             &thread_state,
-            None,
         )
         .await;
 
@@ -3899,7 +3713,6 @@ mod tests {
             aborted,
             &outgoing,
             &thread_state,
-            None,
         )
         .await;
 
@@ -3911,75 +3724,6 @@ mod tests {
                 assert_eq!(n.turn.error, Some(expected_error));
                 assert_eq!(n.turn.completed_at, Some(TEST_TURN_COMPLETED_AT));
                 assert_eq!(n.turn.duration_ms, Some(TEST_TURN_DURATION_MS));
-            }
-            other => bail!("unexpected message: {other:?}"),
-        }
-        assert!(rx.try_recv().is_err(), "no extra messages expected");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn restart_internal_error_projection_preserves_retained_metadata() -> Result<()> {
-        let conversation_id = ThreadId::new();
-        let event_turn_id = "restart-internal-error".to_string();
-        let mut aborted = turn_aborted_event(&event_turn_id);
-        aborted.reason = codex_protocol::protocol::TurnAbortReason::InternalError;
-        let terminal_event = EventMsg::TurnAborted(aborted.clone());
-        let terminal_fingerprint = codex_core::terminal_event_fingerprint(&terminal_event)
-            .expect("terminal event should have a fingerprint");
-        let thread_state = new_thread_state();
-        thread_state
-            .lock()
-            .await
-            .seed_terminal_ledger_from_history(&[
-                RolloutItem::EventMsg(EventMsg::TurnStarted(
-                    codex_protocol::protocol::TurnStartedEvent {
-                        turn_id: event_turn_id.clone(),
-                        trace_id: None,
-                        started_at: Some(42),
-                        model_context_window: None,
-                        collaboration_mode_kind: Default::default(),
-                    },
-                )),
-                RolloutItem::EventMsg(EventMsg::Error(codex_protocol::protocol::ErrorEvent {
-                    message: "worker panicked".to_string(),
-                    codex_error_info: Some(
-                        codex_protocol::protocol::CodexErrorInfo::InternalServerError,
-                    ),
-                })),
-                RolloutItem::EventMsg(terminal_event),
-            ]);
-        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(
-            tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        ));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(
-            outgoing,
-            vec![ConnectionId(1)],
-            conversation_id,
-        );
-
-        handle_turn_interrupted(
-            conversation_id,
-            event_turn_id.clone(),
-            aborted,
-            &outgoing,
-            &thread_state,
-            Some(&terminal_fingerprint),
-        )
-        .await;
-
-        let msg = recv_broadcast_message(&mut rx).await?;
-        match msg {
-            OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(n)) => {
-                assert_eq!(n.turn.id, event_turn_id);
-                assert_eq!(n.turn.status, TurnStatus::Failed);
-                assert_eq!(n.turn.started_at, Some(42));
-                assert_eq!(
-                    n.turn.error.as_ref().map(|error| error.message.as_str()),
-                    Some("worker panicked")
-                );
             }
             other => bail!("unexpected message: {other:?}"),
         }
@@ -4019,7 +3763,6 @@ mod tests {
             turn_complete_event(&event_turn_id),
             &outgoing,
             &thread_state,
-            None,
         )
         .await;
 
@@ -4061,26 +3804,12 @@ mod tests {
             explanation: Some("need plan".to_string()),
             plan: vec![
                 PlanItemArg {
-                    id: Some("first".to_string()),
                     step: "first".to_string(),
                     status: StepStatus::Pending,
-                    depends_on: Vec::new(),
-                    acceptance_criteria: vec!["inspect owner".to_string()],
-                    runtime_paths: vec!["src/first.rs".to_string()],
-                    generated_artifacts: Vec::new(),
-                    risks: Vec::new(),
-                    validation_route: None,
                 },
                 PlanItemArg {
-                    id: Some("second".to_string()),
                     step: "second".to_string(),
-                    status: StepStatus::Passed,
-                    depends_on: vec!["first".to_string()],
-                    acceptance_criteria: Vec::new(),
-                    runtime_paths: Vec::new(),
-                    generated_artifacts: Vec::new(),
-                    risks: Vec::new(),
-                    validation_route: None,
+                    status: StepStatus::Completed,
                 },
             ],
         };
@@ -4098,11 +3827,8 @@ mod tests {
                 assert_eq!(n.plan.len(), 2);
                 assert_eq!(n.plan[0].step, "first");
                 assert_eq!(n.plan[0].status, TurnPlanStepStatus::Pending);
-                assert_eq!(n.plan[0].id.as_deref(), Some("first"));
-                assert_eq!(n.plan[0].acceptance_criteria, ["inspect owner"]);
                 assert_eq!(n.plan[1].step, "second");
-                assert_eq!(n.plan[1].status, TurnPlanStepStatus::Passed);
-                assert_eq!(n.plan[1].depends_on, ["first"]);
+                assert_eq!(n.plan[1].status, TurnPlanStepStatus::Completed);
             }
             other => bail!("unexpected message: {other:?}"),
         }
@@ -4424,7 +4150,6 @@ mod tests {
                     turn_complete_event(&a_turn1),
                     &outgoing,
                     &thread_state,
-                    None,
                 )
                 .await;
             },
@@ -4451,7 +4176,6 @@ mod tests {
                     turn_complete_event(&b_turn1),
                     &outgoing,
                     &thread_state,
-                    None,
                 )
                 .await;
             },
@@ -4468,7 +4192,6 @@ mod tests {
                     turn_complete_event(&a_turn2),
                     &outgoing,
                     &thread_state,
-                    None,
                 )
                 .await;
             },

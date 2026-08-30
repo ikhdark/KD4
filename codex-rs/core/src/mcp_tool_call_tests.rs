@@ -80,46 +80,19 @@ use wiremock::matchers::method;
 use wiremock::matchers::path_regex;
 
 #[test]
-fn repo_atlas_task_normalizes_oversized_max_tokens_before_execution() {
-    let mut arguments = Some(serde_json::json!({ "maxTokens": 7_000 }));
-    normalize_mcp_tool_arguments_before_execution(
-        REPO_ATLAS_SERVER_NAME,
-        REPO_ATLAS_TASK_TOOL_NAME,
-        &mut arguments,
-    );
-    assert_eq!(
-        arguments,
-        Some(serde_json::json!({ "maxTokens": REPO_ATLAS_TASK_MAX_TOKENS }))
-    );
-    let mut normalized_name_arguments = Some(serde_json::json!({ "maxTokens": 7_000 }));
-    normalize_mcp_tool_arguments_before_execution(
-        REPO_ATLAS_NORMALIZED_SERVER_NAME,
-        REPO_ATLAS_TASK_TOOL_NAME,
-        &mut normalized_name_arguments,
-    );
-    assert_eq!(
-        normalized_name_arguments,
-        Some(serde_json::json!({ "maxTokens": REPO_ATLAS_TASK_MAX_TOKENS }))
-    );
+fn mcp_arguments_preserve_server_valid_values_before_execution() {
+    let arguments = parse_mcp_tool_arguments_before_execution(r#"{"maxTokens":7000}"#)
+        .expect("valid MCP arguments should parse");
+    assert_eq!(arguments, Some(serde_json::json!({ "maxTokens": 7_000 })));
 }
 
 #[test]
-fn repo_atlas_task_preflight_leaves_valid_and_unrelated_arguments_unchanged() {
-    let mut valid = Some(serde_json::json!({ "maxTokens": 4_000 }));
-    let expected_valid = valid.clone();
-    normalize_mcp_tool_arguments_before_execution(
-        REPO_ATLAS_SERVER_NAME,
-        REPO_ATLAS_TASK_TOOL_NAME,
-        &mut valid,
+fn mcp_argument_parser_keeps_empty_and_invalid_input_contracts() {
+    assert_eq!(
+        parse_mcp_tool_arguments_before_execution("  ").expect("empty arguments are valid"),
+        None
     );
-    assert_eq!(valid, expected_valid);
-
-    let mut unrelated = Some(serde_json::json!({ "maxTokens": 7_000 }));
-    let expected_unrelated = unrelated.clone();
-    normalize_mcp_tool_arguments_before_execution("other-server", "task", &mut unrelated);
-    assert_eq!(unrelated, expected_unrelated);
-    normalize_mcp_tool_arguments_before_execution(REPO_ATLAS_SERVER_NAME, "batch", &mut unrelated);
-    assert_eq!(unrelated, expected_unrelated);
+    assert!(parse_mcp_tool_arguments_before_execution("{").is_err());
 }
 
 fn annotations(
@@ -1709,48 +1682,6 @@ fn sanitize_mcp_tool_result_for_model_rewrites_image_content() {
 }
 
 #[test]
-fn split_mcp_tool_call_execution_moves_raw_result() {
-    let raw_server_result = CallToolResult {
-        content: vec![serde_json::json!({
-            "type": "text",
-            "text": "raw server evidence",
-        })],
-        structured_content: None,
-        is_error: Some(false),
-        meta: None,
-    };
-    let raw_text_ptr = raw_server_result.content[0]["text"]
-        .as_str()
-        .expect("raw server text")
-        .as_ptr();
-    let model_result = CallToolResult {
-        content: vec![serde_json::json!({
-            "type": "text",
-            "text": "model-visible result",
-        })],
-        structured_content: None,
-        is_error: Some(false),
-        meta: None,
-    };
-
-    let (model_result, raw_server_result) =
-        split_mcp_tool_call_execution(Ok(ExecutedMcpToolCall {
-            raw_server_result: Some(raw_server_result),
-            model_result,
-        }));
-    let raw_server_result = raw_server_result.expect("raw server result");
-
-    assert!(model_result.is_ok());
-    assert_eq!(
-        raw_server_result.content[0]["text"]
-            .as_str()
-            .map(str::as_ptr),
-        Some(raw_text_ptr),
-        "the consuming split should move raw evidence instead of cloning it",
-    );
-}
-
-#[test]
 fn sanitize_mcp_tool_result_for_model_preserves_image_when_supported() {
     let original = CallToolResult {
         content: vec![serde_json::json!({
@@ -1770,70 +1701,6 @@ fn sanitize_mcp_tool_result_for_model_preserves_image_when_supported() {
     .expect("unsanitized result");
 
     assert_eq!(got, original);
-}
-
-#[test]
-fn raw_mcp_tool_result_remains_exact_when_model_copy_is_sanitized() {
-    let original = CallToolResult {
-        content: vec![serde_json::json!({
-            "type": "image",
-            "data": "Zm9v",
-            "mimeType": "image/png",
-        })],
-        structured_content: Some(serde_json::json!({"evidenceMeta": {"schemaVersion": 1}})),
-        is_error: Some(false),
-        meta: Some(serde_json::json!({"server": "raw"})),
-    };
-
-    let (raw, model) = preserve_raw_mcp_tool_result_for_evidence(
-        /*supports_image_input*/ false,
-        original.clone(),
-    )
-    .expect("preserved result");
-    let raw = raw.expect("evidence-bearing result should retain the raw response");
-
-    assert_eq!(raw, original);
-    assert_ne!(model.content, raw.content);
-    assert_eq!(model.structured_content, raw.structured_content);
-}
-
-#[test]
-fn ordinary_mcp_result_is_moved_directly_to_the_model_path() {
-    let original = CallToolResult {
-        content: vec![serde_json::json!({
-            "type": "text",
-            "text": "ordinary result",
-        })],
-        structured_content: Some(serde_json::json!({"complete": true})),
-        is_error: Some(false),
-        meta: None,
-    };
-    let text_ptr = original.content[0]["text"]
-        .as_str()
-        .expect("ordinary result text")
-        .as_ptr();
-
-    let (raw, model) =
-        preserve_raw_mcp_tool_result_for_evidence(/*supports_image_input*/ false, original)
-            .expect("ordinary result");
-
-    assert_eq!(raw, None);
-    assert_eq!(
-        model.content[0]["text"].as_str().map(str::as_ptr),
-        Some(text_ptr),
-        "ordinary results should be moved instead of cloned for unused evidence capture",
-    );
-}
-
-#[test]
-fn synthetic_mcp_outcomes_never_expose_raw_server_evidence() {
-    let skipped =
-        McpToolCallOutcome::skipped("skipped".to_string(), serde_json::json!({"input": true}));
-    let cancelled =
-        McpToolCallOutcome::cancelled(serde_json::json!({"input": true}), Duration::from_millis(1));
-
-    assert_eq!(skipped.raw_server_result, None);
-    assert_eq!(cancelled.raw_server_result, None);
 }
 
 #[test]

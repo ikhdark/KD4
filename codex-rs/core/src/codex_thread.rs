@@ -424,22 +424,13 @@ impl CodexThread {
         app_server_client_version: Option<String>,
         mcp_elicitations_auto_deny: bool,
     ) -> ConstraintResult<()> {
-        let app_server_delivery_enabled = app_server_client_name.is_some();
-        let result = self
-            .codex
+        self.codex
             .set_app_server_client_info(
                 app_server_client_name,
                 app_server_client_version,
                 mcp_elicitations_auto_deny,
             )
-            .await;
-        if result.is_ok() && app_server_delivery_enabled {
-            self.codex
-                .session
-                .resume_pending_terminal_deliveries()
-                .await;
-        }
-        result
+            .await
     }
 
     pub async fn set_openai_form_elicitation_support(&self, supported: bool) -> anyhow::Result<()> {
@@ -583,36 +574,6 @@ impl CodexThread {
 
     pub async fn next_event(&self) -> CodexResult<Event> {
         self.codex.next_event().await
-    }
-
-    /// Confirms that app-server reduced the authoritative terminal event and handed its client
-    /// notification to the outbound delivery owner.
-    #[doc(hidden)]
-    pub async fn acknowledge_terminal_event(&self, turn_id: &str, fingerprint: &str) -> bool {
-        self.codex
-            .session
-            .acknowledge_terminal_event(turn_id, fingerprint)
-            .await
-    }
-
-    /// Returns the durable terminal acknowledgement fingerprint, when one exists.
-    #[doc(hidden)]
-    pub async fn durably_acknowledged_terminal_fingerprint(&self, turn_id: &str) -> Option<String> {
-        self.codex
-            .session
-            .durably_acknowledged_terminal_fingerprint(turn_id)
-            .await
-    }
-
-    /// Returns terminal fingerprints that still require app-server notification acknowledgement.
-    #[doc(hidden)]
-    pub async fn terminal_events_requiring_app_server_acknowledgement(
-        &self,
-    ) -> Option<std::collections::HashMap<String, String>> {
-        self.codex
-            .session
-            .terminal_events_requiring_app_server_acknowledgement()
-            .await
     }
 
     pub async fn agent_status(&self) -> AgentStatus {

@@ -1,7 +1,7 @@
 {
-  "index_sha256": "0f82a78e9736e85f6fb426addaf80f1889ec4411de2d746257a7d8c2252d4f1a",
+  "index_sha256": "b779ed4073f8b5a987fd0cec8b4d40751a82e615c38a7f2036f451b5de05b546",
   "index_version": 1,
-  "manifest_sha256": "8a3a6a230e0962303f50ea587d41160119d40d78d8a51d86cacd55b65e380ca3",
+  "manifest_sha256": "e9020f0bf35f98d5c6a523e027d946ca94435a863cf76241faf6de436da8b4e5",
   "omitted": {
     "relationships": 0
   },
@@ -452,7 +452,7 @@
         "codex-rs/core/src/tools/handlers/plan.rs"
       ],
       "facet_exclusions": {
-        "configuration_and_gates": "Planning tier and validation behavior are runtime state, not a repository or feature configuration gate.",
+        "configuration_and_gates": "Checklist state is session-local runtime state, not a repository or feature configuration gate.",
         "generated_artifacts": "The update_plan schema is constructed at runtime and has no checked-in generated mirror."
       },
       "feature_ids": [],
@@ -466,9 +466,9 @@
               "symbol": "impl ToolExecutor<ToolInvocation> for PlanHandler"
             }
           ],
-          "id": "durable-plan-update",
+          "id": "session-plan-update",
           "kind": "semantic",
-          "statement": "Committed plan updates reach durable task evidence before the tool response is emitted; cancellation before the commit boundary emits no plan update.",
+          "statement": "Accepted plan updates commit to the session checklist before the tool response is emitted; cancellation before the commit boundary emits no plan update.",
           "tests": [
             "codex-rs/core/src/tools/handlers/plan_tests.rs"
           ]
@@ -830,126 +830,6 @@
           ],
           "cwd": ".",
           "id": "source-owner-focused",
-          "role": "focused_tests"
-        }
-      ]
-    },
-    {
-      "configuration": [
-        ".codex/hooks.json"
-      ],
-      "facet_exclusions": {
-        "configuration_and_gates": "Hook selection is registered directly in .codex/hooks.json; the PowerShell entrypoint has no separate runtime configuration gate.",
-        "generated_artifacts": "Continuity capsules are bounded local runtime state rather than checked-in generated mirrors."
-      },
-      "feature_ids": [
-        "task-continuity-hooks"
-      ],
-      "generated_artifacts": [],
-      "id": "task-continuity-hooks",
-      "invariants": [
-        {
-          "evidence": [
-            {
-              "path": ".codex/hooks/task-continuity-entry.ps1",
-              "symbol": "$emptyOutput = '{}'"
-            }
-          ],
-          "id": "hook-fail-open",
-          "kind": "semantic",
-          "statement": "Every registered lifecycle hook must emit the canonical empty object and exit successfully when routing or continuity processing fails.",
-          "tests": [
-            "scripts/test_task_continuity_hook.py"
-          ]
-        }
-      ],
-      "primary_entries": [
-        {
-          "ambiguous": true,
-          "path": ".codex/hooks/task-continuity-entry.ps1",
-          "symbol": "param("
-        }
-      ],
-      "roots": [
-        ".codex/hooks.json",
-        ".codex/hooks/task-continuity-entry.ps1",
-        ".codex/hooks/task-continuity-fast-basic.ps1",
-        ".codex/hooks/task-continuity-fast-compact.ps1",
-        ".codex/hooks/task-continuity-fast-session.ps1",
-        ".codex/hooks/task-continuity.ps1",
-        "scripts/test_task_continuity_hook.py"
-      ],
-      "tests": [
-        "scripts/test_task_continuity_hook.py"
-      ],
-      "validation": [
-        {
-          "argv": [
-            "python",
-            "-m",
-            "unittest",
-            "scripts.test_task_continuity_hook"
-          ],
-          "cwd": ".",
-          "id": "task-continuity-hooks-focused",
-          "role": "focused_tests"
-        }
-      ]
-    },
-    {
-      "configuration": [
-        "codex-rs/core/src/task_evidence/external_evidence.rs",
-        "codex-rs/core/src/task_evidence/source_owner_index.rs"
-      ],
-      "facet_exclusions": {
-        "configuration_and_gates": "KD4 completion evidence is activated by repository identity rather than a user-selectable feature gate.",
-        "generated_artifacts": "Evidence documents and oversized payload artifacts are runtime state under CODEX_HOME, not checked-in generated mirrors."
-      },
-      "feature_ids": [
-        "task-evidence-completion-gate"
-      ],
-      "generated_artifacts": [],
-      "id": "task-evidence-runtime",
-      "invariants": [
-        {
-          "evidence": [
-            {
-              "path": "codex-rs/core/src/task_evidence.rs",
-              "symbol": "pub(crate) async fn completion_gate("
-            }
-          ],
-          "id": "current-evidence-completion",
-          "kind": "semantic",
-          "statement": "Completion admission uses current, repository-contained evidence and reopens after relevant mutations or stale validation.",
-          "tests": [
-            "codex-rs/core/src/task_evidence_tests.rs"
-          ]
-        }
-      ],
-      "primary_entries": [
-        {
-          "path": "codex-rs/core/src/task_evidence.rs",
-          "symbol": "TaskEvidenceLedger"
-        }
-      ],
-      "roots": [
-        "codex-rs/core/src/task_evidence.rs",
-        "codex-rs/core/src/task_evidence"
-      ],
-      "tests": [
-        "codex-rs/core/src/task_evidence_tests.rs"
-      ],
-      "validation": [
-        {
-          "argv": [
-            "cargo",
-            "test",
-            "-p",
-            "codex-core",
-            "task_evidence_tests"
-          ],
-          "cwd": "codex-rs",
-          "id": "task-evidence-focused",
           "role": "focused_tests"
         }
       ]
@@ -1363,19 +1243,6 @@
       "target": "path:codex-rs/core/src/session/reasoning_governor.rs"
     },
     {
-      "category": "control_flow",
-      "confidence": "compiler_resolved",
-      "evidence": [
-        {
-          "path": "codex-rs/core/src/tools/handlers/plan.rs",
-          "symbol": "impl ToolExecutor<ToolInvocation> for PlanHandler"
-        }
-      ],
-      "kind": "calls",
-      "source": "owner:planning-architecture-runtime",
-      "target": "path:codex-rs/core/src/task_evidence.rs"
-    },
-    {
       "category": "runtime_registration",
       "confidence": "compiler_resolved",
       "evidence": [
@@ -1394,7 +1261,7 @@
       "evidence": [
         {
           "path": "codex-rs/core/src/tools/handlers/plan_tests.rs",
-          "symbol": "cancellation_after_plan_commit_boundary_waits_for_durable_update"
+          "symbol": "cancellation_after_plan_commit_boundary_waits_for_session_update"
         }
       ],
       "kind": "validated_by",
@@ -1705,110 +1572,6 @@
     },
     {
       "category": "control_flow",
-      "confidence": "declared",
-      "evidence": [
-        {
-          "path": ".codex/hooks/task-continuity-fast-basic.ps1",
-          "symbol": "task-continuity.ps1"
-        }
-      ],
-      "kind": "calls",
-      "source": "owner:task-continuity-hooks",
-      "target": "path:.codex/hooks/task-continuity.ps1"
-    },
-    {
-      "category": "runtime_registration",
-      "confidence": "declared",
-      "evidence": [
-        {
-          "path": ".codex/hooks.json",
-          "symbol": "task-continuity-entry.ps1"
-        }
-      ],
-      "kind": "registers",
-      "source": "owner:task-continuity-hooks",
-      "target": "path:.codex/hooks/task-continuity-entry.ps1"
-    },
-    {
-      "category": "tests_contracts",
-      "confidence": "declared",
-      "evidence": [
-        {
-          "path": "scripts/test_task_continuity_hook.py",
-          "symbol": "class TaskContinuityHookTest"
-        }
-      ],
-      "kind": "validated_by",
-      "source": "owner:task-continuity-hooks",
-      "target": "path:scripts/test_task_continuity_hook.py"
-    },
-    {
-      "category": "callers_consumers",
-      "confidence": "compiler_resolved",
-      "evidence": [
-        {
-          "path": "codex-rs/core/src/tools/handlers/mcp.rs",
-          "symbol": "impl ToolExecutor<ToolInvocation> for McpHandler"
-        }
-      ],
-      "kind": "consumed_by",
-      "source": "owner:task-evidence-runtime",
-      "target": "path:codex-rs/core/src/tools/handlers/mcp.rs"
-    },
-    {
-      "category": "control_flow",
-      "confidence": "compiler_resolved",
-      "evidence": [
-        {
-          "path": "codex-rs/core/src/task_evidence.rs",
-          "symbol": "pub(crate) async fn record_planning_update("
-        }
-      ],
-      "kind": "calls",
-      "source": "owner:task-evidence-runtime",
-      "target": "owner:planning-architecture-runtime"
-    },
-    {
-      "category": "runtime_registration",
-      "confidence": "compiler_resolved",
-      "evidence": [
-        {
-          "path": "codex-rs/core/src/session/session.rs",
-          "symbol": "TaskEvidenceLedger::load_or_new"
-        }
-      ],
-      "kind": "constructs",
-      "source": "owner:task-evidence-runtime",
-      "target": "path:codex-rs/core/src/session/session.rs"
-    },
-    {
-      "category": "tests_contracts",
-      "confidence": "declared",
-      "evidence": [
-        {
-          "path": "codex-rs/core/src/task_evidence_tests.rs",
-          "symbol": "source_owner_is_derived_from_implementation_surfaces"
-        }
-      ],
-      "kind": "validated_by",
-      "source": "owner:task-evidence-runtime",
-      "target": "path:codex-rs/core/src/task_evidence_tests.rs"
-    },
-    {
-      "category": "callers_consumers",
-      "confidence": "compiler_resolved",
-      "evidence": [
-        {
-          "path": "codex-rs/core/src/context_manager/history.rs",
-          "symbol": "read_tool_output"
-        }
-      ],
-      "kind": "consumed_by",
-      "source": "owner:tool-output-recovery",
-      "target": "path:codex-rs/core/src/context_manager/history.rs"
-    },
-    {
-      "category": "control_flow",
       "confidence": "compiler_resolved",
       "evidence": [
         {
@@ -1847,7 +1610,7 @@
       "target": "path:codex-rs/core/src/tools/command_output_artifact_tests.rs"
     }
   ],
-  "repository_revision": "manifest:8a3a6a230e0962303f50ea587d41160119d40d78d8a51d86cacd55b65e380ca3:sources:00b7e32e5b3cd36deae84ffa1dfd47f9b7ee343c6122ff22ef5d251669b06c18",
+  "repository_revision": "manifest:e9020f0bf35f98d5c6a523e027d946ca94435a863cf76241faf6de436da8b4e5:sources:c7ac80aaddfd2b3350df92771ec47472769561197bdcb1d9dd4bcb8ffd58d0da",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

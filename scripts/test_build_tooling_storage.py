@@ -401,11 +401,14 @@ class BuildToolingStorageTest(unittest.TestCase):
     def test_process_classification_is_observed_once_for_snapshot_consumers(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
-            rust_build_status,
-            "_classify_rust_process",
-            wraps=rust_build_status._classify_rust_process,
-        ) as classify:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch.object(
+                rust_build_status,
+                "_classify_rust_process",
+                wraps=rust_build_status._classify_rust_process,
+            ) as classify,
+        ):
             process = rust_build_status.RustProcess(
                 pid=7,
                 name="pwsh.exe",

@@ -15,10 +15,12 @@ const MANAGED_ROOT_RECLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound for synchronous Windows process operations moved off Tokio's
 /// async worker threads.
+#[cfg(windows)]
 pub const WINDOWS_PROCESS_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Creation flag used when Job membership must be established before any
 /// child code is allowed to run.
+#[cfg(windows)]
 pub const WINDOWS_CREATE_SUSPENDED: u32 = winapi::um::winbase::CREATE_SUSPENDED;
 
 static MANAGED_ROOT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -77,7 +79,7 @@ fn admission_reclaimers() -> &'static Mutex<Vec<(u64, AdmissionReclaimer)>> {
 /// Object also owns every descendant in the tree.
 pub struct ManagedRootProcess {
     id: u64,
-
+    #[cfg(windows)]
     job: crate::win::JobObject,
 }
 
@@ -109,6 +111,7 @@ impl ManagedRootProcess {
             );
         }
 
+        #[cfg(windows)]
         let job = match crate::win::JobObject::create() {
             Ok(job) => job,
             Err(error) => {
@@ -119,7 +122,7 @@ impl ManagedRootProcess {
 
         Ok(Self {
             id: NEXT_MANAGED_ROOT_ID.fetch_add(1, Ordering::Relaxed),
-
+            #[cfg(windows)]
             job,
         })
     }
@@ -196,6 +199,7 @@ impl ManagedRootProcess {
     }
 
     /// Open a normally running Windows root by PID and attach it to the Job.
+    #[cfg(windows)]
     pub fn attach(&self, pid: u32) -> io::Result<()> {
         use std::os::windows::io::FromRawHandle;
         use std::os::windows::io::OwnedHandle;
@@ -214,15 +218,18 @@ impl ManagedRootProcess {
     /// Attach a `CREATE_SUSPENDED` child to the Job and then resume all of its
     /// threads. Enumerating the new process's threads recovers the primary
     /// thread handle that `std::process` and Tokio do not expose.
+    #[cfg(windows)]
     pub fn attach_and_resume(&self, pid: u32) -> io::Result<()> {
         self.attach(pid)?;
         resume_process_threads(pid)
     }
 
+    #[cfg(windows)]
     pub fn terminate(&self) -> io::Result<()> {
         self.job.terminate()
     }
 
+    #[cfg(windows)]
     pub fn preserve_descendants(&self) -> io::Result<()> {
         self.job.preserve_descendants()
     }
@@ -230,6 +237,7 @@ impl ManagedRootProcess {
 
 /// Run a synchronous Windows process operation on Tokio's blocking pool with
 /// a bounded wait so a stuck loader cannot stall an async worker thread.
+#[cfg(windows)]
 pub async fn run_windows_process_operation<T, F>(timeout: Duration, operation: F) -> io::Result<T>
 where
     T: Send + 'static,
@@ -249,6 +257,7 @@ where
         .map_err(|error| io::Error::other(format!("Windows process task failed: {error}")))?
 }
 
+#[cfg(windows)]
 fn resume_process_threads(pid: u32) -> io::Result<()> {
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;

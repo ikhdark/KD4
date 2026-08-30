@@ -351,16 +351,13 @@ class CliPreflightTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            cli.write_release_manifests(
-                release_dir, package_dir, [archive_path]
-            )
+            cli.write_release_manifests(release_dir, package_dir, [archive_path])
 
             checksums = (release_dir / "codex-package_SHA256SUMS").read_text()
             self.assertIn(archive_path.name, checksums)
             provenance = json.loads(
                 (
-                    release_dir
-                    / "codex-package_x86_64-pc-windows-msvc_PROVENANCE.json"
+                    release_dir / "codex-package_x86_64-pc-windows-msvc_PROVENANCE.json"
                 ).read_text()
             )
             self.assertEqual(provenance["version"], "1.2.3")

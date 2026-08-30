@@ -97,7 +97,6 @@ fn ordinary_user_envelopes_remain_dynamic_history() {
         skill("user-selected-skill collision"),
         "<environment_context>user environment collision</environment_context>".to_string(),
         "<task_model_guidance>user guidance collision</task_model_guidance>".to_string(),
-        "<kd4_task_state_v1>user task-state collision</kd4_task_state_v1>".to_string(),
         "<recommended_plugins>user plugin collision</recommended_plugins>".to_string(),
     ];
     let mut items = vec![
@@ -135,7 +134,6 @@ fn ordinary_user_envelopes_remain_dynamic_history() {
             StableContextKind::SelectedSkill
                 | StableContextKind::Environment
                 | StableContextKind::TaskModelGuidance
-                | StableContextKind::TaskEvidence
                 | StableContextKind::RecommendedPlugins
         )
     }));
@@ -148,7 +146,6 @@ fn malformed_ordinary_user_markers_do_not_disable_projection() {
         format!("{SKILL_OPEN_TAG}\nuser text"),
         "<environment_context>\nuser text".to_string(),
         "<task_model_guidance>\nuser text".to_string(),
-        "<kd4_task_state_v1>\nuser text".to_string(),
         "<recommended_plugins>\nuser text".to_string(),
         format!("{COLLABORATION_MODE_OPEN_TAG}\nuser text"),
         format!("{SKILLS_USAGE_OPEN_TAG}\nuser text"),
@@ -778,7 +775,6 @@ fn token_efficiency_places_volatile_context_after_reusable_history_prefix() {
     let repository = repository("stable repository");
     let collaboration = collaboration("stable collaboration");
     let environment = "<environment_context>volatile environment</environment_context>";
-    let task_evidence = "<kd4_task_state_v1>volatile task evidence</kd4_task_state_v1>";
     let plugins = "<recommended_plugins>volatile catalog</recommended_plugins>";
     let projection = project_stable_context(
         vec![
@@ -786,7 +782,6 @@ fn token_efficiency_places_volatile_context_after_reusable_history_prefix() {
             output_message("prior answer"),
             text_message("user", environment),
             text_message("developer", &collaboration),
-            text_message("user", task_evidence),
             text_message("user", plugins),
             text_message("user", &repository),
             text_message("user", "current task"),
@@ -804,7 +799,6 @@ fn token_efficiency_places_volatile_context_after_reusable_history_prefix() {
             "prior user",
             "prior answer",
             environment,
-            task_evidence,
             plugins,
             "current task",
             "current tail",
@@ -853,42 +847,6 @@ fn unchanged_runtime_context_preserves_the_previous_request_prefix() {
     );
     assert!(second.manifest.components().iter().any(|component| {
         component.kind == StableContextKind::TaskModelGuidance && component.active
-    }));
-}
-
-#[test]
-fn task_state_updates_keep_only_the_latest_model_visible_snapshot() {
-    let first = "<kd4_task_state_v1>\n## Current state\n- first\n</kd4_task_state_v1>";
-    let second = "<kd4_task_state_v1>\n## Current state\n- second\n</kd4_task_state_v1>";
-    let current = "<kd4_task_state_v1>\n## Current state\n- current\n</kd4_task_state_v1>";
-    let projection = project_stable_context(
-        vec![
-            text_message("user", first),
-            output_message("first tool result"),
-            text_message("user", second),
-            output_message("second tool result"),
-            text_message("user", current),
-        ]
-        .into(),
-        StableContextTarget::Sampling,
-    );
-
-    let text = visible_text(&projection.items);
-    assert!(!text.contains(&first));
-    assert!(!text.contains(&second));
-    assert!(text.contains(&current));
-    assert!(text.contains(&"first tool result"));
-    assert!(text.contains(&"second tool result"));
-    assert_eq!(
-        text.iter()
-            .filter(|text| text.starts_with("<kd4_task_state_v1>"))
-            .count(),
-        1
-    );
-    assert!(projection.manifest.components().iter().any(|component| {
-        component.kind == StableContextKind::TaskEvidence
-            && component.active
-            && component.disposition == StableContextDisposition::Replaced
     }));
 }
 

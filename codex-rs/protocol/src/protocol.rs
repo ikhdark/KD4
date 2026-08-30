@@ -1141,7 +1141,6 @@ pub enum EventMsg {
     /// v1 wire format uses `task_complete`; accept `turn_complete` for v2 interop.
     #[serde(rename = "task_complete", alias = "turn_complete")]
     TurnComplete(TurnCompleteEvent),
-    TurnTerminalizationComplete(TurnTerminalizationCompleteEvent),
 
     /// Transient policy decision emitted immediately before a stream attempt.
     ReasoningPolicyUpdated(ReasoningPolicySnapshot),
@@ -1614,21 +1613,6 @@ pub enum AgentStatus {
         last_agent_message: Option<String>,
         surfaced_result: SurfacedToolResult,
     },
-    /// Agent reached a terminal state with machine-derived completion proof.
-    ///
-    /// This additive variant keeps the legacy no-gate variants wire-compatible
-    /// while retaining every terminal payload that can accompany a completion
-    /// gate, including an error or an authoritative surfaced tool result.
-    TerminalWithCompletion {
-        last_agent_message: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        surfaced_result: Option<SurfacedToolResult>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        error: Option<String>,
-        completion: TaskCompletionGate,
-    },
     /// Agent encountered an error.
     Errored(String),
     /// Agent has been shutdown.
@@ -1897,8 +1881,7 @@ pub struct TurnTiming {
     pub local: TurnTimingLocal,
     pub milestones: TurnTimingMilestones,
     pub counters: TurnTimingCounters,
-    /// Additive terminalization phase timings. Older records deserialize to zeroes; the
-    /// terminalization receipt remains authoritative for phases that occur after live dispatch.
+    /// Additive terminalization phase timings captured as part of the terminal timing profile.
     #[serde(default)]
     pub terminalization: TurnTimingTerminalization,
     /// Per-sampling-request milestones, ordered by request. Times are offsets
@@ -2310,13 +2293,6 @@ pub struct TurnTimingTerminalization {
     pub validation_process_ns: u64,
     #[serde(default)]
     pub validation_aggregate_ns: u64,
-    pub completion_gate_ns: u64,
-    #[serde(default)]
-    pub review_preflight_ns: u64,
-    #[serde(default)]
-    pub review_ns: u64,
-    #[serde(default)]
-    pub checkpoint_tokens: u64,
     #[serde(default)]
     pub validation_launch_count: u32,
     #[serde(default)]
@@ -2327,10 +2303,6 @@ pub struct TurnTimingTerminalization {
     pub diff_reuse_count: u32,
     #[serde(default)]
     pub diff_refresh_count: u32,
-    #[serde(default)]
-    pub reviewer_infrastructure_memo_hit_count: u32,
-    #[serde(default)]
-    pub reviews_prevented_by_correctness_count: u32,
     #[serde(default)]
     pub preparation_ns: u64,
     #[serde(default)]
@@ -2351,46 +2323,6 @@ pub struct TurnTimingTerminalization {
     pub post_cleanup_ns: u64,
     #[serde(default)]
     pub unclassified_ns: u64,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(rename_all = "snake_case", export_to = "v2/")]
-pub enum TerminalizationDeliveryState {
-    NotAttempted,
-    Claimed,
-    Delivered,
-    DeliveryFailed,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(rename_all = "snake_case", export_to = "v2/")]
-pub enum TerminalizationRecoveryState {
-    None,
-    Pending,
-    Recovered,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct TurnTerminalizationReceipt {
-    pub terminal_identity: String,
-    pub terminalization: TurnTimingTerminalization,
-    pub delivery_state: TerminalizationDeliveryState,
-    pub active_turn_detached: bool,
-    pub terminal_interaction_released: bool,
-    pub recovery_state: TerminalizationRecoveryState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub deadline_exhausted_phase: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct TurnTerminalizationCompleteEvent {
-    pub turn_id: String,
-    pub receipt: TurnTerminalizationReceipt,
 }
 
 /// Semantic basis used by request token-category accounting.
@@ -2891,8 +2823,6 @@ pub enum TurnTimingProgressKind {
 pub enum TurnTimingGenerationReason {
     Initial,
     ToolContinuation,
-    CompletionReview,
-    CompletionRepairRereview,
     Compaction,
     Subagent,
     #[default]
@@ -2915,8 +2845,6 @@ pub enum TurnTimingAttemptKind {
 pub struct TurnTimingGenerationReasonCounts {
     pub initial: u32,
     pub tool_continuation: u32,
-    pub completion_review: u32,
-    pub completion_repair_rereview: u32,
     pub compaction: u32,
     pub subagent: u32,
     pub other: u32,
@@ -3168,12 +3096,6 @@ pub struct TurnTimingCounters {
     /// Ready startup prewarms observed by the first model request.
     #[serde(default)]
     pub ready_startup_prewarm_count: u32,
-    /// Completion-review coordinators that observed the ready phase.
-    #[serde(default)]
-    pub completion_review_ready_phase_count: u32,
-    /// Completion-review coordinators that observed the terminal phase.
-    #[serde(default)]
-    pub completion_review_terminal_phase_count: u32,
     /// Bounded to the stable purpose enum's cardinality.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub purpose_aggregates: Vec<TurnTimingGenerationPurposeAggregate>,
@@ -3260,25 +3182,6 @@ pub struct TurnTimingCounters {
     pub saturation_count: u32,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(rename_all = "snake_case")]
-pub enum TaskCompletionStatus {
-    Passed,
-    Partial,
-    Blocked,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
-pub struct TaskCompletionGate {
-    pub status: TaskCompletionStatus,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reasons: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub evidence_path: Option<String>,
-}
-
 /// Authoritative typed tool result surfaced as the terminal result of a turn.
 /// `canonical_message`, when present, is owner-authored and may be copied
 /// unchanged into legacy last-message consumers. `value` is never rendered into
@@ -3305,11 +3208,6 @@ pub struct TurnCompleteEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub error: Option<ErrorEvent>,
-    /// Machine-derived completion proof. Absent for read-only or non-KD4 turns
-    /// that never entered the durable task-evidence workflow.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub completion: Option<TaskCompletionGate>,
     /// Unix timestamp (in seconds) when the turn completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null", optional)]
@@ -6099,8 +5997,6 @@ mod tests {
             "ownerDrainedContinuationCount",
             "suppressedValidationOutputCount",
             "readyStartupPrewarmCount",
-            "completionReviewReadyPhaseCount",
-            "completionReviewTerminalPhaseCount",
             "noProgressDirectiveCount",
             "provenLoopActivationCount",
             "toolRouterReuseCount",
@@ -6161,8 +6057,6 @@ mod tests {
         assert_eq!(decoded.counters.owner_drained_continuation_count, 0);
         assert_eq!(decoded.counters.suppressed_validation_output_count, 0);
         assert_eq!(decoded.counters.ready_startup_prewarm_count, 0);
-        assert_eq!(decoded.counters.completion_review_ready_phase_count, 0);
-        assert_eq!(decoded.counters.completion_review_terminal_phase_count, 0);
         assert_eq!(decoded.counters.no_progress_directive_count, 0);
         assert_eq!(decoded.counters.proven_loop_activation_count, 0);
         assert_eq!(decoded.counters.tool_router_reuse_count, 0);
@@ -6210,39 +6104,6 @@ mod tests {
     }
 
     #[test]
-    fn turn_complete_completion_gate_is_typed_and_backward_compatible() -> Result<()> {
-        let event = TurnCompleteEvent {
-            surfaced_result: None,
-            turn_id: "turn-1".to_string(),
-            last_agent_message: None,
-            error: None,
-            completion: Some(TaskCompletionGate {
-                status: TaskCompletionStatus::Partial,
-                reasons: vec!["validation is stale".to_string()],
-                evidence_path: Some("task-evidence/thread.json".to_string()),
-            }),
-            completed_at: None,
-            duration_ms: None,
-            time_to_first_token_ms: None,
-            timing: None,
-        };
-        let value = serde_json::to_value(&event)?;
-        assert_eq!(value["completion"]["status"], json!("partial"));
-        assert_eq!(
-            value["completion"]["reasons"],
-            json!(["validation is stale"])
-        );
-
-        let legacy = serde_json::from_value::<TurnCompleteEvent>(json!({
-            "turn_id": "turn-1",
-            "last_agent_message": null
-        }))?;
-        assert!(legacy.completion.is_none());
-        assert!(legacy.error.is_none());
-        Ok(())
-    }
-
-    #[test]
     fn consolidated_thread_value_types_preserve_their_contracts() -> Result<()> {
         assert_eq!(ThreadSortKey::default(), ThreadSortKey::CreatedAt);
         assert_eq!(SortDirection::default(), SortDirection::Desc);
@@ -6259,33 +6120,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_status_completion_gate_is_additive_and_legacy_shapes_are_stable() -> Result<()> {
+    fn agent_status_completed_shape_is_stable() -> Result<()> {
         assert_eq!(
             serde_json::to_value(AgentStatus::Completed(Some("done".to_string())))?,
             json!({"completed": "done"})
         );
-
-        let completion = TaskCompletionGate {
-            status: TaskCompletionStatus::Passed,
-            reasons: vec!["focused test passed".to_string()],
-            evidence_path: Some("task-evidence/thread.json".to_string()),
-        };
-        let status = AgentStatus::TerminalWithCompletion {
-            last_agent_message: Some("done".to_string()),
-            surfaced_result: Some(SurfacedToolResult {
-                adapter: "owner".to_string(),
-                value: json!({"answer": 42}),
-                canonical_message: None,
-            }),
-            error: None,
-            completion,
-        };
-        let value = serde_json::to_value(&status)?;
-        assert_eq!(
-            value["terminal_with_completion"]["completion"]["status"],
-            json!("passed")
-        );
-        assert_eq!(serde_json::from_value::<AgentStatus>(value)?, status);
         Ok(())
     }
 
@@ -8360,16 +8199,6 @@ mod tests {
         let current =
             serde_json::to_value(TurnTiming::default()).expect("turn timing serialization");
         assert!(current.get("provablyAvoidableTokens").is_none());
-        let terminalization = current["terminalization"]
-            .as_object()
-            .expect("terminalization object");
-        assert!(
-            terminalization
-                .get("candidateToValidationLaunchNs")
-                .is_none()
-        );
-        assert!(terminalization.get("validationAggregateToGateNs").is_none());
-
         let mut historical = current;
         historical["schemaVersion"] = serde_json::json!(9);
         historical
@@ -8384,8 +8213,6 @@ mod tests {
             "reasoningTokens": 5,
             "totalTokens": 6,
         });
-        historical["terminalization"]["candidateToValidationLaunchNs"] = serde_json::json!(7);
-        historical["terminalization"]["validationAggregateToGateNs"] = serde_json::json!(8);
         let mut historical_request = serde_json::to_value(TurnTimingModelRequest::default())
             .expect("model request serialization");
         historical_request["decisionBearing"] = serde_json::json!(true);
@@ -8407,16 +8234,6 @@ mod tests {
         );
         let reserialized = serde_json::to_value(decoded).expect("decoded timing serialization");
         assert!(reserialized.get("provablyAvoidableTokens").is_none());
-        assert!(
-            reserialized["terminalization"]
-                .get("candidateToValidationLaunchNs")
-                .is_none()
-        );
-        assert!(
-            reserialized["terminalization"]
-                .get("validationAggregateToGateNs")
-                .is_none()
-        );
         let request = &reserialized["modelRequests"][0];
         assert!(request.get("decisionBearing").is_none());
         assert!(

@@ -1172,7 +1172,6 @@ async fn interrupted_turn_after_goal_budget_limited_uses_budget_message_snapshot
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,
-                    completion: None,
                     timing: None,
                     surfaced_result: None,
                     reasoning_policy_history: None,
@@ -1205,7 +1204,6 @@ async fn interrupted_turn_after_goal_budget_limited_uses_budget_message_snapshot
             codex_app_server_protocol::TurnCompletedNotification {
                 surfaced_result: None,
                 thread_id: "thread-1".to_string(),
-                completion: None,
                 timing: None,
                 turn: codex_app_server_protocol::Turn {
                     id: "turn-1".to_string(),
@@ -1216,7 +1214,6 @@ async fn interrupted_turn_after_goal_budget_limited_uses_budget_message_snapshot
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,
-                    completion: None,
                     timing: None,
                     surfaced_result: None,
                     reasoning_policy_history: None,

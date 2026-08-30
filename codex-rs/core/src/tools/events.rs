@@ -2,7 +2,6 @@ use crate::FunctionCallError;
 use crate::agent::task_capabilities::normalize_absolute_repo_path;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::tools::command_execution::CompletedValidation;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
 use codex_agent_task_store::AttemptState;
@@ -42,7 +41,6 @@ pub(crate) struct ToolEventCtx<'a> {
     pub turn: &'a TurnContext,
     pub call_id: &'a str,
     pub turn_diff_tracker: Option<&'a SharedTurnDiffTracker>,
-    pub completed_validation: Option<&'a CompletedValidation>,
 }
 
 impl<'a> ToolEventCtx<'a> {
@@ -57,16 +55,7 @@ impl<'a> ToolEventCtx<'a> {
             turn,
             call_id,
             turn_diff_tracker,
-            completed_validation: None,
         }
-    }
-
-    pub fn with_completed_validation(
-        mut self,
-        completed_validation: Option<&'a CompletedValidation>,
-    ) -> Self {
-        self.completed_validation = completed_validation;
-        self
     }
 }
 
@@ -134,7 +123,7 @@ fn apply_patch_intent_paths(changes: &HashMap<PathBuf, FileChange>) -> Vec<PathB
     paths
 }
 
-fn apply_patch_evidence_cwd(
+fn apply_patch_local_cwd(
     ctx: ToolEventCtx<'_>,
     environment_id: Option<&str>,
 ) -> Option<AbsolutePathBuf> {
@@ -150,16 +139,7 @@ fn apply_patch_evidence_cwd(
     if environment.environment.is_remote() {
         return None;
     }
-    let cwd = environment.cwd().to_abs_path().ok()?;
-    cwd.as_path()
-        .ancestors()
-        .any(|candidate| {
-            ctx.session
-                .services
-                .task_evidence
-                .matches_repo_root(candidate)
-        })
-        .then_some(cwd)
+    environment.cwd().to_abs_path().ok()
 }
 
 pub(crate) async fn emit_exec_command_begin(
@@ -314,31 +294,10 @@ impl ToolEmitter {
                 Self::ApplyPatch {
                     changes,
                     auto_approved,
-                    environment_id,
+                    environment_id: _,
                 },
                 ToolEventStage::Begin,
             ) => {
-                let paths = apply_patch_intent_paths(changes);
-                if let Some(cwd) = apply_patch_evidence_cwd(ctx, environment_id.as_deref()) {
-                    let (ledger, provenance) = ctx
-                        .session
-                        .services
-                        .agent_control
-                        .completion_evidence_target(
-                            &ctx.turn.session_source,
-                            ctx.session.thread_id,
-                            &ctx.session.services.task_evidence,
-                        )
-                        .await;
-                    ledger
-                        .record_edit_intent_with_provenance(
-                            ctx.call_id,
-                            cwd.as_path(),
-                            &paths,
-                            provenance.as_ref(),
-                        )
-                        .await;
-                }
                 ctx.session
                     .emit_turn_item_started(
                         ctx.turn,
@@ -932,15 +891,6 @@ async fn emit_exec_end(
     finish_exec_mutation_evidence(ctx).await;
     let possible_mutation = mutation.may_have_mutated();
     let mutation_paths = mutation.paths();
-    let (validation_result, bound_plan_step, bound_work_unit) =
-        ctx.completed_validation
-            .map_or((None, None, None), |completed| {
-                (
-                    Some(completed.result.clone()),
-                    completed.bound_plan_step.clone(),
-                    completed.bound_work_unit.clone(),
-                )
-            });
     let generation_batch = if possible_mutation
         && exec_result.status != ExecCommandStatus::Declined
         && observed_workspace_identity.is_none()
@@ -1054,52 +1004,6 @@ async fn emit_exec_end(
             )
             .await;
     }
-    let (ledger, provenance) = ctx
-        .session
-        .services
-        .agent_control
-        .completion_evidence_target(
-            &ctx.turn.session_source,
-            ctx.session.thread_id,
-            &ctx.session.services.task_evidence,
-        )
-        .await;
-    let implementation_identity_hash = if possible_mutation || validation_result.is_some() {
-        None
-    } else {
-        crate::tasks::completion_review::implementation_identity_for_evidence(ctx.session, &ledger)
-            .await
-    };
-    let bound_plan_step = validation_result
-        .as_ref()
-        .is_some_and(|result| result.status.is_success())
-        .then_some(bound_plan_step)
-        .flatten();
-    let bound_work_unit = validation_result
-        .as_ref()
-        .is_some_and(|result| result.status.is_success())
-        .then_some(bound_work_unit)
-        .flatten();
-    ledger
-        .record_command_bound_with_validation_result(
-            exec_input.command,
-            exec_input.cwd,
-            exec_result.exit_code,
-            exec_result.timed_out,
-            u64::try_from(exec_result.duration.as_millis()).unwrap_or(u64::MAX),
-            mutation,
-            None,
-            provenance.as_ref(),
-            implementation_identity_hash.as_deref(),
-            validation_result,
-            bound_plan_step
-                .as_ref()
-                .map(|(step_id, revision)| (step_id.as_str(), *revision)),
-            bound_work_unit
-                .as_ref()
-                .map(|(work_unit_id, revision)| (work_unit_id.as_str(), *revision)),
-        )
-        .await;
     ctx.session
         .emit_turn_item_completed(
             ctx.turn,
@@ -1140,10 +1044,10 @@ async fn emit_patch_end(
 ) {
     let evidence_cwd = match &tracker_update {
         TurnDiffTrackerUpdate::Track { environment_id, .. } => {
-            apply_patch_evidence_cwd(ctx, environment_id.as_deref())
+            apply_patch_local_cwd(ctx, environment_id.as_deref())
         }
         TurnDiffTrackerUpdate::Invalidate | TurnDiffTrackerUpdate::None => {
-            apply_patch_evidence_cwd(ctx, None)
+            apply_patch_local_cwd(ctx, None)
         }
     };
     if status != PatchApplyStatus::Declined {
@@ -1197,24 +1101,6 @@ async fn emit_patch_end(
                 .await;
         }
     }
-    let outcome = match &status {
-        PatchApplyStatus::Completed => "completed",
-        PatchApplyStatus::Failed => "failed",
-        PatchApplyStatus::Declined => "declined",
-    };
-    let (ledger, provenance) = ctx
-        .session
-        .services
-        .agent_control
-        .completion_evidence_target(
-            &ctx.turn.session_source,
-            ctx.session.thread_id,
-            &ctx.session.services.task_evidence,
-        )
-        .await;
-    ledger
-        .record_edit_result_with_provenance(ctx.call_id, outcome, provenance.as_ref())
-        .await;
     ctx.session
         .emit_turn_item_completed(
             ctx.turn,
@@ -1260,7 +1146,6 @@ mod tests {
     use super::*;
     use crate::session::tests::make_session_and_context_with_dynamic_tools_and_rx;
     use crate::session::turn_context::TurnEnvironment;
-    use crate::task_evidence::TaskEvidenceLedger;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_exec_server::LOCAL_FS;
     use codex_protocol::AgentPath;
@@ -1279,26 +1164,6 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
-
-    async fn enable_task_evidence_for_repo(session: &mut Arc<Session>, repo: &Path) -> PathBuf {
-        tokio::fs::create_dir_all(repo)
-            .await
-            .expect("task evidence repo fixture");
-        tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
-            .await
-            .expect("feature manifest fixture");
-        let codex_home = repo.join(".codex-home");
-        let thread_id = ThreadId::new();
-        let evidence_path = codex_home
-            .join("task-evidence")
-            .join(format!("{thread_id}.json"));
-        let ledger = TaskEvidenceLedger::load_or_new(codex_home, thread_id, repo).await;
-        Arc::get_mut(session)
-            .expect("single session reference")
-            .services
-            .task_evidence = ledger;
-        evidence_path
-    }
 
     async fn enable_typed_task_for_repo(
         session: &mut Arc<Session>,
@@ -1386,20 +1251,6 @@ mod tests {
         )
     }
 
-    async fn latest_evidence_file_paths(evidence_path: &Path) -> Vec<String> {
-        let bytes = tokio::fs::read(evidence_path)
-            .await
-            .expect("task evidence file");
-        let document: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("valid task evidence");
-        document["latest_file_hashes"]
-            .as_object()
-            .expect("latest file hashes")
-            .keys()
-            .cloned()
-            .collect()
-    }
-
     fn initialize_git_repository(path: &Path) {
         std::fs::create_dir_all(path).expect("create repository");
         let status = Command::new("git")
@@ -1408,122 +1259,6 @@ mod tests {
             .status()
             .expect("launch git init");
         assert!(status.success(), "git init failed");
-    }
-
-    #[tokio::test]
-    async fn completed_validation_is_persisted_and_invalidated_by_a_covered_mutation() {
-        let temp = tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        initialize_git_repository(&repo);
-        tokio::fs::create_dir_all(repo.join("src"))
-            .await
-            .expect("source directory");
-        tokio::fs::write(repo.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")
-            .await
-            .expect("source fixture");
-
-        let (mut session, turn, _rx_event) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        let evidence_path = enable_task_evidence_for_repo(&mut session, &repo).await;
-        let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("absolute cwd");
-        let validation_command = vec![
-            "cargo".to_string(),
-            "test".to_string(),
-            "-p".to_string(),
-            "fixture".to_string(),
-            "focused_validation".to_string(),
-        ];
-        let completed_validation = CompletedValidation {
-            result: codex_protocol::validation::ValidationResult {
-                argv: validation_command.clone(),
-                covered_paths: vec!["src/lib.rs".to_string()],
-                call_id: "validation-call".to_string(),
-                process_id: None,
-                status: codex_protocol::validation::ValidationTerminalStatus::Succeeded,
-                duration_ms: 7,
-                summary: Some("focused validation succeeded".to_string()),
-                failure_excerpt: None,
-                raw_artifact_ref: None,
-                raw_artifact_sha256: None,
-            },
-            bound_plan_step: None,
-            bound_work_unit: None,
-            focused_validation_token: None,
-        };
-        let validation = ToolEmitter::shell(
-            validation_command.clone(),
-            cwd.clone(),
-            ExecCommandSource::Agent,
-            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
-        );
-        validation
-            .begin(ToolEventCtx::new(
-                session.as_ref(),
-                turn.as_ref(),
-                "validation-call",
-                None,
-            ))
-            .await;
-        validation
-            .finish(
-                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "validation-call", None)
-                    .with_completed_validation(Some(&completed_validation)),
-                Ok(ExecToolCallOutput::default()),
-                None,
-            )
-            .await
-            .expect("validation event completes");
-
-        let mutation_command = vec!["touch".to_string(), "src/lib.rs".to_string()];
-        let mutation = ToolEmitter::shell(
-            mutation_command,
-            cwd,
-            ExecCommandSource::Agent,
-            codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
-        );
-        mutation
-            .begin(ToolEventCtx::new(
-                session.as_ref(),
-                turn.as_ref(),
-                "mutation-call",
-                None,
-            ))
-            .await;
-        tokio::fs::write(repo.join("src/lib.rs"), "pub fn value() -> u8 { 2 }\n")
-            .await
-            .expect("covered mutation");
-        mutation
-            .finish(
-                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "mutation-call", None),
-                Ok(ExecToolCallOutput::default()),
-                None,
-            )
-            .await
-            .expect("mutation event completes");
-
-        let bytes = tokio::fs::read(evidence_path)
-            .await
-            .expect("task evidence file");
-        let document: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("valid task evidence");
-        let receipt = document["command_receipts"]
-            .as_array()
-            .expect("command receipts")
-            .iter()
-            .find(|receipt| receipt["validation_call_id"] == "validation-call")
-            .expect("persisted validation receipt");
-        assert_eq!(receipt["command"], serde_json::json!(validation_command));
-        assert_eq!(receipt["validation_result"]["callId"], "validation-call");
-        assert_eq!(
-            receipt["validation_result"]["coveredPaths"],
-            serde_json::json!(["src/lib.rs"])
-        );
-        assert!(
-            receipt["validation_invalidated_at_revision"]
-                .as_u64()
-                .is_some_and(|revision| revision > 0),
-            "a later covered mutation must invalidate the persisted validation"
-        );
     }
 
     fn set_turn_environments(turn: &mut Arc<TurnContext>, environments: &[(&str, &Path)]) {
@@ -2059,137 +1794,6 @@ mod tests {
                 .iter()
                 .all(|item| item.pre_write_hash != item.final_hash)
         );
-    }
-
-    #[tokio::test]
-    async fn apply_patch_evidence_uses_selected_environment_and_move_destination() {
-        let temp = tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        let selected = repo.join("selected");
-        tokio::fs::create_dir_all(&selected)
-            .await
-            .expect("selected cwd");
-        tokio::fs::write(selected.join("source.txt"), "before source")
-            .await
-            .expect("source fixture");
-        tokio::fs::write(selected.join("dest.txt"), "before destination")
-            .await
-            .expect("destination fixture");
-        tokio::fs::write(repo.join("source.txt"), "primary source")
-            .await
-            .expect("primary source fixture");
-        tokio::fs::write(repo.join("dest.txt"), "primary destination")
-            .await
-            .expect("primary destination fixture");
-
-        let (mut session, mut turn, _rx_event) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        let evidence_path = enable_task_evidence_for_repo(&mut session, &repo).await;
-        set_turn_environments(
-            &mut turn,
-            &[
-                ("primary", repo.as_path()),
-                ("selected", selected.as_path()),
-            ],
-        );
-        let emitter = ToolEmitter::apply_patch_for_environment(
-            HashMap::from([(
-                PathBuf::from("source.txt"),
-                FileChange::Update {
-                    unified_diff: String::new(),
-                    move_path: Some(PathBuf::from("dest.txt")),
-                },
-            )]),
-            false,
-            "selected".to_string(),
-        );
-
-        emitter
-            .begin(ToolEventCtx::new(
-                session.as_ref(),
-                turn.as_ref(),
-                "move-call",
-                None,
-            ))
-            .await;
-        tokio::fs::remove_file(selected.join("source.txt"))
-            .await
-            .expect("remove source");
-        tokio::fs::write(selected.join("dest.txt"), "after destination")
-            .await
-            .expect("replace destination");
-        emitter
-            .finish(
-                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "move-call", None),
-                Ok(ExecToolCallOutput::default()),
-                None,
-            )
-            .await
-            .expect("successful patch");
-
-        assert_eq!(
-            latest_evidence_file_paths(&evidence_path).await,
-            vec![
-                "selected/dest.txt".to_string(),
-                "selected/source.txt".to_string(),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_patch_evidence_skips_an_unrepresentable_selected_environment() {
-        let temp = tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        let selected = temp.path().join("other-checkout");
-        tokio::fs::create_dir_all(&selected)
-            .await
-            .expect("selected cwd");
-
-        let (mut session, mut turn, _rx_event) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        let evidence_path = enable_task_evidence_for_repo(&mut session, &repo).await;
-        set_turn_environments(
-            &mut turn,
-            &[
-                ("primary", repo.as_path()),
-                ("selected", selected.as_path()),
-            ],
-        );
-        let emitter = ToolEmitter::apply_patch_for_environment(
-            HashMap::from([(
-                PathBuf::from("target.txt"),
-                FileChange::Add {
-                    content: "selected".to_string(),
-                },
-            )]),
-            false,
-            "selected".to_string(),
-        );
-
-        emitter
-            .begin(ToolEventCtx::new(
-                session.as_ref(),
-                turn.as_ref(),
-                "outside-call",
-                None,
-            ))
-            .await;
-        tokio::fs::write(repo.join("target.txt"), "unrelated primary mutation")
-            .await
-            .expect("primary mutation");
-        tokio::fs::write(selected.join("target.txt"), "selected mutation")
-            .await
-            .expect("selected mutation");
-        emitter
-            .finish(
-                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "outside-call", None),
-                Ok(ExecToolCallOutput::default()),
-                None,
-            )
-            .await
-            .expect("successful patch");
-
-        assert!(latest_evidence_file_paths(&evidence_path).await.is_empty());
     }
 
     #[tokio::test]

@@ -4,7 +4,6 @@ use std::time::Instant;
 use crate::FunctionCallError;
 use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::mcp_tool_call::handle_mcp_tool_call;
-use crate::task_evidence::ExternalEvidenceCapture;
 use crate::tools::context::McpToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -18,8 +17,6 @@ use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolTelemetryTags;
 use codex_mcp::ToolInfo;
-use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::WarningEvent;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolName;
@@ -28,9 +25,9 @@ use codex_tools::ToolSearchSourceInfo;
 use codex_tools::ToolSpec;
 use codex_tools::can_request_original_image_detail;
 use codex_tools::mcp_tool_to_responses_api_tool;
+use codex_tools::schema_search_text;
 use serde_json::Map;
 use serde_json::Value;
-use tracing::warn;
 
 const LEGACY_MCP_TOOL_NAME_PREFIX: &str = "mcp__";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
@@ -173,7 +170,7 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
         });
 
         ToolSearchInfo::from_spec(
-            build_mcp_search_text(&self.tool_info),
+            build_mcp_search_text(&self.tool_info, registered_spec),
             registered_spec.clone(),
             source_info,
         )
@@ -219,53 +216,6 @@ impl McpHandler {
             cancellation_token,
         )
         .await;
-        if let Some(raw_server_result) = result.raw_server_result.as_ref() {
-            let (evidence_ledger, provenance) = session
-                .services
-                .agent_control
-                .completion_evidence_target(
-                    &turn.session_source,
-                    session.thread_id,
-                    &session.services.task_evidence,
-                )
-                .await;
-            let implementation_identity_hash = if evidence_ledger
-                .should_compute_external_mcp_evidence_identity(raw_server_result)
-            {
-                crate::tasks::completion_review::implementation_identity_for_evidence(
-                    session.as_ref(),
-                    &evidence_ledger,
-                )
-                .await
-            } else {
-                None
-            };
-            match evidence_ledger
-                .record_external_mcp_evidence_bound_with_provenance(
-                    &self.tool_info.server_name,
-                    self.tool_info.tool.name.as_ref(),
-                    &call_id,
-                    raw_server_result,
-                    provenance.as_ref(),
-                    implementation_identity_hash.as_deref(),
-                )
-                .await
-            {
-                ExternalEvidenceCapture::Warning(message) => {
-                    warn!("{message}");
-                    session
-                        .send_event(
-                            turn.as_ref(),
-                            EventMsg::Warning(WarningEvent {
-                                message: message.to_string(),
-                            }),
-                        )
-                        .await;
-                }
-                ExternalEvidenceCapture::Ignored | ExternalEvidenceCapture::Stored => {}
-            }
-        }
-
         Ok(boxed_tool_output(McpToolOutput::new(
             result.result,
             result.tool_input,
@@ -392,16 +342,8 @@ fn mcp_hook_tool_input(raw_arguments: &str) -> Value {
     }
 }
 
-fn build_mcp_search_text(info: &ToolInfo) -> String {
+fn build_mcp_search_text(info: &ToolInfo, registered_spec: &ToolSpec) -> String {
     let tool_name = info.canonical_tool_name();
-    let mut schema_properties = info
-        .tool
-        .input_schema
-        .get("properties")
-        .and_then(serde_json::Value::as_object)
-        .map(|map| map.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    schema_properties.sort();
     let mut parts = vec![
         flat_tool_name(&tool_name).into_owned(),
         info.callable_name.clone(),
@@ -436,7 +378,17 @@ fn build_mcp_search_text(info: &ToolInfo) -> String {
             .filter(|display_name| !display_name.is_empty())
             .map(str::to_string),
     );
-    parts.extend(schema_properties);
+    match registered_spec {
+        ToolSpec::Function(tool) => parts.push(schema_search_text(&tool.parameters)),
+        ToolSpec::Namespace(namespace) => {
+            for tool in &namespace.tools {
+                let ResponsesApiNamespaceTool::Function(tool) = tool;
+                parts.push(schema_search_text(&tool.parameters));
+            }
+        }
+        ToolSpec::Freeform(_) | ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => {}
+    }
+    parts.retain(|part| !part.trim().is_empty());
     parts.join(" ")
 }
 

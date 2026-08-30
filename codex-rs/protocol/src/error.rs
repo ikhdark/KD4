@@ -65,6 +65,10 @@ pub enum CodexErr {
     /// have happened before dispatch. Outer response-stream loops must not retry this error again.
     #[error("request failed before dispatch after exhausting retries: {0}")]
     PreDispatchRetryExhausted(String),
+    /// Returned when a request cannot be constructed. Repeating the same request cannot repair
+    /// malformed request data, so outer response-stream loops must not retry this error.
+    #[error("request could not be built: {0}")]
+    RequestBuild(String),
     #[error(
         "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
     )]
@@ -160,6 +164,7 @@ impl CodexErr {
             | CodexErr::EnvVar(_)
             | CodexErr::Fatal(_)
             | CodexErr::PreDispatchRetryExhausted(_)
+            | CodexErr::RequestBuild(_)
             | CodexErr::RegionRestricted(_)
             | CodexErr::UsageNotIncluded
             | CodexErr::QuotaExceeded
@@ -177,10 +182,12 @@ impl CodexErr {
             | CodexErr::UsageLimitReached(_)
             | CodexErr::ServerOverloaded
             | CodexErr::CyberPolicy { .. } => false,
+            CodexErr::UnexpectedStatus(error) => {
+                error.status == StatusCode::TOO_MANY_REQUESTS || error.status.is_server_error()
+            }
             CodexErr::Stream(..)
             | CodexErr::Timeout
             | CodexErr::RequestTimeout
-            | CodexErr::UnexpectedStatus(_)
             | CodexErr::ResponseStreamFailed(_)
             | CodexErr::ConnectionFailed(_)
             | CodexErr::InternalServerError

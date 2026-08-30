@@ -47,14 +47,6 @@ suppressedValidationOutputCount: number,
  */
 readyStartupPrewarmCount: number,
 /**
- * Completion-review coordinators that observed the ready phase.
- */
-completionReviewReadyPhaseCount: number,
-/**
- * Completion-review coordinators that observed the terminal phase.
- */
-completionReviewTerminalPhaseCount: number,
-/**
  * Bounded to the stable purpose enum's cardinality.
  */
 purposeAggregates?: Array<TurnTimingGenerationPurposeAggregate>, samePurposeContinuationCount: number, exactRepeatedWaitCount: number, planningGenerationCount: number, planRevisionGenerationCount: number, planningFixedPointIterationCount: number, planningInvalidationCount: number, planningSemanticEffectCount: number, planningFailureCount: number, failureSignatureCount: number, failureDiagnosisCount: number, attemptsByKind: TurnTimingAttemptKindCounts, modelRequestCount: number, modelRetryCount: number, modelFallbackCount: number, toolCallCount: number, approvalWaitCount: number, permissionWaitCount: number, userInputWaitCount: number, mcpElicitationWaitCount: number, waitOnlyGenerationCount: number, internallyDrainedWaitCount: number, noProgressDirectiveCount: number, provenLoopActivationCount: number, toolRouterReuseCount: number, toolRouterRebuildCount: number, projectionSourceDependenciesReuseCount: number, projectionSourceDependenciesFallbackCount: number, toolOutputTruncationCount: number, toolOutputProjectedTokenCount: bigint, toolOutputArtifactRereadCount: number, toolOutputCanonicalByteCount: bigint, toolOutputCanonicalTokenCount: bigint, toolOutputModelByteCount: bigint, toolOutputModelTokenCount: bigint, toolOutputArtifactCreationCount: number, toolOutputArtifactReuseCount: number, toolOutputProjectionTruncationCount: number, toolOutputOmittedSectionCount: bigint, toolOutputRecoveryCallCount: number, toolOutputRecoveryRetruncationCount: number, toolOutputRecursiveSpillCount: number, attributableRecoveryGenerationCount: number, truncationInducedContinuationCount: number, invalidTransitionCount: number, clockRegressionCount: number, saturationCount: number, };

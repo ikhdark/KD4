@@ -13,7 +13,6 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnTimingToolCallSource;
 use codex_protocol::user_input::UserInput;
@@ -701,16 +700,6 @@ async fn exec_command_fast_success_and_failure_lifecycles_finish_inline() -> Res
         completed.error.as_ref().map(|error| error.message.as_str()),
         Some(error_message)
     );
-    let completion = completed
-        .completion
-        .expect("required command failure carries semantic completion status");
-    assert_eq!(completion.status, TaskCompletionStatus::Partial);
-    assert!(
-        completion
-            .reasons
-            .iter()
-            .any(|reason| reason == error_message)
-    );
     let timing = completed
         .timing
         .expect("turn completion should include timing");
@@ -953,6 +942,10 @@ async fn exec_command_interrupt_closes_unpublished_retained_process_before_turn_
     assert!(
         lifecycle.process_spawned_at_ms <= lifecycle.process_exited_at_ms,
         "process exit must not precede process spawn: {lifecycle:?}"
+    );
+    assert!(
+        lifecycle.process_exited_at_ms <= lifecycle.handler_exit_at_ms,
+        "the handler must not return before retained-process exit: {lifecycle:?}"
     );
     assert!(lifecycle.output_collected_at_ms.is_some());
     assert!(

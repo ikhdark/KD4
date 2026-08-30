@@ -13,6 +13,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+use codex_app_server_protocol::DESKTOP_CLIENT_NAME;
+use codex_app_server_protocol::DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH;
+use codex_app_server_protocol::DesktopRuntimeReceipt;
 use codex_install_context::InstallContext;
 use codex_install_context::InstallMethod;
 use codex_utils_build_info::BuildInfo;
@@ -28,9 +31,6 @@ use super::DoctorIssue;
 use super::describe_install_context;
 use super::doctor_install_context;
 use super::push_path_detail;
-
-const DESKTOP_RUNTIME_RECEIPT_RELATIVE_PATH: &str = "runtime/desktop-app-server-runtime.json";
-const DESKTOP_CLIENT_NAME: &str = "codex_desktop";
 
 /// Builds the process provenance row for the current Codex executable.
 ///
@@ -94,7 +94,7 @@ fn local_publish_target_path_from_inputs(
 
     let publish_dir = match local_publish_dir {
         Some(path) => path,
-        None => default_home?.join("Desktop").join("LOCAL-KD"),
+        None => default_home?.join("Desktop").join("LOCAL-KD").join("bin"),
     };
     Some(publish_dir.join("codex.exe"))
 }
@@ -338,7 +338,6 @@ pub(super) async fn desktop_runtime_chain_check(
         &target_path,
         std::process::id(),
         &expected_codex_home,
-        BuildInfo::current(),
     ) {
         details.push(format!("desktop runtime receipt status: {err}"));
         return DoctorCheck::new(
@@ -586,21 +585,6 @@ struct DesktopProcessEvidence {
     is_app_server: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct DesktopRuntimeReceipt {
-    schema_version: u32,
-    pid: u32,
-    executable_path: PathBuf,
-    codex_home: PathBuf,
-    client_name: String,
-    build_version: String,
-    build_commit: String,
-    build_dirty: String,
-    build_profile: String,
-    build_built: String,
-}
-
 fn read_desktop_runtime_receipt(path: &Path) -> Result<DesktopRuntimeReceipt, String> {
     let file = File::open(path).map_err(|err| err.to_string())?;
     serde_json::from_reader(file).map_err(|err| err.to_string())
@@ -612,7 +596,6 @@ fn validate_desktop_runtime_receipt(
     target_path: &Path,
     current_pid: u32,
     expected_codex_home: &Path,
-    expected_build: BuildInfo,
 ) -> Result<(), String> {
     if receipt.schema_version != 1 {
         return Err(format!(
@@ -648,22 +631,10 @@ fn validate_desktop_runtime_receipt(
     if !same_path(&receipt.codex_home, expected_codex_home) {
         return Err("receipt CODEX_HOME does not match the intended fork home".to_string());
     }
-    let expected_identity = [
-        expected_build.version,
-        expected_build.commit,
-        expected_build.dirty,
-        expected_build.profile,
-        expected_build.built,
-    ];
-    let receipt_identity = [
-        receipt.build_version.as_str(),
-        receipt.build_commit.as_str(),
-        receipt.build_dirty.as_str(),
-        receipt.build_profile.as_str(),
-        receipt.build_built.as_str(),
-    ];
-    if receipt_identity != expected_identity {
-        return Err("receipt build identity does not match the selected binary".to_string());
+    let target_sha256 =
+        file_sha256(target_path).map_err(|err| format!("could not hash selected binary: {err}"))?;
+    if receipt.executable_sha256 != target_sha256 {
+        return Err("receipt executable hash does not match the selected binary".to_string());
     }
     Ok(())
 }
@@ -800,10 +771,12 @@ mod tests {
         codex_home: PathBuf,
         pid: u32,
     ) -> DesktopRuntimeReceipt {
+        std::fs::write(&executable_path, b"test codex binary").expect("write test binary");
         let build = BuildInfo::current();
         DesktopRuntimeReceipt {
             schema_version: 1,
             pid,
+            executable_sha256: file_sha256(&executable_path).expect("hash test binary"),
             executable_path,
             codex_home,
             client_name: "codex_desktop".to_string(),
@@ -857,7 +830,12 @@ mod tests {
         );
         assert_eq!(
             local_publish_target_path_from_inputs(None, None, Some(home.clone())),
-            Some(home.join("Desktop").join("LOCAL-KD").join("codex.exe"))
+            Some(
+                home.join("Desktop")
+                    .join("LOCAL-KD")
+                    .join("bin")
+                    .join("codex.exe")
+            )
         );
     }
 
@@ -955,15 +933,8 @@ mod tests {
         let home = temp.path().join("LOCAL-KD");
         let receipt = matching_receipt(target.clone(), home.clone(), 42);
 
-        let err = validate_desktop_runtime_receipt(
-            &receipt,
-            &[],
-            &target,
-            10,
-            &home,
-            BuildInfo::current(),
-        )
-        .expect_err("an absent receipt PID must not prove a Desktop restart");
+        let err = validate_desktop_runtime_receipt(&receipt, &[], &target, 10, &home)
+            .expect_err("an absent receipt PID must not prove a Desktop restart");
 
         assert!(err.contains("not live"), "unexpected error: {err}");
     }
@@ -981,15 +952,8 @@ mod tests {
         let mut receipt = matching_receipt(target.clone(), home.clone(), 42);
         receipt.client_name = "codex_vscode".to_string();
 
-        let err = validate_desktop_runtime_receipt(
-            &receipt,
-            &processes,
-            &target,
-            10,
-            &home,
-            BuildInfo::current(),
-        )
-        .expect_err("a non-Desktop receipt must not prove a Desktop restart");
+        let err = validate_desktop_runtime_receipt(&receipt, &processes, &target, 10, &home)
+            .expect_err("a non-Desktop receipt must not prove a Desktop restart");
 
         assert!(err.contains("not Codex Desktop"), "unexpected error: {err}");
     }
@@ -1008,27 +972,15 @@ mod tests {
         }];
 
         let wrong_binary_receipt = matching_receipt(wrong_binary, home.clone(), 42);
-        let binary_err = validate_desktop_runtime_receipt(
-            &wrong_binary_receipt,
-            &processes,
-            &target,
-            10,
-            &home,
-            BuildInfo::current(),
-        )
-        .expect_err("a wrong receipt executable must fail");
+        let binary_err =
+            validate_desktop_runtime_receipt(&wrong_binary_receipt, &processes, &target, 10, &home)
+                .expect_err("a wrong receipt executable must fail");
         assert!(binary_err.contains("executable"));
 
         let wrong_home_receipt = matching_receipt(target.clone(), wrong_home, 42);
-        let home_err = validate_desktop_runtime_receipt(
-            &wrong_home_receipt,
-            &processes,
-            &target,
-            10,
-            &home,
-            BuildInfo::current(),
-        )
-        .expect_err("a wrong receipt CODEX_HOME must fail");
+        let home_err =
+            validate_desktop_runtime_receipt(&wrong_home_receipt, &processes, &target, 10, &home)
+                .expect_err("a wrong receipt CODEX_HOME must fail");
         assert!(home_err.contains("CODEX_HOME"));
     }
 
@@ -1044,14 +996,30 @@ mod tests {
         }];
         let receipt = matching_receipt(target.clone(), home.clone(), 42);
 
-        validate_desktop_runtime_receipt(
-            &receipt,
-            &processes,
-            &target,
-            10,
-            &home,
-            BuildInfo::current(),
-        )
-        .expect("matching live receipt should prove the selected fork runtime");
+        validate_desktop_runtime_receipt(&receipt, &processes, &target, 10, &home)
+            .expect("matching live receipt should prove the selected fork runtime");
+    }
+
+    #[test]
+    fn desktop_runtime_receipt_binds_identity_to_the_selected_file_hash() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("codex.exe");
+        let home = temp.path().join("LOCAL-KD");
+        let processes = vec![DesktopProcessEvidence {
+            pid: 42,
+            path: Some(target.clone()),
+            is_app_server: true,
+        }];
+        let mut receipt = matching_receipt(target.clone(), home.clone(), 42);
+        receipt.build_commit = "receipt-producer-build".to_string();
+        receipt.build_built = "receipt-producer-time".to_string();
+
+        validate_desktop_runtime_receipt(&receipt, &processes, &target, 10, &home)
+            .expect("producer metadata may differ from the doctor when the file hash matches");
+
+        receipt.executable_sha256 = "0".repeat(64);
+        let err = validate_desktop_runtime_receipt(&receipt, &processes, &target, 10, &home)
+            .expect_err("a receipt for different bytes must not validate");
+        assert!(err.contains("hash"), "unexpected error: {err}");
     }
 }

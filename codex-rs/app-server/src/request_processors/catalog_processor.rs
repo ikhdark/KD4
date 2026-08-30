@@ -551,7 +551,8 @@ impl CatalogRequestProcessor {
     ) -> Result<SkillsExtraRootsSetResponse, JSONRPCErrorError> {
         let SkillsExtraRootsSetParams { extra_roots } = params;
         self.skills_watcher
-            .register_runtime_extra_roots(&extra_roots);
+            .register_runtime_extra_roots(&extra_roots)
+            .map_err(internal_error)?;
         self.thread_manager
             .skills_service()
             .set_extra_roots(extra_roots);

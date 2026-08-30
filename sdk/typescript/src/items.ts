@@ -79,13 +79,7 @@ export type CollabTool = "spawn_agent" | "send_input" | "resume_agent" | "wait" 
 
 /** The status of a collaboration agent. */
 export type CollabAgentStatus =
-  | "pending_init"
-  | "running"
-  | "interrupted"
-  | "completed"
-  | "errored"
-  | "shutdown"
-  | "not_found";
+  "pending_init" | "running" | "interrupted" | "completed" | "errored" | "shutdown" | "not_found";
 
 /** Last known state of a collaboration agent. */
 export type CollabAgentState = {

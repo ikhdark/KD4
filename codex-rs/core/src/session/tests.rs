@@ -33,16 +33,6 @@ use codex_config::types::ToolSuggestDisabledTool;
 use codex_core_skills::HostSkillsSnapshot;
 use core_test_support::test_codex::local_selections;
 
-use codex_agent_task_store::AcceptanceCriterion;
-use codex_agent_task_store::AgentRole;
-use codex_agent_task_store::AgentTaskBindingDraft;
-use codex_agent_task_store::AssignmentAdmissionOrigin;
-use codex_agent_task_store::AssignmentDraft;
-use codex_agent_task_store::AssignmentId;
-use codex_agent_task_store::AttemptId;
-use codex_agent_task_store::CapabilityProfile;
-use codex_agent_task_store::ValidationCallStatus;
-use codex_agent_task_store::WorkspaceStrategy;
 use codex_features::Feature;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
@@ -268,67 +258,6 @@ use std::sync::OnceLock;
 use std::time::Duration as StdDuration;
 
 #[tokio::test]
-async fn session_persistent_ledgers_load_concurrently() {
-    let (task_started_tx, task_started_rx) = tokio::sync::oneshot::channel();
-    let (command_started_tx, command_started_rx) = tokio::sync::oneshot::channel();
-    let (task_release_tx, task_release_rx) = tokio::sync::oneshot::channel();
-    let (command_release_tx, command_release_rx) = tokio::sync::oneshot::channel();
-
-    let loads = tokio::spawn(super::session::load_session_persistent_ledgers(
-        async move {
-            task_started_tx
-                .send(())
-                .expect("record task-evidence start");
-            task_release_rx.await.expect("release task-evidence load");
-            "task-evidence-ready"
-        },
-        async move {
-            command_started_tx
-                .send(())
-                .expect("record command-execution start");
-            command_release_rx
-                .await
-                .expect("release command-execution load");
-            "command-execution-ready"
-        },
-    ));
-
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        task_started_rx
-            .await
-            .expect("task-evidence load should start");
-        command_started_rx
-            .await
-            .expect("command-execution load should start before either load is released");
-    })
-    .await
-    .expect("both persistent-ledger loads should start before either is released");
-    assert!(!loads.is_finished());
-
-    task_release_tx.send(()).expect("release task-evidence");
-    command_release_tx
-        .send(())
-        .expect("release command execution");
-    assert_eq!(
-        loads.await.expect("persistent-ledger loads join"),
-        ("task-evidence-ready", "command-execution-ready")
-    );
-
-    assert!(super::session::task_evidence_is_disabled_for_session(
-        true,
-        &SessionSource::SubAgent(SubAgentSource::Review),
-    ));
-    assert!(!super::session::task_evidence_is_disabled_for_session(
-        false,
-        &SessionSource::SubAgent(SubAgentSource::Review),
-    ));
-    assert!(!super::session::task_evidence_is_disabled_for_session(
-        true,
-        &SessionSource::Cli,
-    ));
-}
-
-#[tokio::test]
 async fn tool_history_persistence_queue_batches_mutations_without_dropping_them() {
     let codex_home = tempfile::tempdir().expect("create codex home");
     let thread_id = ThreadId::new();
@@ -342,12 +271,14 @@ async fn tool_history_persistence_queue_batches_mutations_without_dropping_them(
     );
 
     for index in 0..32 {
-        queue.enqueue_mutation(
-            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
-                call_id: format!("snapshot-{index}"),
-            },
-            "test completed-tool history metadata",
-        );
+        queue
+            .enqueue_mutation(
+                crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                    call_id: format!("snapshot-{index}"),
+                },
+                "test completed-tool history metadata",
+            )
+            .expect("persistence worker remains available");
     }
 
     drop(held_io_gate);
@@ -365,6 +296,114 @@ async fn tool_history_persistence_queue_batches_mutations_without_dropping_them(
     assert!(
         queue.persisted_batch_count() <= 2,
         "the worker may persist one in-flight mutation and one accumulated batch"
+    );
+}
+
+#[tokio::test]
+async fn tool_history_persistence_queue_does_not_acknowledge_a_failed_write() {
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let thread_id = ThreadId::new();
+    let failure =
+        crate::tool_history::fail_next_tool_history_persistence_for_test(&thread_id.to_string());
+    let queue = super::session::ToolHistoryPersistenceQueue::new(
+        Arc::new(Semaphore::new(/*permits*/ 1)),
+        codex_home.path().to_path_buf(),
+        thread_id,
+        crate::tool_history::ToolHistoryState::default(),
+    );
+    queue
+        .enqueue_mutation(
+            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "must-survive-restart".to_string(),
+            },
+            "test completed-tool history metadata",
+        )
+        .expect("persistence worker remains available");
+
+    failure.wait_until_reached().await;
+    let mut drain = Box::pin(queue.drain());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), drain.as_mut())
+            .await
+            .is_err(),
+        "the queue must not acknowledge a write while persistence is failing"
+    );
+
+    failure.release();
+    tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+        .await
+        .expect("the durable full-state retry should unblock the drain");
+
+    let persisted =
+        crate::tool_history::load_tool_history_state(codex_home.path(), &thread_id.to_string())
+            .await;
+    let (persisted, warning) = persisted.into_state_and_warning();
+    assert_eq!(warning, None);
+    let persisted = serde_json::to_string(&persisted).expect("serialize persisted history");
+    assert!(persisted.contains("must-survive-restart"));
+}
+
+#[tokio::test]
+async fn tool_history_persistence_queue_rejects_mutations_after_worker_closes() {
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let io_gate = Arc::new(Semaphore::new(/*permits*/ 0));
+    io_gate.close();
+    let queue = super::session::ToolHistoryPersistenceQueue::new(
+        io_gate,
+        codex_home.path().to_path_buf(),
+        ThreadId::new(),
+        crate::tool_history::ToolHistoryState::default(),
+    );
+    queue
+        .enqueue_mutation(
+            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "closes-worker".to_string(),
+            },
+            "test completed-tool history metadata",
+        )
+        .expect("the first mutation wakes the worker");
+    queue.wait_until_worker_closed_for_test().await;
+
+    let error = queue
+        .enqueue_mutation(
+            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "must-not-be-silently-dropped".to_string(),
+            },
+            "test completed-tool history metadata",
+        )
+        .expect_err("a closed worker must reject later mutations");
+    assert_eq!(
+        error,
+        super::session::ToolHistoryPersistenceEnqueueError::WorkerClosed
+    );
+}
+
+#[tokio::test]
+async fn tool_history_persistence_checkpoint_does_not_acknowledge_after_worker_closes() {
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let io_gate = Arc::new(Semaphore::new(/*permits*/ 0));
+    io_gate.close();
+    let queue = super::session::ToolHistoryPersistenceQueue::new(
+        io_gate,
+        codex_home.path().to_path_buf(),
+        ThreadId::new(),
+        crate::tool_history::ToolHistoryState::default(),
+    );
+    queue
+        .enqueue_mutation(
+            crate::tool_history::ToolHistoryMutation::RegisterNonWorkspaceCodeModeCall {
+                call_id: "closes-worker-before-checkpoint".to_string(),
+            },
+            "test completed-tool history metadata",
+        )
+        .expect("the first mutation wakes the worker");
+    queue.wait_until_worker_closed_for_test().await;
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), queue.checkpoint())
+            .await
+            .is_err(),
+        "a closed persistence worker must not falsely acknowledge the checkpoint"
     );
 }
 
@@ -623,34 +662,6 @@ async fn prepare_conversation_items_assigns_missing_response_item_ids_by_default
             .id()
             .is_some_and(|item_id| item_id.starts_with("msg_"))
     );
-}
-
-#[tokio::test]
-async fn completion_review_private_slot_fails_open_while_occupied_and_is_reusable() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let normal_control = session
-        .services
-        .agent_control
-        .clone()
-        .with_session_id(session.session_id(), /*max_threads*/ 1);
-    let normal_source = codex_protocol::protocol::SessionSource::SubAgent(
-        codex_protocol::protocol::SubAgentSource::Other("capacity-test".to_string()),
-    );
-    let _normal_permit = normal_control
-        .reserve_execution_capacity(MultiAgentVersion::V2, &normal_source)
-        .expect("reserve normal agent capacity")
-        .expect("normal agent permit");
-    assert!(matches!(
-        normal_control.reserve_execution_capacity(MultiAgentVersion::V2, &normal_source),
-        Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 })
-    ));
-
-    let permit = session
-        .try_acquire_completion_review_slot()
-        .expect("private reviewer slot");
-    assert!(session.try_acquire_completion_review_slot().is_none());
-    drop(permit);
-    assert!(session.try_acquire_completion_review_slot().is_some());
 }
 
 fn assistant_message(text: &str) -> ResponseItem {
@@ -2983,13 +2994,9 @@ fn startup_rollout_facts_reduce_startup_consumers_in_one_pass() {
         })),
     ]);
 
-    let facts = StartupRolloutFacts::reduce(ThreadId::default(), &history);
+    let facts = StartupRolloutFacts::reduce(&history);
 
     assert_eq!(facts.initial_messages.as_ref().map(Vec::len), Some(2));
-    assert_eq!(
-        facts.terminal_recovery_turn_id.as_deref(),
-        Some("turn-open")
-    );
     assert_eq!(
         facts.mailbox_communication_ids,
         vec![codex_protocol::ResponseItemId::from_server(
@@ -3883,7 +3890,6 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
                 turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -4091,7 +4097,6 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
-            completion: None,
             timing: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -4124,7 +4129,6 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
-            completion: None,
             timing: None,
         })),
     ])
@@ -4215,7 +4219,6 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
-            completion: None,
             timing: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -4243,7 +4246,6 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
-            completion: None,
             timing: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -4279,7 +4281,6 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
-            completion: None,
             timing: None,
         })),
     ])
@@ -4356,7 +4357,6 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
-            completion: None,
             timing: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -4387,7 +4387,6 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
-            completion: None,
             timing: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -4418,7 +4417,6 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
-            completion: None,
             timing: None,
         })),
     ])
@@ -4774,7 +4772,6 @@ async fn turn_context_with_model_updates_model_fields() {
     let (session, mut turn_context) = make_session_and_context().await;
     turn_context.configured_reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     turn_context.reasoning_effort = Some(ReasoningEffortConfig::Minimal);
-    turn_context.kd4_workflow_enabled = true;
     let durable_history_completed_commits =
         Arc::clone(&turn_context.durable_history_completed_commits);
     let updated = turn_context
@@ -4792,7 +4789,6 @@ async fn turn_context_with_model_updates_model_fields() {
     assert_eq!(updated.config.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(updated.collaboration_mode.model(), "gpt-5.4");
     assert_eq!(updated.model_info, expected_model_info);
-    assert!(updated.kd4_workflow_enabled);
     assert!(Arc::ptr_eq(
         &updated.durable_history_completed_commits,
         &durable_history_completed_commits,
@@ -7423,6 +7419,82 @@ async fn shutdown_continues_when_tool_history_persistence_stalls() {
 }
 
 #[tokio::test]
+async fn completed_tool_consumption_does_not_wait_for_persistence() {
+    let codex_home = tempfile::tempdir().expect("create temp dir");
+    let (session, turn_context, _rx_event) = make_session_and_context_with_auth_config_home_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        codex_home.path(),
+        |config| config.completed_tool_history_projection = true,
+    )
+    .await;
+    let call_id = "completed-tool-persistence-barrier";
+    let bounded_model_output = "bounded completed tool output".to_string();
+    session
+        .register_tool_history_candidate(
+            codex_home.path(),
+            crate::tool_history::ToolHistoryCandidate {
+                call_id: call_id.to_string(),
+                tool_identity: "functions.exec".to_string(),
+                semantic_class: "tool_output".to_string(),
+                source_dependencies: std::collections::BTreeSet::new(),
+                source_dependencies_current: true,
+                artifact_id: "artifact-completion-barrier".to_string(),
+                artifact_bytes: bounded_model_output.len() as u64,
+                artifact_sha256: crate::tool_history::sha256(b"canonical artifact"),
+                original_output_sha256: crate::tool_history::sha256(
+                    bounded_model_output.as_bytes(),
+                ),
+                original_tokens: 100,
+                preserved_non_text_tokens: 0,
+                bounded_model_output: bounded_model_output.clone(),
+                complete: true,
+                projection_eligible: true,
+                proof_identity: None,
+                supersession_identity: None,
+                consumed_by_generation: None,
+                derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
+            },
+        )
+        .await;
+    session.flush_tool_history_persistence().await;
+
+    let persistence_pause = crate::tool_history::pause_next_tool_history_persistence_for_test(
+        &session.thread_id.to_string(),
+    );
+    let input = vec![ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text(bounded_model_output),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let mark_consumed = tokio::spawn({
+        let session = Arc::clone(&session);
+        let turn_context = Arc::clone(&turn_context);
+        async move {
+            session
+                .mark_tool_history_consumed(
+                    &turn_context,
+                    &input,
+                    crate::tool_history::ModelGenerationId {
+                        turn_id: "turn-completion-barrier".to_string(),
+                        ordinal: 1,
+                    },
+                )
+                .await;
+        }
+    });
+    persistence_pause.wait_until_reached().await;
+
+    tokio::time::timeout(Duration::from_millis(100), mark_consumed)
+        .await
+        .expect("turn completion must not wait for completed-tool persistence")
+        .expect("consumption task should not panic");
+    persistence_pause.release();
+    session.flush_tool_history_persistence().await;
+}
+
+#[tokio::test]
 async fn submission_loop_channel_close_runs_full_thread_teardown() {
     struct SessionStopMarker;
     struct ThreadStopMarker;
@@ -7787,6 +7859,54 @@ async fn guardian_shutdown_waits_for_background_retired_session_cleanup() {
         .send(())
         .expect("background child shutdown should still be waiting");
     shutdown.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn guardian_shutdown_stops_waiting_after_the_graceful_deadline() {
+    let (parent_session, _parent_turn_context) = make_session_and_context().await;
+    let parent_session = Arc::new(parent_session);
+    let (child_session, _child_turn_context) = make_session_and_context().await;
+    let (child_tx_sub, child_rx_sub) = async_channel::bounded(4);
+    let (_child_tx_event, child_rx_event) = async_channel::unbounded();
+    let (_child_status_tx, child_agent_status) = watch::channel(AgentStatus::PendingInit);
+    let (child_shutdown_started_tx, child_shutdown_started_rx) = tokio::sync::oneshot::channel();
+    let child_session_loop_handle = tokio::spawn(async move {
+        let shutdown: Submission = child_rx_sub
+            .recv()
+            .await
+            .expect("child shutdown submission");
+        assert_eq!(shutdown.op, Op::Shutdown);
+        child_shutdown_started_tx
+            .send(())
+            .expect("child shutdown start should be observed");
+        std::future::pending::<()>().await;
+    });
+    let child_codex = Codex {
+        tx_sub: child_tx_sub,
+        rx_event: child_rx_event,
+        agent_status: child_agent_status,
+        session: Arc::new(child_session),
+        session_loop_termination: session_loop_termination_from_handle(child_session_loop_handle),
+    };
+    parent_session
+        .guardian_review_session
+        .cache_for_test(child_codex)
+        .await;
+    parent_session
+        .guardian_review_session
+        .retire_trunk_for_test()
+        .await;
+    child_shutdown_started_rx
+        .await
+        .expect("background cleanup should start child shutdown");
+
+    let started_at = tokio::time::Instant::now();
+    parent_session.guardian_review_session.shutdown().await;
+
+    assert_eq!(
+        started_at.elapsed(),
+        crate::guardian::GUARDIAN_SHUTDOWN_TIMEOUT
+    );
 }
 
 #[tokio::test]
@@ -8241,10 +8361,6 @@ where
         ),
         command_execution: crate::tools::command_execution::CommandExecutionLedger::default(),
         plan_store: crate::plan_store::PlanStore::default(),
-        task_evidence: crate::task_evidence::TaskEvidenceLedger::disabled(),
-        kd4_repository_context: std::sync::RwLock::new(
-            crate::task_evidence::Kd4RepositoryContext::default(),
-        ),
         elicitations: crate::elicitation::ElicitationService::new(),
         analytics_events_client: AnalyticsEventsClient::new(
             Arc::clone(&auth_manager),
@@ -8361,7 +8477,6 @@ where
         /*network*/ None,
         resolved_turn_environments,
         git_metadata_source,
-        /*kd4_workflow_enabled*/ false,
         "turn_id".to_string(),
         skills_snapshot,
     ));
@@ -8399,12 +8514,10 @@ where
         turn_config_cache: Default::default(),
         queued_tool_manifest_hash: Default::default(),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
-        terminal_delivery_cache: Mutex::new(super::session::TerminalDeliveryCache::default()),
         terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
-        completion_review_slot: Semaphore::new(/*permits*/ 1),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     });
@@ -8436,203 +8549,6 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
     async_channel::Receiver<Event>,
 ) {
     make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await
-}
-
-struct TypedTerminalNotificationFixture {
-    session: Arc<Session>,
-    turn_context: Arc<TurnContext>,
-    assignment_id: AssignmentId,
-    attempt_id: AttemptId,
-    _state_home: tempfile::TempDir,
-    _repository: tempfile::TempDir,
-}
-
-async fn typed_terminal_notification_fixture(
-    required_evidence: Vec<String>,
-) -> TypedTerminalNotificationFixture {
-    let (session, mut turn_context, _events) = make_session_and_context_with_rx().await;
-    let state_home = tempfile::tempdir().expect("create task-state home");
-    let repository = tempfile::tempdir().expect("create task repository");
-    let coordinator = session.services.agent_control.task_coordinator();
-    let state_runtime = codex_state::StateRuntime::init(
-        state_home.path().to_path_buf(),
-        "test-provider".to_string(),
-    )
-    .await
-    .expect("task state initializes");
-    coordinator
-        .initialize(state_runtime, "notification-root".to_string())
-        .await
-        .expect("task coordinator initializes");
-    let (assignment, attempt) = coordinator
-        .create_assignment(
-            repository.path(),
-            AssignmentDraft {
-                root_session_id: "notification-root".to_string(),
-                admission_origin: AssignmentAdmissionOrigin::Typed,
-                role: AgentRole::Worker,
-                capability_profile: CapabilityProfile::ScopedSourceWrite,
-                objective: "complete the typed task".to_string(),
-                acceptance_criteria: vec![AcceptanceCriterion {
-                    id: "criterion".to_string(),
-                    text: "the terminal outcome is durable".to_string(),
-                }],
-                read_scope: Vec::new(),
-                write_scope: Vec::new(),
-                stop_condition: "stop after the terminal outcome".to_string(),
-                dependencies: Vec::new(),
-                risk_hints: Vec::new(),
-                required_evidence,
-                prohibited_changes: Vec::new(),
-                contract_claims: Vec::new(),
-                workspace_strategy: WorkspaceStrategy::Auto,
-                relation: None,
-                architecture_contract_ref: None,
-            },
-        )
-        .await
-        .expect("typed assignment creates");
-    let child_agent_path = AgentPath::try_from("/root/worker").expect("valid child path");
-    coordinator
-        .bind_agent_task(AgentTaskBindingDraft {
-            assignment_id: assignment.assignment_id,
-            attempt_id: attempt.attempt_id,
-            agent_path: child_agent_path.to_string(),
-            task_name: "worker".to_string(),
-            thread_id: Some(session.thread_id.to_string()),
-        })
-        .await
-        .expect("typed assignment binds");
-    {
-        let turn_context_mut =
-            Arc::get_mut(&mut turn_context).expect("turn context is uniquely owned");
-        turn_context_mut.multi_agent_version = MultiAgentVersion::V2;
-        turn_context_mut.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id: ThreadId::new(),
-            depth: 1,
-            agent_path: Some(child_agent_path),
-            agent_nickname: Some("worker".to_string()),
-            agent_role: Some("worker".to_string()),
-        });
-    }
-
-    TypedTerminalNotificationFixture {
-        session,
-        turn_context: Arc::clone(&turn_context),
-        assignment_id: assignment.assignment_id,
-        attempt_id: attempt.attempt_id,
-        _state_home: state_home,
-        _repository: repository,
-    }
-}
-
-fn typed_terminal_event(turn_context: &TurnContext) -> EventMsg {
-    EventMsg::TurnAborted(TurnAbortedEvent {
-        turn_id: Some(turn_context.sub_id.clone()),
-        reason: TurnAbortReason::InternalError,
-        completed_at: None,
-        duration_ms: None,
-        timing: None,
-    })
-}
-
-#[tokio::test]
-async fn typed_terminal_notification_retries_when_missing_receipt_cannot_seal() {
-    let command = "cargo test -p typed-terminal".to_string();
-    let fixture = typed_terminal_notification_fixture(vec![command.clone()]).await;
-    let coordinator = fixture.session.services.agent_control.task_coordinator();
-    let validation = coordinator
-        .begin_focused_validation_for_source(
-            &fixture.turn_context.session_source,
-            "typed-terminal-running".to_string(),
-            command,
-        )
-        .await
-        .expect("validation begins")
-        .expect("typed source is bound");
-    let sends_before = fixture
-        .session
-        .services
-        .agent_control
-        .inter_agent_communication_attempt_count();
-
-    assert!(
-        !fixture
-            .session
-            .maybe_notify_parent_of_terminal_turn(
-                &fixture.turn_context,
-                &typed_terminal_event(&fixture.turn_context),
-            )
-            .await
-    );
-    assert_eq!(
-        fixture
-            .session
-            .services
-            .agent_control
-            .inter_agent_communication_attempt_count(),
-        sends_before,
-        "parent delivery must not run before receipt sealing succeeds"
-    );
-    assert!(
-        coordinator
-            .get_agent_task(fixture.assignment_id, Some(0))
-            .await
-            .expect("unsealed task reads")
-            .receipt
-            .is_none()
-    );
-    coordinator
-        .finish_focused_validation(validation, ValidationCallStatus::Succeeded)
-        .await
-        .expect("validation cleanup succeeds");
-}
-
-#[tokio::test]
-async fn typed_terminal_notification_retries_when_durable_readback_fails() {
-    let fixture = typed_terminal_notification_fixture(Vec::new()).await;
-    let coordinator = fixture.session.services.agent_control.task_coordinator();
-    coordinator.fail_next_agent_task_read_for_test();
-    let sends_before = fixture
-        .session
-        .services
-        .agent_control
-        .inter_agent_communication_attempt_count();
-
-    assert!(
-        !fixture
-            .session
-            .maybe_notify_parent_of_terminal_turn(
-                &fixture.turn_context,
-                &typed_terminal_event(&fixture.turn_context),
-            )
-            .await
-    );
-    assert_eq!(
-        fixture
-            .session
-            .services
-            .agent_control
-            .inter_agent_communication_attempt_count(),
-        sends_before,
-        "parent delivery must not run before durable readback succeeds"
-    );
-    assert!(
-        coordinator
-            .get_agent_task(fixture.assignment_id, Some(0))
-            .await
-            .expect("sealed task reads after injected failure")
-            .receipt
-            .is_some(),
-        "receipt sealing succeeds before the injected readback failure"
-    );
-    assert_eq!(
-        coordinator
-            .binding_for_assignment(fixture.assignment_id)
-            .expect("binding remains durable")
-            .attempt_id,
-        fixture.attempt_id
-    );
 }
 
 #[tokio::test]
@@ -11385,6 +11301,65 @@ async fn turn_complete_flushes_terminal_event_after_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_complete_is_an_interaction_ready_boundary_for_rollback() {
+    let (mut sess, first_turn, rx) = make_session_and_context_with_rx().await;
+    attach_thread_persistence(Arc::get_mut(&mut sess).expect("session should be uniquely owned"))
+        .await;
+
+    let retained_turn = [
+        user_message("retained turn user"),
+        assistant_message("retained turn assistant"),
+    ];
+    sess.record_conversation_items(first_turn.as_ref(), &retained_turn)
+        .await;
+    sess.spawn_task(Arc::clone(&first_turn), Vec::new(), CompletingTask)
+        .await;
+    recv_terminal_event(&rx, TerminalEventKind::TurnComplete).await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if sess.active_turn.lock().await.is_none() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("seed turn should finish before the rollback target starts");
+    let expected_history = sess.clone_history().await.raw_items().to_vec();
+
+    let rollback_turn = sess.new_default_turn().await;
+    let rollback_target = [
+        user_message("rollback target user"),
+        assistant_message("rollback target assistant"),
+    ];
+    sess.record_conversation_items(rollback_turn.as_ref(), &rollback_target)
+        .await;
+    let (cache_persist_started, release_cache_persist) = sess
+        .services
+        .command_execution
+        .block_next_cache_persist_for_test();
+    sess.spawn_task(Arc::clone(&rollback_turn), Vec::new(), CompletingTask)
+        .await;
+
+    let terminal = recv_terminal_event(&rx, TerminalEventKind::TurnComplete).await;
+    assert!(matches!(terminal.msg, EventMsg::TurnComplete(_)));
+    handlers::thread_rollback(&sess, "rollback-after-terminal".to_string(), 1).await;
+
+    let rolled_back = wait_for_thread_rolled_back(&rx).await;
+    assert_eq!(rolled_back.num_turns, 1);
+    assert_eq!(
+        sess.clone_history().await.raw_items(),
+        expected_history.as_slice()
+    );
+    cache_persist_started
+        .await
+        .expect("terminal finalizer should reach optional cache persistence");
+    release_cache_persist
+        .send(())
+        .expect("terminal finalizer should still await cache persistence");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_aborted_persists_missing_call_output_before_terminal_event() {
     let (mut sess, tc, rx) = make_session_and_context_with_rx().await;
     let store = attach_in_memory_thread_store(
@@ -11699,82 +11674,6 @@ async fn accepted_context_commit_defers_flush_to_terminal_barrier() {
         store.calls().await.flush_thread,
         before_commit.flush_thread + 1
     );
-}
-
-#[tokio::test]
-async fn turn_started_delivers_live_and_defers_flush_until_terminal_event() {
-    let (mut sess, tc, rx) = make_session_and_context_with_rx().await;
-    let store = attach_in_memory_thread_store(
-        Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
-    )
-    .await;
-    let before_start = store.calls().await;
-    let started = EventMsg::TurnStarted(TurnStartedEvent {
-        turn_id: tc.sub_id.clone(),
-        trace_id: tc.trace_id.clone(),
-        started_at: tc.turn_timing_state.started_at_unix_secs().await,
-        model_context_window: tc.model_context_window(),
-        collaboration_mode_kind: tc.collaboration_mode.mode,
-    });
-
-    sess.send_event(tc.as_ref(), started).await;
-    let delivered = timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("turn start should be delivered without waiting for disk")
-        .expect("event receiver should remain open");
-    assert!(matches!(
-        delivered.msg,
-        EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) if turn_id == tc.sub_id
-    ));
-    let after_start = store.calls().await;
-    assert_eq!(after_start.append_items, before_start.append_items + 1);
-    assert_eq!(after_start.flush_thread, before_start.flush_thread);
-
-    let completed = EventMsg::TurnComplete(TurnCompleteEvent {
-        turn_id: tc.sub_id.clone(),
-        last_agent_message: Some("done".to_string()),
-        surfaced_result: None,
-        error: None,
-        completion: None,
-        completed_at: None,
-        duration_ms: None,
-        time_to_first_token_ms: None,
-        timing: None,
-    });
-    sess.flush_rollout_after_ordered_commits(tc.as_ref())
-        .await
-        .expect("pre-terminal barrier should flush the ordered turn prefix");
-    let after_prefix = store.calls().await;
-    assert_eq!(after_prefix.flush_thread, before_start.flush_thread + 1);
-
-    sess.persist_terminal_event_for_dispatch(&completed, Duration::from_secs(2))
-        .await
-        .expect("terminal persistence should append after the ordered turn prefix");
-    sess.flush_rollout()
-        .await
-        .expect("post-terminal barrier should make the terminal event durable");
-    let after_terminal = store.calls().await;
-    assert_eq!(after_terminal.flush_thread, before_start.flush_thread + 2);
-
-    let stored = codex_thread_store::ThreadStore::load_history(
-        store.as_ref(),
-        codex_thread_store::LoadThreadHistoryParams {
-            thread_id: sess.thread_id,
-            include_archived: false,
-        },
-    )
-    .await
-    .expect("flushed turn history should be readable");
-    let lifecycle = stored
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::TurnStarted(_)) => Some("started"),
-            RolloutItem::EventMsg(EventMsg::TurnComplete(_)) => Some("completed"),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(lifecycle, vec!["started", "completed"]);
 }
 
 #[tokio::test]
@@ -12260,21 +12159,6 @@ async fn panic_after_terminal_claim_uses_fail_safe_terminal_outcome() {
         Arc::get_mut(&mut sess).expect("test session should be uniquely owned"),
     )
     .await;
-    let evidence_home = tempfile::tempdir().expect("create evidence home");
-    let task_evidence = crate::task_evidence::TaskEvidenceLedger::load_or_new(
-        evidence_home.path().to_path_buf(),
-        sess.thread_id,
-        Path::new(env!("CARGO_MANIFEST_DIR")),
-    )
-    .await;
-    assert_eq!(
-        task_evidence.mode(),
-        crate::task_evidence::TaskEvidenceMode::Kd4Completion
-    );
-    Arc::get_mut(&mut sess)
-        .expect("test session should be uniquely owned")
-        .services
-        .task_evidence = task_evidence;
     sess.spawn_task(
         Arc::clone(&tc),
         Vec::new(),
@@ -12303,21 +12187,6 @@ async fn panic_after_terminal_claim_uses_fail_safe_terminal_outcome() {
             ..
         })
     ));
-    let terminalization = timeout(Duration::from_secs(2), async {
-        loop {
-            let event = rx.recv().await.expect("terminalization event");
-            if let EventMsg::TurnTerminalizationComplete(event) = event.msg {
-                break event;
-            }
-        }
-    })
-    .await
-    .expect("fail-safe terminalization should reach the event stream");
-    assert_eq!(terminalization.turn_id, tc.sub_id);
-    assert!(
-        terminalization.receipt.terminalization.post_cleanup_ns > 0,
-        "the receipt should include fail-safe post-cleanup timing"
-    );
     assert!(sess.active_turn.lock().await.is_none());
 }
 
@@ -12452,7 +12321,7 @@ async fn terminal_task_tracker_shutdown_waits_for_running_finalizer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn terminal_task_tracker_waits_for_receipt_persistence_and_delivery() {
+async fn terminal_task_tracker_waits_for_tracked_work() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     let persistence_started = Arc::new(tokio::sync::Notify::new());
     let delivery_started = Arc::new(tokio::sync::Notify::new());
@@ -12460,7 +12329,7 @@ async fn terminal_task_tracker_waits_for_receipt_persistence_and_delivery() {
     let (release_persistence_tx, release_persistence_rx) = tokio::sync::oneshot::channel();
     let (release_delivery_tx, release_delivery_rx) = tokio::sync::oneshot::channel();
 
-    sess.spawn_terminal_receipt_task({
+    sess.terminal_tasks.spawn({
         let persistence_started = Arc::clone(&persistence_started);
         let delivery_started = Arc::clone(&delivery_started);
         let delivery_completed = Arc::clone(&delivery_completed);
@@ -12474,7 +12343,7 @@ async fn terminal_task_tracker_waits_for_receipt_persistence_and_delivery() {
     });
     timeout(Duration::from_secs(2), persistence_started.notified())
         .await
-        .expect("receipt persistence should start");
+        .expect("tracked terminal work should start");
 
     sess.terminal_tasks.close();
     let mut tracker_wait = tokio::spawn({
@@ -12487,32 +12356,32 @@ async fn terminal_task_tracker_waits_for_receipt_persistence_and_delivery() {
         timeout(Duration::from_millis(50), &mut tracker_wait)
             .await
             .is_err(),
-        "tracker wait must retain receipt persistence"
+        "tracker wait must retain tracked terminal work"
     );
 
     release_persistence_tx
         .send(())
-        .expect("receipt persistence task should still be waiting");
+        .expect("tracked terminal task should still be waiting");
     timeout(Duration::from_secs(2), delivery_started.notified())
         .await
-        .expect("receipt delivery should start after persistence");
+        .expect("second tracked phase should start after the first");
     assert!(
         timeout(Duration::from_millis(50), &mut tracker_wait)
             .await
             .is_err(),
-        "tracker wait must retain receipt delivery"
+        "tracker wait must retain the second tracked phase"
     );
 
     let delivery_completed_wait = delivery_completed.notified();
     release_delivery_tx
         .send(())
-        .expect("receipt delivery task should still be waiting");
+        .expect("tracked terminal task should still be waiting");
     timeout(Duration::from_secs(2), delivery_completed_wait)
         .await
-        .expect("receipt delivery should complete");
+        .expect("tracked terminal work should complete");
     timeout(Duration::from_secs(2), &mut tracker_wait)
         .await
-        .expect("tracker should drain after receipt delivery")
+        .expect("tracker should drain after tracked terminal work")
         .expect("tracker waiter should not panic");
 }
 

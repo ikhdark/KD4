@@ -11,6 +11,7 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tool_history::response_item_has_valid_tool_history_receipt;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
 use serde::Deserialize;
@@ -56,7 +57,15 @@ pub(crate) async fn process_compacted_history(
     let (initial_context, world_state_baseline, fragment_digests) =
         build_compaction_initial_context(sess, turn_context, initial_context_injection).await;
 
-    compacted_history = bounded_remote_compacted_history(compacted_history);
+    let artifact_pin_payload = sess
+        .clone_history()
+        .await
+        .tool_history_state()
+        .artifact_pin_payload_for_items(&compacted_history);
+    compacted_history = append_remote_compaction_artifact_pins(
+        bounded_remote_compacted_history(compacted_history),
+        artifact_pin_payload,
+    );
     (
         insert_compaction_initial_context(
             compacted_history,
@@ -66,6 +75,22 @@ pub(crate) async fn process_compacted_history(
         world_state_baseline,
         fragment_digests,
     )
+}
+
+fn append_remote_compaction_artifact_pins(
+    mut history: Vec<ResponseItem>,
+    artifact_pin_payload: Option<String>,
+) -> Vec<ResponseItem> {
+    if let Some(text) = artifact_pin_payload {
+        history.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText { text }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        });
+    }
+    history
 }
 
 /// Returns whether an item from remote compaction output should be preserved.

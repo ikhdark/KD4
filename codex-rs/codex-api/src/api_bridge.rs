@@ -155,7 +155,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     request_id: None,
                 })
             }
-            TransportError::Build(msg) => CodexErr::Stream(msg, None),
+            TransportError::Build(msg) => CodexErr::RequestBuild(msg),
         },
         ApiError::RateLimit(msg) => CodexErr::Stream(msg, None),
     }

@@ -62,6 +62,7 @@ use super::prompt::guardian_policy_prompt_with_config;
 use super::review::guardian_review_session_config;
 
 const GUARDIAN_INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const GUARDIAN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub(crate) enum GuardianReviewSessionOutcome {
     Completed(anyhow::Result<Option<String>>),
@@ -404,21 +405,32 @@ impl GuardianReviewSessionManager {
 
     pub(crate) async fn shutdown(&self) {
         self.cancellation_token.cancel();
-        let (review_session, ephemeral_reviews) = {
-            let mut state = self.state.lock().await;
-            self.background_shutdowns.close();
-            (
-                state.trunk.take(),
-                std::mem::take(&mut state.ephemeral_reviews),
-            )
+        let graceful_shutdown = async {
+            let (review_session, ephemeral_reviews) = {
+                let mut state = self.state.lock().await;
+                self.background_shutdowns.close();
+                (
+                    state.trunk.take(),
+                    std::mem::take(&mut state.ephemeral_reviews),
+                )
+            };
+            if let Some(review_session) = review_session {
+                review_session.shutdown().await;
+            }
+            for review_session in ephemeral_reviews {
+                review_session.shutdown().await;
+            }
+            self.background_shutdowns.wait().await;
         };
-        if let Some(review_session) = review_session {
-            review_session.shutdown().await;
+        if tokio::time::timeout(GUARDIAN_SHUTDOWN_TIMEOUT, graceful_shutdown)
+            .await
+            .is_err()
+        {
+            warn!(
+                timeout_secs = GUARDIAN_SHUTDOWN_TIMEOUT.as_secs(),
+                "guardian reviewer shutdown exceeded its graceful deadline"
+            );
         }
-        for review_session in ephemeral_reviews {
-            review_session.shutdown().await;
-        }
-        self.background_shutdowns.wait().await;
     }
 
     #[expect(
@@ -876,6 +888,14 @@ async fn run_review_on_session(
         }
     };
     let reviewed_action_truncated = prompt_items.reviewed_action_truncated;
+    analytics_result.reviewed_action_truncated = reviewed_action_truncated;
+    if let Err(err) = reject_truncated_reviewed_action(reviewed_action_truncated) {
+        return (
+            GuardianReviewSessionOutcome::PromptBuildFailed(err),
+            false,
+            analytics_result,
+        );
+    }
     let transcript_cursor = prompt_items.transcript_cursor;
     let token_usage_at_review_start = review_session
         .codex
@@ -939,8 +959,6 @@ async fn run_review_on_session(
         }
         Err(outcome) => return (outcome, false, analytics_result),
     };
-    analytics_result.reviewed_action_truncated = reviewed_action_truncated;
-
     let outcome = wait_for_guardian_review(
         review_session,
         child_turn_id.as_str(),
@@ -963,6 +981,17 @@ async fn run_review_on_session(
         state.last_reviewed_transcript_cursor = Some(transcript_cursor);
     }
     (outcome.0, outcome.1, analytics_result)
+}
+
+pub(super) fn reject_truncated_reviewed_action(
+    reviewed_action_truncated: bool,
+) -> anyhow::Result<()> {
+    if reviewed_action_truncated {
+        return Err(anyhow!(
+            "guardian review cannot safely assess an action whose exact payload was truncated"
+        ));
+    }
+    Ok(())
 }
 
 async fn append_guardian_followup_reminder(review_session: &GuardianReviewSession) {
@@ -1287,7 +1316,6 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms,
-                completion: None,
                 timing: None,
             }),
         }

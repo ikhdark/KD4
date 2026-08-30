@@ -39,6 +39,17 @@ pub(crate) fn exit_code_from_status(status: ExitStatus) -> i32 {
     -1
 }
 
+pub(crate) fn publish_exit_status(
+    exit_status: &AtomicBool,
+    exit_code: &StdMutex<Option<i32>>,
+    code: i32,
+) {
+    *exit_code
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(code);
+    exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub(crate) trait ChildTerminator: Send + Sync {
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()>;
 
@@ -342,6 +353,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exit_status_is_not_visible_before_exit_code() {
+        let exit_status = Arc::new(AtomicBool::new(false));
+        let exit_code = Arc::new(StdMutex::new(None));
+        let exit_code_guard = exit_code.lock().expect("lock exit code");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let publisher_status = Arc::clone(&exit_status);
+        let publisher_code = Arc::clone(&exit_code);
+        let publisher = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce publisher start");
+            publish_exit_status(&publisher_status, &publisher_code, 17);
+        });
+
+        started_rx.recv().expect("publisher should start");
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(
+            !exit_status.load(Ordering::SeqCst),
+            "exit status must remain unpublished while the exit code is locked"
+        );
+
+        drop(exit_code_guard);
+        publisher.join().expect("publisher should finish");
+        assert!(exit_status.load(Ordering::SeqCst));
+        assert_eq!(
+            *exit_code.lock().expect("read published exit code"),
+            Some(17)
+        );
+    }
+
     #[tokio::test]
     async fn finish_releases_terminator_without_killing_child() {
         let dropped = Arc::new(AtomicBool::new(false));
@@ -635,10 +675,7 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
     let wait_exit_code = Arc::clone(&exit_code);
     let wait_handle = tokio::spawn(async move {
         let code = exit_rx.await.unwrap_or(-1);
-        wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut guard) = wait_exit_code.lock() {
-            *guard = Some(code);
-        }
+        publish_exit_status(&wait_exit_status, &wait_exit_code, code);
         let _ = exit_seen_tx.send(true);
         let _ = exit_tx.send(code);
     });

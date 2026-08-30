@@ -127,14 +127,32 @@ async fn guardian_review_request_preserves_foreign_paths() {
 }
 
 #[test]
-fn mutation_evidence_rejects_foreign_paths() {
-    let repo_root = std::env::temp_dir().abs();
-    let foreign_path = PathUri::parse("file:///tmp/typed-remote.txt").expect("POSIX path URI");
+fn unbound_mutation_evidence_allows_paths_outside_the_repo() {
+    let repo_root = std::env::temp_dir().join("apply-patch-repo").abs();
+    let outside_path = std::env::temp_dir().join("apply-patch-outside.txt").abs();
+    let outside_path = PathUri::from_abs_path(&outside_path);
 
-    let error = native_mutation_repo_paths(repo_root.as_path(), &[foreign_path])
-        .expect_err("foreign paths cannot be captured by the host mutation store");
+    let evidence = native_mutation_repo_paths(
+        repo_root.as_path(),
+        std::slice::from_ref(&outside_path),
+        /*require_complete*/ false,
+    )
+    .expect("best-effort evidence must not block an otherwise approved patch");
+    assert_eq!(
+        evidence,
+        NativeMutationRepoPaths {
+            paths: Vec::new(),
+            complete: false,
+        }
+    );
 
-    assert!(format!("{error:?}").contains("mutation evidence cannot represent"));
+    let error = native_mutation_repo_paths(
+        repo_root.as_path(),
+        &[outside_path],
+        /*require_complete*/ true,
+    )
+    .expect_err("bound assignments still require complete mutation evidence");
+    assert!(format!("{error:?}").contains("outside the evidence workspace"));
 }
 
 #[tokio::test]

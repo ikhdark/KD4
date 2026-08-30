@@ -3,6 +3,7 @@ use crate::ToolName;
 use crate::ToolSpec;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
+use std::collections::HashSet;
 
 const CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE: &str = "In code mode, this returns a structured result. Inspect `status` before using `tools`: `completed` is complete, `incomplete` reports an exact `omitted_result_count` when known, and `aborted` has `omitted_result_count: null`. A null count means the lower layer did not provide an exact count.";
 
@@ -99,10 +100,39 @@ pub fn collect_code_mode_tool_definitions<'a>(
             definitions
         })
         .filter(|definition| codex_code_mode::is_code_mode_nested_tool(&definition.name))
-        .map(codex_code_mode::augment_tool_definition)
         .collect::<Vec<_>>();
-    tool_definitions.sort_by(|left, right| left.name.cmp(&right.name));
+    tool_definitions.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.tool_name.cmp(&right.tool_name))
+    });
+
+    let mut used_names = HashSet::with_capacity(tool_definitions.len());
+    for definition in &mut tool_definitions {
+        let normalized = codex_code_mode::normalize_code_mode_identifier(&definition.name);
+        if used_names.insert(normalized) {
+            continue;
+        }
+
+        let kind = if definition.tool_name.namespace.is_some() {
+            "namespaced"
+        } else {
+            "plain"
+        };
+        let base = format!("{}__{kind}", definition.name);
+        let mut candidate = base.clone();
+        let mut sequence = 2usize;
+        while !used_names.insert(codex_code_mode::normalize_code_mode_identifier(&candidate)) {
+            candidate = format!("{base}_{sequence}");
+            sequence = sequence.saturating_add(1);
+        }
+        definition.name = candidate;
+    }
+
     tool_definitions
+        .into_iter()
+        .map(codex_code_mode::augment_tool_definition)
+        .collect()
 }
 
 fn augmented_description_for_spec(spec: &ToolSpec) -> Option<String> {

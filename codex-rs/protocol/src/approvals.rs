@@ -140,13 +140,13 @@ pub enum GuardianAssessmentAction {
     Command {
         source: GuardianCommandSource,
         command: String,
-        cwd: AbsolutePathBuf,
+        cwd: LegacyAppPathString,
     },
     Execve {
         source: GuardianCommandSource,
         program: String,
         argv: Vec<String>,
-        cwd: AbsolutePathBuf,
+        cwd: LegacyAppPathString,
     },
     ApplyPatch {
         cwd: LegacyAppPathString,
@@ -533,7 +533,7 @@ mod tests {
             GuardianAssessmentAction::Command {
                 source: GuardianCommandSource::Shell,
                 command: "rm -rf /tmp/guardian".to_string(),
-                cwd: test_path_buf("/tmp").abs(),
+                cwd: test_path_buf("/tmp").abs().into(),
             }
         );
     }

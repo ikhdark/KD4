@@ -140,7 +140,6 @@ pub(super) async fn spawn_review_thread(
         deferred_tool_activations: Arc::new(std::sync::RwLock::new(
             crate::session::turn_context::DeferredToolActivationState::default(),
         )),
-        kd4_workflow_enabled: parent_turn_context.kd4_workflow_enabled,
         validation_authorization: Arc::clone(&parent_turn_context.validation_authorization),
         turn_metadata_state,
         extension_data,

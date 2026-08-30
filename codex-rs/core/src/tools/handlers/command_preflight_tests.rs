@@ -221,7 +221,7 @@ fn records_only_the_immediate_parent_as_the_next_expansion_scope() {
 }
 
 #[test]
-fn fails_closed_for_unparseable_or_non_native_rg_searches() {
+fn search_narrowing_is_best_effort_for_dynamic_and_non_native_commands() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -233,16 +233,20 @@ fn fails_closed_for_unparseable_or_non_native_rg_searches() {
         "$tool = 'rg'; & $tool needle .",
     ]);
 
-    assert!(
-        classify_rg_search_narrowing(&dynamic_powershell, Some(ShellType::PowerShell), root, root,)
-            .is_err()
+    assert_eq!(
+        classify_rg_search_narrowing(&dynamic_powershell, Some(ShellType::PowerShell), root, root,),
+        Ok(None)
     );
-    assert!(
-        reject_rg_search_without_native_scope(&strings(&["rg", "needle", "src"]), None).is_err()
+    assert_eq!(
+        classify_rg_search_narrowing_without_native_scope(&strings(&["rg", "needle", "src"]), None,),
+        None
     );
-    assert!(
-        reject_rg_search_without_native_scope(&strings(&["git", "status", "--short"]), None)
-            .is_ok()
+    assert_eq!(
+        classify_rg_search_narrowing_without_native_scope(
+            &strings(&["git", "status", "--short"]),
+            None,
+        ),
+        None
     );
 }
 
@@ -320,6 +324,51 @@ fn confirmed_performance_non_rg_commands_skip_search_path_normalization() {
     );
 }
 
+#[tokio::test]
+async fn search_scope_state_ignores_unrelated_content_and_detects_target_changes() {
+    let temp = tempfile::tempdir().expect("search scope fixture");
+    let root = temp.path();
+    let src = root.join("src");
+    std::fs::create_dir(&src).expect("create target scope");
+    std::fs::write(src.join("lib.rs"), b"original").expect("write target file");
+    std::fs::write(root.join("outside.bin"), vec![b'x'; 1024 * 1024])
+        .expect("write unrelated content");
+    let command = strings(&["rg", "needle", "src"]);
+
+    let mut first = classify_rg_search_narrowing(&command, None, root, root)
+        .expect("classification")
+        .expect("rg search");
+    crate::tools::handlers::command_search::observe_rg_search_scope_state(&mut first).await;
+    let first_identity = first
+        .scope_state_identity
+        .expect("target scope exposes a native filesystem identity");
+
+    std::fs::write(root.join("outside.bin"), vec![b'y'; 2 * 1024 * 1024])
+        .expect("change unrelated content");
+    let mut after_unrelated = classify_rg_search_narrowing(&command, None, root, root)
+        .expect("classification")
+        .expect("rg search");
+    crate::tools::handlers::command_search::observe_rg_search_scope_state(&mut after_unrelated)
+        .await;
+    assert_eq!(
+        after_unrelated.scope_state_identity.as_deref(),
+        Some(first_identity.as_str()),
+        "content outside the rg targets must not invalidate the scoped miss"
+    );
+
+    std::fs::write(src.join("lib.rs"), b"changed!").expect("change target content");
+    let mut after_relevant = classify_rg_search_narrowing(&command, None, root, root)
+        .expect("classification")
+        .expect("rg search");
+    crate::tools::handlers::command_search::observe_rg_search_scope_state(&mut after_relevant)
+        .await;
+    assert_ne!(
+        after_relevant.scope_state_identity.as_deref(),
+        Some(first_identity.as_str()),
+        "a target change must invalidate the scoped miss"
+    );
+}
+
 #[test]
 fn repairs_direct_argv_git_status_to_disable_optional_locks() {
     let invocation = CommandInvocation::Argv {
@@ -392,8 +441,8 @@ fn rejects_known_rg_flag_typo_for_direct_argv() {
 }
 
 #[test]
-fn audit_command_preflight_rejects_unparseable_shell_command() {
-    let issue = preflight_command_issue(
+fn command_preflight_accepts_dynamic_shell_command_when_static_parse_is_inconclusive() {
+    let commands = preflight_command_issue(
         &strings(&[
             "pwsh",
             "-NoProfile",
@@ -402,12 +451,20 @@ fn audit_command_preflight_rejects_unparseable_shell_command() {
         ]),
         /*shell_type*/ None,
     )
-    .expect_err("an unparseable shell command must fail closed");
+    .expect("static parser uncertainty must not reject a valid dynamic command");
 
-    assert_eq!(issue.code, CommandPreflightIssueCode::UnparseableCommand);
-    let rendered = issue.render_for_model();
-    assert!(rendered.contains("could not be parsed precisely enough"));
-    assert!(rendered.contains("command_preflight_unparseable_command"));
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn direct_argv_accepts_executable_with_powershell_cmdlet_shape() {
+    let commands = preflight_command_issue(
+        &strings(&["Get-Widget", "--version"]),
+        /*shell_type*/ None,
+    )
+    .expect("an unknown Verb-Noun executable is valid direct argv");
+
+    assert!(commands.is_empty());
 }
 
 #[test]
@@ -437,6 +494,37 @@ fn repairs_one_read_only_direct_argv_typo() {
             .as_deref()
             .is_some_and(|notice| notice.contains("read-only equivalent repair"))
     );
+}
+
+#[test]
+fn arguments_after_double_dash_are_not_linted_or_repaired() {
+    let invocation = CommandInvocation::Argv {
+        program: "rg".to_string(),
+        args: strings(&["TODO", "src", "--", "--ignorecase"]),
+    };
+    let outcome = preflight_invocation_with_equivalent_repair(
+        &invocation,
+        &invocation.to_direct_argv().expect("argv"),
+        None,
+    )
+    .expect("arguments after -- belong to the invoked program");
+
+    assert_eq!(outcome.invocation, invocation);
+    assert!(!outcome.repaired());
+
+    let invocation = CommandInvocation::Argv {
+        program: "rg".to_string(),
+        args: strings(&["literal", "--", "-gdata\\with\\backslashes"]),
+    };
+    let outcome = preflight_invocation_with_equivalent_repair(
+        &invocation,
+        &invocation.to_direct_argv().expect("argv"),
+        None,
+    )
+    .expect("glob-like data after -- must remain literal data");
+
+    assert_eq!(outcome.invocation, invocation);
+    assert!(!outcome.repaired());
 }
 
 #[test]
@@ -532,6 +620,57 @@ fn rejects_rg_literal_glob_path_for_direct_argv() {
     assert!(rendered.contains("not shell-expanded"));
     assert!(rendered.contains("pass wildcards through `--glob`"));
     assert!(rendered.contains("\"kind\":\"rg_literal_glob_path\""));
+}
+
+#[test]
+fn files_with_matches_keeps_the_first_positional_argument_as_a_pattern() {
+    preflight_command(
+        &strings(&[
+            "rg",
+            "--files-with-matches",
+            "TODO|*.rs",
+            "codex-rs/core/src",
+        ]),
+        None,
+    )
+    .expect("files-with-matches still takes a search pattern before its paths");
+}
+
+#[test]
+fn files_mode_still_treats_each_positional_argument_as_a_path() {
+    let issue = preflight_command_issue(&strings(&["rg", "--files", "codex-rs/*/src"]), None)
+        .expect_err("--files has path operands and direct argv does not expand them");
+
+    assert_eq!(issue.code, CommandPreflightIssueCode::RgLiteralGlobPath);
+}
+
+#[test]
+fn supported_powershell_launcher_shapes_are_not_rejected_by_partial_static_parsing() {
+    for invocation in [
+        strings(&[
+            "pwsh",
+            "-NonInteractive",
+            "-Command",
+            "Write-Output ok",
+            "extra",
+        ]),
+        strings(&[
+            "powershell.exe",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            "script.ps1",
+            "argument",
+        ]),
+        strings(&[
+            "pwsh",
+            "-EncodedCommand",
+            "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQA",
+        ]),
+    ] {
+        preflight_command(&invocation, None)
+            .unwrap_or_else(|issue| panic!("supported launcher shape was rejected: {issue:?}"));
+    }
 }
 
 #[test]
@@ -644,6 +783,20 @@ fn powershell_shell_mismatch_help_is_windows_only() {
 }
 
 #[test]
+fn powershell_shell_mismatch_ignores_quoted_text_and_comments() {
+    preflight_command(
+        &strings(&[
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            "Write-Output 'export PATH'; Write-Output \"source ./env 2>/dev/null\"; # export OTHER=value\nWrite-Output done",
+        ]),
+        Some(ShellType::PowerShell),
+    )
+    .expect("quoted data and comments are not active POSIX syntax");
+}
+
+#[test]
 fn rejects_unbalanced_quotes_in_shell_script() {
     let issue = preflight_command_issue(
         &strings(&["/bin/bash", "-lc", "rg 'TODO src"]),
@@ -657,6 +810,28 @@ fn rejects_unbalanced_quotes_in_shell_script() {
             .render_for_model()
             .contains("missing closing single quote")
     );
+}
+
+#[tokio::test]
+async fn direct_runtime_does_not_gate_execution_on_preflight_heuristics() {
+    let script = "Write-Output 'unterminated";
+    let invocation = CommandInvocation::PowerShellScript(script.to_string());
+    let command = strings(&["pwsh", "-NoProfile", "-Command", script]);
+    preflight_invocation_with_equivalent_repair(&invocation, &command, Some(ShellType::PowerShell))
+        .expect_err("legacy preflight should reject the fixture");
+
+    let outcome = preflight_invocation_for_runtime(
+        /*direct_runtime*/ true,
+        &invocation,
+        &command,
+        Some(ShellType::PowerShell),
+    )
+    .await
+    .expect("direct runtime should preserve the authoritative command");
+
+    assert_eq!(outcome.invocation, invocation);
+    assert!(outcome.validation_invocations.is_empty());
+    assert_eq!(outcome.repair_notice, None);
 }
 
 #[test]
@@ -728,6 +903,16 @@ fn literal_path_lint_windows_only_help_matches_path_parameter_colon_form() {
     assert!(rendered.contains("-LiteralPath"));
     assert!(rendered.contains("cmd quoting example"));
     assert!(!rendered.contains("POSIX"), "{rendered}");
+}
+
+#[test]
+fn literal_path_lint_accepts_plain_path_parameter() {
+    lint_windows_path_shape(
+        r"Get-Content -Path C:\repo\plain.txt",
+        Some(ShellType::PowerShell),
+        &[strings(&["Get-Content", "-Path", r"C:\repo\plain.txt"])],
+    )
+    .expect("plain -Path values do not need literal-path rewriting");
 }
 
 #[test]

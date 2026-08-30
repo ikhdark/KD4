@@ -190,6 +190,34 @@ fn sandbox_detection_uses_aggregated_output() {
 }
 
 #[test]
+fn sandbox_detection_ignores_application_sandbox_text() {
+    let output = make_exec_output(
+        /*exit_code*/ 1,
+        "",
+        "test failed: sandbox fixture returned the wrong value",
+        "",
+    );
+    assert!(!is_likely_sandbox_denied(
+        SandboxType::WindowsRestrictedToken,
+        &output
+    ));
+}
+
+#[test]
+fn sandbox_detection_ignores_generic_write_failures() {
+    let output = make_exec_output(
+        /*exit_code*/ 1,
+        "",
+        "failed to write file: no space left on device",
+        "",
+    );
+    assert!(!is_likely_sandbox_denied(
+        SandboxType::WindowsRestrictedToken,
+        &output
+    ));
+}
+
+#[test]
 fn sandbox_detection_ignores_network_policy_text_with_zero_exit_code() {
     let output = make_exec_output(
         /*exit_code*/ 0,

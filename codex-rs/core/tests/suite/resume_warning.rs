@@ -103,7 +103,6 @@ fn resume_history(
                 turn_id,
                 last_agent_message: None,
                 error: None,
-                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,

@@ -325,9 +325,7 @@ fn save_oauth_tokens_to_direct_keyring<K: KeyringStore>(
     let key = compute_store_key(server_name, &tokens.url)?;
     match keyring_store.save(KEYRING_SERVICE, &key, &serialized) {
         Ok(()) => {
-            delete_oauth_tokens_from_file(codex_home, &key).context(
-                "secure OAuth credentials were saved but plaintext fallback cleanup failed",
-            )?;
+            cleanup_plaintext_after_secure_save(codex_home, &key);
             Ok(())
         }
         Err(error) => {
@@ -363,9 +361,14 @@ fn save_oauth_tokens_to_secrets_keyring<K: KeyringStore + Clone + 'static>(
     }
 
     let key = compute_store_key(server_name, &tokens.url)?;
-    delete_oauth_tokens_from_file(codex_home, &key)
-        .context("secure OAuth credentials were saved but plaintext fallback cleanup failed")?;
+    cleanup_plaintext_after_secure_save(codex_home, &key);
     Ok(())
+}
+
+fn cleanup_plaintext_after_secure_save(codex_home: &Path, key: &str) {
+    if let Err(error) = delete_oauth_tokens_from_file(codex_home, key) {
+        warn!("secure OAuth credentials were saved but plaintext fallback cleanup failed: {error}");
+    }
 }
 
 /// Writes one credential to Secrets. The caller must hold the Secrets aggregate-store lock.
@@ -1199,6 +1202,29 @@ mod tests {
         assert!(!fallback_path.exists(), "fallback file should be removed");
         let stored = store.saved_value(&key).expect("value saved to keyring");
         assert_eq!(serde_json::from_str::<StoredOAuthTokens>(&stored)?, tokens);
+        Ok(())
+    }
+
+    #[test]
+    fn secure_save_cleanup_failure_does_not_fallback_to_plaintext() -> Result<()> {
+        let env = TempCodexHome::new();
+        let store = MockKeyringStore::default();
+        let tokens = sample_tokens();
+        let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
+        let malformed_plaintext = b"{not-valid-json";
+        let fallback_path = super::fallback_file_path(env.path());
+        std::fs::write(&fallback_path, malformed_plaintext)?;
+
+        super::save_oauth_tokens_with_keyring_with_fallback_to_file(
+            &store,
+            env.path(),
+            AuthKeyringBackendKind::Direct,
+            &tokens.server_name,
+            &tokens,
+        )?;
+
+        assert!(store.saved_value(&key).is_some());
+        assert_eq!(std::fs::read(fallback_path)?, malformed_plaintext);
         Ok(())
     }
 

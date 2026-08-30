@@ -379,7 +379,6 @@ fn turn_items_for_thread_returns_matching_turn_items() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -396,7 +395,6 @@ fn turn_items_for_thread_returns_matching_turn_items() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -422,7 +420,6 @@ fn should_backfill_turn_completed_items_skips_ephemeral_threads() {
         ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread-1".to_string(),
-            completion: None,
             timing: None,
             turn: codex_app_server_protocol::Turn {
                 id: "turn-1".to_string(),
@@ -433,7 +430,6 @@ fn should_backfill_turn_completed_items_skips_ephemeral_threads() {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,

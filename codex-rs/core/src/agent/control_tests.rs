@@ -13,6 +13,10 @@ use crate::context::SubagentNotification;
 use crate::init_state_db;
 use crate::thread_manager::StartThreadOptions;
 use assert_matches::assert_matches;
+use codex_agent_graph_store::AgentGraphStore;
+use codex_agent_graph_store::AgentGraphStoreError;
+use codex_agent_graph_store::AgentGraphStoreFuture;
+use codex_agent_graph_store::ThreadSpawnEdgeStatus;
 use codex_agent_task_store::AcceptanceCriterion;
 use codex_agent_task_store::AgentRole;
 use codex_agent_task_store::AgentStatusClaim;
@@ -160,6 +164,14 @@ impl AgentControlHarness {
     }
 
     async fn new_with_config(home: TempDir, config: Config) -> Self {
+        Self::new_with_config_and_agent_graph_store(home, config, None).await
+    }
+
+    async fn new_with_config_and_agent_graph_store(
+        home: TempDir,
+        config: Config,
+        agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
+    ) -> Self {
         let state_db = init_state_db(&config).await;
         let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
             CodexAuth::from_api_key("dummy"),
@@ -167,7 +179,8 @@ impl AgentControlHarness {
             config.codex_home.to_path_buf(),
             std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             state_db.clone(),
-        );
+        )
+        .with_agent_graph_store_for_tests(agent_graph_store);
         let control = manager.agent_control();
         Self {
             _home: home,
@@ -209,6 +222,85 @@ impl AgentControlHarness {
             .await
             .expect("start subagent thread");
         (new_thread.thread_id, new_thread.thread)
+    }
+}
+
+struct FailingAgentGraphStore {
+    fail_upsert: bool,
+    fail_list: bool,
+    attempted_child: std::sync::Mutex<Option<ThreadId>>,
+}
+
+impl FailingAgentGraphStore {
+    fn failing_upsert() -> Self {
+        Self {
+            fail_upsert: true,
+            fail_list: false,
+            attempted_child: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn failing_list() -> Self {
+        Self {
+            fail_upsert: false,
+            fail_list: true,
+            attempted_child: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn injected_error(operation: &'static str) -> AgentGraphStoreError {
+        AgentGraphStoreError::InvalidRequest {
+            message: format!("injected {operation} failure"),
+        }
+    }
+}
+
+impl AgentGraphStore for FailingAgentGraphStore {
+    fn upsert_thread_spawn_edge(
+        &self,
+        _parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+        _status: ThreadSpawnEdgeStatus,
+    ) -> AgentGraphStoreFuture<'_, ()> {
+        *self
+            .attempted_child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child_thread_id);
+        let result = if self.fail_upsert {
+            Err(Self::injected_error("upsert"))
+        } else {
+            Ok(())
+        };
+        Box::pin(std::future::ready(result))
+    }
+
+    fn set_thread_spawn_edge_status(
+        &self,
+        _child_thread_id: ThreadId,
+        _status: ThreadSpawnEdgeStatus,
+    ) -> AgentGraphStoreFuture<'_, ()> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn list_thread_spawn_children(
+        &self,
+        _parent_thread_id: ThreadId,
+        _status_filter: Option<ThreadSpawnEdgeStatus>,
+    ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>> {
+        let result = if self.fail_list {
+            Err(Self::injected_error("list children"))
+        } else {
+            Ok(Vec::new())
+        };
+        Box::pin(std::future::ready(result))
+    }
+
+    fn list_thread_spawn_descendants(
+        &self,
+        _root_thread_id: ThreadId,
+        _status_filter: Option<ThreadSpawnEdgeStatus>,
+    ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>> {
+        Box::pin(std::future::ready(Ok(Vec::new())))
     }
 }
 
@@ -384,6 +476,75 @@ async fn assert_thread_not_loaded(manager: &ThreadManager, thread_id: ThreadId) 
 }
 
 #[tokio::test]
+async fn spawn_agent_reports_spawn_edge_persistence_failure_and_rolls_back() {
+    let (home, config) = test_config().await;
+    let graph_store = Arc::new(FailingAgentGraphStore::failing_upsert());
+    let harness = AgentControlHarness::new_with_config_and_agent_graph_store(
+        home,
+        config,
+        Some(graph_store.clone()),
+    )
+    .await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+
+    let error = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect_err("spawn must fail when its durable graph edge cannot be written");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to persist thread-spawn edge"),
+        "unexpected error: {error}"
+    );
+    let child_thread_id = graph_store
+        .attempted_child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("the failed graph write should identify the spawned child");
+    assert_thread_not_loaded(&harness.manager, child_thread_id).await;
+}
+
+#[tokio::test]
+async fn legacy_resume_reports_spawn_graph_read_failure() {
+    let (home, config) = test_config().await;
+    let graph_store = Arc::new(FailingAgentGraphStore::failing_list());
+    let harness =
+        AgentControlHarness::new_with_config_and_agent_graph_store(home, config, Some(graph_store))
+            .await;
+    let (thread_id, thread) = harness.start_thread().await;
+    persist_thread_for_tree_resume(&thread, "persist root before resume").await;
+    harness
+        .control
+        .shutdown_live_agent(thread_id)
+        .await
+        .expect("root shutdown should succeed");
+
+    let error = harness
+        .control
+        .resume_agent_from_rollout(harness.config.clone(), thread_id, SessionSource::Exec)
+        .await
+        .expect_err("resume must fail when persisted child topology cannot be read");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to load persisted thread-spawn children"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn send_input_errors_when_manager_dropped() {
     let control = AgentControl::default();
     let err = control
@@ -431,7 +592,6 @@ async fn on_event_updates_status_from_task_complete() {
         completed_at: None,
         duration_ms: None,
         time_to_first_token_ms: None,
-        completion: None,
         timing: None,
     }));
     let expected = AgentStatus::Completed(Some("done".to_string()));
@@ -453,7 +613,6 @@ async fn on_event_preserves_typed_surface_in_agent_status() {
         completed_at: None,
         duration_ms: None,
         time_to_first_token_ms: None,
-        completion: None,
         timing: None,
     }));
     assert_eq!(
@@ -2853,7 +3012,6 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
-                completion: None,
                 timing: None,
             }),
         )
@@ -2944,7 +3102,6 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
-                completion: None,
                 timing: None,
             }),
         )
@@ -3096,7 +3253,6 @@ async fn completion_watcher_emits_terminal_metrics_for_missing_typed_receipt() {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
-                completion: None,
                 timing: None,
             }),
         )

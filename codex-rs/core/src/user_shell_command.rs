@@ -4,7 +4,6 @@ use std::time::Duration;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::formatted_truncate_text;
 
 use crate::context::ContextualUserFragment;
 use crate::context::UserShellCommand;
@@ -18,11 +17,10 @@ fn user_shell_command_fragment(
     exit_code: i32,
     duration: Duration,
     output: String,
-    truncation_policy: TruncationPolicy,
+    _truncation_policy: TruncationPolicy,
 ) -> UserShellCommand {
     let command = escape_xml_text(command);
     let output = escape_xml_text(&output);
-    let output = formatted_truncate_text(&output, truncation_policy);
     UserShellCommand::new(command, exit_code, duration, output)
 }
 

@@ -32,7 +32,7 @@ const WATCHER_THROTTLE_INTERVAL: Duration = Duration::from_secs(10);
 const WATCHER_THROTTLE_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) struct SkillsWatcher {
-    runtime: OnceLock<SkillsWatcherRuntime>,
+    runtime: OnceLock<Result<SkillsWatcherRuntime, String>>,
     skills_service: Arc<SkillsService>,
     outgoing: Arc<OutgoingMessageSender>,
     runtime_extra_roots_registration: Mutex<WatchRegistration>,
@@ -41,6 +41,8 @@ pub(crate) struct SkillsWatcher {
     initialization_count: AtomicUsize,
     #[cfg(test)]
     thread_config_registration_count: AtomicUsize,
+    #[cfg(test)]
+    file_watcher_result: Option<Result<Arc<FileWatcher>, String>>,
 }
 
 struct SkillsWatcherRuntime {
@@ -64,17 +66,40 @@ impl SkillsWatcher {
             initialization_count: AtomicUsize::new(0),
             #[cfg(test)]
             thread_config_registration_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            file_watcher_result: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_file_watcher_result(
+        skills_service: Arc<SkillsService>,
+        outgoing: Arc<OutgoingMessageSender>,
+        file_watcher_result: Result<Arc<FileWatcher>, String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            runtime: OnceLock::new(),
+            skills_service,
+            outgoing,
+            runtime_extra_roots_registration: Mutex::new(WatchRegistration::default()),
+            shutdown_requested: AtomicBool::new(false),
+            initialization_count: AtomicUsize::new(0),
+            thread_config_registration_count: AtomicUsize::new(0),
+            file_watcher_result: Some(file_watcher_result),
         })
     }
 
     pub(crate) fn shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
-        if let Some(runtime) = self.runtime.get() {
+        if let Some(Ok(runtime)) = self.runtime.get() {
             runtime.shutdown_token.cancel();
         }
     }
 
-    pub(crate) fn register_runtime_extra_roots(&self, extra_roots: &[AbsolutePathBuf]) {
+    pub(crate) fn register_runtime_extra_roots(
+        &self,
+        extra_roots: &[AbsolutePathBuf],
+    ) -> Result<(), String> {
         let roots = extra_roots
             .iter()
             .map(|root| WatchPath {
@@ -84,22 +109,21 @@ impl SkillsWatcher {
             .collect::<Vec<_>>();
         let registration = if roots.is_empty() {
             WatchRegistration::default()
-        } else if let Some(runtime) = self.runtime() {
-            match runtime.subscriber.register_paths(roots) {
-                Ok(registration) => registration,
-                Err(err) => {
-                    warn!("failed to register runtime skills roots: {err}");
-                    WatchRegistration::default()
-                }
-            }
         } else {
-            WatchRegistration::default()
+            let runtime = self
+                .runtime()?
+                .ok_or_else(|| "skills watcher is shut down".to_string())?;
+            runtime
+                .subscriber
+                .register_paths(roots)
+                .map_err(|err| format!("failed to register runtime skills roots: {err}"))?
         };
         let mut guard = self
             .runtime_extra_roots_registration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = registration;
+        Ok(())
     }
 
     pub(crate) async fn register_thread_config(
@@ -107,12 +131,12 @@ impl SkillsWatcher {
         config: &Config,
         thread_manager: &ThreadManager,
         environments: &[TurnEnvironmentSelection],
-    ) -> WatchRegistration {
+    ) -> Result<WatchRegistration, String> {
         #[cfg(test)]
         self.thread_config_registration_count
             .fetch_add(1, Ordering::AcqRel);
         let Some(environment_selection) = environments.first() else {
-            return WatchRegistration::default();
+            return Ok(WatchRegistration::default());
         };
         let Some(environment) = thread_manager
             .environment_manager()
@@ -122,10 +146,10 @@ impl SkillsWatcher {
                 "failed to register skills watcher for unknown environment `{}`",
                 environment_selection.environment_id
             );
-            return WatchRegistration::default();
+            return Ok(WatchRegistration::default());
         };
         if environment.is_remote() {
-            return WatchRegistration::default();
+            return Ok(WatchRegistration::default());
         }
 
         let plugins_input = config.plugins_config_input();
@@ -150,18 +174,15 @@ impl SkillsWatcher {
             })
             .collect::<Vec<_>>();
         if roots.is_empty() {
-            return WatchRegistration::default();
+            return Ok(WatchRegistration::default());
         }
-        let Some(runtime) = self.runtime() else {
-            return WatchRegistration::default();
-        };
-        match runtime.subscriber.register_paths(roots) {
-            Ok(registration) => registration,
-            Err(err) => {
-                warn!("failed to register skills roots: {err}");
-                WatchRegistration::default()
-            }
-        }
+        let runtime = self
+            .runtime()?
+            .ok_or_else(|| "skills watcher is shut down".to_string())?;
+        runtime
+            .subscriber
+            .register_paths(roots)
+            .map_err(|err| format!("failed to register skills roots: {err}"))
     }
 
     #[cfg(test)]
@@ -172,7 +193,7 @@ impl SkillsWatcher {
 
     #[cfg(test)]
     pub(crate) fn is_initialized(&self) -> bool {
-        self.runtime.get().is_some()
+        matches!(self.runtime.get(), Some(Ok(_)))
     }
 
     #[cfg(test)]
@@ -180,20 +201,14 @@ impl SkillsWatcher {
         self.initialization_count.load(Ordering::Acquire)
     }
 
-    fn runtime(&self) -> Option<&SkillsWatcherRuntime> {
+    fn runtime(&self) -> Result<Option<&SkillsWatcherRuntime>, String> {
         if self.shutdown_requested.load(Ordering::Acquire) {
-            return None;
+            return Ok(None);
         }
         let runtime = self.runtime.get_or_init(|| {
             #[cfg(test)]
             self.initialization_count.fetch_add(1, Ordering::AcqRel);
-            let file_watcher = match FileWatcher::new() {
-                Ok(file_watcher) => Arc::new(file_watcher),
-                Err(err) => {
-                    warn!("failed to initialize skills file watcher: {err}");
-                    Arc::new(FileWatcher::noop())
-                }
-            };
+            let file_watcher = self.create_file_watcher()?;
             let (subscriber, rx) = file_watcher.add_subscriber();
             let shutdown_token = CancellationToken::new();
             Self::spawn_event_loop(
@@ -201,19 +216,31 @@ impl SkillsWatcher {
                 Arc::clone(&self.skills_service),
                 Arc::clone(&self.outgoing),
                 shutdown_token.child_token(),
-            );
-            SkillsWatcherRuntime {
+            )?;
+            Ok(SkillsWatcherRuntime {
                 subscriber,
                 _shutdown_drop_guard: shutdown_token.clone().drop_guard(),
                 shutdown_token,
-            }
+            })
         });
-        if self.shutdown_requested.load(Ordering::Acquire) {
-            runtime.shutdown_token.cancel();
-            None
-        } else {
-            Some(runtime)
+        match runtime {
+            Ok(runtime) if self.shutdown_requested.load(Ordering::Acquire) => {
+                runtime.shutdown_token.cancel();
+                Ok(None)
+            }
+            Ok(runtime) => Ok(Some(runtime)),
+            Err(err) => Err(err.clone()),
         }
+    }
+
+    fn create_file_watcher(&self) -> Result<Arc<FileWatcher>, String> {
+        #[cfg(test)]
+        if let Some(result) = &self.file_watcher_result {
+            return result.clone();
+        }
+        FileWatcher::new()
+            .map(Arc::new)
+            .map_err(|err| format!("failed to initialize skills file watcher: {err}"))
     }
 
     fn spawn_event_loop(
@@ -221,22 +248,19 @@ impl SkillsWatcher {
         skills_service: Arc<SkillsService>,
         outgoing: Arc<OutgoingMessageSender>,
         shutdown_token: CancellationToken,
-    ) {
+    ) -> Result<(), String> {
         let mut rx = ThrottledWatchReceiver::new(rx, WATCHER_THROTTLE_INTERVAL);
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            warn!("skills watcher listener skipped: no Tokio runtime available");
-            return;
-        };
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|err| format!("skills watcher listener requires a Tokio runtime: {err}"))?;
         handle.spawn(async move {
             loop {
                 let event = tokio::select! {
                     _ = shutdown_token.cancelled() => break,
-                    event = rx.recv() => event,
+                    event = rx.recv_with_observer(|_| skills_service.clear_cache()) => event,
                 };
                 if event.is_none() {
                     break;
                 }
-                skills_service.clear_cache();
                 outgoing
                     .send_server_notification(ServerNotification::SkillsChanged(
                         SkillsChangedNotification {},
@@ -244,5 +268,6 @@ impl SkillsWatcher {
                     .await;
             }
         });
+        Ok(())
     }
 }

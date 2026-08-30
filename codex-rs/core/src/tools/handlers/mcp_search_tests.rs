@@ -42,6 +42,52 @@ fn search_info_uses_connector_name_for_output_namespace_description() {
     );
 }
 
+#[test]
+fn search_info_indexes_nested_schema_branches_and_definitions() {
+    let mut info = tool_info();
+    info.tool.input_schema = Arc::new(rmcp::model::object(json!({
+        "type": "object",
+        "properties": {
+            "payload": {
+                "oneOf": [
+                    { "$ref": "#/$defs/batchRequest" },
+                    { "type": "string", "enum": ["single-event"] }
+                ]
+            }
+        },
+        "$defs": {
+            "batchRequest": {
+                "type": "object",
+                "description": "Bulk calendar import",
+                "required": ["calendar_ids"],
+                "properties": {
+                    "calendar_ids": { "type": "array", "items": { "type": "string" } }
+                }
+            }
+        }
+    })));
+
+    let handler = McpHandler::new(info).expect("MCP tool spec should build");
+    let search_text = handler
+        .search_info()
+        .expect("MCP search info")
+        .entry
+        .search_text;
+
+    for expected in [
+        "#/$defs/batchRequest",
+        "single-event",
+        "batchRequest",
+        "Bulk calendar import",
+        "calendar_ids",
+    ] {
+        assert!(
+            search_text.contains(expected),
+            "missing `{expected}` from `{search_text}`"
+        );
+    }
+}
+
 fn tool_info() -> ToolInfo {
     ToolInfo {
         server_name: "codex-apps".to_string(),

@@ -119,7 +119,23 @@ fn validation_commands_do_not_clear_generic_mutation_revision() {
     assert_eq!(tracker.current_mutation_revision(), 1);
 
     tracker.record_exec_command_end(&["cargo".into(), "check".into()], 0, false);
+    tracker.record_exec_command_end(
+        &["cargo".into(), "test".into(), "selected_case".into()],
+        0,
+        false,
+    );
     assert_eq!(tracker.current_mutation_revision(), 1);
+
+    tracker.record_exec_command_end(
+        &[
+            "sh".into(),
+            "-c".into(),
+            "cargo test && touch marker".into(),
+        ],
+        0,
+        false,
+    );
+    assert_eq!(tracker.current_mutation_revision(), 2);
 }
 
 #[test]
@@ -933,125 +949,4 @@ fn large_rewrite_returns_promptly_and_preserves_exact_content() {
         fs::read_to_string(path).expect("read large file"),
         new_content
     );
-}
-
-fn coherent_boundary(candidate_identity: &str) -> CoherentImplementationBoundary {
-    CoherentImplementationBoundary {
-        candidate_identity: candidate_identity.to_string(),
-        batch_closed: true,
-        implementation_obligations_satisfied: true,
-        pending_mutation_obligations: false,
-        typed_children_quiescent: true,
-        default_children_quiescent: true,
-    }
-}
-
-fn inspection_dependencies() -> PostEditInspectionDependencies {
-    PostEditInspectionDependencies {
-        requirement_manifest_identity: "requirements-1".to_string(),
-        proof_route_identity: "proof-1".to_string(),
-        validation_identity: "validation-1".to_string(),
-        rendered_gate_identity: "gate-1".to_string(),
-    }
-}
-
-#[test]
-fn open_three_mutation_batch_inspects_once_at_final_quiescent_revision() {
-    let mut tracker = TurnDiffTracker::new();
-    let mut boundary = coherent_boundary("candidate-1");
-    boundary.batch_closed = false;
-
-    for _ in 0..3 {
-        tracker.record_unknown_mutation();
-        assert_eq!(
-            tracker.prepare_post_edit_inspection(Some(&boundary), inspection_dependencies()),
-            PostEditInspectionPreparation::FailOpen,
-        );
-    }
-
-    boundary.batch_closed = true;
-    let PostEditInspectionPreparation::Ready(bundle) =
-        tracker.prepare_post_edit_inspection(Some(&boundary), inspection_dependencies())
-    else {
-        panic!("quiescent candidate should be inspectable");
-    };
-    assert_eq!(bundle.final_mutation_revision, 3);
-    assert!(tracker.record_post_edit_inspection_outcome(
-        &bundle.fingerprint,
-        PostEditInspectionOutcome::AcceptForFocusedValidation,
-    ));
-    assert_eq!(
-        tracker.prepare_post_edit_inspection(Some(&boundary), inspection_dependencies()),
-        PostEditInspectionPreparation::Suppressed(
-            PostEditInspectionOutcome::AcceptForFocusedValidation
-        ),
-    );
-}
-
-#[test]
-fn post_edit_bundle_invalidates_only_changed_dependency_sections() {
-    let mut tracker = TurnDiffTracker::new();
-    tracker.record_unknown_mutation();
-    let boundary = coherent_boundary("candidate-1");
-    let PostEditInspectionPreparation::Ready(first) =
-        tracker.prepare_post_edit_inspection(Some(&boundary), inspection_dependencies())
-    else {
-        panic!("initial bundle should be ready");
-    };
-    assert!(tracker.record_post_edit_inspection_outcome(
-        &first.fingerprint,
-        PostEditInspectionOutcome::AcceptForFocusedValidation,
-    ));
-
-    let mut validation_changed = inspection_dependencies();
-    validation_changed.validation_identity = "validation-2".to_string();
-    let PostEditInspectionPreparation::Ready(second) =
-        tracker.prepare_post_edit_inspection(Some(&boundary), validation_changed)
-    else {
-        panic!("changed validation should rebuild its section");
-    };
-    assert_eq!(
-        second.rebuilt_sections,
-        vec![PostEditBundleSection::ProofAndValidation]
-    );
-
-    let mut requirements_changed = second.dependencies;
-    requirements_changed.requirement_manifest_identity = "requirements-2".to_string();
-    let PostEditInspectionPreparation::Ready(third) =
-        tracker.prepare_post_edit_inspection(Some(&boundary), requirements_changed)
-    else {
-        panic!("changed requirements should rebuild their section");
-    };
-    assert_eq!(
-        third.rebuilt_sections,
-        vec![PostEditBundleSection::Requirements]
-    );
-}
-
-#[test]
-fn quiescent_repair_batch_creates_one_new_candidate_inspection() {
-    let mut tracker = TurnDiffTracker::new();
-    tracker.record_unknown_mutation();
-    let initial = coherent_boundary("candidate-1");
-    let PostEditInspectionPreparation::Ready(first) =
-        tracker.prepare_post_edit_inspection(Some(&initial), inspection_dependencies())
-    else {
-        panic!("initial candidate should be ready");
-    };
-    assert!(tracker.record_post_edit_inspection_outcome(
-        &first.fingerprint,
-        PostEditInspectionOutcome::RequestRepairBatch {
-            repair_identity: "repair-1".to_string(),
-        },
-    ));
-
-    tracker.record_unknown_mutation();
-    let repair = coherent_boundary("candidate-2");
-    let PostEditInspectionPreparation::Ready(repaired) =
-        tracker.prepare_post_edit_inspection(Some(&repair), inspection_dependencies())
-    else {
-        panic!("quiescent repair candidate should be ready");
-    };
-    assert_eq!(repaired.final_mutation_revision, 2);
-    assert_eq!(repaired.candidate_identity, "candidate-2");
 }

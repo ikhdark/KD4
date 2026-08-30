@@ -24,6 +24,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair_async;
 use crate::tools::handlers::command_search::classify_rg_search_narrowing;
+use crate::tools::handlers::command_search::observe_rg_search_scope_state;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_repository_root;
@@ -45,9 +46,7 @@ use super::super::shell_spec::create_shell_command_tool_for_policy;
 use super::super::unified_exec::ExecCommandHandler;
 use super::super::unified_exec::ExecCommandHandlerOptions;
 use super::RunExecLikeArgs;
-use super::ValidationLaunchPreparationArgs;
 use super::parse_shell_command_hook_invocation;
-use super::prepare_validation_launch;
 use super::run_exec_like;
 use super::validation_environment_hash;
 use super::validation_structured_output;
@@ -99,11 +98,6 @@ impl ShellCommandHandler {
         );
         if !allow_login_shell && !object.contains_key("login") {
             object.insert("login".to_string(), serde_json::Value::Bool(false));
-        }
-        if !object.contains_key("yield_time_ms")
-            && let Some(timeout_ms) = object.get("timeout_ms").cloned()
-        {
-            object.insert("yield_time_ms".to_string(), timeout_ms);
         }
         serde_json::to_string(&value).map_err(|err| {
             FunctionCallError::RespondToModel(format!(
@@ -352,14 +346,14 @@ impl ShellCommandHandler {
         let command_repaired = preflight.repaired();
         let validation_invocations = preflight.validation_invocations;
         let command_invocation = preflight.invocation;
-        let mut repair_notice = preflight.repair_notice;
+        let repair_notice = preflight.repair_notice;
         let validation_admission = admit_validation_invocations(
             &turn.validation_authorization,
             &validation_invocations,
             params.validation.is_some(),
         )
         .await;
-        let mut validation_launch = match validation_admission {
+        let validation_launch = match validation_admission {
             ValidationAdmission::Skip(skipped) => {
                 if matches!(
                     skipped.skip_disposition,
@@ -380,47 +374,7 @@ impl ShellCommandHandler {
                 classification,
                 authorization_revision,
                 explicitly_tagged: params.validation.is_some(),
-                structured_route: None,
-                bound_plan_step: None,
-                bound_work_unit: None,
-                validation_call_id: None,
-                turn_timing_state: Some(Arc::clone(&turn.turn_timing_state)),
-                focused_validation_token: None,
             }),
-        };
-        super::downgrade_unattributed_validation(
-            &mut validation_launch,
-            params.validation.is_some(),
-            &mut repair_notice,
-        );
-        let direct_validation_route = if validation_launch.is_some() {
-            let context = params.validation.as_ref().ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "validation commands require direct argv and `validation.covered_paths`"
-                        .to_string(),
-                )
-            })?;
-            let validation_repository = super::validation_repository_root_if_needed(
-                true,
-                cwd.as_path(),
-                turn.config.cwd.as_path(),
-            );
-            let repository = validation_repository.as_ref().ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "validation effective cwd must be inside a repository".to_string(),
-                )
-            })?;
-            Some(
-                super::direct_validation_route(
-                    context,
-                    &command_invocation,
-                    repository,
-                    params.timeout_ms.unwrap_or(10_000),
-                )
-                .map_err(FunctionCallError::RespondToModel)?,
-            )
-        } else {
-            None
         };
         let hook_command = command_invocation.display_command();
         maybe_emit_implicit_skill_invocation(session.as_ref(), turn.as_ref(), &hook_command, &cwd)
@@ -489,13 +443,6 @@ impl ShellCommandHandler {
             )
             .await;
         let validation_cwd = exec_params.cwd.to_string_lossy().into_owned();
-        prepare_validation_launch(ValidationLaunchPreparationArgs {
-            session: session.as_ref(),
-            validation_launch: &mut validation_launch,
-            direct_validation_route: direct_validation_route.as_ref(),
-            call_id: &call_id,
-        })
-        .await?;
         let attempt_key = if validation_launch.is_none() {
             let repository = resolve_repository_root(exec_params.cwd.as_path());
             let attempt_key = CommandAttemptKey::new(
@@ -511,13 +458,16 @@ impl ShellCommandHandler {
             .with_runtime_context(&runtime_context)
             .with_repository_epoch(repository_epoch)
             .with_workspace_identity(workspace_identity.as_deref());
-            let search = classify_rg_search_narrowing(
+            let mut search = classify_rg_search_narrowing(
                 &safety_command,
                 shell_type,
                 exec_params.cwd.as_path(),
                 &repository,
             )
             .map_err(FunctionCallError::RespondToModel)?;
+            if let Some(search) = search.as_mut() {
+                observe_rg_search_scope_state(search).await;
+            }
             let attempt_key = attempt_key.with_search_narrowing(
                 &turn.sub_id,
                 repository.to_string_lossy().as_ref(),
@@ -658,5 +608,27 @@ impl CoreToolRuntime for ShellCommandHandler {
             tool_input: command.hook_input(),
             tool_response,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::ShellCommandHandler;
+
+    #[test]
+    fn forwarding_timeout_to_unified_exec_preserves_default_yield() {
+        let forwarded = ShellCommandHandler::forward_arguments_to_unified_exec(
+            &json!({"command": "long-running", "timeout_ms": 60_000}).to_string(),
+            "remote",
+            true,
+        )
+        .expect("forward shell_command arguments");
+        let forwarded: serde_json::Value =
+            serde_json::from_str(&forwarded).expect("parse forwarded arguments");
+
+        assert_eq!(forwarded["timeout_ms"], 60_000);
+        assert!(forwarded.get("yield_time_ms").is_none());
     }
 }

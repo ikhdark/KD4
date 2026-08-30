@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -23,8 +22,6 @@ use crate::guardian::GuardianRejectionCircuitBreaker;
 use crate::mcp::McpManager;
 use crate::plan_store::PlanStore;
 use crate::session::McpRuntimeSnapshot;
-use crate::task_evidence::Kd4RepositoryContext;
-use crate::task_evidence::TaskEvidenceLedger;
 use crate::tools::code_mode::CodeModeService;
 use crate::tools::command_execution::CommandExecutionLedger;
 use crate::tools::handlers::ToolSearchHandlerCache;
@@ -68,8 +65,6 @@ pub(crate) struct SessionServices {
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
     pub(crate) command_execution: CommandExecutionLedger,
     pub(crate) plan_store: PlanStore,
-    pub(crate) task_evidence: TaskEvidenceLedger,
-    pub(crate) kd4_repository_context: std::sync::RwLock<Kd4RepositoryContext>,
     pub(crate) elicitations: ElicitationService,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) hooks: ArcSwap<Hooks>,
@@ -115,21 +110,6 @@ pub(crate) struct SessionServices {
 }
 
 impl SessionServices {
-    pub(crate) fn kd4_workflow_enabled_for(&self, cwd: &Path) -> bool {
-        self.kd4_repository_context
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(cwd)
-    }
-
-    pub(crate) fn set_kd4_repository_context(&self, repository_root: Option<std::path::PathBuf>) {
-        *self
-            .kd4_repository_context
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Kd4RepositoryContext::from_repository_root(repository_root);
-    }
-
     /// Installs the manager before validating required servers so startup-time elicitation can
     /// resolve through the session's manager while validation waits.
     pub(crate) async fn install_mcp_connection_manager(

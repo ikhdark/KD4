@@ -274,9 +274,10 @@ def validate_package_dir(
     ).hexdigest()
     if metadata.get("bundleId") != expected_bundle_id:
         raise RuntimeError("Invalid package metadata field 'bundleId'")
-    if not isinstance(metadata.get("buildIdentity"), dict) or not metadata[
-        "buildIdentity"
-    ]:
+    if (
+        not isinstance(metadata.get("buildIdentity"), dict)
+        or not metadata["buildIdentity"]
+    ):
         raise RuntimeError("Invalid package metadata field 'buildIdentity'")
 
     validate_pe_targets(package_dir, files, spec)
@@ -435,7 +436,9 @@ def validate_host_entrypoint_version(
             timeout=15,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        raise RuntimeError(f"Packaged entrypoint failed --version: {entrypoint}") from error
+        raise RuntimeError(
+            f"Packaged entrypoint failed --version: {entrypoint}"
+        ) from error
     version_match = re.search(r"([0-9][0-9A-Za-z.+-]*)\s*$", completed.stdout.strip())
     actual_version = version_match.group(1) if version_match else None
     if actual_version != expected_version:

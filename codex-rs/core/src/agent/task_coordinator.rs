@@ -22,9 +22,6 @@ use codex_agent_task_store::ReceiptDraft;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::StoreResult;
 use codex_agent_task_store::TaskActor;
-use codex_agent_task_store::ValidationCall;
-use codex_agent_task_store::ValidationCallStatus;
-use codex_agent_task_store::ValidationEvidence;
 use codex_agent_task_store::WorkspaceActorKind;
 use codex_agent_task_store::WorkspaceActorRegistration;
 use codex_agent_task_store::WorkspaceStrategy;
@@ -45,15 +42,6 @@ use tracing::warn;
 use super::task_metrics::TASK_FIRST_MEANINGFUL_PROGRESS_DURATION_METRIC;
 use super::task_metrics::TaskMetricRuntime;
 use super::task_metrics::terminal_metrics_ready;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FocusedValidationToken {
-    assignment_id: AssignmentId,
-    attempt_id: codex_agent_task_store::AttemptId,
-    call_id: String,
-    command_summary: String,
-    evidence: ValidationEvidence,
-}
 
 #[derive(Default)]
 struct BindingIndex {
@@ -83,8 +71,6 @@ pub(crate) struct AgentTaskCoordinator {
     root_session_id: Arc<OnceCell<String>>,
     bindings: Arc<RwLock<BindingIndex>>,
     metrics: Arc<Mutex<TaskMetricIndex>>,
-    #[cfg(test)]
-    fail_next_agent_task_read: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgentTaskCoordinator {
@@ -355,15 +341,6 @@ impl AgentTaskCoordinator {
         assignment_id: AssignmentId,
         observation_limit: Option<usize>,
     ) -> StoreResult<AgentTask> {
-        #[cfg(test)]
-        if self
-            .fail_next_agent_task_read
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(StoreError::CorruptData(
-                "injected agent-task read failure".to_string(),
-            ));
-        }
         self.required_store()?
             .get_agent_task(assignment_id, observation_limit)
             .await
@@ -373,24 +350,9 @@ impl AgentTaskCoordinator {
         &self,
         assignment_id: AssignmentId,
     ) -> StoreResult<AgentTaskAuthorization> {
-        #[cfg(test)]
-        if self
-            .fail_next_agent_task_read
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(StoreError::CorruptData(
-                "injected agent-task read failure".to_string(),
-            ));
-        }
         self.required_store()?
             .get_agent_task_authorization(assignment_id)
             .await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_agent_task_read_for_test(&self) {
-        self.fail_next_agent_task_read
-            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) async fn get_agent_task_binding(
@@ -416,123 +378,6 @@ impl AgentTaskCoordinator {
             self.remember_binding(binding.clone());
         }
         Ok(binding)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn begin_focused_validation_for_source(
-        &self,
-        session_source: &SessionSource,
-        call_id: String,
-        command_summary: String,
-    ) -> StoreResult<Option<FocusedValidationToken>> {
-        self.begin_focused_validation_for_source_with_evidence(
-            session_source,
-            call_id,
-            command_summary,
-            ValidationEvidence::default(),
-        )
-        .await
-    }
-
-    pub(crate) async fn begin_focused_validation_for_source_with_evidence(
-        &self,
-        session_source: &SessionSource,
-        call_id: String,
-        command_summary: String,
-        evidence: ValidationEvidence,
-    ) -> StoreResult<Option<FocusedValidationToken>> {
-        let Some(binding) = self.binding_for_source(session_source) else {
-            return Ok(None);
-        };
-        let mut token = FocusedValidationToken {
-            assignment_id: binding.assignment_id,
-            attempt_id: binding.attempt_id,
-            call_id,
-            command_summary,
-            evidence,
-        };
-        let store = self.required_store()?;
-        store
-            .record_validation_call(ValidationCall {
-                call_id: token.call_id.clone(),
-                attempt_id: token.attempt_id,
-                command_summary: token.command_summary.clone(),
-                evidence: token.evidence.clone(),
-                status: ValidationCallStatus::Running,
-                recorded_at: Utc::now(),
-            })
-            .await?;
-        let persisted = store
-            .get_validation_call(token.call_id.clone())
-            .await?
-            .ok_or_else(|| {
-                StoreError::CorruptData(format!(
-                    "focused validation {} disappeared after persistence",
-                    token.call_id
-                ))
-            })?;
-        token.evidence = persisted.evidence;
-        Ok(Some(token))
-    }
-
-    pub(crate) async fn heartbeat_focused_validation(
-        &self,
-        token: &FocusedValidationToken,
-    ) -> StoreResult<bool> {
-        self.required_store()?
-            .heartbeat_validation_call(
-                token.call_id.clone(),
-                Utc::now()
-                    + chrono::Duration::seconds(
-                        codex_agent_task_store::MAX_VALIDATION_LEASE_SECONDS,
-                    ),
-            )
-            .await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn finish_focused_validation(
-        &self,
-        token: FocusedValidationToken,
-        status: ValidationCallStatus,
-    ) -> StoreResult<()> {
-        self.finish_focused_validation_with_result(token, status, None, None, None)
-            .await
-    }
-
-    pub(crate) async fn finish_focused_validation_with_result(
-        &self,
-        token: FocusedValidationToken,
-        status: ValidationCallStatus,
-        retained_output_ref: Option<String>,
-        output_summary: Option<String>,
-        validation_result: Option<serde_json::Value>,
-    ) -> StoreResult<()> {
-        if !status.is_terminal() {
-            return Err(StoreError::InvalidAssignment(
-                "focused validation finish requires a terminal status".to_string(),
-            ));
-        }
-        let store = self.required_store()?;
-        let task = store.get_agent_task(token.assignment_id, Some(0)).await?;
-        if task.current_attempt.attempt_id != token.attempt_id {
-            return Err(StoreError::AttemptNotActive(token.attempt_id));
-        }
-        let mut evidence = token.evidence;
-        evidence.retained_output_ref = retained_output_ref;
-        evidence.output_summary = output_summary;
-        evidence.validation_result = validation_result;
-        store
-            .record_validation_call(ValidationCall {
-                call_id: token.call_id,
-                attempt_id: token.attempt_id,
-                command_summary: token.command_summary,
-                evidence,
-                status,
-                recorded_at: Utc::now(),
-            })
-            .await?;
-        Ok(())
     }
 
     pub(crate) fn record_task_usage_for_source(

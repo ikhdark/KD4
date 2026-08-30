@@ -56,6 +56,17 @@ enum RefreshTokenRequestOutcome {
     FailedPermanently,
 }
 
+impl RefreshTokenRequestOutcome {
+    fn into_request_result(self) -> Result<(), JSONRPCErrorError> {
+        match self {
+            Self::NotAttemptedOrSucceeded | Self::FailedPermanently => Ok(()),
+            Self::FailedTransiently => Err(internal_error(
+                "failed to refresh account token; retry the request",
+            )),
+        }
+    }
+}
+
 impl Drop for ActiveLogin {
     fn drop(&mut self) {
         self.cancel();
@@ -869,7 +880,9 @@ impl AccountRequestProcessor {
         let include_token = params.include_token.unwrap_or(false);
         let do_refresh = params.refresh_token.unwrap_or(false);
 
-        self.refresh_token_if_requested(do_refresh).await;
+        self.refresh_token_if_requested(do_refresh)
+            .await
+            .into_request_result()?;
 
         // Determine whether auth is required based on the active model provider.
         // If a custom provider is configured with `requires_openai_auth == false`,
@@ -940,7 +953,9 @@ impl AccountRequestProcessor {
     ) -> Result<GetAccountResponse, JSONRPCErrorError> {
         let do_refresh = params.refresh_token;
 
-        self.refresh_token_if_requested(do_refresh).await;
+        self.refresh_token_if_requested(do_refresh)
+            .await
+            .into_request_result()?;
 
         let provider = create_model_provider(
             self.config.model_provider.clone(),

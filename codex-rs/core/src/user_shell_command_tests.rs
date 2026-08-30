@@ -92,12 +92,13 @@ async fn escapes_command_and_output_structural_delimiters() {
 }
 
 #[test]
-fn reapplies_output_truncation_after_escaping() {
+fn over_truncation_does_not_truncate_formatted_output_twice_after_escaping() {
+    let formatted_output = format!("{}\nROOT_CAUSE_AT_END", "<".repeat(64));
     let item = user_shell_command_record_item_from_formatted_output(
         "echo safe",
         0,
         Duration::from_secs(1),
-        "<".repeat(64),
+        formatted_output,
         TruncationPolicy::Bytes(64),
     );
     let ResponseItem::Message { content, .. } = item else {
@@ -107,5 +108,7 @@ fn reapplies_output_truncation_after_escaping() {
         panic!("expected input text");
     };
 
-    assert!(record.contains("Warning: truncated output"));
+    assert!(record.contains(&"&lt;".repeat(64)));
+    assert!(record.contains("ROOT_CAUSE_AT_END"));
+    assert!(!record.contains("Warning: truncated output"));
 }

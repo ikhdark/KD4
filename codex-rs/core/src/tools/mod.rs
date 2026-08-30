@@ -30,6 +30,7 @@ use codex_tools::ToolName;
 use codex_utils_output_truncation::OutputLimitResolution;
 use codex_utils_output_truncation::OutputOutcome;
 use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
 use codex_utils_output_truncation::resolve_output_limits;
 use codex_utils_output_truncation::truncate_text;
@@ -146,17 +147,6 @@ pub(crate) fn project_exec_output_for_model_with_budget(
 ) -> FormattedExecOutput {
     let duration_seconds = ((exec_output.duration.as_secs_f32()) * 10.0).round() / 10.0;
     let raw_content = build_content_with_timeout(exec_output);
-    let summarized = summarize_shell_output_for_model(
-        &raw_content,
-        exec_output.exit_code,
-        exec_output.timed_out,
-        ShellOutputSummaryOptions {
-            enabled: true,
-            turn_cost_guard: false,
-            command_text,
-        },
-    );
-    let content = summarized.as_deref().unwrap_or(&raw_content);
     let limits = resolve_exec_output_limits(
         exec_output,
         requested_limit,
@@ -164,6 +154,25 @@ pub(crate) fn project_exec_output_for_model_with_budget(
         &raw_content,
         truncation_policy,
     );
+    let raw_envelope = format!(
+        "Exit code: {}\nWall time: {duration_seconds} seconds\nOutput:\n{raw_content}",
+        exec_output.exit_code
+    );
+    let summarized = (approx_token_count(&raw_envelope) > limits.applied_limit)
+        .then(|| {
+            summarize_shell_output_for_model(
+                &raw_content,
+                exec_output.exit_code,
+                exec_output.timed_out,
+                ShellOutputSummaryOptions {
+                    enabled: true,
+                    turn_cost_guard: false,
+                    command_text,
+                },
+            )
+        })
+        .flatten();
+    let content = summarized.as_deref().unwrap_or(&raw_content);
     let truncated = truncate_text_with_output_limit(content, limits);
     let total_lines = content.lines().count();
 
@@ -178,9 +187,10 @@ pub(crate) fn project_exec_output_for_model_with_budget(
     sections.push(truncated.text);
 
     let rendered = sections.join("\n");
+    let text = truncate_text_to_token_ceiling(&rendered, limits.applied_limit);
     FormattedExecOutput {
-        text: truncate_text_to_token_ceiling(&rendered, limits.applied_limit),
-        reduced: summarized.is_some() || truncated.was_truncated,
+        reduced: summarized.is_some() || truncated.was_truncated || text != rendered,
+        text,
     }
 }
 
@@ -215,17 +225,6 @@ pub(crate) fn project_exec_output_text_with_budget(
     command_text: Option<&str>,
 ) -> FormattedExecOutput {
     let raw_content = build_content_with_timeout(exec_output);
-    let summarized = summarize_shell_output_for_model(
-        &raw_content,
-        exec_output.exit_code,
-        exec_output.timed_out,
-        ShellOutputSummaryOptions {
-            enabled: true,
-            turn_cost_guard: false,
-            command_text,
-        },
-    );
-    let content = summarized.as_deref().unwrap_or(&raw_content);
     let limits = resolve_exec_output_limits(
         exec_output,
         requested_limit,
@@ -233,6 +232,21 @@ pub(crate) fn project_exec_output_text_with_budget(
         &raw_content,
         truncation_policy,
     );
+    let summarized = (approx_token_count(&raw_content) > limits.applied_limit)
+        .then(|| {
+            summarize_shell_output_for_model(
+                &raw_content,
+                exec_output.exit_code,
+                exec_output.timed_out,
+                ShellOutputSummaryOptions {
+                    enabled: true,
+                    turn_cost_guard: false,
+                    command_text,
+                },
+            )
+        })
+        .flatten();
+    let content = summarized.as_deref().unwrap_or(&raw_content);
     let truncated = formatted_truncate_text_with_output_limit(content, limits);
     FormattedExecOutput {
         reduced: summarized.is_some() || truncated.was_truncated,

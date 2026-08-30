@@ -158,8 +158,7 @@ PACKAGE_ENTRYPOINT_NAMES: dict[str, dict[str, str]] = {
 
 
 HOST_RELEASE_TARGETS: dict[str, str] = {
-    release.host_machine: target
-    for target, release in RELEASE_TARGETS.items()
+    release.host_machine: target for target, release in RELEASE_TARGETS.items()
 }
 
 

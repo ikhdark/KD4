@@ -593,26 +593,6 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
     )
     .await;
     sess.recompute_token_usage(turn_context.as_ref()).await;
-    let reconciled_history = sess.clone_history().await;
-    if !sess
-        .services
-        .task_evidence
-        .reconcile_rollback_history(reconciled_history.raw_items())
-        .await
-    {
-        sess.services
-            .task_evidence
-            .mark_user_source_capture_failed()
-            .await;
-        sess.send_event(
-            turn_context.as_ref(),
-            EventMsg::Warning(WarningEvent {
-                message: "Rolled the thread back, but failed to reconcile task evidence; completion will remain blocked until new evidence is recorded."
-                    .to_string(),
-            }),
-        )
-        .await;
-    }
 
     sess.persist_rollout_items(&[RolloutItem::EventMsg(rollback_msg.clone())])
         .await;

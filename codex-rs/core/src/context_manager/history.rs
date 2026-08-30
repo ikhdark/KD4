@@ -1,7 +1,5 @@
-use crate::context::CompletionCheckpointContext;
 use crate::context::ContextualUserFragment;
 use crate::context::PromptProvenanceSidecar;
-use crate::context::is_startup_contextual_user_fragment;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::normalize;
@@ -738,7 +736,6 @@ impl ContextManager {
         }
         evict_resolved_reasoning(Arc::make_mut(&mut self.items));
         self.normalize_history(input_modalities);
-        crate::continuity::deduplicate_prepared_capsules(Arc::make_mut(&mut self.items));
         project_update_plan_history(Arc::make_mut(&mut self.items));
         let normalized_items: Arc<[ResponseItem]> = Arc::from(Arc::unwrap_or_clone(self.items));
         let projection = project_stable_context(normalized_items, stable_context_target);
@@ -909,63 +906,6 @@ impl ContextManager {
     ) -> std::collections::BTreeSet<String> {
         // Keep the same post-cache projection boundary while returning the changed call IDs.
         Arc::make_mut(&mut self.tool_history).mark_consumed_with_delta(input, generation)
-    }
-
-    /// Prepares the bounded prompt used by completion finalization from this
-    /// immutable history snapshot. Ordinary history, compaction, and persistence
-    /// are untouched: the selected items are normalized and fingerprinted by the
-    /// same `PreparedPromptInput` path as every other model request.
-    pub(crate) fn prepare_for_finalization(
-        &self,
-        input_modalities: &[InputModality],
-        checkpoint: CompletionCheckpointContext,
-        requested_artifact_call_ids: &BTreeSet<String>,
-    ) -> PreparedPromptInput {
-        let exact_artifact_call_ids = self
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                ResponseItem::FunctionCall { name, call_id, .. }
-                    if name
-                        == crate::tools::handlers::read_tool_output_spec::READ_TOOL_OUTPUT_TOOL_NAME
-                        && requested_artifact_call_ids.contains(call_id) =>
-                {
-                    Some(call_id.clone())
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-
-        let mut projected = ContextManager::new();
-        let startup = self.items.iter().filter(|item| match item {
-            ResponseItem::Message { role, content, .. } if role == "user" => {
-                !content.is_empty() && content.iter().all(is_startup_contextual_user_fragment)
-            }
-            _ => false,
-        });
-        projected.record_items(startup, TruncationPolicy::Bytes(usize::MAX));
-        projected.record_items(
-            [ResponseItem::Message {
-                id: None,
-                role: checkpoint.role().to_string(),
-                content: vec![ContentItem::InputText {
-                    text: checkpoint.render(),
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            }]
-            .iter(),
-            TruncationPolicy::Bytes(usize::MAX),
-        );
-        let exact_artifacts = self.items.iter().filter(|item| match item {
-            ResponseItem::FunctionCall { call_id, .. } => exact_artifact_call_ids.contains(call_id),
-            ResponseItem::FunctionCallOutput { call_id, .. } => {
-                exact_artifact_call_ids.contains(call_id)
-            }
-            _ => false,
-        });
-        projected.record_items(exact_artifacts, TruncationPolicy::Bytes(usize::MAX));
-        projected.prepare_for_prompt(input_modalities)
     }
 
     /// Returns raw items in the history.
@@ -1267,6 +1207,30 @@ impl ContextManager {
         );
     }
 
+    fn get_non_last_reasoning_items_tokens(&self) -> i64 {
+        // The server snapshot accounts for the current response's reasoning even when it omits
+        // resolved reasoning from earlier turns. Re-estimate only reasoning before the latest
+        // instruction boundary so the current response is not counted twice.
+        let Some(last_user_index) = self.items.iter().rposition(is_user_turn_boundary) else {
+            return 0;
+        };
+
+        self.items
+            .iter()
+            .take(last_user_index)
+            .filter(|item| {
+                matches!(
+                    item,
+                    ResponseItem::Reasoning {
+                        encrypted_content: Some(_),
+                        ..
+                    }
+                )
+            })
+            .map(estimate_item_token_count)
+            .fold(0i64, i64::saturating_add)
+    }
+
     // These are local items added after the most recent model-emitted item.
     // They are not reflected in `last_token_usage.total_tokens`.
     fn items_after_last_model_generated_item(&self) -> &[ResponseItem] {
@@ -1278,11 +1242,11 @@ impl ContextManager {
         &self.items[start..]
     }
 
-    /// Returns the active model-visible context estimate. The transport's reasoning-accounting
-    /// mode does not affect this projection: resolved reasoning is not sent in either mode.
+    /// Returns the active model-visible context estimate. When the server omits resolved
+    /// reasoning from its usage snapshot, earlier encrypted reasoning is estimated locally.
     pub(crate) fn get_total_token_usage(
         &self,
-        _server_reasoning_included: bool,
+        server_reasoning_included: bool,
         base_instructions: &BaseInstructions,
     ) -> i64 {
         let items_after_last_model_generated = self.items_after_last_model_generated_item();
@@ -1315,7 +1279,14 @@ impl ContextManager {
             .iter()
             .map(estimate_item_token_count)
             .fold(0i64, i64::saturating_add);
-        last_tokens.saturating_add(items_after_last_model_generated_tokens)
+        let earlier_reasoning_tokens = if server_reasoning_included {
+            0
+        } else {
+            self.get_non_last_reasoning_items_tokens()
+        };
+        last_tokens
+            .saturating_add(earlier_reasoning_tokens)
+            .saturating_add(items_after_last_model_generated_tokens)
     }
 
     pub(crate) fn estimated_tokens_after_last_model_generated_item(&self) -> i64 {

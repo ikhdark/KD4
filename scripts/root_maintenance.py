@@ -290,18 +290,6 @@ UV_RUN_SCRIPTS = ["uv", "run", "--frozen", "--project", "scripts"]
 # same-stem test file. Keep that routing explicit so changed PowerShell
 # helpers and shared Python utilities do not receive syntax-only validation.
 SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
-    ".codex/hooks.json": ("scripts.test_task_continuity_hook",),
-    ".codex/hooks/task-continuity-entry.ps1": ("scripts.test_task_continuity_hook",),
-    ".codex/hooks/task-continuity-fast-basic.ps1": (
-        "scripts.test_task_continuity_hook",
-    ),
-    ".codex/hooks/task-continuity-fast-compact.ps1": (
-        "scripts.test_task_continuity_hook",
-    ),
-    ".codex/hooks/task-continuity-fast-session.ps1": (
-        "scripts.test_task_continuity_hook",
-    ),
-    ".codex/hooks/task-continuity.ps1": ("scripts.test_task_continuity_hook",),
     "scripts/app_server_schema_runtime_check.py": ("scripts.test_dev_environment",),
     "scripts/build_codex_package.py": ("scripts.test_stage_npm_packages",),
     "scripts/cargo-lane-trash-cleanup.ps1": ("scripts.test_cargo_lane",),

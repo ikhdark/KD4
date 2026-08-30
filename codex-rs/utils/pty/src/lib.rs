@@ -3,11 +3,13 @@ pub mod pipe;
 mod process;
 pub mod process_group;
 pub mod pty;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests;
 
+#[cfg(windows)]
 mod win;
 
+#[cfg(windows)]
 mod windows_input;
 
 pub const DEFAULT_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
@@ -16,9 +18,12 @@ pub use managed_process::ManagedRootAdmissionReclaimerGuard;
 pub use managed_process::ManagedRootProcess;
 pub use managed_process::ManagedRootReclaimFuture;
 pub use managed_process::ManagedRootReclaimHook;
+#[cfg(windows)]
 pub use managed_process::WINDOWS_CREATE_SUSPENDED;
+#[cfg(windows)]
 pub use managed_process::WINDOWS_PROCESS_OPERATION_TIMEOUT;
 pub use managed_process::install_managed_root_admission_reclaimer;
+#[cfg(windows)]
 pub use managed_process::run_windows_process_operation;
 /// Spawn a non-interactive process using regular pipes for stdin/stdout/stderr.
 pub use pipe::spawn_process as spawn_pipe_process;
@@ -48,17 +53,22 @@ pub use pty::conpty_supported;
 /// Spawn a process attached to a PTY for interactive use.
 pub use pty::spawn_process as spawn_pty_process;
 
+#[cfg(windows)]
 pub use win::JobObject;
 
+#[cfg(windows)]
 pub use win::PsuedoCon;
 
+#[cfg(windows)]
 pub use win::conpty::RawConPty;
 
+#[cfg(windows)]
 pub use windows_input::WindowsTtyInputNormalizer;
 
 /// Adds Windows process arguments without applying MSVCRT escaping to a
 /// `cmd.exe /c` script. `cmd.exe` parses its script using its own quoting rules,
 /// so the script must be appended as one raw, outer-quoted command line tail.
+#[cfg(windows)]
 pub fn configure_windows_command_args<S>(
     command: &mut std::process::Command,
     program: &std::ffi::OsStr,
@@ -78,6 +88,7 @@ pub fn configure_windows_command_args<S>(
     command.raw_arg(format!(r#""{payload}""#));
 }
 
+#[cfg(windows)]
 pub(crate) fn windows_cmd_payload_index<S>(program: &std::ffi::OsStr, args: &[S]) -> Option<usize>
 where
     S: AsRef<std::ffi::OsStr>,

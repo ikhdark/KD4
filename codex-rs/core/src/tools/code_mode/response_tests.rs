@@ -98,6 +98,29 @@ fn yielded_runtime_response_is_resumable_not_timed_out() {
 }
 
 #[test]
+fn terminated_runtime_response_emits_failure_sampling_evidence() {
+    let output = format_runtime_response(
+        RuntimeResponse::Terminated {
+            cell_id: CellId::new("cell-terminated".to_string()),
+            content_items: Vec::new(),
+        },
+        None,
+        usize::MAX,
+        true,
+        Instant::now(),
+        Vec::new(),
+    );
+
+    assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Failure);
+    assert!(!output.success_for_logging());
+    assert!(
+        output
+            .sampling_request_signal()
+            .is_some_and(|signal| signal.to_string().contains("failure_signature"))
+    );
+}
+
+#[test]
 fn runtime_response_sampling_identity_excludes_wall_time() {
     let response = || RuntimeResponse::Result {
         cell_id: CellId::new("cell-1".to_string()),

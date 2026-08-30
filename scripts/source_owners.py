@@ -372,9 +372,7 @@ def load_and_validate(
             errors.append(f"{owner_id}: unreadable symbol evidence {raw_path}: {error}")
             return
         if symbol not in source_text[candidate]:
-            errors.append(
-                f"{owner_id}: stale symbol evidence {raw_path}::{symbol}"
-            )
+            errors.append(f"{owner_id}: stale symbol evidence {raw_path}::{symbol}")
 
     if manifest.get("schema_version") != SCHEMA_VERSION:
         errors.append(f"unsupported schema_version: {manifest.get('schema_version')!r}")
@@ -612,9 +610,7 @@ def _supporting_source_digest(manifest: dict, root: Path) -> str:
     return digest.hexdigest()
 
 
-_snapshot_cache: OrderedDict[
-    tuple[str, int, int, int, int, int], bytes
-] = OrderedDict()
+_snapshot_cache: OrderedDict[tuple[str, int, int, int, int, int], bytes] = OrderedDict()
 _snapshot_cache_bytes = 0
 _snapshot_cache_lock = threading.Lock()
 
@@ -638,9 +634,7 @@ def _metadata_change_token(path: Path, observation: os.stat_result) -> int | Non
         with path.open("rb") as source:
             handle = msvcrt.get_osfhandle(source.fileno())
             info = FileBasicInfo()
-            get_file_information = (
-                ctypes.windll.kernel32.GetFileInformationByHandleEx
-            )
+            get_file_information = ctypes.windll.kernel32.GetFileInformationByHandleEx
             get_file_information.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_int,
@@ -782,6 +776,7 @@ def _query_graph(
             relationships.append({"source": f"owner:{source_id}", **relationship})
     relationships = _deduplicate_graph_relationships(relationships)
     relationship_count = len(relationships)
+
     def relationship_key(item: dict) -> tuple[str, str, str, str]:
         return (
             item["source"],
@@ -789,9 +784,8 @@ def _query_graph(
             item["kind"],
             item["target"],
         )
-    relationships = _bounded_sorted(
-        relationships, relationship_key, max_relationships
-    )
+
+    relationships = _bounded_sorted(relationships, relationship_key, max_relationships)
     omitted_relationships = (
         0
         if max_relationships is None
@@ -868,14 +862,17 @@ def _architecture_index_is_usable(index: object, digest: str) -> bool:
     checksum_payload = {
         key: value for key, value in index.items() if key != "index_sha256"
     }
-    if stored_checksum != hashlib.sha256(
-        json.dumps(
-            checksum_payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest():
+    if (
+        stored_checksum
+        != hashlib.sha256(
+            json.dumps(
+                checksum_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    ):
         return False
     owner_ids: set[str] = set()
     for owner in index["owners"]:
@@ -897,9 +894,7 @@ def _architecture_index_is_usable(index: object, digest: str) -> bool:
     return True
 
 
-def load_architecture_index(
-    index_path: Path, digest: str, root: Path
-) -> dict | None:
+def load_architecture_index(index_path: Path, digest: str, root: Path) -> dict | None:
     try:
         candidate = json.loads(index_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
@@ -1053,9 +1048,7 @@ def _deduplicate_graph_relationships(relationships: list[dict]) -> list[dict]:
     return unique
 
 
-def _bounded_sorted(
-    items: list[dict], key: object, limit: int | None
-) -> list[dict]:
+def _bounded_sorted(items: list[dict], key: object, limit: int | None) -> list[dict]:
     if limit is None or limit >= len(items):
         return sorted(items, key=key)
     return heapq.nsmallest(limit, items, key=key)
@@ -1064,9 +1057,7 @@ def _bounded_sorted(
 def _round_robin_relationships(
     relationships_by_facet: dict[str, list[dict]], limit: int
 ) -> dict[str, list[dict]]:
-    retained: dict[str, list[dict]] = {
-        facet: [] for facet in relationships_by_facet
-    }
+    retained: dict[str, list[dict]] = {facet: [] for facet in relationships_by_facet}
     retained_count = 0
     for rank in range(max(map(len, relationships_by_facet.values()), default=0)):
         if retained_count >= limit:
@@ -1276,10 +1267,7 @@ def architecture_slice(
     omitted_relationships = graph["omitted"]["relationships"]
     if relationship_total > max_relationships:
         retained = _round_robin_relationships(
-            {
-                facet: output[facet]["relationships"]
-                for facet in ARCHITECTURE_FACETS
-            },
+            {facet: output[facet]["relationships"] for facet in ARCHITECTURE_FACETS},
             max_relationships,
         )
         omitted_relationships += relationship_total - max_relationships
@@ -1486,7 +1474,12 @@ def main() -> int:
                 write_text_atomic(args.source_map, expected)
                 write_text_atomic(args.architecture_index, expected_index)
             return 0
-        except (GenerationLockError, OSError, ValueError, tomllib.TOMLDecodeError) as error:
+        except (
+            GenerationLockError,
+            OSError,
+            ValueError,
+            tomllib.TOMLDecodeError,
+        ) as error:
             print(error, file=sys.stderr)
             return 1
     if args.command == "list":

@@ -325,10 +325,6 @@ pub struct ConfigToml {
     /// Whether to inject the `<environment_context>` user block.
     pub include_environment_context: Option<bool>,
 
-    /// Explicitly enables or disables the KD4 repository workflow. When unset,
-    /// Codex continues to detect KD4 repositories from their marker file.
-    pub kd4_workflow_enabled: Option<bool>,
-
     /// Optional path to a file containing model instructions that will override
     /// the built-in instructions for the selected model. Users are STRONGLY
     /// DISCOURAGED from using this field, as deviating from the instructions
@@ -724,6 +720,10 @@ fn is_unsandboxed_windows(windows_sandbox_level: WindowsSandboxLevel, is_windows
     is_windows && windows_sandbox_level == WindowsSandboxLevel::Disabled
 }
 
+const fn current_platform_is_windows() -> bool {
+    cfg!(windows)
+}
+
 impl ConfigToml {
     /// Derive the effective permission profile from legacy sandbox config.
     ///
@@ -737,7 +737,8 @@ impl ConfigToml {
         active_project: Option<&ProjectConfig>,
         permission_profile_constraint: Option<&crate::Constrained<PermissionProfile>>,
     ) -> PermissionProfile {
-        let is_unsandboxed_windows = is_unsandboxed_windows(windows_sandbox_level, true);
+        let is_unsandboxed_windows =
+            is_unsandboxed_windows(windows_sandbox_level, current_platform_is_windows());
         let configured_sandbox_mode = sandbox_mode_override.or(self.sandbox_mode);
         let resolved_sandbox_mode = configured_sandbox_mode
             .or_else(|| {
@@ -977,6 +978,15 @@ mod tests {
             WindowsSandboxLevel::RestrictedToken,
             /*is_windows*/ true
         ));
+    }
+
+    #[test]
+    fn permission_policy_uses_the_compile_target_platform_boundary() {
+        assert_eq!(current_platform_is_windows(), cfg!(windows));
+        assert_eq!(
+            is_unsandboxed_windows(WindowsSandboxLevel::Disabled, current_platform_is_windows()),
+            cfg!(windows)
+        );
     }
 
     #[test]

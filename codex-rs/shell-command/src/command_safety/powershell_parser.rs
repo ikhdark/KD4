@@ -20,6 +20,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
+use std::sync::TryLockError;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -128,12 +129,31 @@ fn parse_with_powershell_ast_request(
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone()
     };
-    let mut parser = lock_cached_parser(&parser);
-    parse_with_cached_process(&mut parser, executable, script, resolution)
+    match acquire_cached_parser(&parser) {
+        CachedParserAccess::Shared(mut parser) => {
+            parse_with_cached_process(&mut parser, executable, script, resolution)
+        }
+        CachedParserAccess::Temporary => {
+            // The shared child has one stdin/stdout protocol stream, but independent parser
+            // requests do not depend on one another. Use a short-lived host instead of queuing
+            // every classification behind a slow or stalled request.
+            let mut parser = None;
+            parse_with_cached_process(&mut parser, executable, script, resolution)
+        }
+    }
 }
 
-fn lock_cached_parser(parser: &CachedParser) -> MutexGuard<'_, Option<PowershellParserProcess>> {
-    parser.lock().unwrap_or_else(PoisonError::into_inner)
+enum CachedParserAccess<'a> {
+    Shared(MutexGuard<'a, Option<PowershellParserProcess>>),
+    Temporary,
+}
+
+fn acquire_cached_parser(parser: &CachedParser) -> CachedParserAccess<'_> {
+    match parser.try_lock() {
+        Ok(parser) => CachedParserAccess::Shared(parser),
+        Err(TryLockError::Poisoned(poisoned)) => CachedParserAccess::Shared(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => CachedParserAccess::Temporary,
+    }
 }
 
 pub(crate) fn try_parse_powershell_ast_commands(
@@ -723,25 +743,17 @@ mod tests {
     }
 
     #[test]
-    fn cached_parser_contention_queues_instead_of_creating_an_uncached_host() {
+    fn cached_parser_contention_uses_a_temporary_host_slot() {
         let parser: CachedParser = Arc::new(Mutex::new(None));
-        let held = lock_cached_parser(&parser);
-        let (acquired_tx, acquired_rx) = mpsc::channel();
-        let queued_parser = Arc::clone(&parser);
-        let queued = std::thread::spawn(move || {
-            let _guard = lock_cached_parser(&queued_parser);
-            acquired_tx.send(()).expect("report queued acquisition");
-        });
-
+        let held = parser.lock().unwrap_or_else(PoisonError::into_inner);
         assert!(
-            acquired_rx.recv_timeout(Duration::from_millis(25)).is_err(),
-            "contended parser access did not queue"
+            matches!(
+                acquire_cached_parser(&parser),
+                CachedParserAccess::Temporary
+            ),
+            "contended parser access should avoid waiting on the shared host"
         );
         drop(held);
-        acquired_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("queued parser access should resume");
-        queued.join().expect("queued parser thread");
     }
 
     #[test]

@@ -1459,7 +1459,6 @@ mod tests {
         ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
             surfaced_result: None,
             thread_id: "thread".to_string(),
-            completion: None,
             timing: None,
             turn: codex_app_server_protocol::Turn {
                 id: "turn".to_string(),
@@ -1470,7 +1469,6 @@ mod tests {
                 started_at: None,
                 completed_at: Some(0),
                 duration_ms: Some(1),
-                completion: None,
                 timing: None,
                 surfaced_result: None,
                 reasoning_policy_history: None,
@@ -2589,7 +2587,6 @@ mod tests {
                     codex_app_server_protocol::TurnCompletedNotification {
                         surfaced_result: None,
                         thread_id: "thread".to_string(),
-                        completion: None,
                         timing: None,
                         turn: codex_app_server_protocol::Turn {
                             id: "turn".to_string(),
@@ -2600,7 +2597,6 @@ mod tests {
                             started_at: None,
                             completed_at: Some(0),
                             duration_ms: None,
-                            completion: None,
                             timing: None,
                             surfaced_result: None,
                             reasoning_policy_history: None,

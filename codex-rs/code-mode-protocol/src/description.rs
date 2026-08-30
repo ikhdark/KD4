@@ -262,7 +262,7 @@ mod tests {
         assert!(description.contains("never whole files"));
         assert!(description.contains("concise synthesis, not raw payloads"));
         assert!(description.contains("retained-artifact selectors after truncation"));
-        assert!(description.contains("Output defaults to 4000 tokens"));
+        assert!(description.contains("Output defaults to the 10000-token hard cap"));
         assert!(description.contains("smallest useful budget"));
         assert!(description.contains("10000-token hard cap"));
         assert!(!description.contains("including six small calls"));

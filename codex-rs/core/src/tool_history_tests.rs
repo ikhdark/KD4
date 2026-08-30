@@ -12,6 +12,18 @@ fn source_dependency_normalization_preserves_case_on_case_sensitive_filesystems(
 }
 
 #[test]
+fn source_dependency_normalization_uses_the_target_platform_case_policy() {
+    let upper = normalized_source_path(Path::new("src/Owner.rs"));
+    let lower = normalized_source_path(Path::new("src/owner.rs"));
+
+    if cfg!(windows) {
+        assert_eq!(upper, lower);
+    } else {
+        assert_ne!(upper, lower);
+    }
+}
+
+#[test]
 fn identity_projection_reuses_shared_response_items() {
     let canonical: Arc<[ResponseItem]> = Arc::from([ResponseItem::FunctionCall {
         id: None,
@@ -1027,47 +1039,49 @@ fn tool_history_admission_reserves_competing_results_before_spending_the_shared_
 }
 
 #[test]
-fn tool_history_admission_preserves_newest_unconsumed_pair_over_budget() {
+fn token_backfire_tool_history_pressure_keeps_every_result_recoverable() {
     let mut state = ToolHistoryState::default();
     let mut items = Vec::new();
     for index in 0..80 {
         let call_id = format!("call-{index}");
         let output = format!("result-{index} ").repeat(20_000);
-        state.register(candidate(&call_id, output.clone()));
+        let mut registered = candidate(&call_id, output.clone());
+        registered.artifact_id = format!("artifact-{index}");
+        state.register(registered);
         items.push(function_call(&call_id));
         items.push(text_output(&call_id, output));
     }
 
     let projection = state.project(Arc::from(items));
-    let projected_tokens = projection
-        .items
-        .iter()
-        .filter_map(textual_output_identity)
-        .map(|(_, output)| approx_token_count(output))
-        .sum::<usize>();
 
-    assert!(projected_tokens > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
-    assert!(projection.items.len() < 160);
-    let fallback_tokens = projection
-        .unreplaced_items
-        .iter()
-        .filter_map(textual_output_identity)
-        .map(|(_, output)| approx_token_count(output))
-        .sum::<usize>();
-    assert!(fallback_tokens > MODEL_VISIBLE_TOOL_RESULT_TOKEN_BUDGET);
-    let (call_id, output) = projection
-        .items
-        .iter()
-        .find_map(textual_output_identity)
-        .expect("newest unconsumed output");
-    assert_eq!(call_id, "call-79");
-    assert!(output.starts_with("result-79 "));
-    assert!(projection.items.iter().any(|item| {
-        matches!(
-            item,
-            ResponseItem::FunctionCall { call_id, .. } if call_id == "call-79"
-        )
-    }));
+    assert_eq!(projection.items.len(), 160);
+    assert_eq!(projection.unreplaced_items.len(), 160);
+    for index in 0..80 {
+        let call_id = format!("call-{index}");
+        let output = projection
+            .items
+            .iter()
+            .filter_map(textual_output_identity)
+            .find(|(projected_call_id, _)| *projected_call_id == call_id.as_str())
+            .map(|(_, output)| output)
+            .expect("every admitted tool result must retain a model-visible recovery path");
+        assert!(
+            output.starts_with(&format!("result-{index} "))
+                || output.contains(&format!("artifact-{index}")),
+            "result {index} must remain raw or expose its exact artifact handle"
+        );
+        let fallback_output = projection
+            .unreplaced_items
+            .iter()
+            .filter_map(textual_output_identity)
+            .find(|(projected_call_id, _)| *projected_call_id == call_id.as_str())
+            .map(|(_, output)| output)
+            .expect("fallback projection must retain the same recovery path");
+        assert!(
+            fallback_output.starts_with(&format!("result-{index} "))
+                || fallback_output.contains(&format!("artifact-{index}"))
+        );
+    }
 }
 
 #[test]
@@ -1668,6 +1682,25 @@ fn compaction_tool_history_receipt_survives_history_replacement() {
     state.register(candidate);
 
     state.retain_for_history(&[text_output("compaction-summary", receipt)]);
+
+    assert!(state.candidates.contains_key(call_id));
+}
+
+#[test]
+fn token_backfire_compaction_pins_artifact_without_model_copying_receipt() {
+    let call_id = "call-1";
+    let output = bounded_output();
+    let mut state = ToolHistoryState::default();
+    state.register(candidate(call_id, output.clone()));
+    let projection = state.project(Arc::from([
+        function_call(call_id),
+        text_output(call_id, output),
+    ]));
+
+    let pin_payload = state
+        .artifact_pin_payload_for_items(&projection.items)
+        .expect("the compaction projection must yield a deterministic recovery sidecar");
+    state.retain_for_history(&[text_output("compaction-summary", pin_payload)]);
 
     assert!(state.candidates.contains_key(call_id));
 }

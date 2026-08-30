@@ -36,7 +36,6 @@ use codex_tools::ToolSpec;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use tempfile::tempdir;
 
 use super::active_collaboration_namespace;
 use super::merge_into_namespaces;
@@ -59,28 +58,41 @@ const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
 
 #[test]
 fn merged_namespace_descriptions_share_one_hard_budget_in_stable_spec_order() {
-    let specs = [("zeta", 'z'), ("alpha", 'a')]
-        .into_iter()
-        .map(|(name, fill)| {
-            ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
-                name: name.to_string(),
-                description: fill.to_string().repeat(30_000),
-                tools: Vec::new(),
-            })
-        })
-        .collect::<Vec<_>>();
+    let specs = vec![
+        ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+            name: "zeta".to_string(),
+            description: "z".repeat(60_000),
+            tools: Vec::new(),
+        }),
+        ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+            name: "alpha".to_string(),
+            description: "Short alpha description.".to_string(),
+            tools: Vec::new(),
+        }),
+        ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+            name: "beta".to_string(),
+            description: String::new(),
+            tools: Vec::new(),
+        }),
+    ];
 
     let merged = merge_into_namespaces(specs);
     let ToolSpec::Namespace(first_namespace) = &merged[0] else {
         panic!("expected first merged spec to be a namespace");
     };
     assert_eq!(first_namespace.name, "zeta");
-    assert_eq!(first_namespace.description, "z".repeat(30_000));
+    assert!(!first_namespace.description.is_empty());
+    assert!(first_namespace.description.len() < 60_000);
     let ToolSpec::Namespace(second_namespace) = &merged[1] else {
         panic!("expected second merged spec to be a namespace");
     };
     assert_eq!(second_namespace.name, "alpha");
-    assert!(second_namespace.description.len() < 30_000);
+    assert_eq!(second_namespace.description, "Short alpha description.");
+    let ToolSpec::Namespace(third_namespace) = &merged[2] else {
+        panic!("expected third merged spec to be a namespace");
+    };
+    assert_eq!(third_namespace.name, "beta");
+    assert!(!third_namespace.description.is_empty());
     let merged_bytes = merged
         .iter()
         .map(|spec| match spec {
@@ -327,6 +339,23 @@ async fn update_plan_is_not_exposed_or_registered_in_plan_mode() {
 }
 
 #[tokio::test]
+async fn read_turn_timing_is_absent_from_tool_plans() {
+    let searchable = probe(|turn| {
+        turn.model_info.supports_search_tool = true;
+    })
+    .await;
+    searchable.assert_registered_lacks(&["read_turn_timing"]);
+    searchable.assert_visible_lacks(&["read_turn_timing"]);
+
+    let unsearchable = probe(|turn| {
+        turn.model_info.supports_search_tool = false;
+    })
+    .await;
+    unsearchable.assert_registered_lacks(&["read_turn_timing"]);
+    unsearchable.assert_visible_lacks(&["read_turn_timing"]);
+}
+
+#[tokio::test]
 async fn production_tool_registrations_have_explicit_authorization_classes() {
     let utilities = probe(|turn| {
         set_features(
@@ -363,39 +392,6 @@ async fn production_tool_registrations_have_explicit_authorization_classes() {
     )
     .await;
     plugins.assert_no_unknown_authorization_classes();
-}
-
-#[tokio::test]
-async fn confirmed_performance_tool_plan_reuses_turn_kd4_classification() {
-    let temp = tempdir().expect("create temp directory");
-    let ordinary_cwd = temp.path().join("ordinary");
-    let kd4_cwd = temp.path().join("kd4");
-    std::fs::create_dir_all(&ordinary_cwd).expect("create ordinary repository fixture");
-    std::fs::create_dir_all(&kd4_cwd).expect("create KD4 repository fixture");
-    std::fs::write(kd4_cwd.join("kd4_features.toml"), "# test marker\n")
-        .expect("write KD4 repository marker");
-
-    let ordinary_cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(ordinary_cwd)
-        .expect("ordinary fixture path should be absolute");
-    let ordinary_plan = probe(move |turn| {
-        update_config(turn, |config| config.cwd = ordinary_cwd);
-        turn.kd4_workflow_enabled = false;
-    })
-    .await;
-    ordinary_plan.assert_visible_lacks(&["read_turn_timing"]);
-    ordinary_plan.assert_registered_lacks(&["read_turn_timing"]);
-
-    let kd4_cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(kd4_cwd)
-        .expect("KD4 fixture path should be absolute");
-    let kd4_plan = probe(move |turn| {
-        update_config(turn, |config| config.cwd = kd4_cwd);
-        turn.kd4_workflow_enabled = true;
-        std::fs::remove_file(turn.cwd().join("kd4_features.toml"))
-            .expect("remove marker after turn classification");
-    })
-    .await;
-    kd4_plan.assert_visible_contains(&["read_turn_timing"]);
-    kd4_plan.assert_registered_contains(&["read_turn_timing"]);
 }
 
 fn set_feature(turn: &mut TurnContext, feature: Feature, enabled: bool) {
@@ -811,7 +807,7 @@ async fn wait_is_always_registered_when_code_mode_is_enabled() {
 }
 
 #[tokio::test]
-async fn code_mode_identifier_collision_fails_during_router_planning() {
+async fn code_mode_identifier_collision_is_disambiguated_during_router_planning() {
     let (_session, mut turn) = make_session_and_context().await;
     set_feature(&mut turn, Feature::CodeMode, /*enabled*/ true);
     let turn = Arc::new(turn);
@@ -836,7 +832,7 @@ async fn code_mode_identifier_collision_fails_during_router_planning() {
         }),
     ];
 
-    let error = ToolRouter::try_from_context(
+    let _router = ToolRouter::try_from_context(
         step_context.as_ref(),
         ToolRouterParams {
             mcp_tools: None,
@@ -848,12 +844,7 @@ async fn code_mode_identifier_collision_fails_during_router_planning() {
         },
         &tool_search_cache,
     )
-    .err()
-    .expect("colliding code-mode globals must fail before advertising the router");
-
-    assert!(error.contains("code mode tool identifier collision"));
-    assert!(error.contains("`acme__lookup`"));
-    assert!(error.contains("`acme.lookup`"));
+    .expect("colliding flattened names should receive distinct code-mode globals");
 }
 
 #[tokio::test]

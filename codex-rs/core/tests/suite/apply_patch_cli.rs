@@ -388,9 +388,30 @@ async fn apply_patch_cli_rejects_invalid_hunk_header() -> Result<()> {
 
     let patch = "*** Begin Patch\n*** Frobnicate File: foo\n*** End Patch";
     let call_id = "apply-invalid-header";
-    mount_apply_patch(&harness, call_id, patch, "ok").await;
+    let response_mock = mount_sse_sequence(
+        harness.server(),
+        apply_patch_responses(call_id, patch, "ok", ev_apply_patch_custom_tool_call),
+    )
+    .await;
 
     harness.submit("apply invalid header patch").await?;
+
+    let requests = response_mock.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "a model-visible apply_patch failure must continue to the supplied follow-up response"
+    );
+    let (model_visible_output, success) = requests[1]
+        .custom_tool_call_output_content_and_success(call_id)
+        .expect("the follow-up request must contain the failed apply_patch result");
+    assert_eq!(success, Some(false));
+    assert!(
+        model_visible_output
+            .as_deref()
+            .is_some_and(|output| output.contains("apply_patch verification failed")),
+        "the follow-up request must expose the verification failure to the model"
+    );
 
     let out = harness.apply_patch_output(call_id).await;
 

@@ -18,7 +18,7 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript; input 
 - Keep long commands in the same awaited evaluation; call `yield_control()` only for a new model decision.
 - On deterministic failure or unchanged evidence, change route/state, synthesize, or stop; never repeat the same call/poll.
 - Keep evidence bounded: relevant tables/line ranges, never whole files; concise synthesis, not raw payloads; retained-artifact selectors after truncation.
-- Output defaults to 4000 tokens; request the smallest useful budget within the 10000-token hard cap. Optional `max_output_tokens`; use the documented `{ timeout_ms }` option.
+- Output defaults to the 10000-token hard cap; request the smallest useful budget when less output is sufficient. Optional `max_output_tokens`; use the documented `{ timeout_ms }` option.
 - When evaluation ends, unawaited work is discarded.
 
 Helpers:
@@ -28,7 +28,7 @@ Helpers:
 - `ALL_TOOL_NAMES` lists; `resolve_tool(name)` resolves; `ALL_TOOLS` is legacy."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
 - `cell_id` identifies the running `exec` cell to resume.
-- `max_tokens` limits how much new output this wait call returns. Model projections default to 4000 tokens; an explicit request is honored up to the 10000-token hard cap.
+- `max_tokens` limits how much new output this wait call returns. Model projections default to the 10000-token hard cap; an explicit request can select a smaller budget.
 - `terminate: true` stops the running cell; false or omitted waits for output.
 - `wait` returns only meaningful new output or state changes since the last model-visible result, or the final completion or termination result for that cell.
 - New user steering or mailbox input interrupts a held wait without terminating a still-valid cell.

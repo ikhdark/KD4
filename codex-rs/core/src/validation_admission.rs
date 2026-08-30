@@ -33,6 +33,7 @@ pub(crate) struct ValidationAuthorization {
 pub(crate) type SharedValidationAuthorization = Arc<RwLock<ValidationAuthorization>>;
 
 impl ValidationAuthorization {
+    #[cfg(test)]
     pub(crate) fn enabled() -> Self {
         Self {
             enabled: true,
@@ -79,7 +80,8 @@ const fn operation_index(operation: ValidationOperation) -> usize {
 }
 
 fn parse_directives(text: &str) -> Vec<(ValidationOperation, bool)> {
-    let mut normalized = text
+    let actionable_text = actionable_directive_text(text);
+    let mut normalized = actionable_text
         .replace(['\u{2018}', '\u{2019}'], "'")
         .to_ascii_lowercase();
     for starter in [
@@ -136,6 +138,67 @@ fn parse_directives(text: &str) -> Vec<(ValidationOperation, bool)> {
         }
     }
     directives
+}
+
+fn actionable_directive_text(text: &str) -> String {
+    let mut actionable = String::with_capacity(text.len());
+    let mut fence: Option<&str> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(marker) = fence {
+            if trimmed.starts_with(marker) {
+                fence = None;
+            }
+            actionable.push('\n');
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            fence = Some("```");
+            actionable.push('\n');
+            continue;
+        }
+        if trimmed.starts_with("~~~") {
+            fence = Some("~~~");
+            actionable.push('\n');
+            continue;
+        }
+        if trimmed.starts_with('>') || line.starts_with("    ") || line.starts_with('\t') {
+            actionable.push('\n');
+            continue;
+        }
+
+        let mut closing_quote = None;
+        let mut preceding_backslashes = 0_usize;
+        for character in line.chars() {
+            if let Some(closing) = closing_quote {
+                if character == closing
+                    && (closing != '"' || preceding_backslashes.is_multiple_of(2))
+                {
+                    closing_quote = None;
+                }
+                preceding_backslashes = if character == '\\' {
+                    preceding_backslashes.saturating_add(1)
+                } else {
+                    0
+                };
+                continue;
+            }
+            closing_quote = match character {
+                '"' => Some('"'),
+                '\u{201c}' => Some('\u{201d}'),
+                '`' => Some('`'),
+                _ => None,
+            };
+            preceding_backslashes = 0;
+            if closing_quote.is_none() {
+                actionable.push(character);
+            }
+        }
+        actionable.push('\n');
+    }
+
+    actionable
 }
 
 fn imperative_suffix_denial(clause: &str) -> Option<&str> {
@@ -214,6 +277,9 @@ fn parse_directive(clause: &str) -> Vec<(ValidationOperation, bool)> {
         };
         (true, body)
     } else if let Some(body) = clause.strip_prefix("skip ") {
+        let Some(body) = skip_validation_body(body) else {
+            return Vec::new();
+        };
         (true, body)
     } else if let Some(body) = clause
         .strip_prefix("without running ")
@@ -235,6 +301,14 @@ fn parse_directive(clause: &str) -> Vec<(ValidationOperation, bool)> {
         .into_iter()
         .map(|operation| (operation, denied))
         .collect()
+}
+
+fn skip_validation_body(body: &str) -> Option<&str> {
+    let first_target = body.split_once(" and ").map_or(body, |(first, _)| first);
+    let first_target = first_target
+        .split_once(',')
+        .map_or(first_target, |(first, _)| first);
+    (!operations_from_instruction(first_target).is_empty()).then_some(body)
 }
 
 fn bare_no_validation_body(body: &str) -> Option<&str> {
@@ -405,13 +479,6 @@ pub(crate) struct ValidationLaunchPlan {
     pub(crate) classification: ValidationClassification,
     pub(crate) authorization_revision: u64,
     pub(crate) explicitly_tagged: bool,
-    pub(crate) structured_route: Option<codex_protocol::plan_tool::ValidationRoute>,
-    pub(crate) bound_plan_step: Option<(String, u64)>,
-    pub(crate) bound_work_unit: Option<(String, u64)>,
-    pub(crate) validation_call_id: Option<String>,
-    pub(crate) turn_timing_state: Option<Arc<crate::turn_timing::TurnTimingState>>,
-    pub(crate) focused_validation_token:
-        Option<crate::agent::task_coordinator::FocusedValidationToken>,
 }
 
 pub(crate) fn recheck_validation_launch(
@@ -476,10 +543,30 @@ pub(crate) fn classify_validation(invocation: &CommandInvocation) -> ValidationC
     VALIDATION_CLASSIFICATION_COUNT.with(|count| count.set(count.get() + 1));
     match invocation {
         CommandInvocation::Argv { program, args } => classify_argv(program, args),
-        CommandInvocation::Script(script) | CommandInvocation::PowerShellScript(script) => {
-            classify_simple_script(script, 0)
-        }
+        CommandInvocation::Script(script) => classify_simple_script(script, 0),
+        CommandInvocation::PowerShellScript(script) => classify_powershell_script(script),
     }
+}
+
+fn classify_powershell_script(script: &str) -> ValidationClassification {
+    let command = vec![
+        "pwsh".to_string(),
+        "-Command".to_string(),
+        script.to_string(),
+    ];
+    let Some(commands) =
+        codex_shell_command::powershell::parse_powershell_command_into_plain_commands(&command)
+    else {
+        return classify_simple_script(script, 0);
+    };
+    if commands.is_empty() {
+        return classify_simple_script(script, 0);
+    }
+    combine_validation_classifications(commands.into_iter().filter_map(|argv| {
+        let mut arguments = argv.into_iter();
+        let program = arguments.next()?;
+        Some(classify_argv(&program, &arguments.collect::<Vec<_>>()))
+    }))
 }
 
 #[cfg(test)]
@@ -747,7 +834,9 @@ fn recognize_operations(binary: &str, args: &[String]) -> (Vec<ValidationOperati
     match binary {
         "cargo" => cargo_operations(args),
         "pytest" => (vec![ValidationOperation::Test], false),
-        "python" | "python3" => (python_operation(args).into_iter().collect(), false),
+        binary if is_python_launcher(binary) => {
+            (python_operation(args).into_iter().collect(), false)
+        }
         "dotnet" | "go" => (
             args.first()
                 .is_some_and(|argument| argument.eq_ignore_ascii_case("test"))
@@ -764,6 +853,20 @@ fn recognize_operations(binary: &str, args: &[String]) -> (Vec<ValidationOperati
         "just" | "make" | "task" => wrapper_operations(binary, args),
         _ => (Vec::new(), false),
     }
+}
+
+fn is_python_launcher(binary: &str) -> bool {
+    if matches!(binary, "py" | "python") {
+        return true;
+    }
+
+    binary.strip_prefix("python").is_some_and(|version| {
+        !version.is_empty()
+            && version
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '.')
+            && version.chars().any(|character| character.is_ascii_digit())
+    })
 }
 
 fn cargo_operations(args: &[String]) -> (Vec<ValidationOperation>, bool) {
@@ -838,11 +941,61 @@ fn cargo_operation(argument: &str) -> Option<ValidationOperation> {
 }
 
 fn python_operation(args: &[String]) -> Option<ValidationOperation> {
-    (args.first().is_some_and(|argument| argument == "-m")
-        && args
-            .get(1)
-            .is_some_and(|module| matches!(module.as_str(), "pytest" | "unittest")))
-    .then_some(ValidationOperation::Test)
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "-m" {
+            return args
+                .get(index + 1)
+                .is_some_and(|module| matches!(module.as_str(), "pytest" | "unittest"))
+                .then_some(ValidationOperation::Test);
+        }
+        if argument == "--" || !argument.starts_with('-') || argument == "-" {
+            return None;
+        }
+
+        if matches!(
+            argument.as_str(),
+            "-b" | "-B"
+                | "-d"
+                | "-E"
+                | "-h"
+                | "--help"
+                | "-i"
+                | "-I"
+                | "-O"
+                | "-OO"
+                | "-P"
+                | "-q"
+                | "-s"
+                | "-S"
+                | "-u"
+                | "-v"
+                | "-V"
+                | "--version"
+                | "-x"
+        ) {
+            index += 1;
+            continue;
+        }
+
+        if matches!(argument.as_str(), "-W" | "-X" | "--check-hash-based-pycs") {
+            args.get(index + 1)?;
+            index += 2;
+            continue;
+        }
+        if argument
+            .strip_prefix("-W")
+            .or_else(|| argument.strip_prefix("-X"))
+            .is_some_and(|value| !value.is_empty())
+            || argument.starts_with("--check-hash-based-pycs=")
+        {
+            index += 1;
+            continue;
+        }
+
+        return None;
+    }
+    None
 }
 
 fn jvm_test_operation(binary: &str, args: &[String]) -> Option<ValidationOperation> {
@@ -928,7 +1081,7 @@ fn wrapper_operations(binary: &str, args: &[String]) -> (Vec<ValidationOperation
             index += 1;
             continue;
         }
-        let found = selector_operations(selector);
+        let found = exact_selector_operations(selector);
         if found.is_empty() {
             has_unclassified_targets = true;
         } else {
@@ -937,6 +1090,17 @@ fn wrapper_operations(binary: &str, args: &[String]) -> (Vec<ValidationOperation
         index += 1;
     }
     (operations, has_unclassified_targets)
+}
+
+fn exact_selector_operations(selector: &str) -> Vec<ValidationOperation> {
+    match selector.to_ascii_lowercase().as_str() {
+        "test" | "tests" | "testing" => vec![ValidationOperation::Test],
+        "check" | "checks" => vec![ValidationOperation::Check],
+        "lint" | "lints" | "clippy" | "fmt" | "format" => vec![ValidationOperation::Lint],
+        "bench" | "benchmark" | "benchmarks" => vec![ValidationOperation::Bench],
+        "fuzz" | "fuzzing" => vec![ValidationOperation::Fuzz],
+        _ => Vec::new(),
+    }
 }
 
 fn runner_option_value_count(binary: &str, option: &str) -> usize {
@@ -1218,6 +1382,45 @@ mod tests {
     }
 
     #[test]
+    fn skipping_an_unrelated_step_does_not_deny_later_validation() {
+        let mut authorization = ValidationAuthorization::enabled();
+
+        assert!(!authorization.update_from_user_input("Skip the intro and check the tests"));
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["check"]), false).is_none());
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["test"]), false).is_none());
+
+        assert!(authorization.update_from_user_input("skip the unit tests and lint"));
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["test"]), false).is_some());
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["clippy"]), false).is_some());
+    }
+
+    #[test]
+    fn quoted_or_pasted_validation_text_does_not_change_authorization() {
+        for text in [
+            "The phrase \u{201c}do not run tests\u{201d} is being discussed.",
+            "The phrase `do not run tests` is being discussed.",
+            "> do not run tests\nThat was the previous instruction.",
+            "```text\ndo not run tests\n```\nThat was the previous instruction.",
+            "    do not run tests\nThat was pasted output.",
+            r#""\"do not run tests\"""#,
+            r#"{"message":"The phrase \"do not run tests\" is data."}"#,
+        ] {
+            let mut authorization = ValidationAuthorization::enabled();
+            assert!(!authorization.update_from_user_input(text), "{text:?}");
+            assert!(
+                prohibited_skip_for(&authorization, &argv("cargo", &["test"]), false).is_none(),
+                "{text:?}"
+            );
+        }
+
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input(
+            "The old note said \u{201c}run tests\u{201d}. Do not run tests."
+        ));
+        assert!(prohibited_skip_for(&authorization, &argv("cargo", &["test"]), false).is_some());
+    }
+
+    #[test]
     fn scope_words_do_not_override_the_latest_operation_stance() {
         let focused = argv("cargo", &["test", "selected_case"]);
         let workspace = argv("cargo", &["test", "--workspace"]);
@@ -1293,12 +1496,56 @@ mod tests {
             argv("yarn", &["test"]),
             argv("mvn", &["test", "-Dgroups=unit"]),
             argv("gradlew", &[":module:test", "--continue"]),
-            argv("just", &["fmt-check", "--unstable"]),
-            argv("make", &["integration-tests"]),
+            argv("just", &["fmt", "--unstable"]),
+            argv("make", &["tests"]),
             argv("task", &["check"]),
         ] {
             assert!(is_validation(&invocation), "{invocation:?}");
         }
+    }
+
+    #[test]
+    fn python_launchers_and_interpreter_options_preserve_test_denials() {
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input("do not run tests"));
+
+        for invocation in [
+            argv("py", &["-m", "pytest", "-q"]),
+            argv("py.exe", &["-m", "unittest", "discover"]),
+            argv("python3.12", &["-I", "-m", "pytest"]),
+            argv("python", &["-X", "dev", "-m", "pytest"]),
+            argv("python", &["-Xdev", "-Werror", "-m", "unittest"]),
+        ] {
+            assert!(is_validation(&invocation), "{invocation:?}");
+            assert!(
+                prohibited_skip_for(&authorization, &invocation, false).is_some(),
+                "{invocation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_module_markers_after_a_script_or_double_dash_are_not_tests() {
+        for invocation in [
+            argv("python", &["script.py", "-m", "pytest"]),
+            argv("python", &["--", "-m", "pytest"]),
+            argv("python", &["-c", "print('pytest')", "-m", "pytest"]),
+        ] {
+            assert!(!is_validation(&invocation), "{invocation:?}");
+        }
+    }
+
+    #[test]
+    fn wrapper_target_with_validation_word_is_not_suppressed() {
+        let invocation = argv("make", &["format-report"]);
+        assert_eq!(
+            classify_validation(&invocation),
+            ValidationClassification::Opaque
+        );
+
+        let mut authorization = ValidationAuthorization::enabled();
+        assert!(authorization.update_from_user_input("do not run lint"));
+        assert!(prohibited_skip_for(&authorization, &invocation, false).is_none());
     }
 
     #[test]
@@ -1387,12 +1634,6 @@ mod tests {
             classification: classify_validation(&argv("cargo", &["test"])),
             authorization_revision: authorization.revision,
             explicitly_tagged: false,
-            structured_route: None,
-            bound_plan_step: None,
-            bound_work_unit: None,
-            validation_call_id: None,
-            turn_timing_state: None,
-            focused_validation_token: None,
         };
         assert!(authorization.update_from_user_input("do not run tests"));
         reset_validation_classification_count();
@@ -1502,6 +1743,11 @@ mod tests {
             "Invoke-Expression -Verbose -Command 'cargo test'".to_string(),
         );
         assert!(!is_validation(&powershell));
+
+        let powershell_pipeline = CommandInvocation::PowerShellScript(
+            "cargo test -p codex-core | Select-Object -First 1".to_string(),
+        );
+        assert!(is_validation(&powershell_pipeline));
 
         let cmd_for = argv("cmd", &["/c", "for %i in (do) do cargo test"]);
         assert!(!is_validation(&cmd_for));

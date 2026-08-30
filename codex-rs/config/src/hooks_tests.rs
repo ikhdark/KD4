@@ -196,6 +196,24 @@ command = "python3 /enterprise/place/pre.py"
 }
 
 #[test]
+fn managed_hooks_directory_uses_target_specific_setting() {
+    let requirements = ManagedHooksRequirementsToml {
+        managed_dir: Some(std::path::PathBuf::from("/enterprise/hooks")),
+        windows_managed_dir: Some(std::path::PathBuf::from(r"C:\enterprise\hooks")),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        requirements.managed_dir_for_platform(false),
+        Some(std::path::Path::new("/enterprise/hooks"))
+    );
+    assert_eq!(
+        requirements.managed_dir_for_platform(true),
+        Some(std::path::Path::new(r"C:\enterprise\hooks"))
+    );
+}
+
+#[test]
 fn hook_events_deserialize_windows_override_from_toml() {
     let parsed: HookEventsToml = toml::from_str(
         r#"

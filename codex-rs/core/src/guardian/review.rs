@@ -1064,18 +1064,16 @@ async fn wait_before_guardian_retry(
 fn should_retry_guardian_review(outcome: &GuardianReviewOutcome) -> bool {
     matches!(
         outcome,
-        GuardianReviewOutcome::Error(
-            GuardianReviewError::Session {
-                error_info: Some(
-                    CodexErrorInfo::ServerOverloaded
-                        | CodexErrorInfo::HttpConnectionFailed { .. }
-                        | CodexErrorInfo::ResponseStreamConnectionFailed { .. }
-                        | CodexErrorInfo::InternalServerError
-                        | CodexErrorInfo::ResponseStreamDisconnected { .. }
-                ),
-                ..
-            } | GuardianReviewError::Parse { .. }
-        )
+        GuardianReviewOutcome::Error(GuardianReviewError::Session {
+            error_info: Some(
+                CodexErrorInfo::ServerOverloaded
+                    | CodexErrorInfo::HttpConnectionFailed { .. }
+                    | CodexErrorInfo::ResponseStreamConnectionFailed { .. }
+                    | CodexErrorInfo::InternalServerError
+                    | CodexErrorInfo::ResponseStreamDisconnected { .. }
+            ),
+            ..
+        })
     )
 }
 
@@ -1114,7 +1112,7 @@ mod review_tests {
     }
 
     #[test]
-    fn guardian_review_retry_only_retries_transient_session_and_parse_errors() {
+    fn guardian_review_retry_only_retries_transient_session_errors() {
         let assessment = GuardianAssessment {
             risk_level: GuardianRiskLevel::High,
             user_authorization: GuardianUserAuthorization::Unknown,
@@ -1169,7 +1167,7 @@ mod review_tests {
             ),
             (
                 GuardianReviewOutcome::Error(GuardianReviewError::parse(anyhow::anyhow!("parse"))),
-                true,
+                false,
             ),
             (
                 GuardianReviewOutcome::Error(GuardianReviewError::Timeout),

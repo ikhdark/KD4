@@ -533,7 +533,7 @@ async fn handle_exec_approval_uses_call_id_for_guardian_review_and_approval_id_f
     let expected_action = GuardianAssessmentAction::Command {
         source: GuardianCommandSource::Shell,
         command: "rm -rf tmp".to_string(),
-        cwd: test_path_buf("/tmp").abs(),
+        cwd: test_path_buf("/tmp").abs().into(),
     };
     assert!(!assessment_event.id.is_empty());
     assert_eq!(

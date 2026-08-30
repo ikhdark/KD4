@@ -148,7 +148,12 @@ impl AbExecutionConfig {
 
     fn latency_gate_mode(self, workload_class: AbWorkloadClass) -> AbLatencyGateMode {
         if workload_class == AbWorkloadClass::CorrectnessOnly {
-            AbLatencyGateMode::Excluded
+            // Correctness-only workloads still report their latency gates so a
+            // regression cannot hide behind a `passed` verdict. They stay
+            // advisory: at one pair per cluster a p95 bound is too wide to
+            // enforce, and these workloads must not gain veto power over the
+            // run on tail noise alone.
+            AbLatencyGateMode::Advisory
         } else if self.latency_hard_gate {
             AbLatencyGateMode::Hard
         } else {
@@ -346,7 +351,13 @@ impl AbWorkload {
             // the exact concurrency/graph gates, but do not bootstrap unequal work.
             Self::ParallelSafeTripleDirect => &[],
             Self::ExclusiveGateSerialization => &AbLatencyMetric::WITH_PARALLEL_GATE_WAIT,
-            Self::CodeModeHighVolume => &[],
+            // A and B run identical work here (this workload is absent from
+            // `restores_missing_baseline_tool_outputs`), so the ratio is
+            // meaningful and the workload must not go unmeasured. Only the
+            // request-shaped metrics are used: the per-call metrics are not
+            // populated for every high-volume sample, and an uncomputable
+            // metric would report as a diagnostic rather than a gate.
+            Self::CodeModeHighVolume => &AbLatencyMetric::REQUEST_ONLY,
             Self::RetainedExecWriteStdinLifecycle => &AbLatencyMetric::ALL,
             Self::AbortDirectNestedInFlight | Self::AbortRetainedProcess => &[],
             Self::SessionReplay => &AbLatencyMetric::REPLAY,
@@ -702,8 +713,6 @@ struct AbReplaySubturnRecord {
     name: String,
     logical_generations: u32,
     terminal_event: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    completion_status: Option<String>,
     application_result: String,
     typed_error_count: u32,
     final_response_present: bool,
@@ -852,8 +861,6 @@ struct Sample {
     tool_closure: Option<AbToolClosureCompat>,
     #[serde(default)]
     terminal_event: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    completion_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     abort_reason: Option<String>,
     #[serde(default)]

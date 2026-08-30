@@ -23,8 +23,6 @@ mod plan;
 pub(crate) mod plan_spec;
 mod read_tool_output;
 pub(crate) mod read_tool_output_spec;
-mod read_turn_timing;
-pub(crate) mod read_turn_timing_spec;
 mod request_permissions;
 mod request_plugin_install;
 pub(crate) mod request_plugin_install_spec;
@@ -82,7 +80,6 @@ pub use plan::PlanHandler;
 pub use read_tool_output::ReadToolOutputHandler;
 #[cfg(test)]
 pub(crate) use read_tool_output::execute_recovery_transaction;
-pub use read_turn_timing::ReadTurnTimingHandler;
 pub use request_permissions::RequestPermissionsHandler;
 pub use request_plugin_install::RequestPluginInstallHandler;
 pub use request_user_input::RequestUserInputHandler;
@@ -197,19 +194,7 @@ where
 }
 
 pub(crate) fn resolve_repository_root(cwd: &Path) -> PathBuf {
-    #[cfg(test)]
-    REPOSITORY_ROOT_RESOLUTION_COUNT.with(|count| count.set(count.get() + 1));
     resolve_repository_root_with(cwd, get_git_repo_root)
-}
-
-#[cfg(test)]
-thread_local! {
-    static REPOSITORY_ROOT_RESOLUTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_repository_root_resolution_count() {
-    REPOSITORY_ROOT_RESOLUTION_COUNT.with(|count| count.set(0));
 }
 
 fn resolve_repository_root_with(

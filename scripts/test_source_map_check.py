@@ -91,9 +91,7 @@ class SourceMapCheckTest(unittest.TestCase):
                 contextlib.redirect_stderr(stderr),
             ):
                 self.assertEqual(
-                    source_map_check.main(
-                        [str(source_map), "--repo-root", str(root)]
-                    ),
+                    source_map_check.main([str(source_map), "--repo-root", str(root)]),
                     1,
                 )
             self.assertIn("source map outputs is already locked", stderr.getvalue())
@@ -419,9 +417,7 @@ class SourceMapCheckTest(unittest.TestCase):
                 wraps=original_run,
             ) as git_run:
                 self.assertEqual(
-                    source_map_check.main(
-                        [str(source_map), "--repo-root", str(root)]
-                    ),
+                    source_map_check.main([str(source_map), "--repo-root", str(root)]),
                     0,
                 )
             git_run.assert_called_once()

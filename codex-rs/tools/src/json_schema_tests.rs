@@ -975,7 +975,8 @@ fn parse_large_tool_input_schema_compacts_descriptions_only_on_default_path() {
             },
             "$defs": {
                 "metadata": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "Metadata value"
                 }
             }
         })
@@ -1038,12 +1039,15 @@ fn parse_large_tool_input_schema_ignores_dropped_metadata_for_budget() {
             "properties": {
                 "event": {
                     "type": "object",
+                    "description": "Calendar event",
                     "properties": {
                         "recurrence": {
                             "type": "object",
+                            "description": "Recurrence settings",
                             "properties": {
                                 "pattern": {
-                                    "type": "string"
+                                    "type": "string",
+                                    "description": "Recurrence pattern"
                                 }
                             }
                         }
@@ -1115,6 +1119,7 @@ fn parse_large_tool_input_schema_preserves_reachable_definitions_over_budget() {
             "$defs": {
                 "metadata": {
                     "type": "object",
+                    "description": "metadata object",
                     "properties": many_string_properties(/*count*/ 300)
                 }
             }
@@ -1123,7 +1128,7 @@ fn parse_large_tool_input_schema_preserves_reachable_definitions_over_budget() {
 }
 
 #[test]
-fn parse_large_tool_input_schema_strips_descriptions_without_removing_description_property() {
+fn parse_large_tool_input_schema_preserves_field_descriptions_and_description_property() {
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object",
         "description": "x".repeat(5_500),
@@ -1180,41 +1185,80 @@ fn parse_large_tool_input_schema_strips_descriptions_without_removing_descriptio
             "type": "object",
             "properties": {
                 "choice": {
+                    "description": "Choice value",
                     "anyOf": [
                         {
-                            "type": "string"
+                            "type": "string",
+                            "description": "String choice"
                         },
                         {
-                            "type": "number"
+                            "type": "number",
+                            "description": "Number choice"
                         }
                     ]
                 },
                 "description": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "User-facing description value"
                 },
                 "extras": {
                     "type": "object",
                     "properties": {},
                     "additionalProperties": {
-                        "type": "string"
+                        "type": "string",
+                        "description": "Extra value"
                     }
                 },
                 "metadata": {
                     "type": "object",
+                    "description": "Metadata object",
                     "properties": {
                         "label": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Metadata label"
                         }
                     }
                 },
                 "tags": {
                     "type": "array",
+                    "description": "Tag list",
                     "items": {
-                        "type": "string"
+                        "type": "string",
+                        "description": "Tag value"
                     }
                 }
             }
         })
+    );
+}
+
+#[test]
+fn parse_large_tool_input_schema_truncates_only_oversized_field_descriptions() {
+    let schema = parse_tool_input_schema(&serde_json::json!({
+        "type": "object",
+        "properties": {
+            "payload": {
+                "type": "string",
+                "description": "x".repeat(5_500)
+            },
+            "mode": {
+                "type": "string",
+                "description": "Select the processing mode."
+            }
+        }
+    }))
+    .expect("parse schema");
+
+    let properties = schema.properties.expect("object properties");
+    let payload_description = properties["payload"]
+        .description
+        .as_deref()
+        .expect("truncated payload description");
+    assert!(payload_description.len() <= 512);
+    assert!(payload_description.ends_with(" [... truncated ...]"));
+    assert_eq!(
+        properties["mode"].description.as_deref(),
+        Some("Select the processing mode.")
     );
 }
 

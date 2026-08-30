@@ -118,6 +118,7 @@ pub use tool_output::telemetry_preview;
 pub use tool_payload::ToolPayload;
 pub use tool_search::ToolSearchEntry;
 pub use tool_search::ToolSearchInfo;
+pub use tool_search::schema_search_text;
 pub use tool_spec::ResponsesApiWebSearchFilters;
 pub use tool_spec::ResponsesApiWebSearchUserLocation;
 pub use tool_spec::ToolSpec;

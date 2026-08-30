@@ -276,7 +276,9 @@ class StageNpmPackagesTests(unittest.TestCase):
         vendor_src = self.root / "vendor-src"
         (vendor_src / "x86_64-unknown-linux-gnu").mkdir(parents=True)
 
-        with self.assertRaisesRegex(RuntimeError, "Unsupported non-Windows native target"):
+        with self.assertRaisesRegex(
+            RuntimeError, "Unsupported non-Windows native target"
+        ):
             build.copy_native_binaries(
                 vendor_src,
                 self.root / "staging",
@@ -886,7 +888,9 @@ class StageNpmPackagesTests(unittest.TestCase):
     def test_install_single_binary_rejects_non_windows_target(self) -> None:
         component = stage.BinaryComponent("codex", "codex", "codex.exe")
 
-        with self.assertRaisesRegex(RuntimeError, "Unsupported non-Windows native target"):
+        with self.assertRaisesRegex(
+            RuntimeError, "Unsupported non-Windows native target"
+        ):
             stage.install_single_binary(
                 self.root / "artifacts",
                 self.root / "vendor",

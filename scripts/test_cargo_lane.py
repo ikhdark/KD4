@@ -1002,9 +1002,7 @@ class CargoLaneTest(unittest.TestCase):
         user_profile = self.temp_root / "user"
         cargo_config = user_profile / ".cargo" / "config.toml"
         cargo_config.parent.mkdir(parents=True)
-        source_config = (
-            'build.rustc-wrapper = "custom-wrapper"\n[net]\nretry = 3\n'
-        )
+        source_config = 'build.rustc-wrapper = "custom-wrapper"\n[net]\nretry = 3\n'
         cargo_config.write_text(source_config, encoding="utf-8")
         local_app_data = self.temp_root / "local-app-data"
         fake_bin = self.temp_root / "bin"

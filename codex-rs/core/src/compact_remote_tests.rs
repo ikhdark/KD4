@@ -171,6 +171,38 @@ fn remote_compaction_evicts_raw_messages_and_bounds_tool_receipts() {
 }
 
 #[test]
+fn over_truncation_remote_compaction_keeps_exact_artifact_recovery_sidecar() {
+    let compaction = ResponseItem::Compaction {
+        id: None,
+        encrypted_content: "opaque-state".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let payload = serde_json::json!({
+        "version": 1,
+        "kind": "tool_history_artifact_pins",
+        "instruction": "Use read_tool_output with the retained artifact_id.",
+        "artifacts": [{
+            "artifact_id": "019fd974-843a-7601-8624-dc36cd5cc3cd",
+            "sha256": "a".repeat(64),
+            "bytes": 123
+        }]
+    })
+    .to_string();
+
+    let retained = append_remote_compaction_artifact_pins(vec![compaction], Some(payload));
+    let ResponseItem::Message { content, .. } = &retained[1] else {
+        panic!("expected deterministic artifact recovery sidecar");
+    };
+    let ContentItem::InputText { text } = &content[0] else {
+        panic!("expected text sidecar");
+    };
+
+    assert!(text.contains("tool_history_artifact_pins"));
+    assert!(text.contains("019fd974-843a-7601-8624-dc36cd5cc3cd"));
+    assert!(text.contains("read_tool_output"));
+}
+
+#[test]
 fn remote_compaction_drops_nonrecoverable_tool_receipts() {
     let items = vec![
         function_call("plain-call", "call-plain"),
