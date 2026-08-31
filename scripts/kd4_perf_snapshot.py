@@ -169,11 +169,9 @@ def scenario_catalog(
         "focused-core-test": Scenario(
             "focused-core-test",
             (
-                "cargo",
-                "nextest",
-                "run",
-                "-p",
-                "codex-core",
+                "just",
+                "core-test-fast",
+                "core_lib",
                 "-E",
                 "test(typed_agents_inherit_every_non_root_tool_class)",
             ),

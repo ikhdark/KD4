@@ -16,8 +16,8 @@ use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
-use core_test_support::wait_for_event;
-use core_test_support::wait_for_event_match;
+use core_test_support::wait_for_event_match_with_timeout;
+use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::path::Path;
@@ -101,17 +101,30 @@ async fn run_tool_turn_on_harness(
         })
         .await?;
 
-    wait_for_event_match(&codex, |event| match event {
-        EventMsg::ExecCommandBegin(begin) if begin.call_id == call_id => Some(()),
-        _ => None,
-    })
+    wait_for_event_match_with_timeout(
+        &codex,
+        |event| match event {
+            EventMsg::ExecCommandBegin(begin) if begin.call_id == call_id => Some(()),
+            _ => None,
+        },
+        Duration::from_secs(10),
+    )
     .await;
-    let end = wait_for_event_match(&codex, |event| match event {
-        EventMsg::ExecCommandEnd(end) if end.call_id == call_id => Some(end.clone()),
-        _ => None,
-    })
+    let end = wait_for_event_match_with_timeout(
+        &codex,
+        |event| match event {
+            EventMsg::ExecCommandEnd(end) if end.call_id == call_id => Some(end.clone()),
+            _ => None,
+        },
+        Duration::from_secs(10),
+    )
     .await;
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        &codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(10),
+    )
+    .await;
     Ok(end)
 }
 
@@ -138,6 +151,7 @@ async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
         "warm up PowerShell snapshot",
         "powershell-snapshot-warmup",
         json!({
+            "kind": "script",
             "cmd": "Microsoft.PowerShell.Utility\\Write-Output warmup",
             "yield_time_ms": 1_000,
         }),
@@ -169,6 +183,7 @@ async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
         "verify PowerShell snapshot replay",
         "powershell-snapshot-replay",
         json!({
+            "kind": "script",
             "cmd": "Invoke-CodexSnapshotE2E",
             "yield_time_ms": 1_000,
         }),

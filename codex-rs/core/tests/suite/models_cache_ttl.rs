@@ -125,9 +125,19 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
         .await?;
 
     let _ = wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let refresh_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let refreshed_cache = loop {
+        let cache = read_cache(&cache_path).await?;
+        if cache.fetched_at >= refresh_started_at {
+            break cache;
+        }
+        assert!(
+            tokio::time::Instant::now() < refresh_deadline,
+            "matching response ETag did not renew the cache TTL before the deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
     let refresh_finished_at = Utc::now();
-
-    let refreshed_cache = read_cache(&cache_path).await?;
     assert!(
         refreshed_cache.fetched_at >= refresh_started_at
             && refreshed_cache.fetched_at <= refresh_finished_at,

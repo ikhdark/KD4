@@ -173,19 +173,21 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
 
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
+
+    // This test covers reuse of a completed startup prewarm. Observe the
+    // speculative request before submitting the real turn so scheduler load
+    // cannot abort it before the assertion path begins.
+    let warmup = server.wait_for_request(0, 0).await.body_json();
+    assert_eq!(warmup["type"].as_str(), Some("response.create"));
+    assert_eq!(warmup["generate"].as_bool(), Some(false));
+
     test.submit_turn_with_policy("hello", test.config.legacy_sandbox_policy())
         .await?;
 
     assert_eq!(server.handshakes().len(), 1);
     let connection = server.single_connection();
     assert_eq!(connection.len(), 2);
-    let warmup = connection
-        .first()
-        .expect("missing warmup request")
-        .body_json();
     let turn = connection.get(1).expect("missing turn request").body_json();
-    assert_eq!(warmup["type"].as_str(), Some("response.create"));
-    assert_eq!(warmup["generate"].as_bool(), Some(false));
     let warmup_metadata: Value = serde_json::from_str(
         warmup["client_metadata"]["x-codex-turn-metadata"]
             .as_str()
@@ -236,6 +238,17 @@ async fn websocket_first_turn_handles_handshake_delay_with_startup_prewarm() -> 
 
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
+
+    // Startup prewarm is speculative and a real turn intentionally never waits for unfinished
+    // speculative work. Observe the delayed prewarm request first so this test proves that a
+    // prewarm completing after a slow handshake is reusable by the first turn.
+    let delayed_warmup = server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
+        .await
+        .body_json();
+    assert_eq!(delayed_warmup["type"].as_str(), Some("response.create"));
+    assert_eq!(delayed_warmup["generate"].as_bool(), Some(false));
+
     test.submit_turn_with_policy("hello", test.config.legacy_sandbox_policy())
         .await?;
 
@@ -401,8 +414,15 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
     let mut builder = test_codex().with_windows_cmd_shell();
 
     let test = builder.build_with_websocket_server(&server).await?;
-    test.submit_turn_with_policy("run the echo command", test.config.legacy_sandbox_policy())
-        .await?;
+    // Observe completion of the speculative startup request before submitting the turn.
+    // Otherwise a loaded scheduler can let the turn cancel the warmup while this fixture
+    // still expects the resulting websocket response chain to be reusable.
+    let warmup = server.wait_for_request(0, 0).await.body_json();
+    assert_eq!(warmup["type"].as_str(), Some("response.create"));
+    assert_eq!(warmup["generate"].as_bool(), Some(false));
+    // The transport chain is the contract under test. Disable sandbox enforcement so a
+    // policy rejection cannot terminalize the required shell tool before its output is sent.
+    test.submit_turn("run the echo command").await?;
 
     let connection = server.single_connection();
     assert_eq!(connection.len(), 3);
@@ -423,7 +443,7 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
     assert_eq!(warmup["type"].as_str(), Some("response.create"));
     assert_eq!(warmup["generate"].as_bool(), Some(false));
     assert_eq!(first_turn["type"].as_str(), Some("response.create"));
-    assert_eq!(first_turn["previous_response_id"].as_str(), Some("warm-1"));
+    assert_eq!(first_turn.get("previous_response_id"), None);
     assert!(
         first_turn
             .get("input")
@@ -534,6 +554,10 @@ async fn websocket_v2_first_turn_drops_fast_tier_after_startup_prewarm() -> Resu
     assert_eq!(warmup["type"].as_str(), Some("response.create"));
     assert_eq!(warmup["generate"].as_bool(), Some(false));
     assert_eq!(warmup["service_tier"].as_str(), Some("priority"));
+    // Request capture happens before the fixture writes its response frames. Wait for the
+    // completed warmup batch, then let the client consume it before the first-turn handoff.
+    server.wait_for_response_batch(0, 0).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     test.submit_turn_with_service_tier("hello", /*service_tier*/ None)
         .await?;

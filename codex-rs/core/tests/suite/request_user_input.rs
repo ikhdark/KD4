@@ -251,7 +251,7 @@ async fn request_user_input_round_trip_for_mode(
             additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 environments: Some(local_selections(cwd.abs())),
-                approval_policy: Some(AskForApproval::Never),
+                approval_policy: Some(AskForApproval::OnRequest),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
                 collaboration_mode: Some(CollaborationMode {
@@ -399,7 +399,7 @@ async fn request_user_input_interrupt_emits_deferred_token_count() -> anyhow::Re
             additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 environments: Some(local_selections(cwd.abs())),
-                approval_policy: Some(AskForApproval::Never),
+                approval_policy: Some(AskForApproval::OnRequest),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
                 collaboration_mode: Some(CollaborationMode {

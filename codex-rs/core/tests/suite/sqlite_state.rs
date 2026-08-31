@@ -197,7 +197,7 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
             "tools": [{
                 "type": "function",
                 "name": tool_name,
-                "description": "Look up a value after resume.\n\nexec tool declaration:\n```ts\ndeclare const tools: { resume_tools__resume_lookup(args: { query: string; }, options?: { timeout_ms?: number }): Promise<unknown>; };\n```",
+                "description": tool_description,
                 "strict": false,
                 "parameters": input_schema,
             }],
@@ -310,7 +310,7 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
             "tools": [{
                 "type": "function",
                 "name": tool_name,
-                "description": "Look up a value after resume.\n\nexec tool declaration:\n```ts\ndeclare const tools: { resume_tools__resume_lookup(args: { query: string; }, options?: { timeout_ms?: number }): Promise<unknown>; };\n```",
+                "description": tool_description,
                 "strict": false,
                 "parameters": input_schema,
             }],
@@ -775,6 +775,7 @@ async fn tool_call_logs_include_thread_id() -> Result<()> {
     let server = start_mock_server().await;
     let call_id = "call-1";
     let args = json!({
+        "kind": "script",
         "command": "echo hello",
         "timeout_ms": 1_000,
         "login": false,

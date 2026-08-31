@@ -6,6 +6,7 @@ pub(crate) fn create_code_mode_tool(
     code_mode_only: bool,
     has_deferred_tools: bool,
     direct_only_tool_names: &[String],
+    eager_nested_tool_descriptions: &[String],
 ) -> ToolSpec {
     const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
 start: pragma_source | plain_source
@@ -17,13 +18,19 @@ NEWLINE: /\r?\n/
 SOURCE: /[\s\S]+/
 "#;
 
+    let mut description = codex_code_mode::build_exec_tool_description(
+        code_mode_only,
+        has_deferred_tools,
+        direct_only_tool_names,
+    );
+    for eager_description in eager_nested_tool_descriptions {
+        description.push_str("\n\nEager nested tool contract:\n\n");
+        description.push_str(eager_description);
+    }
+
     ToolSpec::Freeform(FreeformTool {
         name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
-        description: codex_code_mode::build_exec_tool_description(
-            code_mode_only,
-            has_deferred_tools,
-            direct_only_tool_names,
-        ),
+        description,
         format: FreeformToolFormat {
             r#type: "grammar".to_string(),
             syntax: "lark".to_string(),
@@ -44,6 +51,7 @@ mod tests {
                 /*code_mode_only*/ true,
                 /*has_deferred_tools*/ false,
                 &["direct_helper".to_string()],
+                &[],
             ),
             ToolSpec::Freeform(FreeformTool {
                 name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
@@ -84,5 +92,20 @@ SOURCE: /[\s\S]+/
             codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL
         );
         assert_eq!(codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL, 10_000);
+    }
+
+    #[test]
+    fn eager_nested_tool_contract_is_rendered_in_the_exec_description() {
+        let ToolSpec::Freeform(exec) = create_code_mode_tool(
+            /*code_mode_only*/ true,
+            /*has_deferred_tools*/ false,
+            &[],
+            &["exec command description\n\ndeclare const tools: { exec_command(args: unknown): Promise<unknown>; };".to_string()],
+        ) else {
+            panic!("expected code mode exec tool");
+        };
+
+        assert!(exec.description.contains("Eager nested tool contract:"));
+        assert!(exec.description.contains("exec_command(args:"));
     }
 }

@@ -61,7 +61,7 @@ use crate::responses::WebSocketTestServer;
 use crate::responses::output_value_to_text;
 use crate::responses::start_mock_server;
 use crate::streaming_sse::StreamingSseServer;
-use crate::wait_for_event_match;
+use crate::wait_for_event_match_with_timeout;
 use crate::wait_for_event_with_timeout;
 use wiremock::Match;
 use wiremock::matchers::path_regex;
@@ -71,7 +71,7 @@ type PreBuildHook = dyn FnOnce(&Path) + Send + 'static;
 type WorkspaceSetup = dyn FnOnce(AbsolutePathBuf, Arc<dyn ExecutorFileSystem>) -> BoxFuture<'static, Result<()>>
     + Send;
 const TEST_MODEL_WITH_EXPERIMENTAL_TOOLS: &str = "test-gpt-5.1-codex";
-const SUBMIT_TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
+const SUBMIT_TURN_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct RecordingUserInstructionsProvider {
     inner: Arc<dyn UserInstructionsProvider>,
@@ -200,6 +200,7 @@ pub struct TestCodexBuilder {
     supports_openai_form_elicitation: bool,
     external_time_provider: Option<Arc<dyn TimeProvider>>,
     code_mode_host_program: Option<PathBuf>,
+    raw_response_items: bool,
     session_source: SessionSource,
 }
 
@@ -309,6 +310,16 @@ impl TestCodexBuilder {
 
     pub fn with_code_mode_host_program(mut self, host_program: PathBuf) -> Self {
         self.code_mode_host_program = Some(host_program);
+        self
+    }
+
+    /// Opts this fixture into the raw response-item stream.
+    ///
+    /// Most integration tests consume the normal semantic event stream. Raw
+    /// items are intentionally opt-in in production, so only tests that assert
+    /// on them should enable the extra events.
+    pub fn with_raw_response_items(mut self) -> Self {
+        self.raw_response_items = true;
         self
     }
 
@@ -594,7 +605,9 @@ impl TestCodexBuilder {
                 .await?
             }
         };
-        new_conversation.thread.request_raw_response_items();
+        if self.raw_response_items {
+            new_conversation.thread.request_raw_response_items();
+        }
 
         Ok(TestCodex {
             home,
@@ -959,10 +972,14 @@ impl TestCodex {
             })
             .await?;
 
-        let turn_id = wait_for_event_match(&self.codex, |event| match event {
-            EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
-            _ => None,
-        })
+        let turn_id = wait_for_event_match_with_timeout(
+            &self.codex,
+            |event| match event {
+                EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+                _ => None,
+            },
+            SUBMIT_TURN_EVENT_TIMEOUT,
+        )
         .await;
         let completed = wait_for_event_with_timeout(
             &self.codex,
@@ -970,7 +987,7 @@ impl TestCodex {
                 EventMsg::TurnComplete(event) => event.turn_id == turn_id,
                 _ => false,
             },
-            SUBMIT_TURN_COMPLETE_TIMEOUT,
+            SUBMIT_TURN_EVENT_TIMEOUT,
         )
         .await;
         let EventMsg::TurnComplete(completed) = completed else {
@@ -1236,6 +1253,7 @@ pub fn test_codex() -> TestCodexBuilder {
         supports_openai_form_elicitation: false,
         external_time_provider: None,
         code_mode_host_program: None,
+        raw_response_items: false,
         session_source: SessionSource::Exec,
     }
 }

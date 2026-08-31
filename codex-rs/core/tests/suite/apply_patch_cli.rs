@@ -405,7 +405,10 @@ async fn apply_patch_cli_rejects_invalid_hunk_header() -> Result<()> {
     let (model_visible_output, success) = requests[1]
         .custom_tool_call_output_content_and_success(call_id)
         .expect("the follow-up request must contain the failed apply_patch result");
-    assert_eq!(success, Some(false));
+    assert_eq!(
+        success, None,
+        "tool success is internal metadata and must not change the custom-tool wire shape"
+    );
     assert!(
         model_visible_output
             .as_deref()
@@ -1102,14 +1105,18 @@ async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> 
     submit_without_wait(&harness, "aggregate diffs").await?;
 
     let mut turn_diffs = Vec::new();
-    wait_for_event(&codex, |event| match event {
-        EventMsg::TurnDiff(ev) => {
-            turn_diffs.push(ev.unified_diff.clone());
-            false
-        }
-        EventMsg::TurnComplete(_) => true,
-        _ => false,
-    })
+    wait_for_event_with_timeout(
+        &codex,
+        |event| match event {
+            EventMsg::TurnDiff(ev) => {
+                turn_diffs.push(ev.unified_diff.clone());
+                false
+            }
+            EventMsg::TurnComplete(_) => true,
+            _ => false,
+        },
+        Duration::from_secs(30),
+    )
     .await;
 
     assert_eq!(

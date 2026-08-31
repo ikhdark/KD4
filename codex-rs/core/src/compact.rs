@@ -115,7 +115,7 @@ struct CompactionTextOmissionReceiptV1 {
 /// The test-only `BeforeLastUserMessage` variant preserves coverage for legacy replacement-history
 /// ordering. `AtStart` keeps the summary or compaction item last while preserving the stable prompt
 /// prefix in production.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum InitialContextInjection {
     AtStart(Arc<WorldState>),
     #[cfg(test)]
@@ -205,6 +205,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    emit_error_event: bool,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let InlineAutoCompactReuse {
@@ -233,6 +234,7 @@ pub(crate) async fn run_inline_auto_compact_task(
         CompactionTrigger::Auto,
         reason,
         phase,
+        emit_error_event,
         cancellation_token,
     )
     .await?;
@@ -267,6 +269,7 @@ pub(crate) async fn run_compact_task(
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
+        /*emit_error_event*/ true,
         cancellation_token,
     )
     .await?;
@@ -284,6 +287,7 @@ async fn run_compact_task_inner(
     trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
+    emit_error_event: bool,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let compaction_metadata =
@@ -317,6 +321,7 @@ async fn run_compact_task_inner(
         input,
         initial_context_injection,
         compaction_metadata,
+        emit_error_event,
         cancellation_token,
     )
     .await;
@@ -355,6 +360,7 @@ async fn run_compact_task_inner_impl(
     mut input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
+    emit_error_event: bool,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
@@ -468,14 +474,18 @@ async fn run_compact_task_inner_impl(
                 Err(e @ CodexErr::ContextWindowExceeded) => {
                     sess.set_total_tokens_full(turn_context.as_ref()).await;
                     sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                    sess.send_event(&turn_context, event).await;
+                    if emit_error_event {
+                        let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                        sess.send_event(&turn_context, event).await;
+                    }
                     return Err(e);
                 }
                 Err(e) if !e.is_retryable() => {
                     sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                    sess.send_event(&turn_context, event).await;
+                    if emit_error_event {
+                        let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                        sess.send_event(&turn_context, event).await;
+                    }
                     return Err(e);
                 }
                 Err(e) => {
@@ -492,8 +502,10 @@ async fn run_compact_task_inner_impl(
                     .await
                     {
                         sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                        let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                        sess.send_event(&turn_context, event).await;
+                        if emit_error_event {
+                            let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                            sess.send_event(&turn_context, event).await;
+                        }
                         return Err(e);
                     }
                     turn_context.turn_timing_state.record_model_retry();
@@ -505,8 +517,10 @@ async fn run_compact_task_inner_impl(
         Ok(summary_text) => summary_text,
         Err(error) => {
             sess.track_turn_codex_error(turn_context.as_ref(), &error);
-            let event = EventMsg::Error(error.to_error_event(/*message_prefix*/ None));
-            sess.send_event(&turn_context, event).await;
+            if emit_error_event {
+                let event = EventMsg::Error(error.to_error_event(/*message_prefix*/ None));
+                sess.send_event(&turn_context, event).await;
+            }
             return Err(error);
         }
     };

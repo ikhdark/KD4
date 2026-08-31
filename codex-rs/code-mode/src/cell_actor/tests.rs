@@ -254,7 +254,7 @@ async fn yield_timer_preempts_buffered_runtime_output() {
 }
 
 #[tokio::test]
-async fn state_change_observer_wakes_on_output_without_an_empty_timer_yield() {
+async fn state_change_observer_wakes_on_output_after_the_completion_grace() {
     let mut harness = spawn_cell_actor_harness(ObserveMode::StateChange);
     harness.event_tx.send(RuntimeEvent::Started).unwrap();
 
@@ -274,8 +274,20 @@ async fn state_change_observer_wakes_on_output_without_an_empty_timer_yield() {
             admitted_bytes: 0,
         })
         .unwrap();
+    assert!(
+        tokio::time::timeout(
+            STATE_CHANGE_COMPLETION_GRACE / 2,
+            &mut harness.initial_event_rx,
+        )
+        .await
+        .is_err(),
+        "ordinary output must leave a short window for imminent completion"
+    );
     assert_eq!(
-        harness.initial_event_rx.await.unwrap(),
+        tokio::time::timeout(Duration::from_secs(1), harness.initial_event_rx)
+            .await
+            .expect("state-change completion grace timed out")
+            .unwrap(),
         Ok(CellEvent::Yielded {
             content_items: vec![OutputItem::Text {
                 text: "meaningful output".to_string(),
@@ -289,6 +301,52 @@ async fn state_change_observer_wakes_on_output_without_an_empty_timer_yield() {
         termination.await,
         Ok(CellEvent::Terminated {
             content_items: Vec::new(),
+        })
+    );
+    harness.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn state_change_observer_coalesces_output_with_imminent_completion() {
+    let mut harness = spawn_cell_actor_harness(ObserveMode::StateChange);
+    harness.event_tx.send(RuntimeEvent::Started).unwrap();
+    harness
+        .event_tx
+        .send(RuntimeEvent::ContentItem {
+            item: FunctionCallOutputContentItem::InputText {
+                text: "tool output".to_string(),
+            },
+            admitted_bytes: 0,
+        })
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(
+            STATE_CHANGE_COMPLETION_GRACE / 2,
+            &mut harness.initial_event_rx,
+        )
+        .await
+        .is_err(),
+        "tool output must not force a running response before imminent completion"
+    );
+
+    harness
+        .event_tx
+        .send(RuntimeEvent::Result {
+            stored_value_writes: HashMap::new(),
+            error_text: None,
+        })
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), harness.initial_event_rx)
+            .await
+            .expect("coalesced completion timed out")
+            .unwrap(),
+        Ok(CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "tool output".to_string(),
+            }],
+            error_text: None,
         })
     );
     harness.task.await.unwrap();

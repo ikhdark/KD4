@@ -925,9 +925,9 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
             Write-Output "CARGO_HOME=$env:CARGO_HOME"
         }
-        Write-Output "Example: just test-lane-package codex-core"
-        Write-Output "Example: just check-lane codex-core"
-        Write-Output "Direct example: .\scripts\cargo-lane.ps1 -Lane auto --% cargo nextest run -p codex-core"
+        Write-Output "Core test example: just core-test-lane core_lib"
+        Write-Output "Generic package example: just test-lane-package codex-tui"
+        Write-Output "Check example: just check-lane codex-core"
         exit 0
     }
 

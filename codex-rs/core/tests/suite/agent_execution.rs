@@ -17,6 +17,8 @@ const FIRST_PROMPT: &str = "spawn the first agent";
 const FIRST_TASK: &str = "spawn the second agent";
 const SECOND_TASK: &str = "second worker task";
 const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
+const TASK_CAPSULE_OPEN_TAG: &str = "<task_capsule_v1>";
+const TASK_CAPSULE_CLOSE_TAG: &str = "</task_capsule_v1>";
 
 fn has_function_call_output(request: &wiremock::Request, call_id: &str) -> bool {
     serde_json::from_slice::<serde_json::Value>(&request.body).is_ok_and(|body| {
@@ -27,6 +29,49 @@ fn has_function_call_output(request: &wiremock::Request, call_id: &str) -> bool 
                     item.get("type").and_then(serde_json::Value::as_str)
                         == Some("function_call_output")
                         && item.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id)
+                })
+            })
+    })
+}
+
+fn has_task_capsule_objective(request: &wiremock::Request, objective: &str) -> bool {
+    serde_json::from_slice::<serde_json::Value>(&request.body).is_ok_and(|body| {
+        body.get("input")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("message")
+                        && item.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                        && item
+                            .get("content")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|content| {
+                                content.iter().any(|part| {
+                                    part.get("type").and_then(serde_json::Value::as_str)
+                                        == Some("input_text")
+                                        && part
+                                            .get("text")
+                                            .and_then(serde_json::Value::as_str)
+                                            .and_then(|text| {
+                                                text.strip_prefix(TASK_CAPSULE_OPEN_TAG).and_then(
+                                                    |text| {
+                                                        text.strip_suffix(TASK_CAPSULE_CLOSE_TAG)
+                                                    },
+                                                )
+                                            })
+                                            .and_then(|payload| {
+                                                serde_json::from_str::<serde_json::Value>(payload)
+                                                    .ok()
+                                            })
+                                            .and_then(|capsule| {
+                                                capsule
+                                                    .get("objective")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    .map(|value| value == objective)
+                                            })
+                                            == Some(true)
+                                })
+                            })
                 })
             })
     })
@@ -63,7 +108,7 @@ async fn v2_nested_spawn_checks_shared_active_execution_capacity() -> Result<()>
     mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
-            request_has_last_message_input_text(request, "user", FIRST_TASK)
+            has_task_capsule_objective(request, FIRST_TASK)
                 && !has_function_call_output(request, "first-call")
         },
         sse(vec![

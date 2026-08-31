@@ -76,40 +76,14 @@ fn codex_home_for_windows_sandbox_test(name: &str) -> anyhow::Result<TestCodexHo
     Ok(TestCodexHome::Temporary(TempDir::new()?))
 }
 
-fn stage_windows_sandbox_helpers() -> anyhow::Result<()> {
-    let test_exe = std::env::current_exe().context("resolve current Windows test executable")?;
-    let test_exe_dir = test_exe
-        .parent()
-        .context("Windows test executable should have a parent directory")?;
-    let resources_dir = test_exe_dir.join("codex-resources");
-    match std::fs::create_dir_all(&resources_dir) {
-        Ok(()) => {}
-        Err(err)
-            if err.kind() == std::io::ErrorKind::PermissionDenied && resources_dir.is_dir() => {}
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("create resources dir {}", resources_dir.display()));
-        }
-    }
-    for helper_name in ["codex-windows-sandbox-setup", "codex-command-runner"] {
-        let helper = codex_utils_cargo_bin::cargo_bin(helper_name)?;
-        let file_name = Path::new(helper_name).with_extension("exe");
-        let destination = resources_dir.join(file_name);
-        if let Err(err) = std::fs::copy(&helper, &destination) {
-            // A sandbox helper can briefly remain alive after the sandboxed
-            // command exits. A retry may begin while that process still
-            // has the staged executable open, so keep the already-staged copy.
-            if err.kind() == std::io::ErrorKind::PermissionDenied && destination.exists() {
-                continue;
-            }
-            return Err(err).with_context(|| {
-                format!(
-                    "stage Windows sandbox helper {} at {}",
-                    helper.display(),
-                    destination.display()
-                )
-            });
-        }
+#[test]
+fn windows_sandbox_helper_staging_is_parallel_safe() -> anyhow::Result<()> {
+    let workers = (0..8)
+        .map(|_| std::thread::spawn(super::stage_windows_sandbox_helpers))
+        .collect::<Vec<_>>();
+
+    for worker in workers {
+        worker.join().expect("helper staging worker panicked")?;
     }
     Ok(())
 }
@@ -199,9 +173,10 @@ async fn windows_restricted_token_rejects_exact_and_glob_deny_read_policy() -> a
 #[tokio::test]
 #[serial(codex_home)]
 async fn windows_elevated_enforces_deny_read_and_protects_setup_marker() -> anyhow::Result<()> {
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
     let codex_home = codex_home_for_windows_sandbox_test("windows-elevated-deny-read-codex-home")?;
     let _codex_home_guard = EnvVarGuard::set("CODEX_HOME", codex_home.path().as_os_str());
-    stage_windows_sandbox_helpers()?;
+    super::stage_windows_sandbox_helpers()?;
     let workspace = TempDir::new()?;
     let cwd = dunce::canonicalize(workspace.path())?.abs();
     let glob_secret = cwd.join("secret.env");
@@ -257,7 +232,7 @@ async fn windows_elevated_enforces_deny_read_and_protects_setup_marker() -> anyh
                     setup_marker.display()
                 ),
             ],
-            codex_home: cwd.clone(),
+            codex_home: dunce::canonicalize(codex_home.path())?.abs(),
             cwd: cwd.clone(),
             expiration: 10_000.into(),
             capture_policy: ExecCapturePolicy::ShellTool,

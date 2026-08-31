@@ -7,15 +7,13 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::command_shape::CommandInvocation;
+use crate::tools::handlers::parse_arguments;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::PostToolUsePayload;
 use codex_protocol::models::AdditionalPermissionProfile;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-#[cfg(test)]
-use crate::tools::handlers::parse_arguments;
 
 mod exec_command;
 mod write_stdin;
@@ -25,9 +23,27 @@ pub(crate) use exec_command::ExecCommandHandlerOptions;
 pub use write_stdin::WriteStdinHandler;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "RawExecCommandArgs")]
 pub(crate) struct ExecCommandArgs {
+    command: CommandInvocation,
+    shell: Option<String>,
+    login: Option<bool>,
+    tty: bool,
+    yield_time_ms: u64,
+    max_output_tokens: Option<usize>,
+    sandbox_permissions: SandboxPermissions,
+    additional_permissions: Option<AdditionalPermissionProfile>,
+    justification: Option<String>,
+    prefix_rule: Option<Vec<String>>,
+    force_fresh: bool,
+    validation: Option<codex_protocol::validation::ValidationCommandContext>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExecCommandArgs {
     #[serde(default)]
-    pub(crate) cmd: Option<String>,
+    cmd: Option<String>,
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
@@ -58,45 +74,86 @@ pub(crate) struct ExecCommandArgs {
     force_fresh: bool,
     #[serde(default)]
     validation: Option<codex_protocol::validation::ValidationCommandContext>,
+    // Compatibility-only shell_command fields. The foreign-environment shell
+    // adapter has historically forwarded these while unified exec retained its
+    // own foreground-yield semantics.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    stall_timeout_ms: Option<u64>,
+    #[serde(default)]
+    environment_id: Option<String>,
+    #[serde(default)]
+    workdir: Option<String>,
+}
+
+impl TryFrom<RawExecCommandArgs> for ExecCommandArgs {
+    type Error = String;
+
+    fn try_from(raw: RawExecCommandArgs) -> Result<Self, Self::Error> {
+        if !(crate::unified_exec::MIN_YIELD_TIME_MS..=crate::unified_exec::MAX_YIELD_TIME_MS)
+            .contains(&raw.yield_time_ms)
+        {
+            return Err(format!(
+                "exec_command schema error at `$.yield_time_ms`: actual value {} violates the inclusive bound {}..={}",
+                raw.yield_time_ms,
+                crate::unified_exec::MIN_YIELD_TIME_MS,
+                crate::unified_exec::MAX_YIELD_TIME_MS,
+            ));
+        }
+
+        let command = CommandInvocation::from_parts(
+            "exec_command",
+            "cmd",
+            raw.cmd.as_deref(),
+            raw.kind.as_deref(),
+            raw.program.as_deref(),
+            raw.args.as_deref(),
+            raw.script_body.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+        // Environment selection and workdir resolution intentionally happen
+        // in a separate boundary pass before the command arguments are
+        // decoded. Reading these fields here keeps this decoder permissive for
+        // that shared surface without retaining either value internally.
+        let _compatibility_only_fields = (
+            &raw.timeout_ms,
+            &raw.stall_timeout_ms,
+            &raw.environment_id,
+            &raw.workdir,
+        );
+
+        Ok(Self {
+            command,
+            shell: raw.shell,
+            login: raw.login,
+            tty: raw.tty,
+            yield_time_ms: raw.yield_time_ms,
+            max_output_tokens: raw.max_output_tokens,
+            sandbox_permissions: raw.sandbox_permissions,
+            additional_permissions: raw.additional_permissions,
+            justification: raw.justification,
+            prefix_rule: raw.prefix_rule,
+            force_fresh: raw.force_fresh,
+            validation: raw.validation,
+        })
+    }
 }
 
 impl ExecCommandArgs {
     pub(crate) fn command_invocation(&self) -> Result<CommandInvocation, String> {
-        CommandInvocation::from_parts(
-            "exec_command",
-            "cmd",
-            self.cmd.as_deref(),
-            self.kind.as_deref(),
-            self.program.as_deref(),
-            self.args.as_deref(),
-            self.script_body.as_deref(),
-        )
-        .map_err(|err| err.to_string())
+        Ok(self.command.clone())
     }
 
     pub(crate) fn replace_command_invocation(&mut self, invocation: &CommandInvocation) {
-        self.cmd = None;
-        self.kind = None;
-        self.program = None;
-        self.args = None;
-        self.script_body = None;
-
-        match invocation {
-            CommandInvocation::Script(script) => {
-                self.kind = Some("script".to_string());
-                self.cmd = Some(script.clone());
-            }
-            CommandInvocation::Argv { program, args } => {
-                self.kind = Some("argv".to_string());
-                self.program = Some(program.clone());
-                self.args = Some(args.clone());
-            }
-            CommandInvocation::PowerShellScript(script_body) => {
-                self.kind = Some("powershell_script".to_string());
-                self.script_body = Some(script_body.clone());
-            }
-        }
+        self.command = invocation.clone();
     }
+}
+
+pub(crate) fn validate_exec_command_arguments(arguments: &str) -> Result<(), String> {
+    parse_arguments::<ExecCommandArgs>(arguments)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Deserialize)]

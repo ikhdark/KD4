@@ -29,6 +29,82 @@ use tokio::sync::Mutex;
 const TEST_TRUNCATION_POLICY: TruncationPolicy = TruncationPolicy::Tokens(10_000);
 
 #[test]
+fn exec_command_boundary_normalizes_unambiguous_legacy_forms() {
+    let cases = [
+        (
+            serde_json::json!({"cmd": "rg --files"}),
+            CommandInvocation::Script("rg --files".to_string()),
+        ),
+        (
+            serde_json::json!({"program": "rg", "args": ["--files"]}),
+            CommandInvocation::Argv {
+                program: "rg".to_string(),
+                args: vec!["--files".to_string()],
+            },
+        ),
+        (
+            serde_json::json!({"script_body": "Get-ChildItem"}),
+            CommandInvocation::PowerShellScript("Get-ChildItem".to_string()),
+        ),
+    ];
+
+    for (arguments, expected) in cases {
+        let decoded: ExecCommandArgs =
+            parse_arguments(&arguments.to_string()).expect("legacy boundary form should decode");
+        assert_eq!(decoded.command_invocation().unwrap(), expected);
+    }
+}
+
+#[test]
+fn exec_command_boundary_accepts_legacy_shell_timeouts_without_changing_yield() {
+    let decoded: ExecCommandArgs = parse_arguments(
+        &serde_json::json!({
+            "cmd": "long-running",
+            "timeout_ms": 60_000,
+            "stall_timeout_ms": 5_000
+        })
+        .to_string(),
+    )
+    .expect("legacy shell timeout fields should remain compatible");
+
+    assert_eq!(decoded.yield_time_ms, default_exec_yield_time_ms());
+}
+
+#[test]
+fn exec_command_boundary_reports_branch_field_and_bound_errors() {
+    let legacy_kind = validate_exec_command_arguments(
+        &serde_json::json!({"kind": "legacy", "cmd": "rg --files"}).to_string(),
+    )
+    .expect_err("legacy kind must be omitted at the compatibility boundary");
+    assert!(legacy_kind.contains("$.kind"), "{legacy_kind}");
+    assert!(
+        legacy_kind.contains("actual value `legacy`"),
+        "{legacy_kind}"
+    );
+    assert!(legacy_kind.contains("omit `kind`"), "{legacy_kind}");
+
+    let mixed_branch = validate_exec_command_arguments(
+        &serde_json::json!({
+            "kind": "argv",
+            "program": "rg",
+            "cmd": "rg --files"
+        })
+        .to_string(),
+    )
+    .expect_err("mixed command branches must be rejected");
+    assert!(mixed_branch.contains("`argv` branch"), "{mixed_branch}");
+    assert!(mixed_branch.contains("$.cmd"), "{mixed_branch}");
+
+    let invalid_bound = validate_exec_command_arguments(
+        &serde_json::json!({"cmd": "rg --files", "yield_time_ms": 50}).to_string(),
+    )
+    .expect_err("out-of-range yield must be rejected");
+    assert!(invalid_bound.contains("$.yield_time_ms"), "{invalid_bound}");
+    assert!(invalid_bound.contains("actual value 50"), "{invalid_bound}");
+    assert!(invalid_bound.contains("250..=30000"), "{invalid_bound}");
+}
+
+#[test]
 fn exec_command_runtime_declares_confirmed_cancellation_cleanup() {
     let handler = ExecCommandHandler::default();
 

@@ -61,7 +61,6 @@ async fn responses_api_parent_and_subagent_requests_include_identity_headers() -
         &server,
         |req: &wiremock::Request| {
             request_body_contains(req, CHILD_PROMPT)
-                && !request_body_contains(req, SPAWN_CALL_ID)
                 && request_header(req, "x-openai-subagent") == Some("collab_spawn")
         },
         sse(vec![
@@ -88,6 +87,14 @@ async fn responses_api_parent_and_subagent_requests_include_identity_headers() -
     let mut builder = test_codex().with_config(|config| {
         config
             .features
+            .enable(Feature::Collab)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .disable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+        config
+            .features
             .disable(Feature::EnableRequestCompression)
             .expect("test config should allow feature update");
     });
@@ -100,7 +107,6 @@ async fn responses_api_parent_and_subagent_requests_include_identity_headers() -
     .await?;
     let child = wait_for_matching_request(&child_mock, "child request", |request| {
         request.body_contains_text(CHILD_PROMPT)
-            && !request.body_contains_text(SPAWN_CALL_ID)
             && request.header("x-openai-subagent").as_deref() == Some("collab_spawn")
     })
     .await?;

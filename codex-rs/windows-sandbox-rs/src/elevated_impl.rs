@@ -16,6 +16,7 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub use_private_desktop: bool,
     pub proxy_enforced: bool,
     pub read_roots_override: Option<&'a [PathBuf]>,
+    pub additional_read_roots: &'a [AbsolutePathBuf],
     pub read_roots_include_platform_defaults: bool,
     pub write_roots_override: Option<&'a [PathBuf]>,
     pub deny_read_paths_override: &'a [AbsolutePathBuf],
@@ -33,7 +34,7 @@ mod windows_impl {
     use crate::env::inherit_path_env;
     use crate::env::normalize_null_device_env;
     use crate::identity::refresh_logon_sandbox_creds;
-    use crate::identity::require_logon_sandbox_creds;
+    use crate::identity::require_logon_sandbox_creds_with_additional_read_roots;
     use crate::ipc_framed::EmptyPayload;
     use crate::ipc_framed::FramedMessage;
     use crate::ipc_framed::Message;
@@ -51,6 +52,7 @@ mod windows_impl {
     use crate::sandbox_utils::ensure_codex_home_exists;
     use crate::sandbox_utils::inject_git_safe_directory;
     use crate::setup::effective_write_roots_for_permissions;
+    use crate::spawn_prep::sandbox_capability_sid_strings;
     use crate::token::LocalSid;
     use anyhow::Result;
     use codex_utils_absolute_path::AbsolutePathBuf;
@@ -113,6 +115,7 @@ mod windows_impl {
             use_private_desktop,
             proxy_enforced,
             read_roots_override,
+            additional_read_roots,
             read_roots_include_platform_defaults,
             write_roots_override,
             deny_read_paths_override,
@@ -133,6 +136,10 @@ mod windows_impl {
             .iter()
             .map(AbsolutePathBuf::to_path_buf)
             .collect::<Vec<_>>();
+        let additional_read_roots = additional_read_roots
+            .iter()
+            .map(AbsolutePathBuf::to_path_buf)
+            .collect::<Vec<_>>();
         normalize_null_device_env(&mut env_map);
         ensure_non_interactive_pager(&mut env_map);
         inherit_path_env(&mut env_map);
@@ -143,12 +150,13 @@ mod windows_impl {
 
         let logs_base_dir: Option<&Path> = Some(sandbox_base.as_path());
         log_start(&command, logs_base_dir);
-        let sandbox_creds = require_logon_sandbox_creds(
+        let sandbox_creds = require_logon_sandbox_creds_with_additional_read_roots(
             &permissions,
             cwd,
             &env_map,
             codex_home,
             read_roots_override,
+            &additional_read_roots,
             read_roots_include_platform_defaults,
             write_roots_override,
             &deny_read_paths_override,
@@ -158,8 +166,8 @@ mod windows_impl {
         )?;
         // Build capability SID for ACL grants.
         let caps = load_or_create_cap_sids(codex_home)?;
-        let (sid_for_null, cap_sids) = if permissions.uses_write_capabilities_for_cwd(cwd, &env_map)
-        {
+        let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(cwd, &env_map);
+        let write_root_sids = if uses_write_capabilities {
             let write_roots = effective_write_roots_for_permissions(
                 &permissions,
                 cwd,
@@ -167,18 +175,19 @@ mod windows_impl {
                 codex_home,
                 write_roots_override,
             );
-            let cap_sids = write_roots
+            write_roots
                 .iter()
                 .map(|root| workspace_write_cap_sid_for_root(codex_home, cwd, root))
-                .collect::<Result<Vec<_>>>()?;
-            if cap_sids.is_empty() {
-                anyhow::bail!("workspace-write sandbox has no writable root capability SIDs");
-            }
-            (LocalSid::from_string(&cap_sids[0])?, cap_sids)
+                .collect::<Result<Vec<_>>>()?
         } else {
-            let sid = LocalSid::from_string(&caps.readonly)?;
-            (sid, vec![caps.readonly])
+            Vec::new()
         };
+        let cap_sids = sandbox_capability_sid_strings(
+            uses_write_capabilities,
+            write_root_sids,
+            &caps.readonly,
+        );
+        let sid_for_null = LocalSid::from_string(&cap_sids[0])?;
 
         unsafe {
             allow_null_device(sid_for_null.as_ptr());
@@ -218,6 +227,7 @@ mod windows_impl {
                         &env_map,
                         codex_home,
                         read_roots_override,
+                        &additional_read_roots,
                         read_roots_include_platform_defaults,
                         write_roots_override,
                         &deny_read_paths_override,

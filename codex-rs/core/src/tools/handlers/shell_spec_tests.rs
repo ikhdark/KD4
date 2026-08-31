@@ -47,63 +47,6 @@ fn has_parameter(tool: &ToolSpec, parameter_name: &str) -> bool {
     let tool = serde_json::to_value(tool).expect("tool spec should serialize");
     tool.pointer(&format!("/parameters/properties/{parameter_name}"))
         .is_some()
-        || tool
-            .pointer("/parameters/oneOf")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|branches| {
-                branches.iter().any(|branch| {
-                    branch
-                        .pointer(&format!("/properties/{parameter_name}"))
-                        .is_some()
-                })
-            })
-}
-
-fn resolved_command_parameter_schema<'a>(
-    tool: &'a serde_json::Value,
-    branch: &'a serde_json::Value,
-    parameter_name: &str,
-) -> &'a serde_json::Value {
-    let schema = &branch["properties"][parameter_name];
-    let Some(schema_ref) = schema["$ref"].as_str() else {
-        return schema;
-    };
-    let pointer = schema_ref
-        .strip_prefix('#')
-        .expect("local command parameter schema reference");
-    tool["parameters"]
-        .pointer(pointer)
-        .expect("referenced command parameter schema")
-}
-
-fn inline_common_command_parameter_schemas(parameters: &serde_json::Value) -> serde_json::Value {
-    let mut inline = parameters.clone();
-    for branch in inline["oneOf"]
-        .as_array_mut()
-        .expect("command form branches")
-    {
-        for schema in branch["properties"]
-            .as_object_mut()
-            .expect("command form properties")
-            .values_mut()
-        {
-            let Some(schema_ref) = schema["$ref"].as_str() else {
-                continue;
-            };
-            let pointer = schema_ref
-                .strip_prefix('#')
-                .expect("local command parameter schema reference");
-            *schema = parameters
-                .pointer(pointer)
-                .expect("referenced command parameter schema")
-                .clone();
-        }
-    }
-    inline
-        .as_object_mut()
-        .expect("command parameters object")
-        .remove("$defs");
-    inline
 }
 
 #[test]
@@ -119,23 +62,18 @@ fn command_validation_context_is_lean_and_strict() {
         }),
     ] {
         let tool = serde_json::to_value(tool).expect("serialize command tool");
-        let branches = tool["parameters"]["oneOf"]
-            .as_array()
-            .expect("command variants");
-        for branch in branches {
-            let validation = resolved_command_parameter_schema(&tool, branch, "validation");
-            assert_eq!(
-                validation["properties"]
-                    .as_object()
-                    .expect("validation properties")
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>(),
-                vec!["covered_paths"]
-            );
-            assert_eq!(validation["required"], serde_json::json!(["covered_paths"]));
-            assert_eq!(validation["additionalProperties"], serde_json::json!(false));
-        }
+        let validation = &tool["parameters"]["properties"]["validation"];
+        assert_eq!(
+            validation["properties"]
+                .as_object()
+                .expect("validation properties")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["covered_paths"]
+        );
+        assert_eq!(validation["required"], serde_json::json!(["covered_paths"]));
+        assert_eq!(validation["additionalProperties"], serde_json::json!(false));
     }
 }
 
@@ -160,15 +98,10 @@ fn token_efficiency_command_tools_explain_validation_proof_metadata() {
         assert!(description.contains("`validation.covered_paths`"));
         assert!(description.contains("may run, but is not recorded as proof"));
 
-        for branch in tool["parameters"]["oneOf"]
-            .as_array()
-            .expect("command variants")
-        {
-            assert_eq!(
-                resolved_command_parameter_schema(&tool, branch, "validation")["description"],
-                KD4_VALIDATION_COMMAND_GUIDANCE
-            );
-        }
+        assert_eq!(
+            tool["parameters"]["properties"]["validation"]["description"],
+            KD4_VALIDATION_COMMAND_GUIDANCE
+        );
     }
 }
 
@@ -195,14 +128,9 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "kind".to_string(),
             JsonSchema::string_enum(
-                vec![
-                    json!("legacy"),
-                    json!("script"),
-                    json!("argv"),
-                    json!("powershell_script"),
-                ],
+                vec![json!("script"), json!("argv"), json!("powershell_script")],
                 Some(
-                    "Command encoding. `legacy` preserves the historical untagged `cmd` string; `script` explicitly uses `cmd`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`."
+                    "Canonical command encoding. `script` explicitly uses `cmd`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`. Legacy input remains supported by omitting `kind`; the runtime infers the branch from the single populated command field and normalizes it immediately."
                         .to_string(),
                 ),
             ),
@@ -287,7 +215,7 @@ fn exec_command_tool_matches_expected_spec() {
             description,
             strict: false,
             defer_loading: None,
-            parameters: command_parameters_schema(properties, "cmd"),
+            parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
             output_schema: Some(unified_exec_output_schema()),
         })
     );
@@ -475,14 +403,9 @@ Examples of valid command strings:
         (
             "kind".to_string(),
             JsonSchema::string_enum(
-                vec![
-                    json!("legacy"),
-                    json!("script"),
-                    json!("argv"),
-                    json!("powershell_script"),
-                ],
+                vec![json!("script"), json!("argv"), json!("powershell_script")],
                 Some(
-                    "Command encoding. `legacy` preserves the historical untagged `command` string; `script` explicitly uses `command`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`."
+                    "Canonical command encoding. `script` explicitly uses `command`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`. Legacy input remains supported by omitting `kind`; the runtime infers the branch from the single populated command field and normalizes it immediately."
                         .to_string(),
                 ),
             ),
@@ -557,101 +480,14 @@ Examples of valid command strings:
             description,
             strict: false,
             defer_loading: None,
-            parameters: command_parameters_schema(properties, "command"),
+            parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
             output_schema: None,
         })
     );
 }
 
 #[test]
-fn command_tools_advertise_only_mutually_exclusive_explicit_forms() {
-    for tool in [
-        create_exec_command_tool(CommandToolOptions {
-            allow_login_shell: true,
-            exec_permission_approvals_enabled: false,
-        }),
-        create_shell_command_tool(CommandToolOptions {
-            allow_login_shell: true,
-            exec_permission_approvals_enabled: false,
-        }),
-    ] {
-        let tool = serde_json::to_value(tool).expect("serialize command tool");
-        let branches = tool
-            .pointer("/parameters/oneOf")
-            .and_then(serde_json::Value::as_array)
-            .expect("command form branches");
-        assert_eq!(branches.len(), 3);
-        let kinds = branches
-            .iter()
-            .map(|branch| branch["properties"]["kind"]["enum"][0].clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kinds,
-            vec![json!("script"), json!("argv"), json!("powershell_script")]
-        );
-        assert!(
-            branches
-                .iter()
-                .all(|branch| branch["additionalProperties"] == false)
-        );
-        assert!(branches.iter().all(|branch| {
-            branch["required"]
-                .as_array()
-                .is_some_and(|required| required.contains(&json!("kind")))
-        }));
-        assert!(
-            branches
-                .iter()
-                .all(|branch| branch["properties"]["kind"]["enum"] != json!(["legacy"]))
-        );
-        assert!(branches.iter().all(|branch| {
-            branch["properties"]["kind"]["description"]
-                .as_str()
-                .is_some_and(|description| {
-                    description.contains("Explicit command encoding")
-                        && !description.contains("legacy")
-                })
-        }));
-    }
-}
-
-#[test]
-fn command_tools_define_common_parameters_once_and_reference_them_from_each_form() {
-    for tool in [
-        create_exec_command_tool(CommandToolOptions {
-            allow_login_shell: true,
-            exec_permission_approvals_enabled: false,
-        }),
-        create_shell_command_tool(CommandToolOptions {
-            allow_login_shell: true,
-            exec_permission_approvals_enabled: false,
-        }),
-    ] {
-        let tool = serde_json::to_value(tool).expect("serialize command tool");
-        let parameters = &tool["parameters"];
-        let definitions = parameters["$defs"]
-            .as_object()
-            .expect("common parameter definitions");
-        let branches = parameters["oneOf"].as_array().expect("command forms");
-        assert!(!definitions.is_empty());
-
-        for branch in branches {
-            let properties = branch["properties"]
-                .as_object()
-                .expect("command form properties");
-            for name in definitions.keys() {
-                assert_eq!(
-                    properties[name],
-                    json!({"$ref": format!("#/$defs/{name}")}),
-                    "common parameter `{name}` should reference its single definition"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn command_tool_schema_deduplication_preserves_validation_and_reduces_bytes() {
+fn command_tools_accept_legacy_untagged_and_canonical_kind_forms() {
     for (tool, script_field) in [
         (
             create_exec_command_tool(CommandToolOptions {
@@ -670,77 +506,83 @@ fn command_tool_schema_deduplication_preserves_validation_and_reduces_bytes() {
     ] {
         let tool = serde_json::to_value(tool).expect("serialize command tool");
         let parameters = &tool["parameters"];
-        let inline = inline_common_command_parameter_schemas(parameters);
-        assert!(
-            serde_json::to_vec(parameters)
-                .expect("serialize referenced command schema")
-                .len()
-                < serde_json::to_vec(&inline)
-                    .expect("serialize inline command schema")
-                    .len()
+        // The advertised schema must match the runtime decoder's surface: one
+        // flat object whose `kind` is optional and canonical. Field
+        // combination rules belong to `CommandInvocation::from_parts`, which
+        // reports violations with prescriptive field-level messages.
+        assert!(parameters.get("oneOf").is_none());
+        assert!(parameters.get("$defs").is_none());
+        assert_eq!(parameters["required"], serde_json::Value::Null);
+        assert_eq!(
+            parameters["properties"]["kind"]["enum"],
+            json!(["script", "argv", "powershell_script"])
         );
 
-        let referenced_validator = jsonschema::validator_for(parameters)
-            .expect("referenced command schema should compile");
-        let inline_validator =
-            jsonschema::validator_for(&inline).expect("inline command schema should compile");
-
-        let mut script = json!({
+        let validator =
+            jsonschema::validator_for(parameters).expect("command schema should compile");
+        let mut legacy_untagged = json!({});
+        legacy_untagged[script_field] = json!("git status --short");
+        let mut explicit_script = json!({
             "kind": "script",
             "workdir": "repo",
             "validation": {"covered_paths": ["src"]}
         });
-        script[script_field] = json!("git status --short");
-        let mut mixed_form = script.clone();
-        mixed_form["program"] = json!("git");
-        let cases = [
-            (script, true),
-            (
-                json!({
-                    "kind": "argv",
-                    "program": "git",
-                    "args": ["status", "--short"],
-                    "force_fresh": true
-                }),
-                true,
-            ),
-            (
-                json!({"kind": "powershell_script", "script_body": "Get-ChildItem"}),
-                true,
-            ),
-            (json!({"program": "git", "args": ["status"]}), false),
-            (mixed_form, false),
-            (
-                json!({"kind": "argv", "program": "git", "unknown": true}),
-                false,
-            ),
-            (
-                json!({"kind": "argv", "program": "git", "workdir": 42}),
-                false,
-            ),
-            (
-                json!({
-                    "kind": "argv",
-                    "program": "git",
-                    "validation": {"covered_paths": "src"}
-                }),
-                false,
-            ),
+        explicit_script[script_field] = json!("git status --short");
+        let accepted = [
+            legacy_untagged,
+            explicit_script,
+            json!({
+                "kind": "argv",
+                "program": "git",
+                "args": ["status", "--short"],
+                "force_fresh": true
+            }),
+            json!({"program": "git", "args": ["status"]}),
+            json!({"kind": "powershell_script", "script_body": "Get-ChildItem"}),
         ];
-
-        for (arguments, expected) in cases {
-            assert_eq!(
-                referenced_validator.is_valid(&arguments),
-                inline_validator.is_valid(&arguments),
-                "referenced and inline schemas disagree for {arguments}"
+        for arguments in accepted {
+            assert!(
+                validator.is_valid(&arguments),
+                "command schema should accept decoder-supported shape {arguments}"
             );
-            assert_eq!(
-                referenced_validator.is_valid(&arguments),
-                expected,
-                "unexpected command-schema result for {arguments}"
+        }
+
+        let rejected = [
+            json!({"kind": "argv", "program": "git", "unknown": true}),
+            json!({"kind": "argv", "program": "git", "workdir": 42}),
+            json!({
+                "kind": "argv",
+                "program": "git",
+                "validation": {"covered_paths": "src"}
+            }),
+        ];
+        for arguments in rejected {
+            assert!(
+                !validator.is_valid(&arguments),
+                "command schema should reject malformed arguments {arguments}"
             );
         }
     }
+}
+
+#[test]
+fn command_schema_reports_specific_bounds_violations() {
+    let tool = serde_json::to_value(create_exec_command_tool(CommandToolOptions {
+        allow_login_shell: true,
+        exec_permission_approvals_enabled: false,
+    }))
+    .expect("serialize exec tool");
+    let validator =
+        jsonschema::validator_for(&tool["parameters"]).expect("command schema should compile");
+
+    let arguments = json!({"cmd": "Get-Content README.md", "yield_time_ms": 50});
+    let errors = validator
+        .iter_errors(&arguments)
+        .map(|error| format!("{}: {error}", error.instance_path().as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("/yield_time_ms"), "{errors:?}");
+    assert!(errors[0].contains("250"), "{errors:?}");
 }
 
 #[test]
@@ -750,8 +592,7 @@ fn integer_arguments_expose_destination_types_and_runtime_bounds() {
         exec_permission_approvals_enabled: false,
     }))
     .expect("serialize exec tool");
-    let exec_yield =
-        resolved_command_parameter_schema(&exec, &exec["parameters"]["oneOf"][0], "yield_time_ms");
+    let exec_yield = &exec["parameters"]["properties"]["yield_time_ms"];
     assert_eq!(exec_yield["type"], "integer");
     assert_eq!(
         exec_yield["minimum"],
@@ -772,7 +613,7 @@ fn integer_arguments_expose_destination_types_and_runtime_bounds() {
         u32::MAX
     );
     assert_eq!(
-        write["parameters"]["properties"]["yield-time_ms"]["maximum"],
+        write["parameters"]["properties"]["yield_time_ms"]["maximum"],
         crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS
     );
 }

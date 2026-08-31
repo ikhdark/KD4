@@ -1,0 +1,250 @@
+# Named Rust test targets and gates for the fork-local test runner.
+#
+# `scripts/rust_test_runner.py` is the only supported consumer. The runner
+# parses this file strictly: unknown tables and unknown keys are errors, and
+# every package, test target, and helper binary named here is validated against
+# `cargo metadata --no-deps` before anything is built or run.
+#
+# Target selection is immutable once a name is chosen: callers pick a target or
+# gate by name and may only narrow it with filtering options. Package and test
+# target overrides are rejected by the runner.
+
+version = 1
+
+# ---------------------------------------------------------------------------
+# Helper binaries
+#
+# Integration and library tests resolve these through
+# `codex_utils_cargo_bin::cargo_bin`, which reads `CARGO_BIN_EXE_*`. The runner
+# builds exactly the helpers declared by the selected target into the active
+# lane's target directory and exports both the dashed and underscored aliases.
+# ---------------------------------------------------------------------------
+
+[helpers.codex]
+package = "codex-cli"
+bin = "codex"
+
+[helpers.codex-code-mode-host]
+package = "codex-code-mode-host"
+bin = "codex-code-mode-host"
+
+[helpers.test_stdio_server]
+package = "codex-rmcp-client"
+bin = "test_stdio_server"
+
+[helpers.test_streamable_http_server]
+package = "codex-rmcp-client"
+bin = "test_streamable_http_server"
+
+[helpers.codex-windows-sandbox-setup]
+package = "codex-windows-sandbox"
+bin = "codex-windows-sandbox-setup"
+platform = "windows"
+
+[helpers.codex-command-runner]
+package = "codex-windows-sandbox"
+bin = "codex-command-runner"
+platform = "windows"
+
+# ---------------------------------------------------------------------------
+# Named targets
+# ---------------------------------------------------------------------------
+
+[targets.core_lib]
+package = "codex-core"
+lib = true
+helpers = [
+  "codex",
+  "codex-code-mode-host",
+  "test_stdio_server",
+  "codex-windows-sandbox-setup",
+  "codex-command-runner",
+]
+
+[targets.available_skills_instructions]
+package = "codex-core"
+test = "available_skills_instructions"
+helpers = ["codex", "codex-code-mode-host"]
+
+[targets.responses_headers]
+package = "codex-core"
+test = "responses_headers"
+helpers = ["codex", "codex-code-mode-host"]
+
+[targets.round_trip_batching]
+package = "codex-core"
+test = "round_trip_batching"
+helpers = ["codex", "codex-code-mode-host"]
+
+[targets.turn_latency_bench]
+package = "codex-core"
+test = "turn_latency_bench"
+helpers = ["codex", "codex-code-mode-host"]
+
+# Bounded core integration targets. Every shard carries the conservative
+# runtime helper pair; MCP, stdio, and Windows sandbox helpers are added only
+# where the assigned modules need them.
+
+[targets.core_cli_workspace]
+package = "codex-core"
+test = "core_cli_workspace"
+helpers = ["codex", "codex-code-mode-host"]
+
+[targets.core_code_mode_mcp]
+package = "codex-core"
+test = "core_code_mode_mcp"
+helpers = [
+  "codex",
+  "codex-code-mode-host",
+  "test_stdio_server",
+  "test_streamable_http_server",
+]
+
+[targets.core_exec_permissions]
+package = "codex-core"
+test = "core_exec_permissions"
+helpers = [
+  "codex",
+  "codex-code-mode-host",
+  "codex-windows-sandbox-setup",
+  "codex-command-runner",
+]
+
+[targets.core_thread_state]
+package = "codex-core"
+test = "core_thread_state"
+helpers = ["codex", "codex-code-mode-host", "test_stdio_server"]
+
+[targets.core_transport_telemetry]
+package = "codex-core"
+test = "core_transport_telemetry"
+helpers = ["codex", "codex-code-mode-host"]
+
+[targets.core_agents_review]
+package = "codex-core"
+test = "core_agents_review"
+helpers = ["codex", "codex-code-mode-host"]
+
+[targets.core_model_prompt_runtime]
+package = "codex-core"
+test = "core_model_prompt_runtime"
+helpers = ["codex", "codex-code-mode-host"]
+
+[targets.core_windows]
+package = "codex-core"
+test = "core_windows"
+helpers = [
+  "codex",
+  "codex-code-mode-host",
+  "codex-windows-sandbox-setup",
+  "codex-command-runner",
+]
+
+# `codex-config` owns the raw adaptive-reasoning tables; the adaptive reasoning
+# gate pairs it with the resolved `codex-core` defaults in one ordered run.
+[targets.config_lib]
+package = "codex-config"
+lib = true
+helpers = []
+
+# ---------------------------------------------------------------------------
+# Named gates
+#
+# Each gate is an ordered list of steps. A step names a target, an optional
+# nextest filterset, and the exact set of test IDs the step must select. The
+# runner fails when the listed IDs and the declared IDs are not equal, so a
+# renamed or deleted test can never silently drop out of a gate.
+# ---------------------------------------------------------------------------
+
+[gates.adaptive-reasoning-contract]
+description = "Raw config tables, resolved defaults, and reachable sampling policy."
+
+[[gates.adaptive-reasoning-contract.steps]]
+target = "config_lib"
+filter = "test(reasoning_phase_efforts_distinguish_absent_empty_partial_and_full_tables) | test(empty_higher_reasoning_phase_table_preserves_lower_entries) | test(partial_higher_reasoning_phase_table_merges_per_field)"
+tests = [
+  "config_toml::tests::reasoning_phase_efforts_distinguish_absent_empty_partial_and_full_tables",
+  "merge::tests::empty_higher_reasoning_phase_table_preserves_lower_entries",
+  "merge::tests::partial_higher_reasoning_phase_table_merges_per_field",
+]
+
+[[gates.adaptive-reasoning-contract.steps]]
+target = "core_lib"
+filter = "test(load_config_defaults_phase_tracking_to_compatibility_efforts) | test(load_config_preserves_explicit_reasoning_phase_effort_overrides) | test(load_config_preserves_all_explicit_reasoning_phase_effort_overrides) | test(reachable_changed_continuation_uses_the_lowest_supported_explicit_override) | test(reachable_changed_continuation_defaults_to_low_even_when_turn_is_high) | test(request_policy_rejects_host_terminal_completion) | test(protocol_terminal_continuation_is_marked_for_host_elision_only_when_unchanged) | test(global_effort_survives_unoverridden_decision_bearing_phases)"
+tests = [
+  "config::tests::load_config_defaults_phase_tracking_to_compatibility_efforts",
+  "config::tests::load_config_preserves_all_explicit_reasoning_phase_effort_overrides",
+  "config::tests::load_config_preserves_explicit_reasoning_phase_effort_overrides",
+  "session::reasoning_governor::tests::global_effort_survives_unoverridden_decision_bearing_phases",
+  "session::reasoning_governor::tests::protocol_terminal_continuation_is_marked_for_host_elision_only_when_unchanged",
+  "session::reasoning_governor::tests::reachable_changed_continuation_defaults_to_low_even_when_turn_is_high",
+  "session::reasoning_governor::tests::reachable_changed_continuation_uses_the_lowest_supported_explicit_override",
+  "session::reasoning_governor::tests::request_policy_rejects_host_terminal_completion",
+]
+
+[gates.config-schema-protocol]
+description = "Config schema fixture parity without regenerating generated output."
+
+[[gates.config-schema-protocol.steps]]
+target = "core_lib"
+filter = "test(config_schema_matches_fixture) | test(config_schema_hides_unsupported_inline_mcp_bearer_token)"
+tests = [
+  "config::schema::tests::config_schema_hides_unsupported_inline_mcp_bearer_token",
+  "config::schema::tests::config_schema_matches_fixture",
+]
+
+[gates.windows-sandbox-core-exec]
+description = "codex-core leg of the Windows sandbox process-tree gate."
+
+[[gates.windows-sandbox-core-exec.steps]]
+target = "core_lib"
+filter = "test(direct_exec_cancellation_terminates_windows_descendants)"
+tests = ["exec::tests::direct_exec_cancellation_terminates_windows_descendants"]
+
+[gates.core-helper-resolution]
+description = "Required test helper binaries must resolve, and lookup failures must propagate."
+
+[[gates.core-helper-resolution.steps]]
+target = "core_lib"
+filter = "test(missing_stdio_helper_binary_resolution_reports_an_error)"
+tests = [
+  "tools::handlers::request_plugin_install::tests::missing_stdio_helper_binary_resolution_reports_an_error",
+]
+
+[[gates.core-helper-resolution.steps]]
+target = "core_cli_workspace"
+filter = "test(live_runner_resolves_the_required_codex_binary) | test(missing_helper_binary_resolution_reports_an_error)"
+tests = [
+  "suite::live_cli::live_runner_resolves_the_required_codex_binary",
+  "suite::live_cli::missing_helper_binary_resolution_reports_an_error",
+]
+
+[[gates.core-helper-resolution.steps]]
+target = "core_code_mode_mcp"
+filter = "test(missing_streamable_http_helper_resolution_reports_an_error)"
+tests = [
+  "suite::rmcp_client::missing_streamable_http_helper_resolution_reports_an_error",
+]
+
+[gates.core-stdio-helper-regressions]
+description = "Library regressions that used to exit silently when test_stdio_server was missing."
+
+[[gates.core-stdio-helper-regressions.steps]]
+target = "core_lib"
+filter = "test(pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot) | test(requested_mcp_servers_are_refreshed_before_install_completion)"
+tests = [
+  "session::turn::tests::pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot",
+  "tools::handlers::request_plugin_install::tests::requested_mcp_servers_are_refreshed_before_install_completion",
+]
+
+[gates.rmcp-streamable-http]
+description = "Streamable HTTP MCP round trips that require test_streamable_http_server."
+
+[[gates.rmcp-streamable-http.steps]]
+target = "core_code_mode_mcp"
+filter = "test(streamable_http_tool_call_round_trip) | test(streamable_http_configured_auth_precedes_chatgpt_auth) | test(streamable_http_with_oauth_round_trip)"
+tests = [
+  "suite::rmcp_client::streamable_http_configured_auth_precedes_chatgpt_auth",
+  "suite::rmcp_client::streamable_http_tool_call_round_trip",
+  "suite::rmcp_client::streamable_http_with_oauth_round_trip",
+]

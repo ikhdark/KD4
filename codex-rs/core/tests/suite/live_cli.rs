@@ -1,10 +1,11 @@
 //! Optional smoke tests that hit the real OpenAI /v1/responses endpoint. They are `#[ignore]` by
 //! default so CI stays deterministic and free. Developers can run them locally with
-//! `just test -p codex-core --test all --run-ignored only live_cli` provided they set a valid
+//! `just core-test core_cli_workspace --run-ignored only live_cli` provided they set a valid
 //! `OPENAI_API_KEY`.
 
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
+use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 use std::time::Duration;
@@ -18,6 +19,16 @@ fn require_api_key_from(value: Result<String, std::env::VarError>) -> Result<Str
 fn require_api_key() -> String {
     require_api_key_from(std::env::var("OPENAI_API_KEY"))
         .expect("OPENAI_API_KEY env var not set — live test cannot run")
+}
+
+fn resolve_codex_binary() -> Result<PathBuf, codex_utils_cargo_bin::CargoBinError> {
+    resolve_codex_binary_with(codex_utils_cargo_bin::cargo_bin)
+}
+
+fn resolve_codex_binary_with(
+    resolver: impl FnOnce(&str) -> Result<PathBuf, codex_utils_cargo_bin::CargoBinError>,
+) -> Result<PathBuf, codex_utils_cargo_bin::CargoBinError> {
+    resolver("codex")
 }
 
 fn wait_for_child(
@@ -55,7 +66,7 @@ fn run_live(prompt: &str) -> (assert_cmd::assert::Assert, TempDir) {
     // implementation). Instead we configure the std `Command` ourselves, then later hand the
     // resulting `Output` to `assert_cmd` for the familiar assertions.
 
-    let mut cmd = Command::new(codex_utils_cargo_bin::cargo_bin("codex-rs").unwrap());
+    let mut cmd = Command::new(resolve_codex_binary().unwrap());
     cmd.current_dir(dir.path());
     cmd.env("OPENAI_API_KEY", require_api_key());
     cmd.env("HOME", home.path());
@@ -82,7 +93,7 @@ fn run_live(prompt: &str) -> (assert_cmd::assert::Assert, TempDir) {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().expect("failed to spawn codex-rs");
+    let mut child = cmd.spawn().expect("failed to spawn codex");
 
     // Send the terminating newline so Session::run exits after the first turn.
     child
@@ -180,6 +191,36 @@ fn missing_api_key_is_an_error() {
     assert_eq!(
         require_api_key_from(Err(std::env::VarError::NotPresent)),
         Err("OPENAI_API_KEY env var not set".to_string())
+    );
+}
+
+#[test]
+fn live_runner_resolves_the_required_codex_binary() {
+    let path = resolve_codex_binary().expect("resolve the codex binary used by run_live");
+    assert!(
+        path.is_file(),
+        "resolved codex binary is missing: {}",
+        path.display()
+    );
+}
+
+/// What this tests: a failed helper lookup propagates to the caller instead of
+/// resolving to some other path, so `run_live` cannot silently spawn a binary
+/// the target never declared.
+#[test]
+fn missing_helper_binary_resolution_reports_an_error() {
+    let error = resolve_codex_binary_with(|name| {
+        Err(codex_utils_cargo_bin::CargoBinError::NotFound {
+            name: name.to_string(),
+            env_keys: vec![format!("CARGO_BIN_EXE_{name}")],
+            fallback: "disabled in propagation test".to_string(),
+        })
+    })
+    .expect_err("a missing required helper must fail the test");
+
+    assert!(
+        error.to_string().contains("codex"),
+        "error should name the missing helper: {error}"
     );
 }
 

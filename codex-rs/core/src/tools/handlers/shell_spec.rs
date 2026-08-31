@@ -39,81 +39,31 @@ fn bounded_integer(description: String, minimum: u64, maximum: u64) -> JsonSchem
 }
 
 fn command_parameters_schema(
-    properties: BTreeMap<String, JsonSchema>,
+    mut properties: BTreeMap<String, JsonSchema>,
     script_field: &str,
 ) -> JsonSchema {
-    let common = properties
-        .iter()
-        .filter(|(name, _)| {
-            !matches!(
-                name.as_str(),
-                "cmd" | "command" | "kind" | "program" | "args" | "script_body"
-            )
-        })
-        .map(|(name, schema)| (name.clone(), schema.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let common_refs = common
-        .keys()
-        .map(|name| {
-            let escaped_name = name.replace('~', "~0").replace('/', "~1");
-            (
-                name.clone(),
-                JsonSchema {
-                    schema_ref: Some(format!("#/$defs/{escaped_name}")),
-                    ..Default::default()
-                },
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let command_property = properties[script_field].clone();
-    let program_property = properties["program"].clone();
-    let args_property = properties["args"].clone();
-    let powershell_property = properties["script_body"].clone();
-    let kind_description = Some(format!(
-        "Explicit command encoding. `script` uses `{script_field}`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`."
-    ));
-
-    let variant =
-        |kind: &str, variant_properties: Vec<(String, JsonSchema)>, required: Vec<String>| {
-            let mut branch = common_refs.clone();
-            branch.insert(
-                "kind".to_string(),
-                JsonSchema::string_enum(vec![json!(kind)], kind_description.clone()),
-            );
-            branch.extend(variant_properties);
-            let mut required_fields = vec!["kind".to_string()];
-            required_fields.extend(required);
-            JsonSchema::object(branch, Some(required_fields), Some(false.into()))
-        };
-
-    let mut schema = JsonSchema::one_of(
-        vec![
-            variant(
-                "script",
-                vec![(script_field.to_string(), command_property)],
-                vec![script_field.to_string()],
-            ),
-            variant(
-                "argv",
-                vec![
-                    ("program".to_string(), program_property),
-                    ("args".to_string(), args_property),
-                ],
-                vec!["program".to_string()],
-            ),
-            variant(
-                "powershell_script",
-                vec![("script_body".to_string(), powershell_property)],
-                vec!["script_body".to_string()],
-            ),
-        ],
-        Some(
-            "Exactly one explicit command encoding: script, argv, or PowerShell script."
-                .to_string(),
+    // The runtime decoder (`CommandInvocation::from_parts`) accepts the
+    // historical untagged script string and infers `argv` or
+    // `powershell_script` from their fields, so the advertised and
+    // preflight-enforced schema must accept exactly that surface. Field
+    // combination rules stay in the decoder, which reports violations with
+    // prescriptive field-level messages; a stricter schema here rejects
+    // shapes the runtime supports and buries the reason in an opaque
+    // validation error.
+    properties.insert(
+        "kind".to_string(),
+        JsonSchema::string_enum(
+            vec![
+                json!("script"),
+                json!("argv"),
+                json!("powershell_script"),
+            ],
+            Some(format!(
+                "Canonical command encoding. `script` explicitly uses `{script_field}`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`. Legacy input remains supported by omitting `kind`; the runtime infers the branch from the single populated command field and normalizes it immediately."
+            )),
         ),
     );
-    schema.defs = Some(common);
-    schema
+    JsonSchema::object(properties, /*required*/ None, Some(false.into()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

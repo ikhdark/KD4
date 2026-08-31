@@ -594,8 +594,10 @@ pub struct WebSocketConnectionConfig {
 pub struct WebSocketTestServer {
     uri: String,
     connections: Arc<Mutex<Vec<Vec<WebSocketRequest>>>>,
+    response_batches_sent: Arc<Mutex<Vec<usize>>>,
     handshakes: Arc<Mutex<Vec<WebSocketHandshake>>>,
     request_log_updated: Arc<Notify>,
+    response_batch_sent: Arc<Notify>,
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -634,6 +636,23 @@ impl WebSocketTestServer {
                 return request;
             }
             self.request_log_updated.notified().await;
+        }
+    }
+
+    /// Waits until the scripted response batch for a request has been written to the socket.
+    pub async fn wait_for_response_batch(&self, connection_index: usize, request_index: usize) {
+        loop {
+            let notified = self.response_batch_sent.notified();
+            if self
+                .response_batches_sent
+                .lock()
+                .unwrap()
+                .get(connection_index)
+                .is_some_and(|sent| *sent > request_index)
+            {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -1372,11 +1391,15 @@ pub async fn start_websocket_server_with_headers(
     let addr = listener.local_addr().expect("websocket server address");
     let uri = format!("ws://{addr}");
     let connections_log = Arc::new(Mutex::new(Vec::new()));
+    let response_batches_sent_log = Arc::new(Mutex::new(Vec::new()));
     let handshakes_log = Arc::new(Mutex::new(Vec::new()));
     let request_log_updated = Arc::new(Notify::new());
+    let response_batch_sent = Arc::new(Notify::new());
     let requests = Arc::clone(&connections_log);
+    let response_batches_sent = Arc::clone(&response_batches_sent_log);
     let handshakes = Arc::clone(&handshakes_log);
     let request_log = Arc::clone(&request_log_updated);
+    let response_batch_log = Arc::clone(&response_batch_sent);
     let connections = Arc::new(Mutex::new(VecDeque::from(connections)));
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
@@ -1453,6 +1476,7 @@ pub async fn start_websocket_server_with_headers(
                 log.push(Vec::new());
                 log.len() - 1
             };
+            response_batches_sent.lock().unwrap().push(0);
             let close_after_requests = connection.close_after_requests;
             for request_events in connection.requests {
                 let Some(Ok(message)) = ws_stream.next().await else {
@@ -1507,13 +1531,26 @@ pub async fn start_websocket_server_with_headers(
                         .iter()
                         .find_map(|event| event.get("delta").and_then(Value::as_str)),
                 );
+                let mut sent_entire_batch = true;
                 for event in &request_events {
                     let Ok(payload) = serde_json::to_string(event) else {
-                        continue;
+                        sent_entire_batch = false;
+                        break;
                     };
                     if ws_stream.send(Message::Text(payload.into())).await.is_err() {
+                        sent_entire_batch = false;
                         break;
                     }
+                }
+                if sent_entire_batch {
+                    if let Some(sent) = response_batches_sent
+                        .lock()
+                        .unwrap()
+                        .get_mut(connection_index)
+                    {
+                        *sent += 1;
+                    }
+                    response_batch_log.notify_waiters();
                 }
             }
 
@@ -1533,8 +1570,10 @@ pub async fn start_websocket_server_with_headers(
     WebSocketTestServer {
         uri,
         connections: connections_log,
+        response_batches_sent: response_batches_sent_log,
         handshakes: handshakes_log,
         request_log_updated,
+        response_batch_sent,
         shutdown: shutdown_tx,
         task,
     }

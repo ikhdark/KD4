@@ -1,6 +1,7 @@
 use codex_git_utils::collect_git_info;
 use codex_login::CODEX_ACCESS_TOKEN_ENV_VAR;
 use codex_login::CODEX_API_KEY_ENV_VAR;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::GitInfo;
 use core_test_support::fs_wait;
 use core_test_support::responses;
@@ -42,7 +43,15 @@ fn cli_sse_response() -> String {
     ])
 }
 
+fn sse_provider_override(server: &MockServer, base_path: &str) -> String {
+    format!(
+        "model_providers.mock={{ name = \"mock\", base_url = \"{}{base_path}\", env_key = \"PATH\", wire_api = \"responses\", supports_websockets = false }}",
+        server.uri()
+    )
+}
+
 async fn mount_personal_access_token_startup(server: &MockServer) {
+    let _models = responses::mount_models_once(server, ModelsResponse { models: Vec::new() }).await;
     Mock::given(method("GET"))
         .and(path(WHOAMI_PATH))
         .and(header("authorization", PERSONAL_ACCESS_TOKEN_AUTHORIZATION))
@@ -72,7 +81,12 @@ fn personal_access_token_exec_command(server: &MockServer, home: &TempDir) -> Co
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-c")
-        .arg(format!("openai_base_url=\"{}/api/codex\"", server.uri()))
+        .arg(format!(
+            "model_providers.pat={{ name = \"pat\", base_url = \"{}/api/codex\", wire_api = \"responses\", requires_openai_auth = true, supports_websockets = false }}",
+            server.uri()
+        ))
+        .arg("-c")
+        .arg("model_provider=\"pat\"")
         .arg("-c")
         .arg(format!("chatgpt_base_url=\"{}/backend-api\"", server.uri()))
         .arg("-C")
@@ -200,6 +214,8 @@ async fn responses_mode_stream_cli() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
+    let _models_mock =
+        responses::mount_models_once(&server, ModelsResponse { models: Vec::new() }).await;
     let repo_root = repo_root();
     let sse = responses::sse(vec![
         responses::ev_response_created("resp-1"),
@@ -209,10 +225,7 @@ async fn responses_mode_stream_cli() {
     let resp_mock = responses::mount_sse_once(&server, sse).await;
 
     let home = TempDir::new().unwrap();
-    let provider_override = format!(
-        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\" }}",
-        server.uri()
-    );
+    let provider_override = sse_provider_override(&server, "/v1");
     let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
     let mut cmd = Command::new(bin);
     cmd.arg("exec")
@@ -247,6 +260,11 @@ async fn responses_mode_stream_cli_supports_openai_base_url_config_override() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(426))
+        .mount(&server)
+        .await;
     let repo_root = repo_root();
     let sse = responses::sse(vec![
         responses::ev_response_created("resp-1"),
@@ -270,7 +288,13 @@ async fn responses_mode_stream_cli_supports_openai_base_url_config_override() {
         .env("OPENAI_API_KEY", "dummy");
 
     let output = run_cli_command(&mut cmd).unwrap();
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "codex-cli exec failed with status {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 
     let request = resp_mock.single_request();
     assert_eq!(request.path(), "/v1/responses");
@@ -435,7 +459,9 @@ async fn responses_api_stream_cli() {
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-c")
-        .arg(format!("openai_base_url=\"{}/v1\"", server.uri()))
+        .arg(sse_provider_override(&server, "/v1"))
+        .arg("-c")
+        .arg("model_provider=\"mock\"")
         .arg("-C")
         .arg(&repo_root)
         .arg("hello?");
@@ -477,7 +503,9 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-c")
-        .arg(format!("openai_base_url=\"{}/v1\"", server.uri()))
+        .arg(sse_provider_override(&server, "/v1"))
+        .arg("-c")
+        .arg("model_provider=\"mock\"")
         .arg("-C")
         .arg(&repo_root)
         .arg(&prompt);
@@ -594,7 +622,9 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     cmd2.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-c")
-        .arg(format!("openai_base_url=\"{}/v1\"", server.uri()))
+        .arg(sse_provider_override(&server, "/v1"))
+        .arg("-c")
+        .arg("model_provider=\"mock\"")
         .arg("-C")
         .arg(&repo_root)
         .arg(&prompt2)

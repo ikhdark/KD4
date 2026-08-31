@@ -21,6 +21,7 @@ use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::openai_models::WebSearchToolType;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_tools::DiscoverablePluginInfo;
@@ -38,6 +39,7 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use super::active_collaboration_namespace;
+use super::build_code_mode_executors;
 use super::merge_into_namespaces;
 use crate::agent::task_capabilities::ExternalMutationIntent;
 use crate::agent::task_capabilities::TypedToolClass;
@@ -47,8 +49,11 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::exposure::AgentSurfaceStage;
 use crate::tools::exposure::ToolExposureIdentity;
+use crate::tools::handlers::ExecCommandHandler;
+use crate::tools::handlers::ExecCommandHandlerOptions;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
+use crate::tools::registry::RegisteredTool;
 use crate::tools::router::ToolRouter;
 use crate::tools::router::ToolRouterParams;
 use crate::tools::router::ToolSuggestCandidates;
@@ -807,6 +812,32 @@ async fn wait_is_always_registered_when_code_mode_is_enabled() {
 }
 
 #[tokio::test]
+async fn code_mode_eagerly_exposes_the_exec_command_contract() {
+    let (_session, mut turn) = make_session_and_context().await;
+    set_features(&mut turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
+    let registered = RegisteredTool::new(
+        Arc::new(ExecCommandHandler::new(ExecCommandHandlerOptions {
+            allow_login_shell: true,
+            allow_escalated_sandbox_permissions: false,
+            exec_permission_approvals_enabled: false,
+            include_environment_id: false,
+            include_shell_parameter: true,
+        })),
+        TypedToolClass::Shell,
+    );
+
+    let runtimes =
+        build_code_mode_executors(&turn, &[registered]).expect("code mode executors should build");
+    let ToolSpec::Freeform(exec) = runtimes[0].spec() else {
+        panic!("expected code mode exec tool");
+    };
+
+    assert!(exec.description.contains("Eager nested tool contract:"));
+    assert!(exec.description.contains("exec_command(args:"));
+    assert!(exec.description.contains("yield_time_ms"));
+}
+
+#[tokio::test]
 async fn code_mode_identifier_collision_is_disambiguated_during_router_planning() {
     let (_session, mut turn) = make_session_and_context().await;
     set_feature(&mut turn, Feature::CodeMode, /*enabled*/ true);
@@ -870,6 +901,17 @@ async fn request_user_input_stays_direct_in_code_mode_only() {
     };
     assert!(exec.description.contains("direct-only tools stay outside"));
     assert!(exec.description.contains("request_user_input"));
+}
+
+#[tokio::test]
+async fn request_user_input_is_absent_under_never_approval() {
+    let plan = probe(|turn| {
+        turn.approval_policy = codex_config::Constrained::allow_any(AskForApproval::Never);
+    })
+    .await;
+
+    plan.assert_visible_lacks(&["request_user_input"]);
+    plan.assert_registered_lacks(&["request_user_input"]);
 }
 
 #[tokio::test]

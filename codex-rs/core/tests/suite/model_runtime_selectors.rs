@@ -28,6 +28,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use tokio::time::Duration;
@@ -38,6 +39,7 @@ const CHILD_MODEL: &str = "test-multi-agent-child";
 const ROOT_MODEL: &str = "test-multi-agent-root";
 const ROOT_PROMPT: &str = "spawn an agent child";
 const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
+const REMOTE_SELECTOR_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 const UNSUPPORTED_CODE_MODE_WARNING: &str = "does not advertise Code Mode support";
 
 struct RemoteModelResponse {
@@ -147,7 +149,9 @@ async fn response_for_remote_model(
         .await?;
     let mut warnings = Vec::new();
     loop {
-        match wait_for_event(&test.codex, |_| true).await {
+        match wait_for_event_with_timeout(&test.codex, |_| true, REMOTE_SELECTOR_EVENT_TIMEOUT)
+            .await
+        {
             EventMsg::Warning(warning) => warnings.push(warning.message),
             EventMsg::TurnComplete(_) => break,
             _ => {}
@@ -200,6 +204,7 @@ async fn remote_tool_mode_selector_overrides_feature_flags() -> Result<()> {
         vec![
             // Code-mode entrypoints.
             codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
+            codex_code_mode::WAIT_TOOL_NAME.to_string(),
             "request_user_input".to_string(),
             // Hosted Responses tool.
             "web_search".to_string(),
@@ -426,9 +431,11 @@ async fn remote_multi_agent_selector_uses_model_selected_before_first_turn() -> 
             thread_settings: Default::default(),
         })
         .await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        REMOTE_SELECTOR_EVENT_TIMEOUT,
+    )
     .await;
 
     assert_eq!(

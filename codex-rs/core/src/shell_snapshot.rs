@@ -387,14 +387,18 @@ impl ShellSnapshot {
 }
 
 impl ShellSnapshotFile {
+    pub(crate) fn local_path(&self) -> Option<&AbsolutePathBuf> {
+        match &self.location {
+            ShellSnapshotLocation::Local(path) => Some(path),
+            ShellSnapshotLocation::Remote { .. } => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn path(&self) -> AbsolutePathBuf {
-        match &self.location {
-            ShellSnapshotLocation::Local(path) => path.clone(),
-            ShellSnapshotLocation::Remote { .. } => {
-                panic!("remote shell snapshot does not have a local path")
-            }
-        }
+        self.local_path()
+            .cloned()
+            .expect("remote shell snapshot does not have a local path")
     }
 
     pub(crate) fn native_path_string(&self) -> String {

@@ -302,6 +302,33 @@ fn typed_preflight_rejects_invalid_hook_rewritten_code_mode_arguments() {
     assert_eq!(preflight.validation_count.load(Ordering::Relaxed), 2);
 }
 
+#[test]
+fn exec_command_code_mode_preflight_preserves_prescriptive_boundary_errors() {
+    let spec = crate::tools::handlers::shell_spec::create_exec_command_tool(
+        crate::tools::handlers::shell_spec::CommandToolOptions {
+            allow_login_shell: true,
+            exec_permission_approvals_enabled: false,
+        },
+    );
+    let name = ToolName::plain("exec_command");
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "rg",
+            "cmd": "rg --files"
+        })
+        .to_string(),
+    };
+    let arguments = ParsedFunctionArguments::from_payload(&payload);
+    let error = CodeModeArgumentPreflight::default()
+        .validate(&name, &spec, &payload, arguments.as_ref())
+        .expect_err("mixed branches must fail before Code Mode dispatch");
+
+    assert!(error.contains("argument preflight failed"), "{error}");
+    assert!(error.contains("`argv` branch"), "{error}");
+    assert!(error.contains("$.cmd"), "{error}");
+}
+
 #[tokio::test]
 async fn code_mode_dispatch_without_hook_rewrite_preflights_once() -> anyhow::Result<()> {
     let (session, turn) = crate::session::tests::make_session_and_context().await;

@@ -13,19 +13,25 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_ACTION_BLOCK;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_ACTION_PERMIT;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_ACTRL_MATCH_FILTER;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_BYTE_BLOB;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_CONDITION_FLAG_IS_LOOPBACK;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_CONDITION_VALUE0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_CONDITION_VALUE0_0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_EMPTY;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_MATCH_EQUAL;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_MATCH_FLAGS_ALL_SET;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_MATCH_FLAGS_NONE_SET;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_SECURITY_DESCRIPTOR_TYPE;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT8;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT16;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT32;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ACTION0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ACTION0_0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_ALE_USER_ID;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_FLAGS;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_IP_PROTOCOL;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_IP_REMOTE_PORT;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_DISPLAY_DATA0;
@@ -47,6 +53,8 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLaye
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionAbort0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionBegin0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionCommit0;
+use windows_sys::Win32::Networking::WinSock::IPPROTO_TCP;
+use windows_sys::Win32::Networking::WinSock::IPPROTO_UDP;
 use windows_sys::Win32::Security::Authorization::BuildExplicitAccessWithNameW;
 use windows_sys::Win32::Security::Authorization::BuildSecurityDescriptorW;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
@@ -66,6 +74,51 @@ const PROVIDER_DESCRIPTION: &str = "Persistent WFP provider for Codex Windows sa
 const SUBLAYER_NAME: &str = "Codex Windows Sandbox WFP";
 const SUBLAYER_DESCRIPTION: &str = "Persistent WFP sublayer for Codex Windows sandbox filters";
 
+#[derive(Clone, Copy)]
+struct LoopbackFilterSpec {
+    key: GUID,
+    name: &'static str,
+    description: &'static str,
+    layer_key: GUID,
+    protocol: u8,
+}
+
+const LOOPBACK_BLOCK_WEIGHT: u8 = 8;
+const LOOPBACK_PROXY_PERMIT_WEIGHT: u8 = 9;
+const MAX_PROXY_PORTS: usize = 10;
+const LOOPBACK_PROXY_FILTER_KEY_BASE: u128 = 0xa72e1d8b_2cc4_4faa_8000_000000000000;
+
+const LOOPBACK_FILTER_SPECS: &[LoopbackFilterSpec] = &[
+    LoopbackFilterSpec {
+        key: GUID::from_u128(0x23a8c889_d0f8_4e7e_9e5e_267189459fb2),
+        name: "codex_wfp_loopback_tcp_v4",
+        description: "Block sandbox-account loopback TCP except configured proxy ports v4",
+        layer_key: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        protocol: IPPROTO_TCP as u8,
+    },
+    LoopbackFilterSpec {
+        key: GUID::from_u128(0x59480d35_d5bc_49d6_a425_440f4f30f66e),
+        name: "codex_wfp_loopback_tcp_v6",
+        description: "Block sandbox-account loopback TCP except configured proxy ports v6",
+        layer_key: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        protocol: IPPROTO_TCP as u8,
+    },
+    LoopbackFilterSpec {
+        key: GUID::from_u128(0xbfc10c2b_c9a2_42ae_8726_b9c00bcaf9c1),
+        name: "codex_wfp_loopback_udp_v4",
+        description: "Block sandbox-account loopback UDP v4",
+        layer_key: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        protocol: IPPROTO_UDP as u8,
+    },
+    LoopbackFilterSpec {
+        key: GUID::from_u128(0xe5f42f10_b350_4856_9e04_f08925524b84),
+        name: "codex_wfp_loopback_udp_v6",
+        description: "Block sandbox-account loopback UDP v6",
+        layer_key: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        protocol: IPPROTO_UDP as u8,
+    },
+];
+
 // WFP identifies persistent providers, sublayers, and filters by stable GUIDs.
 // These values are Codex-owned identities; do not regenerate them unless we
 // intentionally want to orphan old objects and create a new WFP namespace.
@@ -74,20 +127,79 @@ const SUBLAYER_KEY: GUID = GUID::from_u128(0xe65054fd_4d32_4c7c_95ef_621f0cf6431
 
 /// Installs the persistent Codex WFP filters for `account`.
 ///
-/// This is intended to run from the already-elevated setup helper. Callers
-/// should treat any returned error as non-fatal to the rest of setup.
-pub fn install_wfp_filters_for_account(account: &str) -> Result<usize> {
+/// This is intended to run from the already-elevated setup helper. The loopback
+/// filters installed here are a required part of offline network isolation.
+pub fn install_wfp_filters_for_account(
+    account: &str,
+    proxy_ports: &[u16],
+    allow_local_binding: bool,
+) -> Result<usize> {
     let engine = Engine::open()?;
     let mut transaction = engine.begin_transaction()?;
     ensure_provider(engine.handle)?;
     ensure_sublayer(engine.handle)?;
 
     let user_condition = UserMatchCondition::for_account(account)?;
+    let proxy_ports = normalized_proxy_ports(proxy_ports)?;
     let mut installed_filter_count = 0;
     for spec in FILTER_SPECS {
         delete_filter_if_present(engine.handle, &spec.key)?;
         add_filter(engine.handle, spec, &user_condition)?;
         installed_filter_count += 1;
+    }
+    for spec in LOOPBACK_FILTER_SPECS {
+        delete_filter_if_present(engine.handle, &spec.key)?;
+    }
+    for family in 0..2 {
+        for slot in 0..MAX_PROXY_PORTS {
+            delete_filter_if_present(engine.handle, &loopback_proxy_filter_key(family, slot))?;
+        }
+    }
+
+    if !allow_local_binding {
+        for spec in LOOPBACK_FILTER_SPECS {
+            let conditions = loopback_conditions(spec.protocol, None);
+            add_filter_parts(
+                engine.handle,
+                spec.key,
+                spec.name,
+                spec.description,
+                spec.layer_key,
+                &conditions,
+                &user_condition,
+                FWP_ACTION_BLOCK,
+                LOOPBACK_BLOCK_WEIGHT,
+            )?;
+            installed_filter_count += 1;
+        }
+        for (slot, port) in proxy_ports.into_iter().enumerate() {
+            for (family, layer_key) in [
+                windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let name = format!("codex_wfp_loopback_proxy_v{}_slot_{slot}", family + 4);
+                let description = format!(
+                    "Permit sandbox-account loopback proxy TCP port {port} v{}",
+                    family + 4
+                );
+                let conditions = loopback_conditions(IPPROTO_TCP as u8, Some(port));
+                add_filter_parts(
+                    engine.handle,
+                    loopback_proxy_filter_key(family, slot),
+                    &name,
+                    &description,
+                    layer_key,
+                    &conditions,
+                    &user_condition,
+                    FWP_ACTION_PERMIT,
+                    LOOPBACK_PROXY_PERMIT_WEIGHT,
+                )?;
+                installed_filter_count += 1;
+            }
+        }
     }
 
     transaction.commit()?;
@@ -269,12 +381,36 @@ fn add_filter(
     spec: &FilterSpec,
     user_condition: &UserMatchCondition,
 ) -> Result<()> {
-    let filter_name = to_wide(OsStr::new(spec.name));
-    let filter_description = to_wide(OsStr::new(spec.description));
-    let mut filter_conditions = build_conditions(spec.conditions, user_condition);
+    add_filter_parts(
+        engine,
+        spec.key,
+        spec.name,
+        spec.description,
+        spec.layer_key,
+        spec.conditions,
+        user_condition,
+        FWP_ACTION_BLOCK,
+        0,
+    )
+}
+
+fn add_filter_parts(
+    engine: HANDLE,
+    key: GUID,
+    name: &str,
+    description: &str,
+    layer_key: GUID,
+    conditions: &[ConditionSpec],
+    user_condition: &UserMatchCondition,
+    action: u32,
+    weight: u8,
+) -> Result<()> {
+    let filter_name = to_wide(OsStr::new(name));
+    let filter_description = to_wide(OsStr::new(description));
+    let mut filter_conditions = build_conditions(conditions, user_condition);
     let provider_key = PROVIDER_KEY;
     let filter = FWPM_FILTER0 {
-        filterKey: spec.key,
+        filterKey: key,
         displayData: FWPM_DISPLAY_DATA0 {
             name: filter_name.as_ptr() as *mut _,
             description: filter_description.as_ptr() as *mut _,
@@ -282,13 +418,17 @@ fn add_filter(
         flags: FWPM_FILTER_FLAG_PERSISTENT,
         providerKey: &provider_key as *const _ as *mut _,
         providerData: empty_blob(),
-        layerKey: spec.layer_key,
+        layerKey: layer_key,
         subLayerKey: SUBLAYER_KEY,
-        weight: empty_value(),
+        weight: if weight == 0 {
+            empty_value()
+        } else {
+            uint8_value(weight)
+        },
         numFilterConditions: filter_conditions.len() as u32,
         filterCondition: filter_conditions.as_mut_ptr(),
         action: FWPM_ACTION0 {
-            r#type: FWP_ACTION_BLOCK,
+            r#type: action,
             Anonymous: FWPM_ACTION0_0 {
                 filterType: zero_guid(),
             },
@@ -301,7 +441,40 @@ fn add_filter(
 
     let mut filter_id = 0_u64;
     let result = unsafe { FwpmFilterAdd0(engine, &filter, null_mut(), &mut filter_id) };
-    ensure_success(result, &format!("FwpmFilterAdd0({})", spec.name))
+    ensure_success(result, &format!("FwpmFilterAdd0({name})"))
+}
+
+fn loopback_conditions(protocol: u8, remote_port: Option<u16>) -> Vec<ConditionSpec> {
+    let mut conditions = vec![
+        ConditionSpec::User,
+        ConditionSpec::Loopback,
+        ConditionSpec::Protocol(protocol),
+    ];
+    if let Some(remote_port) = remote_port {
+        conditions.push(ConditionSpec::RemotePort(remote_port));
+    }
+    conditions
+}
+
+fn normalized_proxy_ports(proxy_ports: &[u16]) -> Result<Vec<u16>> {
+    let mut proxy_ports = proxy_ports
+        .iter()
+        .copied()
+        .filter(|port| *port != 0)
+        .collect::<Vec<_>>();
+    proxy_ports.sort_unstable();
+    proxy_ports.dedup();
+    if proxy_ports.len() > MAX_PROXY_PORTS {
+        return Err(anyhow::anyhow!(
+            "too many loopback proxy ports for WFP filter slots: {} > {MAX_PROXY_PORTS}",
+            proxy_ports.len()
+        ));
+    }
+    Ok(proxy_ports)
+}
+
+fn loopback_proxy_filter_key(family: usize, slot: usize) -> GUID {
+    GUID::from_u128(LOOPBACK_PROXY_FILTER_KEY_BASE + (family * MAX_PROXY_PORTS + slot) as u128)
 }
 
 /// Converts our compact condition specs into WFP filter conditions.
@@ -319,6 +492,26 @@ fn build_conditions(
                     r#type: FWP_SECURITY_DESCRIPTOR_TYPE,
                     Anonymous: FWP_CONDITION_VALUE0_0 {
                         sd: &user_condition.blob as *const _ as *mut _,
+                    },
+                },
+            },
+            ConditionSpec::Loopback => FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_FLAGS,
+                matchType: FWP_MATCH_FLAGS_ALL_SET,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT32,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        uint32: FWP_CONDITION_FLAG_IS_LOOPBACK,
+                    },
+                },
+            },
+            ConditionSpec::NotLoopback => FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_FLAGS,
+                matchType: FWP_MATCH_FLAGS_NONE_SET,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT32,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        uint32: FWP_CONDITION_FLAG_IS_LOOPBACK,
                     },
                 },
             },
@@ -385,13 +578,30 @@ fn empty_value() -> FWP_VALUE0 {
     }
 }
 
+fn uint8_value(value: u8) -> FWP_VALUE0 {
+    FWP_VALUE0 {
+        r#type: FWP_UINT8,
+        Anonymous: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0_0 {
+            uint8: value,
+        },
+    }
+}
+
 fn zero_guid() -> GUID {
     GUID::from_u128(0)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::ConditionSpec;
     use super::FILTER_SPECS;
+    use super::IPPROTO_TCP;
+    use super::LOOPBACK_FILTER_SPECS;
+    use super::LOOPBACK_PROXY_FILTER_KEY_BASE;
+    use super::MAX_PROXY_PORTS;
+    use super::loopback_conditions;
+    use super::loopback_proxy_filter_key;
+    use super::normalized_proxy_ports;
     use pretty_assertions::assert_eq;
     use std::collections::BTreeSet;
 
@@ -399,16 +609,17 @@ mod tests {
     fn filter_keys_are_unique() {
         let keys = FILTER_SPECS
             .iter()
-            .map(|spec| {
-                (
-                    spec.key.data1,
-                    spec.key.data2,
-                    spec.key.data3,
-                    spec.key.data4,
-                )
-            })
+            .map(|spec| spec.key)
+            .chain(LOOPBACK_FILTER_SPECS.iter().map(|spec| spec.key))
+            .chain((0..2).flat_map(|family| {
+                (0..MAX_PROXY_PORTS).map(move |slot| loopback_proxy_filter_key(family, slot))
+            }))
+            .map(|spec| (spec.data1, spec.data2, spec.data3, spec.data4))
             .collect::<BTreeSet<_>>();
-        assert_eq!(keys.len(), FILTER_SPECS.len());
+        assert_eq!(
+            keys.len(),
+            FILTER_SPECS.len() + LOOPBACK_FILTER_SPECS.len() + 2 * MAX_PROXY_PORTS
+        );
     }
 
     #[test]
@@ -416,7 +627,61 @@ mod tests {
         let names = FILTER_SPECS
             .iter()
             .map(|spec| spec.name)
+            .chain(LOOPBACK_FILTER_SPECS.iter().map(|spec| spec.name))
             .collect::<BTreeSet<_>>();
-        assert_eq!(names.len(), FILTER_SPECS.len());
+        assert_eq!(
+            names.len(),
+            FILTER_SPECS.len() + LOOPBACK_FILTER_SPECS.len()
+        );
+    }
+
+    #[test]
+    fn loopback_proxy_filter_matches_one_exact_port() {
+        assert_eq!(
+            loopback_conditions(IPPROTO_TCP as u8, Some(8080)),
+            vec![
+                ConditionSpec::User,
+                ConditionSpec::Loopback,
+                ConditionSpec::Protocol(IPPROTO_TCP as u8),
+                ConditionSpec::RemotePort(8080),
+            ]
+        );
+    }
+
+    #[test]
+    fn proxy_ports_are_normalized_within_fixed_filter_slots() {
+        assert_eq!(
+            normalized_proxy_ports(&[8080, 0, 3128, 8080]).expect("valid proxy ports"),
+            vec![3128, 8080]
+        );
+        let first = loopback_proxy_filter_key(0, 0);
+        let last = loopback_proxy_filter_key(1, MAX_PROXY_PORTS - 1);
+        assert_eq!(
+            (first.data1, first.data2, first.data3, first.data4),
+            (0xa72e1d8b, 0x2cc4, 0x4faa, [0x80, 0, 0, 0, 0, 0, 0, 0])
+        );
+        let expected_last = windows_sys::core::GUID::from_u128(
+            LOOPBACK_PROXY_FILTER_KEY_BASE + (2 * MAX_PROXY_PORTS - 1) as u128,
+        );
+        assert_eq!(
+            (last.data1, last.data2, last.data3, last.data4),
+            (
+                expected_last.data1,
+                expected_last.data2,
+                expected_last.data3,
+                expected_last.data4,
+            )
+        );
+    }
+
+    #[test]
+    fn static_ale_port_blocks_exclude_loopback_proxy_ports() {
+        for spec in FILTER_SPECS.iter().filter(|spec| {
+            spec.conditions
+                .iter()
+                .any(|condition| matches!(condition, ConditionSpec::RemotePort(_)))
+        }) {
+            assert!(spec.conditions.contains(&ConditionSpec::NotLoopback));
+        }
     }
 }

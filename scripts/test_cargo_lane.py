@@ -570,6 +570,18 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn("8388608", lines)
         self.assertIn("target=", lines)
 
+    def test_no_command_guidance_routes_core_tests_through_named_lanes(self) -> None:
+        result = self.run_script("-Lane", f"unit-guidance-{os.getpid()}")
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("just core-test-lane core_lib", result.stdout)
+        self.assertNotIn("test-lane-package codex-core", result.stdout)
+        self.assertNotIn("cargo nextest run -p codex-core", result.stdout)
+
     def test_uses_scoop_llvm_lld_link_when_not_on_path(self) -> None:
         lane = f"unit-linker-{os.getpid()}"
         user_profile = self.temp_root / "user"

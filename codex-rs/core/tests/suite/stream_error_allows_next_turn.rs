@@ -13,7 +13,6 @@ use core_test_support::wait_for_event;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
-use wiremock::matchers::body_string_contains;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
@@ -34,14 +33,6 @@ async fn continue_after_stream_error() {
 
     // The provider below disables request retries (request_max_retries = 0),
     // so the failing request should only occur once.
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .and(body_string_contains("first message"))
-        .respond_with(fail)
-        .expect(1)
-        .mount(&server)
-        .await;
-
     let ok = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
         .set_body_raw(
@@ -54,9 +45,15 @@ async fn continue_after_stream_error() {
 
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
-        .and(body_string_contains("follow up"))
-        .respond_with(ok)
-        .expect(1)
+        .respond_with(move |request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            if body.contains("follow up") {
+                ok.clone()
+            } else {
+                fail.clone()
+            }
+        })
+        .expect(2)
         .mount(&server)
         .await;
 
@@ -76,7 +73,7 @@ async fn continue_after_stream_error() {
         http_headers: None,
         env_http_headers: None,
         request_max_retries: Some(0),
-        stream_max_retries: Some(1),
+        stream_max_retries: Some(0),
         stream_idle_timeout_ms: Some(2_000),
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,

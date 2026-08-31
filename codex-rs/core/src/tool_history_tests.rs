@@ -40,10 +40,14 @@ fn identity_projection_reuses_shared_response_items() {
     assert!(Arc::ptr_eq(&projection.items, &canonical));
     assert!(Arc::ptr_eq(&projection.unreplaced_items, &canonical));
 }
+use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::command_execution::CommandExecutionLedger;
 use crate::tools::command_output_artifact::create_canonical_output_artifact;
 use crate::tools::command_output_artifact::protect_active_tool_history_artifact;
 use crate::tools::command_output_artifact::read_exact_tool_output_artifact;
 use crate::tools::command_output_artifact::remint_tool_history_artifact_for_thread;
+use crate::tools::handlers::command_search::RgSearchBreadth;
+use crate::tools::handlers::command_search::RgSearchNarrowing;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_tools::CanonicalToolResult;
 use pretty_assertions::assert_eq;
@@ -57,6 +61,7 @@ fn candidate(call_id: &str, bounded_model_output: String) -> ToolHistoryCandidat
         call_id: call_id.to_string(),
         tool_identity: "functions.exec".to_string(),
         semantic_class: "tool_output".to_string(),
+        successful: true,
         source_dependencies: BTreeSet::new(),
         source_dependencies_current: true,
         artifact_id: "artifact-1".to_string(),
@@ -96,6 +101,21 @@ fn named_function_call(call_id: &str, name: &str) -> ResponseItem {
         name: name.to_string(),
         namespace: None,
         arguments: "{}".to_string(),
+        call_id: call_id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn named_function_call_with_arguments(
+    call_id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> ResponseItem {
+    ResponseItem::FunctionCall {
+        id: None,
+        name: name.to_string(),
+        namespace: None,
+        arguments: arguments.to_string(),
         call_id: call_id.to_string(),
         internal_chat_message_metadata_passthrough: None,
     }
@@ -397,6 +417,148 @@ fn workspace_evidence_invalidates_only_overlapping_source_dependencies() {
 }
 
 #[test]
+fn workspace_error_outputs_are_never_stale_masked() {
+    let call_id = "failed-workspace-read";
+    let dependency = PathBuf::from("/repo/src/foo.rs");
+    let mut payload = FunctionCallOutputPayload::from_text("permission denied".to_string());
+    payload.success = Some(false);
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: payload,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let canonical: Arc<[ResponseItem]> = Arc::from([
+        named_function_call_with_arguments(
+            call_id,
+            "exec_command",
+            serde_json::json!({
+                "kind": "argv",
+                "program": "rg",
+                "args": ["needle", "src/foo.rs"]
+            }),
+        ),
+        output.clone(),
+    ]);
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(workspace_identity("captured")),
+            &output,
+            BTreeSet::from([SourceDependencyV1::new(&dependency, false)]),
+        )
+        .expect("failed workspace observation"),
+    );
+
+    assert!(!state.invalidate_source_dependencies(
+        Some(&BTreeSet::from([dependency])),
+        Some(&workspace_identity("changed")),
+    ));
+    let projection = state.project_with_workspace_identity(
+        Arc::clone(&canonical),
+        Some(&workspace_identity("changed")),
+    );
+    assert_eq!(projection.items, canonical);
+}
+
+#[tokio::test]
+async fn intersecting_workspace_transition_marks_stale_and_permits_suppressed_rerun() {
+    let call_id = "stale-search";
+    let dependency = PathBuf::from("/repo/src/foo.rs");
+    let arguments = serde_json::json!({
+        "kind": "argv",
+        "program": "rg",
+        "args": ["needle", "src/foo.rs"]
+    });
+    let mut payload = FunctionCallOutputPayload::from_text("src/foo.rs:needle".to_string());
+    payload.success = Some(true);
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: payload,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let canonical: Arc<[ResponseItem]> = Arc::from([
+        named_function_call_with_arguments(call_id, "exec_command", arguments),
+        output.clone(),
+    ]);
+    let captured = workspace_identity("captured");
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(captured),
+            &output,
+            BTreeSet::from([SourceDependencyV1::new(&dependency, false)]),
+        )
+        .expect("successful workspace observation"),
+    );
+
+    let search = RgSearchNarrowing {
+        breadth: RgSearchBreadth::Narrow,
+        query_identity: "needle".to_string(),
+        search_identity: "needle:src/foo.rs".to_string(),
+        scope_identity: "src/foo.rs".to_string(),
+        parent_scope_identity: Some("repo".to_string()),
+        scope_state_identity: Some("scope-state".to_string()),
+        state_paths: Vec::new(),
+        can_record_miss: true,
+    };
+    let command = [
+        "rg".to_string(),
+        "needle".to_string(),
+        "src/foo.rs".to_string(),
+    ];
+    let attempt_key = CommandAttemptKey::new("exec_command", "local", "/repo", &command)
+        .with_repository_epoch(1)
+        .with_workspace_identity(Some("workspace-a"))
+        .with_search_narrowing("turn-a", "repo-a", Some(search));
+    let ledger = CommandExecutionLedger::default();
+    ledger
+        .begin_attempt_with_freshness(&attempt_key, false, false)
+        .await
+        .expect("initial search runs");
+    ledger.record_exit(&attempt_key, 1).await;
+    ledger
+        .begin_attempt_with_freshness(&attempt_key, false, false)
+        .await
+        .expect_err("unchanged negative search is suppressed");
+
+    let after_unrelated = workspace_identity("after-unrelated");
+    assert!(state.invalidate_source_dependencies(
+        Some(&BTreeSet::from([PathBuf::from("/repo/src/bar.rs")])),
+        Some(&after_unrelated),
+    ));
+    let unrelated =
+        state.project_with_workspace_identity(Arc::clone(&canonical), Some(&after_unrelated));
+    assert_eq!(unrelated.items, canonical);
+
+    let after_overlap = workspace_identity("after-overlap");
+    assert!(
+        state.invalidate_source_dependencies(
+            Some(&BTreeSet::from([dependency])),
+            Some(&after_overlap),
+        )
+    );
+    let stale = state.project_with_workspace_identity(canonical, Some(&after_overlap));
+    let ResponseItem::FunctionCall { arguments, .. } = &stale.items[0] else {
+        panic!("projected invocation");
+    };
+    let projected_arguments: serde_json::Value =
+        serde_json::from_str(arguments).expect("projected exec_command arguments");
+    let force_fresh = projected_arguments
+        .get("force_fresh")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    assert!(force_fresh);
+    let (_, stale_output) = textual_output_identity(&stale.items[1]).expect("stale output");
+    assert!(stale_output.contains("\"rerun\":{\"force_fresh\":true}"));
+    ledger
+        .begin_attempt_with_freshness(&attempt_key, false, force_fresh)
+        .await
+        .expect("stale projection bypasses unchanged-failure suppression");
+}
+
+#[test]
 fn generation_batch_invalidation_excludes_its_own_completed_calls() {
     let current_call_id = "current-generation-call";
     let older_call_id = "older-call";
@@ -569,6 +731,21 @@ fn command_dependencies_cover_search_test_and_ownership_inputs() {
         Path::new("/repo/architecture_index.json"),
         false,
     )));
+
+    let powershell = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "powershell_script",
+            "script_body": "rg needle src/foo.rs"
+        })
+        .to_string(),
+    };
+    assert_eq!(
+        source_dependencies_for_tool_call("exec_command", &powershell, cwd),
+        BTreeSet::from([SourceDependencyV1::new(
+            Path::new("/repo/src/foo.rs"),
+            false,
+        )])
+    );
 }
 
 #[test]

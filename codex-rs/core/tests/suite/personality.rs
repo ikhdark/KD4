@@ -137,6 +137,7 @@ async fn user_turn_personality_none_does_not_add_update_message() -> anyhow::Res
             .features
             .enable(Feature::Personality)
             .expect("test config should allow feature update");
+        config.personality = Some(Personality::None);
     });
     let test = builder.build(&server).await?;
 
@@ -474,7 +475,7 @@ async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn user_turn_personality_same_value_does_not_add_update_message() -> anyhow::Result<()> {
+async fn user_turn_personality_same_value_reinjects_update_message() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -536,8 +537,8 @@ async fn user_turn_personality_same_value_does_not_add_update_message() -> anyho
         .iter()
         .find(|text| text.contains("<personality_spec>"));
     assert!(
-        personality_text.is_none(),
-        "expected no personality preamble for unchanged personality, got {personality_text:?}"
+        personality_text.is_some_and(|text| text.contains(LOCAL_PRAGMATIC_TEMPLATE)),
+        "expected the unchanged personality to be reinjected, got {personality_text:?}"
     );
 
     Ok(())

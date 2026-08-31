@@ -823,8 +823,7 @@ impl Session {
                 };
                 match active_turn.terminal.as_ref().cloned() {
                     Some(coordinator) => {
-                        if expected_turn_id
-                            .is_some_and(|turn_id| coordinator.turn_id() != turn_id)
+                        if expected_turn_id.is_some_and(|turn_id| coordinator.turn_id() != turn_id)
                         {
                             return TerminalSchedule::NotFound;
                         }
@@ -834,8 +833,7 @@ impl Session {
                         let Some(task) = active_turn.task.take() else {
                             return TerminalSchedule::AlreadyRunning(coordinator);
                         };
-                        coordinator
-                            .seal_tool_call_acceptance(&task.turn_context.turn_timing_state);
+                        coordinator.seal_tool_call_acceptance(&task.turn_context.turn_timing_state);
                         self.terminal_interaction_pending
                             .store(true, Ordering::Release);
                         Ok((
@@ -846,10 +844,8 @@ impl Session {
                             coordinator,
                         ))
                     }
-                    None => Err(
-                        (expected_turn_id.is_none() && active_turn.task.is_none())
-                            .then(|| Arc::clone(&active_turn.turn_state)),
-                    ),
+                    None => Err((expected_turn_id.is_none() && active_turn.task.is_none())
+                        .then(|| Arc::clone(&active_turn.turn_state))),
                 }
             };
             let scheduling = match scheduling {

@@ -327,8 +327,10 @@ pub async fn wait_for_event_match<T, F>(codex: &CodexThread, matcher: F) -> T
 where
     F: Fn(&codex_protocol::protocol::EventMsg) -> Option<T>,
 {
-    wait_for_event_match_with_timeout(codex, matcher, tokio::time::Duration::from_secs(1)).await
+    wait_for_event_match_with_timeout(codex, matcher, INTEGRATION_EVENT_TIMEOUT).await
 }
+
+const INTEGRATION_EVENT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 pub async fn wait_for_event_match_with_timeout<T, F>(
     codex: &CodexThread,
@@ -398,8 +400,23 @@ pub fn format_with_current_shell_display_non_login(command: &str) -> String {
     codex_app_server_protocol::command_display_string(&args)
 }
 
+/// Resolves a helper binary the caller requires. Lookup failure is returned so
+/// the caller propagates it; a required helper must never turn into a silent
+/// pass. The owning test target declares the helper in
+/// `codex-rs/.config/kd4-rust-tests.toml`, which builds it before the run.
+pub fn required_helper_bin_with(
+    name: &str,
+    resolver: impl FnOnce(&str) -> Result<PathBuf, CargoBinError>,
+) -> Result<String, CargoBinError> {
+    resolver(name).map(|path| path.to_string_lossy().to_string())
+}
+
+pub fn required_helper_bin(name: &str) -> Result<String, CargoBinError> {
+    required_helper_bin_with(name, codex_utils_cargo_bin::cargo_bin)
+}
+
 pub fn stdio_server_bin() -> Result<String, CargoBinError> {
-    codex_utils_cargo_bin::cargo_bin("test_stdio_server").map(|p| p.to_string_lossy().to_string())
+    required_helper_bin("test_stdio_server")
 }
 
 pub mod fs_wait {
@@ -620,6 +637,14 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(1),
             "requested short deadline was widened: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn integration_event_timeout_allows_loaded_shards_to_make_progress() {
+        assert_eq!(
+            INTEGRATION_EVENT_TIMEOUT,
+            tokio::time::Duration::from_secs(30)
         );
     }
 }

@@ -240,20 +240,20 @@ fn untagged_command_preserves_legacy_compatibility() {
 }
 
 #[test]
-fn tagged_script_and_legacy_shapes_are_explicit() {
+fn tagged_script_is_canonical_and_tagged_legacy_is_rejected() {
     let script =
         parse(Some("Write-Output ok"), Some("script"), None, None, None).expect("tagged script");
-    let legacy =
-        parse(Some("Write-Output ok"), Some("legacy"), None, None, None).expect("tagged legacy");
+    let legacy_error = parse(Some("Write-Output ok"), Some("legacy"), None, None, None)
+        .expect_err("legacy input must omit kind so the decoder can normalize it");
 
     assert_eq!(
         script,
         CommandInvocation::Script("Write-Output ok".to_string())
     );
-    assert_eq!(
-        legacy,
-        CommandInvocation::Script("Write-Output ok".to_string())
-    );
+    let message = legacy_error.to_string();
+    assert!(message.contains("$.kind"), "{message}");
+    assert!(message.contains("actual value `legacy`"), "{message}");
+    assert!(message.contains("omit `kind`"), "{message}");
 }
 
 #[test]
@@ -454,10 +454,11 @@ fn powershell_script_mode_rejects_mixed_fields() {
     )
     .expect_err("legacy script field should be rejected");
 
+    let message = err.to_string();
+    assert!(message.contains("`powershell_script` branch"), "{message}");
     assert!(
-        err.to_string()
-            .contains("received legacy script or argv fields with `kind: \"powershell_script\"`"),
-        "unexpected error: {err}"
+        message.contains("$.command") || message.contains("$.cmd"),
+        "{message}"
     );
 }
 

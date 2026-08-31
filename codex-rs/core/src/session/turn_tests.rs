@@ -9,6 +9,7 @@ use crate::tools::exposure::GoalSurfaceState;
 use crate::tools::exposure::ToolExposureIdentity;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::router::ToolRouter;
+use anyhow::Context as _;
 use anyhow::Result;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
@@ -3714,16 +3715,8 @@ fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot() -> Result<()>
 }
 
 async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot_impl() -> Result<()> {
-    let command = match core_test_support::stdio_server_bin() {
-        Ok(command) => command,
-        Err(err) => {
-            tracing::warn!(
-                %err,
-                "test_stdio_server unavailable; skipping MCP snapshot regression"
-            );
-            return Ok(());
-        }
-    };
+    let command = core_test_support::stdio_server_bin()
+        .context("test_stdio_server helper is required by the MCP inventory snapshot regression")?;
     let (mut session, mut turn_context, _events) =
         crate::session::tests::make_session_and_context_with_rx().await;
     let auth_manager =

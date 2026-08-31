@@ -535,6 +535,7 @@ pub(crate) async fn execute_exec_request(
         file_system_sandbox_policy: _,
         network_sandbox_policy,
         windows_sandbox_filesystem_overrides,
+        windows_sandbox_additional_read_roots,
         network_environment_id,
         arg0,
         exec_server_sandbox: _,
@@ -578,6 +579,7 @@ pub(crate) async fn execute_exec_request(
         &windows_sandbox_policy_cwd,
         &windows_sandbox_workspace_roots,
         windows_sandbox_filesystem_overrides.as_ref(),
+        &windows_sandbox_additional_read_roots,
     )
     .await;
     let duration = start.elapsed();
@@ -596,6 +598,7 @@ async fn get_raw_output_result(
 
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
     windows_sandbox_filesystem_overrides: Option<&WindowsSandboxFilesystemOverrides>,
+    windows_sandbox_additional_read_roots: &[AbsolutePathBuf],
 ) -> Result<RawExecToolCallOutput> {
     if sandbox == SandboxType::WindowsRestrictedToken {
         return exec_windows_sandbox(
@@ -605,6 +608,7 @@ async fn get_raw_output_result(
             windows_sandbox_policy_cwd,
             windows_sandbox_workspace_roots,
             windows_sandbox_filesystem_overrides,
+            windows_sandbox_additional_read_roots,
         )
         .await;
     }
@@ -682,6 +686,7 @@ async fn exec_windows_sandbox(
     windows_sandbox_policy_cwd: &AbsolutePathBuf,
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
     windows_sandbox_filesystem_overrides: Option<&WindowsSandboxFilesystemOverrides>,
+    windows_sandbox_additional_read_roots: &[AbsolutePathBuf],
 ) -> Result<RawExecToolCallOutput> {
     use codex_windows_sandbox::CaptureOutputSink;
     use codex_windows_sandbox::CaptureOutputStream;
@@ -776,6 +781,7 @@ async fn exec_windows_sandbox(
         .is_some_and(|overrides| overrides.read_roots_include_platform_defaults);
     let elevated_write_roots_override = windows_sandbox_filesystem_overrides
         .and_then(|overrides| overrides.write_roots_override.clone());
+    let windows_sandbox_additional_read_roots = windows_sandbox_additional_read_roots.to_vec();
     let spawn_res = tokio::task::spawn_blocking(move || {
         if use_elevated {
             run_windows_sandbox_capture_for_permission_profile_elevated(
@@ -791,6 +797,7 @@ async fn exec_windows_sandbox(
                     use_private_desktop: windows_sandbox_private_desktop,
                     proxy_enforced,
                     read_roots_override: elevated_read_roots_override.as_deref(),
+                    additional_read_roots: &windows_sandbox_additional_read_roots,
                     read_roots_include_platform_defaults:
                         elevated_read_roots_include_platform_defaults,
                     write_roots_override: elevated_write_roots_override.as_deref(),

@@ -145,6 +145,20 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             <= categories
         )
 
+    def test_focused_core_scenario_uses_the_named_core_target(self) -> None:
+        scenario = kd4_perf_snapshot.scenario_catalog()["focused-core-test"]
+
+        self.assertEqual(
+            scenario.command,
+            (
+                "just",
+                "core-test-fast",
+                "core_lib",
+                "-E",
+                "test(typed_agents_inherit_every_non_root_tool_class)",
+            ),
+        )
+
     def test_atomic_json_writer_replaces_target(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             target = Path(tempdir) / "snapshot.json"

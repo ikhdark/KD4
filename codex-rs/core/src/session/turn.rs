@@ -22,6 +22,8 @@ use crate::compact::InitialContextInjection;
 use crate::compact::InlineAutoCompactReuse;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact::should_use_remote_compact_task;
+use crate::compact_model_fallback::record_model_fallback;
+use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ApprovalPromptContext;
@@ -131,6 +133,7 @@ use crate::turn_timing::TurnTimingGuard;
 use crate::turn_timing::TurnTimingState;
 use crate::turn_timing::record_turn_ttft_metric;
 use codex_analytics::AppInvocation;
+use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::InvocationType;
@@ -2832,7 +2835,8 @@ async fn run_auto_compact(
             "local",
             /*manual*/ false,
         );
-        run_inline_auto_compact_task(
+        let previous_model = turn_context.model_info.slug.as_str();
+        let initial_attempt = run_inline_auto_compact_task(
             Arc::clone(sess),
             Arc::clone(turn_context),
             InlineAutoCompactReuse {
@@ -2840,12 +2844,61 @@ async fn run_auto_compact(
                 client_session,
                 prefetched_workspace_identity,
             },
-            initial_context_injection,
+            initial_context_injection.clone(),
             reason,
             phase,
+            /*emit_error_event*/ fallback_step_context.is_none(),
             cancellation_token,
         )
-        .await?;
+        .await;
+
+        match initial_attempt {
+            Ok(()) => {}
+            Err(previous_error) => {
+                let Some(fallback_step_context) = fallback_step_context else {
+                    return Err(previous_error);
+                };
+                if !should_retry_with_current_model(&previous_error) {
+                    return Err(previous_error);
+                }
+
+                let fallback_turn_context = &fallback_step_context.turn;
+                let fallback_result = run_inline_auto_compact_task(
+                    Arc::clone(sess),
+                    Arc::clone(fallback_turn_context),
+                    InlineAutoCompactReuse {
+                        client_session,
+                        prefetched_workspace_identity,
+                    },
+                    initial_context_injection,
+                    reason,
+                    phase,
+                    /*emit_error_event*/ true,
+                    cancellation_token,
+                )
+                .await;
+                record_model_fallback(
+                    &sess.services.session_telemetry,
+                    previous_model,
+                    fallback_turn_context.model_info.slug.as_str(),
+                    reason,
+                    CompactionImplementation::Responses,
+                    fallback_result.as_ref().err(),
+                );
+                if let Err(fallback_error) = &fallback_result {
+                    sess.send_event(
+                        fallback_turn_context,
+                        EventMsg::Warning(WarningEvent {
+                            message: format!(
+                                "Compaction failed with the previous model: {previous_error}; retry with the current model also failed: {fallback_error}"
+                            ),
+                        }),
+                    )
+                    .await;
+                }
+                fallback_result?;
+            }
+        }
     }
     Ok(())
 }

@@ -125,6 +125,25 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertTrue(result.ok, result.findings)
         self.assertGreaterEqual(result.feature_count, 1)
 
+    def test_repository_core_verifications_use_named_rust_target(self) -> None:
+        with check_kd4_features.DEFAULT_MANIFEST.open("rb") as manifest_file:
+            manifest = tomllib.load(manifest_file)
+
+        core_verifications = [
+            feature["runtime_verification"]
+            for feature in manifest["features"]
+            if feature.get("runtime_verification", {})
+            .get("path", "")
+            .startswith("codex-rs/core/")
+        ]
+        self.assertTrue(core_verifications)
+        for verification in core_verifications:
+            command = verification["command"]
+            self.assertEqual(command[:3], ["just", "core-test-fast", "core_lib"])
+            self.assertEqual(command[3], "-E")
+            self.assertIn(verification["symbol"], command[4])
+            self.assertNotIn("codex-core", command)
+
     def test_desktop_runtime_receipt_feature_is_absent(self) -> None:
         with check_kd4_features.DEFAULT_MANIFEST.open("rb") as manifest_file:
             manifest = tomllib.load(manifest_file)

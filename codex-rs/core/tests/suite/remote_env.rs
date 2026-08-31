@@ -7,6 +7,7 @@ use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::config::Constrained;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
 use codex_features::Feature;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -31,6 +32,7 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use futures::SinkExt;
@@ -289,6 +291,9 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server = start_mock_server().await;
     let wait_call_id = "wait-for-startup";
+    let approval_policy = AskForApproval::OnRequest;
+    let permission_profile = PermissionProfile::read_only();
+    let permission_profile_for_config = permission_profile.clone();
     let response_mock = mount_sse_sequence(
         &server,
         vec![
@@ -310,6 +315,7 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
                     "request-permissions",
                     "request_permissions",
                     &json!({
+                        "environment_id": REMOTE_ENVIRONMENT_ID,
                         "reason": "Verify that the ready environment is used.",
                         "permissions": {
                             "network": { "enabled": true }
@@ -329,9 +335,13 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
     .await;
     let mut builder = test_codex()
         .with_exec_server_url(format!("ws://{}", listener.local_addr()?))
-        .with_config(|config| {
+        .with_config(move |config| {
             config.project_doc_max_bytes = 0;
-            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+            config
+                .permissions
+                .set_permission_profile(permission_profile_for_config)
+                .expect("set permission profile");
             config.approvals_reviewer = ApprovalsReviewer::User;
             assert!(config.features.enable(Feature::DeferredExecutor).is_ok());
             assert!(config.features.enable(Feature::UnifiedExec).is_ok());
@@ -345,6 +355,8 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
     let test = timeout(Duration::from_secs(5), builder.build(&server))
         .await
         .context("DeferredExecutor session startup must not wait for the remote environment")??;
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(permission_profile, test.cwd.path());
 
     test.codex
         .submit(Op::UserInput {
@@ -355,7 +367,13 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
             additional_context: Default::default(),
-            thread_settings: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                approval_policy: Some(approval_policy),
+                approvals_reviewer: Some(ApprovalsReviewer::User),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                ..Default::default()
+            },
         })
         .await?;
     wait_for_response_request_count(&response_mock, /*expected_count*/ 1).await;

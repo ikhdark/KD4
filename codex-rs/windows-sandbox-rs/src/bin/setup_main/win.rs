@@ -620,11 +620,19 @@ fn configure_offline_sandbox_network(
     install_wfp_filters(
         &payload.codex_home,
         &payload.offline_username,
+        &payload.proxy_ports,
+        payload.allow_local_binding,
         payload.otel.as_ref(),
         |message| {
             let _ = log_line(log, message);
         },
-    );
+    )
+    .map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
+            format!("required WFP loopback isolation setup failed: {err}"),
+        ))
+    })?;
     Ok(())
 }
 

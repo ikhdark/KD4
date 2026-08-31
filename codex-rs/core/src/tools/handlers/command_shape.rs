@@ -10,7 +10,6 @@ use crate::shell::ShellType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandKind {
-    Legacy,
     Script,
     Argv,
     PowerShellScript,
@@ -19,12 +18,11 @@ enum CommandKind {
 impl CommandKind {
     fn parse(value: &str) -> Result<Self, FunctionCallError> {
         match value {
-            "legacy" => Ok(Self::Legacy),
             "script" => Ok(Self::Script),
             "argv" => Ok(Self::Argv),
             "powershell_script" => Ok(Self::PowerShellScript),
             other => Err(FunctionCallError::RespondToModel(format!(
-                "unsupported command kind `{other}`; use `legacy`, `script`, `argv`, or `powershell_script`."
+                "command schema error in branch selection at `$.kind`: actual value `{other}` is unsupported; use canonical `script`, `argv`, or `powershell_script`. For the legacy form, omit `kind` and provide the script in the legacy command field."
             ))),
         }
     }
@@ -61,21 +59,21 @@ impl CommandInvocation {
             None => None,
         };
 
-        match kind.unwrap_or(CommandKind::Legacy) {
-            CommandKind::Legacy | CommandKind::Script => {
+        match kind.unwrap_or(CommandKind::Script) {
+            CommandKind::Script => {
                 if has_argv_fields {
                     return Err(FunctionCallError::RespondToModel(format!(
-                        "{tool_name} received argv fields in script mode; omit `program`/`args` or set `kind` to `argv`."
+                        "{tool_name} schema error in `script` branch at `$.program`/`$.args`: argv fields were supplied with `{script_field}` or `kind: \"script\"`; omit them, or use only `kind: \"argv\"`, `program`, and optional `args`."
                     )));
                 }
                 if has_powershell_script_fields {
                     return Err(FunctionCallError::RespondToModel(format!(
-                        "{tool_name} received `script_body` in script mode; omit `script_body` or set `kind` to `powershell_script`."
+                        "{tool_name} schema error in `script` branch at `$.script_body`: this field belongs to `kind: \"powershell_script\"`; omit it, or use only `kind: \"powershell_script\"` and `script_body`."
                     )));
                 }
                 let Some(script) = script else {
                     return Err(FunctionCallError::RespondToModel(format!(
-                        "{tool_name} requires `{script_field}` for script mode, `kind: \"argv\"` with `program`, or `kind: \"powershell_script\"` with `script_body`."
+                        "{tool_name} schema error in `script` branch at `$.{script_field}`: the field is required and must be a non-blank string. Alternatively use `kind: \"argv\"` with `program`, or `kind: \"powershell_script\"` with `script_body`."
                     )));
                 };
                 Ok(Self::Script(script.to_string()))
@@ -83,17 +81,17 @@ impl CommandInvocation {
             CommandKind::Argv => {
                 if script.is_some() {
                     return Err(FunctionCallError::RespondToModel(format!(
-                        "{tool_name} received `{script_field}` with `kind: \"argv\"`; omit `{script_field}` for direct argv commands."
+                        "{tool_name} schema error in `argv` branch at `$.{script_field}`: script text cannot be mixed with `kind: \"argv\"`; omit `$.{script_field}`."
                     )));
                 }
                 if has_powershell_script_fields {
                     return Err(FunctionCallError::RespondToModel(format!(
-                        "{tool_name} received `script_body` with `kind: \"argv\"`; omit `script_body` for direct argv commands."
+                        "{tool_name} schema error in `argv` branch at `$.script_body`: PowerShell script text cannot be mixed with `kind: \"argv\"`; omit `$.script_body`."
                     )));
                 }
                 let Some(program) = program else {
                     return Err(FunctionCallError::RespondToModel(format!(
-                        "{tool_name} requires `program` when `kind` is `argv`."
+                        "{tool_name} schema error in `argv` branch at `$.program`: the field is required and must be a non-blank string."
                     )));
                 };
                 Ok(Self::Argv {
@@ -104,12 +102,12 @@ impl CommandInvocation {
             CommandKind::PowerShellScript => {
                 if script.is_some() || has_argv_fields {
                     return Err(FunctionCallError::RespondToModel(format!(
-                        "{tool_name} received legacy script or argv fields with `kind: \"powershell_script\"`; use only `script_body`."
+                        "{tool_name} schema error in `powershell_script` branch at `$.{script_field}`/`$.program`/`$.args`: those fields cannot be mixed with this branch; use only `kind: \"powershell_script\"` and `script_body`."
                     )));
                 }
                 let Some(script_body) = script_body else {
                     return Err(FunctionCallError::RespondToModel(format!(
-                        "{tool_name} requires `script_body` when `kind` is `powershell_script`."
+                        "{tool_name} schema error in `powershell_script` branch at `$.script_body`: the field is required and must be a non-blank string."
                     )));
                 };
                 Ok(Self::PowerShellScript(script_body.to_string()))
@@ -199,7 +197,7 @@ impl CommandInvocation {
 
         match self {
             Self::Script(_) => {
-                if !matches!(kind, None | Some("legacy" | "script"))
+                if !matches!(kind, None | Some("script"))
                     || program.is_some()
                     || args.is_some()
                     || script_body.is_some()

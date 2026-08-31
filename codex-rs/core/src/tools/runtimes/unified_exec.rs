@@ -21,6 +21,7 @@ use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::ShellCommandPreparation;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::prepare_shell_command;
+use crate::tools::runtimes::shell_snapshot_additional_read_roots;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ApprovalCtx;
@@ -480,6 +481,10 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
         })
         .await;
 
+        let additional_read_roots = shell_snapshot_additional_read_roots(
+            shell_snapshot_location.as_deref(),
+            attempt.sandbox,
+        );
         let command = build_unified_exec_sandbox_command(
             &command,
             &req.cwd,
@@ -502,6 +507,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
             .open_session_with_exec_env(
                 req.process_id,
                 command,
+                additional_read_roots,
                 options,
                 req.additional_permissions_uri.as_ref(),
                 attempt,

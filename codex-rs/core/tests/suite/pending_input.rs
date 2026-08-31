@@ -734,7 +734,7 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_reasoning_item(
                 ev_function_call(
                     "call-preserved",
                     "shell",
-                    r#"{"command":"echo preserved tool call"}"#,
+                    r#"{"kind":"script","command":"echo preserved tool call"}"#,
                 ),
                 ev_message_item_added("msg-stale", ""),
                 ev_output_text_delta("stale final"),
@@ -800,7 +800,7 @@ async fn queued_inter_agent_mail_waits_for_later_tool_call_after_commentary_mess
                 ev_function_call(
                     "call-preserved",
                     "shell",
-                    r#"{"command":"echo preserved tool call"}"#,
+                    r#"{"kind":"script","command":"echo preserved tool call"}"#,
                 ),
                 ev_message_item_added("msg-stale", ""),
                 ev_output_text_delta("stale final"),
@@ -865,7 +865,7 @@ async fn user_input_does_not_preempt_after_reasoning_item() {
                 ev_function_call(
                     "call-preserved",
                     "shell",
-                    r#"{"command":"echo preserved tool call"}"#,
+                    r#"{"kind":"script","command":"echo preserved tool call"}"#,
                 ),
                 ev_message_item_added("msg-1", ""),
                 ev_output_text_delta("first answer"),
@@ -1098,6 +1098,7 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
 
     let large_output_command = "[Console]::Out.Write([string]::new([char]'0', 40000))";
     let large_output_args = json!({
+        "kind": "script",
         "command": large_output_command,
         "login": false,
         "timeout_ms": 2000,
@@ -1177,7 +1178,12 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
     steer_user_input(&codex, "second prompt").await;
     let _ = gate_first_completed_tx.send(());
 
-    wait_for_turn_complete(&codex).await;
+    core_test_support::wait_for_event_with_timeout(
+        &codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        tokio::time::Duration::from_secs(10),
+    )
+    .await;
 
     let requests = server.requests().await;
     assert_eq!(requests.len(), 4);

@@ -199,6 +199,8 @@ pub(crate) struct ToolHistoryCandidate {
     pub(crate) call_id: String,
     pub(crate) tool_identity: String,
     pub(crate) semantic_class: String,
+    #[serde(default = "default_true")]
+    pub(crate) successful: bool,
     #[serde(default)]
     pub(crate) source_dependencies: BTreeSet<SourceDependencyV1>,
     #[serde(default = "default_true")]
@@ -474,6 +476,8 @@ pub(crate) struct ToolHistoryState {
 pub(crate) struct WorkspaceEvidenceObservation {
     call_id: String,
     output_sha256: String,
+    #[serde(default = "default_true")]
+    successful: bool,
     #[serde(default)]
     revision: Option<WorkspaceEvidenceIdentity>,
     #[serde(default)]
@@ -509,6 +513,7 @@ impl WorkspaceEvidenceObservation {
         Some(Self {
             call_id: call_id.to_string(),
             output_sha256: sha256(output.as_bytes()),
+            successful: response_item_output_success(item) != Some(false),
             revision,
             source_dependencies,
             source_path_observations: Vec::new(),
@@ -689,7 +694,7 @@ impl ToolHistoryState {
             if excluded_call_ids.contains(call_id) {
                 continue;
             }
-            if !candidate.source_dependencies_current {
+            if !candidate.successful || !candidate.source_dependencies_current {
                 continue;
             }
             let affected = if candidate.source_dependencies.is_empty() {
@@ -712,7 +717,7 @@ impl ToolHistoryState {
             if excluded_call_ids.contains(call_id) {
                 continue;
             }
-            if !observation.source_dependencies_current {
+            if !observation.successful || !observation.source_dependencies_current {
                 continue;
             }
             let affected = observation.source_dependencies.is_empty()
@@ -1386,16 +1391,23 @@ impl ToolHistoryState {
     ) {
         let requirements = self.workspace_evidence_requirements(items);
 
+        let mut stale_exec_call_ids = BTreeSet::new();
         for item_index in 0..items.len() {
             let replacement = {
                 let item = &items[item_index];
                 let Some((call_id, output)) = canonical_textual_output_identity(item) else {
                     continue;
                 };
+                if response_item_output_success(item) == Some(false) {
+                    continue;
+                }
                 let Some(origin_call_id) = requirements.get(call_id) else {
                     continue;
                 };
                 let observation = self.workspace_evidence.get(origin_call_id);
+                if observation.is_some_and(|observation| !observation.successful) {
+                    continue;
+                }
                 let revision_matches = observation.is_some_and(|observation| {
                     observation.source_dependencies_current
                         && ((observation.revision.as_ref() == workspace_identity)
@@ -1431,11 +1443,42 @@ impl ToolHistoryState {
                 body,
                 serde_json::json!({
                     "call_id": call_id,
+                    "rerun": { "force_fresh": true },
                     "reason": reason,
                     "stale_workspace_evidence": true,
                 })
                 .to_string(),
             );
+            stale_exec_call_ids.insert(call_id);
+        }
+
+        if stale_exec_call_ids.is_empty() {
+            return;
+        }
+        for item in items.make_owned() {
+            let ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } = item
+            else {
+                continue;
+            };
+            if !stale_exec_call_ids.contains(call_id)
+                || name.rsplit('.').next() != Some("exec_command")
+            {
+                continue;
+            }
+            let Ok(serde_json::Value::Object(mut arguments_value)) =
+                serde_json::from_str(arguments)
+            else {
+                continue;
+            };
+            arguments_value.insert("force_fresh".to_string(), serde_json::Value::Bool(true));
+            if let Ok(projected_arguments) = serde_json::to_string(&arguments_value) {
+                *arguments = projected_arguments;
+            }
         }
     }
 
@@ -2480,6 +2523,14 @@ fn canonical_textual_output_identity(item: &ResponseItem) -> Option<(&str, Cow<'
     }
 }
 
+fn response_item_output_success(item: &ResponseItem) -> Option<bool> {
+    match item {
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => output.success,
+        _ => None,
+    }
+}
+
 fn textual_output_body_mut(item: &mut ResponseItem) -> Option<(&str, &mut FunctionCallOutputBody)> {
     match item {
         ResponseItem::FunctionCallOutput {
@@ -3458,7 +3509,7 @@ fn dependency_command(arguments: &serde_json::Value) -> Option<Vec<String>> {
         );
         return Some(command);
     }
-    for key in ["command", "cmd"] {
+    for key in ["command", "cmd", "script_body"] {
         match arguments.get(key) {
             Some(serde_json::Value::Array(values)) => {
                 return values
@@ -3487,13 +3538,19 @@ fn dependency_search_command(
     }
     let script = arguments
         .get("command")
-        .or_else(|| arguments.get("cmd"))?
+        .or_else(|| arguments.get("cmd"))
+        .or_else(|| arguments.get("script_body"))?
         .as_str()?;
-    let shell_type = arguments
-        .get("shell")
-        .and_then(serde_json::Value::as_str)
-        .and_then(shell_type_from_name)
-        .unwrap_or_else(|| crate::shell::default_user_shell().shell_type);
+    let shell_type =
+        if arguments.get("kind").and_then(serde_json::Value::as_str) == Some("powershell_script") {
+            crate::shell::ShellType::PowerShell
+        } else {
+            arguments
+                .get("shell")
+                .and_then(serde_json::Value::as_str)
+                .and_then(shell_type_from_name)
+                .unwrap_or_else(|| crate::shell::default_user_shell().shell_type)
+        };
     let command = match shell_type {
         crate::shell::ShellType::PowerShell => vec![
             "powershell".to_string(),

@@ -2666,6 +2666,7 @@ fn tool_history_candidate_lifecycle_preserves_prepared_base_and_refreshes_projec
         call_id: call_id.to_string(),
         tool_identity: "functions.exec".to_string(),
         semantic_class: "tool_output".to_string(),
+        successful: true,
         source_dependencies: BTreeSet::new(),
         source_dependencies_current: true,
         artifact_id: "artifact-cached-tool-history".to_string(),

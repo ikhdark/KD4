@@ -83,6 +83,7 @@ use codex_sandboxing::SandboxCommand;
 
 use crate::tools::runtimes::prove_noprofile_powershell_direct_argv_async;
 use codex_tools::ToolName;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathUri;
 
@@ -1688,6 +1689,7 @@ impl UnifiedExecProcessManager {
         &self,
         process_id: u32,
         command: SandboxCommand,
+        additional_read_roots: Vec<AbsolutePathBuf>,
         options: ExecOptions,
         additional_permissions_uri: Option<
             &codex_protocol::request_permissions::UriAdditionalPermissionProfile,
@@ -1714,6 +1716,7 @@ impl UnifiedExecProcessManager {
             attempt.env_for(command, options, network, environment_id)
         }
         .map_err(ToolError::Codex)?;
+        request.windows_sandbox_additional_read_roots = additional_read_roots;
         request.exec_server_env_config = exec_server_env_config;
         self.open_session_with_prepared_exec_env(
             process_id,
@@ -1792,6 +1795,7 @@ impl UnifiedExecProcessManager {
                         request.network.is_some(),
                         None,
                         elevated_read_roots_override.as_deref(),
+                        &request.windows_sandbox_additional_read_roots,
                         elevated_read_roots_include_platform_defaults,
                         elevated_write_roots_override.as_deref(),
                         &additional_deny_read_paths,

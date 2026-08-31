@@ -156,10 +156,42 @@ pub fn require_logon_sandbox_creds(
     proxy_enforced: bool,
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
 ) -> Result<SandboxCreds> {
+    require_logon_sandbox_creds_with_additional_read_roots(
+        permissions,
+        command_cwd,
+        env_map,
+        codex_home,
+        read_roots_override,
+        &[],
+        read_roots_include_platform_defaults,
+        write_roots_override,
+        deny_read_paths_override,
+        deny_write_paths_override,
+        proxy_enforced,
+        proxy_settings_mode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn require_logon_sandbox_creds_with_additional_read_roots(
+    permissions: &ResolvedWindowsSandboxPermissions,
+    command_cwd: &Path,
+    env_map: &HashMap<String, String>,
+    codex_home: &Path,
+    read_roots_override: Option<&[PathBuf]>,
+    additional_read_roots: &[PathBuf],
+    read_roots_include_platform_defaults: bool,
+    write_roots_override: Option<&[PathBuf]>,
+    deny_read_paths_override: &[PathBuf],
+    deny_write_paths_override: &[PathBuf],
+    proxy_enforced: bool,
+    proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+) -> Result<SandboxCreds> {
     let sandbox_dir = crate::setup::sandbox_dir(codex_home);
-    let needed_read = read_roots_override
+    let mut needed_read = read_roots_override
         .map(<[PathBuf]>::to_vec)
         .unwrap_or_else(|| gather_read_roots(command_cwd, permissions, env_map, codex_home));
+    extend_read_roots(&mut needed_read, additional_read_roots);
     let needed_write = write_roots_override
         .map(<[PathBuf]>::to_vec)
         .unwrap_or_else(|| gather_write_roots_for_permissions(permissions, command_cwd, env_map));
@@ -256,6 +288,14 @@ pub fn require_logon_sandbox_creds(
     })
 }
 
+fn extend_read_roots(read_roots: &mut Vec<PathBuf>, additional_read_roots: &[PathBuf]) {
+    for root in additional_read_roots {
+        if !read_roots.contains(root) {
+            read_roots.push(root.clone());
+        }
+    }
+}
+
 fn desired_offline_proxy_settings(
     marker: Option<&SetupMarker>,
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
@@ -279,6 +319,7 @@ pub(crate) fn refresh_logon_sandbox_creds(
     env_map: &HashMap<String, String>,
     codex_home: &Path,
     read_roots_override: Option<&[PathBuf]>,
+    additional_read_roots: &[PathBuf],
     read_roots_include_platform_defaults: bool,
     write_roots_override: Option<&[PathBuf]>,
     deny_read_paths_override: &[PathBuf],
@@ -287,12 +328,13 @@ pub(crate) fn refresh_logon_sandbox_creds(
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
 ) -> Result<SandboxCreds> {
     remove_sandbox_users_file(codex_home, "sandbox user login failed")?;
-    require_logon_sandbox_creds(
+    require_logon_sandbox_creds_with_additional_read_roots(
         permissions,
         command_cwd,
         env_map,
         codex_home,
         read_roots_override,
+        additional_read_roots,
         read_roots_include_platform_defaults,
         write_roots_override,
         deny_read_paths_override,
@@ -305,6 +347,7 @@ pub(crate) fn refresh_logon_sandbox_creds(
 #[cfg(test)]
 mod tests {
     use super::desired_offline_proxy_settings;
+    use super::extend_read_roots;
     use super::remove_sandbox_users_file;
     use crate::WindowsSandboxProxySettingsMode;
     use crate::setup::SandboxNetworkIdentity;
@@ -313,7 +356,19 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn additional_read_roots_preserve_base_roots_and_exact_files() {
+        let base = PathBuf::from(r"C:\workspace");
+        let snapshot = PathBuf::from(r"C:\codex-home\shell_snapshots\session.ps1");
+        let mut roots = vec![base.clone()];
+
+        extend_read_roots(&mut roots, &[snapshot.clone(), snapshot.clone()]);
+
+        assert_eq!(roots, vec![base, snapshot]);
+    }
 
     #[test]
     fn remove_sandbox_users_file_deletes_existing_file() {

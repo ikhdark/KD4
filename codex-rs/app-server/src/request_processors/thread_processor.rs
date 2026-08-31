@@ -3325,9 +3325,11 @@ impl ThreadRequestProcessor {
             match self.thread_manager.get_thread(existing_thread_id).await {
                 Ok(existing_thread) => Some((existing_thread_id, existing_thread, source_thread)),
                 Err(_) => {
-                    return Ok(RunningThreadResumeResult::NotRunning(Some(Box::new(
-                        source_thread,
-                    ))));
+                    // The running-thread probe deliberately avoids loading persisted history.
+                    // A cold resume must go through the normal rollout read below, which reloads
+                    // the same source with `include_history = true` before constructing
+                    // `InitialHistory`.
+                    return Ok(RunningThreadResumeResult::NotRunning(None));
                 }
             }
         };

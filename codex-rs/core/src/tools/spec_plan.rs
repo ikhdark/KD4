@@ -712,12 +712,19 @@ fn build_code_mode_executors(
 
     direct_only_tool_names.sort();
     direct_only_tool_names.dedup();
+    let eager_nested_tool_descriptions = code_mode_nested_tool_specs
+        .iter()
+        .filter(|spec| spec.name() == "exec_command")
+        .filter_map(codex_tools::tool_spec_to_code_mode_tool_definition)
+        .map(|definition| definition.description)
+        .collect::<Vec<_>>();
 
     let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new(
         create_code_mode_tool(
             tool_mode == ToolMode::CodeModeOnly,
             has_deferred_tools,
             &direct_only_tool_names,
+            &eager_nested_tool_descriptions,
         ),
         code_mode_nested_tool_specs,
         deferred_code_mode_nested_tool_specs,
@@ -990,6 +997,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 
     if turn_context.config.experimental_request_user_input_enabled
         && context.exposure_identity.request_user_input_eligible
+        && !matches!(turn_context.approval_policy.value(), AskForApproval::Never)
     {
         planned_tools.add_with_exposure_and_authorization_class(
             RequestUserInputHandler {

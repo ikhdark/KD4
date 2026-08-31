@@ -36,7 +36,7 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
-use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_with_timeout;
 use core_test_support::workspace_write_excluding_tmp;
 use pretty_assertions::assert_eq;
 use regex_lite::Regex;
@@ -44,7 +44,10 @@ use serde_json::Value;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 use test_case::test_case;
+
+const REQUEST_PERMISSIONS_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct CommandResult {
     exit_code: Option<i64>,
@@ -88,8 +91,10 @@ fn parse_result(item: &Value) -> CommandResult {
         }
         Err(_) => {
             let structured = Regex::new(r"(?s)^Exit code:\s*(-?\d+).*?Output:\n(.*)$").unwrap();
-            let regex =
-                Regex::new(r"(?s)^.*?Process exited with code (\d+)\n.*?Output:\n(.*)$").unwrap();
+            let regex = Regex::new(
+                r"(?s)^.*?Process exited with code (-?\d+)(?:;[^\n]*)?\n.*?Output:\n(.*)$",
+            )
+            .unwrap();
             if let Some(captures) = structured.captures(output_str) {
                 let exit_code = captures.get(1).unwrap().as_str().parse::<i64>().unwrap();
                 let output = captures.get(2).unwrap().as_str();
@@ -120,6 +125,7 @@ fn shell_event_with_request_permissions<S: serde::Serialize>(
     additional_permissions: &S,
 ) -> Result<Value> {
     let args = json!({
+        "kind": "script",
         "command": command,
         "timeout_ms": 1_000_u64,
         "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
@@ -144,6 +150,7 @@ fn request_permissions_tool_event(
 
 fn shell_command_event(call_id: &str, command: &str) -> Result<Value> {
     let args = json!({
+        "kind": "script",
         "command": command,
         "timeout_ms": 1_000_u64,
     });
@@ -153,8 +160,9 @@ fn shell_command_event(call_id: &str, command: &str) -> Result<Value> {
 
 fn exec_command_event(call_id: &str, command: &str) -> Result<Value> {
     let args = json!({
+        "kind": "script",
         "cmd": command,
-        "yield_time_ms": 1_000_u64,
+        "yield_time_ms": 30_000_u64,
     });
     let args_str = serde_json::to_string(&args)?;
     Ok(ev_function_call(call_id, "exec_command", &args_str))
@@ -166,8 +174,9 @@ fn exec_command_event_with_request_permissions<S: serde::Serialize>(
     additional_permissions: &S,
 ) -> Result<Value> {
     let args = json!({
+        "kind": "script",
         "cmd": command,
-        "yield_time_ms": 1_000_u64,
+        "yield_time_ms": 30_000_u64,
         "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
         "additional_permissions": additional_permissions,
     });
@@ -180,6 +189,7 @@ fn exec_command_event_with_missing_additional_permissions(
     command: &str,
 ) -> Result<Value> {
     let args = json!({
+        "kind": "script",
         "cmd": command,
         "yield_time_ms": 1_000_u64,
         "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
@@ -228,9 +238,11 @@ async fn submit_turn(
 }
 
 async fn wait_for_completion(test: &TestCodex) {
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        REQUEST_PERMISSIONS_EVENT_TIMEOUT,
+    )
     .await;
 }
 
@@ -238,12 +250,16 @@ async fn expect_exec_approval(
     test: &TestCodex,
     expected_command: &str,
 ) -> ExecApprovalRequestEvent {
-    let event = wait_for_event(&test.codex, |event| {
-        matches!(
-            event,
-            EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
-        )
-    })
+    let event = wait_for_event_with_timeout(
+        &test.codex,
+        |event| {
+            matches!(
+                event,
+                EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
+            )
+        },
+        REQUEST_PERMISSIONS_EVENT_TIMEOUT,
+    )
     .await;
 
     match event {
@@ -264,12 +280,16 @@ async fn expect_exec_approval(
 async fn wait_for_exec_approval_or_completion(
     test: &TestCodex,
 ) -> Option<ExecApprovalRequestEvent> {
-    let event = wait_for_event(&test.codex, |event| {
-        matches!(
-            event,
-            EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
-        )
-    })
+    let event = wait_for_event_with_timeout(
+        &test.codex,
+        |event| {
+            matches!(
+                event,
+                EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
+            )
+        },
+        REQUEST_PERMISSIONS_EVENT_TIMEOUT,
+    )
     .await;
 
     match event {
@@ -283,12 +303,16 @@ async fn expect_request_permissions_event(
     test: &TestCodex,
     expected_call_id: &str,
 ) -> RequestPermissionProfile {
-    let event = wait_for_event(&test.codex, |event| {
-        matches!(
-            event,
-            EventMsg::RequestPermissions(_) | EventMsg::TurnComplete(_)
-        )
-    })
+    let event = wait_for_event_with_timeout(
+        &test.codex,
+        |event| {
+            matches!(
+                event,
+                EventMsg::RequestPermissions(_) | EventMsg::TurnComplete(_)
+            )
+        },
+        REQUEST_PERMISSIONS_EVENT_TIMEOUT,
+    )
     .await;
 
     match event {
@@ -342,7 +366,9 @@ async fn with_additional_permissions_requires_approval_under_on_request() -> Res
         )),
         ..Default::default()
     };
-    let event = shell_event_with_request_permissions(call_id, command, &requested_permissions)?;
+    let native_requested_permissions = native_permissions(requested_permissions.clone())?;
+    let event =
+        shell_event_with_request_permissions(call_id, command, &native_requested_permissions)?;
 
     let _ = mount_sse_once(
         &server,
@@ -457,12 +483,16 @@ async fn request_permissions_tool_is_auto_denied_when_granular_request_permissio
     )
     .await?;
 
-    let event = wait_for_event(&test.codex, |event| {
-        matches!(
-            event,
-            EventMsg::RequestPermissions(_) | EventMsg::TurnComplete(_)
-        )
-    })
+    let event = wait_for_event_with_timeout(
+        &test.codex,
+        |event| {
+            matches!(
+                event,
+                EventMsg::RequestPermissions(_) | EventMsg::TurnComplete(_)
+            )
+        },
+        REQUEST_PERMISSIONS_EVENT_TIMEOUT,
+    )
     .await;
     assert!(
         matches!(event, EventMsg::TurnComplete(_)),
@@ -545,6 +575,7 @@ async fn relative_additional_permissions_resolve_against_tool_workdir(
         AdditionalPermissionsCommandTool::ShellCommand => (
             "shell_command",
             json!({
+                "kind": "script",
                 "command": command,
                 "workdir": workdir,
                 "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
@@ -554,6 +585,7 @@ async fn relative_additional_permissions_resolve_against_tool_workdir(
         AdditionalPermissionsCommandTool::ExecCommand => (
             "exec_command",
             json!({
+                "kind": "script",
                 "cmd": command,
                 "workdir": workdir,
                 "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
@@ -662,7 +694,9 @@ async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> 
         )),
         ..RequestPermissionProfile::default()
     };
-    let event = shell_event_with_request_permissions(call_id, &command, &requested_permissions)?;
+    let native_requested_permissions = native_permissions(requested_permissions.clone())?;
+    let event =
+        shell_event_with_request_permissions(call_id, &command, &native_requested_permissions)?;
 
     let _ = mount_sse_once(
         &server,
@@ -764,7 +798,9 @@ async fn with_additional_permissions_denied_approval_blocks_execution() -> Resul
         )),
         ..Default::default()
     })?;
-    let event = shell_event_with_request_permissions(call_id, &command, &requested_permissions)?;
+    let native_requested_permissions = native_permissions(requested_permissions.clone())?;
+    let event =
+        shell_event_with_request_permissions(call_id, &command, &native_requested_permissions)?;
 
     let _ = mount_sse_once(
         &server,
@@ -957,6 +993,7 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
     let requested_permissions = requested_directory_write_permissions(outside_dir.path());
     let normalized_requested_permissions =
         normalized_directory_write_permissions(outside_dir.path())?;
+    let native_requested_permissions = native_permissions(requested_permissions.clone())?;
     let responses = mount_sse_sequence(
         &server,
         vec![
@@ -974,7 +1011,7 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
                 exec_command_event_with_request_permissions(
                     "exec-call",
                     &command,
-                    &requested_permissions,
+                    &native_requested_permissions,
                 )?,
                 ev_completed("resp-sticky-explicit-2"),
             ]),
@@ -1321,6 +1358,7 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
     };
     let granted_permissions = normalized_directory_write_permissions(first_dir.path())?;
     let second_dir_permissions = requested_directory_write_permissions(second_dir.path());
+    let native_second_dir_permissions = native_permissions(second_dir_permissions.clone())?;
     let merged_permissions = PermissionProfile {
         file_system: Some(FileSystemPermissions::from_read_write_roots(
             Some(vec![]),
@@ -1349,7 +1387,7 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
                 exec_command_event_with_request_permissions(
                     "exec-call",
                     &command,
-                    &second_dir_permissions,
+                    &native_second_dir_permissions,
                 )?,
                 ev_completed("resp-partial-2"),
             ]),

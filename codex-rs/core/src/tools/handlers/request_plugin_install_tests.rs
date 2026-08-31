@@ -4,6 +4,7 @@ use crate::plugins::test_support::write_curated_plugin_sha;
 use crate::plugins::test_support::write_openai_curated_marketplace;
 use crate::plugins::test_support::write_plugins_feature_config;
 use crate::session::tests::make_session_and_context_with_rx;
+use anyhow::Context as _;
 use codex_app_server_protocol::PluginAuthPolicy;
 use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
@@ -161,18 +162,30 @@ fn local_plugin_completion_requires_requested_mcp_servers() {
     ));
 }
 
+/// What this tests: resolving a helper binary no test target declares fails
+/// instead of returning a path, so a missing required helper propagates to the
+/// caller rather than turning the regression below into a silent pass.
+#[test]
+fn missing_stdio_helper_binary_resolution_reports_an_error() {
+    let error = core_test_support::required_helper_bin_with("test_stdio_server", |name| {
+        Err(codex_utils_cargo_bin::CargoBinError::NotFound {
+            name: name.to_string(),
+            env_keys: vec![format!("CARGO_BIN_EXE_{name}")],
+            fallback: "disabled in propagation test".to_string(),
+        })
+    })
+    .expect_err("a missing required helper must fail the test");
+
+    assert!(
+        error.to_string().contains("test_stdio_server"),
+        "error should name the missing helper: {error}"
+    );
+}
+
 #[tokio::test]
-async fn requested_mcp_servers_are_refreshed_before_install_completion() {
-    let command = match core_test_support::stdio_server_bin() {
-        Ok(command) => command,
-        Err(err) => {
-            tracing::warn!(
-                %err,
-                "test_stdio_server unavailable; skipping plugin MCP refresh regression"
-            );
-            return;
-        }
-    };
+async fn requested_mcp_servers_are_refreshed_before_install_completion() -> anyhow::Result<()> {
+    let command = core_test_support::stdio_server_bin()
+        .context("test_stdio_server is required by the plugin MCP refresh regression")?;
     let (session, mut turn, _events) = make_session_and_context_with_rx().await;
     let turn_context = Arc::get_mut(&mut turn).expect("test turn should be uniquely owned");
     let config = Arc::make_mut(&mut turn_context.config);
@@ -232,6 +245,7 @@ async fn requested_mcp_servers_are_refreshed_before_install_completion() {
             .any(|tool| tool.server_name == "installed-plugin-server"),
         "the refreshed current-session runtime should expose the plugin MCP tools"
     );
+    Ok(())
 }
 
 #[tokio::test]

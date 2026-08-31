@@ -216,7 +216,7 @@ async fn model_change_appends_compact_compatibility_delta() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn model_switch_with_unchanged_personality_omits_personality_delta() -> Result<()> {
+async fn model_switch_with_unchanged_personality_reinjects_personality_delta() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -231,6 +231,7 @@ async fn model_switch_with_unchanged_personality_omits_personality_delta() -> Re
             .features
             .enable(Feature::Personality)
             .expect("test config should allow feature update");
+        config.personality = Some(Personality::Pragmatic);
     });
     let test = builder.build(&server).await?;
     let next_model = "exp-codex-personality";
@@ -281,10 +282,10 @@ async fn model_switch_with_unchanged_personality_omits_personality_delta() -> Re
         "expected model switch message when model changes"
     );
     assert!(
-        !developer_texts
+        developer_texts
             .iter()
             .any(|text| text.contains("<personality_spec>")),
-        "did not expect a separate personality update during the model switch"
+        "expected the new model to receive the unchanged personality wording"
     );
 
     Ok(())

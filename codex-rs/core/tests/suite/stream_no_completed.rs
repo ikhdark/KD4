@@ -98,7 +98,7 @@ async fn retries_on_early_close() {
     assert_eq!(stream_error.message, "Reconnecting... 1/1");
     assert_eq!(
         stream_error.additional_details.as_deref(),
-        Some("stream disconnected before completion: stream closed before response.completed")
+        Some("Error while reading the server response: stream closed before response.completed")
     );
     assert!(matches!(
         stream_error.codex_error_info,

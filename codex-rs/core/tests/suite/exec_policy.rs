@@ -6,6 +6,7 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecPolicyAmendment;
@@ -112,6 +113,7 @@ async fn unified_exec_disabled_windows_sandbox_rejects_managed_read_only_command
     let test = builder.build(&server).await?;
     let call_id = "unified-exec-disabled-windows-sandbox-read-only";
     let args = json!({
+        "kind": "script",
         "cmd": "cmd.exe /c dir",
         "yield_time_ms": 1_000,
     });
@@ -163,20 +165,22 @@ async fn unified_exec_disabled_windows_sandbox_rejects_managed_read_only_command
 
 #[tokio::test]
 async fn execpolicy_blocks_shell_invocation() -> Result<()> {
-    let mut builder = test_codex().with_pre_build_hook(|codex_home| {
-        let policy_path = codex_home.join("rules").join("policy.rules");
-        fs::create_dir_all(
-            policy_path
-                .parent()
-                .expect("policy directory must have a parent"),
-        )
-        .expect("create policy directory");
-        fs::write(
-            &policy_path,
-            r#"prefix_rule(pattern=["echo"], decision="forbidden")"#,
-        )
-        .expect("write policy file");
-    });
+    let mut builder = test_codex()
+        .with_raw_response_items()
+        .with_pre_build_hook(|codex_home| {
+            let policy_path = codex_home.join("rules").join("policy.rules");
+            fs::create_dir_all(
+                policy_path
+                    .parent()
+                    .expect("policy directory must have a parent"),
+            )
+            .expect("create policy directory");
+            fs::write(
+                &policy_path,
+                r#"prefix_rule(pattern=["echo"], decision="forbidden")"#,
+            )
+            .expect("write policy file");
+        });
     let server = start_mock_server().await;
     let test = builder.build(&server).await?;
 
@@ -197,55 +201,34 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
         ]),
     )
     .await;
-    let results_mock = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-1", "done"),
-            ev_completed("resp-2"),
-        ]),
+    submit_user_turn(
+        &test,
+        "run shell command",
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+        None,
     )
-    .await;
-
-    let session_model = test.session_configured.model.clone();
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
-    test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "run shell command".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
-                approval_policy: Some(AskForApproval::Never),
-                sandbox_policy: Some(sandbox_policy),
-                permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
-                        model: session_model,
-                        reasoning_effort: None,
-                        developer_instructions: None,
-                    },
-                }),
-                ..Default::default()
-            },
-        })
-        .await?;
-
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-
-    let output_item = results_mock.single_request().function_call_output(call_id);
-    let output = output_item
-        .get("output")
-        .and_then(Value::as_str)
-        .expect("function call output should include a string output payload");
+    .await?;
+    let output = loop {
+        match wait_for_event(&test.codex, |_| true).await {
+            EventMsg::RawResponseItem(raw) => {
+                if let ResponseItem::FunctionCallOutput {
+                    call_id: output_call_id,
+                    output,
+                    ..
+                } = raw.item
+                    && output_call_id == call_id
+                    && let Some(text) = output.text_content()
+                {
+                    break text.to_string();
+                }
+            }
+            EventMsg::TurnComplete(_) => {
+                panic!("forbidden command emitted no model-visible tool output")
+            }
+            _ => {}
+        }
+    };
     assert!(
         output.contains("policy forbids commands starting with `echo`"),
         "unexpected output: {output}",
@@ -415,6 +398,7 @@ async fn shell_command_empty_script_with_collaboration_mode_does_not_panic() -> 
     let test = builder.build(&server).await?;
     let call_id = "shell-empty-script-collab";
     let args = json!({
+        "kind": "script",
         "command": "",
         "timeout_ms": 1_000,
     });
@@ -470,6 +454,7 @@ async fn unified_exec_empty_script_with_collaboration_mode_does_not_panic() -> R
     let test = builder.build(&server).await?;
     let call_id = "unified-exec-empty-script-collab";
     let args = json!({
+        "kind": "script",
         "cmd": "",
         "yield_time_ms": 1_000,
     });
@@ -520,6 +505,7 @@ async fn shell_command_whitespace_script_with_collaboration_mode_does_not_panic(
     let test = builder.build(&server).await?;
     let call_id = "shell-whitespace-script-collab";
     let args = json!({
+        "kind": "script",
         "command": "  \n\t  ",
         "timeout_ms": 1_000,
     });
@@ -575,6 +561,7 @@ async fn unified_exec_whitespace_script_with_collaboration_mode_does_not_panic()
     let test = builder.build(&server).await?;
     let call_id = "unified-exec-whitespace-script-collab";
     let args = json!({
+        "kind": "script",
         "cmd": " \n \t",
         "yield_time_ms": 1_000,
     });

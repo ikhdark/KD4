@@ -22,6 +22,7 @@ use crate::tools::runtimes::ShellCommandPreparation;
 use crate::tools::runtimes::build_sandbox_command;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::prepare_shell_command;
+use crate::tools::runtimes::shell_snapshot_additional_read_roots;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ApprovalCtx;
@@ -385,6 +386,10 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         })
         .await;
 
+        let additional_read_roots = shell_snapshot_additional_read_roots(
+            shell_snapshot_location.as_deref(),
+            attempt.sandbox,
+        );
         let command =
             build_sandbox_command(&command, &req.cwd, &env, req.additional_permissions.clone())?;
         let mut expiration: crate::exec::ExecExpiration = req.timeout_ms.into();
@@ -400,7 +405,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             expiration,
             capture_policy: ExecCapturePolicy::ShellTool,
         };
-        let env = attempt
+        let mut env = attempt
             .env_for(
                 command,
                 options,
@@ -408,6 +413,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 Some(&req.turn_environment.environment_id),
             )
             .map_err(ToolError::Codex)?;
+        env.windows_sandbox_additional_read_roots = additional_read_roots;
         let authorization_guard = if let Some(launch) = req.validation_launch.as_ref() {
             let guard = Arc::clone(&ctx.turn.validation_authorization)
                 .read_owned()

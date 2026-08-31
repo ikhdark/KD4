@@ -64,7 +64,12 @@ async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
         .submit(Op::RunUserShellCommand { command: list_cmd })
         .await
         .unwrap();
-    let msg = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecCommandEnd(_))).await;
+    let msg = wait_for_event_with_timeout(
+        &codex,
+        |ev| matches!(ev, EventMsg::ExecCommandEnd(_)),
+        Duration::from_secs(10),
+    )
+    .await;
     let EventMsg::ExecCommandEnd(ExecCommandEndEvent {
         stdout, exit_code, ..
     }) = msg
@@ -76,6 +81,12 @@ async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
         stdout.contains(file_name),
         "ls output should include {file_name}, got: {stdout:?}"
     );
+    wait_for_event_with_timeout(
+        &codex,
+        |ev| matches!(ev, EventMsg::TurnComplete(_)),
+        Duration::from_secs(10),
+    )
+    .await;
 
     // 2) shell command should print the file contents verbatim
     let cat_cmd = format!("cat {file_name}");
@@ -83,7 +94,12 @@ async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
         .submit(Op::RunUserShellCommand { command: cat_cmd })
         .await
         .unwrap();
-    let msg = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExecCommandEnd(_))).await;
+    let msg = wait_for_event_with_timeout(
+        &codex,
+        |ev| matches!(ev, EventMsg::ExecCommandEnd(_)),
+        Duration::from_secs(10),
+    )
+    .await;
     let EventMsg::ExecCommandEnd(ExecCommandEndEvent {
         mut stdout,
         exit_code,
@@ -178,17 +194,23 @@ async fn user_shell_cmd_can_be_interrupted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()> {
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.4");
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow unified exec");
+    });
     let fixture = builder.build(&server).await?;
 
     let call_id = "active-turn-shell-call";
     let args = serde_json::json!({
-        "command": "Start-Sleep -Seconds 2; Write-Output model-shell",
-        "timeout_ms": 10_000,
+        "kind": "script",
+        "cmd": "Start-Sleep -Seconds 2; Write-Output model-shell",
+        "yield_time_ms": 10_000,
     });
     let first = sse(vec![
         ev_response_created("resp-1"),
-        ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+        ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
         ev_completed("resp-1"),
     ]);
     let second = sse(vec![
@@ -229,12 +251,16 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
         })
         .await?;
 
-    let _ = wait_for_event_match(&fixture.codex, |ev| match ev {
-        EventMsg::ExecCommandBegin(event) if event.source == ExecCommandSource::Agent => {
-            Some(event.clone())
-        }
-        _ => None,
-    })
+    wait_for_event_with_timeout(
+        &fixture.codex,
+        |ev| {
+            matches!(
+                ev,
+                EventMsg::ExecCommandBegin(event) if event.call_id == call_id
+            )
+        },
+        Duration::from_secs(10),
+    )
     .await;
 
     let user_shell_command = "Write-Output user-shell".to_string();
@@ -389,16 +415,20 @@ async fn user_shell_command_does_not_set_network_sandbox_env_var() -> anyhow::Re
         .submit(Op::RunUserShellCommand { command })
         .await?;
 
-    let ExecCommandEndEvent {
+    let EventMsg::ExecCommandEnd(ExecCommandEndEvent {
         exit_code,
         stdout,
         stderr,
         ..
-    } = wait_for_event_match(&test.codex, |ev| match ev {
-        EventMsg::ExecCommandEnd(event) => Some(event.clone()),
-        _ => None,
-    })
-    .await;
+    }) = wait_for_event_with_timeout(
+        &test.codex,
+        |ev| matches!(ev, EventMsg::ExecCommandEnd(_)),
+        Duration::from_secs(10),
+    )
+    .await
+    else {
+        unreachable!()
+    };
 
     assert_eq!(
         exit_code, 0,

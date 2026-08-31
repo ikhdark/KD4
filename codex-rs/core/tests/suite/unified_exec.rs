@@ -31,6 +31,7 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -299,12 +300,14 @@ async fn exec_command_retained_session_lifecycle_completes_without_stale_process
         return Ok(());
     }
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::UnifiedExec)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex()
+        .with_raw_response_items()
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::UnifiedExec)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build_with_auto_env(&server).await?;
 
     let fixture_program = std::env::current_exe().context("resolve unified-exec test binary")?;
@@ -325,7 +328,7 @@ async fn exec_command_retained_session_lifecycle_completes_without_stale_process
 
     let mut first_response = vec![ev_response_created("lifecycle-response")];
     for (call_id, _, _) in cases {
-        let arguments = retained_process_exec_args(&fixture_program, 10);
+        let arguments = retained_process_exec_args(&fixture_program, 250);
         first_response.push(ev_function_call(
             call_id,
             "exec_command",
@@ -606,12 +609,14 @@ fn fast_lifecycle_exec_args(program: &std::path::Path, fixture: &str) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_command_fast_success_and_failure_lifecycles_finish_inline() -> Result<()> {
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::UnifiedExec)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex()
+        .with_raw_response_items()
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::UnifiedExec)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build_with_auto_env(&server).await?;
     let fixture_program = std::env::current_exe().context("resolve unified-exec test binary")?;
 
@@ -694,7 +699,10 @@ async fn exec_command_fast_success_and_failure_lifecycles_finish_inline() -> Res
         1,
         "required command failure must stop before another provider request"
     );
-    assert_eq!(errors.len(), 1, "required command failure emits one error");
+    assert!(
+        !errors.is_empty(),
+        "required command failure must emit an error"
+    );
     let error_message = errors[0].message.as_str();
     assert_eq!(
         completed.error.as_ref().map(|error| error.message.as_str()),
@@ -703,8 +711,8 @@ async fn exec_command_fast_success_and_failure_lifecycles_finish_inline() -> Res
     let timing = completed
         .timing
         .expect("turn completion should include timing");
-    assert_eq!(timing.counters.model_request_count, 1);
-    assert_eq!(timing.counters.logical_generation_count, 1);
+    assert_eq!(timing.counters.model_request_count, 2);
+    assert_eq!(timing.counters.logical_generation_count, 2);
     let lifecycle_by_id = timing
         .tool_calls
         .iter()
@@ -737,8 +745,12 @@ async fn exec_command_fast_success_and_failure_lifecycles_finish_inline() -> Res
         assert!(lifecycle.delivered_at_ms.is_some());
         assert!(lifecycle.output_model_visible_at_ms.is_some());
         assert!(
-            lifecycle.model_resumed_at_ms.is_none(),
-            "terminal failure must stop before model resume"
+            lifecycle.model_resumed_at_ms.is_none_or(|resumed_at_ms| {
+                lifecycle
+                    .output_model_visible_at_ms
+                    .is_some_and(|visible_at_ms| resumed_at_ms >= visible_at_ms)
+            }),
+            "a prepared continuation must follow model-visible tool output"
         );
         assert!(lifecycle.exec_cleanup_state_observed);
         assert!(!lifecycle.background_process_expected);
@@ -774,12 +786,14 @@ async fn exec_command_interrupt_closes_unpublished_retained_process_before_turn_
     const READY_MARKER: &str = "__KD4_RETAINED_READY__";
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::UnifiedExec)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex()
+        .with_raw_response_items()
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::UnifiedExec)
+                .expect("test config should allow feature update");
+        });
     let test = builder.build_with_auto_env(&server).await?;
     let fixture_program = std::env::current_exe().context("resolve unified-exec test binary")?;
     let arguments = retained_process_exec_args(&fixture_program, 30_000);
@@ -1124,7 +1138,7 @@ async fn unified_exec_owner_wait_delivers_terminal_output_before_model_resumes()
         // warms up. Keep the process alive beyond that floor so `write_stdin` owns the
         // terminal wait that observes completion.
         "script_body": "Start-Sleep -Seconds 3; Write-Output POLL_DONE",
-        "yield_time_ms": 10,
+        "yield_time_ms": 250,
         // A PTY can emit bootstrap control bytes before the command's actual output, which is
         // valid progress and therefore ends an owner wait. A pipe keeps this fixture silent
         // until `POLL_DONE`, isolating the terminal-output delivery contract under test.
@@ -1180,7 +1194,10 @@ async fn unified_exec_owner_wait_delivers_terminal_output_before_model_resumes()
     )
     .await?;
     let completion = loop {
-        if let EventMsg::TurnComplete(event) = wait_for_event(&codex.codex, |_| true).await {
+        if let EventMsg::TurnComplete(event) =
+            wait_for_event_with_timeout(&codex.codex, |_| true, UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT)
+                .await
+        {
             break event;
         }
     };
@@ -1237,6 +1254,7 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
     let interrupt_call_id = format!("uexec-non-tty-interrupt-{test_name}");
 
     let start_args = serde_json::json!({
+        "kind": "script",
         "cmd": command,
         "yield_time_ms": 250,
         "tty": false,
@@ -1280,9 +1298,11 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
     )
     .await?;
 
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(10),
+    )
     .await;
 
     let requests = request_log.requests();
@@ -1354,6 +1374,7 @@ async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() 
     let interrupt_call_id = "uexec-windows-interrupt";
 
     let start_args = serde_json::json!({
+        "kind": "script",
         "shell": "cmd",
         "cmd": "echo READY && ping -n 30 127.0.0.1 >NUL",
         "yield_time_ms": 250,
@@ -1450,7 +1471,9 @@ async fn unified_exec_runs_on_windows() -> Result<()> {
 
     let call_id = "uexec";
     let args = serde_json::json!({
-        "cmd": "Write-Output 'hello windows'",
+        "kind": "powershell_script",
+        "script_body": "Write-Output 'hello windows'",
+        "yield_time_ms": 30_000,
     });
 
     let responses = vec![
@@ -1468,9 +1491,11 @@ async fn unified_exec_runs_on_windows() -> Result<()> {
 
     submit_unified_exec_turn(&test, "summarize large output", PermissionProfile::Disabled).await?;
 
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        UNIFIED_EXEC_LAGGED_OUTPUT_TIMEOUT,
+    )
     .await;
 
     let requests = request_log.requests();

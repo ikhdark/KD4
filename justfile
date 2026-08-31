@@ -212,52 +212,77 @@ rust-perf-env *args:
 # `--all-features`.
 [windows]
 test *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed "target" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast @forwarded_args
 
 # Fast local test loop: stop at the first failure and skip flaky retries.
 [windows]
 test-fast *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed "target" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run @forwarded_args
 
 # Keep the raw config, resolved defaults, and reachable sampling policy in one gate.
-[windows]
+# The filters and their exact test IDs live in codex-rs/.config/kd4-rust-tests.toml.
 adaptive-reasoning-contract-check:
-    just test-fast -p codex-config --no-tests=fail -E 'test(reasoning_phase_efforts_distinguish_absent_empty_partial_and_full_tables) | test(empty_higher_reasoning_phase_table_preserves_lower_entries) | test(partial_higher_reasoning_phase_table_merges_per_field)'
-    just test-fast -p codex-core --no-tests=fail -E 'test(load_config_defaults_phase_tracking_to_compatibility_efforts) | test(load_config_preserves_explicit_reasoning_phase_effort_overrides) | test(load_config_preserves_all_explicit_reasoning_phase_effort_overrides) | test(reachable_changed_continuation_uses_the_lowest_supported_explicit_override) | test(reachable_changed_continuation_defaults_to_low_even_when_turn_is_high) | test(request_policy_rejects_host_terminal_completion) | test(protocol_terminal_continuation_is_marked_for_host_elision_only_when_unchanged) | test(global_effort_survives_unoverridden_decision_bearing_phases)'
+    just core-gate adaptive-reasoning-contract
+
+# Named `codex-core` test targets and gates. `codex-rs/.config/kd4-rust-tests.toml`
+# owns the package/target selection and the exact helper binaries each target
+# needs, so the selection cannot drift and a zero-test selection always fails.
+# `just core-test-list` prints the available names.
+[windows]
+core-test target *args:
+    $forwarded_args = @($args | Select-Object -Skip 2); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" run-target "{{ target }}" --no-fail-fast @forwarded_args
+
+# Fast local loop for a named core target: stop at the first failure, no retries.
+[windows]
+core-test-fast target *args:
+    $forwarded_args = @($args | Select-Object -Skip 2); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" run-target "{{ target }}" @forwarded_args
+
+# Run a named core target in its own reserved Cargo lane.
+[windows]
+core-test-lane target *args:
+    $forwarded_args = @($args | Select-Object -Skip 2); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane "{{ target }}" -- just _core-test-lane-reserved "{{ target }}" @forwarded_args
 
 [windows]
-_core-test-helpers-if-needed target_dir *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); $text = ($forwarded_args -join " "); $has_filter = ($forwarded_args -contains "-E") -or ($forwarded_args -contains "--filter-expr") -or ($text -match "--filter-expr="); if (-not $has_filter) { just _core-test-helpers "{{ target_dir }}"; exit $LASTEXITCODE }; just _core-test-helpers-runtime "{{ target_dir }}"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; if ($text -match "(?i)rmcp|mcp|plugin|test_stdio_server") { just _core-test-helpers-mcp "{{ target_dir }}"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; if ($text -match "(?i)windows_sandbox|windows-sandbox|sandbox|codex_command_runner") { just _core-test-helpers-windows-sandbox "{{ target_dir }}"; exit $LASTEXITCODE }
+_core-test-lane-reserved target *args:
+    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" --target-dir $target_dir run-target "{{ target }}" @forwarded_args
 
+# Run a named gate: every declared step must select exactly its declared test IDs.
 [windows]
-_core-test-helpers target_dir:
-    just _core-test-helpers-runtime "{{ target_dir }}"
-    just _core-test-helpers-mcp "{{ target_dir }}"
-    just _core-test-helpers-windows-sandbox "{{ target_dir }}"
+core-gate gate:
+    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" run-gate "{{ gate }}"
 
-[windows]
-_core-test-helpers-runtime target_dir:
-    cargo build --target-dir "{{ target_dir }}" -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host
+# List the named core targets and gates.
+[no-cd]
+core-test-list:
+    @{{ python }} "{{ justfile_directory() }}/scripts/rust_test_runner.py" list-targets
 
-[windows]
-_core-test-helpers-mcp target_dir:
-    cargo build --target-dir "{{ target_dir }}" -p codex-rmcp-client --bin test_stdio_server
+# Show the resolved selection, helper builds, and commands for a target or gate.
+[no-cd]
+core-test-plan name:
+    @{{ python }} "{{ justfile_directory() }}/scripts/rust_test_runner.py" plan "{{ name }}"
 
+# Validate the manifest against `cargo metadata --no-deps` without building tests.
+[no-cd]
+core-test-manifest-check:
+    @{{ python }} "{{ justfile_directory() }}/scripts/rust_test_runner.py" check-manifest
+
+# Compare a legacy integration target against the union of its replacements, then
+# run both once. Used only for the authorized `all` -> shard migration gate.
 [windows]
-_core-test-helpers-windows-sandbox target_dir:
-    cargo build --target-dir "{{ target_dir }}" -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
+core-test-parity legacy *args:
+    $forwarded_args = @($args | Select-Object -Skip 2); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" parity "{{ legacy }}" @forwarded_args
 
 [windows]
 test-fast-nosccache *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = "{{ justfile_directory() }}\codex-rs\target\lanes\perf-nextest-nosccache"; if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed $target_dir @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; $command_args = @("cargo", "nextest", "run") + $forwarded_args; & "{{ justfile_directory() }}\scripts\invoke-rust-perf-env.ps1" -NoSccache -CargoTargetLane "perf-nextest-nosccache" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $command_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; $command_args = @("cargo", "nextest", "run") + $forwarded_args; & "{{ justfile_directory() }}\scripts\invoke-rust-perf-env.ps1" -NoSccache -CargoTargetLane "perf-nextest-nosccache" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $command_args; exit $LASTEXITCODE
 
 [windows]
 test-compile *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto -- cargo nextest run --no-run @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; python "{{ justfile_directory() }}\scripts\rust_build_status.py" run-lane --lane auto -- cargo nextest run --no-run @forwarded_args
 
 [windows]
 test-windows-sandbox-processes *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS = "1"; cargo nextest run --no-tests=fail -p codex-utils-pty -E 'test(terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty) | test(normal_exit_preserves_descendants_for_pipe_and_conpty) | test(conpty_delivers_input_to_foreground_children) | test(conpty_ctrl_c_interrupts_powershell_foreground_child) | test(required_process_test_prerequisites_report_unverified_coverage)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo nextest run --no-tests=fail -p codex-windows-sandbox -E 'test(legacy_capture_cancellation_terminates_descendants_without_timeout) | test(controlling_ipc_eof_terminates_process_tree) | test(process_wait_failure_is_not_treated_as_exit) | test(invalid_process_wait_is_not_treated_as_exit)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo nextest run --no-tests=fail -p codex-core direct_exec_cancellation_terminates_windows_descendants @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS = "1"; cargo nextest run --no-tests=fail -p codex-utils-pty -E 'test(terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty) | test(normal_exit_preserves_descendants_for_pipe_and_conpty) | test(conpty_delivers_input_to_foreground_children) | test(conpty_ctrl_c_interrupts_powershell_foreground_child) | test(required_process_test_prerequisites_report_unverified_coverage)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo nextest run --no-tests=fail -p codex-windows-sandbox -E 'test(legacy_capture_cancellation_terminates_descendants_without_timeout) | test(controlling_ipc_eof_terminates_process_tree) | test(process_wait_failure_is_not_treated_as_exit) | test(invalid_process_wait_is_not_treated_as_exit)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; just core-gate windows-sandbox-core-exec
 
 # Full local test gate plus benchmark startup smoke.
 test-full-with-bench *args:
@@ -297,16 +322,16 @@ test-lane-fast lane *args:
 
 [windows]
 _test-lane-local-reserved *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed $target_dir @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --target-dir $target_dir --no-fail-fast @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --target-dir $target_dir --no-fail-fast @forwarded_args
 
 [windows]
 _test-lane-fast-reserved *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed $target_dir @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir @forwarded_args
 
 # Emit nextest timing reports for the selected local test slice.
 [windows]
 test-timings *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed "target" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast --timings=html,json @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast --timings=html,json @forwarded_args
 
 # Focused crate test without repo-wide formatting.
 validate-crate-focused crate:
@@ -365,7 +390,7 @@ test-lane-package package *args:
 
 [windows]
 _test-lane-package-reserved package *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; if ("{{ package }}" -eq "codex-core") { just _core-test-helpers-if-needed $target_dir "-p" "{{ package }}" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; python "{{ justfile_directory() }}\scripts\rust_test_runner.py" _guard-generic -- "-p" "{{ package }}" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args
 
 [windows]
 check-lane package *args:
@@ -453,7 +478,7 @@ generate-exec-server-relay-proto-check:
 
 # Run focused config schema fixture validation without regenerating schemas.
 config-schema-protocol-check:
-    cargo nextest run -p codex-core -E 'test(config_schema_matches_fixture) | test(config_schema_hides_unsupported_inline_mcp_bearer_token)'
+    just core-gate config-schema-protocol
 
 # Check config schema freshness without modifying generated output.
 [no-cd]
@@ -552,7 +577,6 @@ app-server-thread-status-check:
     cargo check -p codex-app-server
 
 _app-server-thread-status-tests:
-    cargo nextest run -p codex-core -E 'test(validated_invalidated_tracker_still_requests_diff_fallback)'
     cargo nextest run -p codex-app-server -E 'test(thread_status::tests::stale_active_running_thread_resume_clears_watch_status) | test(thread_status::tests::stale_active_repair_preserves_pending_approval_status)'
 
 app-server-schema-protocol-check:

@@ -126,30 +126,39 @@ fn emit_wfp_setup_metric_safely<F>(
 pub fn install_wfp_filters<F>(
     codex_home: &Path,
     offline_username: &str,
+    proxy_ports: &[u16],
+    allow_local_binding: bool,
     otel: Option<&StatsigMetricsSettings>,
     mut log: F,
-) where
+) -> Result<()>
+where
     F: FnMut(&str),
 {
-    let metric = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        install_wfp_filters_for_account(offline_username)
+    let install_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        install_wfp_filters_for_account(offline_username, proxy_ports, allow_local_binding)
     })) {
-        Ok(Ok(installed_filter_count)) => {
+        Ok(result) => result,
+        Err(panic_payload) => {
+            let error = panic_payload_to_string(panic_payload);
+            Err(anyhow::anyhow!("WFP setup panicked: {error}"))
+        }
+    };
+
+    let metric = match &install_result {
+        Ok(installed_filter_count) => {
             log(&format!(
                 "WFP setup succeeded for {offline_username} with {installed_filter_count} installed filters"
             ));
             WfpSetupMetric {
                 outcome: WfpSetupMetricOutcome::Success,
                 target_account: offline_username.to_string(),
-                installed_filter_count,
+                installed_filter_count: *installed_filter_count,
                 error: None,
             }
         }
-        Ok(Err(err)) => {
+        Err(err) => {
             let error = err.to_string();
-            log(&format!(
-                "WFP setup failed for {offline_username}: {error}; continuing elevated setup"
-            ));
+            log(&format!("WFP setup failed for {offline_username}: {error}"));
             WfpSetupMetric {
                 outcome: WfpSetupMetricOutcome::Failure,
                 target_account: offline_username.to_string(),
@@ -157,19 +166,8 @@ pub fn install_wfp_filters<F>(
                 error: Some(error),
             }
         }
-        Err(panic_payload) => {
-            let error = panic_payload_to_string(panic_payload);
-            log(&format!(
-                "WFP setup panicked for {offline_username}: {error}; continuing elevated setup"
-            ));
-            WfpSetupMetric {
-                outcome: WfpSetupMetricOutcome::Failure,
-                target_account: offline_username.to_string(),
-                installed_filter_count: 0,
-                error: Some(format!("panic: {error}")),
-            }
-        }
     };
 
     emit_wfp_setup_metric_safely(codex_home, otel, offline_username, &metric, &mut log);
+    install_result.map(|_| ())
 }

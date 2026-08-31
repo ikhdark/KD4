@@ -43,6 +43,7 @@ use crate::tools::router::ToolCallSource;
 use codex_protocol::openai_models::ToolMode;
 use codex_tools::ToolName;
 use codex_tools::ToolOutputOutcome;
+use codex_tools::ToolOutputOutcomeContext;
 use codex_tools::ToolOutputSkipDisposition;
 use codex_tools::can_request_original_image_detail;
 use codex_tools::sanitize_original_image_detail as sanitize_image_detail_items;
@@ -472,6 +473,15 @@ fn fold_nested_required_terminal(
     }
 }
 
+fn required_nested_tool_terminal_cause(
+    outcome_context: ToolOutputOutcomeContext,
+    signal: Option<&JsonValue>,
+) -> Option<RequiredToolTerminalCause> {
+    let failed = outcome_context.outcome == ToolOutputOutcome::Failure;
+    required_tool_terminal_cause(outcome_context, signal)
+        .or_else(|| failed.then_some(RequiredToolTerminalCause::Failure))
+}
+
 fn runtime_response_cell_id(response: &RuntimeResponse) -> &str {
     match response {
         RuntimeResponse::Yielded { cell_id, .. }
@@ -777,7 +787,7 @@ async fn call_nested_tool(
     let post_tool_use_feedback = result.take_code_mode_feedback();
     let result_value = result.code_mode_result();
     let required_terminal =
-        required_tool_terminal_cause(outcome_context, signal.as_ref()).map(|cause| {
+        required_nested_tool_terminal_cause(outcome_context, signal.as_ref()).map(|cause| {
             let label = match cause {
                 RequiredToolTerminalCause::Blocked => "blocked",
                 RequiredToolTerminalCause::Failure => "failed",
@@ -995,6 +1005,7 @@ mod tests {
     use super::format_runtime_response;
     use super::is_batchable_observation;
     use super::nested_failure_fingerprint;
+    use super::required_nested_tool_terminal_cause;
     use super::result_has_live_exec_session;
     use super::serialized_json_len;
     use super::truncate_code_mode_result;
@@ -1011,6 +1022,7 @@ mod tests {
     use codex_tools::ToolName;
     use codex_tools::ToolOutput;
     use codex_tools::ToolOutputOutcome;
+    use codex_tools::ToolOutputOutcomeContext;
     use codex_tools::ToolOutputSkipDisposition;
     use serde_json::json;
 
@@ -1161,6 +1173,38 @@ mod tests {
             Some(ToolOutputSkipDisposition::BlockingRequiredOperation)
         );
         assert!(output.into_text().contains("first nested block"));
+    }
+
+    #[test]
+    fn nested_terminal_classification_promotes_failed_tool_results() {
+        assert_eq!(
+            required_nested_tool_terminal_cause(
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
+                None,
+            ),
+            Some(RequiredToolTerminalCause::Failure),
+        );
+        assert_eq!(
+            required_nested_tool_terminal_cause(
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
+                Some(&json!({ "outcome": "blocked" })),
+            ),
+            Some(RequiredToolTerminalCause::Blocked),
+        );
+        assert_eq!(
+            required_nested_tool_terminal_cause(
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                None,
+            ),
+            None,
+        );
+        assert_eq!(
+            required_nested_tool_terminal_cause(
+                ToolOutputOutcomeContext::new(ToolOutputOutcome::Yielded),
+                None,
+            ),
+            None,
+        );
     }
 
     #[test]

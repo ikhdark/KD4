@@ -235,7 +235,7 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
 
     let expected_tools_names = vec![
         "exec",
-        "tool_search",
+        "wait",
         "exec_command",
         "write_stdin",
         "read_tool_output",
@@ -271,7 +271,7 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gpt_5_tools_without_apply_patch_append_apply_patch_instructions() -> anyhow::Result<()> {
+async fn gpt_5_tools_without_apply_patch_keep_base_instructions_consistent() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     use pretty_assertions::assert_eq;
 
@@ -329,18 +329,18 @@ async fn gpt_5_tools_without_apply_patch_append_apply_patch_instructions() -> an
         .as_str()
         .expect("instructions should be a string");
     assert!(
-        normalize_newlines(instructions0)
+        !normalize_newlines(instructions0)
             .contains(&normalize_newlines(APPLY_PATCH_TOOL_INSTRUCTIONS)),
-        "instructions should include the apply-patch guidance when the tool is absent"
+        "base instructions should remain unchanged when apply_patch is exposed as a tool"
     );
     assert!(
-        !body0["tools"]
+        body0["tools"]
             .as_array()
             .expect("tools should be an array")
             .iter()
             .any(|tool| tool.get("name").and_then(serde_json::Value::as_str)
                 == Some("apply_patch")),
-        "fixture must not register the apply_patch tool"
+        "gpt-5.2 fixture should register the apply_patch tool"
     );
 
     let body1 = req2.single_request().body_json();

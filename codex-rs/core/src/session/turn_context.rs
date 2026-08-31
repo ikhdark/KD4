@@ -542,9 +542,10 @@ impl TurnContext {
             trace_id: self.trace_id.clone(),
             config: Arc::new(config),
             effective_workspace_roots,
-            base_instructions: Arc::new(BaseInstructions {
-                text: model_info.base_instructions.clone(),
-            }),
+            // A model switch changes the active catalog metadata, but the provider request must
+            // keep using the base instructions that established this session. The compact
+            // `<model_switch>` delta communicates the compatibility boundary to the new model.
+            base_instructions: Arc::clone(&self.base_instructions),
             auth_manager: self.auth_manager.clone(),
             model_info: model_info.clone(),
             session_telemetry: self
@@ -828,7 +829,7 @@ impl Session {
         let extension_data = Arc::new(codex_extension_api::ExtensionData::new(sub_id.clone()));
         extension_data.insert(skills_snapshot.clone());
         let base_instructions = Arc::new(BaseInstructions {
-            text: model_info.base_instructions.clone(),
+            text: session_configuration.base_instructions.clone(),
         });
         let effective_workspace_roots = per_turn_config.effective_workspace_roots().into();
         TurnContext {

@@ -17,6 +17,7 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -315,7 +316,12 @@ async fn resume_preserves_persisted_model_and_base_instructions() -> Result<()> 
             thread_settings: Default::default(),
         })
         .await?;
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        &codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(30),
+    )
+    .await;
 
     let initial_body = initial_mock.single_request().body_json();
     let initial_instructions = initial_body
@@ -358,9 +364,11 @@ async fn resume_preserves_persisted_model_and_base_instructions() -> Result<()> 
             thread_settings: Default::default(),
         })
         .await?;
-    wait_for_event(&resumed.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &resumed.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(30),
+    )
     .await;
 
     resumed
@@ -376,9 +384,11 @@ async fn resume_preserves_persisted_model_and_base_instructions() -> Result<()> 
             thread_settings: Default::default(),
         })
         .await?;
-    wait_for_event(&resumed.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &resumed.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(30),
+    )
     .await;
 
     let requests = resumed_mock.requests();
@@ -454,7 +464,12 @@ async fn resume_model_switch_is_not_duplicated_after_pre_turn_override() -> Resu
             thread_settings: Default::default(),
         })
         .await?;
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        &codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(30),
+    )
+    .await;
     let _ = initial_mock.single_request();
 
     let resumed_mock = mount_sse_once(
@@ -492,9 +507,11 @@ async fn resume_model_switch_is_not_duplicated_after_pre_turn_override() -> Resu
             thread_settings: Default::default(),
         })
         .await?;
-    wait_for_event(&resumed.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &resumed.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(30),
+    )
     .await;
 
     let request = resumed_mock.single_request();

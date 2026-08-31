@@ -133,7 +133,7 @@ owner = "codex-rs/core"
 summary = "Explicit legacy, script, argv, and internally encoded PowerShell command shapes."
 upstream_equivalent = "partial"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_shape_tests.rs", symbol = "tagged_script_and_legacy_shapes_are_explicit", command = ["cargo", "test", "-p", "codex-core", "tagged_script_and_legacy_shapes_are_explicit"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_shape_tests.rs", symbol = "tagged_script_and_legacy_shapes_are_explicit", command = ["just", "core-test-fast", "core_lib", "-E", "test(tagged_script_and_legacy_shapes_are_explicit)"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -169,7 +169,7 @@ owner = "codex-rs/core"
 summary = "Active preflight with one bounded read-only equivalent repair and rejection-only mutating commands."
 upstream_equivalent = "none"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_preflight_tests.rs", symbol = "never_repairs_mutating_command_flag_typos", command = ["cargo", "test", "-p", "codex-core", "never_repairs_mutating_command_flag_typos"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/command_preflight_tests.rs", symbol = "never_repairs_mutating_command_flag_typos", command = ["just", "core-test-fast", "core_lib", "-E", "test(never_repairs_mutating_command_flag_typos)"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -200,7 +200,7 @@ owner = "codex-rs/core"
 summary = "Bounded failure-focused output on classic and unified execution paths."
 upstream_equivalent = "partial"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/shell_output_summary_tests.rs", symbol = "failed_output_keeps_exact_error_lines", command = ["cargo", "test", "-p", "codex-core", "failed_output_keeps_exact_error_lines"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/shell_output_summary_tests.rs", symbol = "failed_output_keeps_exact_error_lines", command = ["just", "core-test-fast", "core_lib", "-E", "test(failed_output_keeps_exact_error_lines)"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -231,7 +231,7 @@ owner = "codex-rs/core"
 summary = "Session-bounded command fingerprints with repair accounting and third-identical-failure prevention."
 upstream_equivalent = "none"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/command_execution.rs", symbol = "input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses", command = ["cargo", "test", "-p", "codex-core", "input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/command_execution.rs", symbol = "input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses", command = ["just", "core-test-fast", "core_lib", "-E", "test(input_state_determined_failure_blocks_exact_retry_but_freshness_bypasses)"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -267,7 +267,7 @@ owner = "codex-rs/core"
 summary = "Addressable full raw command output streamed before bounded transcript retention or model summarization, including background completion."
 upstream_equivalent = "none"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs", symbol = "foreground_output_artifact_retains_bytes_beyond_transcript_cap", command = ["cargo", "test", "-p", "codex-core", "foreground_output_artifact_retains_bytes_beyond_transcript_cap"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs", symbol = "foreground_output_artifact_retains_bytes_beyond_transcript_cap", command = ["just", "core-test-fast", "core_lib", "-E", "test(foreground_output_artifact_retains_bytes_beyond_transcript_cap)"] }
 
 [[features.evidence]]
 kind = "entrypoint"
@@ -419,7 +419,7 @@ owner = "codex-rs/core"
 summary = "Cached and diversified discovery of deferred core and extension tools."
 upstream_equivalent = "partial"
 config_keys = []
-runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/spec_plan_tests.rs", symbol = "tool_search_cache_rebuilds_when_deferred_sources_change", command = ["cargo", "test", "-p", "codex-core", "tool_search_cache_rebuilds_when_deferred_sources_change"] }
+runtime_verification = { kind = "contract_test", path = "codex-rs/core/src/tools/spec_plan_tests.rs", symbol = "tool_search_cache_rebuilds_when_deferred_sources_change", command = ["just", "core-test-fast", "core_lib", "-E", "test(tool_search_cache_rebuilds_when_deferred_sources_change)"] }
 
 [[features.evidence]]
 kind = "entrypoint"

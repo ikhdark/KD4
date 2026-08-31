@@ -4820,6 +4820,7 @@ async fn includes_timed_out_message() {
 #[tokio::test]
 async fn turn_context_with_model_updates_model_fields() {
     let (session, mut turn_context) = make_session_and_context().await;
+    let session_base_instructions = Arc::clone(&turn_context.base_instructions);
     turn_context.configured_reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     turn_context.reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     let durable_history_completed_commits =
@@ -4839,6 +4840,10 @@ async fn turn_context_with_model_updates_model_fields() {
     assert_eq!(updated.config.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(updated.collaboration_mode.model(), "gpt-5.4");
     assert_eq!(updated.model_info, expected_model_info);
+    assert!(Arc::ptr_eq(
+        &updated.base_instructions,
+        &session_base_instructions,
+    ));
     assert!(Arc::ptr_eq(
         &updated.durable_history_completed_commits,
         &durable_history_completed_commits,
@@ -7487,6 +7492,7 @@ async fn completed_tool_consumption_does_not_wait_for_persistence() {
                 call_id: call_id.to_string(),
                 tool_identity: "functions.exec".to_string(),
                 semantic_class: "tool_output".to_string(),
+                successful: true,
                 source_dependencies: std::collections::BTreeSet::new(),
                 source_dependencies_current: true,
                 artifact_id: "artifact-completion-barrier".to_string(),
@@ -8450,6 +8456,7 @@ where
         network_proxy_audit_metadata: crate::config::NetworkProxyAuditMetadata::default(),
         managed_network_requirements_configured: false,
         network_approval: Arc::clone(&network_approval),
+        network_policy_decider: None,
         state_db: state_db.clone(),
         live_thread: None,
         thread_store: Arc::new(codex_thread_store::LocalThreadStore::new(

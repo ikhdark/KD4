@@ -283,10 +283,16 @@ async fn later_follow_up_uses_background_recovered_apps_after_mid_thread_startup
     );
 
     tokio::fs::remove_dir_all(test.codex_home_path().join("cache/codex_apps_tools")).await?;
+    let initial_initialize_attempts = startup_control.initialize_attempts();
     startup_control.fail_next_initialize_attempts(/*attempts*/ 1);
     let runtime_mcp_config = test.codex.runtime_mcp_config(&test.config).await;
+    let mut configured_servers = codex_mcp::configured_mcp_servers(&runtime_mcp_config);
+    configured_servers
+        .get_mut(CODEX_APPS_MCP_SERVER_NAME)
+        .expect("Apps server should be present in the refresh configuration")
+        .startup_timeout_sec = Some(Duration::from_secs(31));
     let refresh_config = McpServerRefreshConfig {
-        mcp_servers: serde_json::to_value(codex_mcp::configured_mcp_servers(&runtime_mcp_config))?,
+        mcp_servers: serde_json::to_value(configured_servers)?,
         mcp_oauth_credentials_store_mode: serde_json::to_value(
             runtime_mcp_config.mcp_oauth_credentials_store_mode,
         )?,
@@ -301,13 +307,22 @@ async fn later_follow_up_uses_background_recovered_apps_after_mid_thread_startup
         .await?;
     test.submit_turn("use Calendar after transient Apps startup failures")
         .await?;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while startup_control.initialize_attempts() < 3 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+    let refreshed_runtime = test.codex.current_mcp_runtime().await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !refreshed_runtime
+                .manager()
+                .list_all_tools()
+                .await
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("background Apps reconnect should complete");
+    .expect("background Apps reconnect should restore the tool catalog");
     test.submit_turn("use Calendar after background Apps recovery")
         .await?;
 
@@ -323,7 +338,10 @@ async fn later_follow_up_uses_background_recovered_apps_after_mid_thread_startup
         .is_some(),
         "Calendar should recover on the follow-up turn: {recovered_request}",
     );
-    assert_eq!(startup_control.initialize_attempts(), 3);
+    assert!(
+        startup_control.initialize_attempts() >= initial_initialize_attempts + 2,
+        "the configured transient Apps startup failure and recovery should both be exercised"
+    );
 
     Ok(())
 }

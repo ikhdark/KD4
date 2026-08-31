@@ -1,3 +1,4 @@
+use codex_core::CodexThread;
 use codex_core::config::Constrained;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
@@ -29,7 +30,7 @@ use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
-use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_with_timeout;
 use std::sync::Mutex;
 use std::time::Duration;
 use tracing::Level;
@@ -37,6 +38,13 @@ use tracing_test::traced_test;
 
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_test::internal::MockWriter;
+
+async fn wait_for_event<F>(codex: &CodexThread, predicate: F) -> EventMsg
+where
+    F: FnMut(&EventMsg) -> bool,
+{
+    wait_for_event_with_timeout(codex, predicate, Duration::from_secs(10)).await
+}
 
 fn extract_log_field(line: &str, key: &str) -> Option<String> {
     let quoted_prefix = format!("{key}=\"");
@@ -76,8 +84,55 @@ fn assert_empty_mcp_tool_fields(line: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn assert_private_tool_result_fields(
+    line: &str,
+    expected_arguments_length: usize,
+) -> Result<(), String> {
+    let arguments_length = extract_log_field(line, "arguments_length")
+        .ok_or_else(|| "missing arguments_length field".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid arguments_length field: {error}"))?;
+    if arguments_length != expected_arguments_length {
+        return Err(format!(
+            "expected arguments_length={expected_arguments_length}, got {arguments_length}"
+        ));
+    }
+    let output_length = extract_log_field(line, "output_length")
+        .ok_or_else(|| "missing output_length field".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid output_length field: {error}"))?;
+    if output_length == 0 {
+        return Err("expected nonzero output_length".to_string());
+    }
+    let output_line_count = extract_log_field(line, "output_line_count")
+        .ok_or_else(|| "missing output_line_count field".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid output_line_count field: {error}"))?;
+    if output_line_count == 0 {
+        return Err("expected nonzero output_line_count".to_string());
+    }
+    if extract_log_field(line, "arguments").is_some() {
+        return Err("raw arguments field should not be logged".to_string());
+    }
+    if extract_log_field(line, "output").is_some() {
+        return Err("raw output field should not be logged".to_string());
+    }
+    Ok(())
+}
+
 fn shell_command_call(call_id: &str, command: &str) -> serde_json::Value {
-    let args = serde_json::json!({ "command": command }).to_string();
+    let args = serde_json::json!({ "kind": "script", "command": command }).to_string();
+    ev_function_call(call_id, "shell_command", &args)
+}
+
+fn shell_command_call_requiring_approval(call_id: &str, command: &str) -> serde_json::Value {
+    let args = serde_json::json!({
+        "kind": "script",
+        "command": command,
+        "sandbox_permissions": "require_escalated",
+        "justification": "Approve this telemetry test command?",
+    })
+    .to_string();
     ev_function_call(call_id, "shell_command", &args)
 }
 
@@ -885,12 +940,7 @@ async fn handle_response_item_records_tool_result_for_custom_tool_call() {
         if !line.contains("tool_name=unsupported_tool") {
             return Err("missing tool_name field".to_string());
         }
-        if !line.contains("arguments={\"key\":\"value\"}") {
-            return Err("missing arguments field".to_string());
-        }
-        if !line.contains("output=unsupported custom tool call: unsupported_tool") {
-            return Err("missing output field".to_string());
-        }
+        assert_private_tool_result_fields(line, r#"{"key":"value"}"#.len())?;
         if !line.contains("success=false") {
             return Err("missing success field".to_string());
         }
@@ -952,12 +1002,7 @@ async fn handle_response_item_records_tool_result_for_function_call() {
         if !line.contains("tool_name=nonexistent") {
             return Err("missing tool_name field".to_string());
         }
-        if !line.contains("arguments={\"value\":1}") {
-            return Err("missing arguments field".to_string());
-        }
-        if !line.contains("output=unsupported call: nonexistent") {
-            return Err("missing output field".to_string());
-        }
+        assert_private_tool_result_fields(line, r#"{"value":1}"#.len())?;
         if !line.contains("success=false") {
             return Err("missing success field".to_string());
         }
@@ -1023,15 +1068,12 @@ async fn handle_response_item_records_tool_result_for_shell_command_call() {
         if !line.contains("tool_name=shell_command") {
             return Err("missing tool_name field".to_string());
         }
-        if !line.contains("arguments={\"command\":\"echo shell\"}") {
-            return Err("missing arguments field".to_string());
-        }
-        let output_idx = line
-            .find("output=")
-            .ok_or_else(|| "missing output field".to_string())?;
-        if line[output_idx + "output=".len()..].is_empty() {
-            return Err("empty output field".to_string());
-        }
+        let shell_arguments = serde_json::json!({
+            "kind": "script",
+            "command": "echo shell",
+        })
+        .to_string();
+        assert_private_tool_result_fields(line, shell_arguments.len())?;
         if !line.contains("success=false") {
             return Err("missing success field".to_string());
         }
@@ -1203,7 +1245,7 @@ async fn handle_shell_command_user_approved_records_tool_decision() {
     mount_sse_once(
         &server,
         sse(vec![
-            shell_command_call("user_approved_call", &command),
+            shell_command_call_requiring_approval("user_approved_call", &command),
             ev_completed("done"),
         ]),
     )
@@ -1220,8 +1262,7 @@ async fn handle_shell_command_user_approved_records_tool_decision() {
 
     let test = test_codex()
         .with_config(|config| {
-            config.permissions.approval_policy =
-                Constrained::allow_any(AskForApproval::UnlessTrusted);
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         })
         .build(&server)
         .await
@@ -1257,7 +1298,7 @@ async fn handle_shell_command_user_approved_records_tool_decision() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     logs_assert(tool_decision_assertion(
         "user_approved_call",
@@ -1275,7 +1316,7 @@ async fn handle_shell_command_user_approved_for_session_records_tool_decision() 
     mount_sse_once(
         &server,
         sse(vec![
-            shell_command_call("user_approved_session_call", &command),
+            shell_command_call_requiring_approval("user_approved_session_call", &command),
             ev_completed("done"),
         ]),
     )
@@ -1291,8 +1332,7 @@ async fn handle_shell_command_user_approved_for_session_records_tool_decision() 
 
     let test = test_codex()
         .with_config(|config| {
-            config.permissions.approval_policy =
-                Constrained::allow_any(AskForApproval::UnlessTrusted);
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         })
         .build(&server)
         .await
@@ -1328,7 +1368,7 @@ async fn handle_shell_command_user_approved_for_session_records_tool_decision() 
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     logs_assert(tool_decision_assertion(
         "user_approved_session_call",
@@ -1346,7 +1386,7 @@ async fn handle_sandbox_error_user_approves_retry_records_tool_decision() {
     mount_sse_once(
         &server,
         sse(vec![
-            shell_command_call("sandbox_retry_call", &command),
+            shell_command_call_requiring_approval("sandbox_retry_call", &command),
             ev_completed("done"),
         ]),
     )
@@ -1362,8 +1402,7 @@ async fn handle_sandbox_error_user_approves_retry_records_tool_decision() {
 
     let test = test_codex()
         .with_config(|config| {
-            config.permissions.approval_policy =
-                Constrained::allow_any(AskForApproval::UnlessTrusted);
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         })
         .build(&server)
         .await
@@ -1399,7 +1438,7 @@ async fn handle_sandbox_error_user_approves_retry_records_tool_decision() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     logs_assert(tool_decision_assertion(
         "sandbox_retry_call",
@@ -1417,7 +1456,7 @@ async fn handle_shell_command_user_denies_records_tool_decision() {
     mount_sse_once(
         &server,
         sse(vec![
-            shell_command_call("user_denied_call", &command),
+            shell_command_call_requiring_approval("user_denied_call", &command),
             ev_completed("done"),
         ]),
     )
@@ -1433,8 +1472,7 @@ async fn handle_shell_command_user_denies_records_tool_decision() {
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.permissions.approval_policy =
-                Constrained::allow_any(AskForApproval::UnlessTrusted);
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         })
         .build(&server)
         .await
@@ -1470,7 +1508,7 @@ async fn handle_shell_command_user_denies_records_tool_decision() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     logs_assert(tool_decision_assertion(
         "user_denied_call",
@@ -1488,7 +1526,7 @@ async fn handle_sandbox_error_user_approves_for_session_records_tool_decision() 
     mount_sse_once(
         &server,
         sse(vec![
-            shell_command_call("sandbox_session_call", &command),
+            shell_command_call_requiring_approval("sandbox_session_call", &command),
             ev_completed("done"),
         ]),
     )
@@ -1504,8 +1542,7 @@ async fn handle_sandbox_error_user_approves_for_session_records_tool_decision() 
 
     let test = test_codex()
         .with_config(|config| {
-            config.permissions.approval_policy =
-                Constrained::allow_any(AskForApproval::UnlessTrusted);
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         })
         .build(&server)
         .await
@@ -1541,7 +1578,7 @@ async fn handle_sandbox_error_user_approves_for_session_records_tool_decision() 
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     logs_assert(tool_decision_assertion(
         "sandbox_session_call",
@@ -1559,7 +1596,7 @@ async fn handle_sandbox_error_user_denies_records_tool_decision() {
     mount_sse_once(
         &server,
         sse(vec![
-            shell_command_call("sandbox_deny_call", &command),
+            shell_command_call_requiring_approval("sandbox_deny_call", &command),
             ev_completed("done"),
         ]),
     )
@@ -1576,8 +1613,7 @@ async fn handle_sandbox_error_user_denies_records_tool_decision() {
 
     let test = test_codex()
         .with_config(|config| {
-            config.permissions.approval_policy =
-                Constrained::allow_any(AskForApproval::UnlessTrusted);
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         })
         .build(&server)
         .await
@@ -1613,7 +1649,7 @@ async fn handle_sandbox_error_user_denies_records_tool_decision() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     logs_assert(tool_decision_assertion(
         "sandbox_deny_call",

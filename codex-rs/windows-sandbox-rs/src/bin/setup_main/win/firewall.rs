@@ -46,7 +46,6 @@ struct BlockRuleSpec<'a> {
     internal_name: &'a str,
     friendly_desc: &'a str,
     protocol: i32,
-    local_user_spec: &'a str,
     offline_sid: &'a str,
     remote_addresses: Option<&'a str>,
     remote_ports: Option<&'a str>,
@@ -58,8 +57,6 @@ pub fn ensure_offline_proxy_allowlist(
     allow_local_binding: bool,
     log: &mut dyn Write,
 ) -> Result<()> {
-    let local_user_spec = format!("O:LSD:(A;;CC;;;{offline_sid})");
-
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     if hr.is_err() {
         return Err(anyhow::Error::new(SetupFailure::new(
@@ -100,7 +97,6 @@ pub fn ensure_offline_proxy_allowlist(
                     internal_name: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME,
                     friendly_desc: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY,
                     protocol: NET_FW_IP_PROTOCOL_UDP.0,
-                    local_user_spec: &local_user_spec,
                     offline_sid,
                     remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
                     remote_ports: None,
@@ -116,7 +112,6 @@ pub fn ensure_offline_proxy_allowlist(
                     internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
                     friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
                     protocol: NET_FW_IP_PROTOCOL_TCP.0,
-                    local_user_spec: &local_user_spec,
                     offline_sid,
                     remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
                     remote_ports: None,
@@ -135,7 +130,6 @@ pub fn ensure_offline_proxy_allowlist(
                         internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
                         friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
                         protocol: NET_FW_IP_PROTOCOL_TCP.0,
-                        local_user_spec: &local_user_spec,
                         offline_sid,
                         remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
                         remote_ports: Some(&blocked_remote_ports),
@@ -154,8 +148,6 @@ pub fn ensure_offline_proxy_allowlist(
 }
 
 pub fn ensure_offline_outbound_block(offline_sid: &str, log: &mut dyn Write) -> Result<()> {
-    let local_user_spec = format!("O:LSD:(A;;CC;;;{offline_sid})");
-
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     if hr.is_err() {
         return Err(anyhow::Error::new(SetupFailure::new(
@@ -188,7 +180,6 @@ pub fn ensure_offline_outbound_block(offline_sid: &str, log: &mut dyn Write) -> 
                     internal_name: OFFLINE_BLOCK_RULE_NAME,
                     friendly_desc: OFFLINE_BLOCK_RULE_FRIENDLY,
                     protocol: NET_FW_IP_PROTOCOL_ANY.0,
-                    local_user_spec: &local_user_spec,
                     offline_sid,
                     remote_addresses: Some(NON_LOOPBACK_REMOTE_ADDRESSES),
                     remote_ports: None,
@@ -319,8 +310,8 @@ fn ensure_block_rule(
     log_line(
         log,
         &format!(
-            "firewall rule configured name={} protocol={} RemoteAddresses={remote_addresses_log} RemotePorts={remote_ports_log} LocalUserAuthorizedList={}",
-            spec.internal_name, spec.protocol, spec.local_user_spec
+            "firewall rule configured name={} protocol={} RemoteAddresses={remote_addresses_log} RemotePorts={remote_ports_log} LocalUserOwner={}",
+            spec.internal_name, spec.protocol, spec.offline_sid
         ),
     )?;
     Ok(())
@@ -360,29 +351,56 @@ fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<()> {
             ))
         })?;
         configure_rule_network_scope(rule, spec)?;
-        rule.SetLocalUserAuthorizedList(&BSTR::from(spec.local_user_spec))
+        // LocalUserAuthorizedList applies to AppContainer traffic. These rules must instead
+        // match classic desktop processes launched with the offline sandbox user's token.
+        // Clear the legacy condition before assigning LocalUserOwner so existing rules migrate
+        // to the effective per-user condition idempotently.
+        rule.SetLocalUserAuthorizedList(&BSTR::new())
             .map_err(|err| {
                 anyhow::Error::new(SetupFailure::new(
                     SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
                     format!("SetLocalUserAuthorizedList failed: {err:?}"),
                 ))
             })?;
+        rule.SetLocalUserOwner(&BSTR::from(spec.offline_sid))
+            .map_err(|err| {
+                anyhow::Error::new(SetupFailure::new(
+                    SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
+                    format!("SetLocalUserOwner failed: {err:?}"),
+                ))
+            })?;
     }
 
     // Read-back verification: ensure we actually wrote the expected SID scope.
-    let actual = unsafe { rule.LocalUserAuthorizedList() }.map_err(|err| {
+    let actual_owner = unsafe { rule.LocalUserOwner() }.map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperFirewallRuleVerifyFailed,
+            format!("LocalUserOwner (read-back) failed: {err:?}"),
+        ))
+    })?;
+    let actual_owner = actual_owner.to_string();
+    if actual_owner != spec.offline_sid {
+        return Err(anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperFirewallRuleVerifyFailed,
+            format!(
+                "offline firewall rule user scope mismatch: expected SID {}, got {actual_str}",
+                spec.offline_sid,
+                actual_str = actual_owner
+            ),
+        )));
+    }
+    let authorized_users = unsafe { rule.LocalUserAuthorizedList() }.map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperFirewallRuleVerifyFailed,
             format!("LocalUserAuthorizedList (read-back) failed: {err:?}"),
         ))
     })?;
-    let actual_str = actual.to_string();
-    if !actual_str.contains(spec.offline_sid) {
+    if !authorized_users.is_empty() {
         return Err(anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperFirewallRuleVerifyFailed,
             format!(
-                "offline firewall rule user scope mismatch: expected SID {}, got {actual_str}",
-                spec.offline_sid
+                "offline firewall rule retained legacy LocalUserAuthorizedList: {}",
+                authorized_users.to_string()
             ),
         )));
     }
@@ -511,7 +529,6 @@ mod tests {
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         assert!(hr.is_ok(), "CoInitializeEx failed: {hr:?}");
 
-        let local_user_spec = "O:LSD:(A;;CC;;;S-1-5-18)";
         let offline_sid = "S-1-5-18";
         let blocked_remote_ports =
             blocked_loopback_tcp_remote_ports(&[8080]).expect("proxy-port complement should exist");
@@ -520,7 +537,6 @@ mod tests {
                 internal_name: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME,
                 friendly_desc: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY,
                 protocol: NET_FW_IP_PROTOCOL_UDP.0,
-                local_user_spec,
                 offline_sid,
                 remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
                 remote_ports: None,
@@ -529,7 +545,6 @@ mod tests {
                 internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
                 friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
                 protocol: NET_FW_IP_PROTOCOL_TCP.0,
-                local_user_spec,
                 offline_sid,
                 remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
                 remote_ports: Some(&blocked_remote_ports),
@@ -538,7 +553,6 @@ mod tests {
                 internal_name: OFFLINE_BLOCK_RULE_NAME,
                 friendly_desc: OFFLINE_BLOCK_RULE_FRIENDLY,
                 protocol: NET_FW_IP_PROTOCOL_ANY.0,
-                local_user_spec,
                 offline_sid,
                 remote_addresses: Some(NON_LOOPBACK_REMOTE_ADDRESSES),
                 remote_ports: None,
@@ -546,12 +560,11 @@ mod tests {
         ];
 
         let results = specs.each_ref().map(|spec| unsafe {
-            let rule: windows::core::Result<INetFwRule3> =
-                CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER);
-            match rule {
-                Ok(rule) => configure_rule_network_scope(&rule, spec),
-                Err(err) => Err(err.into()),
-            }
+            let rule: INetFwRule3 = CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER)?;
+            configure_rule(&rule, spec)?;
+            let owner = rule.LocalUserOwner()?.to_string();
+            let authorized_users = rule.LocalUserAuthorizedList()?.to_string();
+            Ok::<_, anyhow::Error>((owner, authorized_users))
         });
 
         unsafe {
@@ -559,14 +572,14 @@ mod tests {
         }
 
         for (spec, result) in specs.into_iter().zip(results) {
-            assert!(
-                result.is_ok(),
-                "firewall rejected network scope for rule={} protocol={} remote_addresses={:?} remote_ports={:?}: {result:?}",
-                spec.internal_name,
-                spec.protocol,
-                spec.remote_addresses,
-                spec.remote_ports
-            );
+            let (owner, authorized_users) = result.unwrap_or_else(|err| {
+                panic!(
+                    "firewall rejected rule={} protocol={} remote_addresses={:?} remote_ports={:?}: {err:#}",
+                    spec.internal_name, spec.protocol, spec.remote_addresses, spec.remote_ports
+                )
+            });
+            assert_eq!(owner, offline_sid);
+            assert_eq!(authorized_users, "");
         }
     }
 

@@ -1763,7 +1763,14 @@ class BuildToolingPolicyTest(unittest.TestCase):
         )
 
         self.assertIn("[windows]\ntest-windows-sandbox-processes *args:", justfile)
-        self.assertGreaterEqual(justfile.count("--no-tests=fail"), 3)
+        # The two non-core legs still force the zero-test policy inline. The
+        # codex-core leg gets it from its named gate, which forces
+        # `--no-tests=fail` inside `scripts/rust_test_runner.py`.
+        sandbox_recipe = justfile.split("test-windows-sandbox-processes *args:", 1)[
+            1
+        ].split("\n\n", 1)[0]
+        self.assertEqual(sandbox_recipe.count("--no-tests=fail"), 2)
+        self.assertIn("just core-gate windows-sandbox-core-exec", sandbox_recipe)
         self.assertIn("-p codex-utils-pty", justfile)
         self.assertIn("CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS", justfile)
         self.assertIn("CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS", sandbox_tests)
@@ -1900,16 +1907,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "cargo nextest run --no-run @forwarded_args",
             'cargo watch -x "check --target-dir $target_dir -p {{ package }}" @forwarded_args',
             'cargo llvm-cov -p "{{ package }}" @($args | Select-Object -Skip 2)',
-            "_core-test-helpers-runtime target_dir:",
-            "_core-test-helpers-mcp target_dir:",
-            "_core-test-helpers-windows-sandbox target_dir:",
-            'cargo build --target-dir "{{ target_dir }}" -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host',
-            'cargo build --target-dir "{{ target_dir }}" -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner',
             "just _test-lane-package-reserved",
             "$target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR",
             '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args',
-            '$text -match "(?i)rmcp|mcp|plugin|test_stdio_server"',
-            '$text -match "(?i)windows_sandbox|windows-sandbox|sandbox|codex_command_runner"',
         ):
             self.assertIn(command, justfile)
         self.assertNotIn(
@@ -1920,12 +1920,65 @@ class BuildToolingPolicyTest(unittest.TestCase):
             justfile.count('scripts\\rust_build_status.py" run-lane'), 10
         )
         self.assertNotIn('$target_dir = "target\\lanes\\', justfile)
-        self.assertEqual(
-            justfile.count(
-                'cargo build --target-dir "{{ target_dir }}" -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host'
-            ),
-            1,
+
+    def test_core_tests_only_run_through_named_targets_and_gates(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        manifest = load_toml(
+            REPO_ROOT / "codex-rs" / ".config" / "kd4-rust-tests.toml"
         )
+
+        # Every generic nextest recipe refuses a codex-core selection instead of
+        # inferring helper binaries from the forwarded arguments.
+        for recipe in (
+            "test *args:",
+            "test-fast *args:",
+            "test-fast-nosccache *args:",
+            "test-compile *args:",
+            "test-timings *args:",
+            "_test-lane-local-reserved *args:",
+            "_test-lane-fast-reserved *args:",
+            "_test-lane-package-reserved package *args:",
+        ):
+            body = justfile.split(recipe, 1)[1].split("\n\n", 1)[0]
+            self.assertIn("rust_test_runner.py\" _guard-generic --", body, recipe)
+
+        # The named recipes replace the removed helper-inference recipes.
+        for recipe in (
+            "core-test target *args:",
+            "core-test-fast target *args:",
+            "core-test-lane target *args:",
+            "_core-test-lane-reserved target *args:",
+            "core-gate gate:",
+            "core-test-list:",
+            "core-test-manifest-check:",
+        ):
+            self.assertIn(recipe, justfile)
+        self.assertNotIn("_core-test-helpers", justfile)
+        self.assertNotIn("(?i)rmcp|mcp|plugin|test_stdio_server", justfile)
+        self.assertNotIn("(?i)windows_sandbox|windows-sandbox|sandbox", justfile)
+
+        # Helper builds moved into the manifest, so no recipe may build them.
+        self.assertNotIn("--bin test_stdio_server", justfile)
+        self.assertNotIn("--bin codex-windows-sandbox-setup", justfile)
+
+        # Repository-owned codex-core invocations go through named gates.
+        self.assertNotIn("nextest run -p codex-core", justfile)
+        self.assertNotIn("-p codex-core", justfile)
+        for gate in (
+            "adaptive-reasoning-contract",
+            "config-schema-protocol",
+            "windows-sandbox-core-exec",
+        ):
+            self.assertIn(f"just core-gate {gate}", justfile)
+            self.assertIn(gate, manifest["gates"])
+
+        # The app-server thread-status recipe kept only its two real contracts.
+        thread_status = justfile.split("_app-server-thread-status-tests:", 1)[1].split(
+            "\n\n", 1
+        )[0]
+        self.assertNotIn("validated_invalidated_tracker_still_requests_diff_fallback", thread_status)
+        self.assertIn("stale_active_running_thread_resume_clears_watch_status", thread_status)
+        self.assertIn("stale_active_repair_preserves_pending_approval_status", thread_status)
 
     def test_perf_env_recipes_pass_structured_argv(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")

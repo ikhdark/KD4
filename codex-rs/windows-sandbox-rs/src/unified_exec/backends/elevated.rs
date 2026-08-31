@@ -34,6 +34,7 @@ struct RunnerTransportRequest {
     logs_base_dir: Option<PathBuf>,
     spawn_request: SpawnRequest,
     read_roots_override: Option<Vec<PathBuf>>,
+    additional_read_roots: Vec<PathBuf>,
     read_roots_include_platform_defaults: bool,
     write_roots_override: Option<Vec<PathBuf>>,
     deny_read_paths_override: Vec<PathBuf>,
@@ -52,6 +53,7 @@ fn spawn_runner_transport_with_retry<T>(
         &HashMap<String, String>,
         &Path,
         Option<&[PathBuf]>,
+        &[PathBuf],
         bool,
         Option<&[PathBuf]>,
         &[PathBuf],
@@ -79,6 +81,7 @@ fn spawn_runner_transport_with_retry<T>(
                 &request.env_map,
                 &request.codex_home,
                 request.read_roots_override.as_deref(),
+                &request.additional_read_roots,
                 request.read_roots_include_platform_defaults,
                 request.write_roots_override.as_deref(),
                 &request.deny_read_paths_override,
@@ -118,6 +121,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
     timeout_ms: Option<u64>,
     read_roots_override: Option<&[PathBuf]>,
+    additional_read_roots: &[AbsolutePathBuf],
     read_roots_include_platform_defaults: bool,
     write_roots_override: Option<&[PathBuf]>,
     deny_read_paths_override: &[AbsolutePathBuf],
@@ -134,6 +138,10 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
         .iter()
         .map(AbsolutePathBuf::to_path_buf)
         .collect::<Vec<_>>();
+    let additional_read_roots = additional_read_roots
+        .iter()
+        .map(AbsolutePathBuf::to_path_buf)
+        .collect::<Vec<_>>();
     let permissions =
         ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
             permission_profile,
@@ -146,6 +154,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
         &mut env_map,
         &command,
         read_roots_override,
+        &additional_read_roots,
         read_roots_include_platform_defaults,
         write_roots_override,
         &deny_read_paths_override,
@@ -176,6 +185,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
             use_private_desktop,
         },
         read_roots_override: read_roots_override.map(<[PathBuf]>::to_vec),
+        additional_read_roots,
         read_roots_include_platform_defaults,
         write_roots_override: write_roots_override.map(<[PathBuf]>::to_vec),
         deny_read_paths_override,

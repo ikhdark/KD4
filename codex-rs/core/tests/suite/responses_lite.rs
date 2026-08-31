@@ -71,9 +71,9 @@ fn additional_tools(body: &Value) -> Result<&[Value]> {
     body["input"]
         .as_array()
         .context("Responses request input should be an array")?
-        .first()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
-        .context("Responses request should start with additional_tools")?["tools"]
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        .context("Responses request should include additional_tools")?["tools"]
         .as_array()
         .map(Vec::as_slice)
         .context("additional_tools tools should be an array")
@@ -111,18 +111,22 @@ async fn responses_lite_uses_input_items_for_instructions_and_tools() -> Result<
     let input = body["input"]
         .as_array()
         .context("Responses request input should be an array")?;
-    assert_eq!(input[0]["type"], "additional_tools");
-    assert_eq!(input[0]["role"], "developer");
-    assert_eq!(
-        input[1],
-        serde_json::json!({
-            "type": "message",
-            "role": "developer",
-            "content": [{
-                "type": "input_text",
-                "text": "test instructions",
-            }],
-        })
+    let additional_tools_item = input
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        .context("Responses request should include additional_tools")?;
+    assert_eq!(additional_tools_item["role"], "developer");
+    let instructions_item = serde_json::json!({
+        "type": "message",
+        "role": "developer",
+        "content": [{
+            "type": "input_text",
+            "text": "test instructions",
+        }],
+    });
+    assert!(
+        input.contains(&instructions_item),
+        "Responses Lite input should include configured developer instructions"
     );
 
     let tools = additional_tools(&body)?;

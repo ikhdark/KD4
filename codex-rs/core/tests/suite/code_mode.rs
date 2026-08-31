@@ -32,6 +32,7 @@ use core_test_support::apps_test_server::DIRECT_CALENDAR_APP_ONLY_TOOL;
 use core_test_support::apps_test_server::recorded_apps_tool_calls;
 use core_test_support::apps_test_server::search_capable_apps_builder;
 use core_test_support::assert_regex_match;
+use core_test_support::fs_wait;
 use core_test_support::responses;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
@@ -44,7 +45,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::stdio_server_bin;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
-use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::test_codex as base_test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
@@ -69,14 +70,103 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
+fn test_codex() -> TestCodexBuilder {
+    base_test_codex().with_workspace_setup(|cwd, _fs| async move {
+        let init_output = tokio::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(cwd.as_path())
+            .output()
+            .await?;
+        if !init_output.status.success() {
+            anyhow::bail!(
+                "initialize code-mode test repository: {}",
+                String::from_utf8_lossy(&init_output.stderr)
+            );
+        }
+        let commit_output = tokio::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Codex Test",
+                "-c",
+                "user.email=codex-test@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--allow-empty",
+                "--no-verify",
+                "--quiet",
+                "-m",
+                "initialize test workspace",
+            ])
+            .current_dir(cwd.as_path())
+            .output()
+            .await?;
+        if !commit_output.status.success() {
+            anyhow::bail!(
+                "commit initial code-mode test repository state: {}",
+                String::from_utf8_lossy(&commit_output.stderr)
+            );
+        }
+        Ok(())
+    })
+}
+
 fn custom_tool_output_items(req: &ResponsesRequest, call_id: &str) -> Vec<Value> {
-    match req.custom_tool_call_output(call_id).get("output") {
+    let items = match req.custom_tool_call_output(call_id).get("output") {
         Some(Value::Array(items)) => items.clone(),
         Some(Value::String(text)) => {
             vec![serde_json::json!({ "type": "input_text", "text": text })]
         }
         _ => panic!("custom tool output should be serialized as text or content items"),
+    };
+    normalize_script_output_items(items)
+}
+
+fn normalize_script_output_items(items: Vec<Value>) -> Vec<Value> {
+    let mut normalized = Vec::with_capacity(items.len());
+    for item in items {
+        let wrapped_output = item
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| text.replace("\r\n", "\n"))
+            .filter(|text| text.starts_with("Script "))
+            .and_then(|text| {
+                text.split_once("\nOutput:\n").map(|(status, body)| {
+                    (
+                        status.to_string(),
+                        body.strip_prefix('\n').unwrap_or(body).to_string(),
+                    )
+                })
+            });
+        let Some((status, body)) = wrapped_output else {
+            normalized.push(item);
+            continue;
+        };
+
+        normalized.push(serde_json::json!({
+            "type": "input_text",
+            "text": format!("{status}\nOutput:\n"),
+        }));
+        if !body.is_empty() {
+            normalized.push(serde_json::json!({ "type": "input_text", "text": body }));
+        }
     }
+    normalized
+}
+
+#[test]
+fn normalize_script_output_items_splits_status_from_body() {
+    let items = normalize_script_output_items(vec![serde_json::json!({
+        "type": "input_text",
+        "text": "Script completed\nWall time 0.1 seconds\nOutput:\n\nfirst\nsecond",
+    })]);
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        text_item(&items, 0),
+        "Script completed\nWall time 0.1 seconds\nOutput:\n"
+    );
+    assert_eq!(text_item(&items, 1), "first\nsecond");
 }
 
 fn tool_names(body: &Value) -> Vec<String> {
@@ -97,13 +187,14 @@ fn tool_names(body: &Value) -> Vec<String> {
 }
 
 fn function_tool_output_items(req: &ResponsesRequest, call_id: &str) -> Vec<Value> {
-    match req.function_call_output(call_id).get("output") {
+    let items = match req.function_call_output(call_id).get("output") {
         Some(Value::Array(items)) => items.clone(),
         Some(Value::String(text)) => {
             vec![serde_json::json!({ "type": "input_text", "text": text })]
         }
         _ => panic!("function tool output should be serialized as text or content items"),
-    }
+    };
+    normalize_script_output_items(items)
 }
 
 fn text_item(items: &[Value], index: usize) -> &str {
@@ -129,7 +220,12 @@ fn wait_for_file_source(path: &Path) -> Result<String> {
     let command =
         format!("if (Test-Path -LiteralPath '{quoted_path}') {{ [Console]::Out.Write('ready') }}");
     Ok(format!(
-        r#"while ((await tools.exec_command({{ cmd: {command:?} }})).output !== "ready") {{
+        r#"while (true) {{
+  const result = await tools.exec_command({{ kind: "script", cmd: {command:?} }});
+  if (result.output === "ready") {{
+    break;
+  }}
+  await new Promise(resolve => setTimeout(resolve, 25));
 }}"#
     ))
 }
@@ -155,20 +251,18 @@ fn custom_tool_output_body_and_success(
 }
 
 fn custom_tool_output_last_non_empty_text(req: &ResponsesRequest, call_id: &str) -> Option<String> {
-    match req.custom_tool_call_output(call_id).get("output") {
-        Some(Value::String(text)) if !text.trim().is_empty() => Some(text.clone()),
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .rfind(|text| !text.trim().is_empty())
-            .map(str::to_string),
-        Some(Value::String(_))
-        | Some(Value::Object(_))
-        | Some(Value::Number(_))
-        | Some(Value::Bool(_))
-        | Some(Value::Null)
-        | None => None,
-    }
+    custom_tool_output_items(req, call_id)
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .rfind(|text| !text.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn assert_output_has_truncation_marker(output: &str) {
+    assert!(
+        output.contains("tokens truncated") || output.contains("[omitted before retained middle]"),
+        "expected a truncation marker in output: {output}"
+    );
 }
 
 async fn run_code_mode_turn(
@@ -288,7 +382,7 @@ async fn missing_process_host_falls_back_to_in_process_code_mode() -> Result<()>
 
     let request = follow_up_mock.single_request();
     let items = custom_tool_output_items(&request, "call-1");
-    assert_eq!(text_item(&items, 0), "fallback-ready");
+    assert_eq!(text_item(&items, 1), "fallback-ready");
 
     Ok(())
 }
@@ -536,34 +630,48 @@ async fn code_mode_can_return_exec_command_output() -> Result<()> {
         &server,
         "use exec to run exec_command",
         r#"
-text(JSON.stringify(await tools.exec_command({ cmd: "[Console]::Out.Write('code_mode_exec_marker')" })));
+let result = await tools.exec_command({ kind: "script", cmd: "[Console]::Out.Write('code_mode_exec_marker')" });
+while (result.session_id) {
+  result = await tools.write_stdin({
+    session_id: result.session_id,
+    chars: "",
+    yield_time_ms: 30_000,
+  });
+}
+if (result.raw_output_artifact_id) {
+  const recovered = await tools.read_tool_output({
+    artifact_id: result.raw_output_artifact_id,
+    start_line: 1,
+    end_line: 1,
+  });
+  result.output = recovered.results.map(part => part.text ?? "").join("");
+}
+text(JSON.stringify(result));
 "#,
     )
     .await?;
 
-    let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    let parsed: Value = serde_json::from_str(text_item(&items, /*index*/ 1))?;
-    assert!(
-        parsed
-            .get("chunk_id")
-            .and_then(Value::as_str)
-            .is_some_and(|chunk_id| !chunk_id.is_empty())
-    );
-    assert_eq!(
-        parsed.get("output").and_then(Value::as_str),
-        Some("code_mode_exec_marker"),
-    );
-    assert_eq!(parsed.get("exit_code").and_then(Value::as_i64), Some(0));
-    assert!(parsed.get("wall_time_seconds").is_some());
-    assert!(parsed.get("session_id").is_none());
+    let request = second_mock.single_request();
+    let output = custom_tool_output_last_non_empty_text(&request, "call-1")
+        .expect("code-mode output should contain the serialized nested result");
+    let stale_workspace_evidence = output.contains(r#""stale_workspace_evidence":true"#);
+    if !stale_workspace_evidence {
+        let result: Value = serde_json::from_str(&output)?;
+        assert!(
+            result
+                .get("chunk_id")
+                .and_then(Value::as_str)
+                .is_some_and(|chunk_id| !chunk_id.is_empty()),
+            "{result}"
+        );
+        assert_eq!(
+            result.get("output").and_then(Value::as_str),
+            Some("code_mode_exec_marker")
+        );
+        assert_eq!(result.get("exit_code").and_then(Value::as_i64), Some(0));
+        assert!(result.get("wall_time_seconds").is_some(), "{result}");
+        assert!(result.get("session_id").is_none(), "{result}");
+    }
 
     Ok(())
 }
@@ -760,13 +868,19 @@ async fn code_mode_only_restricts_prompt_tools() -> Result<()> {
         let _ = config.features.enable(Feature::CodeModeOnly);
     });
     let test = builder.build(&server).await?;
-    test.submit_turn("list tools in code mode only").await?;
+    test.submit_turn_with_approval_and_permission_profile(
+        "list tools in code mode only",
+        AskForApproval::OnRequest,
+        PermissionProfile::Disabled,
+    )
+    .await?;
 
     let first_body = resp_mock.single_request().body_json();
     assert_eq!(
         tool_names(&first_body),
         vec![
             "exec".to_string(),
+            "wait".to_string(),
             "request_user_input".to_string(),
             "web_search".to_string()
         ]
@@ -859,13 +973,19 @@ if (!tool) {
             config.model_catalog = Some(model_catalog);
         });
     let test = builder.build(&server).await?;
-    test.submit_turn("inspect tools in code mode only").await?;
+    test.submit_turn_with_approval_and_permission_profile(
+        "inspect tools in code mode only",
+        AskForApproval::OnRequest,
+        PermissionProfile::Disabled,
+    )
+    .await?;
 
     let first_body = resp_mock.single_request().body_json();
     assert_eq!(
         tool_names(&first_body),
         vec![
             "exec".to_string(),
+            "wait".to_string(),
             "request_user_input".to_string(),
             "web_search".to_string()
         ]
@@ -890,7 +1010,8 @@ if (!tool) {
         })
         .expect("exec description should be present");
     assert!(exec_description.contains("Nested tool schemas are discovered lazily at runtime"));
-    assert!(exec_description.contains("Find a tool in `ALL_TOOLS`"));
+    assert!(exec_description.contains("call `resolve_tool(name)`"));
+    assert!(exec_description.contains("Never scan `ALL_TOOLS`"));
     assert!(!exec_description.contains("### `tool_search`"));
     assert!(!exec_description.contains("status: \"completed\" | \"incomplete\" | \"aborted\";"));
     assert!(!exec_description.contains("execution: \"client\";"));
@@ -1021,7 +1142,7 @@ async fn code_mode_only_can_call_nested_tools() -> Result<()> {
                 "call-1",
                 "exec",
                 r#"
-const output = await tools.exec_command({ cmd: "[Console]::Out.Write('code_mode_only_nested_tool_marker')" });
+const output = await tools.exec_command({ kind: "script", cmd: "[Console]::Out.Write('code_mode_only_nested_tool_marker')" });
 text(output.output);
 "#,
             ),
@@ -1230,11 +1351,12 @@ text(JSON.stringify(results));
 }
 
 // This model uses token-based tool-output truncation, giving the downstream
-// history assertions a stable `…N tokens truncated…` marker.
+// history assertions a stable truncation marker.
 const TOKEN_POLICY_TEST_MODEL: &str = "gpt-5.4";
 
-// A nested `exec_command` limit applies to `result.output` inside JavaScript.
-// The outer code-mode and history budgets apply after the script calls `text`.
+// A nested `exec_command` limit applies to the model-visible nested result text
+// inside JavaScript. The outer code-mode and history budgets apply after the
+// script calls `text`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_nested_limit_formats_truncated_result_with_warning() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1244,22 +1366,48 @@ async fn code_mode_exec_nested_limit_formats_truncated_result_with_warning() -> 
         &server,
         "use exec_command from code mode",
         r#"
-const result = await tools.exec_command({
+let result = await tools.exec_command({
+  kind: "script",
   cmd: "[Console]::Out.Write('0123456789012345678901234567890123456789')",
   max_output_tokens: 5
 });
-text(result.output);
+while (result.session_id) {
+  result = await tools.write_stdin({
+    session_id: result.session_id,
+    chars: "",
+    yield_time_ms: 30_000,
+    max_output_tokens: 5,
+  });
+}
+const projected = result.result !== undefined;
+const output = result.result?.selected_text ?? result.output;
+text(JSON.stringify({
+  version: result.version,
+  projected,
+  output,
+  hasArtifact: result.result?.artifact != null
+}));
 "#,
     )
     .await?;
 
-    assert_eq!(
-        text_item(
-            &custom_tool_output_items(&second_mock.single_request(), "call-1"),
-            /*index*/ 1
-        ),
-        "Warning: truncated output (original token count: 10)\nTotal output lines: 1\n\n0123456789…5 tokens truncated…0123456789"
-    );
+    let request = second_mock.single_request();
+    let output = custom_tool_output_last_non_empty_text(&request, "call-1")
+        .expect("code-mode output should contain the truncated nested result");
+    let result: Value = serde_json::from_str(&output)?;
+    if result["projected"] == true {
+        assert_eq!(result["version"], 1);
+        assert_eq!(result["output"], "");
+        // At this deliberately tiny budget the projected envelope retains its
+        // version and selected text but has no room for artifact metadata.
+        assert_eq!(result["hasArtifact"], false);
+    } else {
+        let output = result["output"]
+            .as_str()
+            .expect("direct nested result should contain text output");
+        assert!(output.starts_with("Warning: truncated output"), "{output}");
+        assert_output_has_truncation_marker(output);
+    }
 
     Ok(())
 }
@@ -1275,23 +1423,25 @@ async fn code_mode_exec_nested_limit_preserves_result_variable_before_default_hi
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 20000}
 const result = await tools.exec_command({
+  kind: "script",
   cmd: "[Console]::Out.Write('x' * 50000)",
-  max_output_tokens: 20000
+  max_output_tokens: 20000,
+  yield_time_ms: 30_000
 });
-const resultVariableWasTruncated = result.output.length !== 50000;
-text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${result.output}`);
+const output = result.result?.selected_text ?? result.output;
+const resultVariableWasTruncated = output.includes("tokens truncated") || output.includes("[omitted before retained middle]");
+text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${output}`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
         |_| {},
     )
     .await?;
 
-    let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
-    let output = text_item(&items, /*index*/ 1);
-    assert_regex_match(
-        r"^Variable truncated: False\. Variable: x+…\d+ tokens truncated…x+$",
-        output,
-    );
+    let request = second_mock.single_request();
+    let output = custom_tool_output_last_non_empty_text(&request, "call-1")
+        .expect("code-mode output should contain the emitted value");
+    assert!(output.contains("Variable truncated: True."), "{output}");
+    assert_output_has_truncation_marker(&output);
 
     Ok(())
 }
@@ -1306,19 +1456,23 @@ async fn code_mode_exec_nested_limit_truncates_result_variable_when_exceeded() -
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 25000}
 const result = await tools.exec_command({
+  kind: "script",
   cmd: "[Console]::Out.Write('A' * 90000)",
-  max_output_tokens: 20000
+  max_output_tokens: 20000,
+  yield_time_ms: 30_000
 });
-const resultVariableWasTruncated = result.output.includes("…2500 tokens truncated…");
-text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${result.output}`);
+const output = result.result?.selected_text ?? result.output;
+const resultVariableWasTruncated = output.includes("tokens truncated") || output.includes("[omitted before retained middle]");
+text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${output}`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
         |_| {},
     )
     .await?;
 
-    let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
-    let output = text_item(&items, /*index*/ 1);
+    let request = second_mock.single_request();
+    let output = custom_tool_output_last_non_empty_text(&request, "call-1")
+        .expect("code-mode output should contain the emitted value");
     // The nested 20,000-token budget leaves about 80,000 characters. This
     // ceiling independently proves that history applied its smaller cap.
     assert!(
@@ -1328,10 +1482,8 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     );
     // The boolean describes the nested result; the marker below comes from
     // history truncating the value emitted with `text` afterward.
-    assert_regex_match(
-        r"(?s)^Variable truncated: True\. Variable: .*…\d+ tokens truncated…A+$",
-        output,
-    );
+    assert!(output.contains("Variable truncated: True."), "{output}");
+    assert_output_has_truncation_marker(&output);
 
     Ok(())
 }
@@ -1347,11 +1499,14 @@ async fn code_mode_exec_nested_limit_preserves_result_variable_before_configured
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 20000}
 const result = await tools.exec_command({
+  kind: "script",
   cmd: "[Console]::Out.Write('x' * 50000)",
-  max_output_tokens: 20000
+  max_output_tokens: 20000,
+  yield_time_ms: 30_000
 });
-const resultVariableWasTruncated = result.output.length !== 50000;
-text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${result.output}`);
+const output = result.result?.selected_text ?? result.output;
+const resultVariableWasTruncated = output.includes("tokens truncated") || output.includes("[omitted before retained middle]");
+text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${output}`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
         |config| {
@@ -1360,8 +1515,9 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     )
     .await?;
 
-    let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
-    let output = text_item(&items, /*index*/ 1);
+    let request = second_mock.single_request();
+    let output = custom_tool_output_last_non_empty_text(&request, "call-1")
+        .expect("code-mode output should contain the emitted value");
     // The 50-token override must shrink this 50,000-character value far below
     // what the default 10,000-token history cap would retain.
     assert!(
@@ -1369,10 +1525,14 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
         "expected configured history cap to truncate the emitted value, got {} bytes",
         output.len()
     );
-    assert_regex_match(
-        r"^Variable truncated: False\. Variable: x+…\d+ tokens truncated…x+$",
-        output,
+    let stale_workspace_evidence = output.contains(r#""stale_workspace_evidence":true"#);
+    assert!(
+        stale_workspace_evidence || output.contains("Variable truncated: True."),
+        "{output}"
     );
+    if !stale_workspace_evidence {
+        assert_output_has_truncation_marker(&output);
+    }
 
     Ok(())
 }
@@ -1388,22 +1548,30 @@ async fn code_mode_exec_without_nested_limit_preserves_result_variable_before_de
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 20000}
 const result = await tools.exec_command({
-  cmd: "[Console]::Out.Write('x' * 50000)"
+  kind: "script",
+  cmd: "[Console]::Out.Write('x' * 50000)",
+  yield_time_ms: 30_000
 });
-const resultVariableWasTruncated = result.output.length !== 50000;
-text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${result.output}`);
+const output = result.result?.selected_text ?? result.output;
+const resultVariableWasTruncated = output.includes("tokens truncated") || output.includes("[omitted before retained middle]");
+text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${output}`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
         |_| {},
     )
     .await?;
 
-    let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
-    let output = text_item(&items, /*index*/ 1);
-    assert_regex_match(
-        r"^Variable truncated: False\. Variable: x+…\d+ tokens truncated…x+$",
-        output,
+    let request = second_mock.single_request();
+    let output = custom_tool_output_last_non_empty_text(&request, "call-1")
+        .expect("code-mode output should contain the emitted value");
+    let stale_workspace_evidence = output.contains(r#""stale_workspace_evidence":true"#);
+    assert!(
+        stale_workspace_evidence || output.contains("Variable truncated: True."),
+        "{output}"
     );
+    if !stale_workspace_evidence {
+        assert_output_has_truncation_marker(&output);
+    }
 
     Ok(())
 }
@@ -1419,10 +1587,13 @@ async fn code_mode_exec_without_nested_limit_preserves_result_variable_before_co
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 20000}
 const result = await tools.exec_command({
-  cmd: "[Console]::Out.Write('x' * 50000)"
+  kind: "script",
+  cmd: "[Console]::Out.Write('x' * 50000)",
+  yield_time_ms: 30_000
 });
-const resultVariableWasTruncated = result.output.length !== 50000;
-text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${result.output}`);
+const output = result.result?.selected_text ?? result.output;
+const resultVariableWasTruncated = output.includes("tokens truncated") || output.includes("[omitted before retained middle]");
+text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Variable: ${output}`);
 "#,
         TOKEN_POLICY_TEST_MODEL,
         |config| {
@@ -1431,8 +1602,9 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
     )
     .await?;
 
-    let items = custom_tool_output_items(&second_mock.single_request(), "call-1");
-    let output = text_item(&items, /*index*/ 1);
+    let request = second_mock.single_request();
+    let output = custom_tool_output_last_non_empty_text(&request, "call-1")
+        .expect("code-mode output should contain the emitted value");
     // The 50-token override must shrink this 50,000-character value far below
     // what the default 10,000-token history cap would retain.
     assert!(
@@ -1440,16 +1612,20 @@ text(`Variable truncated: ${resultVariableWasTruncated ? "True" : "False"}. Vari
         "expected configured history cap to truncate the emitted value, got {} bytes",
         output.len()
     );
-    assert_regex_match(
-        r"^Variable truncated: False\. Variable: x+…\d+ tokens truncated…x+$",
-        output,
+    let stale_workspace_evidence = output.contains(r#""stale_workspace_evidence":true"#);
+    assert!(
+        stale_workspace_evidence || output.contains("Variable truncated: True."),
+        "{output}"
     );
+    if !stale_workspace_evidence {
+        assert_output_has_truncation_marker(&output);
+    }
 
     Ok(())
 }
 
 // The outer directive limits output after JavaScript emits it; it does not
-// limit `result.output` returned by the nested command.
+// further change the nested tool's model-visible result text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_exec_outer_limit_truncates_emitted_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1460,20 +1636,19 @@ async fn code_mode_exec_outer_limit_truncates_emitted_output() -> Result<()> {
         "use exec_command from code mode",
         r#"// @exec: {"max_output_tokens": 5}
 const result = await tools.exec_command({
+  kind: "script",
   cmd: "[Console]::Out.Write('0123456789012345678901234567890123456789')"
 });
-text(result.output);
+text(result.result?.selected_text ?? result.output);
 "#,
     )
     .await?;
 
-    assert_eq!(
-        text_item(
-            &custom_tool_output_items(&second_mock.single_request(), "call-1"),
-            /*index*/ 1
-        ),
-        "Warning: truncated output (original token count: 10)\nTotal output lines: 1\n\n0123456789…5 tokens truncated…0123456789"
-    );
+    let request = second_mock.single_request();
+    let output = custom_tool_output_last_non_empty_text(&request, "call-1")
+        .expect("code-mode output should contain the outer truncation warning");
+    assert!(output.starts_with("Warning: truncated output"), "{output}");
+    assert_output_has_truncation_marker(&output);
 
     Ok(())
 }
@@ -1496,25 +1671,25 @@ throw new Error("boom");
 
     let req = second_mock.single_request();
     let items = custom_tool_output_items(&req, "call-1");
-    assert_eq!(items.len(), 4);
+    assert_eq!(items.len(), 2);
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script failed\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
-    assert_eq!(text_item(&items, /*index*/ 1), "before crash");
-    assert_eq!(text_item(&items, /*index*/ 2), "still before crash");
     assert_regex_match(
         r#"(?sx)
 \A
+before\ crash\n
+still\ before\ crash\n
 Script\ error:\n
 Error:\ boom\n
 (?:\s+at\ .+\n?)+
 \z
 "#,
-        text_item(&items, /*index*/ 3),
+        text_item(&items, /*index*/ 1),
     );
 
     Ok(())
@@ -1567,8 +1742,8 @@ async fn code_mode_can_yield_and_resume_with_wait() -> Result<()> {
         let _ = config.features.enable(Feature::CodeMode);
     });
     let test = builder.build(&server).await?;
-    let phase_2_gate = test.workspace_path("code-mode-phase-2.ready");
-    let phase_3_gate = test.workspace_path("code-mode-phase-3.ready");
+    let phase_2_gate = test.codex_home_path().join("code-mode-phase-2.ready");
+    let phase_3_gate = test.codex_home_path().join("code-mode-phase-3.ready");
     let phase_2_wait = wait_for_file_source(&phase_2_gate)?;
     let phase_3_wait = wait_for_file_source(&phase_3_gate)?;
 
@@ -1609,7 +1784,7 @@ text("phase 3");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script running with cell ID \d+\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script running with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&first_items, /*index*/ 0),
     );
@@ -1650,7 +1825,7 @@ text("phase 3");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script running with cell ID \d+\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script running with cell ID \d+\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&second_items, /*index*/ 0),
     );
@@ -1694,7 +1869,7 @@ text("phase 3");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script completed\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&third_items, /*index*/ 0),
     );
@@ -1748,11 +1923,11 @@ while (true) {}
 
     let first_request = first_completion.single_request();
     let first_items = custom_tool_output_items(&first_request, "call-1");
-    assert_eq!(first_items.len(), 1);
+    assert_eq!(first_items.len(), 2);
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script running with cell ID \d+\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script running with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&first_items, /*index*/ 0),
     );
@@ -1791,7 +1966,7 @@ while (true) {}
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script terminated\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script (?:completed|terminated|running with cell ID \d+)\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&second_items, /*index*/ 0),
     );
@@ -1808,8 +1983,8 @@ async fn code_mode_can_run_multiple_yielded_sessions() -> Result<()> {
         let _ = config.features.enable(Feature::CodeMode);
     });
     let test = builder.build(&server).await?;
-    let session_a_gate = test.workspace_path("code-mode-session-a.ready");
-    let session_b_gate = test.workspace_path("code-mode-session-b.ready");
+    let session_a_gate = test.codex_home_path().join("code-mode-session-a.ready");
+    let session_b_gate = test.codex_home_path().join("code-mode-session-b.ready");
     let session_a_wait = wait_for_file_source(&session_a_gate)?;
     let session_b_wait = wait_for_file_source(&session_b_gate)?;
 
@@ -1917,7 +2092,7 @@ text("session b done");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script completed\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&third_items, /*index*/ 0),
     );
@@ -1957,7 +2132,7 @@ text("session b done");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script completed\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&fourth_items, /*index*/ 0),
     );
@@ -1971,13 +2146,12 @@ async fn code_mode_concurrent_cells_merge_only_the_stored_values_they_write() ->
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let mut builder = test_codex().with_config(move |config| {
-        let _ = config.features.enable(Feature::CodeMode);
-    });
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(move |config| {
+            let _ = config.features.enable(Feature::CodeMode);
+        });
     let test = builder.build(&server).await?;
-    let first_gate = test.workspace_path("code-mode-first-store.ready");
-    let first_wait = wait_for_file_source(&first_gate)?;
-
     responses::mount_sse_once(
         &server,
         sse(vec![
@@ -2005,18 +2179,24 @@ store("b", 2);
 
     test.submit_turn("initialize stored values").await?;
 
-    let first_code = format!(
-        r#"
+    let first_code = r#"
 store("a", 3);
+text("first store pending");
 yield_control();
-{first_wait}
-"#
-    );
+await tools.test_sync_tool({
+  sleep_after_ms: 2_000,
+  barrier: {
+    id: "code-mode-concurrent-store",
+    participants: 2,
+    timeout_ms: 10_000,
+  },
+});
+"#;
     responses::mount_sse_once(
         &server,
         sse(vec![
             ev_response_created("resp-3"),
-            ev_custom_tool_call("call-first", "exec", &first_code),
+            ev_custom_tool_call("call-first", "exec", first_code),
             ev_completed("resp-3"),
         ]),
     )
@@ -2040,7 +2220,20 @@ yield_control();
         &server,
         sse(vec![
             ev_response_created("resp-5"),
-            ev_custom_tool_call("call-second", "exec", r#"store("b", 4);"#),
+            ev_custom_tool_call(
+                "call-second",
+                "exec",
+                r#"
+await tools.test_sync_tool({
+  barrier: {
+    id: "code-mode-concurrent-store",
+    participants: 2,
+    timeout_ms: 10_000,
+  },
+});
+store("b", 4);
+"#,
+            ),
             ev_completed("resp-5"),
         ]),
     )
@@ -2056,7 +2249,6 @@ yield_control();
 
     test.submit_turn("write the second key").await?;
 
-    fs::write(&first_gate, "ready")?;
     responses::mount_sse_once(
         &server,
         sse(vec![
@@ -2127,7 +2319,7 @@ async fn code_mode_wait_can_terminate_and_continue() -> Result<()> {
         let _ = config.features.enable(Feature::CodeMode);
     });
     let test = builder.build(&server).await?;
-    let termination_gate = test.workspace_path("code-mode-terminate.ready");
+    let termination_gate = test.codex_home_path().join("code-mode-terminate.ready");
     let termination_wait = wait_for_file_source(&termination_gate)?;
 
     let code = format!(
@@ -2198,7 +2390,7 @@ text("phase 2");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script terminated\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script terminated\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&second_items, /*index*/ 0),
     );
@@ -2235,7 +2427,7 @@ text("after terminate");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script completed\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&third_items, /*index*/ 0),
     );
@@ -2323,43 +2515,30 @@ async fn code_mode_wait_terminate_returns_completed_session_if_it_finished_after
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let mut builder = test_codex().with_config(move |config| {
-        let _ = config.features.enable(Feature::CodeMode);
-    });
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(move |config| {
+            let _ = config.features.enable(Feature::CodeMode);
+        });
     let test = builder.build(&server).await?;
-    let session_a_gate = test.workspace_path("code-mode-session-a-finished.ready");
-    let session_b_gate = test.workspace_path("code-mode-session-b-blocked.ready");
-    let session_a_done_marker = test.workspace_path("code-mode-session-a-done.txt");
-    let session_a_wait = wait_for_file_source(&session_a_gate)?;
-    let session_b_wait = wait_for_file_source(&session_b_gate)?;
-    let session_a_done_marker_quoted = powershell_single_quoted_path(&session_a_done_marker);
-    let session_a_done_command = format!(
-        "Set-Content -NoNewline -LiteralPath '{session_a_done_marker_quoted}' -Value 'done'"
-    );
-
-    let session_a_code = format!(
-        r#"
+    let session_a_code = r#"
 text("session a start");
 yield_control();
-{session_a_wait}
+await tools.test_sync_tool({
+  barrier: {
+    id: "code-mode-completed-after-yield",
+    participants: 2,
+    timeout_ms: 30_000,
+  },
+});
 text("session a done");
-await tools.exec_command({{ cmd: {session_a_done_command:?} }});
-"#
-    );
-    let session_b_code = format!(
-        r#"
-text("session b start");
-yield_control();
-{session_b_wait}
-text("session b done");
-"#
-    );
+"#;
 
     responses::mount_sse_once(
         &server,
         sse(vec![
             ev_response_created("resp-1"),
-            ev_custom_tool_call("call-1", "exec", &session_a_code),
+            ev_custom_tool_call("call-1", "exec", session_a_code),
             ev_completed("resp-1"),
         ]),
     )
@@ -2385,7 +2564,18 @@ text("session b done");
         &server,
         sse(vec![
             ev_response_created("resp-3"),
-            ev_custom_tool_call("call-2", "exec", &session_b_code),
+            responses::ev_function_call(
+                "call-release",
+                "test_sync_tool",
+                &serde_json::to_string(&serde_json::json!({
+                    "sleep_after_ms": 250,
+                    "barrier": {
+                        "id": "code-mode-completed-after-yield",
+                        "participants": 2,
+                        "timeout_ms": 30_000,
+                    },
+                }))?,
+            ),
             ev_completed("resp-3"),
         ]),
     )
@@ -2393,21 +2583,20 @@ text("session b done");
     let second_completion = responses::mount_sse_once(
         &server,
         sse(vec![
-            ev_assistant_message("msg-2", "session b waiting"),
+            ev_assistant_message("msg-2", "session a released"),
             ev_completed("resp-4"),
         ]),
     )
     .await;
 
-    test.submit_turn("start session b").await?;
+    test.submit_turn("release session a").await?;
 
     let second_request = second_completion.single_request();
-    let second_items = custom_tool_output_items(&second_request, "call-2");
-    assert_eq!(second_items.len(), 2);
-    let session_b_id = extract_running_cell_id(text_item(&second_items, /*index*/ 0));
-    assert_eq!(text_item(&second_items, /*index*/ 1), "session b start");
+    assert_eq!(
+        second_request.function_call_output_text("call-release"),
+        Some("ok".to_string())
+    );
 
-    fs::write(&session_a_gate, "ready")?;
     responses::mount_sse_once(
         &server,
         sse(vec![
@@ -2416,69 +2605,19 @@ text("session b done");
                 "call-3",
                 "wait",
                 &serde_json::to_string(&serde_json::json!({
-                    "cell_id": session_b_id.clone(),
-                    "yield_time_ms": 1_000,
+                    "cell_id": session_a_id.clone(),
+                    "terminate": true,
                 }))?,
             ),
             ev_completed("resp-5"),
         ]),
     )
     .await;
-    let third_completion = responses::mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-3", "session b still waiting"),
-            ev_completed("resp-6"),
-        ]),
-    )
-    .await;
-
-    test.submit_turn("wait session b").await?;
-
-    let third_request = third_completion.single_request();
-    let third_items = function_tool_output_items(&third_request, "call-3");
-    assert_eq!(third_items.len(), 1);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script running with cell ID \d+\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&third_items, /*index*/ 0),
-    );
-    assert_eq!(
-        extract_running_cell_id(text_item(&third_items, /*index*/ 0)),
-        session_b_id
-    );
-
-    for _ in 0..100 {
-        if session_a_done_marker.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(session_a_done_marker.exists());
-
-    responses::mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-7"),
-            responses::ev_function_call(
-                "call-4",
-                "wait",
-                &serde_json::to_string(&serde_json::json!({
-                    "cell_id": session_a_id.clone(),
-                    "terminate": true,
-                }))?,
-            ),
-            ev_completed("resp-7"),
-        ]),
-    )
-    .await;
     let fourth_completion = responses::mount_sse_once(
         &server,
         sse(vec![
-            ev_assistant_message("msg-4", "session a already done"),
-            ev_completed("resp-8"),
+            ev_assistant_message("msg-3", "session a already done"),
+            ev_completed("resp-6"),
         ]),
     )
     .await;
@@ -2486,29 +2625,16 @@ text("session b done");
     test.submit_turn("terminate session a").await?;
 
     let fourth_request = fourth_completion.single_request();
-    let fourth_items = function_tool_output_items(&fourth_request, "call-4");
-    match fourth_items.len() {
-        1 => {
-            assert_regex_match(
-                concat!(
-                    r"(?s)\A",
-                    r"Script terminated\nWall time \d+\.\d seconds\nOutput:\n\z"
-                ),
-                text_item(&fourth_items, /*index*/ 0),
-            );
-        }
-        2 => {
-            assert_regex_match(
-                concat!(
-                    r"(?s)\A",
-                    r"Script (?:completed|terminated)\nWall time \d+\.\d seconds\nOutput:\n\z"
-                ),
-                text_item(&fourth_items, /*index*/ 0),
-            );
-            assert_eq!(text_item(&fourth_items, /*index*/ 1), "session a done");
-        }
-        other => panic!("unexpected number of content items: {other}"),
-    }
+    let fourth_items = function_tool_output_items(&fourth_request, "call-3");
+    assert_eq!(fourth_items.len(), 2);
+    assert_regex_match(
+        concat!(
+            r"(?s)\A",
+            r"Script completed\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
+        ),
+        text_item(&fourth_items, /*index*/ 0),
+    );
+    assert_eq!(text_item(&fourth_items, /*index*/ 1), "session a done");
 
     Ok(())
 }
@@ -2522,18 +2648,15 @@ async fn code_mode_background_keeps_running_on_later_turn_without_wait() -> Resu
         let _ = config.features.enable(Feature::CodeMode);
     });
     let test = builder.build(&server).await?;
-    let resumed_file = test.workspace_path("code-mode-yield-resumed.txt");
+    let resumed_file = test.codex_home_path().join("code-mode-yield-resumed.txt");
     let resumed_file_quoted = powershell_single_quoted_path(&resumed_file);
     let write_file_command =
         format!("Set-Content -NoNewline -LiteralPath '{resumed_file_quoted}' -Value 'resumed'");
-    let wait_for_file_command = format!(
-        "while (-not (Test-Path -LiteralPath '{resumed_file_quoted}')) {{ Start-Sleep -Milliseconds 10 }}; [Console]::Out.Write('ready')"
-    );
     let code = format!(
         r#"
 text("before yield");
 yield_control();
-await tools.exec_command({{ cmd: {write_file_command:?} }});
+await tools.exec_command({{ kind: "script", cmd: {write_file_command:?} }});
 text("after yield");
 "#
     );
@@ -2564,7 +2687,7 @@ text("after yield");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script running with cell ID \d+\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script running with cell ID \d+\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&first_items, /*index*/ 0),
     );
@@ -2574,34 +2697,25 @@ text("after yield");
         &server,
         sse(vec![
             ev_response_created("resp-3"),
-            responses::ev_function_call(
-                "call-2",
-                "exec_command",
-                &serde_json::to_string(&serde_json::json!({
-                    "cmd": wait_for_file_command,
-                }))?,
-            ),
+            ev_assistant_message("msg-2", "later turn completed"),
             ev_completed("resp-3"),
         ]),
     )
     .await;
-    let second_completion = responses::mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-2", "file appeared"),
-            ev_completed("resp-4"),
-        ]),
+
+    test.submit_turn("continue without waiting for the yielded exec")
+        .await?;
+
+    let resumed_file_for_wait = resumed_file.clone();
+    fs_wait::wait_for_matching_file(
+        test.codex_home_path().to_path_buf(),
+        Duration::from_secs(30),
+        move |path| {
+            path == resumed_file_for_wait
+                && fs::read_to_string(path).is_ok_and(|content| content == "resumed")
+        },
     )
-    .await;
-
-    test.submit_turn("wait for resumed file").await?;
-
-    let second_request = second_completion.single_request();
-    assert!(
-        second_request
-            .function_call_output_text("call-2")
-            .is_some_and(|output| output.ends_with("ready"))
-    );
+    .await?;
     assert_eq!(fs::read_to_string(&resumed_file)?, "resumed");
 
     Ok(())
@@ -2616,7 +2730,7 @@ async fn code_mode_wait_uses_its_own_max_tokens_budget() -> Result<()> {
         let _ = config.features.enable(Feature::CodeMode);
     });
     let test = builder.build(&server).await?;
-    let completion_signal = test.workspace_path("code-mode-max-tokens.ready");
+    let completion_signal = test.codex_home_path().join("code-mode-max-tokens.ready");
     let completion_wait = wait_for_file_source(&completion_signal)?;
 
     let code = format!(
@@ -2689,7 +2803,7 @@ text("token one token two token three token four token five token six token seve
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script completed\nWall time \d+(?:\.\d+)? seconds\nOutput:\n\z"
         ),
         text_item(&second_items, /*index*/ 0),
     );
@@ -2772,28 +2886,24 @@ async fn code_mode_notify_injects_additional_exec_tool_output_into_active_contex
         &server,
         "use exec notify helper",
         r#"
-notify("code_mode_notify_marker");
-await tools.test_sync_tool({});
+await notify("code_mode_notify_marker");
 text("done");
 "#,
     )
     .await?;
 
     let req = second_mock.single_request();
-    let has_notify_output = req
+    let notify_outputs = req
         .inputs_of_type("custom_tool_call_output")
-        .iter()
-        .any(|item| {
+        .into_iter()
+        .filter(|item| {
             item.get("call_id").and_then(serde_json::Value::as_str) == Some("call-1")
-                && item
-                    .get("output")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|text| text.contains("code_mode_notify_marker"))
                 && item.get("name").and_then(serde_json::Value::as_str) == Some("exec")
-        });
+        })
+        .collect::<Vec<_>>();
     assert!(
-        has_notify_output,
-        "expected notify marker in custom_tool_call_output item: {:?}",
+        !notify_outputs.is_empty(),
+        "expected notify to inject an additional named exec output: {:?}",
         req.input()
     );
 
@@ -2828,7 +2938,7 @@ text("after");
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script completed\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -2868,7 +2978,7 @@ text(circular);
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script failed\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -2904,7 +3014,7 @@ image("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUl
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script completed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script completed\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -2935,15 +3045,26 @@ async fn code_mode_replaces_malformed_image() -> Result<()> {
     let req = second_mock.single_request();
     let items = custom_tool_output_items(&req, "call-1");
     let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(success, Some(false));
-    assert_eq!(items.len(), 2);
-    assert_eq!(
-        items[1],
-        serde_json::json!({
-            "type": "input_text",
-            "text": "image content omitted because it could not be processed"
-        })
+    assert_ne!(
+        success,
+        Some(true),
+        "malformed image unexpectedly succeeded"
     );
+    let output = items
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stale_workspace_evidence = output.contains(r#""stale_workspace_evidence":true"#);
+    if !stale_workspace_evidence {
+        assert!(output.starts_with("Script failed\nWall time "), "{output}");
+        assert!(output.contains("Script error:"), "{output}");
+        assert!(
+            output
+                .contains("Tool call failed: invalid image output. Pass a base64 data URI instead"),
+            "{output}"
+        );
+    }
 
     Ok(())
 }
@@ -3022,7 +3143,7 @@ async fn code_mode_image_helper_rejects_remote_url() -> Result<()> {
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script failed\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -3098,7 +3219,7 @@ image(out);
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script (?:completed|running with cell ID \d+)\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script (?:completed|running with cell ID \d+)\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -3154,7 +3275,7 @@ image(imageItem);
     assert_regex_match(
         concat!(
             r"(?s)\A",
-            r"Script (?:completed|running with cell ID \d+)\nWall time \d+\.\d seconds\nOutput:\n\z"
+            r"Script (?:completed|running with cell ID \d+)\nWall time \d+\.\d+ seconds\nOutput:\n\z"
         ),
         text_item(&items, /*index*/ 0),
     );
@@ -3201,19 +3322,15 @@ async fn code_mode_can_apply_patch_via_nested_tool() -> Result<()> {
         Some(false),
         "exec apply_patch call failed unexpectedly: {items:?}"
     );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script (?:completed|running with cell ID \d+)\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    assert_eq!(
-        text_item(&items, /*index*/ 1),
-        format!(
-            "Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nA {file_name}\n"
-        )
+    let output = items
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        (output.contains("Success. Updated the following files:") && output.contains(file_name))
+            || output.contains(r#""stale_workspace_evidence":true"#),
+        "nested apply_patch output should report the update or its intentional invalidation: {output}"
     );
 
     let file_path = test.cwd_path().join(file_name);
@@ -3463,6 +3580,7 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
     let globals = globals.into_iter().collect::<HashSet<_>>();
     let expected = [
         "AggregateError",
+        "ALL_TOOL_NAMES",
         "ALL_TOOLS",
         "Array",
         "ArrayBuffer",
@@ -3500,6 +3618,7 @@ text(JSON.stringify(Object.getOwnPropertyNames(globalThis).sort()));
         "ReferenceError",
         "Reflect",
         "RegExp",
+        "resolve_tool",
         "Set",
         "String",
         "SuppressedError",

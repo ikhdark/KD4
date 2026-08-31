@@ -1207,7 +1207,9 @@ async fn stdio_image_responses_resize_large_image() -> anyhow::Result<()> {
     let server_name = "rmcp";
     let namespace = format!("mcp__{server_name}");
 
-    let original_dimensions = (3000, 2000);
+    // Keep the source wider than the model limit while avoiding a multi-million-pixel
+    // fixture that can exhaust the event wait budget in an unoptimized test build.
+    let original_dimensions = (2400, 100);
     let image = ImageBuffer::from_pixel(
         original_dimensions.0,
         original_dimensions.1,
@@ -1288,7 +1290,7 @@ async fn stdio_image_responses_resize_large_image() -> anyhow::Result<()> {
     let resized_bytes = BASE64_STANDARD.decode(resized_base64)?;
     let resized = image::load_from_memory(&resized_bytes)?;
     let resized_dimensions = resized.dimensions();
-    assert_eq!(resized_dimensions, (1920, 1280));
+    assert_eq!(resized_dimensions, (2048, 85));
 
     server.verify().await;
     Ok(())
@@ -1821,11 +1823,8 @@ async fn streamable_http_tool_call_round_trip() -> anyhow::Result<()> {
 
     // Phase 2: start the Streamable HTTP MCP test server as a local process.
     let expected_env_value = "propagated-env-http";
-    let Some(http_server) =
-        start_streamable_http_test_server(expected_env_value, /*expected_token*/ None).await?
-    else {
-        return Ok(());
-    };
+    let http_server =
+        start_streamable_http_test_server(expected_env_value, /*expected_token*/ None).await?;
     let server_url = http_server.url().to_string();
 
     // Phase 3: configure Codex with the Streamable HTTP MCP server.
@@ -1925,11 +1924,8 @@ async fn streamable_http_configured_auth_precedes_chatgpt_auth() -> anyhow::Resu
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let Some(configured_auth_server) =
-        start_streamable_http_test_server("configured-auth", Some("configured-token")).await?
-    else {
-        return Ok(());
-    };
+    let configured_auth_server =
+        start_streamable_http_test_server("configured-auth", Some("configured-token")).await?;
     let configured_auth_url = configured_auth_server.url().to_string();
 
     let configured_auth_fixture = test_codex()
@@ -2157,11 +2153,8 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
     let expected_token = "initial-access-token";
     let client_id = "test-client-id";
     let refresh_token = "initial-refresh-token";
-    let Some(http_server) =
-        start_streamable_http_test_server(expected_env_value, Some(expected_token)).await?
-    else {
-        return Ok(());
-    };
+    let http_server =
+        start_streamable_http_test_server(expected_env_value, Some(expected_token)).await?;
     let server_url = http_server.url().to_string();
 
     // Phase 3: seed an isolated CODEX_HOME with fallback OAuth tokens for this
@@ -2280,14 +2273,8 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
 async fn start_streamable_http_test_server(
     expected_env_value: &str,
     expected_token: Option<&str>,
-) -> anyhow::Result<Option<StreamableHttpTestServer>> {
-    let rmcp_http_server_bin = match cargo_bin("test_streamable_http_server") {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("test_streamable_http_server binary not available, skipping test: {err}");
-            return Ok(None);
-        }
-    };
+) -> anyhow::Result<StreamableHttpTestServer> {
+    let rmcp_http_server_bin = required_streamable_http_server_bin()?;
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
@@ -2306,10 +2293,39 @@ async fn start_streamable_http_test_server(
     let mut child = command.spawn()?;
 
     wait_for_local_streamable_http_server(&mut child, &server_url, Duration::from_secs(5)).await?;
-    Ok(Some(StreamableHttpTestServer {
+    Ok(StreamableHttpTestServer {
         server_url,
         process: child,
-    }))
+    })
+}
+
+fn required_streamable_http_server_bin() -> anyhow::Result<PathBuf> {
+    required_streamable_http_server_bin_with(cargo_bin)
+}
+
+fn required_streamable_http_server_bin_with(
+    resolver: impl FnOnce(&str) -> Result<PathBuf, codex_utils_cargo_bin::CargoBinError>,
+) -> anyhow::Result<PathBuf> {
+    resolver("test_streamable_http_server")
+        .context("resolve required test_streamable_http_server helper")
+}
+
+#[test]
+fn missing_streamable_http_helper_resolution_reports_an_error() {
+    let error = required_streamable_http_server_bin_with(|name| {
+        Err(codex_utils_cargo_bin::CargoBinError::NotFound {
+            name: name.to_string(),
+            env_keys: vec![format!("CARGO_BIN_EXE_{name}")],
+            fallback: "disabled in propagation test".to_string(),
+        })
+    })
+    .expect_err("a missing required helper must fail the test");
+
+    assert!(
+        error
+            .to_string()
+            .contains("resolve required test_streamable_http_server helper")
+    );
 }
 
 /// Waits for the local Streamable HTTP test server to publish OAuth metadata.

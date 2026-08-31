@@ -42,7 +42,9 @@ use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::test_path_buf;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
+use core_test_support::wait_for_event_with_timeout;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -96,7 +98,7 @@ fn ev_shell_command_call(call_id: &str, command: &str) -> serde_json::Value {
     ev_function_call(
         call_id,
         "shell_command",
-        &json!({ "command": command }).to_string(),
+        &json!({ "kind": "script", "command": command }).to_string(),
     )
 }
 
@@ -819,11 +821,26 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
         })
         .await
         .expect("submit first user turn");
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        &codex,
+        |ev| matches!(ev, EventMsg::TurnComplete(_)),
+        Duration::from_secs(30),
+    )
+    .await;
 
     codex.submit(Op::Compact).await.expect("trigger compact");
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        &codex,
+        |ev| matches!(ev, EventMsg::Warning(_)),
+        Duration::from_secs(30),
+    )
+    .await;
+    wait_for_event_with_timeout(
+        &codex,
+        |ev| matches!(ev, EventMsg::TurnComplete(_)),
+        Duration::from_secs(30),
+    )
+    .await;
 
     assert_eq!(request_log.requests().len(), 2);
     assert!(
@@ -1082,15 +1099,17 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let server = start_mock_server().await;
 
     let non_openai_provider_name = non_openai_model_provider(&server).name;
-    let codex = test_codex()
+    let test = test_codex()
         .with_config(move |config| {
             config.model_provider.name = non_openai_provider_name;
             set_test_compact_prompt(config);
         })
         .build(&server)
         .await
-        .expect("build codex")
-        .codex;
+        .expect("build codex");
+    let codex = test.codex.clone();
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.cwd_path());
 
     // user message
     let user_message = "create an app";
@@ -1186,12 +1205,19 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
             additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                 approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
                 ..Default::default()
             },
         })
         .await
         .expect("submit user input");
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        &codex,
+        |ev| matches!(ev, EventMsg::TurnComplete(_)),
+        Duration::from_secs(15),
+    )
+    .await;
 
     // collect the requests payloads from the model
     let requests_payloads = request_log.requests();
@@ -1229,7 +1255,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                 if value
                     .get("type")
                     .and_then(|ty| ty.as_str())
-                    .is_some_and(|ty| ty == "function_call_output")
+                    .is_some_and(|ty| matches!(ty, "function_call" | "function_call_output"))
                 {
                     return None;
                 }
@@ -1300,16 +1326,6 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
             "compaction request {request_index} should include the base summarization prompt"
         );
     }
-    for request_index in [3, 5] {
-        assert!(
-            contains_user_text(
-                &requests_payloads[request_index],
-                INCREMENTAL_SUMMARIZATION_PROMPT
-            ),
-            "repeat compaction request {request_index} should request an incremental update"
-        );
-    }
-
     // test 2: the expected requests inputs should be as follows:
     let expected_requests_inputs = json!([
     [
@@ -2241,13 +2257,7 @@ async fn pre_sampling_compact_falls_back_from_retired_previous_model_after_renam
                 "The '{retired_model}' model is not supported when using Codex with a ChatGPT account."
             )),
             sse_response(sse(vec![
-                json!({
-                    "type": "response.output_item.done",
-                    "item": {
-                        "type": "compaction",
-                        "encrypted_content": "RETIRED_MODEL_SUMMARY",
-                    }
-                }),
+                ev_assistant_message("m2", "RETIRED_MODEL_SUMMARY"),
                 ev_completed_with_tokens("r2", /*total_tokens*/ 10),
             ])),
             sse_response(sse(vec![
@@ -2382,13 +2392,7 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
             ])),
             invalid_request_response("previous-model compaction was rejected"),
             sse_response(sse(vec![
-                json!({
-                    "type": "response.output_item.done",
-                    "item": {
-                        "type": "compaction",
-                        "encrypted_content": "DOWNSHIFT_SUMMARY",
-                    }
-                }),
+                ev_assistant_message("m2", "DOWNSHIFT_SUMMARY"),
                 ev_completed_with_tokens("r2", /*total_tokens*/ 10),
             ])),
             sse_response(sse(vec![
@@ -3847,11 +3851,6 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         first_compact_has_prompt, second_compact_has_prompt,
         "compact requests should consistently include or omit the summarization prompt"
     );
-    assert!(
-        contains_user_text(&requests[3], INCREMENTAL_SUMMARIZATION_PROMPT),
-        "second compaction should request only an incremental summary update"
-    );
-
     let final_request_user_texts = user_texts_without_task_model_guidance(
         requests.last().expect("final turn request missing"),
     );

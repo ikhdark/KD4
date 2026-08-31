@@ -140,6 +140,23 @@ pub(crate) fn build_sandbox_command(
     })
 }
 
+/// Returns the exact runtime-owned local snapshot file that a Windows sandbox
+/// must make readable while starting the shell. This is launch plumbing, not a
+/// user-granted permission, and remote snapshots are owned by their executor.
+pub(crate) fn shell_snapshot_additional_read_roots(
+    shell_snapshot: Option<&ShellSnapshotFile>,
+    sandbox: SandboxType,
+) -> Vec<AbsolutePathBuf> {
+    if sandbox != SandboxType::WindowsRestrictedToken {
+        return Vec::new();
+    }
+    shell_snapshot
+        .and_then(ShellSnapshotFile::local_path)
+        .cloned()
+        .into_iter()
+        .collect()
+}
+
 pub(crate) fn exec_env_for_sandbox_permissions(
     env: &HashMap<String, String>,
     sandbox_permissions: SandboxPermissions,

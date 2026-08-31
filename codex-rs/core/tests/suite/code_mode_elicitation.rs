@@ -27,7 +27,7 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
-use core_test_support::wait_for_event_match;
+use core_test_support::wait_for_event_match_with_timeout;
 use core_test_support::wait_for_event_with_timeout;
 use wiremock::MockServer;
 
@@ -137,10 +137,14 @@ async fn submit_turn(test: &TestCodex, permission_profile: PermissionProfile) ->
         })
         .await?;
 
-    Ok(wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
-        _ => None,
-    })
+    Ok(wait_for_event_match_with_timeout(
+        &test.codex,
+        |event| match event {
+            EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+            _ => None,
+        },
+        TURN_COMPLETE_TIMEOUT,
+    )
     .await)
 }
 
@@ -151,6 +155,7 @@ async fn code_mode_holds_yielded_result_during_command_approval() -> Result<()> 
     let harness = CodeModeElicitationHarness::start(
         r#"// @exec: {"yield_time_ms": 1000}
 await tools.exec_command({
+  kind: "script",
   cmd: "[Console]::Out.Write('code_mode_approval_marker')",
   sandbox_permissions: "require_escalated",
   justification: "test command approval",
@@ -159,10 +164,14 @@ await tools.exec_command({
         |_| {},
     )
     .await?;
-    let approval = wait_for_event_match(&harness.test.codex, |event| match event {
-        EventMsg::ExecApprovalRequest(approval) => Some(approval.clone()),
-        _ => None,
-    })
+    let approval = wait_for_event_match_with_timeout(
+        &harness.test.codex,
+        |event| match event {
+            EventMsg::ExecApprovalRequest(approval) => Some(approval.clone()),
+            _ => None,
+        },
+        TURN_COMPLETE_TIMEOUT,
+    )
     .await;
 
     harness.assert_result_held().await;
@@ -190,10 +199,14 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_patch_approval
         |_| {},
     )
     .await?;
-    let approval = wait_for_event_match(&harness.test.codex, |event| match event {
-        EventMsg::ApplyPatchApprovalRequest(approval) => Some(approval.clone()),
-        _ => None,
-    })
+    let approval = wait_for_event_match_with_timeout(
+        &harness.test.codex,
+        |event| match event {
+            EventMsg::ApplyPatchApprovalRequest(approval) => Some(approval.clone()),
+            _ => None,
+        },
+        TURN_COMPLETE_TIMEOUT,
+    )
     .await;
 
     harness.assert_result_held().await;
@@ -264,10 +277,14 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_denied_patch.t
         |_| {},
     )
     .await?;
-    let approval = wait_for_event_match(&harness.test.codex, |event| match event {
-        EventMsg::ApplyPatchApprovalRequest(approval) => Some(approval.clone()),
-        _ => None,
-    })
+    let approval = wait_for_event_match_with_timeout(
+        &harness.test.codex,
+        |event| match event {
+            EventMsg::ApplyPatchApprovalRequest(approval) => Some(approval.clone()),
+            _ => None,
+        },
+        TURN_COMPLETE_TIMEOUT,
+    )
     .await;
 
     harness
@@ -354,8 +371,8 @@ await tools.apply_patch("*** Begin Patch\n*** Add File: code_mode_denied_patch.t
         "the synthesized direct abort result must record its response projection"
     );
     assert!(
-        nested.output_projection_ms.is_some(),
-        "the synthesized nested abort result must record its CodeMode projection"
+        nested.output_projection_ms.is_none(),
+        "the nested abort remains internal and must not record a model-boundary projection"
     );
     assert!(direct.output_model_visible_at_ms.is_some());
     assert!(direct.model_resumed_at_ms.is_none());
@@ -642,7 +659,11 @@ async fn code_mode_nested_nonzero_returns_to_model_for_repair() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = CodeModeElicitationHarness::start(
-        r#"await tools.exec_command({ cmd: "exit 7" });"#,
+        r#"await tools.exec_command({
+  kind: "script",
+  cmd: "exit 7",
+  yield_time_ms: 30_000
+});"#,
         PermissionProfile::Disabled,
         |_| {},
     )

@@ -20,6 +20,7 @@ use core_test_support::responses;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::request_has_last_message_input_text;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
@@ -528,7 +529,13 @@ async fn selected_environment_sources_match_model_visible_instructions() -> Resu
         .into_iter()
         .find(|text| text.starts_with("# AGENTS.md instructions"))
         .expect("instructions message");
-    assert!(instructions.contains("global doc\n\n--- project-doc ---\n\nproject doc"));
+    let project_source_header = format!(
+        "## AGENTS.md instructions from {}",
+        PathUri::from_abs_path(&project_agents).inferred_native_path_string()
+    );
+    assert!(instructions.contains(&format!(
+        "global doc\n\n{PROJECT_SEPARATOR}\n\n{project_source_header}\n\nproject doc"
+    )));
 
     Ok(())
 }
@@ -688,12 +695,16 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
     // reported source paths change.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
+    let project_source_header = format!(
+        "## AGENTS.md instructions from {}",
+        PathUri::from_abs_path(&project_source).inferred_native_path_string()
+    );
     let expected_contents = format!(
-        "{FRESH_PROVENANCE}\n\n{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{PROJECT_INSTRUCTIONS}"
+        "{FRESH_PROVENANCE}\n\n{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{project_source_header}\n\n{PROJECT_INSTRUCTIONS}"
     );
     let expected_fragment = expected_instruction_fragment(&test.config.cwd, &expected_contents);
     let replacement_contents = format!(
-        "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{FRESH_PROVENANCE}\n\n{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{NEW_PROJECT_INSTRUCTIONS}"
+        "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{FRESH_PROVENANCE}\n\n{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{project_source_header}\n\n{NEW_PROJECT_INSTRUCTIONS}"
     );
     let replacement_fragment =
         expected_instruction_fragment(&test.config.cwd, &replacement_contents);
@@ -1011,6 +1022,7 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
         .with_home(Arc::clone(&home))
         .with_config(|config| {
             let _ = config.features.enable(Feature::Collab);
+            let _ = config.features.disable(Feature::MultiAgentV2);
             let _ = config.features.disable(Feature::EnableRequestCompression);
         });
     let test = builder.build(&server).await?;
@@ -1032,6 +1044,7 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
         move |request: &wiremock::Request| {
             request_prompt_cache_key(request)
                 .is_some_and(|cache_key| cache_key != parent_prompt_cache_key)
+                && request_has_last_message_input_text(request, "user", SPAWN_CHILD_PROMPT)
         },
         responses::sse(vec![
             responses::ev_response_created("child-response"),

@@ -456,6 +456,10 @@ async fn setup_turn_one_with_custom_spawned_child(
             .features
             .enable(Feature::Collab)
             .expect("test config should allow feature update");
+        config
+            .features
+            .disable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
         config.model = Some(INHERITED_MODEL.to_string());
         config.model_reasoning_effort = Some(INHERITED_REASONING_EFFORT);
     }));
@@ -576,6 +580,10 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
             config
                 .features
                 .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .disable(Feature::MultiAgentV2)
                 .expect("test config should allow feature update");
         })
         .build(&server)
@@ -724,6 +732,10 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
             config
                 .features
                 .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .disable(Feature::MultiAgentV2)
                 .expect("test config should allow feature update");
         })
         .build(&server)
@@ -944,6 +956,10 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
         config
             .features
             .enable(Feature::Collab)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .disable(Feature::MultiAgentV2)
             .expect("test config should allow feature update");
     });
     let test = builder.build(&server).await?;
@@ -1383,7 +1399,7 @@ async fn plaintext_multi_agent_v2_completion_without_receipt_sends_error_message
         ]),
     )
     .await;
-    let error = "stream disconnected before completion: stream closed before response.completed";
+    let error = "Error while reading the server response: stream closed before response.completed";
     let (status, expected_text) = match scenario {
         CompletionScenario::Completed => {
             ("Completed(Some(\"child done\"))".to_string(), "child done")
@@ -1391,10 +1407,16 @@ async fn plaintext_multi_agent_v2_completion_without_receipt_sends_error_message
         CompletionScenario::TerminalError => (format!("Errored(\"{error}\")"), error),
     };
     let payload = format!(
-        "durable typed receipt status: needs_main: typed agent /root/worker finished with status {status} without submitting a receipt"
+        "Agent errored: durable typed receipt status: needs_main: typed agent /root/worker finished with status {status} without submitting a receipt"
     );
     let notification = format!(
-        "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n{payload}"
+        concat!(
+            "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n{payload}\n\n",
+            "This agent's turn failed. The full sealed error remains available through get_agent_task; ",
+            "retrieve it with the assignment id returned by spawn_agent before deciding whether to retry. ",
+            "If you still need this agent, use the available collaboration tools to give it another task."
+        ),
+        payload = payload,
     );
     // If the child is still running when the parent turn starts, wait_agent blocks
     // until mailbox delivery. The follow-up request must then contain that delivery.
@@ -1498,8 +1520,7 @@ async fn plaintext_multi_agent_v2_completion_without_receipt_sends_error_message
 
     if let Some(id) = id {
         let id = id.as_str().expect("terminal notification ID string");
-        assert!(id.starts_with("terminal_result_"));
-        assert!(id.ends_with("_parent_notification"));
+        assert!(id.starts_with("amsg_"));
     }
 
     let metadata = metadata.as_object().expect("turn metadata object");
@@ -1586,7 +1607,7 @@ async fn skills_toggle_skips_instructions_for_parent_and_spawned_child() -> Resu
                 .expect("test config should allow feature update");
             config
                 .features
-                .enable(Feature::MultiAgentV2)
+                .disable(Feature::MultiAgentV2)
                 .expect("test config should allow feature update");
             config.include_skill_instructions = false;
         });

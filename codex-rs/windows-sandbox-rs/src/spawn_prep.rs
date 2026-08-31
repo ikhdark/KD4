@@ -15,7 +15,7 @@ use crate::env::ensure_non_interactive_pager;
 use crate::env::inherit_path_env;
 use crate::env::normalize_null_device_env;
 use crate::identity::SandboxCreds;
-use crate::identity::require_logon_sandbox_creds;
+use crate::identity::require_logon_sandbox_creds_with_additional_read_roots;
 use crate::logging::log_start;
 use crate::path_normalization::canonical_path_key;
 use crate::path_normalization::canonicalize_path;
@@ -227,6 +227,18 @@ pub(crate) fn root_capability_sids(
     Ok(out)
 }
 
+pub(crate) fn sandbox_capability_sid_strings(
+    uses_write_capabilities: bool,
+    write_root_sids: Vec<String>,
+    readonly_sid: &str,
+) -> Vec<String> {
+    if uses_write_capabilities && !write_root_sids.is_empty() {
+        write_root_sids
+    } else {
+        vec![readonly_sid.to_string()]
+    }
+}
+
 fn matching_root_capability<'a>(
     path: &Path,
     root_sids: &'a [RootCapabilitySid],
@@ -374,6 +386,7 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
     env_map: &mut HashMap<String, String>,
     command: &[String],
     read_roots_override: Option<&[PathBuf]>,
+    additional_read_roots: &[PathBuf],
     read_roots_include_platform_defaults: bool,
     write_roots_override: Option<&[PathBuf]>,
     deny_read_paths_override: &[PathBuf],
@@ -420,12 +433,13 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
     } else {
         write_roots_override
     };
-    let sandbox_creds = require_logon_sandbox_creds(
+    let sandbox_creds = require_logon_sandbox_creds_with_additional_read_roots(
         &permissions,
         cwd,
         env_map,
         codex_home,
         read_roots_override,
+        additional_read_roots,
         read_roots_include_platform_defaults,
         setup_write_roots_override,
         deny_read_paths_override,
@@ -438,21 +452,17 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
         proxy_settings_mode,
     )?;
     let caps = load_or_create_cap_sids(codex_home)?;
-    let (psid_to_use, cap_sids) = if uses_write_capabilities {
-        let cap_sids = root_capability_sids(codex_home, cwd, effective_write_roots)?
+    let write_root_sids = if uses_write_capabilities {
+        root_capability_sids(codex_home, cwd, effective_write_roots)?
             .into_iter()
             .map(|root_sid| root_sid.sid_str)
-            .collect::<Vec<_>>();
-        if cap_sids.is_empty() {
-            anyhow::bail!("workspace-write sandbox has no writable root capability SIDs");
-        }
-        (LocalSid::from_string(&cap_sids[0])?, cap_sids)
+            .collect::<Vec<_>>()
     } else {
-        (
-            LocalSid::from_string(&caps.readonly)?,
-            vec![caps.readonly.clone()],
-        )
+        Vec::new()
     };
+    let cap_sids =
+        sandbox_capability_sid_strings(uses_write_capabilities, write_root_sids, &caps.readonly);
+    let psid_to_use = LocalSid::from_string(&cap_sids[0])?;
 
     unsafe {
         allow_null_device(psid_to_use.as_ptr());
@@ -474,6 +484,7 @@ mod tests {
     use super::prepare_legacy_spawn_context;
     use super::prepare_spawn_context_common;
     use super::root_capability_sids;
+    use super::sandbox_capability_sid_strings;
     use crate::cap::load_or_create_cap_sids;
     use crate::cap::workspace_write_cap_sid_for_root;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
@@ -501,6 +512,20 @@ mod tests {
 
     fn workspace_roots_for(root: &Path) -> Vec<AbsolutePathBuf> {
         vec![AbsolutePathBuf::from_absolute_path(root).expect("absolute workspace root")]
+    }
+
+    #[test]
+    fn empty_workspace_write_roots_fall_back_to_readonly_capability() {
+        let readonly_sid = "S-1-15-3-1024-1";
+
+        assert_eq!(
+            sandbox_capability_sid_strings(true, Vec::new(), readonly_sid),
+            vec![readonly_sid.to_string()]
+        );
+        assert_eq!(
+            sandbox_capability_sid_strings(true, vec!["S-1-15-3-1024-2".to_string()], readonly_sid,),
+            vec!["S-1-15-3-1024-2".to_string()]
+        );
     }
 
     fn should_apply_network_block(permission_profile: &PermissionProfile) -> bool {

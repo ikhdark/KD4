@@ -2495,6 +2495,10 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         original_response,
         materialization,
     } = input;
+    let successful = !matches!(
+        &outcome,
+        ToolOutputOutcome::Failure | ToolOutputOutcome::TimedOut
+    );
     if !projection_eligible {
         return None;
     }
@@ -2666,6 +2670,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
                 call_id: origin_call_id,
                 tool_identity: tool_name,
                 semantic_class,
+                successful,
                 source_dependencies: source_dependencies.clone(),
                 source_dependencies_current: true,
                 artifact_id,
@@ -2800,6 +2805,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
             call_id: origin_call_id,
             tool_identity: tool_name,
             semantic_class,
+            successful,
             source_dependencies: source_dependencies.clone(),
             source_dependencies_current: true,
             artifact_id,
@@ -3479,9 +3485,14 @@ impl CodeModeArgumentPreflight {
         payload: &ToolPayload,
         parsed_function_arguments: Option<&ParsedFunctionArguments>,
     ) -> Result<(), String> {
-        let ToolPayload::Function { arguments: _ } = payload else {
+        let ToolPayload::Function { arguments } = payload else {
             return Ok(());
         };
+        if tool_name.namespace.is_none() && tool_name.name == "exec_command" {
+            crate::tools::handlers::validate_exec_command_arguments(arguments).map_err(
+                |message| format!("tool `{tool_name}` argument preflight failed: {message}"),
+            )?;
+        }
         let value = parsed_function_arguments
             .and_then(|parsed| parsed.value().ok())
             .cloned()

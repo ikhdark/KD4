@@ -1,7 +1,7 @@
 {
-  "index_sha256": "4d08efb54509e7e3a80a19aedeac55b847b13183c902a03d205b3adf4873d532",
+  "index_sha256": "87728f7216e2146169a6b49e6bb029fa7ac9bfc77ae10c23b3e07d5da3ac2170",
   "index_version": 1,
-  "manifest_sha256": "e9020f0bf35f98d5c6a523e027d946ca94435a863cf76241faf6de436da8b4e5",
+  "manifest_sha256": "5954533d9a4a8e5c39110f6ba28143565cb511f28ab902e368f528b2449a0a24",
   "omitted": {
     "relationships": 0
   },
@@ -268,9 +268,10 @@
         {
           "argv": [
             "just",
-            "test-fast",
-            "-p",
-            "codex-core"
+            "core-test-fast",
+            "core_lib",
+            "-E",
+            "test(tools::router::tests) | test(tools::registry::tests)"
           ],
           "cwd": ".",
           "id": "core-focused",
@@ -497,11 +498,11 @@
       "validation": [
         {
           "argv": [
-            "cargo",
-            "test",
-            "-p",
-            "codex-core",
-            "tools::handlers::plan_tests"
+            "just",
+            "core-test-fast",
+            "core_lib",
+            "-E",
+            "test(tools::handlers::plan::tests)"
           ],
           "cwd": "codex-rs",
           "id": "planning-focused",
@@ -562,11 +563,11 @@
       "validation": [
         {
           "argv": [
-            "cargo",
-            "test",
-            "-p",
-            "codex-core",
-            "git_workspace"
+            "just",
+            "core-test-fast",
+            "core_lib",
+            "-E",
+            "test(git_workspace::tests)"
           ],
           "cwd": "codex-rs",
           "id": "repository-context-focused",
@@ -576,7 +577,8 @@
     },
     {
       "configuration": [
-        "codex-rs/core/benches/turn_latency.rs"
+        "codex-rs/core/benches/turn_latency.rs",
+        "scripts/kd4_live_agent_benchmark.py"
       ],
       "facet_exclusions": {
         "configuration_and_gates": "The benchmark command selects a workflow directly; no repository feature or configuration file owns that selection."
@@ -614,12 +616,39 @@
           "tests": [
             "codex-rs/core/benches/turn_latency/tests.rs"
           ]
+        },
+        {
+          "evidence": [
+            {
+              "path": "scripts/kd4_live_agent_benchmark.py",
+              "symbol": "exact_source_state"
+            },
+            {
+              "path": "scripts/kd4_live_agent_benchmark.py",
+              "symbol": "summarize"
+            },
+            {
+              "path": "scripts/kd4_live_agent_benchmark.py",
+              "symbol": "classify_diagnostics"
+            }
+          ],
+          "id": "live-agent-source-and-scoring-integrity",
+          "kind": "semantic",
+          "statement": "Live-agent reports bind each binary to a clean exact commit and tree, report outcome correctness separately from task-contract compliance, and retain structured diagnostic categories.",
+          "tests": [
+            "scripts/test_kd4_live_agent_benchmark.py"
+          ]
         }
       ],
       "primary_entries": [
         {
           "ambiguous": true,
           "path": "codex-rs/core/benches/turn_latency.rs",
+          "symbol": "main"
+        },
+        {
+          "ambiguous": true,
+          "path": "scripts/kd4_live_agent_benchmark.py",
           "symbol": "main"
         }
       ],
@@ -630,25 +659,37 @@
         "codex-rs/core/benches/turn_latency/runtime_fixtures.rs",
         "codex-rs/core/benches/turn_latency/tests.rs",
         "codex-rs/core/tests/turn_latency_bench.rs",
-        "docs/benchmarks/turn-latency/README.md"
+        "docs/benchmarks/turn-latency/README.md",
+        "scripts/kd4_live_agent_benchmark.py",
+        "scripts/test_kd4_live_agent_benchmark.py"
       ],
       "tests": [
         "codex-rs/core/benches/turn_latency/tests.rs",
-        "codex-rs/core/tests/turn_latency_bench.rs"
+        "codex-rs/core/tests/turn_latency_bench.rs",
+        "scripts/test_kd4_live_agent_benchmark.py"
       ],
       "validation": [
         {
           "argv": [
-            "cargo",
-            "test",
-            "-p",
-            "codex-core",
-            "--test",
+            "just",
+            "core-test-fast",
             "turn_latency_bench",
-            "code_mode_capture_report_has_no_local_ab_gate"
+            "-E",
+            "test(code_mode_capture_report_has_no_local_ab_gate)"
           ],
           "cwd": "codex-rs",
           "id": "rust-turn-latency-focused",
+          "role": "focused_tests"
+        },
+        {
+          "argv": [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.test_kd4_live_agent_benchmark"
+          ],
+          "cwd": ".",
+          "id": "live-agent-benchmark-focused",
           "role": "focused_tests"
         }
       ]
@@ -877,11 +918,11 @@
       "validation": [
         {
           "argv": [
-            "cargo",
-            "test",
-            "-p",
-            "codex-core",
-            "tools::command_output_artifact::hardening_tests"
+            "just",
+            "core-test-fast",
+            "core_lib",
+            "-E",
+            "test(tools::command_output_artifact::hardening_tests)"
           ],
           "cwd": "codex-rs",
           "id": "tool-output-focused",
@@ -1104,8 +1145,40 @@
       "confidence": "declared",
       "evidence": [
         {
-          "path": "codex-rs/core/tests/all.rs",
-          "symbol": "mod suite;"
+          "path": "codex-rs/core/tests/core_cli_workspace.rs",
+          "symbol": "mod suite"
+        },
+        {
+          "path": "codex-rs/core/tests/core_code_mode_mcp.rs",
+          "symbol": "mod suite"
+        },
+        {
+          "path": "codex-rs/core/tests/core_exec_permissions.rs",
+          "symbol": "mod suite"
+        },
+        {
+          "path": "codex-rs/core/tests/core_thread_state.rs",
+          "symbol": "mod suite"
+        },
+        {
+          "path": "codex-rs/core/tests/core_transport_telemetry.rs",
+          "symbol": "mod suite"
+        },
+        {
+          "path": "codex-rs/core/tests/core_agents_review.rs",
+          "symbol": "mod suite"
+        },
+        {
+          "path": "codex-rs/core/tests/core_model_prompt_runtime.rs",
+          "symbol": "mod suite"
+        },
+        {
+          "path": "codex-rs/core/tests/core_windows.rs",
+          "symbol": "mod suite"
+        },
+        {
+          "path": "codex-rs/core/tests/suite/prelude.rs",
+          "symbol": "configure_test_binary_dispatch"
         }
       ],
       "kind": "validated_by",
@@ -1386,6 +1459,19 @@
       "target": "path:codex-rs/core/benches/turn_latency.rs"
     },
     {
+      "category": "tests_contracts",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "scripts/test_kd4_live_agent_benchmark.py",
+          "symbol": "Kd4LiveAgentBenchmarkTest"
+        }
+      ],
+      "kind": "validated_by",
+      "source": "owner:rust-turn-latency-benchmark",
+      "target": "path:scripts/kd4_live_agent_benchmark.py"
+    },
+    {
       "category": "callers_consumers",
       "confidence": "compiler_resolved",
       "evidence": [
@@ -1610,7 +1696,7 @@
       "target": "path:codex-rs/core/src/tools/command_output_artifact_tests.rs"
     }
   ],
-  "repository_revision": "manifest:e9020f0bf35f98d5c6a523e027d946ca94435a863cf76241faf6de436da8b4e5:sources:f8d1f2b0df76874fada90a92b0115ab2adb842ebf2bd1b37ad560f28b1b08f19",
+  "repository_revision": "manifest:5954533d9a4a8e5c39110f6ba28143565cb511f28ab902e368f528b2449a0a24:sources:c1f0a1c780e9e12a9182e9f8e5ed282999c24e0138088ffe395f0338e07fdbb5",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

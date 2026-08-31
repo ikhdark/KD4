@@ -88,22 +88,28 @@ async fn extension_tool_receives_turn_environment_sandbox() -> Result<()> {
         .await;
 
     let call_id = "image-edit-denied";
-    let _response_mock = responses::mount_sse_once(
+    let response_mock = responses::mount_sse_sequence(
         &server,
-        responses::sse(vec![
-            responses::ev_response_created("resp-1"),
-            responses::ev_function_call_with_namespace(
-                call_id,
-                "image_gen",
-                "imagegen",
-                &json!({
-                    "prompt": "edit the image",
-                    "referenced_image_paths": [denied_path.display().to_string()],
-                })
-                .to_string(),
-            ),
-            responses::ev_completed("resp-1"),
-        ]),
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_function_call_with_namespace(
+                    call_id,
+                    "image_gen",
+                    "imagegen",
+                    &json!({
+                        "prompt": "edit the image",
+                        "referenced_image_paths": [denied_path.display().to_string()],
+                    })
+                    .to_string(),
+                ),
+                responses::ev_completed("resp-1"),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("msg-2", "done"),
+                responses::ev_completed("resp-2"),
+            ]),
+        ],
     )
     .await;
 
@@ -127,12 +133,21 @@ async fn extension_tool_receives_turn_environment_sandbox() -> Result<()> {
             permission_profile,
         )
         .await?;
-    let output = completion
-        .error
-        .context("denied extension read should fail the turn")?
-        .message;
     assert!(
-        output.contains("required tool") && output.contains("failed"),
+        completion.error.is_none(),
+        "model should receive the tool denial"
+    );
+    let output_item = response_mock
+        .last_request()
+        .context("model should receive the denied extension output")?
+        .function_call_output(call_id);
+    let output = output_item
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .context("extension output should be text")?;
+    assert!(
+        output.to_ascii_lowercase().contains("denied")
+            || output.to_ascii_lowercase().contains("sandbox"),
         "unexpected extension error: {output}"
     );
 

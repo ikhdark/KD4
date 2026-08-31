@@ -42,6 +42,7 @@ use codex_mcp::McpConfig;
 use codex_mcp::McpConnectionManager;
 use codex_mcp::McpRuntimeContext;
 use codex_models_manager::manager::SharedModelsManager;
+use codex_network_proxy::NetworkPolicyDecider;
 use codex_otel::SessionTelemetry;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_rollout::state_integration::StateDbHandle;
@@ -96,6 +97,7 @@ pub(crate) struct SessionServices {
     pub(crate) network_proxy_audit_metadata: NetworkProxyAuditMetadata,
     pub(crate) managed_network_requirements_configured: bool,
     pub(crate) network_approval: Arc<NetworkApprovalService>,
+    pub(crate) network_policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
     pub(crate) state_db: Option<StateDbHandle>,
     pub(crate) live_thread: Option<LiveThread>,
     pub(crate) thread_store: Arc<dyn ThreadStore>,

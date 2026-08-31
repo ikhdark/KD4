@@ -1426,7 +1426,7 @@ impl Session {
             session_configuration.codex_home().as_path(),
             current_exec_policy.as_ref(),
             &session_configuration.permission_profile(),
-            /*network_policy_decider*/ None,
+            self.services.network_policy_decider.clone(),
             self.services
                 .managed_network_requirements_configured
                 .then(|| {
@@ -2876,13 +2876,32 @@ impl Session {
 
         let requested_permissions = args.permissions;
         let native_environment_cwd = environment.cwd.to_abs_path().ok();
-        let Some(approval_scope_id) = turn_context
+        let approval_scope_id = turn_context
             .environments
             .turn_environments
             .iter()
-            .find(|turn_environment| turn_environment.environment_id == environment.environment_id)
-            .map(|turn_environment| turn_environment.environment.approval_scope_id().to_string())
-        else {
+            .find(|turn_environment| turn_environment.selection() == environment)
+            .map(|turn_environment| turn_environment.environment.approval_scope_id().to_string());
+        let approval_scope_id = if approval_scope_id.is_none()
+            && turn_context
+                .config
+                .features
+                .enabled(Feature::DeferredExecutor)
+        {
+            self.services
+                .turn_environments
+                .snapshot()
+                .await
+                .turn_environments
+                .iter()
+                .find(|turn_environment| turn_environment.selection() == environment)
+                .map(|turn_environment| {
+                    turn_environment.environment.approval_scope_id().to_string()
+                })
+        } else {
+            approval_scope_id
+        };
+        let Some(approval_scope_id) = approval_scope_id else {
             warn!(
                 environment_id = %environment.environment_id,
                 "request_permissions targeted an environment outside the active turn"

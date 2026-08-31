@@ -17,7 +17,6 @@ use codex_features::CurrentTimeSource;
 use codex_features::Feature;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::ThreadId;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -26,7 +25,6 @@ use core_test_support::assert_regex_match;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
@@ -116,18 +114,16 @@ async fn current_time_reminders_follow_time_interval_and_persist_in_history() ->
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let tool_args = json!({
-        "command": "echo current time",
-        "timeout_ms": 1_000,
-    });
+    let tool_args = json!({ "duration_ms": 1 });
     let responses = mount_sse_sequence(
         &server,
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_function_call(
+                ev_function_call_with_namespace(
                     "current-time-tool-call",
-                    "shell_command",
+                    "clock",
+                    "sleep",
                     &serde_json::to_string(&tool_args)?,
                 ),
                 ev_completed("resp-1"),
@@ -143,14 +139,22 @@ async fn current_time_reminders_follow_time_interval_and_persist_in_history() ->
     .await;
     let test = test_codex()
         .with_config(|config| {
-            enable_current_time_reminder(config, /*interval*/ 120, CurrentTimeSource::External)
+            enable_current_time_reminder(
+                config,
+                /*interval*/ 120,
+                CurrentTimeSource::External,
+            );
+            config
+                .current_time_reminder
+                .as_mut()
+                .expect("current-time reminder should be configured")
+                .sleep_tool = true;
         })
         .with_external_time_provider(Arc::new(TestTimeProvider::default()))
         .build(&server)
         .await?;
 
-    test.submit_turn_with_permission_profile("first turn", PermissionProfile::Disabled)
-        .await?;
+    test.submit_turn("first turn").await?;
     test.submit_turn("second turn").await?;
 
     let requests = responses.requests();
@@ -207,23 +211,19 @@ async fn current_time_reminders_can_follow_only_user_or_tool_outputs() -> Result
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let tool_args = json!({
-        "command": "echo current time",
-        "timeout_ms": 1_000,
-    });
+    let tool_args = json!({ "duration_ms": 1 });
     let mut continue_response = ev_completed("resp-2");
     // Ask for another inference without recording a new user message or tool output.
     continue_response["response"]["end_turn"] = json!(false);
-    let mut repeated_continue_response = ev_completed("resp-3");
-    repeated_continue_response["response"]["end_turn"] = json!(false);
     let responses = mount_sse_sequence(
         &server,
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_function_call(
+                ev_function_call_with_namespace(
                     "current-time-tool-call",
-                    "shell_command",
+                    "clock",
+                    "sleep",
                     &serde_json::to_string(&tool_args)?,
                 ),
                 ev_completed("resp-1"),
@@ -232,11 +232,6 @@ async fn current_time_reminders_can_follow_only_user_or_tool_outputs() -> Result
                 ev_response_created("resp-2"),
                 ev_assistant_message("msg-2", "continue"),
                 continue_response,
-            ]),
-            sse(vec![
-                ev_response_created("resp-3"),
-                ev_assistant_message("msg-3", "complete"),
-                repeated_continue_response,
             ]),
         ],
     )
@@ -249,13 +244,17 @@ async fn current_time_reminders_can_follow_only_user_or_tool_outputs() -> Result
                 .as_mut()
                 .expect("current-time reminder should be configured")
                 .delivery_mode = CurrentTimeReminderDeliveryMode::AfterUserOrToolOutput;
+            config
+                .current_time_reminder
+                .as_mut()
+                .expect("current-time reminder should be configured")
+                .sleep_tool = true;
         })
         .with_external_time_provider(Arc::new(TestTimeProvider::default()))
         .build(&server)
         .await?;
 
-    test.submit_turn_with_permission_profile("first turn", PermissionProfile::Disabled)
-        .await?;
+    test.submit_turn("first turn").await?;
 
     let requests = responses.requests();
     // The tool result gets one shared follow-up. A subsequent end_turn=false

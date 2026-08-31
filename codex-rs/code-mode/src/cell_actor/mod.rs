@@ -5,6 +5,7 @@ mod types;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
@@ -42,6 +43,8 @@ use crate::session_runtime::CreateCellRequest as CellRequest;
 use crate::session_runtime::ObserveMode;
 use crate::session_runtime::OutputItem;
 use crate::session_runtime::ToolName as CellToolName;
+
+const STATE_CHANGE_COMPLETION_GRACE: Duration = Duration::from_millis(50);
 
 pub(crate) struct CellActor;
 
@@ -199,27 +202,10 @@ async fn run_cell<H: CellHost>(
                     let _ = response_tx.send(Err(CellError::Busy));
                     continue;
                 }
-                // State-change observations have no fallback timer. Deliver
-                // content that arrived after the previous observer completed
-                // but before this command reached the actor; otherwise that
-                // already-observed state change could remain buffered forever
-                // when the runtime produces no subsequent event.
-                if matches!(mode, ObserveMode::StateChange) && !content_items.is_empty() {
-                    finish_yield_delivery(
-                        send_cell_event(
-                            response_tx,
-                            CellEvent::Yielded {
-                                content_items: std::mem::take(&mut content_items),
-                            },
-                        ),
-                        &mut content_items,
-                        &mut admitted_output_bytes,
-                        output_admission.as_ref(),
-                    );
-                    continue;
-                }
                 observer = Some(Observer { mode, response_tx });
-                yield_timer = observer.as_ref().and_then(observer_timer);
+                yield_timer = observer
+                    .as_ref()
+                    .and_then(|observer| observer_timer(observer, !content_items.is_empty()));
             }
             _ = async {
                 if let Some(yield_timer) = yield_timer.as_mut() {
@@ -321,7 +307,9 @@ async fn run_cell<H: CellHost>(
                 };
                 match event {
                     RuntimeEvent::Started => {
-                        yield_timer = observer.as_ref().and_then(observer_timer);
+                        yield_timer = observer
+                            .as_ref()
+                            .and_then(|observer| observer_timer(observer, !content_items.is_empty()));
                     }
                     RuntimeEvent::ContentItem { item, admitted_bytes } => {
                         content_items.push(output_item(item));
@@ -330,18 +318,14 @@ async fn run_cell<H: CellHost>(
                         if matches!(
                             observer.as_ref().map(|observer| observer.mode),
                             Some(ObserveMode::StateChange)
-                        ) {
-                            finish_yield_delivery(
-                                send_observer_event(
-                                    observer.take(),
-                                    CellEvent::Yielded {
-                                        content_items: std::mem::take(&mut content_items),
-                                    },
-                                ),
-                                &mut content_items,
-                                &mut admitted_output_bytes,
-                                output_admission.as_ref(),
-                            );
+                        ) && yield_timer.is_none() {
+                            // A tool result is commonly followed by cell completion in the
+                            // same JavaScript turn. Give that terminal event a short chance
+                            // to arrive so the owner can return one completed response instead
+                            // of forcing another model turn solely to observe completion.
+                            yield_timer = Some(Box::pin(tokio::time::sleep(
+                                STATE_CHANGE_COMPLETION_GRACE,
+                            )));
                         }
                     }
                     RuntimeEvent::YieldRequested => {
@@ -545,9 +529,15 @@ fn finish_termination(
     }
 }
 
-fn observer_timer(observer: &Observer) -> Option<std::pin::Pin<Box<tokio::time::Sleep>>> {
+fn observer_timer(
+    observer: &Observer,
+    has_buffered_output: bool,
+) -> Option<std::pin::Pin<Box<tokio::time::Sleep>>> {
     match observer.mode {
         ObserveMode::YieldAfter(duration) => Some(Box::pin(tokio::time::sleep(duration))),
+        ObserveMode::StateChange if has_buffered_output => {
+            Some(Box::pin(tokio::time::sleep(STATE_CHANGE_COMPLETION_GRACE)))
+        }
         ObserveMode::StateChange => None,
     }
 }

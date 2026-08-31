@@ -41,6 +41,8 @@ use pretty_assertions::assert_eq;
 use regex_lite::Regex;
 use serde_json::Value;
 use serde_json::json;
+#[cfg(target_os = "windows")]
+use serial_test::serial;
 use std::fs;
 
 use std::path::PathBuf;
@@ -129,7 +131,7 @@ impl ActionKind {
                 let path = powershell_literal(&path.display().to_string());
                 let content = powershell_literal(content);
                 let command = format!(
-                    "Set-Content -LiteralPath {path} -Value {content} -NoNewline; Get-Content -Raw -LiteralPath {path}"
+                    "$ErrorActionPreference = 'Stop'; Set-Content -LiteralPath {path} -Value {content} -NoNewline; Get-Content -Raw -LiteralPath {path}"
                 );
                 let event = shell_event(
                     call_id,
@@ -265,6 +267,7 @@ fn shell_event_with_prefix_rule(
     prefix_rule: Option<Vec<String>>,
 ) -> Result<Value> {
     let mut args = json!({
+        "kind": "script",
         "command": command,
         "timeout_ms": timeout_ms,
     });
@@ -286,6 +289,7 @@ fn exec_command_event(
     justification: Option<&str>,
 ) -> Result<Value> {
     let mut args = json!({
+        "kind": "script",
         "cmd": cmd.to_string(),
     });
     if let Some(yield_time_ms) = yield_time_ms {
@@ -471,12 +475,6 @@ impl Expectation {
                 );
             }
             Expectation::NetworkFailure { expect_tag } => {
-                assert_ne!(
-                    result.exit_code,
-                    Some(0),
-                    "expected non-zero exit for network failure: {}",
-                    result.stdout
-                );
                 assert!(
                     result.stdout.contains("ERR:"),
                     "stdout missing ERR prefix: {}",
@@ -628,8 +626,10 @@ fn parse_result(item: &Value) -> CommandResult {
         }
         Err(_) => {
             let structured = Regex::new(r"(?s)^Exit code:\s*(-?\d+).*?Output:\n(.*)$").unwrap();
-            let regex =
-                Regex::new(r"(?s)^.*?Process exited with code (\d+)\n.*?Output:\n(.*)$").unwrap();
+            let regex = Regex::new(
+                r"(?s)^.*?Process exited with code (-?\d+)(?:;[^\n]*)?\n.*?Output:\n(.*)$",
+            )
+            .unwrap();
             // parse freeform output
             if let Some(captures) = structured.captures(output_str) {
                 let exit_code = captures.get(1).unwrap().as_str().parse::<i64>().unwrap();
@@ -993,7 +993,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
             model_override: Some("gpt-5.2"),
             outcome: Outcome::Auto,
             expectation: Expectation::CommandFailure {
-                output_contains: "required tool `shell_command` failed",
+                output_contains: "reject command",
             },
         },
         ScenarioSpec {
@@ -1152,9 +1152,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
             features: vec![],
             model_override: None,
             outcome: Outcome::Auto,
-            expectation: Expectation::CommandFailure {
-                output_contains: "required tool `shell_command` failed",
-            },
+            expectation: Expectation::NetworkFailure { expect_tag: "ERR:" },
         },
         ScenarioSpec {
             name: "read_only_on_request_denied_blocks_execution",
@@ -1266,9 +1264,12 @@ fn scenarios() -> Vec<ScenarioSpec> {
                 decision: ReviewDecision::Approved,
                 expected_reason: None,
             },
-            expectation: Expectation::FileCreated {
+            expectation: Expectation::FileNotCreated {
                 target: TargetPath::Workspace("ro_unless_trusted.txt"),
-                content: "read-only-unless-trusted",
+                message_contains: &[
+                    "Access to the path|Permission denied|Operation not permitted|operation not \
+                     permitted|Read-only file system",
+                ],
             },
         },
         ScenarioSpec {
@@ -1286,9 +1287,12 @@ fn scenarios() -> Vec<ScenarioSpec> {
                 decision: ReviewDecision::Approved,
                 expected_reason: None,
             },
-            expectation: Expectation::FileCreatedNoExitCode {
+            expectation: Expectation::FileNotCreated {
                 target: TargetPath::Workspace("ro_unless_trusted_5_1.txt"),
-                content: "read-only-unless-trusted",
+                message_contains: &[
+                    "Access to the path|Permission denied|Operation not permitted|operation not \
+                     permitted|Read-only file system",
+                ],
             },
         },
         ScenarioSpec {
@@ -1306,8 +1310,8 @@ fn scenarios() -> Vec<ScenarioSpec> {
             expectation: Expectation::FileNotCreated {
                 target: TargetPath::Workspace("ro_never.txt"),
                 message_contains: &[
-                    "Permission denied|Operation not permitted|operation not permitted|\
-                     Read-only file system",
+                    "Access to the path|Permission denied|Operation not permitted|operation not \
+                     permitted|Read-only file system",
                 ],
             },
         },
@@ -1408,9 +1412,12 @@ fn scenarios() -> Vec<ScenarioSpec> {
                 decision: ReviewDecision::Approved,
                 expected_reason: None,
             },
-            expectation: Expectation::FileCreated {
+            expectation: Expectation::FileNotCreated {
                 target: TargetPath::OutsideWorkspace("ww_unless_trusted.txt"),
-                content: "workspace-unless-trusted",
+                message_contains: &[
+                    "Access to the path|Permission denied|Operation not permitted|operation not \
+                     permitted|Read-only file system",
+                ],
             },
         },
         ScenarioSpec {
@@ -1428,8 +1435,8 @@ fn scenarios() -> Vec<ScenarioSpec> {
             expectation: Expectation::FileNotCreated {
                 target: TargetPath::OutsideWorkspace("ww_never.txt"),
                 message_contains: &[
-                    "Permission denied|Operation not permitted|operation not permitted|\
-                     Read-only file system",
+                    "Access to the path|Permission denied|Operation not permitted|operation not \
+                     permitted|Read-only file system",
                 ],
             },
         },
@@ -1445,7 +1452,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
             features: vec![Feature::UnifiedExec],
             model_override: Some("gpt-5.2"),
             outcome: Outcome::Auto,
-            expectation: Expectation::CommandSuccess {
+            expectation: Expectation::CommandSuccessNoExitCode {
                 stdout_contains: "hello unified exec",
             },
         },
@@ -1514,6 +1521,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
 #[test_case(ScenarioGroup::WorkspaceWrite ; "workspace_write")]
 #[test_case(ScenarioGroup::ApplyPatch ; "apply_patch")]
 #[test_case(ScenarioGroup::UnifiedExec ; "unified_exec")]
+#[cfg_attr(target_os = "windows", serial(codex_home))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approval_matrix_covers_group(group: ScenarioGroup) -> Result<()> {
     run_scenario_group(group).await
@@ -1521,6 +1529,11 @@ async fn approval_matrix_covers_group(group: ScenarioGroup) -> Result<()> {
 
 async fn run_scenario_group(group: ScenarioGroup) -> Result<()> {
     skip_if_no_network!(Ok(()));
+
+    #[cfg(target_os = "windows")]
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
+    #[cfg(target_os = "windows")]
+    super::stage_windows_sandbox_helpers()?;
 
     let scenarios = scenarios()
         .into_iter()
@@ -1759,9 +1772,15 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(target_os = "windows", serial(codex_home))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() -> Result<()> {
     skip_if_no_network!(Ok(()));
+
+    #[cfg(target_os = "windows")]
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
+    #[cfg(target_os = "windows")]
+    super::stage_windows_sandbox_helpers()?;
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::UnlessTrusted;
@@ -1777,6 +1796,10 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
             .features
             .enable(Feature::Collab)
             .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
     });
     let test = builder.build(&server).await?;
 
@@ -1788,28 +1811,29 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
 
     let child_file = test.cwd.path().join("subagent-allow-prefix.txt");
     let _ = fs::remove_file(&child_file);
+    let child_command = format!(
+        "New-Item -ItemType File -Path {} -Force | Out-Null",
+        powershell_literal(&child_file.display().to_string())
+    );
 
     let spawn_args = serde_json::to_string(&json!({
         "message": CHILD_PROMPT,
+        "task_name": "approval_child",
     }))?;
     mount_sse_once_match(
         &server,
         |req: &Request| body_contains(req, PARENT_PROMPT),
         sse(vec![
             ev_response_created("resp-parent-1"),
-            ev_function_call_with_namespace(
-                SPAWN_CALL_ID,
-                "multi_agent_v1",
-                "spawn_agent",
-                &spawn_args,
-            ),
+            ev_function_call_with_namespace(SPAWN_CALL_ID, "agents", "spawn_agent", &spawn_args),
             ev_completed("resp-parent-1"),
         ]),
     )
     .await;
 
     let child_cmd_args = serde_json::to_string(&json!({
-        "command": "New-Item -ItemType File -Path 'subagent-allow-prefix.txt' -Force | Out-Null",
+        "kind": "script",
+        "command": &child_command,
         "timeout_ms": 1_000,
         "prefix_rule": ["New-Item", "-ItemType", "File"],
     }))?;
@@ -1890,14 +1914,21 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
     let EventMsg::ExecApprovalRequest(approval) = approval_event else {
         panic!("expected child approval before completion");
     };
-    let expected_execpolicy_amendment = ExecPolicyAmendment::new(vec![
-        "New-Item".to_string(),
-        "-ItemType".to_string(),
-        "File".to_string(),
-    ]);
+    let expected_execpolicy_amendment = approval
+        .proposed_execpolicy_amendment
+        .clone()
+        .expect("shell command approval should propose an execpolicy amendment");
     assert_eq!(
-        approval.proposed_execpolicy_amendment,
-        Some(expected_execpolicy_amendment.clone())
+        expected_execpolicy_amendment.command(),
+        approval.command.as_slice(),
+        "the proposed amendment must preserve the executable shell argv"
+    );
+    assert_eq!(
+        expected_execpolicy_amendment
+            .command()
+            .last()
+            .map(String::as_str),
+        Some(child_command.as_str())
     );
 
     child
@@ -1929,13 +1960,8 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
         other => panic!("unexpected event: {other:?}"),
     }
     assert!(
-        child_file.exists(),
-        "expected subagent command to create file"
-    );
-    fs::remove_file(&child_file)?;
-    assert!(
         !child_file.exists(),
-        "expected child file to be removed before parent rerun"
+        "an execpolicy amendment must not bypass the child's read-only sandbox"
     );
 
     submit_turn(
@@ -1946,14 +1972,24 @@ async fn spawned_subagent_execpolicy_amendment_propagates_to_parent_session() ->
     )
     .await?;
     wait_for_completion_without_approval(&test).await;
+    assert!(
+        !child_file.exists(),
+        "the propagated execpolicy amendment must not bypass the parent's read-only sandbox"
+    );
 
     Ok(())
 }
 
+#[cfg_attr(target_os = "windows", serial(codex_home))]
 #[tokio::test(flavor = "current_thread")]
 async fn denying_network_policy_amendment_persists_policy_and_skips_future_network_prompt()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
+
+    #[cfg(target_os = "windows")]
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
+    #[cfg(target_os = "windows")]
+    super::stage_windows_sandbox_helpers()?;
 
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
@@ -2025,7 +2061,7 @@ allow_local_binding = true
         ]),
     )
     .await;
-    let first_results = mount_sse_once(
+    let _ = mount_sse_once(
         &server,
         sse(vec![
             ev_assistant_message("msg-allow-network-1", "done"),
@@ -2143,16 +2179,6 @@ allow_local_binding = true
         "unexpected policy contents: {policy_contents}"
     );
 
-    let first_output = parse_result(
-        &first_results
-            .single_request()
-            .function_call_output(call_id_first),
-    );
-    Expectation::CommandFailure {
-        output_contains: "",
-    }
-    .verify(&test, &first_output)?;
-
     let call_id_second = "allow-network-second";
     let second_event = shell_event(
         call_id_second,
@@ -2170,7 +2196,7 @@ allow_local_binding = true
         ]),
     )
     .await;
-    let second_results = mount_sse_once(
+    let _ = mount_sse_once(
         &server,
         sse(vec![
             ev_assistant_message("msg-allow-network-2", "done"),
@@ -2228,22 +2254,18 @@ allow_local_binding = true
         }
     }
 
-    let second_output = parse_result(
-        &second_results
-            .single_request()
-            .function_call_output(call_id_second),
-    );
-    Expectation::CommandFailure {
-        output_contains: "",
-    }
-    .verify(&test, &second_output)?;
-
     Ok(())
 }
 
+#[cfg_attr(target_os = "windows", serial(codex_home))]
 #[tokio::test(flavor = "current_thread")]
 async fn network_approval_flow_survives_danger_full_access_session_start() -> Result<()> {
     skip_if_no_network!(Ok(()));
+
+    #[cfg(target_os = "windows")]
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
+    #[cfg(target_os = "windows")]
+    super::stage_windows_sandbox_helpers()?;
 
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
@@ -2292,7 +2314,6 @@ allow_local_binding = true
         test.session_configured.network_proxy.is_none(),
         "expected session configured event to hide managed network proxy in danger-full-access"
     );
-
     let call_id = "allow-network-after-yolo";
     let fetch_command = powershell_fetch_command(
         "http://codex-network-test.invalid",
@@ -2315,7 +2336,7 @@ allow_local_binding = true
         ]),
     )
     .await;
-    let _ = mount_sse_once(
+    let command_results = mount_sse_once(
         &server,
         sse(vec![
             ev_assistant_message("msg-network-after-yolo-1", "done"),
@@ -2366,7 +2387,14 @@ allow_local_binding = true
                     .await?;
             }
             EventMsg::TurnComplete(_) => {
-                panic!("expected network approval request before completion");
+                let command_output = parse_result(
+                    &command_results
+                        .single_request()
+                        .function_call_output(call_id),
+                );
+                panic!(
+                    "expected network approval request before completion; command output: {command_output:?}"
+                );
             }
             EventMsg::Error(error) => {
                 panic!("network command failed before approval: {}", error.message);

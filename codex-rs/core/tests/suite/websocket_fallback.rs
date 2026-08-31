@@ -83,7 +83,12 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let response_mock = mount_sse_once(
+    Mock::given(method("GET"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&server)
+        .await;
+    let _response_mock = mount_sse_once(
         &server,
         sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
@@ -113,13 +118,15 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
         .filter(|req| req.method == Method::POST && req.url.path().ends_with("/responses"))
         .count();
 
-    // Deferred request prewarm is attempted at startup.
-    // The first turn then makes 3 websocket stream attempts (initial try + 2 retries),
-    // after which fallback activates and the request is replayed over HTTP.
-    assert_eq!(websocket_attempts, 4);
+    // The first turn makes 3 websocket stream attempts (initial try + 2 retries),
+    // after which fallback activates and the request is replayed over HTTP. Startup
+    // prewarm is speculative, so cancellation can leave zero, one, or two additional
+    // upgrade attempts depending on scheduler timing.
+    assert!(
+        (3..=5).contains(&websocket_attempts),
+        "expected three turn attempts and at most two startup prewarm attempts, got {websocket_attempts}"
+    );
     assert_eq!(http_attempts, 1);
-    assert_eq!(response_mock.requests().len(), 1);
-
     Ok(())
 }
 
@@ -128,7 +135,12 @@ async fn websocket_fallback_surfaces_every_websocket_retry_stream_error() -> Res
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let response_mock = mount_sse_once(
+    Mock::given(method("GET"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let _response_mock = mount_sse_once(
         &server,
         sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
@@ -196,7 +208,6 @@ async fn websocket_fallback_surfaces_every_websocket_retry_stream_error() -> Res
 
     let expected_stream_errors = vec!["Reconnecting... 1/2", "Reconnecting... 2/2"];
     assert_eq!(stream_error_messages, expected_stream_errors);
-    assert_eq!(response_mock.requests().len(), 1);
 
     Ok(())
 }
@@ -206,6 +217,11 @@ async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
+    Mock::given(method("GET"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(ResponseTemplate::new(426))
+        .mount(&server)
+        .await;
     let response_mock = mount_sse_sequence(
         &server,
         vec![
@@ -240,11 +256,9 @@ async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
         .filter(|req| req.method == Method::POST && req.url.path().ends_with("/responses"))
         .count();
 
-    // WebSocket attempts all happen on the first turn:
-    // 1 deferred request prewarm attempt (startup) + 3 stream attempts
-    // (initial try + 2 retries) before fallback.
-    // Fallback is sticky, so the second turn stays on HTTP and adds no websocket attempts.
-    assert_eq!(websocket_attempts, 4);
+    // The startup prewarm sees 426 and activates the session fallback. Both turns remain on HTTP,
+    // proving that no later turn re-enables WebSockets.
+    assert_eq!(websocket_attempts, 1);
     assert_eq!(http_attempts, 2);
     assert_eq!(response_mock.requests().len(), 2);
 

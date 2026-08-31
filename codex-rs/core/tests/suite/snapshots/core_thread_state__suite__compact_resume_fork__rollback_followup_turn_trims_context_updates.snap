@@ -1,0 +1,33 @@
+---
+source: core/tests/suite/compact_resume_fork.rs
+expression: "context_snapshot::format_labeled_requests_snapshot(\"rollback trims pre-turn override context updates before the follow-up request\",\n&[(\"rolled-back turn request\", &requests[1]),\n(\"follow-up request after rollback\", &requests[2]),],\n&ContextSnapshotOptions::default().strip_capability_instructions().render_mode(ContextSnapshotRenderMode::KindWithTextPrefix\n{ max_chars: 96 }),)"
+---
+Scenario: rollback trims pre-turn override context updates before the follow-up request
+
+## rolled-back turn request
+00:message/developer:<collaboration_mode>ROLLED_BACK_DEV_INSTRUCTIONS</collaboration_mode>
+01:message/developer:<root_orchestration_instructions>When several independent tool calls and their result handling a...
+02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+03:message/developer:You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+04:message/user:<task_model_guidance>Before acting, form and maintain a working task model from the current requ...
+05:message/developer:<PERMISSIONS_INSTRUCTIONS>
+06:message/developer:<NO_TEXT>
+07:message/developer:<personality_spec> The user has requested a new communication style. Future messages should adhe...
+08:message/user:turn 1 user
+09:message/assistant:turn 1 assistant
+10:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+11:message/user:turn 2 user
+
+## follow-up request after rollback
+00:message/developer:<collaboration_mode>ROLLED_BACK_DEV_INSTRUCTIONS</collaboration_mode>
+01:message/developer:<root_orchestration_instructions>When several independent tool calls and their result handling a...
+02:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
+03:message/developer:You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+04:message/user:<task_model_guidance>Before acting, form and maintain a working task model from the current requ...
+05:message/developer:<PERMISSIONS_INSTRUCTIONS>
+06:message/developer:<NO_TEXT>
+07:message/developer:<personality_spec> The user has requested a new communication style. Future messages should adhe...
+08:message/user:turn 1 user
+09:message/assistant:turn 1 assistant
+10:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+11:message/user:follow-up user

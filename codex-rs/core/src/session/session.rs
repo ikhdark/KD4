@@ -1579,6 +1579,7 @@ impl Session {
                 network_proxy_audit_metadata,
                 managed_network_requirements_configured,
                 network_approval: Arc::clone(&network_approval),
+                network_policy_decider: network_policy_decider.clone(),
                 state_db: state_db_ctx.clone(),
                 live_thread: live_thread_init.as_ref().cloned(),
                 thread_store: Arc::clone(&thread_store),

@@ -3436,7 +3436,13 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
             error_event,
             EventMsg::Error(ref err)
                 if err.message
-                    == "stream disconnected before completion: Incomplete response returned, reason: content_filter"
+                    == "Error while reading the server response: Incomplete response returned, reason: content_filter"
+                    && matches!(
+                        err.codex_error_info,
+                        Some(codex_protocol::protocol::CodexErrorInfo::ResponseStreamConnectionFailed {
+                            http_status_code: None
+                        })
+                    )
         ),
         "expected incomplete content filter error; got {error_event:?}"
     );

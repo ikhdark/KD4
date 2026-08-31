@@ -25,6 +25,7 @@ use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use wiremock::ResponseTemplate;
 
@@ -210,6 +211,7 @@ async fn openai_model_header_mismatch_only_emits_one_warning_per_turn() -> Resul
 
     let server = start_mock_server().await;
     let tool_args = serde_json::json!({
+        "kind": "script",
         "command": "echo hello",
         "timeout_ms": 1_000
     });
@@ -241,7 +243,9 @@ async fn openai_model_header_mismatch_only_emits_one_warning_per_turn() -> Resul
 
     let mut warning_count = 0;
     loop {
-        let event = wait_for_event(&test.codex, |_| true).await;
+        let event =
+            wait_for_event_with_timeout(&test.codex, |_| true, std::time::Duration::from_secs(10))
+                .await;
         match event {
             EventMsg::Warning(warning)
                 if warning
@@ -313,7 +317,9 @@ async fn model_verification_emits_structured_event_without_reroute_or_warning() 
     ]));
     let _mock = mount_response_once(&server, response).await;
 
-    let mut builder = test_codex().with_model(SERVER_MODEL);
+    let mut builder = test_codex()
+        .with_model(SERVER_MODEL)
+        .with_raw_response_items();
     let test = builder.build(&server).await?;
 
     test.codex
@@ -373,6 +379,7 @@ async fn model_verification_only_emits_once_per_turn() -> Result<()> {
 
     let server = start_mock_server().await;
     let tool_args = serde_json::json!({
+        "kind": "script",
         "command": "echo hello",
         "timeout_ms": 1_000
     });

@@ -20,7 +20,9 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
+use std::time::Duration;
 
 /// Delegate should surface ExecApprovalRequest from sub-agent and proceed
 /// after parent submits an approval decision.
@@ -230,7 +232,7 @@ async fn codex_delegate_ignores_legacy_deltas() {
     let mut reasoning_delta_count = 0;
 
     loop {
-        let ev = wait_for_event(&test.codex, |_| true).await;
+        let ev = wait_for_event_with_timeout(&test.codex, |_| true, Duration::from_secs(30)).await;
         match ev {
             EventMsg::ReasoningContentDelta(_) => reasoning_delta_count += 1,
             EventMsg::TurnComplete(_) => break,

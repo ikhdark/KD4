@@ -133,7 +133,17 @@ category = "tests_contracts"
 kind = "validated_by"
 target = "path:codex-rs/core/tests"
 confidence = "declared"
-evidence = [{ path = "codex-rs/core/tests/all.rs", symbol = "mod suite;" }]
+evidence = [
+  { path = "codex-rs/core/tests/core_cli_workspace.rs", symbol = "mod suite" },
+  { path = "codex-rs/core/tests/core_code_mode_mcp.rs", symbol = "mod suite" },
+  { path = "codex-rs/core/tests/core_exec_permissions.rs", symbol = "mod suite" },
+  { path = "codex-rs/core/tests/core_thread_state.rs", symbol = "mod suite" },
+  { path = "codex-rs/core/tests/core_transport_telemetry.rs", symbol = "mod suite" },
+  { path = "codex-rs/core/tests/core_agents_review.rs", symbol = "mod suite" },
+  { path = "codex-rs/core/tests/core_model_prompt_runtime.rs", symbol = "mod suite" },
+  { path = "codex-rs/core/tests/core_windows.rs", symbol = "mod suite" },
+  { path = "codex-rs/core/tests/suite/prelude.rs", symbol = "configure_test_binary_dispatch" },
+]
 
 [[owners.invariants]]
 id = "registered-tool-routing"
@@ -145,7 +155,7 @@ tests = ["codex-rs/core/src/tools/router_tests.rs", "codex-rs/core/src/tools/reg
 [[owners.validation]]
 id = "core-focused"
 cwd = "."
-argv = ["just", "test-fast", "-p", "codex-core"]
+argv = ["just", "core-test-fast", "core_lib", "-E", "test(tools::router::tests) | test(tools::registry::tests)"]
 role = "focused_tests"
 
 [[owners]]
@@ -529,7 +539,7 @@ tests = ["codex-rs/core/src/tools/handlers/plan_tests.rs"]
 [[owners.validation]]
 id = "planning-focused"
 cwd = "codex-rs"
-argv = ["cargo", "test", "-p", "codex-core", "tools::handlers::plan_tests"]
+argv = ["just", "core-test-fast", "core_lib", "-E", "test(tools::handlers::plan::tests)"]
 role = "focused_tests"
 
 [[owners]]
@@ -656,7 +666,7 @@ tests = ["codex-rs/core/src/git_workspace_tests.rs", "codex-rs/core/src/agents_m
 [[owners.validation]]
 id = "repository-context-focused"
 cwd = "codex-rs"
-argv = ["cargo", "test", "-p", "codex-core", "git_workspace"]
+argv = ["just", "core-test-fast", "core_lib", "-E", "test(git_workspace::tests)"]
 role = "focused_tests"
 
 [[owners]]
@@ -707,7 +717,7 @@ tests = ["codex-rs/core/src/tools/command_output_artifact_tests.rs"]
 [[owners.validation]]
 id = "tool-output-focused"
 cwd = "codex-rs"
-argv = ["cargo", "test", "-p", "codex-core", "tools::command_output_artifact::hardening_tests"]
+argv = ["just", "core-test-fast", "core_lib", "-E", "test(tools::command_output_artifact::hardening_tests)"]
 role = "focused_tests"
 
 [[owners]]
@@ -776,16 +786,16 @@ role = "generated_contract_check"
 
 [[owners]]
 id = "rust-turn-latency-benchmark"
-concern_ids = ["turn-latency", "code-mode-capture", "synthetic-non-inferiority"]
-aliases = ["Rust turn latency benchmark", "turn_latency bench"]
-phrases = ["single-build code-mode capture and synthetic latency comparison"]
-roots = ["codex-rs/core/benches/turn_latency.rs", "codex-rs/core/benches/turn_latency/ab_contract.rs", "codex-rs/core/benches/turn_latency/ab_runner.rs", "codex-rs/core/benches/turn_latency/runtime_fixtures.rs", "codex-rs/core/benches/turn_latency/tests.rs", "codex-rs/core/tests/turn_latency_bench.rs", "docs/benchmarks/turn-latency/README.md"]
-primary_entries = [{ path = "codex-rs/core/benches/turn_latency.rs", symbol = "main", ambiguous = true }]
+concern_ids = ["turn-latency", "code-mode-capture", "synthetic-non-inferiority", "live-agent-task-compliance"]
+aliases = ["Rust turn latency benchmark", "turn_latency bench", "paired live-agent benchmark"]
+phrases = ["single-build code-mode capture and synthetic latency comparison", "paired live-agent outcome and task-contract compliance benchmark"]
+roots = ["codex-rs/core/benches/turn_latency.rs", "codex-rs/core/benches/turn_latency/ab_contract.rs", "codex-rs/core/benches/turn_latency/ab_runner.rs", "codex-rs/core/benches/turn_latency/runtime_fixtures.rs", "codex-rs/core/benches/turn_latency/tests.rs", "codex-rs/core/tests/turn_latency_bench.rs", "docs/benchmarks/turn-latency/README.md", "scripts/kd4_live_agent_benchmark.py", "scripts/test_kd4_live_agent_benchmark.py"]
+primary_entries = [{ path = "codex-rs/core/benches/turn_latency.rs", symbol = "main", ambiguous = true }, { path = "scripts/kd4_live_agent_benchmark.py", symbol = "main", ambiguous = true }]
 instructions = ["AGENTS.md"]
 consumers = ["codex-rs/core/Cargo.toml"]
-contracts = ["codex-rs/core/benches/turn_latency.rs"]
+contracts = ["codex-rs/core/benches/turn_latency.rs", "scripts/kd4_live_agent_benchmark.py"]
 generated_mirrors = ["docs/benchmarks/turn-latency/accepted"]
-tests = ["codex-rs/core/benches/turn_latency/tests.rs", "codex-rs/core/tests/turn_latency_bench.rs"]
+tests = ["codex-rs/core/benches/turn_latency/tests.rs", "codex-rs/core/tests/turn_latency_bench.rs", "scripts/test_kd4_live_agent_benchmark.py"]
 
 [owners.facet_exclusions]
 configuration_and_gates = "The benchmark command selects a workflow directly; no repository feature or configuration file owns that selection."
@@ -825,6 +835,13 @@ target = "path:codex-rs/core/benches/turn_latency.rs"
 confidence = "declared"
 evidence = [{ path = "codex-rs/core/tests/turn_latency_bench.rs", symbol = "include" }]
 
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/kd4_live_agent_benchmark.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_kd4_live_agent_benchmark.py", symbol = "Kd4LiveAgentBenchmarkTest" }]
+
 [[owners.invariants]]
 id = "separate-capture-and-comparison-verdicts"
 kind = "semantic"
@@ -839,8 +856,21 @@ statement = "Only hash-valid, complete, uncapped, passing batch and final A/B re
 evidence = [{ path = "codex-rs/core/benches/turn_latency/ab_runner.rs", symbol = "import_accepted_ab_report" }]
 tests = ["codex-rs/core/benches/turn_latency/tests.rs"]
 
+[[owners.invariants]]
+id = "live-agent-source-and-scoring-integrity"
+kind = "semantic"
+statement = "Live-agent reports bind each binary to a clean exact commit and tree, report outcome correctness separately from task-contract compliance, and retain structured diagnostic categories."
+evidence = [{ path = "scripts/kd4_live_agent_benchmark.py", symbol = "exact_source_state" }, { path = "scripts/kd4_live_agent_benchmark.py", symbol = "summarize" }, { path = "scripts/kd4_live_agent_benchmark.py", symbol = "classify_diagnostics" }]
+tests = ["scripts/test_kd4_live_agent_benchmark.py"]
+
 [[owners.validation]]
 id = "rust-turn-latency-focused"
 cwd = "codex-rs"
-argv = ["cargo", "test", "-p", "codex-core", "--test", "turn_latency_bench", "code_mode_capture_report_has_no_local_ab_gate"]
+argv = ["just", "core-test-fast", "turn_latency_bench", "-E", "test(code_mode_capture_report_has_no_local_ab_gate)"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "live-agent-benchmark-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_kd4_live_agent_benchmark"]
 role = "focused_tests"

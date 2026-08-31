@@ -71,6 +71,13 @@ fn count_containing(texts: &[&str], target: &str) -> usize {
     texts.iter().filter(|text| text.contains(target)).count()
 }
 
+fn count_tagged(texts: &[&str], tag: &str) -> usize {
+    texts
+        .iter()
+        .filter(|text| text.trim_start().starts_with(tag))
+        .count()
+}
+
 async fn submit_turn(
     codex: &codex_core::CodexThread,
     prompt: &str,
@@ -268,7 +275,7 @@ async fn empty_configured_mode_hint_suppresses_builtin_text() -> Result<()> {
     let texts = developer_texts(&input);
     assert_eq!(
         (
-            count_containing(&texts, MULTI_AGENT_MODE_OPEN_TAG),
+            count_tagged(&texts, MULTI_AGENT_MODE_OPEN_TAG),
             count_containing(&texts, NO_SPAWN_TEXT),
             count_containing(&texts, PROACTIVE_TEXT),
         ),
@@ -332,7 +339,7 @@ async fn leaving_ultra_after_cold_resume_emits_explicit_mode() -> Result<()> {
     let texts = developer_texts(&resumed_input);
     assert_eq!(
         (
-            count_containing(&texts, MULTI_AGENT_MODE_OPEN_TAG),
+            count_tagged(&texts, MULTI_AGENT_MODE_OPEN_TAG),
             count_containing(&texts, NO_SPAWN_TEXT),
             count_containing(&texts, PROACTIVE_TEXT),
         ),
@@ -355,6 +362,10 @@ async fn ultra_on_multi_agent_v1_uses_max_without_mode_instructions() -> Result<
     let test = test_codex()
         .with_model_info_override("gpt-5.4", add_ultra_reasoning)
         .with_config(|config| {
+            config
+                .features
+                .disable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
             config.reasoning_phase_efforts = None;
             config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
         })
@@ -370,7 +381,7 @@ async fn ultra_on_multi_agent_v1_uses_max_without_mode_instructions() -> Result<
     );
     let input = request.input();
     let texts = developer_texts(&input);
-    assert_eq!(count_containing(&texts, MULTI_AGENT_MODE_OPEN_TAG), 0);
+    assert_eq!(count_tagged(&texts, MULTI_AGENT_MODE_OPEN_TAG), 0);
 
     Ok(())
 }

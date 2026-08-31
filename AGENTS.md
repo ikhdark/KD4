@@ -19,37 +19,22 @@
 
 <!-- SHARED-OPERATING-POLICY: START -->
 
-## Shared operating policy
-
 ### Scope and workspace
 
 - Read the root `AGENTS.md` in full, and read every user-provided or user-named
   file in full.
-- Communicate with the user in plain language.
-- Work only within the requested scope. Do not broaden a directed fix or add
-  unrelated cleanup, refactoring, dependency changes, or activation work.
+- Communicate with the user in very plain language.
 - Do not publish, deploy, or modify upstream state unless the user explicitly
   requests that action.
 - Preserve concurrent work and every unrelated hunk. Compare an overlapping
   target and its diff once, then keep or merge the version that satisfies every
   affected contract and direct test.
-- Ask when unresolved intent
+- Ask questions when the user input is vague.
 - When you encounter overlapping edits, choose the best version. Implement your
   version when it is better, keep the current or concurrently changing version
   when it is better, and combine them when that produces the best result. If
   the existing version is already better than your proposed edit, leave it
   unchanged and move on.
-
-### Bug checks
-
-- Report only defects supported by evidence. Do not report a design preference
-  as a defect or change functional code merely because another design seems
-  preferable.
-- Each finding must identify the violated contract or invariant, responsible
-  producer, reachable consumer or user-visible effect, and exact source
-  locations. For a requested finding count, stop only after that many distinct
-  findings meet all requirements; otherwise continue until every candidate in
-  the requested scope is resolved.
 
 ### Implementation and validation
 
@@ -64,18 +49,6 @@
   zero relevant tests is not runtime proof. Runtime proof requires a direct
   contract test or a user-approved end-to-end gate that executes the changed
   path.
-
-### Validation failure handling
-
-- Run each scoped validation once initially. Retry transient infrastructure at
-  most twice in the existing warmed build lane; do not create a cold lane
-  solely to retry.
-- Stop on unrelated or pre-existing compilation or test failures. Do not repair
-  them without expanded scope; report passed direct checks, the blocker, and
-  checks that could not run.
-- Do not rerun validation while concurrent edits continue. After the same
-  blocker occurs twice, finish and report it.
-- Preserve narrower passing results despite broader failures.
 
 <!-- SHARED-OPERATING-POLICY: END -->
 
@@ -111,16 +84,3 @@ description>" --max-relationships 32`. Require an untruncated result with no
   each child only the role and rules assigned by that workflow. If a child fails
   to start, returns a tool error, or omits its assigned output, continue in the
   primary agent.
-
-## Rust and script validation
-
-- For a Rust edit, run the repository-named package or test filter that executes
-  the changed contract. Validation passes only when at least one direct test is
-  selected and the command exits successfully. Run workspace analyzers only
-  when repository instructions or the user require them. If no direct route is
-  named, report the missing route before editing.
-- Do not run the full `codex-rs/core` test suite unless the user requests that
-  exact scope.
-- For a script edit, follow the validation route named in `SOURCEMAP.md`. If no
-  route is named, run the sibling unit test. If none exists, run the interpreter
-  syntax check and configured formatter or linter.
