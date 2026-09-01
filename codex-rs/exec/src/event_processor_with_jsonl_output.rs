@@ -550,6 +550,7 @@ impl EventProcessorWithJsonOutput {
                         events.push(ThreadEvent::TurnCompleted(TurnCompletedEvent {
                             usage: self.usage_from_last_total(),
                             surfaced_result: notification.surfaced_result,
+                            timing: notification.timing,
                         }));
                         CodexStatus::InitiateShutdown
                     }

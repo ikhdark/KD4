@@ -92,6 +92,66 @@ fn event_stream_error_emits_fatal_and_turn_terminal_events() {
 }
 
 #[test]
+fn completed_turn_exposes_timing_in_jsonl_event() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+    let timing = codex_app_server_protocol::TurnTiming {
+        schema_version: 1,
+        profile_valid: true,
+        unions: codex_protocol::protocol::TurnTimingUnions {
+            model_stream_wait_union_ns: 12_345_678,
+            ..Default::default()
+        },
+        model_requests: vec![
+            codex_protocol::protocol::TurnTimingModelRequest {
+                is_continuation: false,
+                ..Default::default()
+            },
+            codex_protocol::protocol::TurnTimingModelRequest {
+                is_continuation: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let collected = processor.collect_thread_events(ServerNotification::TurnCompleted(
+        codex_app_server_protocol::TurnCompletedNotification {
+            surfaced_result: None,
+            thread_id: "thread-1".to_string(),
+            timing: Some(timing.clone()),
+            turn: codex_app_server_protocol::Turn {
+                id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: Vec::new(),
+                status: TurnStatus::Completed,
+                error: None,
+                started_at: None,
+                completed_at: Some(0),
+                duration_ms: None,
+                timing: Some(timing.clone()),
+                surfaced_result: None,
+                reasoning_policy_history: None,
+            },
+        },
+    ));
+
+    assert_eq!(collected.status, CodexStatus::InitiateShutdown);
+    let [ThreadEvent::TurnCompleted(event)] = collected.events.as_slice() else {
+        panic!("expected one turn.completed event");
+    };
+    assert_eq!(event.timing, Some(timing));
+    let serialized = serde_json::to_value(event).expect("serialize event");
+    assert_eq!(
+        serialized["timing"]["unions"]["modelStreamWaitUnionNs"],
+        json!(12_345_678)
+    );
+    assert_eq!(
+        serialized["timing"]["modelRequests"][1]["isContinuation"],
+        json!(true)
+    );
+}
+
+#[test]
 fn runtime_warning_emits_a_non_fatal_error_item() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
 

@@ -51,6 +51,8 @@ pub struct TurnCompletedEvent {
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surfaced_result: Option<codex_app_server_protocol::SurfacedToolResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<codex_app_server_protocol::TurnTiming>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]

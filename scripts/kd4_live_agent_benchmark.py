@@ -152,7 +152,7 @@ INVALID_CASES = (
     "1ms1s",
 )
 
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 REQUIRED_TEST_COMMAND = "python -m unittest -q"
 _REQUIRED_TEST_PATTERN = re.compile(
     r"(?i)(?:^|[\s;&|])(?:python(?:\d+(?:\.\d+)*)?(?:\.exe)?|py(?:\.exe)?)"
@@ -426,6 +426,25 @@ def is_required_test_command(command: str) -> bool:
     return _REQUIRED_TEST_PATTERN.search(command) is not None
 
 
+def turn_measurements(event: dict[str, Any]) -> tuple[float | None, int | None]:
+    timing = event.get("timing")
+    if not isinstance(timing, dict):
+        return None, None
+    unions = timing.get("unions")
+    requests = timing.get("modelRequests")
+    if not isinstance(unions, dict) or not isinstance(requests, list):
+        return None, None
+    model_wait_ns = unions.get("modelStreamWaitUnionNs")
+    if not isinstance(model_wait_ns, int) or isinstance(model_wait_ns, bool):
+        return None, None
+    continuation_count = sum(
+        request.get("isContinuation") is True
+        for request in requests
+        if isinstance(request, dict)
+    )
+    return round(model_wait_ns / 1_000_000, 3), continuation_count
+
+
 def classify_diagnostics(
     *,
     observed_text: str,
@@ -563,6 +582,9 @@ def run_agent(
         observed_text_parts: list[str] = []
         required_test_attempts: list[dict[str, Any]] = []
         command_execution_failures = 0
+        actual_command_count = 0
+        model_wait_ms: float | None = None
+        continuation_count: int | None = None
 
         while True:
             remaining = deadline - time.monotonic()
@@ -602,6 +624,7 @@ def run_agent(
             if event_type == "item.completed" and item_type == "agent_message":
                 final_message = item.get("text")
             if event_type == "item.completed" and item_type == "command_execution":
+                actual_command_count += 1
                 command_value = item.get("command", "")
                 command_text = (
                     " ".join(str(part) for part in command_value)
@@ -629,6 +652,7 @@ def run_agent(
             if event_type in {"turn.completed", "turn.failed"} and terminal_ns is None:
                 terminal_ns = observed_ns
                 terminal_event = event_type
+                model_wait_ms, continuation_count = turn_measurements(event)
 
         if process.poll() is None:
             terminate_process(process)
@@ -702,6 +726,9 @@ def run_agent(
             },
             "diagnostics": diagnostics,
             "completionMs": round(completion_ns / 1_000_000, 3),
+            "modelWaitMs": model_wait_ms,
+            "continuationCount": continuation_count,
+            "actualCommandCount": actual_command_count,
             "ttfoMs": None if ttfo_ns is None else round(ttfo_ns / 1_000_000, 3),
             "exitCode": exit_code,
             "terminalEvent": terminal_event,
@@ -729,6 +756,18 @@ def distribution(values: list[float]) -> dict[str, Any] | None:
     }
 
 
+def count_distribution(values: list[int]) -> dict[str, Any] | None:
+    if not values:
+        return None
+    return {
+        "count": len(values),
+        "average": round(statistics.fmean(values), 3),
+        "median": round(statistics.median(values), 3),
+        "min": min(values),
+        "max": max(values),
+    }
+
+
 def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
     outcome_correct = [
         run for run in runs if run.get("outcomeCorrect", run.get("success", False))
@@ -738,6 +777,19 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     completion = [run["completionMs"] for run in outcome_correct]
     ttfo = [run["ttfoMs"] for run in outcome_correct if run["ttfoMs"] is not None]
+    model_wait = [
+        run["modelWaitMs"] for run in runs if run.get("modelWaitMs") is not None
+    ]
+    continuations = [
+        run["continuationCount"]
+        for run in runs
+        if run.get("continuationCount") is not None
+    ]
+    actual_commands = [run.get("actualCommandCount", 0) for run in runs]
+    tests_ran = sum(
+        run.get("taskContract", {}).get("successfulTestObserved", False)
+        for run in runs
+    )
     diagnostic_counts = Counter(
         diagnostic["category"]
         for run in runs
@@ -753,6 +805,13 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "successRatePercent": outcome_rate,
         "successfulCompletionTime": distribution(completion),
         "successfulTtfo": distribution(ttfo),
+        "modelWait": distribution(model_wait),
+        "continuationCount": count_distribution(continuations),
+        "actualCommandCount": count_distribution(actual_commands),
+        "testsRan": {
+            "runs": tests_ran,
+            "ratePercent": round(tests_ran / len(runs) * 100, 3),
+        },
         "outcomeCorrectness": {
             "correctRuns": len(outcome_correct),
             "incorrectRuns": len(runs) - len(outcome_correct),
@@ -779,22 +838,22 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
         if not path.is_file():
             raise FileNotFoundError(path)
     fork_source_state = exact_source_state(
-        fork_root, args.fork_revision, "current fork"
+        fork_root, args.fork_revision, args.fork_label
     )
     upstream_source_state = exact_source_state(
-        upstream_root, args.upstream_revision, "official upstream C"
+        upstream_root, args.upstream_revision, args.upstream_label
     )
 
     pairs: list[dict[str, Any]] = []
     for repetition in range(1, args.repetitions + 1):
         upstream_first = repetition % 2 == 1
         order = (
-            (("upstreamC", upstream_binary), ("currentFork", fork_binary))
+            (("upstreamC", args.upstream_label, upstream_binary), ("currentFork", args.fork_label, fork_binary))
             if upstream_first
-            else (("currentFork", fork_binary), ("upstreamC", upstream_binary))
+            else (("currentFork", args.fork_label, fork_binary), ("upstreamC", args.upstream_label, upstream_binary))
         )
         runs: dict[str, dict[str, Any]] = {}
-        for label, binary in order:
+        for role, label, binary in order:
             print(f"pair {repetition}/{args.repetitions}: starting {label}", flush=True)
             run = run_agent(
                 binary=binary,
@@ -807,19 +866,25 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
                 auth_source=auth_source,
                 timeout_seconds=args.timeout_seconds,
             )
-            runs[label] = run
+            runs[role] = run
             print(
                 f"pair {repetition}/{args.repetitions}: {label} "
                 f"outcomeCorrect={run['outcomeCorrect']} "
                 f"taskContractCompliant={run['taskContractCompliant']} "
                 f"completionMs={run['completionMs']} "
-                f"ttfoMs={run['ttfoMs']} failures={run['failureReasons']}",
+                f"modelWaitMs={run['modelWaitMs']} "
+                f"continuations={run['continuationCount']} "
+                f"commands={run['actualCommandCount']} failures={run['failureReasons']}",
                 flush=True,
             )
         pairs.append(
             {
                 "repetition": repetition,
-                "order": "upstreamC,currentFork" if upstream_first else "currentFork,upstreamC",
+                "order": (
+                    f"{args.upstream_label},{args.fork_label}"
+                    if upstream_first
+                    else f"{args.fork_label},{args.upstream_label}"
+                ),
                 "currentFork": runs["currentFork"],
                 "upstreamC": runs["upstreamC"],
             }
@@ -827,16 +892,23 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
 
     fork_runs = [pair["currentFork"] for pair in pairs]
     upstream_runs = [pair["upstreamC"] for pair in pairs]
-    if exact_source_state(fork_root, args.fork_revision, "current fork") != fork_source_state:
-        raise RuntimeError("current fork source state changed during the benchmark")
+    if exact_source_state(fork_root, args.fork_revision, args.fork_label) != fork_source_state:
+        raise RuntimeError(f"{args.fork_label} source state changed during the benchmark")
     if (
-        exact_source_state(upstream_root, args.upstream_revision, "official upstream C")
+        exact_source_state(upstream_root, args.upstream_revision, args.upstream_label)
         != upstream_source_state
     ):
-        raise RuntimeError("official upstream C source state changed during the benchmark")
+        raise RuntimeError(f"{args.upstream_label} source state changed during the benchmark")
+    default_comparison = (
+        args.fork_label == "currentFork" and args.upstream_label == "upstreamC"
+    )
     return {
         "schemaVersion": REPORT_SCHEMA_VERSION,
-        "kind": "fork-vs-official-upstream-c-live-agent-task",
+        "kind": (
+            "fork-vs-official-upstream-c-live-agent-task"
+            if default_comparison
+            else "paired-live-agent-task"
+        ),
         "capturedAt": datetime.now(timezone.utc).isoformat(),
         "scope": "input-identical live coding task",
         "currentFork": {
@@ -844,7 +916,7 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
                 fork_binary,
                 fork_root,
                 fork_source_state,
-                "current fork",
+                args.fork_label,
                 build_command=args.fork_build_command,
             ),
         },
@@ -853,9 +925,9 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
                 upstream_binary,
                 upstream_root,
                 upstream_source_state,
-                "official upstream C",
+                args.upstream_label,
             ),
-            "immutableReference": True,
+            "immutableReference": default_comparison,
         },
         "methodology": {
             "taskPrompt": TASK_PROMPT,
@@ -874,7 +946,11 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
                 "-z --untracked-files=all` must be empty before and after all runs"
             ),
             "repetitionsPerVariant": args.repetitions,
-            "pairOrder": "alternating; upstream first in odd repetitions",
+            "pairOrder": f"alternating; {args.upstream_label} first in odd repetitions",
+            "comparisonLabels": {
+                "currentForkRole": args.fork_label,
+                "upstreamCRole": args.upstream_label,
+            },
             "model": args.model,
             "reasoningEffort": args.reasoning_effort,
             "personality": args.personality,
@@ -987,8 +1063,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fork-root", type=Path)
     parser.add_argument("--fork-revision")
     parser.add_argument("--fork-build-command")
+    parser.add_argument("--fork-label", default="currentFork")
     parser.add_argument("--upstream-root", type=Path)
     parser.add_argument("--upstream-revision")
+    parser.add_argument("--upstream-label", default="upstreamC")
     parser.add_argument("--auth-source", type=Path, default=Path.home() / ".codex" / "auth.json")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--model", default="gpt-5.6-sol")

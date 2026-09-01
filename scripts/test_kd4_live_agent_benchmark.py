@@ -17,10 +17,33 @@ def _run(
         "completionMs": 100.0,
         "ttfoMs": 10.0,
         "diagnostics": [],
+        "modelWaitMs": 75.0,
+        "continuationCount": 2,
+        "actualCommandCount": 4,
+        "taskContract": {"successfulTestObserved": task_contract_compliant},
     }
 
 
 class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
+    def test_turn_measurements_use_union_wait_and_continuation_flags(self) -> None:
+        event = {
+            "type": "turn.completed",
+            "timing": {
+                "unions": {"modelStreamWaitUnionNs": 12_345_678},
+                "modelRequests": [
+                    {"isContinuation": False},
+                    {"isContinuation": True},
+                    {"isContinuation": True},
+                ],
+            },
+        }
+
+        self.assertEqual(benchmark.turn_measurements(event), (12.346, 2))
+        self.assertEqual(
+            benchmark.turn_measurements({"type": "turn.completed"}),
+            (None, None),
+        )
+
     def test_required_test_command_requires_quiet_unittest_execution(self) -> None:
         self.assertTrue(
             benchmark.is_required_test_command("python -m unittest -q")
@@ -54,6 +77,10 @@ class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
             summary["taskContractCompliance"]["ratePercent"], 20.0
         )
         self.assertEqual(summary["successfulCompletionTime"]["count"], 2)
+        self.assertEqual(summary["modelWait"]["averageMs"], 75.0)
+        self.assertEqual(summary["continuationCount"]["average"], 2.0)
+        self.assertEqual(summary["actualCommandCount"]["average"], 4.0)
+        self.assertEqual(summary["testsRan"]["runs"], 1)
 
     def test_diagnostics_use_structured_categories(self) -> None:
         observed = "\n".join(

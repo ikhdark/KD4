@@ -1247,6 +1247,7 @@ fn plan_update_emits_started_then_updated_then_completed() {
                 ThreadEvent::TurnCompleted(TurnCompletedEvent {
                     surfaced_result: None,
                     usage: Usage::default(),
+                    timing: None,
                 }),
             ],
             status: CodexStatus::InitiateShutdown,
@@ -1388,6 +1389,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                     output_tokens: 29,
                     reasoning_output_tokens: 7,
                 },
+                timing: None,
             })],
             status: CodexStatus::InitiateShutdown,
         }
@@ -1430,6 +1432,7 @@ fn turn_completion_recovers_final_message_from_turn_items() {
             events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
                 surfaced_result: None,
                 usage: Usage::default(),
+                timing: None,
             })],
             status: CodexStatus::InitiateShutdown,
         }
@@ -1527,6 +1530,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 ThreadEvent::TurnCompleted(TurnCompletedEvent {
                     surfaced_result: None,
                     usage: Usage::default(),
+                    timing: None,
                 }),
             ],
             status: CodexStatus::InitiateShutdown,
@@ -1583,6 +1587,7 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
             events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
                 surfaced_result: None,
                 usage: Usage::default(),
+                timing: None,
             })],
             status: CodexStatus::InitiateShutdown,
         }
@@ -1634,6 +1639,7 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
             events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
                 surfaced_result: None,
                 usage: Usage::default(),
+                timing: None,
             })],
             status: CodexStatus::InitiateShutdown,
         }
@@ -1772,6 +1778,7 @@ fn turn_completion_falls_back_to_final_plan_text() {
             events: vec![ThreadEvent::TurnCompleted(TurnCompletedEvent {
                 surfaced_result: None,
                 usage: Usage::default(),
+                timing: None,
             })],
             status: CodexStatus::InitiateShutdown,
         }
