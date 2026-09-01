@@ -104,7 +104,7 @@ impl AbExecutionProfile {
                 clusters: 2,
                 looks: &AB_BATCH_LOOKS,
                 cap: Duration::from_secs(10 * 60),
-                latency_hard_gate: false,
+                latency_hard_gate: true,
             },
             Self::Final => AbExecutionConfig {
                 profile: self,
@@ -136,9 +136,9 @@ impl AbExecutionConfig {
 
     fn ucb_quantile(self) -> f64 {
         if self.profile == AbExecutionProfile::Final {
-            1.0 - AB_FAMILY_WISE_ALPHA / self.looks.len() as f64
+            1.0 - AB_PER_LOOK_ALPHA / self.looks.len() as f64
         } else {
-            1.0 - AB_FAMILY_WISE_ALPHA
+            1.0 - AB_PER_LOOK_ALPHA
         }
     }
 
@@ -253,7 +253,6 @@ impl AbWorkload {
             | Self::CodeModeHighVolume
             | Self::AbortDirectNestedInFlight
             | Self::AbortRetainedProcess => AbWorkloadClass::CorrectnessOnly,
-            Self::SessionReplay => AbWorkloadClass::Latency,
             _ => AbWorkloadClass::Latency,
         }
     }
@@ -978,6 +977,7 @@ struct AbCompareArgs {
 #[derive(Clone, Debug)]
 struct AbImportReportArgs {
     report: PathBuf,
+    manifest: PathBuf,
     repo: PathBuf,
 }
 
@@ -1025,6 +1025,20 @@ struct AbPreparedBuild {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct AbRecordedBuildInputs {
+    cargo_version: String,
+    rustc_version: String,
+    rust_target: String,
+    cargo_executable_sha256: String,
+    rustc_executable_sha256: String,
+    baseline_environment_sha256: String,
+    candidate_environment_sha256: String,
+    baseline_cargo_configuration_sha256: String,
+    candidate_cargo_configuration_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct AbPreparedManifest {
     schema_version: u16,
     baseline_commit: String,
@@ -1035,6 +1049,7 @@ struct AbPreparedManifest {
     fixture_matrix_sha256: String,
     workload_schema_matrix_sha256: String,
     build_configuration_sha256: String,
+    build_inputs: AbRecordedBuildInputs,
     rustc_version: String,
     rust_target: String,
     baseline: AbPreparedBuild,
@@ -1254,6 +1269,7 @@ struct AbProvenance {
     candidate_cli_binary_sha256: String,
     rustc_version: String,
     rust_target: String,
+    build_configuration_sha256: String,
     profile: String,
     execution_profile: AbExecutionProfile,
     features: Vec<String>,
@@ -1393,16 +1409,17 @@ struct AbWorkloadVerdict {
 
 struct AbWorkerProcess {
     child: Child,
+    #[cfg(unix)]
+    process_group_id: u32,
+    #[cfg(windows)]
+    managed_root: codex_utils_pty::ManagedRootProcess,
     stdin: ChildStdin,
     stdout: Receiver<std::result::Result<String, String>>,
 }
 
 impl Drop for AbWorkerProcess {
     fn drop(&mut self) {
-        if self.child.try_wait().is_ok_and(|status| status.is_none()) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
+        let _ = terminate_ab_worker_process(self);
     }
 }
 

@@ -6,7 +6,7 @@
   Operate only on fork-local source and artifacts. Upstream synchronization or
   distribution requires a request that explicitly names it.
 - This is a local project for the user's own use and is not intended for public
-  release or distribution.
+  release or distribution. It's main goal is to improve and optimize codex.
 - Treat the active repository root as the checkout location; do not hard-code a
   workstation-specific checkout path.
 - `C:\Users\kuh\Desktop\LOCAL-KD` is the fork home and
@@ -17,40 +17,20 @@
   replacing or updating the local binary, then restarting Desktop. Perform
   those activation steps only when the request includes them.
 
-<!-- SHARED-OPERATING-POLICY: START -->
 
 ### Scope and workspace
-
+- Created tests must prove the direct behavior change and end to end wiring.
+- Ask questions for clarity before implementing.
 - Read the root `AGENTS.md` in full, and read every user-provided or user-named
   file in full.
 - Communicate with the user in very plain language.
 - Do not publish, deploy, or modify upstream state unless the user explicitly
   requests that action.
-- Preserve concurrent work and every unrelated hunk. Compare an overlapping
-  target and its diff once, then keep or merge the version that satisfies every
-  affected contract and direct test.
-- Ask questions when the user input is vague.
 - When you encounter overlapping edits, choose the best version. Implement your
   version when it is better, keep the current or concurrently changing version
   when it is better, and combine them when that produces the best result. If
   the existing version is already better than your proposed edit, leave it
   unchanged and move on.
-
-### Implementation and validation
-
-- For a code edit, add or update the direct test in the same change. The test
-  must fail without the implementation change and pass with it.
-- Produce schemas, snapshots, locks, vendored content, and other generated
-  artifacts through their owner commands; do not hand-edit generated output.
-- Run only the narrow tests that exercise the active implementation. Do not run
-  broad test suites, repository-wide validation, or workspace analyzers unless
-  the user requests that exact scope.
-- A formatter, linter, build, applied patch, or successful command selecting
-  zero relevant tests is not runtime proof. Runtime proof requires a direct
-  contract test or a user-approved end-to-end gate that executes the changed
-  path.
-
-<!-- SHARED-OPERATING-POLICY: END -->
 
 ## Routing and task scope
 

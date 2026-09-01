@@ -121,24 +121,22 @@ fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
         } else {
             (AB_REPLAY_A_GENERATIONS, 4_000, 1_000, 10)
         };
+    // Purpose maps mirror the runtime's own generation-purpose counters, so the
+    // fixture may only use runtime-classifier names and must stay consistent
+    // with the avoidable-generation sum (wait + failure_diagnosis + repair).
     let generation_purposes = if action_first {
         BTreeMap::from([
-            ("targeted_action".to_string(), 1),
-            ("mutation".to_string(), 1),
-            ("validation".to_string(), 1),
-            ("final_response".to_string(), 2),
-            ("recoverable_failure".to_string(), 1),
-            ("failure_recovery".to_string(), 1),
-            ("retained_process_start".to_string(), 1),
-            ("retained_process_poll".to_string(), 2),
+            ("implementation_decision".to_string(), 6),
+            ("validation_interpretation".to_string(), 2),
+            ("terminal_completion_reasoning".to_string(), 2),
         ])
     } else {
         BTreeMap::from([
-            ("necessary_work".to_string(), 8),
-            ("broad_discovery".to_string(), 3),
-            ("repeated_discovery".to_string(), 2),
-            ("wait".to_string(), 1),
-            ("terminal_failure".to_string(), 1),
+            ("implementation_decision".to_string(), 3),
+            ("wait".to_string(), 6),
+            ("failure_diagnosis".to_string(), 2),
+            ("repair".to_string(), 2),
+            ("terminal_completion_reasoning".to_string(), 2),
         ])
     };
     Sample {
@@ -187,12 +185,7 @@ fn valid_session_replay_sample(action_first: bool, lane_ns: u64) -> Sample {
             AbReplaySubturnRecord {
                 name: "recoverable_exec_failure".to_string(),
                 logical_generations: if action_first { 3 } else { 1 },
-                terminal_event: if action_first {
-                    "turn_complete"
-                } else {
-                    "error"
-                }
-                .to_string(),
+                terminal_event: "turn_complete".to_string(),
                 application_result: if action_first { "passed" } else { "failed" }.to_string(),
                 typed_error_count: u32::from(!action_first),
                 final_response_present: action_first,
@@ -285,9 +278,18 @@ fn injected_replay_timing_sample(base_ns: u64) -> Sample {
 
 #[test]
 fn tool_result_correctness_replay_merges_actual_failure_sample() {
-    let action = injected_replay_timing_sample(100);
-    let failure = injected_replay_timing_sample(1_000);
-    let retained_abort = injected_replay_timing_sample(10_000);
+    let mut action = injected_replay_timing_sample(100);
+    action.avoidable_generations = 1;
+    action.nonprogress_tokens = 11;
+    action.generation_purposes = BTreeMap::from([("action-observed".to_string(), 1)]);
+    let mut failure = injected_replay_timing_sample(1_000);
+    failure.avoidable_generations = 2;
+    failure.nonprogress_tokens = 22;
+    failure.generation_purposes = BTreeMap::from([("failure-observed".to_string(), 2)]);
+    let mut retained_abort = injected_replay_timing_sample(10_000);
+    retained_abort.avoidable_generations = 3;
+    retained_abort.nonprogress_tokens = 33;
+    retained_abort.generation_purposes = BTreeMap::from([("retained-observed".to_string(), 3)]);
     let expected = AbLatencyMetric::REPLAY
         .iter()
         .filter(|metric| metric.name() != "end_to_end")
@@ -317,6 +319,16 @@ fn tool_result_correctness_replay_merges_actual_failure_sample() {
     assert_eq!(
         actual, expected,
         "every gated replay timing lane must equal the exact sum of action, required-failure, and retained-abort timing"
+    );
+    assert_eq!(baseline.avoidable_generations, 6);
+    assert_eq!(baseline.nonprogress_tokens, 66);
+    assert_eq!(
+        baseline.generation_purposes,
+        BTreeMap::from([
+            ("action-observed".to_string(), 1),
+            ("failure-observed".to_string(), 2),
+            ("retained-observed".to_string(), 3),
+        ])
     );
 }
 
@@ -420,6 +432,16 @@ fn tool_result_correctness_replay_error_signal_is_not_terminal() {
     ));
 }
 
+#[test]
+fn replay_retained_generation_target_is_lane_dependent() {
+    assert_eq!(replay_retained_generation_target(true), 3);
+    assert_eq!(
+        replay_retained_generation_target(false),
+        4,
+        "the baseline's avoidable-wait generation is expected raw evidence, not a defect"
+    );
+}
+
 fn valid_session_replay_cluster() -> AbPairedCluster {
     AbPairedCluster {
         cluster: 1,
@@ -450,24 +472,42 @@ fn accepted_batch_report_for_import() -> AbReport {
         .map(|workload| {
             let pairs_per_cluster = config.looks_for(*workload)[0];
             let mut clusters = match workload {
-                AbWorkload::CodeModeNestedDispatch => paired_clusters(100, 50),
+                AbWorkload::CodeModeNestedDispatch => {
+                    paired_clusters_with_pairs(100, 50, pairs_per_cluster)
+                }
                 AbWorkload::LongHistoryNoToolInitial
                 | AbWorkload::LongHistoryToolContinuation
                 | AbWorkload::StableContextWarmCache
                 | AbWorkload::ContextChangeInvalidation => {
-                    paired_request_cache_clusters(*workload, 100, 50)
+                    paired_request_cache_clusters_with_pairs(
+                        *workload,
+                        100,
+                        50,
+                        pairs_per_cluster,
+                    )
                 }
                 AbWorkload::SingleDirectToolCall
                 | AbWorkload::ParallelSafeTripleDirect
                 | AbWorkload::ExclusiveGateSerialization => {
-                    paired_tool_gate_clusters(*workload, 100, 50)
+                    paired_tool_gate_clusters_with_pairs(
+                        *workload,
+                        100,
+                        50,
+                        pairs_per_cluster,
+                    )
                 }
-                AbWorkload::CodeModeHighVolume => paired_high_volume_clusters(100, 50),
+                AbWorkload::CodeModeHighVolume => {
+                    paired_high_volume_clusters_with_pairs(100, 50, pairs_per_cluster)
+                }
                 AbWorkload::RetainedExecWriteStdinLifecycle => {
-                    paired_retained_exec_clusters(100, 50)
+                    paired_retained_exec_clusters_with_pairs(100, 50, pairs_per_cluster)
                 }
-                AbWorkload::AbortDirectNestedInFlight => paired_abort_direct_nested_clusters(),
-                AbWorkload::AbortRetainedProcess => paired_abort_retained_process_clusters(),
+                AbWorkload::AbortDirectNestedInFlight => {
+                    paired_abort_direct_nested_clusters_with_pairs(pairs_per_cluster)
+                }
+                AbWorkload::AbortRetainedProcess => {
+                    paired_abort_retained_process_clusters_with_pairs(pairs_per_cluster)
+                }
                 AbWorkload::SessionReplay => unreachable!("batch reports exclude replay"),
             };
             clusters.truncate(config.clusters);
@@ -548,6 +588,7 @@ fn accepted_batch_report_for_import() -> AbReport {
             candidate_cli_binary_sha256: "b-cli".to_string(),
             rustc_version: "rustc test".to_string(),
             rust_target: "test-target".to_string(),
+            build_configuration_sha256: "build-configuration".to_string(),
             profile: AB_BUILD_PROFILE.to_string(),
             execution_profile: profile,
             features: Vec::new(),
@@ -590,6 +631,26 @@ fn rehash_accepted_report(report: &mut AbReport) {
         sha256_bytes(&serde_json::to_vec(&report).expect("rehash accepted report fixture"));
 }
 
+fn bind_accepted_report_to_manifest(report: &mut AbReport, manifest: &AbPreparedManifest) {
+    let provenance = &mut report.provenance;
+    provenance.baseline_commit = manifest.baseline_commit.clone();
+    provenance.candidate_commit = manifest.candidate_commit.clone();
+    provenance.baseline_filtered_tree = manifest.baseline_filtered_tree.clone();
+    provenance.candidate_filtered_tree = manifest.candidate_filtered_tree.clone();
+    provenance.overlay_sha256 = manifest.overlay_sha256.clone();
+    provenance.prepared_manifest_sha256 = manifest.manifest_payload_sha256.clone();
+    provenance.baseline_worker_sha256 = manifest.baseline.worker_sha256.clone();
+    provenance.candidate_worker_sha256 = manifest.candidate.worker_sha256.clone();
+    provenance.baseline_host_binary_sha256 = manifest.baseline.host_sha256.clone();
+    provenance.candidate_host_binary_sha256 = manifest.candidate.host_sha256.clone();
+    provenance.baseline_cli_binary_sha256 = manifest.baseline.cli_sha256.clone();
+    provenance.candidate_cli_binary_sha256 = manifest.candidate.cli_sha256.clone();
+    provenance.rustc_version = manifest.rustc_version.clone();
+    provenance.rust_target = manifest.rust_target.clone();
+    provenance.build_configuration_sha256 = manifest.build_configuration_sha256.clone();
+    rehash_accepted_report(report);
+}
+
 #[test]
 fn code_mode_command_has_one_fixed_configuration() {
     let command = parse_command_from(strings(&[
@@ -630,9 +691,12 @@ fn synthetic_scenarios_do_not_include_code_mode_capture() {
 }
 
 #[test]
-fn synthetic_defaults_include_windows_executor() {
+fn synthetic_defaults_include_windows_executor_only_on_windows() {
     let scenarios = default_synthetic_scenarios();
-    assert!(scenarios.contains(&Scenario::WindowsExecutor));
+    assert_eq!(
+        scenarios.contains(&Scenario::WindowsExecutor),
+        cfg!(windows)
+    );
 }
 
 #[test]
@@ -825,14 +889,22 @@ fn valid_ab_sample(duration_ns: u64) -> Sample {
 }
 
 fn paired_clusters(a_duration_ns: u64, b_duration_ns: u64) -> Vec<AbPairedCluster> {
+    paired_clusters_with_pairs(a_duration_ns, b_duration_ns, AB_ITERATIONS)
+}
+
+fn paired_clusters_with_pairs(
+    a_duration_ns: u64,
+    b_duration_ns: u64,
+    pairs_per_cluster: usize,
+) -> Vec<AbPairedCluster> {
     (1..=AB_CLUSTERS)
         .map(|cluster| AbPairedCluster {
             cluster,
-            a_first: (0..AB_ITERATIONS)
+            a_first: (0..pairs_per_cluster)
                 .map(|index| a_runs_first(cluster, index))
                 .collect(),
-            a_samples: vec![valid_ab_sample(a_duration_ns); AB_ITERATIONS],
-            b_samples: vec![valid_ab_sample(b_duration_ns); AB_ITERATIONS],
+            a_samples: vec![valid_ab_sample(a_duration_ns); pairs_per_cluster],
+            b_samples: vec![valid_ab_sample(b_duration_ns); pairs_per_cluster],
             a_warmup_failures: 0,
             b_warmup_failures: 0,
             a_warmup_failure_details: Vec::new(),
@@ -940,14 +1012,22 @@ fn valid_high_volume_sample(duration_ns: u64) -> Sample {
 }
 
 fn paired_high_volume_clusters(a_duration_ns: u64, b_duration_ns: u64) -> Vec<AbPairedCluster> {
+    paired_high_volume_clusters_with_pairs(a_duration_ns, b_duration_ns, AB_ITERATIONS)
+}
+
+fn paired_high_volume_clusters_with_pairs(
+    a_duration_ns: u64,
+    b_duration_ns: u64,
+    pairs_per_cluster: usize,
+) -> Vec<AbPairedCluster> {
     (1..=AB_CLUSTERS)
         .map(|cluster| AbPairedCluster {
             cluster,
-            a_first: (0..AB_ITERATIONS)
+            a_first: (0..pairs_per_cluster)
                 .map(|index| a_runs_first(cluster, index))
                 .collect(),
-            a_samples: vec![valid_high_volume_sample(a_duration_ns); AB_ITERATIONS],
-            b_samples: vec![valid_high_volume_sample(b_duration_ns); AB_ITERATIONS],
+            a_samples: vec![valid_high_volume_sample(a_duration_ns); pairs_per_cluster],
+            b_samples: vec![valid_high_volume_sample(b_duration_ns); pairs_per_cluster],
             a_warmup_failures: 0,
             b_warmup_failures: 0,
             a_warmup_failure_details: Vec::new(),
@@ -1280,14 +1360,23 @@ fn paired_tool_gate_clusters(
     a_duration_ns: u64,
     b_duration_ns: u64,
 ) -> Vec<AbPairedCluster> {
+    paired_tool_gate_clusters_with_pairs(workload, a_duration_ns, b_duration_ns, AB_ITERATIONS)
+}
+
+fn paired_tool_gate_clusters_with_pairs(
+    workload: AbWorkload,
+    a_duration_ns: u64,
+    b_duration_ns: u64,
+    pairs_per_cluster: usize,
+) -> Vec<AbPairedCluster> {
     (1..=AB_CLUSTERS)
         .map(|cluster| AbPairedCluster {
             cluster,
-            a_first: (0..AB_ITERATIONS)
+            a_first: (0..pairs_per_cluster)
                 .map(|index| a_runs_first(cluster, index))
                 .collect(),
-            a_samples: vec![valid_tool_gate_sample(workload, a_duration_ns); AB_ITERATIONS],
-            b_samples: vec![valid_tool_gate_sample(workload, b_duration_ns); AB_ITERATIONS],
+            a_samples: vec![valid_tool_gate_sample(workload, a_duration_ns); pairs_per_cluster],
+            b_samples: vec![valid_tool_gate_sample(workload, b_duration_ns); pairs_per_cluster],
             a_warmup_failures: 0,
             b_warmup_failures: 0,
             a_warmup_failure_details: Vec::new(),
@@ -1374,14 +1463,22 @@ fn valid_retained_exec_sample(duration_ns: u64) -> Sample {
 }
 
 fn paired_retained_exec_clusters(a_duration_ns: u64, b_duration_ns: u64) -> Vec<AbPairedCluster> {
+    paired_retained_exec_clusters_with_pairs(a_duration_ns, b_duration_ns, AB_ITERATIONS)
+}
+
+fn paired_retained_exec_clusters_with_pairs(
+    a_duration_ns: u64,
+    b_duration_ns: u64,
+    pairs_per_cluster: usize,
+) -> Vec<AbPairedCluster> {
     (1..=AB_CLUSTERS)
         .map(|cluster| AbPairedCluster {
             cluster,
-            a_first: (0..AB_ITERATIONS)
+            a_first: (0..pairs_per_cluster)
                 .map(|index| a_runs_first(cluster, index))
                 .collect(),
-            a_samples: vec![valid_retained_exec_sample(a_duration_ns); AB_ITERATIONS],
-            b_samples: vec![valid_retained_exec_sample(b_duration_ns); AB_ITERATIONS],
+            a_samples: vec![valid_retained_exec_sample(a_duration_ns); pairs_per_cluster],
+            b_samples: vec![valid_retained_exec_sample(b_duration_ns); pairs_per_cluster],
             a_warmup_failures: 0,
             b_warmup_failures: 0,
             a_warmup_failure_details: Vec::new(),
@@ -1478,14 +1575,20 @@ fn valid_abort_direct_nested_sample() -> Sample {
 }
 
 fn paired_abort_direct_nested_clusters() -> Vec<AbPairedCluster> {
+    paired_abort_direct_nested_clusters_with_pairs(AB_ITERATIONS)
+}
+
+fn paired_abort_direct_nested_clusters_with_pairs(
+    pairs_per_cluster: usize,
+) -> Vec<AbPairedCluster> {
     (1..=AB_CLUSTERS)
         .map(|cluster| AbPairedCluster {
             cluster,
-            a_first: (0..AB_ITERATIONS)
+            a_first: (0..pairs_per_cluster)
                 .map(|index| a_runs_first(cluster, index))
                 .collect(),
-            a_samples: vec![valid_abort_direct_nested_sample(); AB_ITERATIONS],
-            b_samples: vec![valid_abort_direct_nested_sample(); AB_ITERATIONS],
+            a_samples: vec![valid_abort_direct_nested_sample(); pairs_per_cluster],
+            b_samples: vec![valid_abort_direct_nested_sample(); pairs_per_cluster],
             a_warmup_failures: 0,
             b_warmup_failures: 0,
             a_warmup_failure_details: Vec::new(),
@@ -1569,14 +1672,20 @@ fn valid_abort_retained_process_sample() -> Sample {
 }
 
 fn paired_abort_retained_process_clusters() -> Vec<AbPairedCluster> {
+    paired_abort_retained_process_clusters_with_pairs(AB_ITERATIONS)
+}
+
+fn paired_abort_retained_process_clusters_with_pairs(
+    pairs_per_cluster: usize,
+) -> Vec<AbPairedCluster> {
     (1..=AB_CLUSTERS)
         .map(|cluster| AbPairedCluster {
             cluster,
-            a_first: (0..AB_ITERATIONS)
+            a_first: (0..pairs_per_cluster)
                 .map(|index| a_runs_first(cluster, index))
                 .collect(),
-            a_samples: vec![valid_abort_retained_process_sample(); AB_ITERATIONS],
-            b_samples: vec![valid_abort_retained_process_sample(); AB_ITERATIONS],
+            a_samples: vec![valid_abort_retained_process_sample(); pairs_per_cluster],
+            b_samples: vec![valid_abort_retained_process_sample(); pairs_per_cluster],
             a_warmup_failures: 0,
             b_warmup_failures: 0,
             a_warmup_failure_details: Vec::new(),
@@ -1594,21 +1703,11 @@ fn test_git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {} should succeed", args.join(" "));
 }
 
-fn test_prepared_build(root: &Path, name: &str, marker: &str) -> (String, String, AbPreparedBuild) {
-    let worktree = root.join(format!("{name}-worktree"));
-    install_ab_overlay(&controller_repository_root(), &worktree).unwrap();
-    fs::write(worktree.join("variant.txt"), marker).unwrap();
-    test_git(&worktree, &["init", "--quiet"]);
-    test_git(&worktree, &["config", "user.name", "KD4 benchmark"]);
-    test_git(
-        &worktree,
-        &["config", "user.email", "benchmark@example.invalid"],
-    );
-    test_git(&worktree, &["add", "."]);
-    test_git(&worktree, &["commit", "--quiet", "-m", marker]);
-    let commit = git_text(&worktree, &["rev-parse", "HEAD"]).unwrap();
-    let filtered_tree = canonical_filtered_tree_identity(&worktree, &commit).unwrap();
-
+fn test_prepared_artifact(
+    root: &Path,
+    worktree: PathBuf,
+    name: &str,
+) -> AbPreparedBuild {
     let target = root.join(format!("{name}-target"));
     let profile_dir = target.join(AB_BUILD_PROFILE_DIR);
     let deps = profile_dir.join("deps");
@@ -1619,14 +1718,77 @@ fn test_prepared_build(root: &Path, name: &str, marker: &str) -> (String, String
     fs::write(&cli, format!("{name}-cli")).unwrap();
     fs::write(&host, format!("{name}-host")).unwrap();
     fs::write(&worker, format!("{name}-worker")).unwrap();
-    let build = AbBuild {
-        worktree,
-        cli,
-        host,
-        worker,
+    prepared_build(
+        &AbBuild {
+            worktree,
+            cli,
+            host,
+            worker,
+        },
+        &target,
+    )
+    .unwrap()
+}
+
+fn test_prepared_manifest(root: &Path) -> AbPreparedManifest {
+    let repository = root.join("source-repository");
+    install_ab_overlay(&controller_repository_root(), &repository).unwrap();
+    fs::write(repository.join("variant.txt"), "baseline").unwrap();
+    test_git(&repository, &["init", "--quiet"]);
+    test_git(&repository, &["config", "user.name", "KD4 benchmark"]);
+    test_git(
+        &repository,
+        &["config", "user.email", "benchmark@example.invalid"],
+    );
+    test_git(&repository, &["add", "."]);
+    test_git(&repository, &["commit", "--quiet", "-m", "baseline"]);
+    let baseline_commit = git_text(&repository, &["rev-parse", "HEAD"]).unwrap();
+    let baseline_filtered_tree =
+        canonical_filtered_tree_identity(&repository, &baseline_commit).unwrap();
+
+    fs::write(repository.join("variant.txt"), "candidate").unwrap();
+    test_git(&repository, &["add", "variant.txt"]);
+    test_git(&repository, &["commit", "--quiet", "-m", "candidate"]);
+    let candidate_commit = git_text(&repository, &["rev-parse", "HEAD"]).unwrap();
+    let candidate_filtered_tree =
+        canonical_filtered_tree_identity(&repository, &candidate_commit).unwrap();
+
+    let baseline_worktree = root.join("baseline-worktree");
+    let candidate_worktree = root.join("candidate-worktree");
+    add_detached_worktree(&repository, &baseline_commit, &baseline_worktree).unwrap();
+    add_detached_worktree(&repository, &candidate_commit, &candidate_worktree).unwrap();
+    install_ab_overlay(&controller_repository_root(), &baseline_worktree).unwrap();
+    install_ab_overlay(&controller_repository_root(), &candidate_worktree).unwrap();
+    let baseline = test_prepared_artifact(root, baseline_worktree, "baseline");
+    let candidate = test_prepared_artifact(root, candidate_worktree, "candidate");
+    let (_, _, build_inputs) = recorded_ab_build_inputs(
+        &baseline.worktree.join("codex-rs"),
+        &baseline.target_dir,
+        &candidate.worktree.join("codex-rs"),
+        &candidate.target_dir,
+    )
+    .unwrap();
+    let rustc_version = build_inputs.rustc_version.clone();
+    let rust_target = build_inputs.rust_target.clone();
+    let mut manifest = AbPreparedManifest {
+        schema_version: AB_PREPARED_MANIFEST_SCHEMA_VERSION,
+        baseline_commit,
+        candidate_commit,
+        baseline_filtered_tree,
+        candidate_filtered_tree,
+        overlay_sha256: ab_overlay_sha256_at_repository(&controller_repository_root()).unwrap(),
+        fixture_matrix_sha256: ab_matrix_hash(ab_all_workloads(), ab_fixture_hash),
+        workload_schema_matrix_sha256: ab_matrix_hash(ab_all_workloads(), ab_workload_schema_hash),
+        build_configuration_sha256: ab_build_configuration_hash(&build_inputs),
+        build_inputs,
+        rustc_version,
+        rust_target,
+        baseline,
+        candidate,
+        manifest_payload_sha256: String::new(),
     };
-    let prepared = prepared_build(&build, &target).unwrap();
-    (commit, filtered_tree, prepared)
+    manifest.manifest_payload_sha256 = prepared_manifest_payload_hash(&manifest).unwrap();
+    manifest
 }
 
 #[test]
@@ -1672,6 +1834,22 @@ fn ab_overlay_dynamic_main_capture_and_dirty_tree_rejection() {
         clean_main_identity(repo.path()).is_err(),
         "baseline capture must reject repositories without a local main ref"
     );
+}
+
+#[test]
+fn ab_git_environment_filter_covers_repository_redirects_and_config() {
+    for name in [
+        "GIT_DIR",
+        "git_work_tree",
+        "GIT_OBJECT_DIRECTORY",
+        "Git_Config_Global",
+        "GIT_REPLACE_REF_BASE",
+    ] {
+        assert!(is_git_environment_variable(std::ffi::OsStr::new(name)));
+    }
+    assert!(!is_git_environment_variable(std::ffi::OsStr::new(
+        "CARGO_HOME"
+    )));
 }
 
 #[test]
@@ -1907,7 +2085,7 @@ fn ab_overlay_tool_closure_is_backward_compatible_but_required_for_b() {
 }
 
 #[test]
-fn ab_overlay_baseline_warmup_failures_are_diagnostic_but_candidate_failures_block() {
+fn ab_overlay_unexpected_warmup_failures_block_both_variants() {
     let workload = AbWorkload::CodeModeNestedDispatch;
     let mut clusters = paired_clusters(100, 50);
     clusters[0].a_warmup_failures = 1;
@@ -1918,8 +2096,8 @@ fn ab_overlay_baseline_warmup_failures_are_diagnostic_but_candidate_failures_blo
     assert!(
         ab_correctness_violations(&clusters, workload.class(), workload)
             .iter()
-            .all(|violation| !violation.contains("warmup_failures")),
-        "baseline-only warmup failures must not reject a noninferior candidate"
+            .any(|violation| violation.contains("warmup_failures:A=1:B=0")),
+        "unexpected baseline warmup failures must reject the run"
     );
 
     clusters[0].b_warmup_failures = 1;
@@ -1947,8 +2125,10 @@ fn ab_overlay_baseline_warmup_failures_are_diagnostic_but_candidate_failures_blo
     workload_report.report_payload_sha256 = sha256_bytes(
         &serde_json::to_vec(&workload_report).expect("rehash baseline warmup fixture"),
     );
-    validate_accepted_ab_workload(workload_report, workload, profile.config())
-        .expect("accepted reports may retain baseline warmup diagnostics");
+    assert!(
+        validate_accepted_ab_workload(workload_report, workload, profile.config()).is_err(),
+        "accepted reports must reject unexpected baseline warmup failures"
+    );
 
     workload_report.clusters[0].b_warmup_failures = 1;
     workload_report.clusters[0].b_warmup_failure_details = vec![AbWarmupFailure {
@@ -2095,7 +2275,7 @@ fn ab_overlay_final_profile_balances_independent_clusters_and_worker_repetition(
     assert_eq!(config.clusters, 14);
     assert_eq!(config.looks, [10]);
     assert_eq!(config.clusters * config.max_pairs_per_cluster(), 140);
-    assert_eq!(config.ucb_quantile(), 1.0 - AB_FAMILY_WISE_ALPHA);
+    assert_eq!(config.ucb_quantile(), 1.0 - AB_PER_LOOK_ALPHA);
     assert_eq!(AB_BUILD_PROFILE, "release");
     assert_eq!(AB_BUILD_PROFILE_DIR, "release");
     for args in [
@@ -2336,6 +2516,75 @@ fn ab_overlay_request_identity_canonicalization_preserves_semantics() {
     assert!(
         canonical_prompt_input_tokens_from_body(&b) > canonical_prompt_input_tokens_from_body(&a),
         "semantic prompt growth must remain observable after canonicalization"
+    );
+}
+
+#[test]
+fn request_component_snapshot_preserves_prompt_cache_key_identity() {
+    let body = |prompt_cache_key: &str| {
+        serde_json::json!({
+            "prompt_cache_key": prompt_cache_key,
+            "input": [{"role": "user", "content": "same prompt"}],
+        })
+    };
+    let first = request_component_snapshot(
+        &body("11111111-1111-4111-8111-111111111111"),
+        "initial",
+    );
+    let second = request_component_snapshot(
+        &body("22222222-2222-4222-8222-222222222222"),
+        "initial",
+    );
+
+    assert_ne!(
+        first.prompt_cache_key_sha256, second.prompt_cache_key_sha256,
+        "prompt cache key UUID changes must remain observable"
+    );
+}
+
+#[test]
+fn high_volume_request_capture_retains_only_its_bounded_window() {
+    use wiremock::Match;
+
+    let capture = HighVolumeRequestCapture::bounded(2);
+    for index in 0..3 {
+        let request = wiremock::Request {
+            url: format!("http://localhost/request-{index}")
+                .parse()
+                .expect("request URL"),
+            method: "POST".parse().expect("request method"),
+            headers: Default::default(),
+            body: index.to_string().into_bytes(),
+        };
+        assert!(capture.matches(&request));
+    }
+
+    assert_eq!(capture.request_count(), 3, "request indices stay monotonic");
+    let retained = capture.requests_since(0);
+    assert_eq!(retained.len(), 2);
+    assert_eq!(retained[0].body, b"1");
+    assert_eq!(retained[1].body, b"2");
+}
+
+#[test]
+fn replay_broad_discovery_excludes_git_metadata() {
+    assert!(replay_broad_path_is_excluded(Path::new("fixture/.git")));
+    assert!(!replay_broad_path_is_excluded(Path::new("fixture/src")));
+}
+
+#[test]
+fn replay_history_seed_count_ignores_non_user_items() {
+    let body = serde_json::json!({
+        "input": [
+            {"role": "user", "content": format!("{AB_REPLAY_HISTORY_SEED_PREFIX}00")},
+            {"role": "assistant", "content": format!("{AB_REPLAY_HISTORY_SEED_PREFIX}01")},
+            {"type": "function_call_output", "output": AB_REPLAY_HISTORY_SEED_PREFIX},
+        ],
+    });
+
+    assert_eq!(
+        history_seed_turns_visible_with_prefix(&body, AB_REPLAY_HISTORY_SEED_PREFIX),
+        1
     );
 }
 
@@ -3770,6 +4019,11 @@ fn ab_overlay_execution_profiles_are_exact() {
     assert_eq!(batch.clusters, 2);
     assert_eq!(batch.looks, [20]);
     assert_eq!(batch.cap, Duration::from_secs(10 * 60));
+    assert!(batch.latency_hard_gate);
+    assert_eq!(
+        batch.latency_gate_mode(AbWorkloadClass::Latency),
+        AbLatencyGateMode::Hard
+    );
     for profile in [
         AbExecutionProfile::Quick,
         AbExecutionProfile::Batch,
@@ -3799,7 +4053,7 @@ fn ab_overlay_execution_profiles_are_exact() {
         final_config.latency_gate_mode(AbWorkloadClass::CorrectnessOnly),
         AbLatencyGateMode::Advisory
     );
-    assert!((final_config.ucb_quantile() - (1.0 - AB_FAMILY_WISE_ALPHA)).abs() < f64::EPSILON);
+    assert!((final_config.ucb_quantile() - (1.0 - AB_PER_LOOK_ALPHA)).abs() < f64::EPSILON);
     assert_eq!(
         ab_profile_workloads(AbExecutionProfile::Final, &[]).unwrap(),
         ab_controller_workloads()
@@ -3862,6 +4116,28 @@ fn ab_overlay_execution_profiles_are_exact() {
     assert_eq!(advisory.stop_reason, AbStopReason::AdvisoryComplete);
     assert!(advisory.passed);
     assert!(advisory.latency_gates.iter().any(|gate| !gate.passed));
+
+    let mut batch_failure = paired_request_cache_clusters_with_pairs(
+        AbWorkload::LongHistoryNoToolInitial,
+        100,
+        200,
+        batch.max_pairs_per_cluster(),
+    );
+    batch_failure.truncate(batch.clusters);
+    let batch_failure = evaluate_ab_workload_with_config(
+        &batch_failure,
+        AbWorkloadClass::Latency,
+        AbWorkload::LongHistoryNoToolInitial,
+        batch,
+        batch.max_pairs_per_cluster(),
+    )
+    .expect("batch hard gate should be measurable");
+    assert_eq!(batch_failure.decision, AbSequentialDecision::Failed);
+    assert_eq!(
+        batch_failure.stop_reason,
+        AbStopReason::LatencyClearFailure
+    );
+    assert!(!batch_failure.passed);
 
     let mut hard_failure =
         paired_request_cache_clusters(AbWorkload::LongHistoryNoToolInitial, 100, 200);
@@ -4029,6 +4305,84 @@ fn ab_overlay_session_replay_rejects_complete_turn_regression_when_local_lanes_p
 }
 
 #[test]
+fn ab_overlay_session_replay_gates_measured_avoidable_work_pointwise() {
+    // The replay verdict compares the runtime-measured avoidable-work fields
+    // between the paired lanes. It must not require or forbid any particular
+    // fixture-assigned purpose label: a valid cluster carries only runtime
+    // classifier purpose names, and a candidate that measures more avoidable
+    // work than its paired baseline fails on the measurement itself.
+    let config = AbExecutionProfile::Replay.config();
+    let clusters = vec![valid_session_replay_cluster()];
+    let baseline_avoidable = clusters[0].a_samples[0].avoidable_generations;
+    let baseline_nonprogress = clusters[0].a_samples[0].nonprogress_tokens;
+    assert!(
+        clusters[0].a_samples[0]
+            .generation_purposes
+            .keys()
+            .all(|purpose| {
+                [
+                    "initial_reasoning",
+                    "implementation_decision",
+                    "wait",
+                    "failure_diagnosis",
+                    "validation_interpretation",
+                    "repair",
+                    "coordination",
+                    "artifact_continuation",
+                    "compaction_recovery",
+                    "terminal_completion_reasoning",
+                ]
+                .contains(&purpose.as_str())
+            }),
+        "replay fixtures must only carry runtime-classifier purpose names"
+    );
+
+    let mut avoidable_regression = clusters.clone();
+    avoidable_regression[0].b_samples[0].avoidable_generations = baseline_avoidable + 1;
+    let verdict = evaluate_ab_workload_with_config(
+        &avoidable_regression,
+        AbWorkloadClass::Latency,
+        AbWorkload::SessionReplay,
+        config,
+        AB_REPLAY_PAIRS,
+    )
+    .expect("a measured avoidable-generation regression must produce a verdict");
+    assert!(!verdict.passed);
+    assert!(
+        verdict.correctness_violations.iter().any(|violation| {
+            violation.contains(&format!(
+                "pair:0:avoidable_generations:B={}>A={baseline_avoidable}",
+                baseline_avoidable + 1
+            ))
+        }),
+        "unexpected violations: {:#?}",
+        verdict.correctness_violations
+    );
+
+    let mut nonprogress_regression = clusters;
+    nonprogress_regression[0].b_samples[0].nonprogress_tokens = baseline_nonprogress + 1;
+    let verdict = evaluate_ab_workload_with_config(
+        &nonprogress_regression,
+        AbWorkloadClass::Latency,
+        AbWorkload::SessionReplay,
+        config,
+        AB_REPLAY_PAIRS,
+    )
+    .expect("a measured nonprogress-token regression must produce a verdict");
+    assert!(!verdict.passed);
+    assert!(
+        verdict.correctness_violations.iter().any(|violation| {
+            violation.contains(&format!(
+                "pair:0:nonprogress_tokens:B={}>A={baseline_nonprogress}",
+                baseline_nonprogress + 1
+            ))
+        }),
+        "unexpected violations: {:#?}",
+        verdict.correctness_violations
+    );
+}
+
+#[test]
 fn ab_overlay_session_replay_requires_retained_cleanup_and_no_avoidable_resume() {
     let mut sample = valid_session_replay_sample(true, 50);
     let raw = serde_json::to_value(&sample).expect("replay sample should serialize");
@@ -4066,7 +4420,7 @@ fn tool_result_correctness_replay_requires_a_terminal_defect_and_b_artifact_reco
     replay_sample_contract_violations(1, 0, "A", &a, &mut violations);
     assert!(violations.is_empty(), "{violations:#?}");
     assert_eq!(a.failure_terminalized_subturns, 1);
-    assert_eq!(a.replay_subturns[1].terminal_event, "error");
+    assert_eq!(a.replay_subturns[1].terminal_event, "turn_complete");
     assert!(!a.replay_subturns[1].follow_up_artifact_present);
 
     a.replay_subturns[1].follow_up_artifact_present = true;
@@ -4206,7 +4560,10 @@ fn ab_overlay_session_replay_routes_custom_tool_output_to_follow_up() {
             .expect("validation call must carry serialized arguments"),
     )
     .expect("validation call arguments must be valid JSON");
-    assert_eq!(validation_arguments["program"], "python");
+    assert_eq!(
+        validation_arguments["program"],
+        if cfg!(windows) { "python" } else { "python3" }
+    );
     assert_eq!(
         validation_arguments["args"],
         serde_json::json!(["-m", "unittest", AB_REPLAY_VALIDATION_SELECTOR])
@@ -4323,6 +4680,58 @@ fn ab_overlay_cargo_target_dir_is_command_safe() {
     assert!(
         !command_path.to_string_lossy().starts_with(r"\\?\"),
         "Cargo target paths passed to MSVC must not use the verbatim prefix"
+    );
+}
+
+#[test]
+fn ab_overlay_build_environment_is_allowlisted_and_cargo_config_is_hashed() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex_rs = temp.path().join("checkout").join("codex-rs");
+    let target = temp.path().join("target-a");
+    fs::create_dir_all(&codex_rs).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    let variables = sanitized_build_variables(&target, Path::new("rustc-under-test"));
+    for excluded in [
+        "RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC",
+        "CARGO_PROFILE_RELEASE_LTO",
+        "CC",
+        "CFLAGS",
+    ] {
+        assert!(
+            !variables.contains_key(std::ffi::OsStr::new(excluded)),
+            "ambient {excluded} must not reach benchmark builds"
+        );
+    }
+    assert_eq!(
+        variables.get(std::ffi::OsStr::new("RUSTC")),
+        Some(&std::ffi::OsString::from("rustc-under-test"))
+    );
+    let initial_environment_hash = build_environment_hash(&variables);
+    let other_target = temp.path().join("target-b");
+    fs::create_dir_all(&other_target).unwrap();
+    assert_ne!(
+        initial_environment_hash,
+        build_environment_hash(&sanitized_build_variables(
+            &other_target,
+            Path::new("rustc-under-test")
+        ))
+    );
+
+    let initial_configuration_hash = cargo_configuration_hash(&codex_rs, &variables).unwrap();
+    let cargo_config_dir = temp.path().join("checkout").join(".cargo");
+    fs::create_dir_all(&cargo_config_dir).unwrap();
+    let cargo_config = cargo_config_dir.join("config.toml");
+    fs::write(&cargo_config, "[build]\nincremental = false\n").unwrap();
+    let configured_hash = cargo_configuration_hash(&codex_rs, &variables).unwrap();
+    assert_ne!(initial_configuration_hash, configured_hash);
+    fs::write(&cargo_config, "[build]\nincremental = true\n").unwrap();
+    assert_ne!(
+        configured_hash,
+        cargo_configuration_hash(&codex_rs, &variables).unwrap()
     );
 }
 
@@ -4570,28 +4979,7 @@ fn ab_overlay_cargo_json_selects_current_turn_latency_artifact() {
 #[test]
 fn ab_overlay_prepared_manifest_is_verified_and_compare_cannot_build() {
     let temp = tempfile::tempdir().unwrap();
-    let (baseline_commit, baseline_filtered_tree, baseline) =
-        test_prepared_build(temp.path(), "baseline", "baseline");
-    let (candidate_commit, candidate_filtered_tree, candidate) =
-        test_prepared_build(temp.path(), "candidate", "candidate");
-    let (rustc_version, rust_target) = rust_provenance().unwrap();
-    let mut manifest = AbPreparedManifest {
-        schema_version: AB_PREPARED_MANIFEST_SCHEMA_VERSION,
-        baseline_commit,
-        candidate_commit,
-        baseline_filtered_tree,
-        candidate_filtered_tree,
-        overlay_sha256: ab_overlay_sha256_at_repository(&controller_repository_root()).unwrap(),
-        fixture_matrix_sha256: ab_matrix_hash(ab_all_workloads(), ab_fixture_hash),
-        workload_schema_matrix_sha256: ab_matrix_hash(ab_all_workloads(), ab_workload_schema_hash),
-        build_configuration_sha256: ab_build_configuration_hash(&rustc_version, &rust_target),
-        rustc_version,
-        rust_target,
-        baseline,
-        candidate,
-        manifest_payload_sha256: String::new(),
-    };
-    manifest.manifest_payload_sha256 = prepared_manifest_payload_hash(&manifest).unwrap();
+    let manifest = test_prepared_manifest(temp.path());
     validate_ab_prepared_manifest(&manifest).unwrap();
 
     let baseline_overlay = manifest
@@ -4667,6 +5055,13 @@ fn ab_overlay_prepared_manifest_is_verified_and_compare_cannot_build() {
     stale.overlay_sha256 = sha256_bytes(b"different overlay");
     stale.manifest_payload_sha256 = prepared_manifest_payload_hash(&stale).unwrap();
     assert!(validate_ab_prepared_manifest_contract(&stale).is_err());
+    let mut stale_build_environment = manifest.clone();
+    stale_build_environment
+        .build_inputs
+        .baseline_environment_sha256 = sha256_bytes(b"different build environment");
+    stale_build_environment.manifest_payload_sha256 =
+        prepared_manifest_payload_hash(&stale_build_environment).unwrap();
+    assert!(validate_ab_prepared_manifest_contract(&stale_build_environment).is_err());
     let mut corrupt = manifest;
     corrupt.manifest_payload_sha256 = sha256_bytes(b"corrupt payload");
     assert!(validate_ab_prepared_manifest_contract(&corrupt).is_err());
@@ -4948,6 +5343,27 @@ fn ab_overlay_request_cache_noninferiority_gates() {
             clusters[0].a_samples[0].request_components[0]
                 .current_input_sha256
                 .clone();
+        clusters[0].a_samples[0].serialized_bytes = 100;
+        clusters[0].b_samples[0].serialized_bytes = 90;
+        clusters[0].a_samples[0].prompt_input_tokens = 100;
+        clusters[0].b_samples[0].prompt_input_tokens = 90;
+        clusters[0].b_samples[0].canonical_request_body_sha256[0] =
+            sha256_bytes(b"candidate request with changed history");
+        clusters[0].b_samples[0].request_components[0].tool_schemas_sha256 =
+            sha256_bytes(b"smaller candidate tool schemas");
+        clusters[0].b_samples[0].request_components[0].history_sha256 =
+            sha256_bytes(b"candidate changed history");
+        assert!(
+            ab_correctness_violations(&clusters, workload.class(), workload)
+                .iter()
+                .any(|violation| violation.contains("request_serialization_noninferiority")),
+            "{} must reject history changes even when the candidate request is smaller",
+            workload.name()
+        );
+        clusters[0].b_samples[0].request_components[0].history_sha256 = clusters[0].a_samples[0]
+            .request_components[0]
+            .history_sha256
+            .clone();
         clusters[0].a_samples[0].prompt_input_tokens = 100;
         clusters[0].b_samples[0].prompt_input_tokens = 101;
         assert!(
@@ -5209,6 +5625,9 @@ fn ab_overlay_canonical_controllable_time_excludes_overlapping_unions() {
     timing.counters.tool_output_recovery_call_count = 7;
     timing.counters.tool_output_recovery_retruncation_count = 11;
     timing.counters.tool_output_recursive_spill_count = 13;
+    timing.counters.generations_by_purpose.wait = 2;
+    timing.counters.generations_by_purpose.repair = 1;
+    timing.counters.generations_by_purpose.terminal_completion_reasoning = 3;
     timing.tool_calls.push(TurnTimingToolCall {
         source: TurnTimingToolCallSource::Direct,
         output_projection_ms: Some(17),
@@ -5248,6 +5667,17 @@ fn ab_overlay_canonical_controllable_time_excludes_overlapping_unions() {
     assert_eq!(sample.output_recovery_count, 7);
     assert_eq!(sample.output_recovery_retruncation_count, 11);
     assert_eq!(sample.output_recursive_spill_count, 13);
+    // Purpose evidence comes from the runtime's own counters: only nonzero
+    // runtime-classified purposes appear, and avoidable work is their sum.
+    assert_eq!(sample.avoidable_generations, 3);
+    assert_eq!(
+        sample.generation_purposes,
+        BTreeMap::from([
+            ("repair".to_string(), 1),
+            ("terminal_completion_reasoning".to_string(), 3),
+            ("wait".to_string(), 2),
+        ])
+    );
 
     let serialized = serde_json::to_value(&sample).expect("sample should serialize");
     assert_eq!(serialized["persistence_union_ns"], 19);
@@ -5263,8 +5693,24 @@ fn ab_overlay_canonical_controllable_time_excludes_overlapping_unions() {
     merge_high_volume_sample(&mut aggregate, sample);
     let aggregate = aggregate.expect("high-volume sample should aggregate");
     assert_eq!(aggregate.persistence_union_ns, 38);
+    assert_eq!(aggregate.model_request_wait_ns, 10);
+    assert_eq!(aggregate.model_stream_processing_ns, 14);
+    assert_eq!(aggregate.planning_ns, 18);
+    assert_eq!(aggregate.router_build_ns, 20);
+    assert_eq!(aggregate.first_request_dispatch_ready_ns, 82);
+    assert_eq!(aggregate.history_snapshot_ns, 118);
+    assert_eq!(aggregate.transport_readiness_ns, 158);
     assert_eq!(aggregate.output_canonical_byte_count, 58);
     assert_eq!(aggregate.output_recursive_spill_count, 26);
+    assert_eq!(aggregate.avoidable_generations, 6);
+    assert_eq!(
+        aggregate.generation_purposes,
+        BTreeMap::from([
+            ("repair".to_string(), 2),
+            ("terminal_completion_reasoning".to_string(), 6),
+            ("wait".to_string(), 4),
+        ])
+    );
 }
 
 #[test]
@@ -5290,7 +5736,7 @@ fn ab_overlay_report_shards_and_payload_hash_are_stable() {
 #[test]
 fn ab_overlay_replay_session_audit_provenance_is_exact_and_profile_scoped() {
     let expected = replay_session_audit_evidence();
-    assert_eq!(AB_REPORT_SCHEMA_VERSION, 20);
+    assert_eq!(AB_REPORT_SCHEMA_VERSION, 22);
     assert_eq!(
         expected.schema_version,
         AB_REPLAY_SESSION_AUDIT_EVIDENCE_VERSION
@@ -5360,13 +5806,18 @@ fn ab_plain_language_report_uses_readable_units_and_explains_technical_metrics()
 fn ab_overlay_imports_only_verified_accepted_reports() {
     let temp = tempfile::tempdir().expect("temporary import root");
     let source = temp.path().join("accepted.json");
+    let manifest_path = temp.path().join("prepared.json");
     let repo = temp.path().join("repo");
-    let report = accepted_batch_report_for_import();
+    let manifest = test_prepared_manifest(temp.path());
+    write_new_ab_prepared_manifest(&manifest_path, &manifest).unwrap();
+    let mut report = accepted_batch_report_for_import();
+    bind_accepted_report_to_manifest(&mut report, &manifest);
     let bytes = serde_json::to_vec_pretty(&report).expect("encode accepted report");
     fs::write(&source, &bytes).expect("write accepted report fixture");
 
     let receipt = import_accepted_ab_report(&AbImportReportArgs {
         report: source,
+        manifest: manifest_path.clone(),
         repo: repo.clone(),
     })
     .expect("verified report should import");
@@ -5377,6 +5828,28 @@ fn ab_overlay_imports_only_verified_accepted_reports() {
         receipt
             .destination
             .starts_with(repo.join("docs/benchmarks/turn-latency/accepted"))
+    );
+
+    let mut forged_provenance = report.clone();
+    forged_provenance.provenance.candidate_worker_sha256 = "forged-worker".to_string();
+    rehash_accepted_report(&mut forged_provenance);
+    let forged_provenance_source = temp.path().join("forged-provenance.json");
+    fs::write(
+        &forged_provenance_source,
+        serde_json::to_vec_pretty(&forged_provenance).unwrap(),
+    )
+    .unwrap();
+    let forged_error = import_accepted_ab_report(&AbImportReportArgs {
+        report: forged_provenance_source,
+        manifest: manifest_path.clone(),
+        repo: repo.clone(),
+    })
+    .expect_err("self-consistent report provenance must match the prepared artifacts");
+    assert!(
+        forged_error
+            .to_string()
+            .contains("does not match its verified prepared manifest"),
+        "unexpected provenance rejection: {forged_error:#}"
     );
 
     let mut stale_schema = accepted_batch_report_for_import();
@@ -5392,6 +5865,7 @@ fn ab_overlay_imports_only_verified_accepted_reports() {
     .expect("write stale-schema report fixture");
     let stale_schema_error = import_accepted_ab_report(&AbImportReportArgs {
         report: stale_schema_source,
+        manifest: manifest_path.clone(),
         repo: repo.clone(),
     })
     .expect_err("stale report schemas must not import");
@@ -5415,6 +5889,7 @@ fn ab_overlay_imports_only_verified_accepted_reports() {
     .expect("write replay report fixture");
     let replay_error = import_accepted_ab_report(&AbImportReportArgs {
         report: replay_source,
+        manifest: manifest_path.clone(),
         repo: repo.clone(),
     })
     .expect_err("replay reports must never enter the tracked accepted set");
@@ -5438,6 +5913,7 @@ fn ab_overlay_imports_only_verified_accepted_reports() {
     assert!(
         import_accepted_ab_report(&AbImportReportArgs {
             report: rejected_source,
+            manifest: manifest_path.clone(),
             repo,
         })
         .is_err(),
@@ -5448,6 +5924,8 @@ fn ab_overlay_imports_only_verified_accepted_reports() {
         "ab-import-report",
         "--report",
         "report.json",
+        "--manifest",
+        "prepared.json",
         "--repo",
         "repo",
     ]))
@@ -5456,7 +5934,112 @@ fn ab_overlay_imports_only_verified_accepted_reports() {
         panic!("expected accepted-report import command");
     };
     assert_eq!(args.report, PathBuf::from("report.json"));
+    assert_eq!(args.manifest, PathBuf::from("prepared.json"));
     assert_eq!(args.repo, PathBuf::from("repo"));
+    assert!(
+        parse_command_from(strings(&["ab-import-report", "--report", "report.json"])).is_err(),
+        "accepted-report import must require the prepared manifest"
+    );
+}
+
+fn wait_for_descendant_pid(path: &Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(value) = fs::read_to_string(path)
+            && let Ok(pid) = value.trim().parse()
+        {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker root did not record its descendant pid"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_is_running(pid: u32) -> bool {
+    let script = "import ctypes,sys; k=ctypes.windll.kernel32; h=k.OpenProcess(0x100000,False,int(sys.argv[1])); running=bool(h) and k.WaitForSingleObject(h,0)==258; h and k.CloseHandle(h); sys.exit(0 if running else 1)";
+    Command::new("python")
+        .args(["-c", script, &pid.to_string()])
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[cfg(windows)]
+#[test]
+fn ab_worker_tree_cleanup_job_survives_root_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let pid_path = temp.path().join("descendant.pid");
+    let script = "import subprocess,sys; p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(120)']); open(sys.argv[1],'w').write(str(p.pid))";
+    let managed_root = codex_utils_pty::ManagedRootProcess::reserve().unwrap();
+    let mut command = Command::new("python");
+    command
+        .args(["-c", script])
+        .arg(&pid_path)
+        .creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().unwrap();
+    managed_root.attach_and_resume(child.id()).unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut worker = AbWorkerProcess {
+        child,
+        managed_root,
+        stdin,
+        stdout: worker_stdout_receiver(stdout),
+    };
+    let descendant_pid = wait_for_descendant_pid(&pid_path);
+    worker.child.wait().unwrap();
+    assert!(windows_process_is_running(descendant_pid));
+
+    terminate_ab_worker(&mut worker).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while windows_process_is_running(descendant_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!windows_process_is_running(descendant_pid));
+}
+
+#[cfg(unix)]
+#[test]
+fn ab_worker_tree_cleanup_process_group_survives_root_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let pid_path = temp.path().join("descendant.pid");
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "sleep 120 & echo $! > \"$1\"", "sh"])
+        .arg(&pid_path)
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().unwrap();
+    let process_group_id = child.id();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut worker = AbWorkerProcess {
+        child,
+        process_group_id,
+        stdin,
+        stdout: worker_stdout_receiver(stdout),
+    };
+    let descendant_pid = wait_for_descendant_pid(&pid_path);
+    worker.child.wait().unwrap();
+    assert_eq!(unsafe { libc::kill(descendant_pid as libc::pid_t, 0) }, 0);
+
+    terminate_ab_worker(&mut worker).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while unsafe { libc::kill(descendant_pid as libc::pid_t, 0) } == 0
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_ne!(unsafe { libc::kill(descendant_pid as libc::pid_t, 0) }, 0);
 }
 
 #[test]
@@ -5493,6 +6076,7 @@ fn ab_overlay_import_rejects_rehashed_report_with_failing_raw_sample() {
 
     let error = import_accepted_ab_report(&AbImportReportArgs {
         report: source,
+        manifest: temp.path().join("unused-prepared.json"),
         repo: temp.path().join("repo"),
     })
     .expect_err("raw sample correctness must outrank self-declared passed fields");
@@ -5515,7 +6099,12 @@ fn accepted_workload_rejects_samples_collected_after_a_terminal_look() {
         latency_hard_gate: true,
     };
     let stopped_at_pairs_per_cluster = TEST_LOOKS[1];
-    let clusters = paired_request_cache_clusters(workload, 100, 50);
+    let clusters = paired_request_cache_clusters_with_pairs(
+        workload,
+        100,
+        50,
+        stopped_at_pairs_per_cluster,
+    );
     let sequential_looks = TEST_LOOKS
         .into_iter()
         .map(|pairs_per_cluster| {
@@ -5591,6 +6180,7 @@ fn ab_overlay_import_rejects_rehashed_report_with_forged_pair_order() {
 
     let error = import_accepted_ab_report(&AbImportReportArgs {
         report: source,
+        manifest: temp.path().join("unused-prepared.json"),
         repo: temp.path().join("repo"),
     })
     .expect_err("declared A/B order must match the controller schedule");
@@ -5618,6 +6208,7 @@ fn ab_overlay_import_rejects_noncanonical_unknown_report_fields() {
 
     let error = import_accepted_ab_report(&AbImportReportArgs {
         report: source,
+        manifest: temp.path().join("unused-prepared.json"),
         repo: temp.path().join("repo"),
     })
     .expect_err("unknown report fields must not bypass the report schema");

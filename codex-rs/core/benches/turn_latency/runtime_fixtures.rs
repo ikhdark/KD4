@@ -428,11 +428,10 @@ fn request_component_snapshot(body: &serde_json::Value, stage: &str) -> AbReques
     let mut current_input = current_input;
     canonicalize_request_identities(&mut history);
     canonicalize_request_identities(&mut current_input);
-    let mut prompt_cache_key = body
+    let prompt_cache_key = body
         .get("prompt_cache_key")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    canonicalize_request_identities(&mut prompt_cache_key);
     AbRequestComponentSnapshot {
         stage: stage.to_string(),
         envelope_sha256: request_envelope_sha256(body),
@@ -611,6 +610,10 @@ fn request_component_delta(
 }
 
 fn history_seed_turns_visible(body: &serde_json::Value) -> u32 {
+    history_seed_turns_visible_with_prefix(body, AB_HISTORY_SEED_PREFIX)
+}
+
+fn history_seed_turns_visible_with_prefix(body: &serde_json::Value, prefix: &str) -> u32 {
     body.get("input")
         .and_then(serde_json::Value::as_array)
         .map(|input| {
@@ -618,7 +621,7 @@ fn history_seed_turns_visible(body: &serde_json::Value) -> u32 {
                 .iter()
                 .filter(|item| {
                     item.get("role").and_then(serde_json::Value::as_str) == Some("user")
-                        && item.to_string().contains(AB_HISTORY_SEED_PREFIX)
+                        && item.to_string().contains(prefix)
                 })
                 .count()
                 .min(u32::MAX as usize) as u32
@@ -1212,8 +1215,7 @@ impl AbortDirectNestedFixture {
                         return Ok(("turn_complete".to_string(), None, event.timing));
                     }
                     EventMsg::AgentMessage(_) => final_response_present = true,
-                    EventMsg::Error(error) => {
-                        eprintln!("replay-retained-error {error:?}");
+                    EventMsg::Error(_) => {
                         typed_error_count = typed_error_count.saturating_add(1);
                     }
                     _ => {}
@@ -1983,6 +1985,10 @@ fn run_ab_retained_child() -> Result<()> {
     Ok(())
 }
 
+fn replay_broad_path_is_excluded(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == ".git")
+}
+
 fn run_ab_replay_command(mode: &str, paths: &[PathBuf]) -> Result<()> {
     fn print_broad_paths(path: &Path, remaining: &mut usize) -> Result<()> {
         if *remaining == 0 {
@@ -1998,6 +2004,9 @@ fn run_ab_replay_command(mode: &str, paths: &[PathBuf]) -> Result<()> {
             .collect::<std::io::Result<Vec<_>>>()?;
         children.sort_by_key(std::fs::DirEntry::path);
         for child in children {
+            if replay_broad_path_is_excluded(&child.path()) {
+                continue;
+            }
             print_broad_paths(&child.path(), remaining)?;
             if *remaining == 0 {
                 break;
@@ -2088,33 +2097,67 @@ struct HighVolumeCodeModeFixture {
     request_capture: HighVolumeRequestCapture,
 }
 
-#[derive(Clone, Debug, Default)]
+const DEFAULT_CAPTURED_REQUEST_LIMIT: usize = 64;
+
+#[derive(Debug)]
+struct CapturedRequests {
+    requests: VecDeque<wiremock::Request>,
+    total_seen: usize,
+    limit: usize,
+}
+
+#[derive(Clone, Debug)]
 struct HighVolumeRequestCapture {
-    requests: Arc<Mutex<Vec<wiremock::Request>>>,
+    captured: Arc<Mutex<CapturedRequests>>,
+}
+
+impl Default for HighVolumeRequestCapture {
+    fn default() -> Self {
+        Self::bounded(DEFAULT_CAPTURED_REQUEST_LIMIT)
+    }
 }
 
 impl HighVolumeRequestCapture {
+    fn bounded(limit: usize) -> Self {
+        assert!(limit > 0, "request capture limit must be non-zero");
+        Self {
+            captured: Arc::new(Mutex::new(CapturedRequests {
+                requests: VecDeque::with_capacity(limit),
+                total_seen: 0,
+                limit,
+            })),
+        }
+    }
+
     fn request_count(&self) -> usize {
-        self.requests
+        self.captured
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+            .total_seen
     }
 
     fn requests_since(&self, index: usize) -> Vec<wiremock::Request> {
-        self.requests
+        let captured = self
+            .captured
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)[index..]
-            .to_vec()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first_retained = captured.total_seen.saturating_sub(captured.requests.len());
+        let retained_index = index.saturating_sub(first_retained);
+        captured.requests.iter().skip(retained_index).cloned().collect()
     }
 }
 
 impl wiremock::Match for HighVolumeRequestCapture {
     fn matches(&self, request: &wiremock::Request) -> bool {
-        self.requests
+        let mut captured = self
+            .captured
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(request.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        captured.total_seen = captured.total_seen.saturating_add(1);
+        captured.requests.push_back(request.clone());
+        while captured.requests.len() > captured.limit {
+            captured.requests.pop_front();
+        }
         true
     }
 }
@@ -2204,7 +2247,8 @@ fn high_volume_request_body_is_initial(body: &serde_json::Value) -> bool {
 }
 
 impl HighVolumeCodeModeFixture {
-    async fn start(code_mode_host: &Path, _samples: usize, fixture_id: &str) -> Result<Self> {
+    async fn start(code_mode_host: &Path, samples: usize, fixture_id: &str) -> Result<Self> {
+        anyhow::ensure!(samples > 0, "high-volume fixture requires at least one sample");
         let server = start_mock_server().await;
         let request_capture = HighVolumeRequestCapture::default();
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -2611,6 +2655,30 @@ fn sample_from_timing_with_lifecycle(
         ..Sample::default()
     };
 
+    // Retain the runtime's own per-purpose generation counts as the sample's
+    // structured purpose evidence. These are measurements from the timing
+    // block; no fixture or evaluator may assign purpose labels of its own.
+    let purposes = &counters.generations_by_purpose;
+    for (purpose, count) in [
+        ("initial_reasoning", purposes.initial_reasoning),
+        ("implementation_decision", purposes.implementation_decision),
+        ("wait", purposes.wait),
+        ("failure_diagnosis", purposes.failure_diagnosis),
+        ("validation_interpretation", purposes.validation_interpretation),
+        ("repair", purposes.repair),
+        ("coordination", purposes.coordination),
+        ("artifact_continuation", purposes.artifact_continuation),
+        ("compaction_recovery", purposes.compaction_recovery),
+        (
+            "terminal_completion_reasoning",
+            purposes.terminal_completion_reasoning,
+        ),
+    ] {
+        if count != 0 {
+            sample.generation_purposes.insert(purpose.to_string(), count);
+        }
+    }
+
     let mut seen_calls = BTreeSet::new();
     let direct_ids = timing
         .tool_calls
@@ -2903,13 +2971,28 @@ fn merge_high_volume_sample(aggregate: &mut Option<Sample>, mut next: Sample) {
         machine_duration_ns,
         controllable_duration_ns,
         model_wait_ns,
+        model_request_wait_ns,
+        model_stream_processing_ns,
         tool_active_ns,
         orchestration_ns,
         standalone_work_ns,
         finalization_ns,
         preparation_ns,
+        planning_ns,
+        router_build_ns,
         persistence_union_ns,
+        startup_prewarm_wait_ns,
         pre_first_output_ns,
+        first_request_dispatch_ready_ns,
+        pre_first_client_critical_path_ns,
+        pre_first_attributed_client_union_ns,
+        pre_first_unattributed_ns,
+        history_snapshot_ns,
+        normalization_ns,
+        prompt_construction_ns,
+        request_transformation_ns,
+        serialization_ns,
+        transport_readiness_ns,
         sampling_to_call_ns,
         post_tool_handoff_ns,
         parallel_gate_wait_ns,
@@ -3021,6 +3104,10 @@ fn merge_high_volume_sample(aggregate: &mut Option<Sample>, mut next: Sample) {
     aggregate
         .retained_session_ids
         .append(&mut next.retained_session_ids);
+    for (purpose, count) in next.generation_purposes {
+        let aggregate_count = aggregate.generation_purposes.entry(purpose).or_default();
+        *aggregate_count = aggregate_count.saturating_add(count);
+    }
     aggregate
         .abort_registered_call_ids
         .append(&mut next.abort_registered_call_ids);

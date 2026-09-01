@@ -50,6 +50,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
@@ -58,6 +59,14 @@ use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt as _;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
@@ -97,7 +106,7 @@ const AB_ITERATIONS: usize = 10;
 const AB_CLUSTERS: usize = 14;
 const AB_BOOTSTRAP_REPLICATES: usize = 10_000;
 const AB_BOOTSTRAP_SEED: u64 = 0x4b44_345f_4142_7631;
-const AB_FAMILY_WISE_ALPHA: f64 = 0.05;
+const AB_PER_LOOK_ALPHA: f64 = 0.05;
 const AB_QUICK_LOOKS: [usize; 1] = [10];
 const AB_BATCH_LOOKS: [usize; 1] = [20];
 const AB_FINAL_LOOKS: [usize; 1] = [AB_ITERATIONS];
@@ -137,13 +146,13 @@ const AB_P95_RATIO_UCB_GATE_MIN_BASELINE_NS: u64 = 5_000_000;
 const AB_INCREMENTAL_RATIO_TARGET: f64 = 1.00;
 const AB_REPLAY_REQUIRED_IMPROVEMENT_PERCENT: u64 = 25;
 const AB_REPLAY_RATIO_TARGET: f64 = 0.75;
-const AB_WORKLOAD_SCHEMA_VERSION: u16 = 17;
+const AB_WORKLOAD_SCHEMA_VERSION: u16 = 18;
 const AB_BASELINE_STATE_SCHEMA_VERSION: u16 = 2;
 const AB_FILTERED_TREE_IDENTITY_VERSION: u16 = 1;
-const AB_METRIC_GATE_VERSION: u16 = 24;
-const AB_REPORT_SCHEMA_VERSION: u16 = 20;
+const AB_METRIC_GATE_VERSION: u16 = 26;
+const AB_REPORT_SCHEMA_VERSION: u16 = 22;
 const AB_REPLAY_SESSION_AUDIT_EVIDENCE_VERSION: u16 = 1;
-const AB_PREPARED_MANIFEST_SCHEMA_VERSION: u16 = 1;
+const AB_PREPARED_MANIFEST_SCHEMA_VERSION: u16 = 2;
 const AB_WORKER_STACK_BYTES: &str = "16777216";
 const AB_OVERLAY_REPOSITORY_PATH: &[u8] = b"codex-rs/core/benches/turn_latency.rs";
 const MAX_READY_TO_SAMPLE_TO_DISPATCH_NS: u64 = 1_000_000_000;
@@ -580,12 +589,15 @@ async fn run_synthetic_reports(args: Args) -> Result<()> {
 }
 
 fn default_synthetic_scenarios() -> Vec<Scenario> {
-    vec![
+    let mut scenarios = vec![
         Scenario::Deterministic,
         Scenario::LoopbackWebsocket,
         Scenario::Persistence,
-        Scenario::WindowsExecutor,
-    ]
+    ];
+    if cfg!(windows) {
+        scenarios.push(Scenario::WindowsExecutor);
+    }
+    scenarios
 }
 
 async fn run_report(scenario: Scenario, mode: Mode, args: &Args) -> Result<Report> {
@@ -967,6 +979,10 @@ fn mean(values: &[f64]) -> f64 {
 fn percentile(values: &[f64], quantile: f64) -> f64 {
     let mut values = values.to_vec();
     values.sort_by(f64::total_cmp);
+    percentile_sorted(&values, quantile)
+}
+
+fn percentile_sorted(values: &[f64], quantile: f64) -> f64 {
     let index = ((values.len() - 1) as f64 * quantile).ceil() as usize;
     values[index]
 }
@@ -1040,6 +1056,7 @@ fn parse_ab_import_report_args_from(
     values: impl IntoIterator<Item = String>,
 ) -> Result<BenchmarkCommand> {
     let mut report = None;
+    let mut manifest = None;
     let mut repo = None;
     let mut values = values.into_iter();
     while let Some(flag) = values.next() {
@@ -1047,6 +1064,13 @@ fn parse_ab_import_report_args_from(
             "--report" => {
                 parse_flag_once(&mut report, "--report", || {
                     Ok(PathBuf::from(values.next().context("missing report path")?))
+                })?;
+            }
+            "--manifest" => {
+                parse_flag_once(&mut manifest, "--manifest", || {
+                    Ok(PathBuf::from(
+                        values.next().context("missing prepared manifest path")?,
+                    ))
                 })?;
             }
             "--repo" => {
@@ -1059,6 +1083,7 @@ fn parse_ab_import_report_args_from(
     }
     Ok(BenchmarkCommand::AbImportReport(AbImportReportArgs {
         report: report.context("ab-import-report requires --report <path>")?,
+        manifest: manifest.context("ab-import-report requires --manifest <path>")?,
         repo: repo.unwrap_or_else(|| PathBuf::from(".")),
     }))
 }

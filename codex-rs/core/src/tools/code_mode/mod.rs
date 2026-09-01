@@ -786,8 +786,8 @@ async fn call_nested_tool(
     }
     let post_tool_use_feedback = result.take_code_mode_feedback();
     let result_value = result.code_mode_result();
-    let required_terminal =
-        required_nested_tool_terminal_cause(outcome_context, signal.as_ref()).map(|cause| {
+    let required_terminal = required_nested_tool_terminal_cause(outcome_context, signal.as_ref())
+        .map(|cause| {
             let label = match cause {
                 RequiredToolTerminalCause::Blocked => "blocked",
                 RequiredToolTerminalCause::Failure => "failed",

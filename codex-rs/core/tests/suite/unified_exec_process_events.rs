@@ -138,9 +138,7 @@ async fn accept_initialized_exec_server(listener: TcpListener) -> WebSocketStrea
     websocket
 }
 
-async fn send_environment_info(
-    websocket: &mut WebSocketStream<TcpStream>,
-) {
+async fn send_environment_info(websocket: &mut WebSocketStream<TcpStream>) {
     let info = read_exec_server_json(websocket).await;
     assert_eq!(info["method"], "environment/info");
     send_exec_server_json(

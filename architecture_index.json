@@ -1,7 +1,7 @@
 {
-  "index_sha256": "87728f7216e2146169a6b49e6bb029fa7ac9bfc77ae10c23b3e07d5da3ac2170",
+  "index_sha256": "5761de902c4aa29a6e9bb69cf266877eaadfd3ce8ecf58c73f0df6104f3e4c4c",
   "index_version": 1,
-  "manifest_sha256": "5954533d9a4a8e5c39110f6ba28143565cb511f28ab902e368f528b2449a0a24",
+  "manifest_sha256": "1a77fa1c3de1f5fd9ff9e07e5122633b72bc352450e625cd60b1ebfa6a2bbda8",
   "omitted": {
     "relationships": 0
   },
@@ -673,9 +673,7 @@
           "argv": [
             "just",
             "core-test-fast",
-            "turn_latency_bench",
-            "-E",
-            "test(code_mode_capture_report_has_no_local_ab_gate)"
+            "turn_latency_bench"
           ],
           "cwd": "codex-rs",
           "id": "rust-turn-latency-focused",
@@ -1696,7 +1694,7 @@
       "target": "path:codex-rs/core/src/tools/command_output_artifact_tests.rs"
     }
   ],
-  "repository_revision": "manifest:5954533d9a4a8e5c39110f6ba28143565cb511f28ab902e368f528b2449a0a24:sources:c1f0a1c780e9e12a9182e9f8e5ed282999c24e0138088ffe395f0338e07fdbb5",
+  "repository_revision": "manifest:1a77fa1c3de1f5fd9ff9e07e5122633b72bc352450e625cd60b1ebfa6a2bbda8:sources:78bec3111958d38b2ad34ec5ad1da877ace7d8ef00fad82d31ec9c5049361159",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

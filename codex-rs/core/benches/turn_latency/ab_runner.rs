@@ -171,19 +171,22 @@ fn hierarchical_paired_bootstrap_for_shape(
         }
     }
 
-    let all_a = clusters
+    let mut all_a = clusters
         .iter()
         .flat_map(|cluster| cluster.a_samples.iter())
         .map(|sample| metric.value(sample) as f64)
         .collect::<Vec<_>>();
-    let all_b = clusters
+    let mut all_b = clusters
         .iter()
         .flat_map(|cluster| cluster.b_samples.iter())
         .map(|sample| metric.value(sample) as f64)
         .collect::<Vec<_>>();
-    let baseline_p95_ns = percentile(&all_a, 0.95);
-    let point_median_ratio = percentile(&all_b, 0.5) / percentile(&all_a, 0.5);
-    let point_p95_ratio = percentile(&all_b, 0.95) / baseline_p95_ns;
+    all_a.sort_by(f64::total_cmp);
+    all_b.sort_by(f64::total_cmp);
+    let baseline_p95_ns = percentile_sorted(&all_a, 0.95);
+    let point_median_ratio =
+        percentile_sorted(&all_b, 0.5) / percentile_sorted(&all_a, 0.5);
+    let point_p95_ratio = percentile_sorted(&all_b, 0.95) / baseline_p95_ns;
     let p95_ratio_ucb_gate_applied =
         baseline_p95_ns >= AB_P95_RATIO_UCB_GATE_MIN_BASELINE_NS as f64;
 
@@ -204,13 +207,21 @@ fn hierarchical_paired_bootstrap_for_shape(
                 resampled_b.push(metric.value(&cluster.b_samples[pair]) as f64);
             }
         }
-        median_ratios.push(percentile(&resampled_b, 0.5) / percentile(&resampled_a, 0.5));
-        p95_ratios.push(percentile(&resampled_b, 0.95) / percentile(&resampled_a, 0.95));
+        resampled_a.sort_by(f64::total_cmp);
+        resampled_b.sort_by(f64::total_cmp);
+        median_ratios.push(
+            percentile_sorted(&resampled_b, 0.5) / percentile_sorted(&resampled_a, 0.5),
+        );
+        p95_ratios.push(
+            percentile_sorted(&resampled_b, 0.95) / percentile_sorted(&resampled_a, 0.95),
+        );
     }
-    let median_ratio_lcb = percentile(&median_ratios, lcb_quantile);
-    let p95_ratio_lcb = percentile(&p95_ratios, lcb_quantile);
-    let median_ratio_ucb = percentile(&median_ratios, ucb_quantile);
-    let p95_ratio_ucb = percentile(&p95_ratios, ucb_quantile);
+    median_ratios.sort_by(f64::total_cmp);
+    p95_ratios.sort_by(f64::total_cmp);
+    let median_ratio_lcb = percentile_sorted(&median_ratios, lcb_quantile);
+    let p95_ratio_lcb = percentile_sorted(&p95_ratios, lcb_quantile);
+    let median_ratio_ucb = percentile_sorted(&median_ratios, ucb_quantile);
+    let p95_ratio_ucb = percentile_sorted(&p95_ratios, ucb_quantile);
     Ok(AbLatencyGate {
         metric: metric.name().to_string(),
         baseline_p95_ns,
@@ -385,6 +396,7 @@ fn request_serialization_is_noninferior(a: &Sample, b: &Sample) -> bool {
                 a_component.stage == b_component.stage
                     && a_component.envelope_sha256 == b_component.envelope_sha256
                     && a_component.instructions_sha256 == b_component.instructions_sha256
+                    && a_component.history_sha256 == b_component.history_sha256
                     && a_component.current_input_sha256 == b_component.current_input_sha256
                     && a_component.prompt_cache_key_sha256 == b_component.prompt_cache_key_sha256
             });
@@ -671,7 +683,7 @@ fn ab_correctness_violations_for_shape(
         ));
     }
     for cluster in clusters {
-        if cluster.b_warmup_failures != 0 {
+        if cluster.a_warmup_failures != 0 || cluster.b_warmup_failures != 0 {
             violations.push(format!(
                 "cluster:{}:warmup_failures:A={}:B={}",
                 cluster.cluster, cluster.a_warmup_failures, cluster.b_warmup_failures
@@ -1292,45 +1304,6 @@ fn evaluate_session_replay(
                     cluster.cluster
                 ));
             }
-            for purpose in ["wait", "terminal_failure", "repeated_discovery"] {
-                if a.generation_purposes
-                    .get(purpose)
-                    .copied()
-                    .unwrap_or_default()
-                    == 0
-                {
-                    violations.push(format!(
-                        "cluster:{}:pair:{index}:A:missing_purpose:{purpose}",
-                        cluster.cluster
-                    ));
-                }
-            }
-            if b.avoidable_generations != 0 || b.nonprogress_tokens != 0 {
-                violations.push(format!(
-                    "cluster:{}:pair:{index}:B:nonprogress",
-                    cluster.cluster
-                ));
-            }
-            for purpose in [
-                "wait",
-                "repair",
-                "failure_diagnosis",
-                "redundant_continuation",
-                "terminal_failure",
-                "compaction",
-            ] {
-                if b.generation_purposes
-                    .get(purpose)
-                    .copied()
-                    .unwrap_or_default()
-                    != 0
-                {
-                    violations.push(format!(
-                        "cluster:{}:pair:{index}:B:avoidable_purpose:{purpose}",
-                        cluster.cluster
-                    ));
-                }
-            }
             if a.provider_input_tokens == 0
                 || b.provider_input_tokens.saturating_mul(2) > a.provider_input_tokens
             {
@@ -1339,7 +1312,22 @@ fn evaluate_session_replay(
                     cluster.cluster, b.provider_input_tokens, a.provider_input_tokens
                 ));
             }
+            // Avoidable generations, nonprogress tokens, and generation purposes
+            // are runtime measurements carried by the samples, not lane labels
+            // this evaluator may assign. The gate is therefore comparative: the
+            // candidate must never record more measured avoidable work than its
+            // paired baseline, whatever either runtime classifier reported.
             for (name, a_value, b_value) in [
+                (
+                    "avoidable_generations",
+                    u64::from(a.avoidable_generations),
+                    u64::from(b.avoidable_generations),
+                ),
+                (
+                    "nonprogress_tokens",
+                    a.nonprogress_tokens,
+                    b.nonprogress_tokens,
+                ),
                 (
                     "between_tools_peak_input_tokens",
                     a.between_tools_peak_input_tokens,
@@ -1498,7 +1486,7 @@ fn replay_sample_contract_violations(
             } else {
                 (
                     "recoverable_exec_failure",
-                    "error",
+                    "turn_complete",
                     "failed",
                     1,
                     false,
@@ -1722,15 +1710,35 @@ fn command_text(mut command: Command, description: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
+fn is_git_environment_variable(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy()
+        .to_ascii_uppercase()
+        .starts_with("GIT_")
+}
+
+fn git_command(repo: &Path) -> Command {
     let mut command = Command::new("git");
-    command.current_dir(repo).args(args);
+    command.current_dir(repo);
+    // Repository pointer and replacement/config variables can redirect `git`
+    // away from `repo` or change the objects a revision resolves to. Benchmark
+    // provenance must be a property of the requested checkout, not of the
+    // controller's ambient environment.
+    for (name, _) in env::vars_os() {
+        if is_git_environment_variable(&name) {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
+fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
+    let mut command = git_command(repo);
+    command.args(args);
     command_text(command, &format!("git {}", args.join(" ")))
 }
 
 fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
-        .current_dir(repo)
+    let output = git_command(repo)
         .args(args)
         .output()
         .with_context(|| format!("start git {}", args.join(" ")))?;
@@ -1851,7 +1859,7 @@ fn canonical_filtered_tree_identity(repo: &Path, commit: &str) -> Result<String>
 }
 
 fn clean_repo_identity(repo: &Path) -> Result<(PathBuf, String, String)> {
-    let root = PathBuf::from(git_text(repo, &["rev-parse", "--show-toplevel"])?);
+    let root = verified_repository_root(repo)?;
     let status = git_text(
         &root,
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -1863,7 +1871,7 @@ fn clean_repo_identity(repo: &Path) -> Result<(PathBuf, String, String)> {
 }
 
 fn clean_main_identity(repo: &Path) -> Result<(PathBuf, String, String)> {
-    let root = PathBuf::from(git_text(repo, &["rev-parse", "--show-toplevel"])?);
+    let root = verified_repository_root(repo)?;
     let status = git_text(
         &root,
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -1876,6 +1884,30 @@ fn clean_main_identity(repo: &Path) -> Result<(PathBuf, String, String)> {
     .context("resolve clean local refs/heads/main for A/B baseline")?;
     let tree = canonical_filtered_tree_identity(&root, &commit)?;
     Ok((root, commit, tree))
+}
+
+fn verified_repository_root(repo: &Path) -> Result<PathBuf> {
+    let requested = fs::canonicalize(repo)
+        .with_context(|| format!("canonicalize requested repository {}", repo.display()))?;
+    let discovered = fs::canonicalize(git_text(
+        &requested,
+        &["rev-parse", "--show-toplevel"],
+    )?)
+    .context("canonicalize Git-reported repository root")?;
+    anyhow::ensure!(
+        discovered == requested,
+        "Git top-level {} does not match requested repository {}",
+        discovered.display(),
+        requested.display()
+    );
+    let common_dir = canonical_git_common_dir(&requested)?;
+    anyhow::ensure!(
+        common_dir.is_dir(),
+        "Git common directory is missing for requested repository {}: {}",
+        requested.display(),
+        common_dir.display()
+    );
+    Ok(requested)
 }
 
 fn validate_distinct_ab_identities(
@@ -1969,8 +2001,7 @@ fn add_detached_worktree(repo: &Path, commit: &str, destination: &Path) -> Resul
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    let status = Command::new("git")
-        .current_dir(repo)
+    let status = git_command(repo)
         .args(["worktree", "add", "--detach"])
         .arg(destination)
         .arg(commit)
@@ -1981,12 +2012,15 @@ fn add_detached_worktree(repo: &Path, commit: &str, destination: &Path) -> Resul
 }
 
 fn canonical_git_common_dir(repo: &Path) -> Result<PathBuf> {
-    let common = PathBuf::from(git_text(repo, &["rev-parse", "--git-common-dir"])?);
-    let common = if common.is_absolute() {
-        common
-    } else {
-        repo.join(common)
-    };
+    let common = PathBuf::from(git_text(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?);
+    anyhow::ensure!(
+        common.is_absolute(),
+        "Git did not report an absolute common directory for {}",
+        repo.display()
+    );
     fs::canonicalize(&common)
         .with_context(|| format!("canonicalize git common directory {}", common.display()))
 }
@@ -2038,13 +2072,266 @@ fn cargo_target_dir_for_command(target_dir: &Path) -> PathBuf {
     dunce::simplified(target_dir).to_path_buf()
 }
 
-fn run_build_command(codex_rs: &Path, target_dir: &Path, args: &[&str]) -> Result<()> {
+struct AbBuildEnvironment {
+    cargo: PathBuf,
+    variables: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    environment_sha256: String,
+    cargo_configuration_sha256: String,
+}
+
+fn update_os_str_hash(hasher: &mut Sha256, value: &std::ffi::OsStr) {
+    #[cfg(unix)]
+    hasher.update(value.as_bytes());
+    #[cfg(windows)]
+    for unit in value.encode_wide() {
+        hasher.update(unit.to_le_bytes());
+    }
+    #[cfg(not(any(unix, windows)))]
+    hasher.update(value.to_string_lossy().as_bytes());
+    hasher.update([0]);
+}
+
+fn build_environment_hash(
+    variables: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kd4.turn_latency.build_environment\0");
+    for (name, value) in variables {
+        update_os_str_hash(&mut hasher, name);
+        update_os_str_hash(&mut hasher, value);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn cargo_home_from_build_environment(
+    variables: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> Option<PathBuf> {
+    variables
+        .get(std::ffi::OsStr::new("CARGO_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            variables
+                .get(std::ffi::OsStr::new("HOME"))
+                .or_else(|| variables.get(std::ffi::OsStr::new("USERPROFILE")))
+                .map(|home| PathBuf::from(home).join(".cargo"))
+        })
+}
+
+fn cargo_configuration_hash(
+    codex_rs: &Path,
+    variables: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> Result<String> {
+    let mut candidates = Vec::new();
+    for ancestor in codex_rs.ancestors() {
+        candidates.push(ancestor.join(".cargo/config"));
+        candidates.push(ancestor.join(".cargo/config.toml"));
+    }
+    if let Some(cargo_home) = cargo_home_from_build_environment(variables) {
+        candidates.push(cargo_home.join("config"));
+        candidates.push(cargo_home.join("config.toml"));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"kd4.turn_latency.cargo_configuration\0");
+    for (precedence, path) in candidates.into_iter().enumerate() {
+        if !path.is_file() {
+            continue;
+        }
+        hasher.update(precedence.to_le_bytes());
+        let canonical = fs::canonicalize(&path)
+            .with_context(|| format!("canonicalize Cargo configuration {}", path.display()))?;
+        update_os_str_hash(&mut hasher, canonical.as_os_str());
+        hasher.update(
+            fs::read(&canonical)
+                .with_context(|| format!("read Cargo configuration {}", canonical.display()))?,
+        );
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn sanitized_build_variables(
+    target_dir: &Path,
+    rustc: &Path,
+) -> BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    // Build scripts receive only this named environment. In particular, ambient
+    // RUSTFLAGS, wrappers, compiler overrides, Cargo profile overrides, target
+    // linker/CC variables, and arbitrary build-script inputs are absent.
+    const RETAINED: &[&str] = &[
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "HOME",
+        "USERPROFILE",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ];
+    let mut variables = BTreeMap::new();
+    for name in RETAINED {
+        if let Some(value) = env::var_os(name) {
+            variables.insert(std::ffi::OsString::from(name), value);
+        }
+    }
+    variables.insert(
+        std::ffi::OsString::from("RUSTC"),
+        rustc.as_os_str().to_owned(),
+    );
+    variables.insert(
+        std::ffi::OsString::from("CARGO_TARGET_DIR"),
+        cargo_target_dir_for_command(target_dir).into_os_string(),
+    );
+    variables
+}
+
+fn build_environment(
+    codex_rs: &Path,
+    target_dir: &Path,
+    cargo: &Path,
+    rustc: &Path,
+) -> Result<AbBuildEnvironment> {
+    let variables = sanitized_build_variables(target_dir, rustc);
+    Ok(AbBuildEnvironment {
+        cargo: cargo.to_path_buf(),
+        environment_sha256: build_environment_hash(&variables),
+        cargo_configuration_sha256: cargo_configuration_hash(codex_rs, &variables)?,
+        variables,
+    })
+}
+
+fn build_command(environment: &AbBuildEnvironment) -> Command {
+    let mut command = Command::new(&environment.cargo);
+    command.env_clear().envs(&environment.variables);
+    command
+}
+
+fn command_text_in_build_environment(
+    environment: &AbBuildEnvironment,
+    cwd: &Path,
+    args: &[&str],
+    description: &str,
+) -> Result<String> {
+    let mut command = build_command(environment);
+    command.current_dir(cwd).args(args);
+    command_text(command, description)
+}
+
+fn executable_text_in_build_environment(
+    executable: &Path,
+    environment: &AbBuildEnvironment,
+    cwd: &Path,
+    args: &[&str],
+    description: &str,
+) -> Result<String> {
+    let mut command = Command::new(executable);
+    command
+        .env_clear()
+        .envs(&environment.variables)
+        .current_dir(cwd)
+        .args(args);
+    command_text(command, description)
+}
+
+fn rust_provenance_in_build_environment(
+    codex_rs: &Path,
+    environment: &AbBuildEnvironment,
+    rustc: &Path,
+) -> Result<(String, String)> {
+    let version = executable_text_in_build_environment(
+        rustc,
+        environment,
+        codex_rs,
+        &["-vV"],
+        "rustc -vV",
+    )?;
+    let target = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .context("rustc -vV did not report host target")?
+        .to_string();
+    Ok((version, target))
+}
+
+fn recorded_ab_build_inputs(
+    baseline_codex_rs: &Path,
+    baseline_target: &Path,
+    candidate_codex_rs: &Path,
+    candidate_target: &Path,
+) -> Result<(AbBuildEnvironment, AbBuildEnvironment, AbRecordedBuildInputs)> {
+    let cargo = fs::canonicalize(which::which("cargo").context("locate cargo on PATH")?)
+        .context("canonicalize cargo executable")?;
+    let rustc = fs::canonicalize(which::which("rustc").context("locate rustc on PATH")?)
+        .context("canonicalize rustc executable")?;
+    let baseline_environment =
+        build_environment(baseline_codex_rs, baseline_target, &cargo, &rustc)?;
+    let candidate_environment =
+        build_environment(candidate_codex_rs, candidate_target, &cargo, &rustc)?;
+
+    let baseline_cargo_version = command_text_in_build_environment(
+        &baseline_environment,
+        baseline_codex_rs,
+        &["-vV"],
+        "cargo -vV for baseline",
+    )?;
+    let candidate_cargo_version = command_text_in_build_environment(
+        &candidate_environment,
+        candidate_codex_rs,
+        &["-vV"],
+        "cargo -vV for candidate",
+    )?;
+    anyhow::ensure!(
+        baseline_cargo_version == candidate_cargo_version,
+        "baseline and candidate select different Cargo toolchains"
+    );
+    let (baseline_rustc_version, baseline_rust_target) =
+        rust_provenance_in_build_environment(baseline_codex_rs, &baseline_environment, &rustc)?;
+    let (candidate_rustc_version, candidate_rust_target) =
+        rust_provenance_in_build_environment(candidate_codex_rs, &candidate_environment, &rustc)?;
+    anyhow::ensure!(
+        baseline_rustc_version == candidate_rustc_version
+            && baseline_rust_target == candidate_rust_target,
+        "baseline and candidate select different Rust toolchains"
+    );
+
+    let build_inputs = AbRecordedBuildInputs {
+        cargo_version: baseline_cargo_version,
+        rustc_version: baseline_rustc_version,
+        rust_target: baseline_rust_target,
+        cargo_executable_sha256: sha256_file(&cargo)?,
+        rustc_executable_sha256: sha256_file(&rustc)?,
+        baseline_environment_sha256: baseline_environment.environment_sha256.clone(),
+        candidate_environment_sha256: candidate_environment.environment_sha256.clone(),
+        baseline_cargo_configuration_sha256: baseline_environment
+            .cargo_configuration_sha256
+            .clone(),
+        candidate_cargo_configuration_sha256: candidate_environment
+            .cargo_configuration_sha256
+            .clone(),
+    };
+    Ok((baseline_environment, candidate_environment, build_inputs))
+}
+
+fn run_build_command(
+    codex_rs: &Path,
+    environment: &AbBuildEnvironment,
+    args: &[&str],
+) -> Result<()> {
     #[cfg(test)]
     AB_BUILD_COMMAND_INVOCATIONS.fetch_add(1, Ordering::SeqCst);
-    let command_target_dir = cargo_target_dir_for_command(target_dir);
-    let status = Command::new("cargo")
+    let status = build_command(environment)
         .current_dir(codex_rs)
-        .env("CARGO_TARGET_DIR", &command_target_dir)
         .args(args)
         .status()
         .with_context(|| format!("run cargo {}", args.join(" ")))?;
@@ -2098,13 +2385,14 @@ fn select_turn_latency_executable_from_cargo_json(output: &[u8]) -> Result<PathB
     Ok(executables.remove(0))
 }
 
-fn build_turn_latency_worker(codex_rs: &Path, target_dir: &Path) -> Result<PathBuf> {
+fn build_turn_latency_worker(
+    codex_rs: &Path,
+    environment: &AbBuildEnvironment,
+) -> Result<PathBuf> {
     #[cfg(test)]
     AB_BUILD_COMMAND_INVOCATIONS.fetch_add(1, Ordering::SeqCst);
-    let command_target_dir = cargo_target_dir_for_command(target_dir);
-    let output = Command::new("cargo")
+    let output = build_command(environment)
         .current_dir(codex_rs)
-        .env("CARGO_TARGET_DIR", &command_target_dir)
         .args(AB_WORKER_BUILD_ARGS)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -2119,11 +2407,15 @@ fn build_turn_latency_worker(codex_rs: &Path, target_dir: &Path) -> Result<PathB
     select_turn_latency_executable_from_cargo_json(&output.stdout)
 }
 
-fn build_ab_variant(worktree: &Path, target_dir: &Path) -> Result<AbBuild> {
+fn build_ab_variant(
+    worktree: &Path,
+    target_dir: &Path,
+    environment: &AbBuildEnvironment,
+) -> Result<AbBuild> {
     let codex_rs = worktree.join("codex-rs");
-    run_build_command(&codex_rs, target_dir, &AB_CLI_BUILD_ARGS)?;
-    run_build_command(&codex_rs, target_dir, &AB_HOST_BUILD_ARGS)?;
-    let worker = build_turn_latency_worker(&codex_rs, target_dir)?;
+    run_build_command(&codex_rs, environment, &AB_CLI_BUILD_ARGS)?;
+    run_build_command(&codex_rs, environment, &AB_HOST_BUILD_ARGS)?;
+    let worker = build_turn_latency_worker(&codex_rs, environment)?;
     let cli = target_dir
         .join(AB_BUILD_PROFILE_DIR)
         .join(executable_name("codex"));
@@ -2145,12 +2437,11 @@ fn build_ab_variant(worktree: &Path, target_dir: &Path) -> Result<AbBuild> {
     })
 }
 
-fn ab_build_configuration_hash(rustc_version: &str, rust_target: &str) -> String {
+fn ab_build_configuration_hash(build_inputs: &AbRecordedBuildInputs) -> String {
     let payload = serde_json::json!({
         "profile": AB_BUILD_PROFILE,
         "features": Vec::<String>::new(),
-        "rustc_version": rustc_version,
-        "rust_target": rust_target,
+        "build_inputs": build_inputs,
         "commands": [AB_CLI_BUILD_ARGS, AB_HOST_BUILD_ARGS, AB_WORKER_BUILD_ARGS],
         "worker_stack_bytes": AB_WORKER_STACK_BYTES,
         "workload_schema_version": AB_WORKLOAD_SCHEMA_VERSION,
@@ -2429,11 +2720,16 @@ fn validate_ab_prepared_manifest_contract(manifest: &AbPreparedManifest) -> Resu
         ab_matrix_hash(matrix, ab_workload_schema_hash) == manifest.workload_schema_matrix_sha256,
         "prepared manifest workload schema no longer matches the controller"
     );
-    // Compare executes the already-built artifacts, so the active toolchain is not
-    // an input. Bind the build configuration to the toolchain recorded at prepare.
+    // Compare executes already-built artifacts. Bind the configuration to the
+    // complete sanitized build environment, Cargo configuration, and toolchain
+    // identities recorded during prepare rather than to the compare host.
     anyhow::ensure!(
-        ab_build_configuration_hash(&manifest.rustc_version, &manifest.rust_target)
-            == manifest.build_configuration_sha256,
+        manifest.rustc_version == manifest.build_inputs.rustc_version
+            && manifest.rust_target == manifest.build_inputs.rust_target,
+        "prepared manifest Rust provenance fields disagree"
+    );
+    anyhow::ensure!(
+        ab_build_configuration_hash(&manifest.build_inputs) == manifest.build_configuration_sha256,
         "prepared manifest build configuration no longer matches the controller"
     );
     Ok(())
@@ -2442,6 +2738,12 @@ fn validate_ab_prepared_manifest_contract(manifest: &AbPreparedManifest) -> Resu
 fn validate_ab_prepared_manifest(manifest: &AbPreparedManifest) -> Result<()> {
     validate_ab_prepared_manifest_contract(manifest)?;
     validate_isolated_prepared_builds(manifest)?;
+    validate_squashed_candidate_parent(
+        &manifest.candidate.worktree,
+        &manifest.baseline_commit,
+        &manifest.candidate_commit,
+    )
+    .context("validate prepared candidate parent")?;
     for (label, build, commit, filtered_tree) in [
         (
             "A",
@@ -2549,12 +2851,46 @@ fn read_worker_json_line<T: for<'de> Deserialize<'de>>(
     }
 }
 
-fn terminate_ab_worker(worker: &mut AbWorkerProcess) -> Result<()> {
-    if worker.child.try_wait()?.is_none() {
-        worker.child.kill()?;
-        let _ = worker.child.wait()?;
+fn terminate_ab_worker_process(worker: &mut AbWorkerProcess) -> Result<()> {
+    #[cfg(windows)]
+    {
+        // Job ownership survives the root's exit, so this still reaches
+        // descendants after `try_wait()` has reaped the direct worker.
+        worker
+            .managed_root
+            .terminate()
+            .context("terminate A/B worker Windows Job Object")?;
+        if worker.child.try_wait()?.is_none() {
+            let _ = worker.child.wait()?;
+        }
+        return Ok(());
     }
-    Ok(())
+
+    #[cfg(unix)]
+    {
+        // The worker starts as the leader of this group. Its numeric group id
+        // remains usable after the root exits, unlike looking the group up from
+        // a reaped pid.
+        codex_utils_pty::process_group::kill_process_group(worker.process_group_id)
+            .context("kill A/B worker Unix process group")?;
+        if worker.child.try_wait()?.is_none() {
+            let _ = worker.child.wait()?;
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        if worker.child.try_wait()?.is_none() {
+            worker.child.kill()?;
+            let _ = worker.child.wait()?;
+        }
+        Ok(())
+    }
+}
+
+fn terminate_ab_worker(worker: &mut AbWorkerProcess) -> Result<()> {
+    terminate_ab_worker_process(worker)
 }
 
 fn spawn_ab_worker(
@@ -2570,7 +2906,8 @@ fn spawn_ab_worker(
     let workload_arg = workload.name();
     let warmups_arg = config.warmups.to_string();
     let samples_arg = config.max_pairs_per_cluster().to_string();
-    let mut child = Command::new(&build.worker)
+    let mut command = Command::new(&build.worker);
+    command
         .current_dir(build.worktree.join("codex-rs"))
         .env("CARGO_BIN_EXE_codex", &build.cli)
         .env("RUST_MIN_STACK", AB_WORKER_STACK_BYTES)
@@ -2591,13 +2928,37 @@ fn spawn_ab_worker(
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(windows)]
+    command.creation_flags(codex_utils_pty::WINDOWS_CREATE_SUSPENDED);
+    #[cfg(windows)]
+    let managed_root = codex_utils_pty::ManagedRootProcess::reserve()
+        .context("reserve A/B worker Windows Job Object")?;
+    let mut child = command
         .spawn()
         .with_context(|| format!("spawn {variant} worker for cluster {cluster}"))?;
+    #[cfg(windows)]
+    if let Err(error) = managed_root.attach_and_resume(child.id()) {
+        // An attach failure can happen before Job ownership exists. The child
+        // was created suspended, so explicitly reap it rather than relying on
+        // the Job's kill-on-close behavior.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error)
+            .with_context(|| format!("attach {variant} worker to Windows Job Object"));
+    }
+    #[cfg(unix)]
+    let process_group_id = child.id();
     let stdin = child.stdin.take().context("worker stdin was not piped")?;
     let stdout = child.stdout.take().context("worker stdout was not piped")?;
     let mut process = AbWorkerProcess {
         child,
+        #[cfg(unix)]
+        process_group_id,
+        #[cfg(windows)]
+        managed_root,
         stdin,
         stdout: worker_stdout_receiver(stdout),
     };
@@ -3162,7 +3523,7 @@ fn replay_direct_validation_events(response_id: &str, input_tokens: u64) -> Vec<
     });
     let arguments = serde_json::json!({
         "kind": "argv",
-        "program": "python",
+        "program": if cfg!(windows) { "python" } else { "python3" },
         "args": ["-m", "unittest", AB_REPLAY_VALIDATION_SELECTOR],
         "yield_time_ms": 10_000,
         "tty": false,
@@ -3566,9 +3927,7 @@ async fn submit_replay_turn(test: &TestCodex, prompt: &str) -> Result<String> {
 }
 
 fn replay_git(root: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let output = git_command(root)
         .args(args)
         .output()
         .with_context(|| format!("run replay fixture git {}", args.join(" ")))?;
@@ -3637,9 +3996,7 @@ fn replay_workspace_fingerprint(root: &Path) -> Result<String> {
         bytes.extend_from_slice(relative.as_bytes());
         bytes.extend_from_slice(&fs::read(root.join(relative))?);
     }
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let status = git_command(root)
         .args(["status", "--porcelain=v1", "--untracked-files=all"])
         .output()
         .context("capture replay fixture git status")?;
@@ -3668,17 +4025,7 @@ fn attach_replay_request_metrics(sample: &mut Sample, requests: &[wiremock::Requ
         .first()
         .map(high_volume_request_body_json)
         .as_ref()
-        .map(|body| {
-            body.get("input")
-                .and_then(serde_json::Value::as_array)
-                .map_or(0, |input| {
-                    input
-                        .iter()
-                        .filter(|item| item.to_string().contains(AB_REPLAY_HISTORY_SEED_PREFIX))
-                        .count()
-                        .min(u32::MAX as usize) as u32
-                })
-        })
+        .map(|body| history_seed_turns_visible_with_prefix(body, AB_REPLAY_HISTORY_SEED_PREFIX))
         .unwrap_or_default();
 }
 
@@ -3797,12 +4144,7 @@ impl ReplayActionFixture {
                     emitted_error_count.max(u32::from(terminal_error.is_some()));
                 sample.final_response_present = completion.last_agent_message.is_some();
                 sample.failure_terminalized_subturns = u32::from(terminalized);
-                if terminalized
-                    && (prompt != AB_REPLAY_FAILURE_PROMPT
-                        || terminal_error.is_none_or(|error| {
-                            !error.message.contains("required replay exec failure")
-                        }))
-                {
+                if terminalized && prompt != AB_REPLAY_FAILURE_PROMPT {
                     sample.failure_codes.push(format!(
                         "replay_unexpected_terminal_error:{}",
                         terminal_error
@@ -3981,6 +4323,13 @@ impl ReplayActionFixture {
             action_turns,
         )
     }
+}
+
+fn replay_retained_generation_target(action_first: bool) -> u32 {
+    // The baseline lane spends one extra generation on its avoidable
+    // retained-process wait before starting the process, so its retained turn
+    // legitimately records four generations to the candidate lane's three.
+    if action_first { 3 } else { 4 }
 }
 
 struct ReplayRetainedResponder {
@@ -4276,9 +4625,6 @@ impl ReplayRetainedAbortFixture {
         if retained.retained_write_stdin_poll_count != 2 {
             failure_codes.push("replay_retained_poll_count".to_string());
         }
-        if retained.logical_generations != 3 {
-            failure_codes.push("replay_retained_generation_count".to_string());
-        }
         if retained.terminal_event != "turn_aborted" || !retained.lifecycle_complete {
             failure_codes.push("replay_retained_abort_closure".to_string());
         }
@@ -4293,7 +4639,7 @@ impl ReplayRetainedAbortFixture {
         let generations = aggregate
             .as_ref()
             .map_or(0, |sample| sample.logical_generations);
-        let expected = if action_first { 3 } else { 4 };
+        let expected = replay_retained_generation_target(action_first);
         if generations != expected {
             let Some(aggregate) = aggregate.as_mut() else {
                 unreachable!("replay retained merge must retain an aggregate");
@@ -4453,33 +4799,10 @@ impl SessionReplayFixture {
             after_sha256: after_fingerprint,
             passed: reset_ok,
         });
-        aggregate.generation_purposes = if targeted_action {
-            aggregate.avoidable_generations = 0;
-            // The generic unchanged-workspace counter includes the two required
-            // retained-process polls. The replay classifies those polls as
-            // necessary process monitoring, not observational nonprogress.
-            aggregate.nonprogress_tokens = 0;
-            BTreeMap::from([
-                ("targeted_action".to_string(), 1),
-                ("mutation".to_string(), 1),
-                ("validation".to_string(), 1),
-                ("final_response".to_string(), 2),
-                ("recoverable_failure".to_string(), 1),
-                ("failure_recovery".to_string(), 1),
-                ("retained_process_start".to_string(), 1),
-                ("retained_process_poll".to_string(), 2),
-            ])
-        } else {
-            aggregate.avoidable_generations = 10;
-            aggregate.nonprogress_tokens = 10_240;
-            BTreeMap::from([
-                ("necessary_work".to_string(), 8),
-                ("broad_discovery".to_string(), 3),
-                ("repeated_discovery".to_string(), 2),
-                ("wait".to_string(), 1),
-                ("terminal_failure".to_string(), 1),
-            ])
-        };
+        // `generation_purposes`, `avoidable_generations`, and
+        // `nonprogress_tokens` already came from runtime timing evidence in the
+        // merged subturns. Keep those observations intact; the fixture's lane
+        // assignment is expectation metadata, not a causal measurement.
         let expected_generations = if targeted_action {
             AB_REPLAY_B_GENERATIONS
         } else {
@@ -4660,18 +4983,6 @@ fn ab_warmup_failure_detail(
     })
 }
 
-fn rust_provenance() -> Result<(String, String)> {
-    let mut command = Command::new("rustc");
-    command.arg("-vV");
-    let version = command_text(command, "rustc -vV")?;
-    let target = version
-        .lines()
-        .find_map(|line| line.strip_prefix("host: "))
-        .context("rustc -vV did not report host target")?
-        .to_string();
-    Ok((version, target))
-}
-
 fn ab_fixture_hash(workload: AbWorkload) -> String {
     let fixture = match workload {
         AbWorkload::CodeModeNestedDispatch => {
@@ -4766,7 +5077,7 @@ fn ab_profile_configuration_hash(config: AbExecutionConfig, workloads: &[AbWorkl
         payload["comparison"] = serde_json::json!({
             "bootstrap_replicates": AB_BOOTSTRAP_REPLICATES,
             "bootstrap_seed": AB_BOOTSTRAP_SEED,
-            "family_wise_alpha": AB_FAMILY_WISE_ALPHA,
+            "per_look_alpha": AB_PER_LOOK_ALPHA,
             "median_ratio_ucb_limit": AB_MEDIAN_RATIO_UCB_LIMIT,
             "p95_ratio_ucb_limit": AB_P95_RATIO_UCB_LIMIT,
             "p95_ratio_ucb_gate_min_baseline_ns": AB_P95_RATIO_UCB_GATE_MIN_BASELINE_NS,
@@ -4861,9 +5172,16 @@ fn run_ab_prepare(args: &AbPrepareArgs) -> Result<()> {
             "installed benchmark overlay identity changed"
         );
     }
-    let a_build = build_ab_variant(&a_worktree, &a_target)?;
-    let b_build = build_ab_variant(&b_worktree, &b_target)?;
-    let (rustc_version, rust_target) = rust_provenance()?;
+    let (a_environment, b_environment, build_inputs) = recorded_ab_build_inputs(
+        &a_worktree.join("codex-rs"),
+        &a_target,
+        &b_worktree.join("codex-rs"),
+        &b_target,
+    )?;
+    let a_build = build_ab_variant(&a_worktree, &a_target, &a_environment)?;
+    let b_build = build_ab_variant(&b_worktree, &b_target, &b_environment)?;
+    let rustc_version = build_inputs.rustc_version.clone();
+    let rust_target = build_inputs.rust_target.clone();
     let matrix = ab_all_workloads();
     let mut manifest = AbPreparedManifest {
         schema_version: AB_PREPARED_MANIFEST_SCHEMA_VERSION,
@@ -4874,7 +5192,8 @@ fn run_ab_prepare(args: &AbPrepareArgs) -> Result<()> {
         overlay_sha256,
         fixture_matrix_sha256: ab_matrix_hash(matrix, ab_fixture_hash),
         workload_schema_matrix_sha256: ab_matrix_hash(matrix, ab_workload_schema_hash),
-        build_configuration_sha256: ab_build_configuration_hash(&rustc_version, &rust_target),
+        build_configuration_sha256: ab_build_configuration_hash(&build_inputs),
+        build_inputs,
         rustc_version,
         rust_target,
         baseline: prepared_build(&a_build, &a_target)?,
@@ -5108,6 +5427,7 @@ fn run_ab_compare(args: &AbCompareArgs) -> Result<()> {
         candidate_cli_binary_sha256: manifest.candidate.cli_sha256.clone(),
         rustc_version: manifest.rustc_version.clone(),
         rust_target: manifest.rust_target,
+        build_configuration_sha256: manifest.build_configuration_sha256.clone(),
         profile: AB_BUILD_PROFILE.to_string(),
         execution_profile: args.profile,
         features: Vec::new(),
@@ -5629,6 +5949,13 @@ fn import_accepted_ab_report(args: &AbImportReportArgs) -> Result<AbImportReport
     {
         validate_accepted_ab_workload(workload_report, workload, config)?;
     }
+    let manifest = load_ab_prepared_manifest(&args.manifest).with_context(|| {
+        format!(
+            "load prepared manifest for accepted report {}",
+            args.manifest.display()
+        )
+    })?;
+    validate_ab_report_prepared_manifest_provenance(&report.provenance, &manifest)?;
     let file_sha256 = sha256_bytes(&bytes);
     let destination = args
         .repo
@@ -5645,6 +5972,32 @@ fn import_accepted_ab_report(args: &AbImportReportArgs) -> Result<AbImportReport
         report_payload_sha256,
         file_sha256,
     })
+}
+
+fn validate_ab_report_prepared_manifest_provenance(
+    provenance: &AbProvenance,
+    manifest: &AbPreparedManifest,
+) -> Result<()> {
+    anyhow::ensure!(
+        provenance.baseline_commit == manifest.baseline_commit
+            && provenance.candidate_commit == manifest.candidate_commit
+            && provenance.baseline_filtered_tree == manifest.baseline_filtered_tree
+            && provenance.candidate_filtered_tree == manifest.candidate_filtered_tree
+            && provenance.overlay_sha256 == manifest.overlay_sha256
+            && provenance.prepared_manifest_sha256 == manifest.manifest_payload_sha256
+            && provenance.baseline_worker_sha256 == manifest.baseline.worker_sha256
+            && provenance.candidate_worker_sha256 == manifest.candidate.worker_sha256
+            && provenance.baseline_host_binary_sha256 == manifest.baseline.host_sha256
+            && provenance.candidate_host_binary_sha256 == manifest.candidate.host_sha256
+            && provenance.baseline_cli_binary_sha256 == manifest.baseline.cli_sha256
+            && provenance.candidate_cli_binary_sha256 == manifest.candidate.cli_sha256
+            && provenance.rustc_version == manifest.rustc_version
+            && provenance.rust_target == manifest.rust_target
+            && provenance.build_configuration_sha256
+                == manifest.build_configuration_sha256,
+        "accepted report provenance does not match its verified prepared manifest"
+    );
+    Ok(())
 }
 
 fn install_accepted_ab_report(destination: &Path, bytes: &[u8]) -> Result<()> {

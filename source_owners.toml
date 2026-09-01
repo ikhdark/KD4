@@ -866,7 +866,7 @@ tests = ["scripts/test_kd4_live_agent_benchmark.py"]
 [[owners.validation]]
 id = "rust-turn-latency-focused"
 cwd = "codex-rs"
-argv = ["just", "core-test-fast", "turn_latency_bench", "-E", "test(code_mode_capture_report_has_no_local_ab_gate)"]
+argv = ["just", "core-test-fast", "turn_latency_bench"]
 role = "focused_tests"
 
 [[owners.validation]]
