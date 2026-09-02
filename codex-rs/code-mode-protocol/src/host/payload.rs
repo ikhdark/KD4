@@ -279,6 +279,10 @@ pub enum WireRuntimeResponse {
         cell_id: WireCellId,
         content_items: Vec<WireContentItem>,
     },
+    ExplicitYield {
+        cell_id: WireCellId,
+        content_items: Vec<WireContentItem>,
+    },
     Terminated {
         cell_id: WireCellId,
         content_items: Vec<WireContentItem>,
@@ -297,6 +301,13 @@ impl From<RuntimeResponse> for WireRuntimeResponse {
                 cell_id,
                 content_items,
             } => Self::Yielded {
+                cell_id: cell_id.into(),
+                content_items: content_items.into_iter().map(Into::into).collect(),
+            },
+            RuntimeResponse::ExplicitYield {
+                cell_id,
+                content_items,
+            } => Self::ExplicitYield {
                 cell_id: cell_id.into(),
                 content_items: content_items.into_iter().map(Into::into).collect(),
             },
@@ -327,6 +338,13 @@ impl From<WireRuntimeResponse> for RuntimeResponse {
                 cell_id,
                 content_items,
             } => Self::Yielded {
+                cell_id: cell_id.into(),
+                content_items: content_items.into_iter().map(Into::into).collect(),
+            },
+            WireRuntimeResponse::ExplicitYield {
+                cell_id,
+                content_items,
+            } => Self::ExplicitYield {
                 cell_id: cell_id.into(),
                 content_items: content_items.into_iter().map(Into::into).collect(),
             },

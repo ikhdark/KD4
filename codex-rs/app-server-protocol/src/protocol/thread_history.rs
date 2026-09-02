@@ -2227,6 +2227,10 @@ mod tests {
         let command_item = CoreTurnItem::CommandExecution(CoreCommandExecutionItem {
             id: "exec-1".to_string(),
             process_id: Some("pid-1".to_string()),
+            parent_call_id: None,
+            parent_cell_id: None,
+            runtime_tool_call_id: None,
+            execution_id: None,
             command: vec!["echo".to_string(), "hello world".to_string()],
             cwd: test_path_buf("/tmp").abs().into(),
             parsed_cmd: vec![ParsedCommand::Unknown {
@@ -2282,6 +2286,10 @@ mod tests {
                 command: "echo 'hello world'".to_string(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-1".to_string()),
+                parent_call_id: None,
+                parent_cell_id: None,
+                runtime_tool_call_id: None,
+                execution_id: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {
@@ -3034,6 +3042,10 @@ mod tests {
                 command: "echo 'hello world'".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-1".into()),
+                parent_call_id: None,
+                parent_cell_id: None,
+                runtime_tool_call_id: None,
+                execution_id: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {
@@ -3280,6 +3292,10 @@ mod tests {
                 command: "ls".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-2".into()),
+                parent_call_id: None,
+                parent_cell_id: None,
+                runtime_tool_call_id: None,
+                execution_id: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Declined,
                 command_actions: vec![CommandAction::Unknown {
@@ -3378,6 +3394,10 @@ mod tests {
                 command: "rm -rf /tmp/guardian".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
+                parent_call_id: None,
+                parent_cell_id: None,
+                runtime_tool_call_id: None,
+                execution_id: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Declined,
                 command_actions: vec![CommandAction::Unknown {
@@ -3444,6 +3464,10 @@ mod tests {
                 command: "/bin/rm -f /tmp/file.sqlite".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
+                parent_call_id: None,
+                parent_cell_id: None,
+                runtime_tool_call_id: None,
+                execution_id: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::InProgress,
                 command_actions: vec![CommandAction::Unknown {
@@ -3548,6 +3572,10 @@ mod tests {
                 command: "echo done".into(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-42".into()),
+                parent_call_id: None,
+                parent_cell_id: None,
+                runtime_tool_call_id: None,
+                execution_id: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
                 command_actions: vec![CommandAction::Unknown {

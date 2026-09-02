@@ -27,6 +27,7 @@ use crate::tools::command_execution::CommandExecutionLedger;
 use crate::tools::command_execution::CompletionApplyResult;
 use crate::tools::command_output_artifact::append_raw_output_artifact;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolCallSource;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventFailure;
@@ -302,6 +303,7 @@ async fn emit_process_terminal_event(
     exit_code: i32,
     timed_out: bool,
     duration: Duration,
+    source: &ToolCallSource,
     tracker: Option<&SharedTurnDiffTracker>,
 ) {
     let process_output = Some(process.snapshot_completion_output().await);
@@ -320,6 +322,7 @@ async fn emit_process_terminal_event(
             message.to_string(),
             timed_out,
             duration,
+            source.clone(),
             tracker.cloned(),
         )
         .await;
@@ -338,6 +341,7 @@ async fn emit_process_terminal_event(
             exit_code,
             timed_out,
             duration,
+            source.clone(),
             tracker.cloned(),
         )
         .await;
@@ -366,6 +370,7 @@ pub(crate) fn spawn_exit_watcher(
     parent_tool_execution_id: ToolExecutionId,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
+    source: ToolCallSource,
     tracker: Option<SharedTurnDiffTracker>,
     known_delta: Option<PreparedKnownDelta>,
     known_delta_executor_started_at: Option<Instant>,
@@ -466,6 +471,7 @@ pub(crate) fn spawn_exit_watcher(
                 exit_code,
                 false,
                 duration,
+                &source,
                 tracker.as_ref(),
             )
             .await;
@@ -540,6 +546,7 @@ pub(crate) fn spawn_exit_watcher(
                 exit_code,
                 false,
                 duration,
+                &source,
                 tracker.as_ref(),
             )
             .await;
@@ -863,6 +870,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     exit_code: i32,
     timed_out: bool,
     duration: Duration,
+    source: ToolCallSource,
     tracker: Option<SharedTurnDiffTracker>,
 ) {
     let (aggregated_output, stdout, stderr) = if let Some(output) = process_output {
@@ -888,7 +896,8 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         turn_ref.as_ref(),
         &call_id,
         tracker.as_ref(),
-    );
+    )
+    .with_call_source(&source);
     let emitter = ToolEmitter::unified_exec(
         &command,
         cwd,
@@ -923,6 +932,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     message: String,
     timed_out: bool,
     duration: Duration,
+    source: ToolCallSource,
     tracker: Option<SharedTurnDiffTracker>,
 ) {
     let (stdout, process_stderr, process_aggregated_output) = if let Some(output) = process_output {
@@ -962,7 +972,8 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         turn_ref.as_ref(),
         &call_id,
         tracker.as_ref(),
-    );
+    )
+    .with_call_source(&source);
     let emitter = ToolEmitter::unified_exec(
         &command,
         cwd,

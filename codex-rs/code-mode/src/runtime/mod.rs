@@ -283,6 +283,10 @@ impl EnabledToolCatalog {
             .get(global_name)
             .and_then(|index| self.tools.get(*index))
     }
+
+    fn index_of(&self, global_name: &str) -> Option<usize> {
+        self.by_global_name.get(global_name).copied()
+    }
 }
 
 pub(super) struct RuntimeState {

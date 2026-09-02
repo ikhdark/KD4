@@ -49,6 +49,8 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::exposure::AgentSurfaceStage;
 use crate::tools::exposure::ToolExposureIdentity;
+use crate::tools::handlers::ApplyPatchHandler;
+use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
 use crate::tools::handlers::ToolSearchHandlerCache;
@@ -812,22 +814,29 @@ async fn wait_is_always_registered_when_code_mode_is_enabled() {
 }
 
 #[tokio::test]
-async fn code_mode_eagerly_exposes_the_exec_command_contract() {
+async fn code_mode_eagerly_exposes_all_direct_nested_tool_contracts() {
     let (_session, mut turn) = make_session_and_context().await;
     set_features(&mut turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
-    let registered = RegisteredTool::new(
-        Arc::new(ExecCommandHandler::new(ExecCommandHandlerOptions {
-            allow_login_shell: true,
-            allow_escalated_sandbox_permissions: false,
-            exec_permission_approvals_enabled: false,
-            include_environment_id: false,
-            include_shell_parameter: true,
-        })),
-        TypedToolClass::Shell,
-    );
+    let registered = [
+        RegisteredTool::new(
+            Arc::new(ExecCommandHandler::new(ExecCommandHandlerOptions {
+                allow_login_shell: true,
+                allow_escalated_sandbox_permissions: false,
+                exec_permission_approvals_enabled: false,
+                include_environment_id: false,
+                include_shell_parameter: true,
+            })),
+            TypedToolClass::Shell,
+        ),
+        RegisteredTool::new(
+            Arc::new(ApplyPatchHandler::new(/*multi_environment*/ false)),
+            TypedToolClass::StructuredEdit,
+        ),
+        RegisteredTool::new(Arc::new(CurrentTimeHandler), TypedToolClass::ReadSearch),
+    ];
 
     let runtimes =
-        build_code_mode_executors(&turn, &[registered]).expect("code mode executors should build");
+        build_code_mode_executors(&turn, &registered).expect("code mode executors should build");
     let ToolSpec::Freeform(exec) = runtimes[0].spec() else {
         panic!("expected code mode exec tool");
     };
@@ -835,6 +844,8 @@ async fn code_mode_eagerly_exposes_the_exec_command_contract() {
     assert!(exec.description.contains("Eager nested tool contract:"));
     assert!(exec.description.contains("exec_command(args:"));
     assert!(exec.description.contains("yield_time_ms"));
+    assert!(exec.description.contains("apply_patch(input: string"));
+    assert!(exec.description.contains("curr_time(args:"));
 }
 
 #[tokio::test]
@@ -895,12 +906,6 @@ async fn request_user_input_stays_direct_in_code_mode_only() {
         plan.exposure("request_user_input"),
         ToolExposure::DirectModelOnly
     );
-
-    let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
-        panic!("expected code mode exec tool");
-    };
-    assert!(exec.description.contains("direct-only tools stay outside"));
-    assert!(exec.description.contains("request_user_input"));
 }
 
 #[tokio::test]
@@ -915,7 +920,7 @@ async fn request_user_input_is_absent_under_never_approval() {
 }
 
 #[tokio::test]
-async fn token_efficiency_code_mode_direct_tools_do_not_repeat_nested_declarations() {
+async fn code_mode_keeps_dynamic_external_tool_contracts_lazy() {
     let plan = probe_with(
         |turn| set_feature(turn, Feature::CodeMode, /*enabled*/ true),
         ToolPlanInputs {
@@ -937,7 +942,56 @@ async fn token_efficiency_code_mode_direct_tools_do_not_repeat_nested_declaratio
     let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
         panic!("expected code mode exec tool");
     };
-    assert!(exec.description.contains("lookup(args:"));
+    assert!(!exec.description.contains("lookup(args:"));
+}
+
+#[tokio::test]
+async fn code_mode_keeps_direct_mcp_contracts_lazy() {
+    let plan = probe_with(
+        |turn| set_feature(turn, Feature::CodeMode, /*enabled*/ true),
+        ToolPlanInputs {
+            mcp_tools: Some(vec![mcp_tool("direct", "mcp__direct", "lookup")]),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let mcp_tool_name = ToolName::namespaced("mcp__direct", "lookup").to_string();
+    plan.assert_registered_contains(&[mcp_tool_name.as_str(), codex_code_mode::PUBLIC_TOOL_NAME]);
+    let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
+        panic!("expected code mode exec tool");
+    };
+    assert!(!exec.description.contains("mcp__direct_lookup(args:"));
+}
+
+#[tokio::test]
+async fn code_mode_keeps_plugin_install_contract_lazy() {
+    let plan = probe_with(
+        |turn| {
+            set_features(
+                turn,
+                &[
+                    Feature::CodeMode,
+                    Feature::ToolSuggest,
+                    Feature::Apps,
+                    Feature::Plugins,
+                ],
+            );
+        },
+        ToolPlanInputs {
+            tool_suggest_candidates: Some(plugin_candidates(
+                ToolSuggestPresentation::RecommendationContext,
+            )),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_registered_contains(&[codex_code_mode::PUBLIC_TOOL_NAME, "request_plugin_install"]);
+    let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
+        panic!("expected code mode exec tool");
+    };
+    assert!(!exec.description.contains("request_plugin_install(args:"));
 }
 
 #[tokio::test]
@@ -1047,6 +1101,30 @@ async fn environment_count_controls_environment_backed_tools() {
         multiple_environments.visible_spec("view_image"),
         "environment_id"
     ));
+}
+
+#[tokio::test]
+async fn kda_is_a_read_only_tool_for_one_local_environment() {
+    let local = probe(|_| {}).await;
+    local.assert_visible_contains(&["kda"]);
+    local.assert_registered_contains(&["kda"]);
+    assert_eq!(local.authorization_class("kda"), TypedToolClass::ReadSearch);
+    assert_eq!(
+        local.external_mutation_intents.get("kda"),
+        Some(&ExternalMutationIntent::ProvenReadOnly)
+    );
+
+    let no_environment = probe(|turn| turn.environments.turn_environments.clear()).await;
+    no_environment.assert_visible_lacks(&["kda"]);
+    no_environment.assert_registered_lacks(&["kda"]);
+
+    let multiple_environments = probe(duplicate_primary_environment).await;
+    multiple_environments.assert_visible_lacks(&["kda"]);
+    multiple_environments.assert_registered_lacks(&["kda"]);
+
+    let foreign_environment = probe(set_foreign_primary_environment).await;
+    foreign_environment.assert_visible_lacks(&["kda"]);
+    foreign_environment.assert_registered_lacks(&["kda"]);
 }
 
 #[tokio::test]

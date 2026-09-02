@@ -181,6 +181,10 @@ pub(crate) async fn execute_user_shell_command(
             &TurnItem::CommandExecution(CommandExecutionItem {
                 id: call_id.clone(),
                 process_id: None,
+                parent_call_id: None,
+                parent_cell_id: None,
+                runtime_tool_call_id: None,
+                execution_id: None,
                 command: display_command.clone(),
                 cwd: cwd.clone(),
                 parsed_cmd: parsed_cmd.clone(),
@@ -242,6 +246,10 @@ pub(crate) async fn execute_user_shell_command(
                     TurnItem::CommandExecution(CommandExecutionItem {
                         id: call_id,
                         process_id: None,
+                        parent_call_id: None,
+                        parent_cell_id: None,
+                        runtime_tool_call_id: None,
+                        execution_id: None,
                         command: display_command.clone(),
                         cwd: cwd.clone(),
                         parsed_cmd: parsed_cmd.clone(),
@@ -267,6 +275,10 @@ pub(crate) async fn execute_user_shell_command(
                     TurnItem::CommandExecution(CommandExecutionItem {
                         id: call_id.clone(),
                         process_id: None,
+                        parent_call_id: None,
+                        parent_cell_id: None,
+                        runtime_tool_call_id: None,
+                        execution_id: None,
                         command: display_command.clone(),
                         cwd: cwd.clone(),
                         parsed_cmd: parsed_cmd.clone(),
@@ -319,6 +331,10 @@ pub(crate) async fn execute_user_shell_command(
                     TurnItem::CommandExecution(CommandExecutionItem {
                         id: call_id,
                         process_id: None,
+                        parent_call_id: None,
+                        parent_cell_id: None,
+                        runtime_tool_call_id: None,
+                        execution_id: None,
                         command: display_command,
                         cwd,
                         parsed_cmd,

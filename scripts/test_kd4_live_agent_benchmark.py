@@ -49,6 +49,49 @@ def _run(*, outcome_correct: bool, task_contract_compliant: bool) -> dict[str, o
     }
 
 
+def _gate_run(**overrides: object) -> dict[str, object]:
+    run: dict[str, object] = {
+        "success": True,
+        "outcomeCorrect": True,
+        "taskContractCompliant": True,
+        "terminalEvent": "turn.completed",
+        "completionMs": 100.0,
+        "modelWaitMs": 75.0,
+        "actualCommandCount": 4,
+        "duplicateCommandCount": 0,
+        "taskContract": {"successfulTestObserved": True},
+        "latencyExplanation": {
+            "observed": {
+                "postFirstOutputMs": 90.0,
+                "firstWorkspaceMutationObservedMs": 20.0,
+                "firstRequiredTestCompletedObservedMs": 80.0,
+                "requiredTestToTerminalMs": 20.0,
+            },
+            "instrumentedRuntime": {
+                "available": True,
+                "counters": {"logicalGenerationCount": 2},
+                "tokenTotalsAcrossRequests": {"totalTokens": 100},
+            },
+        },
+    }
+    run.update(overrides)
+    return run
+
+
+def _gate_pairs() -> list[dict[str, object]]:
+    return [
+        {
+            "taskId": task.task_id,
+            "taskShape": task.shape,
+            "repetition": repetition,
+            "currentFork": _gate_run(),
+            "upstreamC": _gate_run(),
+        }
+        for task in benchmark.BENCHMARK_TASKS
+        for repetition in range(1, benchmark.MIN_GATE_REPETITIONS_PER_TASK + 1)
+    ]
+
+
 def _model_request(**overrides: object) -> dict[str, object]:
     request = {
         "generationIndex": 0,
@@ -260,6 +303,67 @@ class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 self.assertIn(invalid, benchmark.INVALID_CASES)
 
+    def test_every_benchmark_task_has_a_working_independent_verifier(self) -> None:
+        solutions = {
+            "duration_parser": benchmark.CORRECT_IMPLEMENTATION,
+            "slug_diagnostic": """import re
+
+
+def normalize_slug(value: str) -> str:
+    if not isinstance(value, str) or not value.isascii():
+        raise ValueError("invalid slug")
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", value.strip()).strip("-").lower()
+    if not slug:
+        raise ValueError("invalid slug")
+    return slug
+""",
+            "inventory_multi_file": {
+                "inventory/parser.py": """def parse_rows(text: str) -> list[tuple[str, int]]:
+    rows = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(",")
+        if len(parts) != 2:
+            raise ValueError("invalid row")
+        name, quantity = (part.strip() for part in parts)
+        if not name or not quantity.isascii() or not quantity.isdecimal():
+            raise ValueError("invalid row")
+        rows.append((name, int(quantity)))
+    return rows
+""",
+                "inventory/report.py": """from .parser import parse_rows
+
+
+def render_report(text: str) -> str:
+    rows = parse_rows(text)
+    lines = [f"{name}: {quantity}" for name, quantity in rows]
+    lines.append(f"TOTAL: {sum(quantity for _, quantity in rows)}")
+    return "\\n".join(lines)
+""",
+            },
+        }
+        with tempfile.TemporaryDirectory(prefix="kd4-task-suite-") as temp:
+            for task in benchmark.BENCHMARK_TASKS:
+                with self.subTest(task=task.task_id):
+                    root = Path(temp) / task.task_id
+                    root.mkdir()
+                    benchmark.create_fixture(root, task)
+                    self.assertFalse(benchmark.verify_fixture(root, task)[0])
+                    solution = solutions[task.task_id]
+                    if isinstance(solution, str):
+                        self.assertEqual(len(task.editable_files), 1)
+                        (root / task.editable_files[0]).write_text(
+                            solution, encoding="utf-8", newline="\n"
+                        )
+                    else:
+                        for relative, content in solution.items():
+                            (root / relative).write_text(
+                                content, encoding="utf-8", newline="\n"
+                            )
+                    passed, failures = benchmark.verify_fixture(root, task)
+                    self.assertTrue(passed, failures)
+
     def test_elapsed_measurements_require_a_terminal_event_for_completion(self) -> None:
         self.assertEqual(
             benchmark.elapsed_measurements(
@@ -296,6 +400,59 @@ class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
 
         self.assertFalse(comparison["headToHeadComparable"])
         self.assertEqual(comparison["unavailableVariants"], ["official-upstream"])
+
+    def test_comparison_latency_explanation_states_the_measured_mechanism(self) -> None:
+        fork = {
+            "successfulCompletionTime": {"medianMs": 100_000.0},
+            "actualCommandCount": {"median": 8.0},
+            "latencyExplanation": {
+                "harnessObserved": {
+                    "commandExecutionObservedMs": {"medianMs": 120.0}
+                },
+                "instrumentedRuntime": {
+                    "available": True,
+                    "availableRuns": 2,
+                    "exclusiveOwnershipTotalMs": {
+                        "modelOnlyMs": 190_000.0,
+                        "toolOnlyMs": 4_000.0,
+                        "orchestrationMs": 6_000.0,
+                    },
+                    "exclusiveOwnershipSharePercent": {
+                        "modelOnlyPercent": 95.0
+                    },
+                    "counterTotals": {
+                        "logicalGenerationCount": 20,
+                        "modelRetryCount": 0,
+                        "modelFallbackCount": 0,
+                        "attributableRecoveryGenerationCount": 4,
+                    },
+                },
+            },
+        }
+        upstream = {
+            "successfulCompletionTime": {"medianMs": 50_000.0},
+            "actualCommandCount": {"median": 4.0},
+            "latencyExplanation": {
+                "harnessObserved": {
+                    "commandExecutionObservedMs": {"medianMs": 100.0}
+                },
+                "instrumentedRuntime": {"available": False},
+            },
+        }
+
+        explanation = benchmark.comparison_latency_explanation(
+            fork_label="fork",
+            fork_summary=fork,
+            upstream_label="upstream",
+            upstream_summary=upstream,
+        )
+
+        joined = " ".join(explanation["findings"])
+        self.assertIn("2.00x", joined)
+        self.assertIn("command processes themselves do not explain", joined)
+        self.assertIn("18 continuation(s)", joined)
+        self.assertIn("0 model retries", joined)
+        self.assertFalse(explanation["internalOwnershipHeadToHeadComparable"])
 
     def test_summary_reports_outcome_and_task_contract_separately(self) -> None:
         runs = [
@@ -434,16 +591,28 @@ class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
 
     def test_masked_exit_codes_do_not_prove_the_required_suite_passed(self) -> None:
         """`python -m unittest -q || true` exits 0 whether or not the suite did."""
-        trusted = ("python -m unittest -q", 'bash -lc "python -m unittest -q"')
+        trusted = (
+            "python -m unittest -q",
+            'bash -lc "python -m unittest -q"',
+            # Last position: the payload exits with the suite's own status.
+            "cd repo && python -m unittest -q",
+            "git status; python -m unittest -q",
+            # Explicit propagation of the suite's status.
+            "python -m unittest -q; exit $?",
+            "python -m unittest -q; exit $LASTEXITCODE",
+            'bash -lc "python -m unittest -q; exit $?"',
+            "python -m unittest -q; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        )
         masked = (
             "python -m unittest -q || true",
             "python -m unittest -q; echo done",
+            "python -m unittest -q; exit 0",
             'bash -lc "python -m unittest -q || true"',
-            "cd repo && python -m unittest -q",
             "python -m unittest -q && echo done",
             "python -m unittest -q 2>&1 | tail -5",
             "false || python -m unittest -q",
             "true || python -m unittest -q",
+            "true || cd repo && python -m unittest -q",
         )
 
         for command in trusted:
@@ -553,6 +722,164 @@ class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
             4_000.0,
         )
         self.assertIsNotNone(trace["commands"][0]["nextObservedAction"]["latencyMs"])
+
+    def test_process_spawn_fallback_links_complete_one_to_one_population(self) -> None:
+        timing = {
+            "classificationComplete": True,
+            "startedAtUnixMs": 1_700_000_000_000.0,
+            "modelRequests": [
+                _model_request(),
+                _model_request(
+                    generationIndex=1,
+                    isContinuation=True,
+                    dispatchMs=90,
+                    samplingRequestId="req-1",
+                ),
+            ],
+            "toolCalls": [
+                _tool_call(callId="runtime-a", processSpawnedAtMs=10),
+                _tool_call(
+                    callId="runtime-b",
+                    generationIndex=1,
+                    acceptedAtMs=110,
+                    handlerEntryAtMs=110,
+                    processSpawnedAtMs=110,
+                    handlerExitAtMs=200,
+                    outputModelVisibleAtMs=200,
+                ),
+            ],
+            "toolCallTimingOverflow": 0,
+        }
+        commands, item_events = _record_commands(
+            [
+                ("jsonl-a", "git status", 0),
+                ("jsonl-b", "python -m unittest -q", 0),
+            ]
+        )
+
+        trace = _trace(timing=timing, commands=commands, item_events=item_events)
+
+        self.assertEqual(
+            [command["toolLink"]["method"] for command in trace["commands"]],
+            ["nearest_process_spawn", "nearest_process_spawn"],
+        )
+        self.assertEqual(
+            [command["toolLink"]["timingCallId"] for command in trace["commands"]],
+            ["runtime-a", "runtime-b"],
+        )
+
+    def test_runtime_tool_call_id_links_nested_command_without_using_outer_call(self) -> None:
+        timing = {
+            "classificationComplete": True,
+            "modelRequests": [
+                _model_request(),
+                _model_request(
+                    generationIndex=1,
+                    isContinuation=True,
+                    dispatchMs=2_000,
+                    samplingRequestId="req-1",
+                ),
+            ],
+            "toolCalls": [
+                _tool_call(
+                    callId="outer-call",
+                    runtimeToolCallId="outer-runtime",
+                    toolName="exec",
+                ),
+                _tool_call(
+                    callId="nested-call",
+                    runtimeToolCallId="nested-runtime",
+                    toolName="exec_command",
+                    generationIndex=1,
+                    acceptedAtMs=2_100,
+                    processSpawnedAtMs=2_100,
+                    handlerExitAtMs=2_500,
+                    outputModelVisibleAtMs=2_500,
+                ),
+            ],
+            "toolCallTimingOverflow": 0,
+        }
+        records: dict[str, dict[str, object]] = {}
+        order: list[str] = []
+        item_events = []
+        for sequence, phase in enumerate(("item.started", "item.completed"), 1):
+            completed = phase == "item.completed"
+            item = {
+                "id": "item_nested",
+                "type": "command_execution",
+                "command": "git status",
+                "runtime_tool_call_id": "nested-runtime",
+                "parent_tool_call_id": "outer-call",
+                "status": "completed" if completed else "in_progress",
+                "exit_code": 0 if completed else None,
+            }
+            benchmark.record_command_event(
+                records=records,
+                order=order,
+                event_type=phase,
+                item=item,
+                sequence=sequence,
+                observed_ms=100.0 * sequence,
+                observed_at_unix_ms=1_700_000_000_000.0 + 100.0 * sequence,
+            )
+            item_events.append(
+                {
+                    "sequence": sequence,
+                    "eventType": phase,
+                    "itemId": "item_nested",
+                    "itemType": "command_execution",
+                    "observedMs": 100.0 * sequence,
+                    "observedAtUnixMs": 1_700_000_000_000.0 + 100.0 * sequence,
+                }
+            )
+
+        trace = _trace(
+            timing=timing,
+            commands=[records["item_nested"]],
+            item_events=item_events,
+        )
+
+        command = trace["commands"][0]
+        self.assertEqual(command["toolLink"]["method"], "exact_runtime_tool_call_id")
+        self.assertEqual(command["toolLink"]["timingCallId"], "nested-call")
+        self.assertEqual(command["requestLink"]["generationIndex"], 1)
+        self.assertEqual(trace["toolCalls"][0]["commandItemId"], None)
+        self.assertEqual(trace["toolCalls"][1]["commandItemId"], "item_nested")
+
+    def test_failure_evidence_keeps_a_bounded_prefix_and_full_hash(self) -> None:
+        output = "failure: " + "x" * (
+            benchmark.MAX_MODEL_VISIBLE_EVIDENCE_CHARS + 500
+        )
+        row = benchmark.failure_evidence_from_event(
+            event_type="item.completed",
+            event={},
+            item={
+                "id": "failed-command",
+                "type": "command_execution",
+                "status": "failed",
+                "exit_code": 2,
+                "aggregated_output": output,
+                "cell_id": "cell-7",
+                "runtime_tool_call_id": "runtime-7",
+            },
+            item_type="command_execution",
+            item_id="failed-command",
+            sequence=4,
+            observed_ms=12.0,
+        )
+
+        self.assertIsNotNone(row)
+        assert row is not None
+        evidence = row["modelVisibleText"]
+        self.assertEqual(evidence["textChars"], len(output))
+        self.assertTrue(evidence["textTruncated"])
+        self.assertEqual(
+            len(evidence["textPrefix"]),
+            benchmark.MAX_MODEL_VISIBLE_EVIDENCE_CHARS,
+        )
+        self.assertEqual(evidence["textSha256"], benchmark.text_sha256(output))
+        self.assertEqual(row["cellId"], "cell-7")
+        self.assertEqual(row["runtimeToolCallId"], "runtime-7")
 
     def test_trace_retains_bounded_command_evidence_and_absolute_times(self) -> None:
         runtime_start = 1_700_100_000_000
@@ -922,6 +1249,129 @@ class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
             uninstrumented["censoring"]["timingMissingReason"],
         )
 
+    def test_latency_explanation_identifies_the_dominant_owner_and_round_tax(
+        self,
+    ) -> None:
+        timing = {
+            "profileValid": True,
+            "classificationComplete": True,
+            "machineDurationNs": 10_000_000_000,
+            "exclusive": {
+                "modelOnlyNs": 9_000_000_000,
+                "toolOnlyNs": 250_000_000,
+                "modelPlusToolNs": 0,
+                "orchestrationNs": 750_000_000,
+                "finalizationNs": 0,
+                "unclassifiedNs": 0,
+            },
+            "unions": {
+                "modelRequestWaitUnionNs": 100_000_000,
+                "modelStreamWaitUnionNs": 8_900_000_000,
+                "modelStreamProcessingUnionNs": 5_000_000,
+            },
+            "local": {"planningUnionNs": 50_000_000},
+            "counters": {
+                "logicalGenerationCount": 2,
+                "modelRequestCount": 2,
+                "modelRetryCount": 0,
+                "toolCallCount": 1,
+                "attributableRecoveryGenerationCount": 1,
+                "truncationInducedContinuationCount": 1,
+                "toolOutputArtifactCreationCount": 1,
+                "purposeAggregates": [
+                    {
+                        "purpose": "implementation",
+                        "generations": 2,
+                        "modelStreamWaitNs": 8_900_000_000,
+                        "decisionLatencyNs": 4_000_000_000,
+                    }
+                ],
+            },
+            "modelRequests": [
+                _model_request(
+                    tokenUsage={
+                        "inputTokens": 100,
+                        "cachedInputTokens": 0,
+                        "visibleOutputTokens": 10,
+                        "reasoningTokens": 5,
+                        "totalTokens": 115,
+                    }
+                ),
+                _model_request(
+                    generationIndex=1,
+                    generationReason="tool_continuation",
+                    isContinuation=True,
+                    modelStreamWaitNs=7_900_000_000,
+                    decisionLatencyNs=3_000_000_000,
+                    tokenUsage={
+                        "inputTokens": 250,
+                        "cachedInputTokens": 100,
+                        "visibleOutputTokens": 20,
+                        "reasoningTokens": 10,
+                        "totalTokens": 280,
+                    },
+                ),
+            ],
+            "toolCalls": [_tool_call()],
+            "toolCallTimingOverflow": 0,
+        }
+        commands, item_events = _record_commands(
+            [("item_1", "python -m unittest -q", 0)]
+        )
+        trace = _trace(timing=timing, commands=commands, item_events=item_events)
+
+        explanation = benchmark.explain_turn_latency(
+            trace, completion_ms=10_100.0, wall_clock_ms=10_200.0, ttfo_ms=500.0
+        )
+
+        self.assertEqual(explanation["status"], "instrumented")
+        self.assertEqual(
+            explanation["observed"]["commandExecutionObservedMs"], 40.0
+        )
+        runtime = explanation["instrumentedRuntime"]
+        self.assertEqual(runtime["dominantOwner"], "modelOnlyMs")
+        self.assertEqual(
+            runtime["exclusiveOwnershipSharePercent"]["modelOnlyPercent"], 90.0
+        )
+        self.assertEqual(runtime["counters"]["logicalGenerationCount"], 2)
+        self.assertEqual(runtime["providerInputGrowth"]["deltaTokens"], 150)
+        self.assertEqual(
+            runtime["topSlowModelRounds"][0]["generationIndex"], 1
+        )
+        self.assertTrue(
+            any("tool-output projection recovery" in row for row in explanation["findings"])
+        )
+
+        run = {
+            "repetition": 1,
+            "latencyExplanation": explanation,
+        }
+        aggregate = benchmark.summarize_latency_explanations([run])
+        self.assertEqual(aggregate["instrumentedRuns"], 1)
+        self.assertEqual(
+            aggregate["instrumentedRuntime"]["counterTotals"][
+                "logicalGenerationCount"
+            ],
+            2,
+        )
+
+    def test_latency_explanation_keeps_uninstrumented_ownership_unknown(self) -> None:
+        commands, item_events = _record_commands(
+            [("item_1", "python -m unittest -q", 0)]
+        )
+        trace = _trace(timing=None, commands=commands, item_events=item_events)
+
+        explanation = benchmark.explain_turn_latency(
+            trace, completion_ms=100.0, wall_clock_ms=110.0, ttfo_ms=10.0
+        )
+
+        self.assertEqual(explanation["status"], "harness_only")
+        self.assertFalse(explanation["instrumentedRuntime"]["available"])
+        self.assertIn(
+            "model-versus-local ownership inside this build",
+            explanation["remainingUnknowns"],
+        )
+
     def test_summary_aggregates_continuation_classes_and_censoring(self) -> None:
         timing = {
             "classificationComplete": True,
@@ -1039,6 +1489,51 @@ class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
         self.assertEqual(model_wait["signTestTwoSidedP"], 0.5)
         self.assertTrue(model_wait["pairs"][2]["eitherSideRightCensored"])
 
+    def test_regression_gate_passes_each_required_task_shape_independently(
+        self,
+    ) -> None:
+        gate = benchmark.build_regression_gate(
+            _gate_pairs(),
+            fork_label="currentFork",
+            upstream_label="upstreamC",
+            experiment_feature="reasoning_governor",
+        )
+
+        self.assertTrue(gate["passed"])
+        self.assertEqual(
+            set(gate["taskGates"]),
+            {task.task_id for task in benchmark.BENCHMARK_TASKS},
+        )
+        self.assertTrue(
+            all(task_gate["passed"] for task_gate in gate["taskGates"].values())
+        )
+
+    def test_regression_gate_rejects_one_task_p90_even_when_aggregate_passes(
+        self,
+    ) -> None:
+        pairs = _gate_pairs()
+        regressed_pair = next(
+            pair
+            for pair in pairs
+            if pair["taskId"] == "slug_diagnostic" and pair["repetition"] == 6
+        )
+        regressed_pair["currentFork"]["completionMs"] = 106.0
+
+        gate = benchmark.build_regression_gate(
+            pairs,
+            fork_label="currentFork",
+            upstream_label="upstreamC",
+            experiment_feature="terminalization",
+        )
+
+        completion = gate["taskGates"]["slug_diagnostic"]["metrics"][
+            "completionMs"
+        ]
+        self.assertFalse(gate["passed"])
+        self.assertTrue(completion["median"]["passed"])
+        self.assertFalse(completion["p90"]["passed"])
+        self.assertTrue(gate["aggregateDiagnosticOnly"]["passed"])
+
     def test_uninstrumented_variant_reports_null_not_zero_continuations(self) -> None:
         """A build that cannot classify rounds must not look like one with none."""
         commands, item_events = _record_commands(
@@ -1124,8 +1619,24 @@ class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
         """Drive the real event loop so the wiring, not just the helpers, is covered."""
         timing = {
             "schemaVersion": 26,
+            "profileValid": True,
             "classificationComplete": True,
+            "machineDurationNs": 7_000_000_000,
+            "exclusive": {
+                "modelOnlyNs": 6_000_000_000,
+                "toolOnlyNs": 500_000_000,
+                "modelPlusToolNs": 0,
+                "orchestrationNs": 500_000_000,
+                "finalizationNs": 0,
+                "unclassifiedNs": 0,
+            },
             "unions": {"modelStreamWaitUnionNs": 6_000_000_000},
+            "counters": {
+                "logicalGenerationCount": 2,
+                "modelRequestCount": 2,
+                "modelRetryCount": 0,
+                "toolCallCount": 2,
+            },
             "modelRequests": [
                 _model_request(),
                 _model_request(
@@ -1237,6 +1748,102 @@ class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
         self.assertIsNotNone(trace["commands"][0]["nextObservedAction"]["latencyMs"])
         self.assertEqual(
             trace["censoring"]["observedFloors"]["commandExecutionsAtLeast"], 2
+        )
+        explanation = run["latencyExplanation"]
+        self.assertEqual(explanation["status"], "instrumented")
+        self.assertEqual(
+            explanation["instrumentedRuntime"]["dominantOwner"], "modelOnlyMs"
+        )
+        self.assertEqual(
+            explanation["instrumentedRuntime"]["counters"][
+                "logicalGenerationCount"
+            ],
+            2,
+        )
+
+    def test_run_agent_retains_failed_cell_and_error_evidence_end_to_end(self) -> None:
+        command_output = "command failed: " + "z" * (
+            benchmark.MAX_MODEL_VISIBLE_EVIDENCE_CHARS + 250
+        )
+        events = [
+            {"type": "thread.started", "thread_id": "thread_0"},
+            {"type": "turn.started"},
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "failed-item",
+                    "type": "command_execution",
+                    "command": "python -m unittest -q",
+                    "status": "in_progress",
+                    "cell_id": "cell-9",
+                    "runtime_tool_call_id": "runtime-9",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "failed-item",
+                    "type": "command_execution",
+                    "command": "python -m unittest -q",
+                    "aggregated_output": command_output,
+                    "status": "failed",
+                    "exit_code": 7,
+                    "cell_id": "cell-9",
+                    "runtime_tool_call_id": "runtime-9",
+                },
+            },
+            {"type": "turn.failed", "error": {"message": "model saw failure"}},
+        ]
+
+        with tempfile.TemporaryDirectory(prefix="kd4-live-failure-stub-") as temp:
+            temp_root = Path(temp)
+            stub = temp_root / "stub_agent.py"
+            stub.write_text(
+                "import json\n"
+                f"for event in {events!r}:\n"
+                "    print(json.dumps(event), flush=True)\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            auth = temp_root / "auth.json"
+            auth.write_text("{}", encoding="utf-8")
+
+            with mock.patch.object(
+                benchmark,
+                "build_agent_command",
+                return_value=[sys.executable, str(stub)],
+            ):
+                run = benchmark.run_agent(
+                    binary=Path(sys.executable),
+                    label="failure-stub",
+                    repetition=1,
+                    model="stub-model",
+                    reasoning_effort="high",
+                    personality="pragmatic",
+                    code_mode="enabled",
+                    auth_source=auth,
+                    timeout_seconds=60,
+                )
+
+        self.assertEqual(run["terminalEvent"], "turn.failed")
+        trace = run["turnTrace"]
+        command_failure = next(
+            row for row in trace["failureEvidence"] if row["itemId"] == "failed-item"
+        )
+        self.assertEqual(command_failure["cellId"], "cell-9")
+        self.assertEqual(command_failure["runtimeToolCallId"], "runtime-9")
+        self.assertEqual(command_failure["exitCode"], 7)
+        self.assertTrue(command_failure["modelVisibleText"]["textTruncated"])
+        self.assertEqual(
+            command_failure["modelVisibleText"]["textSha256"],
+            benchmark.text_sha256(command_output),
+        )
+        self.assertTrue(
+            any(
+                row["eventType"] == "turn.failed"
+                and row["modelVisibleText"]["textPrefix"] == "model saw failure"
+                for row in trace["failureEvidence"]
+            )
         )
 
     def test_run_agent_rejects_a_passing_suite_followed_by_a_file_change(self) -> None:
@@ -1797,11 +2404,11 @@ class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
         self.assertEqual(even["currentForkFirst"], 2)
         self.assertTrue(even["balanced"])
 
-    def test_parse_args_defaults_to_six_and_rejects_odd_repetitions(self) -> None:
+    def test_parse_args_defaults_to_ten_and_rejects_odd_repetitions(self) -> None:
         with mock.patch.object(
             sys, "argv", ["kd4_live_agent_benchmark.py", "--self-test"]
         ):
-            self.assertEqual(benchmark.parse_args().repetitions, 6)
+            self.assertEqual(benchmark.parse_args().repetitions, 10)
         with (
             mock.patch.object(
                 sys,

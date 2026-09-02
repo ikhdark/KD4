@@ -275,7 +275,7 @@ async fn yields_and_resumes() {
 
     assert_eq!(
         cell.initial_response().await.unwrap(),
-        RuntimeResponse::Yielded {
+        RuntimeResponse::ExplicitYield {
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "before".to_string(),
@@ -429,7 +429,7 @@ async fn observed_natural_completion_wins_over_termination() {
 
     assert_eq!(
         cell.initial_response().await.unwrap(),
-        RuntimeResponse::Yielded {
+        RuntimeResponse::ExplicitYield {
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         }

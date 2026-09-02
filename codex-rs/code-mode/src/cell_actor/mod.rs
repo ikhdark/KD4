@@ -44,7 +44,7 @@ use crate::session_runtime::ObserveMode;
 use crate::session_runtime::OutputItem;
 use crate::session_runtime::ToolName as CellToolName;
 
-const STATE_CHANGE_COMPLETION_GRACE: Duration = Duration::from_millis(50);
+const STATE_CHANGE_COMPLETION_GRACE: Duration = Duration::from_millis(500);
 
 pub(crate) struct CellActor;
 
@@ -338,7 +338,7 @@ async fn run_cell<H: CellHost>(
                             finish_yield_delivery(
                                 send_observer_event(
                                     observer.take(),
-                                    CellEvent::Yielded {
+                                    CellEvent::ExplicitYield {
                                         content_items: std::mem::take(&mut content_items),
                                     },
                                 ),
@@ -499,9 +499,14 @@ fn finish_yield_delivery(
 ) {
     match delivery {
         Ok(()) => output_admission.release(std::mem::take(admitted_output_bytes)),
-        Err(CellEvent::Yielded {
-            content_items: mut undelivered_items,
-        }) => {
+        Err(
+            CellEvent::Yielded {
+                content_items: mut undelivered_items,
+            }
+            | CellEvent::ExplicitYield {
+                content_items: mut undelivered_items,
+            },
+        ) => {
             undelivered_items.append(content_items);
             *content_items = undelivered_items;
         }

@@ -45,6 +45,7 @@ use crate::stable_context::project_stable_context;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
 use crate::tool_history::ToolHistorySubstitution;
+use crate::turn_timing::TurnTimingState;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::ResponseCreateWsRequest;
@@ -817,6 +818,111 @@ fn prompt_context_hashes_track_categories_and_gate_fixed_prefix_reuse() {
             .expect("tool schema category")
             .unchanged_from_previous_request
     );
+}
+
+#[tokio::test]
+async fn http_request_cache_identity_reaches_turn_timing_protocol_without_raw_key()
+-> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let sse_body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",",
+        "\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,",
+        "\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(/*status*/ 200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_body, "text/event-stream"),
+        )
+        .expect(/*requests*/ 2)
+        .mount(&server)
+        .await;
+
+    let provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    let client = ModelClient::new(
+        /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    )
+    .with_prompt_cache_key_override(Some("private-cache-key".to_string()));
+    let timing = Arc::new(TurnTimingState::default());
+    timing.mark_turn_started();
+    let mut session = client.new_session();
+    session.set_turn_timing(Arc::clone(&timing));
+    let prompt = Prompt {
+        input: vec![history_test_item("unchanged request", Some("turn-1"))].into(),
+        base_instructions: BaseInstructions {
+            text: "stable base instructions".to_string(),
+        },
+        ..Prompt::default()
+    };
+    let model_info = test_model_info();
+    let session_telemetry = test_session_telemetry();
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ Some("turn-1"),
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let inference_trace = InferenceTraceContext::disabled();
+
+    for _ in 0..2 {
+        let request_wait = timing.begin_model_request_wait();
+        let mut stream = session
+            .stream(
+                &prompt,
+                &model_info,
+                &session_telemetry,
+                /*effort*/ None,
+                codex_protocol::config_types::ReasoningSummary::None,
+                /*service_tier*/ None,
+                &responses_metadata,
+                &inference_trace,
+            )
+            .await?;
+        drop(request_wait);
+        while let Some(event) = stream.next().await {
+            event?;
+        }
+    }
+
+    let protocol = timing.complete_snapshot().protocol_timing();
+    assert_eq!(protocol.model_requests.len(), 2);
+    assert_eq!(
+        protocol
+            .model_requests
+            .iter()
+            .map(|request| request.fixed_prefix_reuse_eligible)
+            .collect::<Vec<_>>(),
+        vec![Some(false), Some(true)],
+    );
+    for request in &protocol.model_requests {
+        assert_eq!(
+            request.prompt_cache_key_fingerprint.as_deref(),
+            Some("fe058f5a51c2624acfd1804a248fe377f6a507f21f534de572efd087d6659837"),
+        );
+    }
+    let serialized = serde_json::to_string(&protocol)?;
+    assert!(!serialized.contains("private-cache-key"));
+
+    Ok(())
 }
 
 #[test]

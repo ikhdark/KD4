@@ -584,7 +584,9 @@ pub(crate) async fn inspect_pending_input(
             )
             .await
         }
-        TurnInput::ResponseItem(_) => HookRuntimeOutcome::default(),
+        TurnInput::ResponseItem(_) | TurnInput::InternalResponseItem(_) => {
+            HookRuntimeOutcome::default()
+        }
         TurnInput::InterAgentCommunication(_) => HookRuntimeOutcome::default(),
     }
 }
@@ -604,7 +606,7 @@ pub(crate) async fn record_pending_input(
             )
             .await;
         }
-        TurnInput::ResponseItem(item) => {
+        TurnInput::ResponseItem(item) | TurnInput::InternalResponseItem(item) => {
             sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
                 .await;
         }

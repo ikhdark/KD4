@@ -23,6 +23,7 @@ use crate::session::turn::built_tools;
 use crate::startup_timing::StartupPhase;
 use crate::startup_timing::StartupTimingState;
 use crate::tools::router::ToolRouter;
+use codex_features::Feature;
 use codex_otel::STARTUP_PREWARM_AGE_AT_FIRST_TURN_METRIC;
 use codex_otel::STARTUP_PREWARM_DURATION_METRIC;
 use codex_otel::SessionTelemetry;
@@ -30,6 +31,8 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
+
+const CODE_MODE_PREWARM_PHASE: &str = "code_mode_prewarm";
 
 pub(crate) struct SessionStartupPrewarmHandle {
     task: AbortOnDropHandle<CodexResult<ModelClientSession>>,
@@ -346,6 +349,31 @@ impl Session {
             started_at,
         ))
         .await;
+    }
+
+    /// Warms the code-mode host in the background so the first cell of the
+    /// first turn does not wait for isolate and host startup. This is
+    /// independent of the websocket-gated model prewarm above.
+    pub(crate) fn schedule_code_mode_prewarm(self: &Arc<Self>, config: &Config) {
+        if !(config.features.enabled(Feature::CodeMode)
+            || config.features.enabled(Feature::CodeModeOnly))
+        {
+            return;
+        }
+        let session = Arc::clone(self);
+        tokio::spawn(async move {
+            let started_at = Instant::now();
+            let result = session.services.code_mode_service.prewarm().await;
+            let status = if result.is_ok() { "ready" } else { "failed" };
+            session.services.session_telemetry.record_startup_phase(
+                CODE_MODE_PREWARM_PHASE,
+                started_at.elapsed(),
+                Some(status),
+            );
+            if let Err(error) = result {
+                warn!(%error, "code-mode host prewarm failed; the first cell will start it");
+            }
+        });
     }
 
     #[cfg(test)]

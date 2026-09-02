@@ -245,6 +245,7 @@ impl ExecCommandHandler {
             tracker,
             call_id,
             cancellation_token,
+            source,
             payload,
             ..
         } = invocation;
@@ -264,6 +265,7 @@ impl ExecCommandHandler {
             turn.clone(),
             call_id.clone(),
             tracker.clone(),
+            source,
         );
         let environment_args: ExecCommandEnvironmentArgs = parse_arguments(&arguments)?;
         let Some(turn_environment) = resolve_tool_environment(
@@ -737,6 +739,7 @@ impl ExecCommandHandler {
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
         let process_id_reservation = manager.reserve_process_id().await;
         let process_id = process_id_reservation.process_id();
+        let validation_execution_wall_started_at = validation_attempt.then(std::time::Instant::now);
         let exec_result = manager
             .exec_command(
                 ExecCommandRequest {
@@ -787,6 +790,20 @@ impl ExecCommandHandler {
             .command_execution
             .process_execution_identity(process_id)
             .await;
+        if validation_attempt {
+            let duration = match &exec_result {
+                Ok(response) => Some(response.wall_time),
+                Err(UnifiedExecError::SandboxDenied { output, .. }) => Some(output.duration),
+                Err(UnifiedExecError::ProcessFailed { .. }) if tracked_execution.is_some() => {
+                    validation_execution_wall_started_at.map(|started_at| started_at.elapsed())
+                }
+                Err(_) => None,
+            };
+            if let Some(duration) = duration {
+                turn.turn_timing_state
+                    .record_executed_validation_duration(duration);
+            }
+        }
         let mut background_process_expected = false;
         let result = match exec_result {
             Ok(mut response) => {

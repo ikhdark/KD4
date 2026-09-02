@@ -114,6 +114,9 @@ pub enum ThreadItemDetails {
     /// Tracks a command executed by the agent. The item starts when the command is
     /// spawned, and completes when the process exits with an exit code.
     CommandExecution(CommandExecutionItem),
+    /// Records a failed code-mode cell, including stable call/cell identifiers
+    /// and the runtime's error text.
+    CodeModeCell(CodeModeCellItem),
     /// Represents a set of file changes by the agent. The item is emitted only as a
     /// completed event once the patch succeeds or fails.
     FileChange(FileChangeItem),
@@ -164,6 +167,43 @@ pub struct CommandExecutionItem {
     pub aggregated_output: String,
     pub exit_code: Option<i32>,
     pub status: CommandExecutionStatus,
+    /// Core tool call id that produced this command, when known. It lets an
+    /// external harness join JSONL command items to runtime timing records
+    /// exactly instead of guessing by timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub call_id: Option<String>,
+    /// Model-visible exec call that owns this nested code-mode command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub parent_call_id: Option<String>,
+    /// Stable code-mode cell that issued this command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub parent_cell_id: Option<String>,
+    /// Runtime invocation id within the owning cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub runtime_tool_call_id: Option<String>,
+    /// Unique dispatch execution id shared with timing records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub execution_id: Option<String>,
+}
+
+/// A terminally failed code-mode JavaScript cell.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+pub struct CodeModeCellItem {
+    pub call_id: String,
+    pub cell_id: String,
+    pub status: CodeModeCellStatus,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeModeCellStatus {
+    Failed,
 }
 
 /// A set of file changes by the agent.

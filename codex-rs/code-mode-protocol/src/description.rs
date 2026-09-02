@@ -194,91 +194,85 @@ mod tests {
         let description = build_exec_tool_description(false, false, &[]);
 
         assert!(description.contains("raw JavaScript"));
+        assert!(description.contains("Nested tools live on the global `tools` object"));
         assert!(description.contains("await tools.exec_command"));
+        assert!(description.contains("await tools.apply_patch(patchText)"));
+        assert!(
+            description
+                .contains("Bare `exec(...)` / `exec_command(...)` alias `tools.exec_command`")
+        );
+        assert!(description.contains("`console.log(...)` aliases `text(...)`"));
+        assert!(description.contains("Only `ALL_TOOL_NAMES` entries are callable"));
+        assert!(description.contains("never pipe a patch through a shell wrapper"));
+        assert!(description.contains("host also retains bounded nested-tool results"));
         assert!(!description.contains("yield_time_ms"));
         assert!(description.contains("max_output_tokens"));
         assert!(description.contains("type: \"image\""));
         assert!(description.contains("type: \"audio\""));
         assert!(description.contains("unawaited work is discarded"));
-        assert!(description.contains("named symbol/config key"));
-        assert!(description.contains("its exact token and direct consumers"));
-        assert!(description.contains("search repo/project names only if unresolved"));
-        assert!(description.contains("never in the same batch"));
         assert!(description.contains("Prefer a purpose-built tool over shell"));
         assert!(description.contains("consolidate related read-only probes"));
-        assert!(description.contains("Mutating or unproven workspace calls are serialized"));
-        assert!(
-            description
-                .contains("independent proven-read-only workspace calls may run concurrently")
-        );
-        assert!(description.contains("shared read gate"));
-        assert!(!description.contains("workspace shell calls are serialized"));
-        assert!(!description.contains("do not launch them in parallel"));
         assert!(description.contains("merely to re-filter a result already returned"));
         assert!(description.contains("first safe useful read or action in the initial exec"));
         assert!(description.contains("skip status-only sampling"));
+        assert!(description.contains(
+            "Batch the instructions, target source, tests, and status you already know you need into one exec"
+        ));
         assert!(description.contains("project instructions already in context"));
         assert!(description.contains("loaded `AGENTS.md` contract"));
-        assert!(description.contains("reread only if marked omitted, incomplete, or stale"));
         assert!(
             description.contains("Reuse exact schemas, CLI usage, and results already in context")
         );
         assert!(description.contains("do not rediscover or guess arguments/subcommands"));
-        assert!(description.contains("Before guessing an owner ID"));
-        assert!(description.contains("use a compact ID-listing command"));
         assert!(description.contains("If absent or stale"));
         assert!(description.contains("inspect the exact schema or `--help` once before calling"));
         assert!(description.contains("Nested tools: use a present schema"));
         assert!(description.contains("`resolve_tool(name)` when the name is known"));
         assert!(description.contains("or inspect `ALL_TOOL_NAMES`"));
         assert!(description.contains("Never scan/filter/stringify/print `ALL_TOOLS`"));
-        assert!(description.contains("Read or list known paths directly in the current shell"));
+        assert!(description.contains("Read or list known paths directly"));
         assert!(description.contains("do not substitute a search or second shell"));
-        assert!(description.contains("one statically parseable content read"));
-        assert!(description.contains("omit redundant metadata probes"));
-        assert!(description.contains("Repository-wide `rg`/`rg --files` requires"));
-        assert!(description.contains("same-query narrower owner/subtree miss first"));
-        assert!(description.contains("Start scoped with a positional directory"));
-        assert!(description.contains("Never start with bare repo-root `rg --files -g ...`"));
-        assert!(description.contains("every known independent call in one exec"));
-        assert!(description.contains("each fully known multi-file edit in one patch"));
         assert!(description.contains("hard 60s default deadline"));
         assert!(description.contains("Resume only a returned session/cell ID"));
         assert!(description.contains("never duplicate a timed-out operation"));
-        assert!(!description.contains("never an operation"));
         assert!(description.contains("Honor tool contracts"));
-        assert!(description.contains("await `notify` per settlement"));
-        assert!(description.contains("use `allSettled`"));
-        assert!(description.contains("resolves after delivery; await it"));
+        assert!(description.contains("with `Promise.allSettled`"));
         assert!(description.contains("never bare `Promise.all`"));
-        assert!(description.contains("Target at most eight sampling passes"));
-        assert!(description.contains("required routing, safety, contract, test, or validation"));
+        assert!(description.contains("sequence true dependencies"));
+        assert!(description.contains("initial 10s budget"));
         assert!(description.contains("same awaited evaluation"));
-        assert!(description.contains("A tool return alone needs no sampling pass"));
         assert!(description.contains("only for a new model decision"));
+        assert!(description.contains("Run the required test as its own final command"));
+        assert!(description.contains("never mask it with `|| true`"));
+        assert!(description.contains("at most one combined diff/status check, then finish"));
         assert!(description.contains("unchanged evidence"));
         assert!(description.contains("synthesize, or stop"));
+        assert!(description.contains("never repeat the same call/poll"));
+        assert!(description.contains("change route/state"));
+        assert!(description.contains("Keep evidence bounded"));
         assert!(description.contains("relevant tables/line ranges"));
         assert!(description.contains("never whole files"));
         assert!(description.contains("concise synthesis, not raw payloads"));
         assert!(description.contains("retained-artifact selectors after truncation"));
         assert!(description.contains("Output defaults to the 10000-token hard cap"));
         assert!(description.contains("smallest useful budget"));
-        assert!(description.contains("10000-token hard cap"));
-        assert!(!description.contains("including six small calls"));
-        assert!(!description.contains("group 2-5 independent discovery calls"));
-        assert!(description.contains("Only `ALL_TOOLS` entries are callable inside `exec`"));
-        assert!(description.contains("never repeat the same call/poll"));
-        assert!(description.contains("change route/state"));
-        assert!(description.contains("Sequence true dependencies"));
-        assert!(description.contains("Keep evidence bounded"));
+        assert!(
+            description.contains("queues an extra model-visible message without yielding the cell")
+        );
+        // Retired guidance that pushed the model into wait rounds or extra
+        // sampling passes must stay out of the contract.
+        assert!(!description.contains("per settlement"));
+        assert!(!description.contains("resolves after delivery"));
+        assert!(!description.contains("sampling passes"));
+        assert!(!description.contains("Only `ALL_TOOLS` entries are callable inside `exec`"));
         assert!(!description.contains("Shared MCP Types:"));
         assert!(!description.contains("type ImageContent ="));
         assert!(!description.contains("Model projections are capped"));
-        const HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES: usize = 3_337;
+        const COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET: usize = 3_300;
         assert!(
-            EXEC_DESCRIPTION_TEMPLATE.len() * 100 <= HISTORICAL_COMMON_EXEC_DESCRIPTION_BYTES * 96,
-            "information-gain-aware batching guidance takes priority over marginal descriptor savings"
+            EXEC_DESCRIPTION_TEMPLATE.len() <= COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET,
+            "the exec contract must stay within {COMPACT_EXEC_DESCRIPTION_BYTE_BUDGET} bytes; got {}",
+            EXEC_DESCRIPTION_TEMPLATE.len()
         );
     }
 

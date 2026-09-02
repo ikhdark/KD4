@@ -502,7 +502,7 @@ impl CoreTurnHost {
         }
         self.exec
             .session
-            .inject_no_new_turn(
+            .inject_internal_no_new_turn(
                 vec![ResponseItem::CustomToolCallOutput {
                     id: None,
                     call_id,

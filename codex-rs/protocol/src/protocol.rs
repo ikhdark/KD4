@@ -2459,6 +2459,16 @@ pub struct TurnTimingModelRequest {
     /// repository paths, tool arguments, or hashes are persisted here.
     #[serde(default)]
     pub request_token_categories: Option<TurnTimingRequestTokenCategories>,
+    /// Whether this logical request exactly matched the preceding stable
+    /// prompt prefix under the same prompt-cache identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub fixed_prefix_reuse_eligible: Option<bool>,
+    /// Stable SHA-256 fingerprint of the prompt cache key sent to the provider.
+    /// The raw key is intentionally not persisted in timing diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub prompt_cache_key_fingerprint: Option<String>,
     #[serde(default)]
     #[ts(type = "number | null")]
     pub dispatch_ms: Option<u64>,
@@ -3173,8 +3183,13 @@ pub struct TurnTimingCounters {
     pub tool_output_recovery_retruncation_count: u32,
     #[serde(default)]
     pub tool_output_recursive_spill_count: u32,
+    /// Tool-result generations immediately following an observed
+    /// `read_tool_output` recovery transaction. This is independent of
+    /// whether the recovered projection was truncated again.
     #[serde(default)]
     pub attributable_recovery_generation_count: u32,
+    /// Tool-result generations immediately following provider-visible output
+    /// that actually omitted or truncated canonical tool information.
     #[serde(default)]
     pub truncation_induced_continuation_count: u32,
     pub invalid_transition_count: u32,
@@ -7077,6 +7092,10 @@ mod tests {
             item: TurnItem::CommandExecution(CommandExecutionItem {
                 id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
+                parent_call_id: None,
+                parent_cell_id: None,
+                runtime_tool_call_id: None,
+                execution_id: None,
                 command: vec!["echo".into(), "done".into()],
                 cwd: cwd.clone(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
@@ -7100,6 +7119,10 @@ mod tests {
             item: TurnItem::CommandExecution(CommandExecutionItem {
                 id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
+                parent_call_id: None,
+                parent_cell_id: None,
+                runtime_tool_call_id: None,
+                execution_id: None,
                 command: vec!["echo".into(), "done".into()],
                 cwd,
                 parsed_cmd: vec![ParsedCommand::Unknown {

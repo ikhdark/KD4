@@ -46,6 +46,7 @@ pub(crate) type SamplingRequestPolicySource = ReasoningPolicySource;
 const TURN_EFFICIENCY_TOOL_CALL_THRESHOLD: usize = 8;
 const TURN_EFFICIENCY_NEGLIGIBLE_CHILD_RUNTIME_MS_PER_CALL: u64 = 500;
 const DISTINCT_FAILURE_RECOVERY_ADVISORY_THRESHOLD: u32 = 2;
+const SUCCESSFUL_REPLAY_GATE_LIMIT: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ContinuationDisposition {
@@ -425,10 +426,48 @@ pub(crate) struct SuppressedFailureGuard {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct SuccessfulReplayGuard {
+    response: ResponseInputItem,
+}
+
+impl SuccessfulReplayGuard {
+    pub(crate) fn response_for_call(&self, call_id: &str) -> Option<ResponseInputItem> {
+        let mut response = self.response.clone();
+        match &mut response {
+            ResponseInputItem::FunctionCallOutput {
+                call_id: response_call_id,
+                ..
+            }
+            | ResponseInputItem::McpToolCallOutput {
+                call_id: response_call_id,
+                ..
+            }
+            | ResponseInputItem::CustomToolCallOutput {
+                call_id: response_call_id,
+                ..
+            }
+            | ResponseInputItem::ToolSearchOutput {
+                call_id: response_call_id,
+                ..
+            } => *response_call_id = call_id.to_string(),
+            ResponseInputItem::Message { .. } => return None,
+        }
+        Some(response)
+    }
+}
+
+#[derive(Clone, Debug)]
 struct RepeatedFailureGate {
     state_revision: String,
     action_identity: String,
     failure_fingerprint: String,
+}
+
+#[derive(Clone, Debug)]
+struct SuccessfulReplayGate {
+    state_revision: String,
+    action_identity: String,
+    response: ResponseInputItem,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -471,6 +510,7 @@ struct TurnEfficiencyGuardHandle {
 struct DeterministicDispatchLedger {
     blocked_wait_gate: Option<BlockedWaitGate>,
     repeated_failure_gate: Option<RepeatedFailureGate>,
+    successful_replay_gates: VecDeque<SuccessfulReplayGate>,
     timing: Arc<TurnTimingState>,
 }
 
@@ -479,6 +519,7 @@ impl DeterministicDispatchLedger {
         Self {
             blocked_wait_gate: None,
             repeated_failure_gate: None,
+            successful_replay_gates: VecDeque::new(),
             timing,
         }
     }
@@ -489,6 +530,11 @@ struct SamplingRequestSignalState {
     outcomes: Vec<SamplingToolOutcome>,
     structured_actions: BTreeMap<u64, StructuredActionIdentity>,
     evidence_items: BTreeMap<u64, String>,
+    successful_replay_responses: BTreeMap<u64, ResponseInputItem>,
+    validation_ordinals: BTreeSet<u64>,
+    validation_proof_ordinals: BTreeSet<u64>,
+    final_verification_ordinals: BTreeSet<u64>,
+    mutation_ordinals: BTreeSet<u64>,
     suppressed_blocked_wait: bool,
     deterministic_continuation_receipts: BTreeSet<String>,
     registered_count: usize,
@@ -505,6 +551,19 @@ struct SamplingRequestSignalState {
     code_mode_source_dependencies: BTreeMap<String, BTreeSet<SourceDependencyV1>>,
     authoritative_wait_observations: Vec<AuthoritativeWaitObservation>,
     child_runtime_ms: u64,
+    child_runtime_sample_count: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ExecutedValidationSummary {
+    pub(crate) count: u32,
+    pub(crate) duration_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FreshSuccessfulValidation {
+    observed_mutation_before_validation: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -536,6 +595,7 @@ pub(crate) struct SamplingToolCallRegistration {
     pub(crate) ordinal: u64,
     pub(crate) blocked_wait_guard: Option<BlockedWaitGuard>,
     pub(crate) suppressed_failure: Option<SuppressedFailureGuard>,
+    pub(crate) replayed_success: Option<SuccessfulReplayGuard>,
 }
 
 impl SamplingRequestSignalCollector {
@@ -562,7 +622,17 @@ impl SamplingRequestSignalCollector {
         let direct_code_mode_exec = crate::tools::code_mode::is_exec_tool_name(tool_name);
         let (action_identity, structured_action) = action_identities(tool_name, payload);
         let validation = is_validation_invocation(tool_name, payload);
-        let (blocked_wait_guard, suppressed_failure) = self
+        let validation_proof = validation && has_validation_proof_context(payload);
+        let final_verification = is_final_diff_status_invocation(tool_name, payload);
+        let mutation = is_mutation_tool(tool_name);
+        let replayable_action = structured_action.as_ref().is_some_and(|action| {
+            matches!(
+                action.class,
+                StructuredActionClass::BroadSource | StructuredActionClass::PreciseSource
+            )
+        }) || validation_proof
+            || final_verification;
+        let (blocked_wait_guard, suppressed_failure, replayed_success) = self
             .dispatch_ledger
             .as_ref()
             .map(|ledger| {
@@ -589,7 +659,23 @@ impl SamplingRequestSignalCollector {
                                 failure_fingerprint: gate.failure_fingerprint.clone(),
                             })
                     });
-                (blocked_wait_guard, suppressed_failure)
+                let replayed_success = replayable_action
+                    .then_some(structured_action.as_ref())
+                    .flatten()
+                    .and_then(|action| {
+                        ledger
+                            .successful_replay_gates
+                            .iter()
+                            .rev()
+                            .find(|gate| {
+                                gate.state_revision == self.request_state_revision
+                                    && gate.action_identity == action.identity
+                            })
+                            .map(|gate| SuccessfulReplayGuard {
+                                response: gate.response.clone(),
+                            })
+                    });
+                (blocked_wait_guard, suppressed_failure, replayed_success)
             })
             .unwrap_or_default();
 
@@ -609,8 +695,20 @@ impl SamplingRequestSignalCollector {
         }
         state.saw_artifact_read |= tool_name_matches(tool_name, "read_tool_output");
         state.saw_validation |= validation;
-        state.saw_mutation |= is_mutation_tool(tool_name);
+        state.saw_mutation |= mutation;
         state.saw_coordination |= is_coordination_tool(tool_name);
+        if validation {
+            state.validation_ordinals.insert(ordinal);
+        }
+        if validation_proof {
+            state.validation_proof_ordinals.insert(ordinal);
+        }
+        if final_verification {
+            state.final_verification_ordinals.insert(ordinal);
+        }
+        if mutation {
+            state.mutation_ordinals.insert(ordinal);
+        }
         if let Some(structured_action) = structured_action {
             state.structured_actions.insert(ordinal, structured_action);
         }
@@ -619,6 +717,7 @@ impl SamplingRequestSignalCollector {
             ordinal,
             blocked_wait_guard,
             suppressed_failure,
+            replayed_success,
         }
     }
 
@@ -642,6 +741,7 @@ impl SamplingRequestSignalCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.child_runtime_ms = state.child_runtime_ms.saturating_add(runtime_ms);
+        state.child_runtime_sample_count = state.child_runtime_sample_count.saturating_add(1);
     }
 
     fn turn_efficiency_sample(&self) -> (usize, u64) {
@@ -763,6 +863,10 @@ impl SamplingRequestSignalCollector {
         outcome.canonical_artifact_required = canonical_artifact_required;
         outcome.nested_in_code_mode = true;
         let structured_action = structured_action_identity(tool_name, payload);
+        let validation = is_validation_invocation(tool_name, payload);
+        let validation_proof = validation && has_validation_proof_context(payload);
+        let final_verification = is_final_diff_status_invocation(tool_name, payload);
+        let mutation = is_mutation_tool(tool_name);
         let evidence_identity = outcome
             .source_evidence
             .as_ref()
@@ -775,9 +879,21 @@ impl SamplingRequestSignalCollector {
         state.code_mode_nested_tool_count = state.code_mode_nested_tool_count.saturating_add(1);
         state.saw_artifact_read |= tool_name_matches(tool_name, "read_tool_output");
         state.saw_canonical_artifact_requirement |= canonical_artifact_required;
-        state.saw_validation |= is_validation_invocation(tool_name, payload);
-        state.saw_mutation |= is_mutation_tool(tool_name);
+        state.saw_validation |= validation;
+        state.saw_mutation |= mutation;
         state.saw_coordination |= is_coordination_tool(tool_name);
+        if validation {
+            state.validation_ordinals.insert(ordinal);
+        }
+        if validation_proof {
+            state.validation_proof_ordinals.insert(ordinal);
+        }
+        if final_verification {
+            state.final_verification_ordinals.insert(ordinal);
+        }
+        if mutation {
+            state.mutation_ordinals.insert(ordinal);
+        }
         if let Some(source_dependencies) = source_dependencies {
             let accumulated = state
                 .code_mode_source_dependencies
@@ -839,16 +955,33 @@ impl SamplingRequestSignalCollector {
         outcome.nested_in_code_mode = true;
         let structured_action =
             payload.and_then(|payload| structured_action_identity(tool_name, payload));
+        let validation =
+            payload.is_some_and(|payload| is_validation_invocation(tool_name, payload));
+        let validation_proof = validation && payload.is_some_and(has_validation_proof_context);
+        let final_verification =
+            payload.is_some_and(|payload| is_final_diff_status_invocation(tool_name, payload));
+        let mutation = payload.is_some_and(|_| is_mutation_tool(tool_name));
+        let coordination = payload.is_some_and(|_| is_coordination_tool(tool_name));
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.code_mode_nested_tool_count = state.code_mode_nested_tool_count.saturating_add(1);
         state.saw_artifact_read |= tool_name_matches(tool_name, "read_tool_output");
-        if let Some(payload) = payload {
-            state.saw_validation |= is_validation_invocation(tool_name, payload);
-            state.saw_mutation |= is_mutation_tool(tool_name);
-            state.saw_coordination |= is_coordination_tool(tool_name);
+        state.saw_validation |= validation;
+        state.saw_mutation |= mutation;
+        state.saw_coordination |= coordination;
+        if validation {
+            state.validation_ordinals.insert(ordinal);
+        }
+        if validation_proof {
+            state.validation_proof_ordinals.insert(ordinal);
+        }
+        if final_verification {
+            state.final_verification_ordinals.insert(ordinal);
+        }
+        if mutation {
+            state.mutation_ordinals.insert(ordinal);
         }
         if let Some(source_dependencies) = source_dependencies {
             let accumulated = state
@@ -932,11 +1065,60 @@ impl SamplingRequestSignalCollector {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let replayable = state
+            .structured_actions
+            .get(&ordinal)
+            .is_some_and(|action| {
+                matches!(
+                    action.class,
+                    StructuredActionClass::BroadSource | StructuredActionClass::PreciseSource
+                )
+            })
+            || state.validation_proof_ordinals.contains(&ordinal)
+            || state.final_verification_ordinals.contains(&ordinal);
+        if outcome.kind == SamplingToolOutcomeKind::Success
+            && replayable
+            && response_has_replayable_call_id(response)
+        {
+            state
+                .successful_replay_responses
+                .insert(ordinal, response.clone());
+        }
         state.saw_canonical_artifact_requirement |= canonical_artifact_required;
         state.outcomes.push(outcome);
         if let Some(evidence_identity) = evidence_identity {
             state.evidence_items.insert(ordinal, evidence_identity);
         }
+    }
+
+    fn successful_replay_candidates(&self) -> Vec<(String, ResponseInputItem)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let latest_mutation = state.mutation_ordinals.iter().next_back().copied();
+
+        state
+            .successful_replay_responses
+            .iter()
+            .filter(|(ordinal, _)| latest_mutation.is_none_or(|mutation| mutation <= **ordinal))
+            .filter(|(ordinal, _)| {
+                let mut outcomes = state
+                    .outcomes
+                    .iter()
+                    .filter(|outcome| outcome.ordinal == **ordinal);
+                outcomes
+                    .next()
+                    .is_some_and(|outcome| outcome.kind == SamplingToolOutcomeKind::Success)
+                    && outcomes.next().is_none()
+            })
+            .filter_map(|(ordinal, response)| {
+                state
+                    .structured_actions
+                    .get(ordinal)
+                    .map(|action| (action.identity.clone(), response.clone()))
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -1187,6 +1369,109 @@ impl SamplingRequestSignalCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .saw_validation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn executed_validation_summary(&self) -> ExecutedValidationSummary {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let executed_validation_count = state
+            .validation_ordinals
+            .iter()
+            .filter(|ordinal| {
+                state.outcomes.iter().any(|outcome| {
+                    outcome.ordinal == **ordinal
+                        && outcome.kind != SamplingToolOutcomeKind::Skipped
+                        && !outcome.failure_diagnosis_reused
+                })
+            })
+            .count();
+        let count = u32::try_from(executed_validation_count).unwrap_or(u32::MAX);
+        let completed_outcome_count = state
+            .outcomes
+            .iter()
+            .filter(|outcome| !outcome.failure_diagnosis_reused)
+            .count();
+        let duration_is_validation_only = state.child_runtime_sample_count
+            == executed_validation_count
+            && completed_outcome_count
+                == executed_validation_count.saturating_add(state.direct_code_mode_exec_count);
+
+        ExecutedValidationSummary {
+            count,
+            // Runtime samples do not carry ordinals today. Attribute their
+            // aggregate only when every timed child was an executed
+            // validation; mixed requests retain a truthful zero duration.
+            duration_ms: if duration_is_validation_only {
+                state.child_runtime_ms
+            } else {
+                0
+            },
+        }
+    }
+
+    fn fresh_successful_validation(&self) -> Option<FreshSuccessfulValidation> {
+        let allocated_ordinal_count = self.next_ordinal.load(Ordering::Acquire);
+        let allocated_count = usize::try_from(allocated_ordinal_count).ok()?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let latest_validation_ordinal = state
+            .validation_proof_ordinals
+            .iter()
+            .next_back()
+            .copied()?;
+        let outcome_ordinals = state
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.ordinal)
+            .collect::<BTreeSet<_>>();
+        let trailing_ordinal_count = allocated_ordinal_count
+            .saturating_sub(latest_validation_ordinal)
+            .saturating_sub(1);
+        let terminal_observation_is_valid = trailing_ordinal_count == 0
+            || (trailing_ordinal_count == 1
+                && latest_validation_ordinal
+                    .checked_add(1)
+                    .is_some_and(|ordinal| state.final_verification_ordinals.contains(&ordinal)));
+        if state.outcomes.len() != allocated_count
+            || outcome_ordinals.len() != allocated_count
+            || !(0..allocated_ordinal_count).all(|ordinal| outcome_ordinals.contains(&ordinal))
+            || !terminal_observation_is_valid
+            || state
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.kind != SamplingToolOutcomeKind::Success)
+            || state
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.unfinished_mutation_obligation)
+            || state.saw_canonical_artifact_requirement
+            || state.saw_coordination
+            || state.suppressed_blocked_wait
+            || !state.authoritative_wait_observations.is_empty()
+            || state
+                .validation_proof_ordinals
+                .iter()
+                .any(|ordinal| !outcome_ordinals.contains(ordinal))
+            || state
+                .mutation_ordinals
+                .range((
+                    std::ops::Bound::Excluded(latest_validation_ordinal),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .is_some()
+        {
+            return None;
+        }
+
+        Some(FreshSuccessfulValidation {
+            observed_mutation_before_validation: !state.mutation_ordinals.is_empty(),
+        })
     }
 
     fn generation_purpose(
@@ -1502,6 +1787,16 @@ fn response_evidence_identity(response: &ResponseInputItem) -> Option<String> {
     }
 }
 
+fn response_has_replayable_call_id(response: &ResponseInputItem) -> bool {
+    matches!(
+        response,
+        ResponseInputItem::FunctionCallOutput { .. }
+            | ResponseInputItem::McpToolCallOutput { .. }
+            | ResponseInputItem::CustomToolCallOutput { .. }
+            | ResponseInputItem::ToolSearchOutput { .. }
+    )
+}
+
 fn value_evidence_identity(value: &Value) -> Option<String> {
     serialized_evidence_identity(&canonicalize_json(value))
 }
@@ -1715,6 +2010,129 @@ fn is_validation_invocation(tool_name: &ToolName, payload: &ToolPayload) -> bool
     )
 }
 
+fn has_validation_proof_context(payload: &ToolPayload) -> bool {
+    let ToolPayload::Function { arguments } = payload else {
+        return false;
+    };
+    let Ok(arguments) = serde_json::from_str::<Value>(arguments) else {
+        return false;
+    };
+    if arguments.get("kind").and_then(Value::as_str) != Some("argv") {
+        return false;
+    }
+    let Some(validation) = arguments.get("validation") else {
+        return false;
+    };
+    let Ok(validation) = serde_json::from_value::<
+        codex_protocol::validation::ValidationCommandContext,
+    >(validation.clone()) else {
+        return false;
+    };
+
+    !validation.covered_paths.is_empty()
+        && validation
+            .covered_paths
+            .iter()
+            .all(|path| is_normalized_repository_relative_validation_scope(path))
+}
+
+fn is_final_diff_status_invocation(tool_name: &ToolName, payload: &ToolPayload) -> bool {
+    if !is_validation_tool(tool_name) {
+        return false;
+    }
+    let ToolPayload::Function { arguments } = payload else {
+        return false;
+    };
+    let Ok(arguments) = serde_json::from_str::<Value>(arguments) else {
+        return false;
+    };
+    let Some(script) = ["cmd", "command", "script_body"]
+        .iter()
+        .find_map(|field| arguments.get(*field).and_then(Value::as_str))
+    else {
+        return false;
+    };
+
+    final_diff_status_script_is_read_only(script)
+}
+
+fn final_diff_status_script_is_read_only(script: &str) -> bool {
+    let script = script.trim();
+    if script.is_empty()
+        || script
+            .chars()
+            .any(|character| matches!(character, '|' | '>' | '<' | '`' | '$' | '(' | ')'))
+    {
+        return false;
+    }
+
+    let without_conjunctions = script.replace("&&", ";");
+    if without_conjunctions.contains('&') {
+        return false;
+    }
+    let normalized = without_conjunctions.replace(['\r', '\n'], ";");
+    let clauses = normalized
+        .split(';')
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .collect::<Vec<_>>();
+    if clauses.len() != 2 {
+        return false;
+    }
+
+    let mut saw_diff = false;
+    let mut saw_status = false;
+    for clause in clauses {
+        let words = clause.split_whitespace().collect::<Vec<_>>();
+        if words.len() < 2 {
+            return false;
+        }
+        let program = words[0]
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(words[0])
+            .trim_end_matches(".exe")
+            .to_ascii_lowercase();
+        if program != "git" {
+            return false;
+        }
+        let subcommand = words[1].to_ascii_lowercase();
+        let has_write_capable_option = words[2..].iter().any(|argument| {
+            let argument = argument.to_ascii_lowercase();
+            matches!(argument.as_str(), "--output" | "--ext-diff" | "--textconv")
+                || argument.starts_with("--output=")
+        });
+        if has_write_capable_option {
+            return false;
+        }
+        match subcommand.as_str() {
+            "diff" if !saw_diff => saw_diff = true,
+            "status" if !saw_status => saw_status = true,
+            _ => return false,
+        }
+    }
+    saw_diff && saw_status
+}
+
+fn is_normalized_repository_relative_validation_scope(path: &str) -> bool {
+    if path == "." {
+        return true;
+    }
+    if path.is_empty()
+        || path.trim() != path
+        || path.contains('\\')
+        || path.starts_with('/')
+        || path.starts_with('~')
+        || path.ends_with('/')
+        || path.contains("//")
+        || path.as_bytes().get(1) == Some(&b':')
+    {
+        return false;
+    }
+    path.split('/')
+        .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
+}
+
 fn is_wait_tool(tool_name: &ToolName) -> bool {
     tool_name_matches(tool_name, "wait")
 }
@@ -1853,6 +2271,7 @@ pub(crate) struct SamplingReasoningGovernor {
     turn_efficiency_guard: Option<TurnEfficiencyGuardHandle>,
     turn_efficiency_tool_calls: usize,
     turn_efficiency_child_runtime_ms: u64,
+    unresolved_failure: bool,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -1892,6 +2311,7 @@ impl SamplingReasoningGovernor {
             turn_efficiency_guard: None,
             turn_efficiency_tool_calls: 0,
             turn_efficiency_child_runtime_ms: 0,
+            unresolved_failure: false,
         }
     }
 
@@ -2058,6 +2478,7 @@ impl SamplingReasoningGovernor {
 
     pub(crate) fn accepted_user_input(&mut self) {
         self.input_revision = self.input_revision.saturating_add(1);
+        self.unresolved_failure = false;
         self.reset_convergence();
         let mut ledger = self
             .dispatch_ledger
@@ -2104,6 +2525,26 @@ impl SamplingReasoningGovernor {
         settled: &SamplingRequestSettledState,
     ) -> SamplingConvergenceDecision {
         let settled_revision = self.settled_revision_key(settled);
+        if let Some(validation) = collector.fresh_successful_validation()
+            && !self.unresolved_failure
+            && self.input_revision == baselines.input_revision
+            && settled.tool_exposure_revision == baselines.tool_exposure_revision
+            && self
+                .plan
+                .as_ref()
+                .is_none_or(|plan| !plan_is_unfinished(plan))
+            && (settled.mutation_revision == baselines.mutation_revision
+                || validation.observed_mutation_before_validation)
+        {
+            self.reset_convergence();
+            self.last_state_revision = Some(settled_revision);
+            return SamplingConvergenceDecision {
+                continuation: ContinuationDisposition::TerminalCompletionRequired,
+                directive: None,
+                proven_loop_activated: false,
+                authoritative_wait: None,
+            };
+        }
         if settled.mutation_revision != baselines.mutation_revision
             || self.plan_revision != baselines.plan_revision
             || self.input_revision != baselines.input_revision
@@ -2491,9 +2932,6 @@ impl SamplingReasoningGovernor {
         collector: &SamplingRequestSignalCollector,
         settled: &SamplingRequestSettledState,
     ) {
-        if !self.enabled {
-            return;
-        }
         let outcomes = collector.snapshot();
         let latest_plan = outcomes
             .iter()
@@ -2509,6 +2947,40 @@ impl SamplingReasoningGovernor {
         if let Some(plan) = changed_plan.as_ref() {
             self.plan = Some(plan.clone());
             self.plan_revision = self.plan_revision.saturating_add(1);
+        }
+        let replay_candidates = collector.successful_replay_candidates();
+        if !replay_candidates.is_empty() {
+            let state_revision = self.settled_revision_key(settled);
+            let mut ledger = self
+                .dispatch_ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (action_identity, response) in replay_candidates {
+                ledger.successful_replay_gates.retain(|gate| {
+                    gate.state_revision != state_revision || gate.action_identity != action_identity
+                });
+                ledger
+                    .successful_replay_gates
+                    .push_back(SuccessfulReplayGate {
+                        state_revision: state_revision.clone(),
+                        action_identity,
+                        response,
+                    });
+            }
+            while ledger.successful_replay_gates.len() > SUCCESSFUL_REPLAY_GATE_LIMIT {
+                ledger.successful_replay_gates.pop_front();
+            }
+        }
+        let observed_failure = outcomes
+            .iter()
+            .any(SamplingToolOutcome::is_failure_evidence);
+        if observed_failure {
+            self.unresolved_failure = true;
+        } else if collector.fresh_successful_validation().is_some() {
+            self.unresolved_failure = false;
+        }
+        if !self.enabled {
+            return;
         }
         let saw_validation = collector.saw_validation();
         if let Some(failure) = outcomes
@@ -2905,6 +3377,63 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .saw_validation = true;
+        collector
+    }
+
+    fn record_invocation_result(
+        collector: &SamplingRequestSignalCollector,
+        tool_name: ToolName,
+        payload: ToolPayload,
+        call_id: &str,
+        outcome: ToolOutputOutcome,
+    ) {
+        let registration =
+            collector.register_deterministic_tool_call(&tool_name, &payload, call_id);
+        collector.record_response_result(
+            registration.ordinal,
+            ToolOutputOutcomeContext::new(outcome),
+            None,
+            &successful_tool_response(call_id, r#"{"status":"complete"}"#),
+            false,
+        );
+    }
+
+    fn validation_proof_payload() -> ToolPayload {
+        ToolPayload::Function {
+            arguments: serde_json::json!({
+                "kind": "argv",
+                "program": "cargo",
+                "args": ["test", "-p", "codex-core", "focused"],
+                "validation": {
+                    "covered_paths": ["codex-rs/core/src"],
+                },
+            })
+            .to_string(),
+        }
+    }
+
+    fn final_diff_status_payload() -> ToolPayload {
+        ToolPayload::Function {
+            arguments: serde_json::json!({
+                "cmd": "git diff --check && git status --short",
+            })
+            .to_string(),
+        }
+    }
+
+    fn recorded_validation_collector(
+        governor: &SamplingReasoningGovernor,
+        baselines: &SamplingRequestBaselines,
+        outcome: ToolOutputOutcome,
+    ) -> SamplingRequestSignalCollector {
+        let collector = governor.collector(baselines);
+        record_invocation_result(
+            &collector,
+            ToolName::plain("exec_command"),
+            validation_proof_payload(),
+            "validation-call",
+            outcome,
+        );
         collector
     }
 
@@ -4070,6 +4599,496 @@ mod tests {
     }
 
     #[test]
+    fn executed_validation_summary_requires_a_completed_non_skipped_result() {
+        let governor = SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines(0);
+
+        let registered_only = governor.collector(&baselines);
+        registered_only.register_deterministic_tool_call(
+            &ToolName::plain("exec_command"),
+            &ToolPayload::Function {
+                arguments: r#"{"cmd":"cargo test -p codex-core focused"}"#.to_string(),
+            },
+            "registered-only",
+        );
+        registered_only.record_child_runtime(25);
+        assert_eq!(
+            registered_only.executed_validation_summary(),
+            ExecutedValidationSummary::default()
+        );
+
+        let skipped =
+            recorded_validation_collector(&governor, &baselines, ToolOutputOutcome::Skipped);
+        skipped.record_child_runtime(50);
+        assert_eq!(
+            skipped.executed_validation_summary(),
+            ExecutedValidationSummary::default()
+        );
+
+        let completed =
+            recorded_validation_collector(&governor, &baselines, ToolOutputOutcome::Success);
+        completed.record_child_runtime(125);
+        assert_eq!(
+            completed.executed_validation_summary(),
+            ExecutedValidationSummary {
+                count: 1,
+                duration_ms: 125,
+            }
+        );
+
+        let mixed = governor.collector(&baselines);
+        record_invocation_result(
+            &mixed,
+            ToolName::plain("read_tool_output"),
+            ToolPayload::Function {
+                arguments: r#"{"artifact_id":"artifact-1"}"#.to_string(),
+            },
+            "read-call",
+            ToolOutputOutcome::Success,
+        );
+        mixed.record_child_runtime(10);
+        record_invocation_result(
+            &mixed,
+            ToolName::plain("exec_command"),
+            ToolPayload::Function {
+                arguments: r#"{"cmd":"cargo test -p codex-core focused"}"#.to_string(),
+            },
+            "mixed-validation",
+            ToolOutputOutcome::Success,
+        );
+        mixed.record_child_runtime(100);
+        assert_eq!(
+            mixed.executed_validation_summary(),
+            ExecutedValidationSummary {
+                count: 1,
+                duration_ms: 0,
+            },
+            "unkeyed child runtimes must not be attributed across a mixed request"
+        );
+    }
+
+    #[test]
+    fn fresh_successful_validation_requires_one_terminal_completion() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines(0);
+        let settled_state = settled(0);
+        let collector =
+            recorded_validation_collector(&governor, &baselines, ToolOutputOutcome::Success);
+        governor.settle(&baselines, &collector, &settled_state);
+
+        let decision = governor.evaluate_convergence(&baselines, &collector, &settled_state);
+        assert_eq!(
+            decision.continuation,
+            ContinuationDisposition::TerminalCompletionRequired
+        );
+        assert!(decision.directive.is_none());
+        assert!(!decision.proven_loop_activated);
+
+        let completion = governor
+            .continuation_generation_request(&baselines, &collector, &settled_state, false, false)
+            .require_terminal_completion();
+        assert!(completion.terminal_completion_only);
+        assert_eq!(
+            completion.purpose,
+            Some(TurnTimingGenerationPurpose::TerminalCompletionReasoning)
+        );
+        assert_eq!(
+            completion.sampling,
+            SamplingGenerationDisposition::DecisionBearing
+        );
+    }
+
+    #[test]
+    fn recognized_validation_without_explicit_scope_is_execution_not_proof() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines(0);
+        let settled_state = settled(0);
+        let collector = governor.collector(&baselines);
+        record_invocation_result(
+            &collector,
+            ToolName::plain("exec_command"),
+            ToolPayload::Function {
+                arguments: r#"{"cmd":"cargo test -p codex-core focused"}"#.to_string(),
+            },
+            "untagged-validation",
+            ToolOutputOutcome::Success,
+        );
+        collector.record_child_runtime(25);
+        governor.settle(&baselines, &collector, &settled_state);
+
+        assert_eq!(
+            collector.executed_validation_summary(),
+            ExecutedValidationSummary {
+                count: 1,
+                duration_ms: 25,
+            }
+        );
+        assert_ne!(
+            governor
+                .evaluate_convergence(&baselines, &collector, &settled_state)
+                .continuation,
+            ContinuationDisposition::TerminalCompletionRequired,
+            "recognized execution without explicit scoped metadata is not validation proof"
+        );
+    }
+
+    #[test]
+    fn validation_proof_context_requires_direct_argv_and_normalized_repo_scope() {
+        assert!(has_validation_proof_context(&validation_proof_payload()));
+
+        for arguments in [
+            serde_json::json!({
+                "cmd": "cargo test -p codex-core focused",
+                "validation": {"covered_paths": ["codex-rs/core/src"]},
+            }),
+            serde_json::json!({
+                "kind": "argv",
+                "program": "cargo",
+                "args": ["test"],
+                "validation": {"covered_paths": ["C:/repo/src"]},
+            }),
+            serde_json::json!({
+                "kind": "argv",
+                "program": "cargo",
+                "args": ["test"],
+                "validation": {"covered_paths": ["src/../src"]},
+            }),
+            serde_json::json!({
+                "kind": "argv",
+                "program": "cargo",
+                "args": ["test"],
+                "validation": {"covered_paths": []},
+            }),
+        ] {
+            assert!(!has_validation_proof_context(&ToolPayload::Function {
+                arguments: arguments.to_string(),
+            }));
+        }
+    }
+
+    #[test]
+    fn failed_skipped_or_incomplete_validation_cannot_terminalize() {
+        for outcome in [ToolOutputOutcome::Failure, ToolOutputOutcome::Skipped] {
+            let mut governor = SamplingReasoningGovernor::new(None);
+            let baselines = governor.baselines(0);
+            let settled_state = settled(0);
+            let collector = recorded_validation_collector(&governor, &baselines, outcome);
+            governor.settle(&baselines, &collector, &settled_state);
+
+            assert_ne!(
+                governor
+                    .evaluate_convergence(&baselines, &collector, &settled_state)
+                    .continuation,
+                ContinuationDisposition::TerminalCompletionRequired
+            );
+        }
+
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines(0);
+        let settled_state = settled(0);
+        let collector = governor.collector(&baselines);
+        collector.register_deterministic_tool_call(
+            &ToolName::plain("exec_command"),
+            &validation_proof_payload(),
+            "incomplete-validation",
+        );
+        governor.settle(&baselines, &collector, &settled_state);
+        assert_ne!(
+            governor
+                .evaluate_convergence(&baselines, &collector, &settled_state)
+                .continuation,
+            ContinuationDisposition::TerminalCompletionRequired
+        );
+    }
+
+    #[test]
+    fn validation_must_follow_the_last_mutation_or_observation() {
+        let mut validated_after_mutation = SamplingReasoningGovernor::new(None);
+        let baselines = validated_after_mutation.baselines(0);
+        let collector = validated_after_mutation.collector(&baselines);
+        record_invocation_result(
+            &collector,
+            ToolName::plain("apply_patch"),
+            ToolPayload::Custom {
+                input: "*** Begin Patch\n*** End Patch".to_string(),
+            },
+            "mutation-before-validation",
+            ToolOutputOutcome::Success,
+        );
+        record_invocation_result(
+            &collector,
+            ToolName::plain("exec_command"),
+            validation_proof_payload(),
+            "validation-after-mutation",
+            ToolOutputOutcome::Success,
+        );
+        let mutation_settled = settled(1);
+        validated_after_mutation.settle(&baselines, &collector, &mutation_settled);
+        assert_eq!(
+            validated_after_mutation
+                .evaluate_convergence(&baselines, &collector, &mutation_settled)
+                .continuation,
+            ContinuationDisposition::TerminalCompletionRequired
+        );
+
+        let mut mutated_after_validation = SamplingReasoningGovernor::new(None);
+        let baselines = mutated_after_validation.baselines(0);
+        let collector = mutated_after_validation.collector(&baselines);
+        record_invocation_result(
+            &collector,
+            ToolName::plain("exec_command"),
+            validation_proof_payload(),
+            "validation-before-mutation",
+            ToolOutputOutcome::Success,
+        );
+        record_invocation_result(
+            &collector,
+            ToolName::plain("apply_patch"),
+            ToolPayload::Custom {
+                input: "*** Begin Patch\n*** End Patch".to_string(),
+            },
+            "mutation-after-validation",
+            ToolOutputOutcome::Success,
+        );
+        let mutation_settled = settled(1);
+        mutated_after_validation.settle(&baselines, &collector, &mutation_settled);
+        assert_ne!(
+            mutated_after_validation
+                .evaluate_convergence(&baselines, &collector, &mutation_settled)
+                .continuation,
+            ContinuationDisposition::TerminalCompletionRequired
+        );
+
+        let mut observed_after_validation = SamplingReasoningGovernor::new(None);
+        let baselines = observed_after_validation.baselines(0);
+        let collector = recorded_validation_collector(
+            &observed_after_validation,
+            &baselines,
+            ToolOutputOutcome::Success,
+        );
+        record_invocation_result(
+            &collector,
+            ToolName::plain("read_tool_output"),
+            ToolPayload::Function {
+                arguments: r#"{"artifact_id":"artifact-1"}"#.to_string(),
+            },
+            "observation-after-validation",
+            ToolOutputOutcome::Success,
+        );
+        let settled_state = settled(0);
+        observed_after_validation.settle(&baselines, &collector, &settled_state);
+        assert_ne!(
+            observed_after_validation
+                .evaluate_convergence(&baselines, &collector, &settled_state)
+                .continuation,
+            ContinuationDisposition::TerminalCompletionRequired
+        );
+    }
+
+    #[test]
+    fn one_combined_diff_status_observation_may_follow_fresh_validation() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let baselines = governor.baselines(0);
+        let collector =
+            recorded_validation_collector(&governor, &baselines, ToolOutputOutcome::Success);
+        record_invocation_result(
+            &collector,
+            ToolName::plain("exec_command"),
+            final_diff_status_payload(),
+            "final-diff-status",
+            ToolOutputOutcome::Success,
+        );
+        let settled_state = settled(0);
+        governor.settle(&baselines, &collector, &settled_state);
+
+        assert_eq!(
+            governor
+                .evaluate_convergence(&baselines, &collector, &settled_state)
+                .continuation,
+            ContinuationDisposition::TerminalCompletionRequired
+        );
+    }
+
+    #[test]
+    fn extra_or_unsafe_final_observations_do_not_terminalize() {
+        for extra_payload in [
+            final_diff_status_payload(),
+            ToolPayload::Function {
+                arguments:
+                    r#"{"cmd":"git diff --check | Out-File result.txt; git status --short"}"#
+                        .to_string(),
+            },
+        ] {
+            let mut governor = SamplingReasoningGovernor::new(None);
+            let baselines = governor.baselines(0);
+            let collector =
+                recorded_validation_collector(&governor, &baselines, ToolOutputOutcome::Success);
+            record_invocation_result(
+                &collector,
+                ToolName::plain("exec_command"),
+                final_diff_status_payload(),
+                "first-final-observation",
+                ToolOutputOutcome::Success,
+            );
+            record_invocation_result(
+                &collector,
+                ToolName::plain("exec_command"),
+                extra_payload,
+                "extra-final-observation",
+                ToolOutputOutcome::Success,
+            );
+            let settled_state = settled(0);
+            governor.settle(&baselines, &collector, &settled_state);
+
+            assert_ne!(
+                governor
+                    .evaluate_convergence(&baselines, &collector, &settled_state)
+                    .continuation,
+                ContinuationDisposition::TerminalCompletionRequired
+            );
+        }
+        assert!(!final_diff_status_script_is_read_only(
+            "git diff --check | Out-File result.txt; git status --short"
+        ));
+        for script in [
+            "git diff --output=result.txt; git status --short",
+            "git diff --output result.txt; git status --short",
+            "git diff --ext-diff; git status --short",
+            "git diff --textconv; git status --short",
+        ] {
+            assert!(!final_diff_status_script_is_read_only(script), "{script}");
+        }
+    }
+
+    #[test]
+    fn a_fresh_validation_resolves_prior_failure_before_terminal_completion() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let failed_baselines = governor.baselines(0);
+        let failed =
+            recorded_validation_collector(&governor, &failed_baselines, ToolOutputOutcome::Failure);
+        governor.settle(&failed_baselines, &failed, &settled(0));
+        assert!(governor.unresolved_failure);
+
+        let recovery_baselines = governor.baselines(0);
+        let recovered = recorded_validation_collector(
+            &governor,
+            &recovery_baselines,
+            ToolOutputOutcome::Success,
+        );
+        governor.settle(&recovery_baselines, &recovered, &settled(0));
+        assert!(!governor.unresolved_failure);
+        assert_eq!(
+            governor
+                .evaluate_convergence(&recovery_baselines, &recovered, &settled(0))
+                .continuation,
+            ContinuationDisposition::TerminalCompletionRequired
+        );
+    }
+
+    #[test]
+    fn successful_read_replays_only_for_the_exact_unchanged_state() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "kind": "argv",
+                "program": "rg",
+                "args": ["--files", "codex-rs/core/src"],
+            })
+            .to_string(),
+        };
+        let baselines = governor.baselines(0);
+        let first = governor.collector(&baselines);
+        record_invocation_result(
+            &first,
+            ToolName::plain("exec_command"),
+            payload.clone(),
+            "first-read",
+            ToolOutputOutcome::Success,
+        );
+        governor.settle(&baselines, &first, &settled(0));
+
+        let unchanged_baselines = governor.baselines(0);
+        let unchanged = governor.collector(&unchanged_baselines);
+        let replay = unchanged.register_deterministic_tool_call(
+            &ToolName::plain("exec_command"),
+            &payload,
+            "replayed-read",
+        );
+        let replayed_response = replay
+            .replayed_success
+            .expect("unchanged read should replay")
+            .response_for_call("replayed-read")
+            .expect("replayed response should retain a call id");
+        assert!(matches!(
+            replayed_response,
+            ResponseInputItem::FunctionCallOutput { call_id, .. } if call_id == "replayed-read"
+        ));
+
+        let changed_baselines = governor.baselines(1);
+        let changed = governor.collector(&changed_baselines);
+        assert!(
+            changed
+                .register_deterministic_tool_call(
+                    &ToolName::plain("exec_command"),
+                    &payload,
+                    "changed-state-read",
+                )
+                .replayed_success
+                .is_none(),
+            "a mutation revision must invalidate read replay"
+        );
+    }
+
+    #[test]
+    fn successful_non_read_command_is_not_cached_for_replay() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        let payload = ToolPayload::Function {
+            arguments: r#"{"cmd":"echo complete"}"#.to_string(),
+        };
+        let baselines = governor.baselines(0);
+        let first = governor.collector(&baselines);
+        record_invocation_result(
+            &first,
+            ToolName::plain("exec_command"),
+            payload.clone(),
+            "first-command",
+            ToolOutputOutcome::Success,
+        );
+        governor.settle(&baselines, &first, &settled(0));
+
+        let repeated_baselines = governor.baselines(0);
+        let repeated = governor.collector(&repeated_baselines);
+        assert!(
+            repeated
+                .register_deterministic_tool_call(
+                    &ToolName::plain("exec_command"),
+                    &payload,
+                    "repeated-command",
+                )
+                .replayed_success
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unfinished_plan_blocks_fresh_validation_terminalization() {
+        let mut governor = SamplingReasoningGovernor::new(None);
+        settle_plan(&mut governor, plan(&[StepStatus::InProgress]));
+        let baselines = governor.baselines(0);
+        let settled_state = settled(0);
+        let collector =
+            recorded_validation_collector(&governor, &baselines, ToolOutputOutcome::Success);
+        governor.settle(&baselines, &collector, &settled_state);
+
+        assert_ne!(
+            governor
+                .evaluate_convergence(&baselines, &collector, &settled_state)
+                .continuation,
+            ContinuationDisposition::TerminalCompletionRequired
+        );
+    }
+
+    #[test]
     fn nested_code_mode_dependencies_are_unioned_per_cell_and_fail_closed() {
         let collector = SamplingRequestSignalCollector::default();
         let payload = ToolPayload::Function {
@@ -5230,10 +6249,13 @@ mod tests {
             registration.ordinal,
             ToolOutputOutcomeContext::new(ToolOutputOutcome::Failure),
             None,
-            &successful_tool_response(
-                "cargo-failure",
-                r#"{"failure_signature":"validation-failure-v1:stable-diagnostic"}"#,
-            ),
+            &ResponseInputItem::FunctionCallOutput {
+                call_id: "cargo-failure".to_string(),
+                output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                    r#"{"failure_signature":"validation-failure-v1:stable-diagnostic"}"#
+                        .to_string(),
+                ),
+            },
             false,
         );
 

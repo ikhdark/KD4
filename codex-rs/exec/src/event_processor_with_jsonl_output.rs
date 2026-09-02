@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandExecutionStatus;
+use codex_app_server_protocol::DynamicToolCallStatus;
 use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind;
@@ -24,6 +25,8 @@ use crate::event_processor::EventProcessor;
 use crate::event_processor::final_message_from_turn_items;
 use crate::event_processor::handle_last_message;
 use crate::exec_events::AgentMessageItem;
+use crate::exec_events::CodeModeCellItem;
+use crate::exec_events::CodeModeCellStatus;
 use crate::exec_events::CollabAgentState;
 use crate::exec_events::CollabAgentStatus;
 use crate::exec_events::CollabTool;
@@ -168,10 +171,15 @@ impl EventProcessorWithJsonOutput {
                 })
             }
             ThreadItem::CommandExecution {
+                id: call_id,
                 command,
                 aggregated_output,
                 exit_code,
                 status,
+                parent_call_id,
+                parent_cell_id,
+                runtime_tool_call_id,
+                execution_id,
                 ..
             } => Some(ExecThreadItem {
                 id: make_id(),
@@ -179,6 +187,11 @@ impl EventProcessorWithJsonOutput {
                     command,
                     aggregated_output: aggregated_output.unwrap_or_default(),
                     exit_code,
+                    call_id: Some(call_id),
+                    parent_call_id,
+                    parent_cell_id,
+                    runtime_tool_call_id,
+                    execution_id,
                     status: match status {
                         CommandExecutionStatus::InProgress => ExecCommandExecutionStatus::InProgress,
                         CommandExecutionStatus::Completed => ExecCommandExecutionStatus::Completed,
@@ -187,6 +200,26 @@ impl EventProcessorWithJsonOutput {
                     },
                 }),
             }),
+            ThreadItem::DynamicToolCall {
+                namespace: Some(namespace),
+                tool,
+                arguments,
+                status: DynamicToolCallStatus::Failed,
+                error: Some(error),
+                ..
+            } if namespace == "codex.internal" && tool == "code_mode_cell" => {
+                let call_id = arguments.get("call_id")?.as_str()?.to_string();
+                let cell_id = arguments.get("cell_id")?.as_str()?.to_string();
+                Some(ExecThreadItem {
+                    id: make_id(),
+                    details: ThreadItemDetails::CodeModeCell(CodeModeCellItem {
+                        call_id,
+                        cell_id,
+                        status: CodeModeCellStatus::Failed,
+                        error,
+                    }),
+                })
+            }
             ThreadItem::FileChange {
                 changes, status, ..
             } => Some(ExecThreadItem {

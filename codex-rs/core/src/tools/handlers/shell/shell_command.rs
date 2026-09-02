@@ -284,6 +284,7 @@ impl ShellCommandHandler {
             cancellation_token,
             tracker,
             call_id,
+            source: tool_call_source,
             payload,
             ..
         } = invocation;
@@ -500,6 +501,7 @@ impl ShellCommandHandler {
             turn_environment,
             tracker,
             call_id,
+            tool_call_source,
             track_command_mutations: true,
             attempt_key,
             repair_notice,

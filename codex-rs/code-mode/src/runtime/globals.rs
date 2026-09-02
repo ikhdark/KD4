@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use codex_code_mode_protocol::EnabledToolMetadata;
 
+use super::EnabledToolCatalog;
 use super::RuntimeState;
 use super::callbacks::clear_timeout_callback;
+use super::callbacks::console_log_callback;
 use super::callbacks::exit_callback;
 use super::callbacks::generated_image_callback;
 use super::callbacks::image_callback;
@@ -14,6 +16,15 @@ use super::callbacks::store_callback;
 use super::callbacks::text_callback;
 use super::callbacks::tool_callback;
 use super::callbacks::yield_control_callback;
+use super::value::throw_type_error;
+
+/// Bare call forms the model reaches for inside a cell. Each forwards to the
+/// `exec_command` nested tool when it is enabled; otherwise calling one throws
+/// a TypeError that names the canonical `tools.<name>(...)` form and the
+/// enabled tool names, so a single bad guess never loses the whole round.
+const EXEC_COMMAND_ALIASES: &[&str] = &["exec", "exec_command", "execTool", "shell"];
+const EXEC_COMMAND_GLOBAL_NAME: &str = "exec_command";
+const CONSOLE_METHODS: &[&str] = &["log", "info", "warn", "error", "debug"];
 
 pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
     let global = scope.get_current_context().global(scope);
@@ -55,7 +66,75 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     set_global(scope, global, "notify", notify.into())?;
     set_global(scope, global, "yield_control", yield_control.into())?;
     set_global(scope, global, "exit", exit.into())?;
+    install_tool_aliases(scope, global, &enabled_tools)?;
+    install_console_shim(scope, global)?;
     Ok(())
+}
+
+fn install_tool_aliases<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    global: v8::Local<'s, v8::Object>,
+    enabled_tools: &EnabledToolCatalog,
+) -> Result<(), String> {
+    let exec_command_index = enabled_tools.index_of(EXEC_COMMAND_GLOBAL_NAME);
+    for alias in EXEC_COMMAND_ALIASES {
+        // A real nested tool that happens to share an alias name keeps its own
+        // identity on `tools`; only free names become forwarding aliases.
+        if *alias != EXEC_COMMAND_GLOBAL_NAME && enabled_tools.index_of(alias).is_some() {
+            continue;
+        }
+        let function = match exec_command_index {
+            Some(index) => tool_function(scope, index)?,
+            None => helper_function(scope, alias, missing_exec_alias_callback)?,
+        };
+        set_global(scope, global, alias, function.into())?;
+    }
+    Ok(())
+}
+
+fn install_console_shim<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    global: v8::Local<'s, v8::Object>,
+) -> Result<(), String> {
+    let console = v8::Object::new(scope);
+    for method in CONSOLE_METHODS {
+        let function = helper_function(scope, method, console_log_callback)?;
+        let key = v8::String::new(scope, method)
+            .ok_or_else(|| format!("failed to allocate console.{method}"))?;
+        if console.set(scope, key.into(), function.into()) != Some(true) {
+            return Err(format!("failed to set console.{method}"));
+        }
+    }
+    set_global(scope, global, "console", console.into())
+}
+
+fn missing_exec_alias_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue<v8::Value>,
+) {
+    let enabled_names = scope
+        .get_slot::<RuntimeState>()
+        .map(|state| {
+            state
+                .enabled_tools
+                .tools
+                .iter()
+                .map(|tool| tool.global_name.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let listed = if enabled_names.is_empty() {
+        "(no nested tools are enabled)".to_string()
+    } else {
+        enabled_names.join(", ")
+    };
+    throw_type_error(
+        scope,
+        &format!(
+            "no `exec_command` nested tool is enabled in this cell, so `exec(...)` cannot run a command; call `await tools.<name>(...)` with one of: {listed}"
+        ),
+    );
 }
 
 fn build_all_tool_names_value<'s>(

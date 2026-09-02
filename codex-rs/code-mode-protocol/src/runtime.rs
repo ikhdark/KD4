@@ -55,6 +55,10 @@ pub enum RuntimeResponse {
         cell_id: CellId,
         content_items: Vec<FunctionCallOutputContentItem>,
     },
+    ExplicitYield {
+        cell_id: CellId,
+        content_items: Vec<FunctionCallOutputContentItem>,
+    },
     Terminated {
         cell_id: CellId,
         content_items: Vec<FunctionCallOutputContentItem>,

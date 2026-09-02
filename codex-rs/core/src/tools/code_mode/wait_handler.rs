@@ -27,10 +27,12 @@ use codex_tools::ToolSpec;
 
 use super::ExecContext;
 use super::WAIT_TOOL_NAME;
+use super::emit_failed_code_mode_cell_item;
 use super::handle_runtime_response;
 use super::wait_spec::create_wait_tool;
 
-const CANCELLED_CELL_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+const INTERRUPTED_CELL_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+const OWNER_HELD_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 pub struct CodeModeWaitHandler;
 
@@ -61,6 +63,7 @@ pub(super) struct OwnerHeldCodeModeWait {
 pub(super) struct OwnerHeldCodeModeWaitError {
     pub(super) message: String,
     pub(super) drained_observations: u32,
+    pub(super) timed_out: bool,
 }
 
 fn parse_arguments<T>(arguments: &str) -> Result<T, FunctionCallError>
@@ -95,6 +98,7 @@ impl CodeModeWaitHandler {
             session,
             step_context,
             cancellation_token,
+            call_id,
             tool_name,
             payload,
             ..
@@ -147,8 +151,8 @@ impl CodeModeWaitHandler {
                         Ok(held) => held,
                         Err(error) => {
                             record_internally_drained_waits(&exec, error.drained_observations);
-                            if cancellation_token.is_cancelled() {
-                                terminate_cancelled_cell(&exec, &cell_id).await;
+                            if error.timed_out || cancellation_token.is_cancelled() {
+                                terminate_interrupted_cell(&exec, &cell_id).await;
                             }
                             return Err(FunctionCallError::RespondToModel(error.message));
                         }
@@ -166,17 +170,28 @@ impl CodeModeWaitHandler {
                 .map_err(FunctionCallError::RespondToModel)?;
                 let authoritative_wait_signal =
                     terminal_wait_owner_signal(&wait_response, &cell_id);
+                let mut terminal_parent_call_id = None;
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response
-                    && !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. })
+                    && !matches!(
+                        response,
+                        codex_code_mode::RuntimeResponse::Yielded { .. }
+                            | codex_code_mode::RuntimeResponse::ExplicitYield { .. }
+                    )
                 {
                     // Only a live-cell wait can close a CodeCell. A missing
                     // cell is still an ordinary `wait` tool result, but there
                     // is no runtime object for the reducer to complete.
                     let runtime_cell_id = match response {
                         codex_code_mode::RuntimeResponse::Yielded { cell_id, .. }
+                        | codex_code_mode::RuntimeResponse::ExplicitYield { cell_id, .. }
                         | codex_code_mode::RuntimeResponse::Terminated { cell_id, .. }
                         | codex_code_mode::RuntimeResponse::Result { cell_id, .. } => cell_id,
                     };
+                    terminal_parent_call_id = exec
+                        .session
+                        .services
+                        .code_mode_service
+                        .cell_parent_call_id(runtime_cell_id);
                     exec.session
                         .services
                         .rollout_thread_trace
@@ -191,6 +206,12 @@ impl CodeModeWaitHandler {
                         .finish_cell_dispatch(runtime_cell_id);
                 }
                 exec.session.services.elicitations.wait_until_clear().await;
+                if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response {
+                    let parent_call_id =
+                        failed_cell_owner_call_id(terminal_parent_call_id.as_deref(), &call_id);
+                    emit_failed_code_mode_cell_item(&exec, parent_call_id, response, started_at)
+                        .await;
+                }
                 let mut output = handle_runtime_response(
                     &exec,
                     wait_response.into(),
@@ -212,12 +233,19 @@ impl CodeModeWaitHandler {
     }
 }
 
-pub(super) async fn terminate_cancelled_cell(
+fn failed_cell_owner_call_id<'a>(
+    original_exec_call_id: Option<&'a str>,
+    wait_call_id: &'a str,
+) -> &'a str {
+    original_exec_call_id.unwrap_or(wait_call_id)
+}
+
+pub(super) async fn terminate_interrupted_cell(
     exec: &ExecContext,
     cell_id: &codex_code_mode::CellId,
 ) {
     let termination = tokio::time::timeout(
-        CANCELLED_CELL_TERMINATION_GRACE,
+        INTERRUPTED_CELL_TERMINATION_GRACE,
         exec.session
             .services
             .code_mode_service
@@ -238,15 +266,15 @@ pub(super) async fn terminate_cancelled_cell(
                 turn_id = %exec.turn.sub_id,
                 runtime_cell_id = %cell_id,
                 %error,
-                "failed to terminate cancelled code mode cell"
+                "failed to terminate interrupted code mode cell"
             );
         }
         Err(_) => {
             warn!(
                 turn_id = %exec.turn.sub_id,
                 runtime_cell_id = %cell_id,
-                grace_ms = CANCELLED_CELL_TERMINATION_GRACE.as_millis(),
-                "timed out terminating cancelled code mode cell"
+                grace_ms = INTERRUPTED_CELL_TERMINATION_GRACE.as_millis(),
+                "timed out terminating interrupted code mode cell"
             );
         }
     }
@@ -273,7 +301,8 @@ fn terminal_wait_owner_signal(
                 "completed"
             }
         }
-        codex_code_mode::RuntimeResponse::Yielded { .. } => return None,
+        codex_code_mode::RuntimeResponse::Yielded { .. }
+        | codex_code_mode::RuntimeResponse::ExplicitYield { .. } => return None,
     };
     Some(serde_json::json!({
         "authoritative_wait_owner_v1": {
@@ -302,6 +331,7 @@ where
             Err(OwnerHeldCodeModeWaitError {
                 message: cancellation_message.to_string(),
                 drained_observations: 0,
+                timed_out: false,
             })
         }
         activity = next_input_activity(&mut activity_rx, &mut pending_activity) => {
@@ -319,7 +349,18 @@ where
                 .map_err(|message| OwnerHeldCodeModeWaitError {
                     message,
                     drained_observations: 0,
+                    timed_out: false,
                 })
+        }
+        _ = tokio::time::sleep(OWNER_HELD_WAIT_TIMEOUT) => {
+            Err(OwnerHeldCodeModeWaitError {
+                message: format!(
+                    "code mode cell produced no state change within {}ms",
+                    OWNER_HELD_WAIT_TIMEOUT.as_millis()
+                ),
+                drained_observations: 0,
+                timed_out: true,
+            })
         }
     }
 }
@@ -457,8 +498,8 @@ mod tests {
         }
     }
 
-    fn empty_yield(cell_id: &codex_code_mode::CellId) -> codex_code_mode::WaitOutcome {
-        codex_code_mode::WaitOutcome::LiveCell(codex_code_mode::RuntimeResponse::Yielded {
+    fn explicit_empty_yield(cell_id: &codex_code_mode::CellId) -> codex_code_mode::WaitOutcome {
+        codex_code_mode::WaitOutcome::LiveCell(codex_code_mode::RuntimeResponse::ExplicitYield {
             cell_id: cell_id.clone(),
             content_items: Vec::new(),
         })
@@ -486,7 +527,19 @@ mod tests {
             None,
             "raw code-mode output has no owner-designated completion projection"
         );
-        assert!(terminal_wait_owner_signal(&empty_yield(&cell_id), &cell_id).is_none());
+        assert!(terminal_wait_owner_signal(&explicit_empty_yield(&cell_id), &cell_id).is_none());
+    }
+
+    #[test]
+    fn failed_waited_cell_remains_owned_by_the_original_exec_call() {
+        assert_eq!(
+            failed_cell_owner_call_id(Some("outer-exec"), "synthetic-wait"),
+            "outer-exec"
+        );
+        assert_eq!(
+            failed_cell_owner_call_id(None, "standalone-wait"),
+            "standalone-wait"
+        );
     }
 
     #[tokio::test]
@@ -498,7 +551,7 @@ mod tests {
         let held = hold_until_state_change(
             || {
                 observations = observations.saturating_add(1);
-                std::future::ready(Ok(empty_yield(&cell_id)))
+                std::future::ready(Ok(explicit_empty_yield(&cell_id)))
             },
             &tokio_util::sync::CancellationToken::new(),
             activity_rx,
@@ -511,7 +564,7 @@ mod tests {
         assert!(matches!(
             held.exit,
             OwnerHeldCodeModeExit::Runtime(codex_code_mode::WaitOutcome::LiveCell(
-                codex_code_mode::RuntimeResponse::Yielded { content_items, .. }
+                codex_code_mode::RuntimeResponse::ExplicitYield { content_items, .. }
             )) if content_items.is_empty()
         ));
         assert_eq!(held.drained_observations, 0);
@@ -531,7 +584,11 @@ mod tests {
         .await;
         assert!(matches!(
             error,
-            Err(OwnerHeldCodeModeWaitError { message, drained_observations: 0 })
+            Err(OwnerHeldCodeModeWaitError {
+                message,
+                drained_observations: 0,
+                timed_out: false,
+            })
                 if message == "runtime failed"
         ));
 
@@ -548,7 +605,11 @@ mod tests {
         .await;
         assert!(matches!(
             cancelled,
-            Err(OwnerHeldCodeModeWaitError { message, drained_observations: 0 })
+            Err(OwnerHeldCodeModeWaitError {
+                message,
+                drained_observations: 0,
+                timed_out: false,
+            })
                 if message == "wait cancelled"
         ));
     }
@@ -658,14 +719,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn elapsed_five_minutes_does_not_end_held_wait() {
+    async fn held_wait_ignores_short_idle_period_but_stops_at_owner_bound() {
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let wait_cancellation = cancellation.clone();
         let (_activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
         let held = tokio::spawn(async move {
             hold_until_state_change(
                 std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>,
-                &wait_cancellation,
+                &cancellation,
                 activity_rx,
                 None,
                 "wait cancelled",
@@ -678,12 +738,84 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!held.is_finished());
 
-        cancellation.cancel();
+        tokio::time::advance(OWNER_HELD_WAIT_TIMEOUT - Duration::from_secs(5 * 60 + 1)).await;
         let error = held
             .await
             .expect("held wait task")
-            .expect_err("owner cancellation should release held wait");
-        assert_eq!(error.message, "wait cancelled");
+            .expect_err("owner timeout should release held wait");
+        assert_eq!(
+            error.message,
+            "code mode cell produced no state change within 3600000ms"
+        );
+        assert!(error.timed_out);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_timeout_reaches_the_real_code_mode_state_change_path() {
+        let service = Arc::new(crate::tools::code_mode::CodeModeService::new(Arc::new(
+            codex_code_mode::InProcessCodeModeSessionProvider,
+        )));
+        let started_cell = service
+            .execute(codex_code_mode::ExecuteRequest {
+                tool_call_id: "runtime-timeout-call".to_string(),
+                enabled_tools: Vec::new(),
+                source: "await new Promise(() => {});".to_string(),
+                yield_time_ms: Some(1),
+                max_output_tokens: None,
+            })
+            .await
+            .expect("real code-mode cell should start");
+        let cell_id = started_cell.cell_id.clone();
+        assert!(matches!(
+            started_cell
+                .initial_response()
+                .await
+                .expect("real code-mode cell should reach its initial yield"),
+            codex_code_mode::RuntimeResponse::Yielded {
+                content_items,
+                ..
+            } if content_items.is_empty()
+        ));
+
+        let wait_service = Arc::clone(&service);
+        let wait_cell_id = cell_id.clone();
+        let (_activity_tx, activity_rx) = tokio::sync::watch::channel(InputQueueActivity::Mailbox);
+        let held = tokio::spawn(async move {
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            hold_until_state_change(
+                move || {
+                    let service = Arc::clone(&wait_service);
+                    async move { service.wait_for_state_change(wait_cell_id).await }
+                },
+                &cancellation,
+                activity_rx,
+                None,
+                "wait cancelled",
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(OWNER_HELD_WAIT_TIMEOUT).await;
+        let error = held
+            .await
+            .expect("real state-change wait task")
+            .expect_err("real state-change wait should reach the owner timeout");
+        assert!(error.timed_out);
+
+        assert!(matches!(
+            service
+                .terminate(cell_id)
+                .await
+                .expect("timed-out real cell should terminate"),
+            codex_code_mode::WaitOutcome::LiveCell(
+                codex_code_mode::RuntimeResponse::Terminated { .. }
+            )
+        ));
+        service
+            .shutdown()
+            .await
+            .expect("real code-mode runtime should shut down");
     }
 
     #[test]

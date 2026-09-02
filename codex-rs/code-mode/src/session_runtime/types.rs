@@ -40,6 +40,12 @@ pub(crate) enum CellEvent {
     Yielded {
         content_items: Vec<OutputItem>,
     },
+    /// The cell explicitly requested a new model decision with
+    /// `yield_control()`. Unlike a timer-driven yield, owners must not drain
+    /// this event internally.
+    ExplicitYield {
+        content_items: Vec<OutputItem>,
+    },
     Completed {
         content_items: Vec<OutputItem>,
         error_text: Option<String>,

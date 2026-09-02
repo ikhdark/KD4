@@ -284,7 +284,7 @@ impl CellState {
                 pending_initial_yield_items: Some(content_items),
                 event,
             } if matches!(mode, ObserveMode::YieldAfter(_) | ObserveMode::StateChange) => {
-                match response_tx.send(Ok(CellEvent::Yielded { content_items })) {
+                match response_tx.send(Ok(CellEvent::ExplicitYield { content_items })) {
                     Ok(()) => {
                         *phase = CellPhase::Completed {
                             pending_initial_yield_items: None,
@@ -292,7 +292,7 @@ impl CellState {
                         };
                         ObservationDelivery::Buffered
                     }
-                    Err(Ok(CellEvent::Yielded { content_items })) => {
+                    Err(Ok(CellEvent::ExplicitYield { content_items })) => {
                         *phase = CellPhase::Completed {
                             pending_initial_yield_items: Some(content_items),
                             event,
@@ -419,6 +419,12 @@ fn prepend_initial_yield(
         CellEvent::Yielded { mut content_items } => {
             pending_initial_yield_items.append(&mut content_items);
             CellEvent::Yielded {
+                content_items: pending_initial_yield_items,
+            }
+        }
+        CellEvent::ExplicitYield { mut content_items } => {
+            pending_initial_yield_items.append(&mut content_items);
+            CellEvent::ExplicitYield {
                 content_items: pending_initial_yield_items,
             }
         }

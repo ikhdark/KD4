@@ -1770,6 +1770,7 @@ impl Session {
                 .await?;
             sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
                 .await;
+            sess.schedule_code_mode_prewarm(config.as_ref());
             let session_start_source = match &initial_history {
                 InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
                 InitialHistory::New | InitialHistory::Forked(_) => {

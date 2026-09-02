@@ -275,6 +275,22 @@ pub enum ThreadItem {
         cwd: LegacyAppPathString,
         /// Identifier for the underlying PTY process (when available).
         process_id: Option<String>,
+        /// Model-visible exec call that owns a nested code-mode command.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        parent_call_id: Option<String>,
+        /// Stable code-mode cell that issued the nested command.
+        #[serde(default, alias = "cellId", skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        parent_cell_id: Option<String>,
+        /// Runtime invocation id within the owning code-mode cell.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        runtime_tool_call_id: Option<String>,
+        /// Unique dispatch execution id used by timing and lifecycle records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        execution_id: Option<String>,
         #[serde(default)]
         source: CommandExecutionSource,
         status: CommandExecutionStatus,
@@ -791,6 +807,10 @@ impl From<CoreTurnItem> for ThreadItem {
                 command: command_display_string(&command.command),
                 cwd: command.cwd.clone().into(),
                 process_id: command.process_id,
+                parent_call_id: command.parent_call_id,
+                parent_cell_id: command.parent_cell_id,
+                runtime_tool_call_id: command.runtime_tool_call_id,
+                execution_id: command.execution_id,
                 source: command.source.into(),
                 status: command.status.into(),
                 command_actions: command_actions_for_path_uri(&command.parsed_cmd, &command.cwd),

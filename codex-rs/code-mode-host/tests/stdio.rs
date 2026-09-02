@@ -219,7 +219,8 @@ async fn execute_to_terminal(
     let mut response = started.initial_response().await.expect("initial response");
     loop {
         match response {
-            RuntimeResponse::Yielded { cell_id, .. } => {
+            RuntimeResponse::Yielded { cell_id, .. }
+            | RuntimeResponse::ExplicitYield { cell_id, .. } => {
                 response = match session
                     .wait(WaitRequest {
                         cell_id,
@@ -455,7 +456,7 @@ return;
     let running_cell_id = started.cell_id.clone();
     assert_eq!(
         started.initial_response().await.expect("initial response"),
-        RuntimeResponse::Yielded {
+        RuntimeResponse::ExplicitYield {
             cell_id: running_cell_id.clone(),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "hello world".to_string(),
@@ -628,7 +629,7 @@ try {
 }
 
 #[tokio::test]
-async fn oversized_initial_response_does_not_close_the_shared_host() {
+async fn oversized_initial_response_is_bounded_without_closing_the_shared_host() {
     let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
     );
@@ -642,13 +643,19 @@ async fn oversized_initial_response_does_not_close_the_shared_host() {
         )))
         .await
         .expect("start oversized response");
-    let error = started
-        .initial_response()
-        .await
-        .expect_err("oversized initial response should fail");
-    assert!(
-        error.contains("IPC frame limit"),
-        "unexpected error: {error}"
+    assert_eq!(
+        started
+            .initial_response()
+            .await
+            .expect("oversized output should be bounded before IPC framing"),
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "Code mode output was truncated because the cell buffered more than 64 MiB."
+                    .to_string(),
+            }],
+            error_text: None,
+        }
     );
 
     assert_eq!(

@@ -9,16 +9,82 @@ use super::RuntimeResponse;
 use super::WaitOutcome;
 use super::WaitRequest;
 use super::runtime_request;
+use crate::CodeModeNestedToolCall;
+use crate::CodeModeSessionDelegate;
 use crate::CodeModeSessionProvider;
 use crate::CodeModeToolKind;
 use crate::ExecuteRequest;
 use crate::FunctionCallOutputContentItem;
 use crate::NoopCodeModeSessionDelegate;
+use crate::NotificationFuture;
 use crate::ProcessOwnedCodeModeSessionProvider;
 use crate::ToolDefinition;
+use crate::ToolInvocationFuture;
 use crate::runtime::MAX_SESSION_STORED_VALUE_BYTES;
 use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
+use tokio_util::sync::CancellationToken;
+
+/// Answers every nested tool call with its own name and input so tests can
+/// prove which tool a call form reached.
+struct EchoDelegate;
+
+impl CodeModeSessionDelegate for EchoDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        invocation: CodeModeNestedToolCall,
+        _cancellation_token: CancellationToken,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "tool": invocation.tool_name.to_string(),
+                "input": invocation.input,
+            }))
+        })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
+fn exec_command_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "exec_command".to_string(),
+        tool_name: ToolName::plain("exec_command"),
+        description: "run a command".to_string(),
+        kind: CodeModeToolKind::Function,
+        input_schema: None,
+        output_schema: None,
+    }
+}
+
+fn result_text(response: &RuntimeResponse) -> String {
+    let RuntimeResponse::Result {
+        content_items,
+        error_text: None,
+        ..
+    } = response
+    else {
+        panic!("expected a completed cell, got {response:?}");
+    };
+    content_items
+        .iter()
+        .map(|item| match item {
+            FunctionCallOutputContentItem::InputText { text } => text.clone(),
+            other => panic!("unexpected content item {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 fn execute_request(source: &str) -> ExecuteRequest {
     ExecuteRequest {
@@ -296,13 +362,16 @@ async fn start_cell_rejects_new_cell_after_shutdown_begins() {
 }
 
 #[tokio::test]
-async fn v8_console_is_not_exposed_on_global_this() {
+async fn console_shim_forwards_to_text_instead_of_v8_console() {
     let service = InProcessCodeModeSession::new();
 
     let response = execute(
         &service,
         ExecuteRequest {
-            source: r#"text(String(Object.hasOwn(globalThis, "console")));"#.to_string(),
+            source: r#"console.log("alias", 1, { ok: true });
+console.error("bad");
+text(String(typeof console.info === "function"));"#
+                .to_string(),
             yield_time_ms: None,
             ..execute_request("")
         },
@@ -313,9 +382,108 @@ async fn v8_console_is_not_exposed_on_global_this() {
         response,
         RuntimeResponse::Result {
             cell_id: cell_id("1"),
-            content_items: vec![FunctionCallOutputContentItem::InputText {
-                text: "false".to_string(),
-            }],
+            content_items: vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: r#"alias 1 {"ok":true}"#.to_string(),
+                },
+                FunctionCallOutputContentItem::InputText {
+                    text: "bad".to_string(),
+                },
+                FunctionCallOutputContentItem::InputText {
+                    text: "true".to_string(),
+                },
+            ],
+            error_text: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn bare_exec_aliases_forward_to_the_exec_command_tool() {
+    let service = InProcessCodeModeSession::with_delegate(Arc::new(EchoDelegate));
+
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            enabled_tools: vec![exec_command_definition()],
+            source: r#"const viaExec = await exec({ cmd: "echo hi" });
+const viaBare = await exec_command("echo again");
+const viaShell = await shell({ cmd: "pwd" });
+text(JSON.stringify([viaExec, viaBare, viaShell]));"#
+                .to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&result_text(&response)).expect("alias results are JSON");
+    assert_eq!(
+        parsed,
+        serde_json::json!([
+            { "tool": "exec_command", "input": { "cmd": "echo hi" } },
+            { "tool": "exec_command", "input": "echo again" },
+            { "tool": "exec_command", "input": { "cmd": "pwd" } },
+        ])
+    );
+}
+
+#[tokio::test]
+async fn exec_alias_without_exec_command_names_the_canonical_call_form() {
+    let service = InProcessCodeModeSession::new();
+
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            source: r#"await exec("echo hi");"#.to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    let RuntimeResponse::Result {
+        error_text: Some(error_text),
+        ..
+    } = response
+    else {
+        panic!("expected a failed cell, got {response:?}");
+    };
+    assert!(error_text.contains("no `exec_command` nested tool is enabled"));
+    assert!(error_text.contains("call `await tools.<name>(...)`"));
+    assert!(error_text.contains("(no nested tools are enabled)"));
+}
+
+#[tokio::test]
+async fn completion_budget_holds_a_cell_through_output_until_it_finishes() {
+    let service = InProcessCodeModeSession::new();
+
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            source: r#"text("first");
+await new Promise((resolve) => setTimeout(resolve, 200));
+text("second");"#
+                .to_string(),
+            yield_time_ms: Some(10_000),
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "first".to_string(),
+                },
+                FunctionCallOutputContentItem::InputText {
+                    text: "second".to_string(),
+                },
+            ],
             error_text: None,
         }
     );

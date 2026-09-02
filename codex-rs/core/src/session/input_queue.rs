@@ -26,6 +26,10 @@ pub(crate) enum TurnInput {
         client_id: Option<String>,
     },
     ResponseItem(ResponseItem),
+    /// Model-visible runtime context generated inside the active turn. Unlike
+    /// user or extension steering, this must not wake owner-held operations or
+    /// force another turn solely because it is queued.
+    InternalResponseItem(ResponseItem),
     InterAgentCommunication(InterAgentCommunication),
 }
 
@@ -447,7 +451,13 @@ impl InputQueue {
         reason = "active turn checks and turn state reads must remain atomic"
     )]
     pub(crate) async fn has_pending_input(&self, active_turn: &Mutex<Option<ActiveTurn>>) -> bool {
-        if !self.startup_recovery_items.lock().await.is_empty() {
+        if self
+            .startup_recovery_items
+            .lock()
+            .await
+            .iter()
+            .any(TurnInput::requires_turn_continuation)
+        {
             return true;
         }
         let (has_turn_pending_input, accepts_mailbox_delivery) = {
@@ -456,7 +466,11 @@ impl InputQueue {
                 Some(active_turn) => {
                     let turn_state = active_turn.turn_state.lock().await;
                     (
-                        !turn_state.pending_input.items.is_empty(),
+                        turn_state
+                            .pending_input
+                            .items
+                            .iter()
+                            .any(TurnInput::requires_turn_continuation),
                         turn_state.accepts_mailbox_delivery_for_current_turn(),
                     )
                 }
@@ -485,7 +499,9 @@ fn compact_seen_mailbox_ids(mailbox: &mut MailboxState, max_seen_ids: usize) {
 fn turn_input_size_bytes(input: &TurnInput) -> usize {
     match input {
         TurnInput::UserInput { content, client_id } => serialized_size(&(content, client_id)),
-        TurnInput::ResponseItem(item) => serialized_size(item),
+        TurnInput::ResponseItem(item) | TurnInput::InternalResponseItem(item) => {
+            serialized_size(item)
+        }
         TurnInput::InterAgentCommunication(communication) => serialized_size(communication),
     }
 }
@@ -519,6 +535,12 @@ impl TurnInputQueue {
                 TurnInput::UserInput { .. } | TurnInput::ResponseItem(_)
             )
         })
+    }
+}
+
+impl TurnInput {
+    fn requires_turn_continuation(&self) -> bool {
+        !matches!(self, Self::InternalResponseItem(_))
     }
 }
 

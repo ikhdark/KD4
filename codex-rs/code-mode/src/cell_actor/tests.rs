@@ -306,7 +306,7 @@ async fn state_change_observer_wakes_on_output_after_the_completion_grace() {
     harness.task.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn state_change_observer_coalesces_output_with_imminent_completion() {
     let mut harness = spawn_cell_actor_harness(ObserveMode::StateChange);
     harness.event_tx.send(RuntimeEvent::Started).unwrap();
@@ -320,14 +320,12 @@ async fn state_change_observer_coalesces_output_with_imminent_completion() {
         })
         .unwrap();
 
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
     assert!(
-        tokio::time::timeout(
-            STATE_CHANGE_COMPLETION_GRACE / 2,
-            &mut harness.initial_event_rx,
-        )
-        .await
-        .is_err(),
-        "tool output must not force a running response before imminent completion"
+        harness.initial_event_rx.try_recv().is_err(),
+        "output must not force a running response during the completion grace"
     );
 
     harness
@@ -426,7 +424,7 @@ async fn state_change_observer_preserves_an_explicit_empty_yield() {
     harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
     assert_eq!(
         harness.initial_event_rx.await.unwrap(),
-        Ok(CellEvent::Yielded {
+        Ok(CellEvent::ExplicitYield {
             content_items: Vec::new(),
         })
     );
@@ -680,7 +678,7 @@ fn failed_completion_delivery_rebuffers_the_event() {
 }
 
 #[test]
-fn buffered_initial_yield_precedes_buffered_completion_for_yield_observer() {
+fn buffered_initial_explicit_yield_precedes_buffered_completion_for_yield_observer() {
     let cell_state = CellState::new(CancellationToken::new());
     let completion = CellEvent::Completed {
         content_items: vec![OutputItem::Text {
@@ -710,7 +708,7 @@ fn buffered_initial_yield_precedes_buffered_completion_for_yield_observer() {
     ));
     assert_eq!(
         response_rx.try_recv(),
-        Ok(Ok(CellEvent::Yielded {
+        Ok(Ok(CellEvent::ExplicitYield {
             content_items: vec![OutputItem::Text {
                 text: "before".to_string(),
             }],

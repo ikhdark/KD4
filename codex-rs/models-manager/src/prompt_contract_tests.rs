@@ -89,42 +89,22 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         ],
     },
     PromptContract {
-        id: "bounded-counted-audits",
+        id: "general-repository-discovery",
         scope: PromptScope::Gpt56,
         expectation: AnchorExpectation::All,
         anchors: &[
-            "request a specific finding count",
-            "responsible producer",
-            "reachable consumer or user-visible effect",
-            "stop broad searches",
-            "explicitly exhaustive scope",
+            "Prefer fast, scoped search",
+            "Use repository-provided discovery aids when available.",
+            "Do not repeat an unchanged lookup.",
         ],
     },
     PromptContract {
-        id: "lookup-result-reuse",
+        id: "general-tool-discipline",
         scope: PromptScope::Gpt56,
         expectation: AnchorExpectation::All,
         anchors: &[
-            "Resolve candidate paths",
-            "rg --files",
-            "Repo Atlas",
-            "repository source map",
-            "Repeat a missing-file, symbol, configuration, or test lookup only after",
-            "a relevant file changes",
-            "a new routing source is found",
-            "supplies a new name or path",
-        ],
-    },
-    PromptContract {
-        id: "evidence-batching-fixed-point",
-        scope: PromptScope::Gpt56,
-        expectation: AnchorExpectation::All,
-        anchors: &[
-            "Before each tool call, group identified independent operations",
-            "names a new path, symbol, contract, or test",
-            "contradicts the current conclusion",
-            "every grounding category above is resolved",
-            "no inspected source contradicts the conclusion",
+            "Group independent tool work.",
+            "Stop investigating when the available evidence is sufficient.",
         ],
     },
     PromptContract {
@@ -132,33 +112,25 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         scope: PromptScope::Gpt56,
         expectation: AnchorExpectation::All,
         anchors: &[
-            "Repository and skill instructions retain the authority of their source",
-            "Read every applicable `AGENTS.md`",
+            "Read every applicable AGENTS.md",
             "Resolve conflicts by authority and scope",
-            "two same-authority instructions require incompatible actions",
-            "Ask only when repository and tool evidence leaves choices",
-            "choose the reversible option",
+            "Ask only when evidence leaves choices",
+            "choose a safe, reversible option",
             "finish or persist does not expand authorization",
         ],
     },
     PromptContract {
-        id: "grounding-validation-completion",
+        id: "general-change-discipline",
         scope: PromptScope::Gpt56,
         expectation: AnchorExpectation::All,
         anchors: &[
+            "Before editing, identify the relevant owner or contract",
+            "direct callers and consumers",
+            "duplicate or generated representations",
             "Resolve each category with a source location or scoped search showing no match",
-            "contract owner, its first reachable consumer",
-            "narrowest stable boundary that proves the contract",
-            "owner unit test for self-contained logic",
-            "caller or consumer integration test for wiring",
-            "end-to-end test only when no lower boundary can prove the user-visible effect",
-            "regression test that reproduces the failure without the implementation change",
+            "Test at the narrowest stable boundary",
             "actually executes at least one relevant test through the changed path",
-            "ignored-only",
-            "assertions prove only the representation unless that representation is itself the runtime-consumed contract",
-            "answer to each requested question backed by inspected source locations",
-            "every affected representation identified during grounding",
-            "named missing permission, unresolved incompatible outcome, or external failure",
+            "Do not claim completion",
         ],
     },
     PromptContract {
@@ -166,11 +138,22 @@ const PROMPT_CONTRACTS: &[PromptContract] = &[
         scope: PromptScope::Gpt56,
         expectation: AnchorExpectation::All,
         anchors: &[
+            "Existing and newly observed changes belong to the user",
             "Preserve concurrent work",
             "Compare overlapping versions once",
-            "every affected contract and test to remain satisfied",
-            "Use the fork and official session roots named by applicable repository instructions",
-            "Do not guess or hard-code workstation paths in the global prompt.",
+            "do not discard unrelated changes",
+            "Do not hard-code machine-specific paths.",
+        ],
+    },
+    PromptContract {
+        id: "general-global-prompt",
+        scope: PromptScope::Gpt56,
+        expectation: AnchorExpectation::None,
+        anchors: &[
+            "KD4",
+            "Repo Atlas",
+            "repository source map",
+            "official session roots",
         ],
     },
     PromptContract {
@@ -271,7 +254,7 @@ fn resolved_prompts_satisfy_named_contract_registry() {
 
 #[test]
 fn gpt_5_6_family_uses_one_canonical_prompt_within_size_limit() {
-    const PROMPT_CHAR_LIMIT: usize = 12_000;
+    const PROMPT_CHAR_LIMIT: usize = 6_000;
     let response = crate::bundled_models_response().expect("bundled models.json should parse");
     let prompts = GPT_5_6_PROMPT_POLICY_SLUGS
         .iter()

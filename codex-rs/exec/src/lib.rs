@@ -106,6 +106,8 @@ pub use event_processor_with_jsonl_output::CodexStatus;
 pub use event_processor_with_jsonl_output::CollectedThreadEvents;
 pub use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
 pub use exec_events::AgentMessageItem;
+pub use exec_events::CodeModeCellItem;
+pub use exec_events::CodeModeCellStatus;
 pub use exec_events::CollabAgentState;
 pub use exec_events::CollabAgentStatus;
 pub use exec_events::CollabTool;

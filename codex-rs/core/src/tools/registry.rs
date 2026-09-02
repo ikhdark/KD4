@@ -1696,10 +1696,22 @@ struct ModelProjectionInput {
     source_dependencies: std::collections::BTreeSet<crate::tool_history::SourceDependencyV1>,
     projection_eligible: bool,
     projection_truncated: bool,
+    /// The producer, truncation, or predetermined selectors need a durable
+    /// canonical artifact regardless of output size.
+    canonical_artifact_required: bool,
     predetermined_ranges: Vec<ToolOutputProjectionRange>,
     predetermined_json_pointers: Vec<ToolOutputProjectionJsonPointer>,
     original_response: ResponseInputItem,
     materialization: ProjectionMaterialization,
+}
+
+/// Admission-only outputs below this size stay inline. A completed-tool
+/// history receipt is not materially smaller than the output it would replace,
+/// so a durable artifact there only adds I/O and misleading artifact counts.
+const LAZY_CANONICAL_ARTIFACT_MIN_BYTES: u64 = 4 * 1024;
+
+fn admission_only_artifact_is_profitable(canonical: &CanonicalToolResult) -> bool {
+    !canonical.complete || canonical.exact_bytes >= LAZY_CANONICAL_ARTIFACT_MIN_BYTES
 }
 
 tokio::task_local! {
@@ -2006,6 +2018,7 @@ fn prepare_model_projection(
         source_dependencies,
         projection_eligible: true,
         projection_truncated,
+        canonical_artifact_required: needs_canonical_artifact,
         predetermined_ranges: metadata.predetermined_ranges,
         predetermined_json_pointers: metadata.predetermined_json_pointers,
         original_response,
@@ -2490,6 +2503,7 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
         source_dependencies,
         projection_eligible,
         projection_truncated,
+        canonical_artifact_required,
         predetermined_ranges,
         predetermined_json_pointers,
         original_response,
@@ -2506,40 +2520,46 @@ async fn project_model_output(input: ModelProjectionInput) -> Option<ModelToolPr
     // Make the canonical artifact durable before spending time on the inline
     // projection. If projection later fails or is cancelled, recovery still
     // has the complete canonical output to work from.
-    let persisted_artifact = if materialization == ProjectionMaterialization::InlineCarrier {
-        None
-    } else {
-        let existing_artifact_id = essential_inline
-            .get("raw_output_artifact_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let artifact_created = existing_artifact_id.is_none();
-        let artifact = if let Some(artifact_id) = existing_artifact_id {
-            attach_canonical_output_artifact(&codex_home, &thread_id, &artifact_id, &canonical)
-                .await
-        } else {
-            create_canonical_output_artifact(&codex_home, &thread_id, &canonical).await
-        };
-        let artifact_id = artifact.artifact_id();
-        if let Some(artifact_id) = artifact_id
-            && artifact.complete
-            && artifact.retained_bytes == canonical.exact_bytes
-            && artifact.unavailable_ranges.is_empty()
-            && crate::tools::command_output_artifact::protect_active_tool_history_artifact(
-                &codex_home,
-                &thread_id,
-                &artifact_id,
-                canonical.exact_bytes,
-                &canonical.sha256,
-            )
-            .await
-            .is_ok()
-        {
-            Some((artifact, artifact_id, artifact_created))
-        } else {
+    // Small, complete admission-only outputs stay inline: nothing needs to
+    // recover them and a receipt would not be smaller than the output.
+    let lazy_inline_admission = materialization == ProjectionMaterialization::AdmissionOnly
+        && !canonical_artifact_required
+        && !admission_only_artifact_is_profitable(&canonical);
+    let persisted_artifact =
+        if materialization == ProjectionMaterialization::InlineCarrier || lazy_inline_admission {
             None
-        }
-    };
+        } else {
+            let existing_artifact_id = essential_inline
+                .get("raw_output_artifact_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let artifact_created = existing_artifact_id.is_none();
+            let artifact = if let Some(artifact_id) = existing_artifact_id {
+                attach_canonical_output_artifact(&codex_home, &thread_id, &artifact_id, &canonical)
+                    .await
+            } else {
+                create_canonical_output_artifact(&codex_home, &thread_id, &canonical).await
+            };
+            let artifact_id = artifact.artifact_id();
+            if let Some(artifact_id) = artifact_id
+                && artifact.complete
+                && artifact.retained_bytes == canonical.exact_bytes
+                && artifact.unavailable_ranges.is_empty()
+                && crate::tools::command_output_artifact::protect_active_tool_history_artifact(
+                    &codex_home,
+                    &thread_id,
+                    &artifact_id,
+                    canonical.exact_bytes,
+                    &canonical.sha256,
+                )
+                .await
+                .is_ok()
+            {
+                Some((artifact, artifact_id, artifact_created))
+            } else {
+                None
+            }
+        };
     let non_text_tokens = non_text_projection_token_cost(&preserved_content);
     let non_text_bytes = non_text_projection_byte_cost(&preserved_content);
     let preserve_non_text_content = !preserved_content.is_empty()

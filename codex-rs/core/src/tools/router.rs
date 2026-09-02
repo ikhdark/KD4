@@ -195,6 +195,10 @@ impl ToolRouter {
         }
     }
 
+    pub(crate) fn has_registered_tool(&self, name: &ToolName) -> bool {
+        self.registry.tool_exposure(name).is_some()
+    }
+
     pub(crate) fn exposure_identity(&self) -> &ToolExposureIdentity {
         &self.exposure_identity
     }

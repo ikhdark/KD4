@@ -692,6 +692,7 @@ async fn emit_failed_initial_exec_end_if_unstored(
         message,
         false,
         wall_time,
+        context.source.clone(),
         context.tracker.clone(),
     )
     .await;
@@ -928,7 +929,8 @@ impl UnifiedExecProcessManager {
                     context.turn.as_ref(),
                     &context.call_id,
                     context.tracker.as_ref(),
-                );
+                )
+                .with_call_source(&context.source);
                 let emitter = ToolEmitter::unified_exec(
                     &request.command_for_safety,
                     cwd.clone(),
@@ -964,6 +966,7 @@ impl UnifiedExecProcessManager {
                     0,
                     false,
                     wall_time,
+                    context.source.clone(),
                     context.tracker.clone(),
                 )
                 .await;
@@ -1002,7 +1005,8 @@ impl UnifiedExecProcessManager {
             context.turn.as_ref(),
             &context.call_id,
             context.tracker.as_ref(),
-        );
+        )
+        .with_call_source(&context.source);
         let emitter = ToolEmitter::unified_exec(
             &request.command_for_safety,
             cwd.clone(),
@@ -1227,6 +1231,7 @@ impl UnifiedExecProcessManager {
                 exit,
                 false,
                 wall_time,
+                context.source.clone(),
                 context.tracker.clone(),
             )
             .await;
@@ -1675,6 +1680,7 @@ impl UnifiedExecProcessManager {
             parent_tool_execution_id,
             transcript,
             started_at,
+            context.source.clone(),
             context.tracker.clone(),
             known_delta,
             known_delta_executor_started_at,

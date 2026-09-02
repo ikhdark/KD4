@@ -19,7 +19,9 @@
 
 
 ### Scope and workspace
-- Created tests must prove the direct behavior change and end to end wiring.
+- For behavior changes, add or update tests that directly exercise the changed behavior and prove it is reachable through the real integration or runtime path. A single test may prove both. Do not rely only on helper-level tests or implementation-detail assertions. For documentation-only changes, run the nearest relevant existing validation instead of creating a test.
+
+- Partial wiring of implemented code is forbidden, this is non-negotiable.
 - Ask questions for clarity before implementing.
 - Read the root `AGENTS.md` in full, and read every user-provided or user-named
   file in full.

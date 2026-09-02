@@ -11,8 +11,10 @@ use codex_tools::ToolSpec;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::CodeModeService;
 use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
+use super::emit_failed_code_mode_cell_item;
 use super::handle_runtime_response;
 use super::is_exec_tool_name;
 use super::wait_handler::OwnerHeldCodeModeExit;
@@ -20,11 +22,39 @@ use super::wait_handler::attach_drained_wait_evidence;
 use super::wait_handler::hold_until_state_change;
 use super::wait_handler::input_activity_response;
 use super::wait_handler::record_internally_drained_waits;
-use super::wait_handler::terminate_cancelled_cell;
+use super::wait_handler::terminate_interrupted_cell;
 
 pub struct CodeModeExecuteHandler {
     spec: ToolSpec,
     enabled_tools: Vec<codex_code_mode::ToolDefinition>,
+}
+
+struct CellDispatchLease<'a> {
+    service: &'a CodeModeService,
+    cell_id: codex_code_mode::CellId,
+    keep_open: bool,
+}
+
+impl<'a> CellDispatchLease<'a> {
+    fn new(service: &'a CodeModeService, cell_id: codex_code_mode::CellId) -> Self {
+        Self {
+            service,
+            cell_id,
+            keep_open: false,
+        }
+    }
+
+    fn keep_open(&mut self) {
+        self.keep_open = true;
+    }
+}
+
+impl Drop for CellDispatchLease<'_> {
+    fn drop(&mut self) {
+        if !self.keep_open {
+            self.service.finish_cell_dispatch(&self.cell_id);
+        }
+    }
 }
 
 impl CodeModeExecuteHandler {
@@ -84,16 +114,20 @@ impl CodeModeExecuteHandler {
                 tool_call_id: call_id.clone(),
                 enabled_tools: self.enabled_tools.clone(),
                 source: args.code.to_owned(),
-                // Initial observation is an immediate internal hand-off from
-                // the runtime to the code-mode owner. Subsequent observations
-                // wake on output or terminal state.
-                yield_time_ms: Some(0),
+                // Give ordinary awaited cells the runtime's completion budget.
+                // If that budget expires, the owner takes over and waits for a
+                // material state change without another model-mediated poll.
+                yield_time_ms: None,
                 max_output_tokens: args.max_output_tokens,
             })
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         let cell_id = started_cell.cell_id.clone();
         let runtime_cell_id = cell_id.to_string();
+        exec.session
+            .services
+            .code_mode_service
+            .record_cell_parent_call_id(&cell_id, &call_id);
         let code_cell_trace = exec
             .session
             .services
@@ -108,6 +142,11 @@ impl CodeModeExecuteHandler {
             .services
             .code_mode_service
             .mark_cell_ready_for_dispatch(&cell_id);
+        // Any early return after registration must release both the dispatch
+        // gate and the outer-call ownership record. A yielded live cell is the
+        // only path that deliberately transfers that lease to a later wait.
+        let mut dispatch_lease =
+            CellDispatchLease::new(&exec.session.services.code_mode_service, cell_id.clone());
         let turn_state = exec
             .session
             .input_queue
@@ -124,7 +163,7 @@ impl CodeModeExecuteHandler {
         let initial_response = tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
-                terminate_cancelled_cell(&exec, &cell_id).await;
+                terminate_interrupted_cell(&exec, &cell_id).await;
                 return Err(FunctionCallError::RespondToModel("exec cancelled".to_string()));
             }
             response = started_cell.initial_response() => {
@@ -155,8 +194,8 @@ impl CodeModeExecuteHandler {
                 Err(mut error) => {
                     error.drained_observations = error.drained_observations.saturating_add(1);
                     record_internally_drained_waits(&exec, error.drained_observations);
-                    if cancellation_token.is_cancelled() {
-                        terminate_cancelled_cell(&exec, &cell_id).await;
+                    if error.timed_out || cancellation_token.is_cancelled() {
+                        terminate_interrupted_cell(&exec, &cell_id).await;
                     }
                     return Err(FunctionCallError::RespondToModel(error.message));
                 }
@@ -184,16 +223,22 @@ impl CodeModeExecuteHandler {
         code_cell_trace.record_initial_response(&response);
         // Yielded cells keep running, so terminal lifecycle is only emitted
         // here when the first response also ended the runtime.
-        if live_cell && !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
+        let keep_dispatch_open = live_cell
+            && matches!(
+                response,
+                codex_code_mode::RuntimeResponse::Yielded { .. }
+                    | codex_code_mode::RuntimeResponse::ExplicitYield { .. }
+            );
+        if live_cell && !keep_dispatch_open {
             code_cell_trace.record_ended(&response);
-            exec.session
-                .services
-                .code_mode_service
-                .finish_cell_dispatch(&cell_id);
         }
         exec.session.services.elicitations.wait_until_clear().await;
+        emit_failed_code_mode_cell_item(&exec, &call_id, &response, started_at).await;
         let output = handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
             .map_err(FunctionCallError::RespondToModel)?;
+        if keep_dispatch_open {
+            dispatch_lease.keep_open();
+        }
         Ok(attach_drained_wait_evidence(
             &exec,
             output,
@@ -266,6 +311,9 @@ impl CoreToolRuntime for CodeModeExecuteHandler {
 
 #[cfg(test)]
 mod tests {
+    use codex_code_mode::CellId;
+    use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
+
     use super::*;
 
     #[test]
@@ -279,5 +327,40 @@ mod tests {
         assert!(definition.input_schema.is_none());
         assert!(definition.output_schema.is_none());
         assert!(definition.description.contains("exec tool declaration:"));
+    }
+
+    #[test]
+    fn dispatch_lease_cleans_parent_and_active_state_on_early_exit() {
+        let service =
+            CodeModeService::new(Arc::new(ProcessOwnedCodeModeSessionProvider::default()));
+        let cell_id = CellId::new("early-exit-cell".to_string());
+        service.record_cell_parent_call_id(&cell_id, "outer-call");
+        service.mark_cell_ready_for_dispatch(&cell_id);
+        assert!(service.dispatch_broker.has_waitable_cells());
+
+        drop(CellDispatchLease::new(&service, cell_id.clone()));
+
+        assert_eq!(service.cell_parent_call_id(&cell_id), None);
+        assert!(!service.dispatch_broker.has_waitable_cells());
+    }
+
+    #[test]
+    fn dispatch_lease_preserves_a_yielded_live_cell() {
+        let service =
+            CodeModeService::new(Arc::new(ProcessOwnedCodeModeSessionProvider::default()));
+        let cell_id = CellId::new("yielded-cell".to_string());
+        service.record_cell_parent_call_id(&cell_id, "outer-call");
+        service.mark_cell_ready_for_dispatch(&cell_id);
+
+        let mut lease = CellDispatchLease::new(&service, cell_id.clone());
+        lease.keep_open();
+        drop(lease);
+
+        assert_eq!(
+            service.cell_parent_call_id(&cell_id).as_deref(),
+            Some("outer-call")
+        );
+        assert!(service.dispatch_broker.has_waitable_cells());
+        service.finish_cell_dispatch(&cell_id);
     }
 }

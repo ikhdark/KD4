@@ -9,6 +9,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::FunctionCallError;
@@ -23,6 +24,7 @@ use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::events::ToolEmitter;
@@ -109,6 +111,7 @@ pub(super) struct RunExecLikeArgs {
     pub(super) turn_environment: TurnEnvironment,
     pub(super) tracker: crate::tools::context::SharedTurnDiffTracker,
     pub(super) call_id: String,
+    pub(super) tool_call_source: ToolCallSource,
     pub(super) track_command_mutations: bool,
     pub(super) attempt_key: Option<CommandAttemptKey>,
     pub(super) repair_notice: Option<String>,
@@ -443,6 +446,7 @@ async fn finish_validation_skip_after_begin(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,
     call_id: &str,
+    tool_call_source: &ToolCallSource,
     event_tracker: Option<&SharedTurnDiffTracker>,
     skipped: ValidationSkippedToolOutput,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
@@ -454,7 +458,8 @@ async fn finish_validation_skip_after_begin(
         turn.turn_timing_state.record_suppressed_validation_output();
     }
     let value = serde_json::to_value(&skipped).unwrap_or_default();
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), call_id, event_tracker);
+    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), call_id, event_tracker)
+        .with_call_source(tool_call_source);
     let content = emitter
         .finish(event_ctx, Err(ToolError::ValidationSkipped(skipped)), None)
         .await?;
@@ -542,6 +547,7 @@ async fn run_exec_like_with_exit_code_inner(
         turn_environment,
         tracker,
         call_id,
+        tool_call_source,
         track_command_mutations,
         attempt_key,
         repair_notice,
@@ -731,7 +737,8 @@ async fn run_exec_like_with_exit_code_inner(
     )
     .with_model_command_text(hook_command.clone());
     let event_tracker = track_command_mutations.then_some(&tracker);
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
+    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
+        .with_call_source(&tool_call_source);
     emitter.begin(event_ctx).await;
 
     // This is a preliminary resolution used only for the policy compatibility check. The runtime
@@ -847,6 +854,7 @@ async fn run_exec_like_with_exit_code_inner(
         call_id: call_id.clone(),
         tool_name,
     };
+    let validation_execution_wall_started_at = is_validation.then(Instant::now);
     let out = orchestrator
         .run(
             &mut runtime,
@@ -858,14 +866,19 @@ async fn run_exec_like_with_exit_code_inner(
         .await
         .map(|result| result.output);
     let retained_validation_attempt = runtime.take_last_validation_attempt_output();
-    let validation_attempt_started =
-        retained_validation_attempt.is_some() || runtime.take_last_validation_attempt_started();
+    let runtime_validation_attempt_started = runtime.take_last_validation_attempt_started();
+    let validation_attempt_started = is_validation
+        && !known_delta_hit
+        && (retained_validation_attempt.is_some()
+            || runtime_validation_attempt_started
+            || shell_validation_execution_output(&out, None).is_some());
     if let Some(skipped) = unexecuted_validation_skip(&out, validation_attempt_started) {
         return finish_validation_skip_after_begin(
             &emitter,
             &session,
             &turn,
             &call_id,
+            &tool_call_source,
             event_tracker,
             skipped.clone(),
         )
@@ -877,6 +890,17 @@ async fn run_exec_like_with_exit_code_inner(
         retained_validation_attempt.as_ref(),
     );
     let out = restore_retained_validation_attempt(out, retained_validation_attempt.as_ref());
+    if validation_attempt_started {
+        let duration = shell_validation_execution_output(&out, None)
+            .map(|output| output.duration)
+            .unwrap_or_else(|| {
+                validation_execution_wall_started_at
+                    .map(|started_at| started_at.elapsed())
+                    .unwrap_or_default()
+            });
+        turn.turn_timing_state
+            .record_executed_validation_duration(duration);
+    }
     if !known_delta_hit && let Some(known_delta) = known_delta.as_ref() {
         let observation = match &out {
             Ok(output) if is_complete_success(output) => {
@@ -956,7 +980,8 @@ async fn run_exec_like_with_exit_code_inner(
     let canonical_output = canonical_exec_output_bytes(&out);
     let output_bearing_result = shell_result_has_execution_output(&out);
     let tool_outcome = shell_tool_outcome(&out);
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
+    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
+        .with_call_source(&tool_call_source);
     let finish_result = emitter
         .finish(event_ctx, out, /*applied_patch_delta*/ None)
         .await;

@@ -341,6 +341,10 @@ fn runtime_response(
             cell_id: cell_id.clone(),
             content_items: content_items.into_iter().map(output_item).collect(),
         }),
+        runtime::CellEvent::ExplicitYield { content_items } => Ok(RuntimeResponse::ExplicitYield {
+            cell_id: cell_id.clone(),
+            content_items: content_items.into_iter().map(output_item).collect(),
+        }),
         runtime::CellEvent::Completed {
             content_items,
             error_text,

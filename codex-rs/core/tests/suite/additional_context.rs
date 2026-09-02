@@ -614,3 +614,89 @@ fn user_texts_without_task_model_guidance(request: &responses::ResponsesRequest)
         .filter(|text| !text.starts_with("<task_model_guidance>"))
         .collect()
 }
+
+fn task_model_guidance_texts(request: &responses::ResponsesRequest) -> Vec<String> {
+    request
+        .message_input_texts("user")
+        .into_iter()
+        .filter(|text| text.starts_with("<task_model_guidance>"))
+        .collect()
+}
+
+async fn submit_plain_user_text(
+    test: &core_test_support::test_codex::TestCodex,
+    text: &str,
+) -> Result<()> {
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: IndexMap::new(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event_match(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_)).then_some(())
+    })
+    .await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_model_guidance_is_injected_only_when_the_feature_is_enabled() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    // Default configuration: the per-turn guidance fragment stays out of the
+    // request entirely.
+    let server = start_mock_server().await;
+    let request = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| config.include_environment_context = false)
+        .build(&server)
+        .await?;
+    submit_plain_user_text(&test, "summarize the guidance policy").await?;
+    let request = request.single_request();
+    assert!(
+        task_model_guidance_texts(&request).is_empty(),
+        "guidance must be opt-in: {:?}",
+        request.message_input_texts("user")
+    );
+
+    // Opting in restores the fragment ahead of the other injected context.
+    let server = start_mock_server().await;
+    let request = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.include_environment_context = false;
+            config
+                .features
+                .enable(Feature::TaskModelGuidance)
+                .expect("test config should allow feature update");
+        })
+        .build(&server)
+        .await?;
+    submit_plain_user_text(&test, "summarize the guidance policy").await?;
+    let request = request.single_request();
+    let guidance = task_model_guidance_texts(&request);
+    assert_eq!(
+        guidance.len(),
+        1,
+        "exactly one guidance fragment per request"
+    );
+    assert!(guidance[0].contains("direct_file_read"));
+    assert!(guidance[0].ends_with("</task_model_guidance>"));
+
+    Ok(())
+}

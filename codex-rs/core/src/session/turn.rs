@@ -1494,6 +1494,7 @@ fn resets_reasoning_governor(input: &TurnInput) -> bool {
     match input {
         TurnInput::UserInput { content, .. } => !content.is_empty(),
         TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => true,
+        TurnInput::InternalResponseItem(_) => false,
     }
 }
 
@@ -1712,7 +1713,9 @@ async fn build_pure_pending_turn_plan(
         .iter()
         .filter_map(|item| match item {
             TurnInput::UserInput { content, .. } => Some(content.as_slice()),
-            TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => None,
+            TurnInput::ResponseItem(_)
+            | TurnInput::InternalResponseItem(_)
+            | TurnInput::InterAgentCommunication(_) => None,
         })
         .flatten()
         .cloned()
@@ -1901,7 +1904,15 @@ async fn build_pure_pending_turn_plan(
         None => skill_items,
     };
     let base_instructions = Arc::clone(&turn_context.base_instructions);
-    if !base_instructions_own_task_model_guidance(&base_instructions.text) {
+    // The task-model guidance fragment is opt-in: every request re-sends it
+    // and its provenance labels leak into final answers. Base instructions
+    // that own the policy never receive the duplicate either way.
+    if turn_context
+        .config
+        .features
+        .enabled(Feature::TaskModelGuidance)
+        && !base_instructions_own_task_model_guidance(&base_instructions.text)
+    {
         injection_items.insert(0, ContextualUserFragment::into(TaskModelGuidance));
     }
     injection_items.extend(recommended_plugin_items);
@@ -2301,7 +2312,9 @@ fn estimate_pending_tokens(
     let input_bytes = input.iter().fold(0usize, |bytes, item| {
         let item_bytes = match item {
             TurnInput::UserInput { content, .. } => serialized_json_len(content),
-            TurnInput::ResponseItem(item) => serialized_json_len(item),
+            TurnInput::ResponseItem(item) | TurnInput::InternalResponseItem(item) => {
+                serialized_json_len(item)
+            }
             TurnInput::InterAgentCommunication(communication) => {
                 serialized_json_len(&communication.to_model_input_item())
             }
@@ -2331,6 +2344,7 @@ fn estimate_pending_tokens(
         resolves_active_reasoning: input.iter().any(|item| match item {
             TurnInput::UserInput { .. } | TurnInput::InterAgentCommunication(_) => true,
             TurnInput::ResponseItem(item) => crate::context_manager::is_user_turn_boundary(item),
+            TurnInput::InternalResponseItem(_) => false,
         }),
     }
 }
@@ -2534,7 +2548,9 @@ async fn track_turn_resolved_config_analytics(
                 .iter()
                 .filter_map(|item| match item {
                     TurnInput::UserInput { content, .. } => Some(content.as_slice()),
-                    TurnInput::ResponseItem(_) | TurnInput::InterAgentCommunication(_) => None,
+                    TurnInput::ResponseItem(_)
+                    | TurnInput::InternalResponseItem(_)
+                    | TurnInput::InterAgentCommunication(_) => None,
                 })
                 .flatten()
                 .filter(|item| {

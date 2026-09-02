@@ -52,6 +52,8 @@ use codex_protocol::protocol::TurnTimingToolCallIdentity;
 use codex_protocol::protocol::TurnTimingToolCallSource;
 use codex_protocol::protocol::TurnTimingToolClosure;
 use codex_protocol::protocol::TurnTimingUnions;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::ResponseEvent;
 use crate::session::turn_context::TurnContext;
@@ -59,7 +61,7 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
-const TIMING_SCHEMA_VERSION: u16 = 26;
+const TIMING_SCHEMA_VERSION: u16 = 27;
 const MAX_DETERMINISTIC_CONTINUATION_RECEIPTS: usize = 64;
 const MAX_TOOL_CALL_TIMINGS: usize = 1_024;
 // These records are diagnostic histories, not the source of truth for the
@@ -511,6 +513,8 @@ impl TurnTimingSnapshot {
                     reasoning_output_tokens: request.reasoning_output_tokens,
                     token_usage: request.token_usage.clone(),
                     request_token_categories,
+                    fixed_prefix_reuse_eligible: request.fixed_prefix_reuse_eligible,
+                    prompt_cache_key_fingerprint: request.prompt_cache_key_fingerprint.clone(),
                     dispatch_ms: request
                         .dispatch_ns
                         .map(|value| public_ms(value, &mut saturation_count)),
@@ -711,6 +715,8 @@ pub(crate) struct ModelRequestTiming {
     reasoning_output_tokens: u64,
     token_usage: Option<TurnTimingProviderTokenUsage>,
     request_token_categories: Option<TurnTimingRequestTokenCategories>,
+    fixed_prefix_reuse_eligible: Option<bool>,
+    prompt_cache_key_fingerprint: Option<String>,
     dispatch_ns: Option<u128>,
     first_model_output_ns: Option<u128>,
     first_actionable_output_ns: Option<u128>,
@@ -937,7 +943,8 @@ struct TurnTimingStateInner {
     ready_to_sample_ns: Option<u128>,
     pre_first_model_output: Option<PreFirstModelOutputTiming>,
     terminalization: TurnTimingTerminalization,
-    tool_output_projection_pending_continuation: bool,
+    tool_output_truncation_pending_continuation: bool,
+    tool_output_recovery_read_pending_continuation: bool,
     deterministic_continuation_receipts:
         BTreeMap<String, TurnTimingDeterministicContinuationReceipt>,
     deterministic_continuation_receipt_overflow: u32,
@@ -1504,13 +1511,17 @@ impl TurnTimingState {
         if let Some(cause) = cause {
             state.legacy.record_continuation(cause);
         }
-        let projected_tool_output = state.tool_output_projection_pending_continuation;
-        state.tool_output_projection_pending_continuation = false;
-        if projected_tool_output && matches!(cause, Some(ContinuationCause::ToolResult)) {
+        let truncated_tool_output = state.tool_output_truncation_pending_continuation;
+        state.tool_output_truncation_pending_continuation = false;
+        let recovery_read = state.tool_output_recovery_read_pending_continuation;
+        state.tool_output_recovery_read_pending_continuation = false;
+        if truncated_tool_output && matches!(cause, Some(ContinuationCause::ToolResult)) {
             state.counters.truncation_induced_continuation_count = state
                 .counters
                 .truncation_induced_continuation_count
                 .saturating_add(1);
+        }
+        if recovery_read && matches!(cause, Some(ContinuationCause::ToolResult)) {
             state.counters.attributable_recovery_generation_count = state
                 .counters
                 .attributable_recovery_generation_count
@@ -2316,15 +2327,19 @@ impl TurnTimingState {
             .saturating_add(1);
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_executed_validation(&self, duration_ms: u64) {
+    pub(crate) fn record_executed_validation_duration(&self, duration: Duration) {
         let mut state = self.state();
         state.counters.executed_validation_count =
             state.counters.executed_validation_count.saturating_add(1);
         state.counters.executed_validation_duration_ns = state
             .counters
             .executed_validation_duration_ns
-            .saturating_add(duration_ms.saturating_mul(1_000_000));
+            .saturating_add(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_executed_validation(&self, duration_ms: u64) {
+        self.record_executed_validation_duration(Duration::from_millis(duration_ms));
     }
 
     pub(crate) fn record_suppressed_validation_output(&self) {
@@ -2401,6 +2416,30 @@ impl TurnTimingState {
         if let Some(request) = self.state().model_requests.last_mut() {
             request.request_token_categories = Some(categories);
         }
+    }
+
+    /// Records cache-reuse identity on the logical request once. HTTP retries
+    /// share that request row, so a later physical attempt must not overwrite
+    /// the eligibility observed for the original dispatch. The cache key is
+    /// persisted only as a stable SHA-256 fingerprint because callers may
+    /// supply an override containing private session metadata.
+    pub(crate) fn record_model_request_cache_identity(
+        &self,
+        fixed_prefix_reuse_eligible: bool,
+        prompt_cache_key: Option<&str>,
+    ) {
+        let mut state = self.state();
+        let Some(request) = state.model_requests.last_mut() else {
+            return;
+        };
+        if request.fixed_prefix_reuse_eligible.is_some() {
+            return;
+        }
+        request.fixed_prefix_reuse_eligible = Some(fixed_prefix_reuse_eligible);
+        request.prompt_cache_key_fingerprint = prompt_cache_key.map(|key| {
+            let digest = Sha256::digest(key.as_bytes());
+            format!("{digest:x}")
+        });
     }
 
     pub(crate) fn record_accepted_deterministic_continuation_receipts(
@@ -2539,8 +2578,8 @@ impl TurnTimingState {
             .counters
             .tool_output_omitted_section_count
             .saturating_add(omitted_sections);
-        if provider_visible {
-            state.tool_output_projection_pending_continuation = true;
+        if provider_visible && (projection_truncated || omitted_sections > 0) {
+            state.tool_output_truncation_pending_continuation = true;
         }
     }
 
@@ -2554,6 +2593,7 @@ impl TurnTimingState {
             .counters
             .tool_output_recovery_retruncation_count
             .saturating_add(retruncation_count);
+        state.tool_output_recovery_read_pending_continuation = true;
     }
 
     pub(crate) fn record_tool_output_artifact_reread(&self) {

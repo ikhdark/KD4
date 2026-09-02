@@ -64,6 +64,13 @@ pub(super) fn public_runtime_response(
             cell_id: public_cell_id_from_protocol(generation, &cell_id),
             content_items,
         },
+        RuntimeResponse::ExplicitYield {
+            cell_id,
+            content_items,
+        } => RuntimeResponse::ExplicitYield {
+            cell_id: public_cell_id_from_protocol(generation, &cell_id),
+            content_items,
+        },
         RuntimeResponse::Terminated {
             cell_id,
             content_items,
@@ -97,6 +104,7 @@ pub(super) fn public_wait_outcome(generation: u64, outcome: WaitOutcome) -> Wait
 pub(super) fn runtime_response_cell_id(response: &WireRuntimeResponse) -> &WireCellId {
     match response {
         WireRuntimeResponse::Yielded { cell_id, .. }
+        | WireRuntimeResponse::ExplicitYield { cell_id, .. }
         | WireRuntimeResponse::Terminated { cell_id, .. }
         | WireRuntimeResponse::Result { cell_id, .. } => cell_id,
     }

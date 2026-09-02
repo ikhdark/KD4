@@ -639,23 +639,7 @@ impl UnifiedExecProcess {
             Err(TryRecvError::Empty) => {}
         }
 
-        match tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, &mut exit_rx).await {
-            Ok(Ok(exit_code)) => {
-                managed.signal_exit(Some(exit_code));
-                managed.finish_termination();
-                managed.check_for_sandbox_denial().await?;
-                return Ok(managed);
-            }
-            Ok(Err(_)) => {
-                managed.signal_exit_failure(MISSING_LOCAL_EXIT_STATUS_MESSAGE.to_string());
-                managed.finish_termination();
-                return Err(UnifiedExecError::process_failed(
-                    MISSING_LOCAL_EXIT_STATUS_MESSAGE.to_string(),
-                ));
-            }
-            Err(_) => {}
-        }
-
+        let mut state_rx = managed.state_rx.clone();
         tokio::spawn({
             let managed = Arc::clone(&managed);
             async move {
@@ -667,6 +651,31 @@ impl UnifiedExecProcess {
                 }
             }
         });
+
+        match tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, async {
+            state_rx
+                .wait_for(|state| state.has_exited)
+                .await
+                .map(|_| ())
+        })
+        .await
+        {
+            Ok(Ok(())) => {
+                managed.finish_termination();
+                if let Some(message) = managed.failure_message() {
+                    return Err(UnifiedExecError::process_failed(message));
+                }
+                managed.check_for_sandbox_denial().await?;
+                return Ok(managed);
+            }
+            Ok(Err(_)) => {
+                managed.finish_termination();
+                return Err(UnifiedExecError::process_failed(
+                    MISSING_LOCAL_EXIT_STATUS_MESSAGE.to_string(),
+                ));
+            }
+            Err(_) => {}
+        }
 
         Ok(managed)
     }

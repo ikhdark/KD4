@@ -1415,7 +1415,7 @@ fn decision_latency_records_dispatch_actionable_output_and_completion() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 25);
+    assert_eq!(timing.schema_version, 27);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(25));
@@ -1530,6 +1530,27 @@ fn request_categories_reconcile_full_logical_prompt_with_provider_usage() {
     assert_eq!(categories.logical_total, 60);
     assert_eq!(categories.provider_input_tokens, Some(100));
     assert_eq!(categories.provider_reconciliation_residual, Some(40));
+}
+
+#[test]
+fn request_cache_identity_records_reuse_and_redacts_raw_key_once() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    drop(state.begin_model_request_wait());
+
+    state.record_model_request_cache_identity(true, Some("private-cache-key"));
+    state.record_model_request_cache_identity(false, Some("retry-cache-key"));
+
+    let timing = state.complete_snapshot().protocol_timing();
+    let request = &timing.model_requests[0];
+    assert_eq!(request.fixed_prefix_reuse_eligible, Some(true));
+    assert_eq!(
+        request.prompt_cache_key_fingerprint.as_deref(),
+        Some("fe058f5a51c2624acfd1804a248fe377f6a507f21f534de572efd087d6659837")
+    );
+    let serialized = serde_json::to_string(request).expect("serialize request timing");
+    assert!(!serialized.contains("private-cache-key"));
+    assert!(!serialized.contains("retry-cache-key"));
 }
 
 #[test]
@@ -2068,7 +2089,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 25);
+    assert_eq!(profile.schema_version, 27);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);
@@ -2267,7 +2288,7 @@ fn reserved_recursive_spill_counter_remains_zero_in_protocol() {
 }
 
 #[test]
-fn projected_output_counts_only_the_next_tool_result_generation_as_recovery() {
+fn truncated_projection_counts_only_the_next_tool_result_generation_as_truncation_induced() {
     let (_clock, state) = timing();
 
     let record_projection = |tokens| {
@@ -2289,8 +2310,77 @@ fn projected_output_counts_only_the_next_tool_result_generation_as_recovery() {
     let counters = state.complete_snapshot().protocol_timing().counters;
     assert_eq!(counters.tool_output_truncation_count, 4);
     assert_eq!(counters.tool_output_projected_token_count, 75);
+    assert_eq!(counters.generations_by_reason.tool_continuation, 2);
     assert_eq!(counters.truncation_induced_continuation_count, 2);
-    assert_eq!(counters.attributable_recovery_generation_count, 2);
+    assert_eq!(counters.attributable_recovery_generation_count, 0);
+}
+
+#[test]
+fn fully_visible_tool_output_does_not_count_as_truncation_recovery() {
+    let (_clock, state) = timing();
+
+    state.record_tool_output_projection_facts(400, 100, 400, 100, false, false, false, 0, true);
+    let mut pending = Some(ContinuationCause::ToolResult);
+    state.begin_model_generation(&mut pending, &SessionSource::Cli);
+
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.tool_output_projected_token_count, 100);
+    assert_eq!(counters.tool_output_truncation_count, 0);
+    assert_eq!(counters.tool_output_omitted_section_count, 0);
+    assert_eq!(counters.generations_by_reason.tool_continuation, 1);
+    assert_eq!(counters.truncation_induced_continuation_count, 0);
+    assert_eq!(counters.attributable_recovery_generation_count, 0);
+}
+
+#[test]
+fn non_provider_visible_truncation_does_not_attribute_a_recovery_generation() {
+    let (_clock, state) = timing();
+
+    state.record_tool_output_projection_facts(800, 200, 400, 100, false, false, true, 2, false);
+    let mut pending = Some(ContinuationCause::ToolResult);
+    state.begin_model_generation(&mut pending, &SessionSource::Cli);
+
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.tool_output_projection_truncation_count, 1);
+    assert_eq!(counters.tool_output_omitted_section_count, 2);
+    assert_eq!(counters.generations_by_reason.tool_continuation, 1);
+    assert_eq!(counters.truncation_induced_continuation_count, 0);
+    assert_eq!(counters.attributable_recovery_generation_count, 0);
+}
+
+#[test]
+fn observed_recovery_read_attributes_only_its_next_tool_result_generation() {
+    let (_clock, state) = timing();
+
+    state.record_tool_output_recovery(0);
+    let mut pending = Some(ContinuationCause::ToolResult);
+    state.begin_model_generation(&mut pending, &SessionSource::Cli);
+
+    let mut pending = Some(ContinuationCause::ToolResult);
+    state.begin_model_generation(&mut pending, &SessionSource::Cli);
+
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.tool_output_recovery_call_count, 1);
+    assert_eq!(counters.generations_by_reason.tool_continuation, 2);
+    assert_eq!(counters.truncation_induced_continuation_count, 0);
+    assert_eq!(counters.attributable_recovery_generation_count, 1);
+}
+
+#[test]
+fn retruncated_recovery_keeps_truncation_and_recovery_generation_attribution_distinct() {
+    let (_clock, state) = timing();
+
+    state.record_tool_output_projection_facts(800, 200, 400, 100, false, false, true, 2, true);
+    state.record_tool_output_recovery(1);
+    let mut pending = Some(ContinuationCause::ToolResult);
+    state.begin_model_generation(&mut pending, &SessionSource::Cli);
+
+    let counters = state.complete_snapshot().protocol_timing().counters;
+    assert_eq!(counters.tool_output_recovery_call_count, 1);
+    assert_eq!(counters.tool_output_recovery_retruncation_count, 1);
+    assert_eq!(counters.generations_by_reason.tool_continuation, 1);
+    assert_eq!(counters.truncation_induced_continuation_count, 1);
+    assert_eq!(counters.attributable_recovery_generation_count, 1);
 }
 
 #[test]

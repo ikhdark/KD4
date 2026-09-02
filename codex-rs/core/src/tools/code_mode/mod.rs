@@ -18,7 +18,11 @@ use codex_code_mode::CodeModeSession;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::RuntimeResponse;
+use codex_protocol::items::DynamicToolCallItem;
+use codex_protocol::items::DynamicToolCallStatus;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
@@ -63,6 +67,8 @@ pub(crate) use wait_handler::CodeModeWaitHandler;
 
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
 pub(crate) const WAIT_TOOL_NAME: &str = codex_code_mode::WAIT_TOOL_NAME;
+const FAILED_CELL_ITEM_NAMESPACE: &str = "codex.internal";
+const FAILED_CELL_ITEM_TOOL: &str = "code_mode_cell";
 
 /// Returns true for the un-namespaced code-mode `exec` tool.
 pub(crate) fn is_exec_tool_name(tool_name: &ToolName) -> bool {
@@ -80,6 +86,7 @@ pub(crate) struct CodeModeService {
     session_provider: Arc<dyn CodeModeSessionProvider>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
     packet_admission: Mutex<CodeModePacketAdmission>,
+    cell_parent_call_ids: Mutex<HashMap<String, String>>,
     shutting_down: AtomicBool,
 }
 
@@ -96,6 +103,7 @@ struct CodeModePacketMetrics {
     batchable_observation_count: usize,
     result_bytes: usize,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
+    nested_results: Vec<CodeModeNestedResultEvidence>,
     first_required_terminal: Option<CodeModeNestedTerminal>,
 }
 
@@ -106,11 +114,25 @@ struct CodeModeNestedTerminal {
     message: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct CodeModeNestedResultEvidence {
+    #[serde(skip)]
+    ordinal: usize,
+    call_id: String,
+    parent_call_id: Option<String>,
+    parent_cell_id: String,
+    runtime_tool_call_id: String,
+    tool_name: String,
+    output: String,
+    output_truncated: bool,
+}
+
 struct CodeModePacketReceipt {
     nested_call_count: usize,
     batchable_observation_count: usize,
     result_bytes: usize,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
+    nested_results: Vec<CodeModeNestedResultEvidence>,
     first_required_terminal: Option<CodeModeNestedTerminal>,
     advisory: Option<&'static str>,
 }
@@ -118,6 +140,49 @@ struct CodeModePacketReceipt {
 #[derive(Default)]
 struct JsonByteCounter {
     bytes: usize,
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    total_bytes: usize,
+    limit: usize,
+}
+
+impl BoundedJsonWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit),
+            total_bytes: 0,
+            limit,
+        }
+    }
+
+    fn finish(self) -> (String, bool) {
+        let mut bytes = self.bytes;
+        let mut truncated = self.total_bytes > bytes.len();
+        if let Err(error) = std::str::from_utf8(&bytes) {
+            bytes.truncate(error.valid_up_to());
+            truncated = true;
+        }
+        (
+            String::from_utf8(bytes).expect("validated UTF-8 prefix"),
+            truncated,
+        )
+    }
+}
+
+impl std::io::Write for BoundedJsonWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.total_bytes = self.total_bytes.saturating_add(buffer.len());
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&buffer[..buffer.len().min(remaining)]);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl std::io::Write for JsonByteCounter {
@@ -136,8 +201,21 @@ fn serialized_json_len(value: &JsonValue) -> usize {
     serde_json::to_writer(&mut counter, value).map_or(0, |()| counter.bytes)
 }
 
+fn bounded_serialized_json(value: &JsonValue) -> (String, bool) {
+    let mut writer = BoundedJsonWriter::new(MAX_RETAINED_NESTED_RESULT_BYTES);
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        return ("<nested result could not be serialized>".to_string(), false);
+    }
+    writer.finish()
+}
+
 const TINY_PACKET_RESULT_BYTES: usize = 1_024;
-const TINY_PACKET_ADVISORY: &str = "Low-density packet: on the next decision, batch every known independent read in one exec, await notify(...) per settlement, and use Promise.allSettled only to keep the cell alive. Resume only a documented live handle. If evidence is sufficient or unchanged, synthesize and stop instead of sampling or polling again.";
+const MAX_RETAINED_NESTED_RESULTS: usize = 8;
+const MAX_RETAINED_NESTED_RESULT_BYTES: usize = 4_096;
+const MAX_FAILED_CELL_ERROR_BYTES: usize = 4_096;
+const FAILED_CELL_ERROR_TRUNCATION_MARKER: &str = "\n… [truncated]";
+const APPLY_PATCH_ENVELOPE_MARKER: &str = "*** Begin Patch";
+const TINY_PACKET_ADVISORY: &str = "Low-density packet: on the next decision, batch every known independent read in one exec with Promise.allSettled and print the evidence you need with text(...). If evidence is sufficient or unchanged, synthesize and stop instead of sampling or polling again.";
 
 impl CodeModeService {
     pub(crate) fn new(session_provider: Arc<dyn CodeModeSessionProvider>) -> Self {
@@ -147,6 +225,7 @@ impl CodeModeService {
             session_provider,
             dispatch_broker,
             packet_admission: Mutex::new(CodeModePacketAdmission::default()),
+            cell_parent_call_ids: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
         }
     }
@@ -180,6 +259,17 @@ impl CodeModeService {
         .await
     }
 
+    /// Starts the code-mode host before the first turn needs it so the first
+    /// cell does not pay for isolate and host startup.
+    pub(crate) async fn prewarm(&self) -> Result<(), String> {
+        self.session().await.map(|_| ())
+    }
+
+    #[cfg(test)]
+    fn is_initialized(&self) -> bool {
+        self.session.initialized()
+    }
+
     pub(crate) async fn terminate(
         &self,
         cell_id: CellId,
@@ -208,8 +298,27 @@ impl CodeModeService {
         self.dispatch_broker.mark_cell_ready_for_dispatch(cell_id);
     }
 
+    pub(crate) fn record_cell_parent_call_id(&self, cell_id: &CellId, call_id: &str) {
+        self.cell_parent_call_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(cell_id.to_string(), call_id.to_string());
+    }
+
+    pub(crate) fn cell_parent_call_id(&self, cell_id: &CellId) -> Option<String> {
+        self.cell_parent_call_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(cell_id.as_str())
+            .cloned()
+    }
+
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
         self.dispatch_broker.close_cell(cell_id);
+        self.cell_parent_call_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(cell_id.as_str());
     }
 
     fn begin_packet_call(&self, cell_id: &CellId) -> usize {
@@ -231,6 +340,7 @@ impl CodeModeService {
         batchable_observation: bool,
         result_bytes: usize,
         post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
+        nested_result: Option<CodeModeNestedResultEvidence>,
         required_terminal: Option<(RequiredToolTerminalCause, String)>,
     ) {
         let mut admission = self
@@ -245,6 +355,19 @@ impl CodeModeService {
         metrics
             .post_tool_use_feedback
             .extend(post_tool_use_feedback);
+        if let Some(nested_result) = nested_result {
+            if metrics.nested_results.len() < MAX_RETAINED_NESTED_RESULTS {
+                metrics.nested_results.push(nested_result);
+            } else if let Some((latest_index, latest)) = metrics
+                .nested_results
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, result)| result.ordinal)
+                && nested_result.ordinal < latest.ordinal
+            {
+                metrics.nested_results[latest_index] = nested_result;
+            }
+        }
         if let Some((cause, message)) = required_terminal {
             let candidate = CodeModeNestedTerminal {
                 ordinal,
@@ -277,6 +400,7 @@ impl CodeModeService {
             result_bytes,
             post_tool_use_feedback,
             None,
+            None,
         );
     }
 
@@ -285,7 +409,10 @@ impl CodeModeService {
             .packet_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let metrics = admission.cells.remove(cell_id).unwrap_or_default();
+        let mut metrics = admission.cells.remove(cell_id).unwrap_or_default();
+        metrics
+            .nested_results
+            .sort_unstable_by_key(|result| result.ordinal);
         let tiny_read_only_packet = metrics.nested_call_count == 1
             && metrics.batchable_observation_count == 1
             && metrics.result_bytes <= TINY_PACKET_RESULT_BYTES;
@@ -304,6 +431,7 @@ impl CodeModeService {
             batchable_observation_count: metrics.batchable_observation_count,
             result_bytes: metrics.result_bytes,
             post_tool_use_feedback: metrics.post_tool_use_feedback,
+            nested_results: metrics.nested_results,
             first_required_terminal: metrics.first_required_terminal,
             advisory,
         }
@@ -416,9 +544,15 @@ pub(super) fn handle_runtime_response(
         batchable_observation_count = packet.batchable_observation_count,
         result_bytes = packet.result_bytes,
         post_tool_use_feedback_count = packet.post_tool_use_feedback.len(),
+        retained_nested_result_count = packet.nested_results.len(),
         low_density_advisory = packet.advisory.is_some(),
         "code-mode packet admission receipt"
     );
+    let nested_results = if response_needs_retained_nested_results(&response) {
+        packet.nested_results
+    } else {
+        Vec::new()
+    };
     let mut output = format_runtime_response(
         response,
         max_output_tokens,
@@ -426,6 +560,7 @@ pub(super) fn handle_runtime_response(
         original_image_detail_supported,
         started_at,
         packet.post_tool_use_feedback,
+        nested_results,
     );
     if let Some(required_terminal) = packet.first_required_terminal {
         output = fold_nested_required_terminal(output, required_terminal);
@@ -436,6 +571,72 @@ pub(super) fn handle_runtime_response(
         });
     }
     Ok(output)
+}
+
+fn failed_code_mode_cell_item(
+    call_id: &str,
+    response: &RuntimeResponse,
+    duration: Duration,
+) -> Option<DynamicToolCallItem> {
+    let (cell_id, error) = match response {
+        RuntimeResponse::Result {
+            cell_id,
+            error_text: Some(error),
+            ..
+        } => (cell_id.as_str(), bounded_failed_cell_error(error)),
+        RuntimeResponse::Terminated { cell_id, .. } => (
+            cell_id.as_str(),
+            "code-mode cell terminated before completion".to_string(),
+        ),
+        RuntimeResponse::Yielded { .. }
+        | RuntimeResponse::ExplicitYield { .. }
+        | RuntimeResponse::Result {
+            error_text: None, ..
+        } => return None,
+    };
+
+    Some(DynamicToolCallItem {
+        id: format!("code-mode-cell:{cell_id}"),
+        namespace: Some(FAILED_CELL_ITEM_NAMESPACE.to_string()),
+        tool: FAILED_CELL_ITEM_TOOL.to_string(),
+        arguments: serde_json::json!({
+            "call_id": call_id,
+            "cell_id": cell_id,
+        }),
+        status: DynamicToolCallStatus::Failed,
+        content_items: None,
+        success: Some(false),
+        error: Some(error),
+        duration: Some(duration),
+    })
+}
+
+fn bounded_failed_cell_error(error: &str) -> String {
+    if error.len() <= MAX_FAILED_CELL_ERROR_BYTES {
+        return error.to_string();
+    }
+
+    let content_limit =
+        MAX_FAILED_CELL_ERROR_BYTES.saturating_sub(FAILED_CELL_ERROR_TRUNCATION_MARKER.len());
+    let mut end = content_limit.min(error.len());
+    while end > 0 && !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &error[..end], FAILED_CELL_ERROR_TRUNCATION_MARKER)
+}
+
+pub(super) async fn emit_failed_code_mode_cell_item(
+    exec: &ExecContext,
+    call_id: &str,
+    response: &RuntimeResponse,
+    started_at: std::time::Instant,
+) {
+    let Some(item) = failed_code_mode_cell_item(call_id, response, started_at.elapsed()) else {
+        return;
+    };
+    exec.session
+        .emit_turn_item_completed(exec.turn.as_ref(), TurnItem::DynamicToolCall(item))
+        .await;
 }
 
 fn fold_nested_required_terminal(
@@ -485,9 +686,38 @@ fn required_nested_tool_terminal_cause(
 fn runtime_response_cell_id(response: &RuntimeResponse) -> &str {
     match response {
         RuntimeResponse::Yielded { cell_id, .. }
+        | RuntimeResponse::ExplicitYield { cell_id, .. }
         | RuntimeResponse::Terminated { cell_id, .. }
         | RuntimeResponse::Result { cell_id, .. } => cell_id.as_str(),
     }
+}
+
+fn response_needs_retained_nested_results(response: &RuntimeResponse) -> bool {
+    match response {
+        RuntimeResponse::Yielded { content_items, .. }
+        | RuntimeResponse::ExplicitYield { content_items, .. }
+        | RuntimeResponse::Terminated { content_items, .. } => content_items.is_empty(),
+        RuntimeResponse::Result {
+            content_items,
+            error_text,
+            ..
+        } => error_text.is_some() || content_items.is_empty(),
+    }
+}
+
+fn nested_result_content_items(
+    nested_results: Vec<CodeModeNestedResultEvidence>,
+) -> Vec<FunctionCallOutputContentItem> {
+    nested_results
+        .into_iter()
+        .map(|result| {
+            let encoded = serde_json::to_string(&result)
+                .unwrap_or_else(|_| "{\"output\":\"<unavailable>\"}".to_string());
+            FunctionCallOutputContentItem::InputText {
+                text: format!("Nested tool result:\n{encoded}"),
+            }
+        })
+        .collect()
 }
 
 fn format_runtime_response(
@@ -497,45 +727,52 @@ fn format_runtime_response(
     original_image_detail_supported: bool,
     started_at: std::time::Instant,
     post_tool_use_feedback: Vec<FunctionCallOutputContentItem>,
+    nested_results: Vec<CodeModeNestedResultEvidence>,
 ) -> FunctionToolOutput {
     let continuation_owner_key = match &response {
         RuntimeResponse::Yielded { cell_id, .. }
+        | RuntimeResponse::ExplicitYield { cell_id, .. }
         | RuntimeResponse::Terminated { cell_id, .. }
         | RuntimeResponse::Result { cell_id, .. } => cell_id.to_string(),
     };
     let script_status = format_script_status(&response);
-    let yielded = matches!(&response, RuntimeResponse::Yielded { .. });
-    let (mut content_items, outcome, success) = match response {
-        RuntimeResponse::Yielded { content_items, .. } => {
+    let yielded = matches!(
+        &response,
+        RuntimeResponse::Yielded { .. } | RuntimeResponse::ExplicitYield { .. }
+    );
+    let (mut content_items, outcome, success, script_error) = match response {
+        RuntimeResponse::Yielded { content_items, .. }
+        | RuntimeResponse::ExplicitYield { content_items, .. } => {
             let content_items = into_function_call_output_content_items(content_items);
-            (content_items, OutputOutcome::Success, true)
+            (content_items, OutputOutcome::Success, true, None)
         }
         RuntimeResponse::Terminated { content_items, .. } => {
             let content_items = into_function_call_output_content_items(content_items);
-            (content_items, OutputOutcome::Failure, false)
+            (content_items, OutputOutcome::Failure, false, None)
         }
         RuntimeResponse::Result {
             content_items,
             error_text,
             ..
         } => {
-            let mut content_items = into_function_call_output_content_items(content_items);
+            let content_items = into_function_call_output_content_items(content_items);
             let success = error_text.is_none();
-            if let Some(error_text) = error_text {
-                content_items.push(FunctionCallOutputContentItem::InputText {
-                    text: format!("Script error:\n{error_text}"),
-                });
-            }
             let outcome = if success {
                 OutputOutcome::Success
             } else {
                 OutputOutcome::Failure
             };
-            (content_items, outcome, success)
+            (content_items, outcome, success, error_text)
         }
     };
 
+    content_items.extend(nested_result_content_items(nested_results));
     content_items.extend(post_tool_use_feedback);
+    if let Some(error_text) = script_error {
+        content_items.push(FunctionCallOutputContentItem::InputText {
+            text: format!("Script error:\n{error_text}"),
+        });
+    }
     sanitize_image_detail_items(original_image_detail_supported, &mut content_items);
     let mut canonical_content_items = content_items.clone();
     let mut content_items =
@@ -571,12 +808,21 @@ fn format_script_status(response: &RuntimeResponse) -> String {
         RuntimeResponse::Yielded { cell_id, .. } => {
             format!("Script running with cell ID {cell_id}")
         }
-        RuntimeResponse::Terminated { .. } => "Script terminated".to_string(),
-        RuntimeResponse::Result { error_text, .. } => {
+        RuntimeResponse::ExplicitYield { cell_id, .. } => {
+            format!("Script running with cell ID {cell_id} after explicit yield")
+        }
+        RuntimeResponse::Terminated { cell_id, .. } => {
+            format!("Script terminated with cell ID {cell_id}")
+        }
+        RuntimeResponse::Result {
+            cell_id,
+            error_text,
+            ..
+        } => {
             if error_text.is_none() {
-                "Script completed".to_string()
+                format!("Script completed with cell ID {cell_id}")
             } else {
-                "Script failed".to_string()
+                format!("Script failed with cell ID {cell_id}")
             }
         }
     }
@@ -699,6 +945,7 @@ async fn call_nested_tool(
                 false,
                 0,
                 Vec::new(),
+                None,
                 Some((RequiredToolTerminalCause::Failure, message.clone())),
             );
         return Err(FunctionCallError::RespondToModel(message));
@@ -722,15 +969,45 @@ async fn call_nested_tool(
                     false,
                     0,
                     Vec::new(),
+                    None,
                     Some((RequiredToolTerminalCause::Failure, error.clone())),
                 );
             return Err(FunctionCallError::RespondToModel(error));
         }
     };
+    if let Some(message) = wrapped_patch_rejection(
+        &tool_name,
+        &payload,
+        tool_runtime.has_registered_tool(&ToolName::plain("apply_patch")),
+    ) {
+        tool_runtime.record_code_mode_failure(
+            cell_id.as_str(),
+            &tool_name,
+            Some(&payload),
+            nested_failure_fingerprint(&tool_name, &message),
+        );
+        exec.session
+            .services
+            .code_mode_service
+            .complete_packet_call(
+                &cell_id,
+                packet_ordinal,
+                false,
+                0,
+                Vec::new(),
+                None,
+                Some((RequiredToolTerminalCause::Failure, message.clone())),
+            );
+        return Err(FunctionCallError::RespondToModel(message));
+    }
 
+    let nested_call_id = format!(
+        "{PUBLIC_TOOL_NAME}-{}-{runtime_tool_call_id}",
+        cell_id.as_str()
+    );
     let call = ToolCall {
         tool_name: tool_name.clone(),
-        call_id: format!("{PUBLIC_TOOL_NAME}-{}", uuid::Uuid::new_v4()),
+        call_id: nested_call_id.clone(),
         payload: payload.clone(),
     };
     let result = tool_runtime
@@ -740,7 +1017,7 @@ async fn call_nested_tool(
             ToolCallSource::CodeMode {
                 cell_id: cell_id.to_string(),
                 parent_call_id: parent_tool_call_id.clone(),
-                runtime_tool_call_id,
+                runtime_tool_call_id: runtime_tool_call_id.clone(),
             },
             cancellation_token,
         )
@@ -765,6 +1042,7 @@ async fn call_nested_tool(
                     false,
                     0,
                     Vec::new(),
+                    None,
                     terminal_cause.map(|cause| (cause, message)),
                 );
             return Err(error);
@@ -786,6 +1064,17 @@ async fn call_nested_tool(
     }
     let post_tool_use_feedback = result.take_code_mode_feedback();
     let result_value = result.code_mode_result();
+    let (retained_output, output_truncated) = bounded_serialized_json(&result_value);
+    let nested_result = CodeModeNestedResultEvidence {
+        ordinal: packet_ordinal,
+        call_id: nested_call_id,
+        parent_call_id: parent_tool_call_id,
+        parent_cell_id: cell_id.to_string(),
+        runtime_tool_call_id,
+        tool_name: tool_name.to_string(),
+        output: retained_output,
+        output_truncated,
+    };
     let required_terminal = required_nested_tool_terminal_cause(outcome_context, signal.as_ref())
         .map(|cause| {
             let label = match cause {
@@ -809,6 +1098,7 @@ async fn call_nested_tool(
                 && !result_has_live_exec_session(&result_value),
             serialized_json_len(&result_value),
             post_tool_use_feedback,
+            Some(nested_result),
             required_terminal,
         );
     tool_runtime.record_code_mode_result(
@@ -825,6 +1115,107 @@ async fn call_nested_tool(
         &receipts,
     );
     Ok(result_value)
+}
+
+fn nested_command_argv(tool_name: &ToolName, payload: &ToolPayload) -> Option<Vec<String>> {
+    if tool_name.namespace.is_some()
+        || !matches!(
+            tool_name.name.as_str(),
+            "exec_command" | "shell_command" | "unified_exec"
+        )
+    {
+        return None;
+    }
+    let ToolPayload::Function { arguments } = payload else {
+        return None;
+    };
+    let arguments = serde_json::from_str::<JsonValue>(arguments).ok()?;
+    arguments
+        .get("program")
+        .and_then(JsonValue::as_str)
+        .map(|program| {
+            let mut command = vec![program.to_string()];
+            command.extend(
+                arguments
+                    .get("args")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(JsonValue::as_str)
+                    .map(str::to_string),
+            );
+            command
+        })
+        .or_else(|| {
+            ["script_body", "cmd", "command"]
+                .into_iter()
+                .find_map(|field| match arguments.get(field) {
+                    Some(JsonValue::String(command)) => Some(vec![command.clone()]),
+                    Some(JsonValue::Array(command)) => command
+                        .iter()
+                        .map(|part| part.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>(),
+                    _ => None,
+                })
+        })
+}
+
+/// A patch envelope routed through a shell wrapper spawns a process, hides the
+/// patch exit status behind the wrapper, and bypasses the native apply_patch
+/// interception. When the typed tool is registered, fail fast with the exact
+/// call form instead of running the wrapper.
+fn wrapped_patch_rejection(
+    tool_name: &ToolName,
+    payload: &ToolPayload,
+    apply_patch_available: bool,
+) -> Option<String> {
+    if !apply_patch_available {
+        return None;
+    }
+    let command = nested_command_argv(tool_name, payload)?;
+    if !command
+        .iter()
+        .any(|part| part.contains(APPLY_PATCH_ENVELOPE_MARKER))
+        || is_native_apply_patch_invocation(&command)
+    {
+        return None;
+    }
+    Some(format!(
+        "Patch envelopes must go through the apply_patch tool, not a shell wrapper: call `await tools.apply_patch(patch)` with the same `{APPLY_PATCH_ENVELOPE_MARKER}` body. The wrapped `{}` command was not run.",
+        tool_name.name
+    ))
+}
+
+/// Plain `apply_patch` heredoc forms are intercepted natively without a
+/// process spawn; only wrapped or piped envelopes are rejected.
+fn is_native_apply_patch_invocation(command: &[String]) -> bool {
+    fn script_starts_with_apply_patch(script: &str) -> bool {
+        let script = script.trim_start();
+        script
+            .strip_prefix("apply_patch")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    }
+    fn program_stem(program: &str) -> String {
+        if program.chars().any(char::is_whitespace) {
+            return String::new();
+        }
+        std::path::Path::new(program)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(program)
+            .to_ascii_lowercase()
+    }
+    match command {
+        [script] => script_starts_with_apply_patch(script),
+        [program, ..] if program_stem(program) == "apply_patch" => true,
+        [shell, flag, script]
+            if matches!(program_stem(shell).as_str(), "bash" | "sh" | "zsh")
+                && matches!(flag.as_str(), "-lc" | "-c") =>
+        {
+            script_starts_with_apply_patch(script)
+        }
+        _ => false,
+    }
 }
 
 fn is_batchable_observation(tool_name: &ToolName, payload: &ToolPayload) -> bool {
@@ -999,7 +1390,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::CodeModeService;
+    use super::MAX_RETAINED_NESTED_RESULT_BYTES;
     use super::OutputOutcome;
+    use super::bounded_serialized_json;
     use super::build_nested_tool_payload;
     use super::fold_nested_required_terminal;
     use super::format_runtime_response;
@@ -1009,6 +1402,7 @@ mod tests {
     use super::result_has_live_exec_session;
     use super::serialized_json_len;
     use super::truncate_code_mode_result;
+    use super::wrapped_patch_rejection;
     use crate::tools::context::FunctionToolOutput;
     use crate::tools::context::RequiredToolTerminalCause;
     use crate::tools::context::ToolPayload;
@@ -1046,6 +1440,211 @@ mod tests {
     }
 
     #[test]
+    fn retained_nested_result_serialization_is_bounded() {
+        let value = json!({
+            "a_prefix": "kept",
+            "body": "x".repeat(MAX_RETAINED_NESTED_RESULT_BYTES * 2),
+            "tail": "MUST_NOT_BE_RETAINED",
+        });
+
+        let (retained, truncated) = bounded_serialized_json(&value);
+
+        assert!(truncated);
+        assert!(retained.len() <= MAX_RETAINED_NESTED_RESULT_BYTES);
+        assert!(retained.contains("kept"));
+        assert!(!retained.contains("MUST_NOT_BE_RETAINED"));
+    }
+
+    #[test]
+    fn retained_nested_result_bound_never_splits_utf8() {
+        let value = json!({
+            "body": "🙂".repeat(MAX_RETAINED_NESTED_RESULT_BYTES),
+        });
+
+        let (retained, truncated) = bounded_serialized_json(&value);
+
+        assert!(truncated);
+        assert!(retained.len() <= MAX_RETAINED_NESTED_RESULT_BYTES);
+        assert!(std::str::from_utf8(retained.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn cell_parent_call_id_lives_until_dispatch_finishes() {
+        let service = test_service();
+        let cell = CellId::new("cell-parent".to_string());
+
+        service.record_cell_parent_call_id(&cell, "outer-exec-call");
+        assert_eq!(
+            service.cell_parent_call_id(&cell).as_deref(),
+            Some("outer-exec-call")
+        );
+
+        service.finish_cell_dispatch(&cell);
+        assert_eq!(service.cell_parent_call_id(&cell), None);
+    }
+
+    #[tokio::test]
+    async fn prewarm_initializes_the_code_mode_session_once() {
+        let service =
+            CodeModeService::new(Arc::new(codex_code_mode::InProcessCodeModeSessionProvider));
+        assert!(!service.is_initialized());
+
+        service.prewarm().await.expect("in-process host prewarm");
+        assert!(service.is_initialized());
+        let first = service.session().await.expect("prewarmed session");
+        let second = service.session().await.expect("reused session");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn wrapped_patch_envelopes_are_rejected_only_when_apply_patch_is_registered() {
+        let exec_command = ToolName::plain("exec_command");
+        let envelope = "*** Begin Patch\n*** Update File: a.py\n*** End Patch";
+        let wrapped = ToolPayload::Function {
+            arguments: json!({ "cmd": format!("@'\n{envelope}\n'@ | apply_patch") }).to_string(),
+        };
+        let rejection = wrapped_patch_rejection(&exec_command, &wrapped, true)
+            .expect("a piped envelope must be rejected");
+        assert!(rejection.contains("await tools.apply_patch(patch)"));
+        assert!(rejection.contains("was not run"));
+        assert_eq!(
+            wrapped_patch_rejection(&exec_command, &wrapped, false),
+            None
+        );
+
+        let lt = '<';
+        let heredoc = format!("apply_patch {lt}{lt}'EOF'\n{envelope}\nEOF");
+        let native = ToolPayload::Function {
+            arguments: json!({ "cmd": heredoc.clone() }).to_string(),
+        };
+        assert_eq!(wrapped_patch_rejection(&exec_command, &native, true), None);
+        let native_argv = ToolPayload::Function {
+            arguments: json!({ "program": "bash", "args": ["-lc", heredoc] }).to_string(),
+        };
+        assert_eq!(
+            wrapped_patch_rejection(&exec_command, &native_argv, true),
+            None
+        );
+        let ordinary = ToolPayload::Function {
+            arguments: json!({ "cmd": "git diff" }).to_string(),
+        };
+        assert_eq!(
+            wrapped_patch_rejection(&exec_command, &ordinary, true),
+            None
+        );
+        assert_eq!(
+            wrapped_patch_rejection(&ToolName::plain("read_tool_output"), &wrapped, true),
+            None
+        );
+    }
+
+    /// Builds a real session, step context, and tool runtime with the given
+    /// registered tools, exactly as the turn loop does for nested calls.
+    async fn nested_call_fixture(
+        tools: Vec<Arc<dyn crate::tools::registry::CoreToolRuntime>>,
+    ) -> (
+        Arc<crate::session::session::Session>,
+        Arc<crate::session::turn_context::TurnContext>,
+        crate::tools::parallel::ToolCallRuntime,
+    ) {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let step_context = crate::session::step_context::StepContext::for_test(Arc::clone(&turn));
+        let router = Arc::new(crate::tools::router::ToolRouter::from_parts(
+            crate::tools::registry::ToolRegistry::from_tools(tools),
+            Vec::new(),
+        ));
+        let step_context = step_context.with_tool_router_for_test(router);
+        let tracker = Arc::new(tokio::sync::Mutex::new(
+            crate::turn_diff_tracker::TurnDiffTracker::new(),
+        ));
+        let runtime = crate::tools::parallel::ToolCallRuntime::new(
+            Arc::clone(&session),
+            step_context,
+            tracker,
+        );
+        (session, turn, runtime)
+    }
+
+    fn wrapped_patch_invocation(cell_id: &CellId) -> codex_code_mode::CodeModeNestedToolCall {
+        let envelope = "*** Begin Patch\n*** Update File: a.py\n*** End Patch";
+        codex_code_mode::CodeModeNestedToolCall {
+            cell_id: cell_id.clone(),
+            parent_tool_call_id: Some("outer-exec".to_string()),
+            runtime_tool_call_id: "runtime-call-1".to_string(),
+            tool_name: ToolName::plain("exec_command"),
+            tool_kind: CodeModeToolKind::Function,
+            input: Some(json!({ "cmd": format!("@'\n{envelope}\n'@ | apply_patch") })),
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapped_patch_through_a_real_nested_exec_command_is_rejected_before_dispatch() {
+        let apply_patch: Arc<dyn crate::tools::registry::CoreToolRuntime> = Arc::new(
+            crate::tools::handlers::ApplyPatchHandler::new(/*multi_environment*/ false),
+        );
+        let (session, turn, runtime) = nested_call_fixture(vec![apply_patch]).await;
+        let cell_id = CellId::new("cell-patch".to_string());
+        let exec = super::ExecContext {
+            session: Arc::clone(&session),
+            turn: Arc::clone(&turn),
+        };
+
+        let result = super::call_nested_tool(
+            exec,
+            runtime,
+            wrapped_patch_invocation(&cell_id),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        let Err(crate::FunctionCallError::RespondToModel(message)) = result else {
+            panic!("a wrapped patch must be rejected before dispatch, got {result:?}");
+        };
+        assert!(message.contains("await tools.apply_patch(patch)"));
+        assert!(message.contains("was not run"));
+        let packet = session
+            .services
+            .code_mode_service
+            .finish_packet(cell_id.as_str(), turn.sub_id.as_str());
+        assert_eq!(packet.nested_call_count, 1);
+        let terminal = packet
+            .first_required_terminal
+            .expect("the rejection is recorded as the cell's required terminal failure");
+        assert_eq!(terminal.cause, RequiredToolTerminalCause::Failure);
+        assert!(terminal.message.contains("was not run"));
+    }
+
+    #[tokio::test]
+    async fn wrapped_patch_is_not_rejected_when_no_apply_patch_tool_is_registered() {
+        let (session, turn, runtime) = nested_call_fixture(Vec::new()).await;
+        let cell_id = CellId::new("cell-no-patch-tool".to_string());
+        let exec = super::ExecContext {
+            session: Arc::clone(&session),
+            turn: Arc::clone(&turn),
+        };
+
+        let result = super::call_nested_tool(
+            exec,
+            runtime,
+            wrapped_patch_invocation(&cell_id),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        // Without a typed patch tool the call reaches ordinary dispatch, which
+        // fails here only because this fixture registers no exec_command tool.
+        let Err(error) = result else {
+            panic!("dispatch without a registered exec_command tool must fail");
+        };
+        assert!(
+            !error.to_string().contains("await tools.apply_patch(patch)"),
+            "the wrapped-patch rejection must depend on apply_patch being registered: {error}"
+        );
+    }
+
+    #[test]
     fn first_tiny_read_only_packet_produces_one_runtime_advisory() {
         let service = test_service();
         let cell = CellId::new("cell".to_string());
@@ -1056,10 +1655,12 @@ mod tests {
             .advisory
             .expect("first tiny packet should include an advisory");
         assert!(advisory.contains("batch every known independent read in one exec"));
-        assert!(advisory.contains("await notify(...) per settlement"));
+        assert!(
+            !advisory.contains("notify"),
+            "the advisory must not steer the model into notify-driven yields"
+        );
         assert!(advisory.contains("Promise.allSettled"));
-        assert!(advisory.contains("only to keep the cell alive"));
-        assert!(advisory.contains("Resume only a documented live handle"));
+        assert!(advisory.contains("print the evidence you need with text(...)"));
         assert!(advisory.contains("evidence is sufficient or unchanged"));
         assert!(advisory.contains("synthesize and stop"));
         assert!(advisory.contains("instead of sampling or polling again"));
@@ -1139,6 +1740,7 @@ mod tests {
             false,
             0,
             Vec::new(),
+            None,
             Some((
                 RequiredToolTerminalCause::Failure,
                 "second nested failure".to_string(),
@@ -1150,6 +1752,7 @@ mod tests {
             false,
             0,
             Vec::new(),
+            None,
             Some((
                 RequiredToolTerminalCause::Blocked,
                 "first nested block".to_string(),
@@ -1396,6 +1999,7 @@ mod tests {
             false,
             std::time::Instant::now(),
             Vec::new(),
+            Vec::new(),
         );
 
         let projected =
@@ -1489,9 +2093,10 @@ mod tests {
             panic!("expected one capped text item");
         };
         assert!(capped_text.starts_with("Warning: truncated output"));
+        let capped_tokens = codex_utils_string::approx_token_count(capped_text);
         assert!(
-            codex_utils_string::approx_token_count(capped_text)
-                <= codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL
+            capped_tokens <= codex_code_mode::MAX_OUTPUT_TOKENS_PER_EXEC_CALL + 64,
+            "the truncation body should honor the hard limit with only bounded warning metadata; got {capped_tokens} tokens"
         );
     }
 

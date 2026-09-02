@@ -55,6 +55,7 @@ async fn late_validation_denial_finishes_the_started_shell_event() {
     };
     let skipped = {
         let mut authorization = turn.validation_authorization.write().await;
+        *authorization = crate::validation_admission::ValidationAuthorization::enabled();
         assert!(authorization.update_from_user_input("do not run tests"));
         prohibited_skip_for(&authorization, &invocation, true)
             .expect("test denial suppresses the validation")
@@ -86,6 +87,7 @@ async fn late_validation_denial_finishes_the_started_shell_event() {
         &session,
         &turn,
         call_id,
+        &crate::tools::context::ToolCallSource::Direct,
         Some(&tracker),
         skipped,
     )

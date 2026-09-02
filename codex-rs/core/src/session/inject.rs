@@ -42,6 +42,37 @@ impl Session {
         }
     }
 
+    /// Injects model-visible context produced by the active runtime without
+    /// classifying it as user steering or waking owner-held tool execution.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn checks and turn state updates must remain atomic"
+    )]
+    async fn inject_internal_if_running(
+        &self,
+        input: Vec<ResponseItem>,
+    ) -> Result<(), Vec<ResponseItem>> {
+        let mut active = self.active_turn.lock().await;
+        match active.as_mut() {
+            Some(active_turn) => {
+                let pending_input = input
+                    .iter()
+                    .cloned()
+                    .map(TurnInput::InternalResponseItem)
+                    .collect::<Vec<_>>();
+                self.input_queue
+                    .extend_pending_input_for_turn_state(
+                        active_turn.turn_state.as_ref(),
+                        &pending_input,
+                    )
+                    .await
+                    .map_err(|_| input)?;
+                Ok(())
+            }
+            None => Err(input),
+        }
+    }
+
     /// Starts a regular turn with the provided items only if automatic idle work
     /// is allowed for the current session state.
     ///
@@ -205,6 +236,28 @@ impl Session {
         };
         self.record_conversation_items(turn_context, &items).await;
     }
+
+    /// Injects internal runtime context into active work, or records it without
+    /// starting a turn. Internal context is drained normally for model
+    /// projection, but it is never treated as fresh user steering.
+    pub(crate) async fn inject_internal_no_new_turn(
+        &self,
+        items: Vec<ResponseItem>,
+        current_turn_context: Option<&TurnContext>,
+    ) {
+        let Err(items) = self.inject_internal_if_running(items).await else {
+            return;
+        };
+        let default_turn_context;
+        let turn_context = match current_turn_context {
+            Some(turn_context) => turn_context,
+            None => {
+                default_turn_context = self.new_default_turn().await;
+                default_turn_context.as_ref()
+            }
+        };
+        self.record_conversation_items(turn_context, &items).await;
+    }
 }
 
 #[cfg(test)]
@@ -247,5 +300,43 @@ mod tests {
             .subscribe_activity(Some(turn_state.as_ref()))
             .await;
         assert_eq!(pending_activity, Some(InputQueueActivity::Steer));
+    }
+
+    #[tokio::test]
+    async fn injected_internal_response_is_model_visible_without_becoming_steering() {
+        let (session, _turn_context) = crate::session::tests::make_session_and_context().await;
+        let turn_state = {
+            let mut active_turn = session.active_turn.lock().await;
+            Arc::clone(
+                &active_turn
+                    .get_or_insert_with(ActiveTurn::default)
+                    .turn_state,
+            )
+        };
+
+        session
+            .inject_internal_if_running(vec![objective_update_item()])
+            .await
+            .expect("active-turn internal injection should succeed");
+
+        let (_activity_rx, pending_activity) = session
+            .input_queue
+            .subscribe_activity(Some(turn_state.as_ref()))
+            .await;
+        assert_eq!(pending_activity, None);
+        assert!(
+            !session
+                .input_queue
+                .has_pending_input(&session.active_turn)
+                .await
+        );
+        assert!(matches!(
+            session
+                .input_queue
+                .take_pending_input_for_turn_state(turn_state.as_ref())
+                .await
+                .as_slice(),
+            [TurnInput::InternalResponseItem(_)]
+        ));
     }
 }

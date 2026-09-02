@@ -186,6 +186,23 @@ pub struct CommandExecutionItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub process_id: Option<String>,
+    /// Model-visible tool call that owns this nested command, when the command
+    /// originated from a code-mode cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub parent_call_id: Option<String>,
+    /// Stable runtime cell that issued this nested command.
+    #[serde(default, alias = "cell_id", skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub parent_cell_id: Option<String>,
+    /// Code-mode runtime's invocation id within the owning cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub runtime_tool_call_id: Option<String>,
+    /// Unique dispatch execution id used by timing and lifecycle records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub execution_id: Option<String>,
     pub command: Vec<String>,
     pub cwd: PathUri,
     pub parsed_cmd: Vec<ParsedCommand>,

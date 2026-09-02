@@ -1282,6 +1282,14 @@ impl ToolCallRuntime {
         );
     }
 
+    /// Whether the step that advertised this call registered `name`, so a
+    /// nested call can point the model at a typed tool that really exists.
+    pub(crate) fn has_registered_tool(&self, name: &codex_tools::ToolName) -> bool {
+        self.step_context
+            .tool_router()
+            .is_some_and(|router| router.has_registered_tool(name))
+    }
+
     pub(crate) fn create_diff_consumer(
         &self,
         tool_name: &codex_tools::ToolName,
@@ -1438,6 +1446,32 @@ impl ToolCallRuntime {
                 )
                 .await;
                 return Ok(completion);
+            }
+            if let Some(registration) = signal_registration.as_ref()
+                && let Some(guard) = registration.replayed_success.as_ref()
+                && let Some(response) = guard.response_for_call(&call.call_id)
+            {
+                timing.record_outcome("success");
+                timing.mark_output_collected();
+                if let Some(signal_collector) = signal_collector.as_ref() {
+                    signal_collector.record_response_result(
+                        registration.ordinal,
+                        ToolOutputOutcomeContext::new(ToolOutputOutcome::Success),
+                        None,
+                        &response,
+                        false,
+                    );
+                }
+                self.register_workspace_evidence_for_response(
+                    &response,
+                    None,
+                    false,
+                    None,
+                    &workspace_call_classification,
+                    None,
+                )
+                .await;
+                return Ok(ToolCallCompletion::nonterminal(response));
             }
             if let Some(registration) = signal_registration.as_ref()
                 && let Some(guard) = registration.blocked_wait_guard.as_ref()

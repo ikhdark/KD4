@@ -15,6 +15,7 @@ use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
+use crate::tools::handlers::KdaHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
@@ -124,6 +125,17 @@ impl PlannedTools {
     {
         self.runtimes
             .push(RegisteredTool::new(Arc::new(handler), class));
+    }
+
+    fn add_read_only_with_authorization_class<T>(&mut self, handler: T, class: TypedToolClass)
+    where
+        T: CoreToolRuntime + 'static,
+    {
+        self.runtimes.push(
+            RegisteredTool::new(Arc::new(handler), class).with_external_mutation_intent(
+                crate::agent::task_capabilities::ExternalMutationIntent::ProvenReadOnly,
+            ),
+        );
     }
 
     fn add_arc_with_exposure_and_authorization_class(
@@ -680,6 +692,7 @@ fn build_code_mode_executors(
 
     let mut code_mode_nested_tool_specs = Vec::new();
     let mut deferred_code_mode_nested_tool_specs = Vec::new();
+    let mut eager_nested_tool_descriptions = Vec::new();
     let mut direct_only_tool_names = Vec::new();
     let mut has_deferred_tools = false;
     let deferred_tools_guidance_enabled = search_tool_enabled(turn_context);
@@ -706,19 +719,22 @@ fn build_code_mode_executors(
             }
             deferred_code_mode_nested_tool_specs.push(spec);
         } else {
+            // Built-in direct tools have stable contracts, so ship their
+            // typed declarations with `exec`. MCP, plugin, extension, and
+            // other dynamic-external tools remain discoverable at runtime but
+            // keep their schemas lazy to avoid rebuilding the prompt around
+            // an external inventory that can change between turns.
+            if executor.authorization_class() != TypedToolClass::DynamicExternal
+                && let Some(definition) = codex_tools::tool_spec_to_code_mode_tool_definition(&spec)
+            {
+                eager_nested_tool_descriptions.push(definition.description);
+            }
             code_mode_nested_tool_specs.push(spec);
         }
     }
 
     direct_only_tool_names.sort();
     direct_only_tool_names.dedup();
-    let eager_nested_tool_descriptions = code_mode_nested_tool_specs
-        .iter()
-        .filter(|spec| spec.name() == "exec_command")
-        .filter_map(codex_tools::tool_spec_to_code_mode_tool_definition)
-        .map(|definition| definition.description)
-        .collect::<Vec<_>>();
-
     let mut result: Vec<Arc<dyn CoreToolRuntime>> = vec![Arc::new(CodeModeExecuteHandler::new(
         create_code_mode_tool(
             tool_mode == ToolMode::CodeModeOnly,
@@ -981,6 +997,17 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
     planned_tools.add_with_authorization_class(ReadToolOutputHandler, TypedToolClass::ReadSearch);
+
+    if let Some(cwd) = context
+        .step_context
+        .environments
+        .single_local_environment_cwd()
+    {
+        planned_tools.add_read_only_with_authorization_class(
+            KdaHandler::new(cwd.into_path_buf()),
+            TypedToolClass::ReadSearch,
+        );
+    }
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
         planned_tools.add_with_authorization_class(PlanHandler, TypedToolClass::OwnTask);

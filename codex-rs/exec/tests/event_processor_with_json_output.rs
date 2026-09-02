@@ -5,6 +5,7 @@ use codex_app_server_protocol::CollabAgentToolCallStatus as ApiCollabAgentToolCa
 use codex_app_server_protocol::CommandAction;
 use codex_app_server_protocol::CommandExecutionSource;
 use codex_app_server_protocol::CommandExecutionStatus as ApiCommandExecutionStatus;
+use codex_app_server_protocol::DynamicToolCallStatus as ApiDynamicToolCallStatus;
 use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::FileUpdateChange as ApiFileUpdateChange;
 use codex_app_server_protocol::ItemCompletedNotification;
@@ -30,9 +31,13 @@ use codex_app_server_protocol::WebSearchAction as ApiWebSearchAction;
 use codex_app_server_protocol::WebSearchItem as ApiWebSearchItem;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
+use codex_protocol::items::CommandExecutionItem as CoreCommandExecutionItem;
+use codex_protocol::items::CommandExecutionStatus as CoreCommandExecutionStatus;
+use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
@@ -40,6 +45,8 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use codex_exec::AgentMessageItem;
+use codex_exec::CodeModeCellItem;
+use codex_exec::CodeModeCellStatus;
 use codex_exec::CodexStatus;
 use codex_exec::CollabAgentState;
 use codex_exec::CollabAgentStatus;
@@ -171,18 +178,26 @@ fn turn_started_emits_turn_started_event() {
 #[test]
 fn command_execution_started_and_completed_translate_to_thread_events() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
-    let command_item = ThreadItem::CommandExecution {
+    let command_item = ThreadItem::from(CoreTurnItem::CommandExecution(CoreCommandExecutionItem {
         id: "cmd-1".to_string(),
-        command: "ls".to_string(),
-        cwd: test_path_buf("/tmp/project").abs().into(),
         process_id: Some("123".to_string()),
-        source: CommandExecutionSource::UserShell,
-        status: ApiCommandExecutionStatus::InProgress,
-        command_actions: Vec::<CommandAction>::new(),
+        parent_call_id: Some("exec-parent-1".to_string()),
+        parent_cell_id: Some("cell-1".to_string()),
+        runtime_tool_call_id: Some("runtime-call-1".to_string()),
+        execution_id: Some("tool-execution-7".to_string()),
+        command: vec!["ls".to_string()],
+        cwd: test_path_buf("/tmp/project").abs().into(),
+        parsed_cmd: Vec::new(),
+        source: ExecCommandSource::UserShell,
+        interaction_input: None,
+        status: CoreCommandExecutionStatus::InProgress,
+        stdout: None,
+        stderr: None,
         aggregated_output: None,
         exit_code: None,
-        duration_ms: None,
-    };
+        duration: None,
+        formatted_output: None,
+    }));
 
     let started =
         processor.collect_thread_events(ServerNotification::ItemStarted(ItemStartedNotification {
@@ -202,27 +217,49 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
                         aggregated_output: String::new(),
                         exit_code: None,
                         status: CommandExecutionStatus::InProgress,
+                        call_id: Some("cmd-1".to_string()),
+                        parent_call_id: Some("exec-parent-1".to_string()),
+                        parent_cell_id: Some("cell-1".to_string()),
+                        runtime_tool_call_id: Some("runtime-call-1".to_string()),
+                        execution_id: Some("tool-execution-7".to_string()),
                     }),
                 },
             })],
             status: CodexStatus::Running,
         }
     );
+    let started_json = serde_json::to_value(&started.events[0]).expect("serialize started event");
+    assert_eq!(started_json["item"]["call_id"], "cmd-1");
+    assert_eq!(started_json["item"]["parent_call_id"], "exec-parent-1");
+    assert_eq!(started_json["item"]["parent_cell_id"], "cell-1");
+    assert_eq!(
+        started_json["item"]["runtime_tool_call_id"],
+        "runtime-call-1"
+    );
+    assert_eq!(started_json["item"]["execution_id"], "tool-execution-7");
 
     let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
-            item: ThreadItem::CommandExecution {
+            item: ThreadItem::from(CoreTurnItem::CommandExecution(CoreCommandExecutionItem {
                 id: "cmd-1".to_string(),
-                command: "ls".to_string(),
-                cwd: test_path_buf("/tmp/project").abs().into(),
                 process_id: Some("123".to_string()),
-                source: CommandExecutionSource::UserShell,
-                status: ApiCommandExecutionStatus::Completed,
-                command_actions: Vec::<CommandAction>::new(),
+                parent_call_id: Some("exec-parent-1".to_string()),
+                parent_cell_id: Some("cell-1".to_string()),
+                runtime_tool_call_id: Some("runtime-call-1".to_string()),
+                execution_id: Some("tool-execution-7".to_string()),
+                command: vec!["ls".to_string()],
+                cwd: test_path_buf("/tmp/project").abs().into(),
+                parsed_cmd: Vec::new(),
+                source: ExecCommandSource::UserShell,
+                interaction_input: None,
+                status: CoreCommandExecutionStatus::Completed,
+                stdout: None,
+                stderr: None,
                 aggregated_output: Some("a.txt\n".to_string()),
                 exit_code: Some(0),
-                duration_ms: Some(3),
-            },
+                duration: Some(std::time::Duration::from_millis(3)),
+                formatted_output: None,
+            })),
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
             completed_at_ms: 0,
@@ -239,12 +276,76 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
                         aggregated_output: "a.txt\n".to_string(),
                         exit_code: Some(0),
                         status: CommandExecutionStatus::Completed,
+                        call_id: Some("cmd-1".to_string()),
+                        parent_call_id: Some("exec-parent-1".to_string()),
+                        parent_cell_id: Some("cell-1".to_string()),
+                        runtime_tool_call_id: Some("runtime-call-1".to_string()),
+                        execution_id: Some("tool-execution-7".to_string()),
                     }),
                 },
             })],
             status: CodexStatus::Running,
         }
     );
+    let completed_json =
+        serde_json::to_value(&completed.events[0]).expect("serialize completed event");
+    assert_eq!(completed_json["item"]["call_id"], "cmd-1");
+    assert_eq!(completed_json["item"]["parent_call_id"], "exec-parent-1");
+    assert_eq!(completed_json["item"]["parent_cell_id"], "cell-1");
+    assert_eq!(
+        completed_json["item"]["runtime_tool_call_id"],
+        "runtime-call-1"
+    );
+    assert_eq!(completed_json["item"]["execution_id"], "tool-execution-7");
+}
+
+#[test]
+fn failed_code_mode_cell_translates_to_typed_jsonl_item_with_exact_ids() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+    let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
+        ItemCompletedNotification {
+            item: ThreadItem::DynamicToolCall {
+                id: "code-mode-cell:cell-7".to_string(),
+                namespace: Some("codex.internal".to_string()),
+                tool: "code_mode_cell".to_string(),
+                arguments: json!({
+                    "call_id": "exec-call-3",
+                    "cell_id": "cell-7",
+                }),
+                status: ApiDynamicToolCallStatus::Failed,
+                content_items: None,
+                success: Some(false),
+                error: Some("TypeError: tools.exec_command is not a function".to_string()),
+                duration_ms: Some(12),
+            },
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+        },
+    ));
+
+    assert_eq!(
+        collected,
+        CollectedThreadEvents {
+            events: vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                item: ExecThreadItem {
+                    id: "item_0".to_string(),
+                    details: ThreadItemDetails::CodeModeCell(CodeModeCellItem {
+                        call_id: "exec-call-3".to_string(),
+                        cell_id: "cell-7".to_string(),
+                        status: CodeModeCellStatus::Failed,
+                        error: "TypeError: tools.exec_command is not a function".to_string(),
+                    }),
+                },
+            })],
+            status: CodexStatus::Running,
+        }
+    );
+    let encoded = serde_json::to_value(&collected.events[0]).expect("serialize event");
+    assert_eq!(encoded["item"]["type"], "code_mode_cell");
+    assert_eq!(encoded["item"]["call_id"], "exec-call-3");
+    assert_eq!(encoded["item"]["cell_id"], "cell-7");
+    assert_eq!(encoded["item"]["status"], "failed");
 }
 
 #[test]
@@ -1451,6 +1552,10 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 command: "ls".to_string(),
                 cwd: test_path_buf("/tmp/project").abs().into(),
                 process_id: Some("123".to_string()),
+                parent_call_id: None,
+                parent_cell_id: None,
+                runtime_tool_call_id: None,
+                execution_id: None,
                 source: CommandExecutionSource::UserShell,
                 status: ApiCommandExecutionStatus::InProgress,
                 command_actions: Vec::<CommandAction>::new(),
@@ -1473,6 +1578,11 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                         aggregated_output: String::new(),
                         exit_code: None,
                         status: CommandExecutionStatus::InProgress,
+                        call_id: Some("cmd-1".to_string()),
+                        parent_call_id: None,
+                        parent_cell_id: None,
+                        runtime_tool_call_id: None,
+                        execution_id: None,
                     }),
                 },
             })],
@@ -1492,6 +1602,10 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                     command: "ls".to_string(),
                     cwd: test_path_buf("/tmp/project").abs().into(),
                     process_id: Some("123".to_string()),
+                    parent_call_id: None,
+                    parent_cell_id: None,
+                    runtime_tool_call_id: None,
+                    execution_id: None,
                     source: CommandExecutionSource::UserShell,
                     status: ApiCommandExecutionStatus::Completed,
                     command_actions: Vec::<CommandAction>::new(),
@@ -1524,6 +1638,11 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                             aggregated_output: "a.txt\n".to_string(),
                             exit_code: Some(0),
                             status: CommandExecutionStatus::Completed,
+                            call_id: Some("cmd-1".to_string()),
+                            parent_call_id: None,
+                            parent_cell_id: None,
+                            runtime_tool_call_id: None,
+                            execution_id: None,
                         }),
                     },
                 }),

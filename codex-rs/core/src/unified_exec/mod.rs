@@ -48,6 +48,7 @@ use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolCallSource;
 use crate::tools::known_delta_store::PreparedKnownDelta;
 use crate::tools::network_approval::DeferredNetworkApproval;
 
@@ -84,6 +85,7 @@ pub(crate) struct UnifiedExecContext {
     pub turn: Arc<TurnContext>,
     pub call_id: String,
     pub tracker: Option<SharedTurnDiffTracker>,
+    pub source: ToolCallSource,
 }
 
 impl UnifiedExecContext {
@@ -94,6 +96,7 @@ impl UnifiedExecContext {
             turn,
             call_id,
             tracker: None,
+            source: ToolCallSource::Direct,
         }
     }
 
@@ -102,12 +105,14 @@ impl UnifiedExecContext {
         turn: Arc<TurnContext>,
         call_id: String,
         tracker: SharedTurnDiffTracker,
+        source: ToolCallSource,
     ) -> Self {
         Self {
             session,
             turn,
             call_id,
             tracker: Some(tracker),
+            source,
         }
     }
 }

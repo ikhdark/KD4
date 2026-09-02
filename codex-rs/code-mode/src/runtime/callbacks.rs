@@ -113,6 +113,33 @@ pub(super) fn text_callback(
     retval.set(v8::undefined(scope).into());
 }
 
+/// `console.log(...)` and its siblings forward to `text(...)`, joining every
+/// argument with one space the way a terminal would. Scripts written for Node
+/// then produce model-visible output instead of a `console is not defined`
+/// failure that costs a whole model round.
+pub(super) fn console_log_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let mut parts = Vec::with_capacity(usize::try_from(args.length()).unwrap_or_default());
+    for index in 0..args.length() {
+        match serialize_output_text(scope, args.get(index)) {
+            Ok(text) => parts.push(text),
+            Err(error_text) => {
+                throw_type_error(scope, &error_text);
+                return;
+            }
+        }
+    }
+    if let Some(state) = scope.get_slot::<RuntimeState>() {
+        state.emit_output(FunctionCallOutputContentItem::InputText {
+            text: parts.join(" "),
+        });
+    }
+    retval.set(v8::undefined(scope).into());
+}
+
 pub(super) fn image_callback(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,

@@ -127,6 +127,64 @@ async fn exec_output_logging_and_projection_materialize_response_once() {
 }
 
 #[tokio::test]
+async fn small_admission_only_output_stays_inline_without_an_artifact() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let call_id = "registry-small";
+    let raw_registry_output = "small registry output that fits inline".to_string();
+    let invocation = ToolInvocation {
+        payload: ToolPayload::Custom {
+            input: "text('small');".to_string(),
+        },
+        ..test_invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            call_id,
+            ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME),
+        )
+    };
+    let result = AnyToolResult {
+        call_id: call_id.to_string(),
+        payload: invocation.payload.clone(),
+        result: Box::new(crate::tools::context::FunctionToolOutput::from_text(
+            raw_registry_output.clone(),
+            Some(true),
+        )),
+        model_projection: None,
+        source_dependencies: None,
+        code_mode_feedback: Vec::new(),
+    };
+
+    let projection_input = prepare_model_projection(
+        &invocation,
+        &result,
+        /*parsed_function_arguments*/ None,
+        /*source_dependencies_override*/ None,
+        /*force_inline_carrier*/ false,
+        /*track_for_admission*/ true,
+    )
+    .expect("direct code-mode output should be admitted");
+    assert_eq!(
+        projection_input.materialization,
+        ProjectionMaterialization::AdmissionOnly
+    );
+    assert!(!projection_input.canonical_artifact_required);
+    let projection = project_model_output(projection_input)
+        .await
+        .expect("code-mode admission projection");
+
+    assert!(!projection.artifact_created);
+    assert!(!projection.artifact_reused);
+    assert!(
+        projection.candidate.is_none(),
+        "an inline output has no artifact for a later receipt to point at"
+    );
+    assert_eq!(
+        history_output_text(&projection.response()).as_deref(),
+        Some(raw_registry_output.as_str())
+    );
+}
+
+#[tokio::test]
 async fn consumed_code_mode_registry_output_becomes_a_recoverable_receipt() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let call_id = "registry-discovery";
@@ -635,6 +693,7 @@ async fn projection_source_dependency_decision_records_reuse_and_fallback() {
         source_dependencies: carried,
         projection_eligible: true,
         projection_truncated: false,
+        canonical_artifact_required: false,
         predetermined_ranges: Vec::new(),
         predetermined_json_pointers: Vec::new(),
         original_response: ResponseInputItem::FunctionCallOutput {
@@ -878,6 +937,7 @@ async fn structured_projection_artifact_recovers_original_bytes() {
         source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: false,
+        canonical_artifact_required: false,
         predetermined_ranges: Vec::new(),
         predetermined_json_pointers: Vec::new(),
         original_response: ResponseInputItem::FunctionCallOutput {
@@ -953,6 +1013,7 @@ async fn canonical_projection_reuses_existing_artifact_id() {
         source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: true,
+        canonical_artifact_required: false,
         predetermined_ranges: Vec::new(),
         predetermined_json_pointers: Vec::new(),
         original_response: ResponseInputItem::FunctionCallOutput {
@@ -1157,6 +1218,7 @@ async fn projection_owner_recovery_drains_exact_json_pointer_in_original_return(
         source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: true,
+        canonical_artifact_required: false,
         predetermined_ranges: Vec::new(),
         predetermined_json_pointers: vec![ToolOutputProjectionJsonPointer {
             id: "actionable-evidence".to_string(),
@@ -1246,6 +1308,7 @@ async fn one_predetermined_range_is_recovered_in_the_original_return() {
         source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: true,
+        canonical_artifact_required: false,
         predetermined_ranges: vec![ToolOutputProjectionRange {
             id: "omitted-chunk".to_string(),
             start_line: 2,
@@ -1356,6 +1419,7 @@ async fn three_predetermined_artifact_ranges_are_drained_in_original_return() {
         source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: false,
+        canonical_artifact_required: false,
         predetermined_ranges: ranges,
         predetermined_json_pointers: Vec::new(),
         original_response: ResponseInputItem::FunctionCallOutput {
@@ -1498,6 +1562,7 @@ async fn small_code_mode_owner_result_uses_artifact_free_inline_carrier() {
         source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: false,
+        canonical_artifact_required: false,
         predetermined_ranges: Vec::new(),
         predetermined_json_pointers: Vec::new(),
         original_response: ResponseInputItem::CustomToolCallOutput {
@@ -1601,6 +1666,7 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
         source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: true,
+        canonical_artifact_required: false,
         predetermined_ranges: vec![ToolOutputProjectionRange {
             id: "nested-range".to_string(),
             start_line: 1,
@@ -1696,6 +1762,7 @@ async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuatio
         source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: true,
+        canonical_artifact_required: false,
         predetermined_ranges: Vec::new(),
         predetermined_json_pointers: Vec::new(),
         original_response: ResponseInputItem::CustomToolCallOutput {
@@ -1818,6 +1885,7 @@ async fn fresh_corpus_replays_real_producer_handler_and_functions_exec_carrier()
         source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: false,
+        canonical_artifact_required: false,
         predetermined_ranges: Vec::new(),
         predetermined_json_pointers: Vec::new(),
         original_response: ResponseInputItem::CustomToolCallOutput {
@@ -3512,6 +3580,7 @@ async fn admission_only_projection_preserves_original_response_and_registers_can
         source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: false,
+        canonical_artifact_required: false,
         predetermined_ranges: Vec::new(),
         predetermined_json_pointers: Vec::new(),
         original_response: original_response.clone(),
@@ -3573,6 +3642,7 @@ async fn admission_only_projection_preserves_original_response_when_artifact_sto
         source_dependencies: std::collections::BTreeSet::new(),
         projection_eligible: true,
         projection_truncated: false,
+        canonical_artifact_required: false,
         predetermined_ranges: Vec::new(),
         predetermined_json_pointers: Vec::new(),
         original_response: original_response.clone(),

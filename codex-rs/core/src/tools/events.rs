@@ -3,7 +3,9 @@ use crate::agent::task_capabilities::normalize_absolute_repo_path;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolCallSource;
 use crate::tools::sandboxing::ToolError;
+use crate::tools::tool_dispatch_trace::active_tool_dispatch_timing;
 use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::AttributionConfidence;
 use codex_apply_patch::AppliedPatchDelta;
@@ -41,6 +43,9 @@ pub(crate) struct ToolEventCtx<'a> {
     pub turn: &'a TurnContext,
     pub call_id: &'a str,
     pub turn_diff_tracker: Option<&'a SharedTurnDiffTracker>,
+    pub parent_call_id: Option<&'a str>,
+    pub parent_cell_id: Option<&'a str>,
+    pub runtime_tool_call_id: Option<&'a str>,
 }
 
 impl<'a> ToolEventCtx<'a> {
@@ -55,7 +60,24 @@ impl<'a> ToolEventCtx<'a> {
             turn,
             call_id,
             turn_diff_tracker,
+            parent_call_id: None,
+            parent_cell_id: None,
+            runtime_tool_call_id: None,
         }
+    }
+
+    pub fn with_call_source(mut self, source: &'a ToolCallSource) -> Self {
+        if let ToolCallSource::CodeMode {
+            cell_id,
+            parent_call_id,
+            runtime_tool_call_id,
+        } = source
+        {
+            self.parent_call_id = parent_call_id.as_deref();
+            self.parent_cell_id = Some(cell_id);
+            self.runtime_tool_call_id = Some(runtime_tool_call_id);
+        }
+        self
     }
 }
 
@@ -157,6 +179,11 @@ pub(crate) async fn emit_exec_command_begin(
             &TurnItem::CommandExecution(CommandExecutionItem {
                 id: ctx.call_id.to_string(),
                 process_id: process_id.map(str::to_owned),
+                parent_call_id: ctx.parent_call_id.map(str::to_owned),
+                parent_cell_id: ctx.parent_cell_id.map(str::to_owned),
+                runtime_tool_call_id: ctx.runtime_tool_call_id.map(str::to_owned),
+                execution_id: active_tool_dispatch_timing()
+                    .map(|timing| timing.execution_id().0.clone()),
                 command: command.to_vec(),
                 cwd: cwd.clone(),
                 parsed_cmd: parsed_cmd.to_vec(),
@@ -1008,6 +1035,11 @@ async fn emit_exec_end(
             TurnItem::CommandExecution(CommandExecutionItem {
                 id: ctx.call_id.to_string(),
                 process_id: exec_input.process_id.map(str::to_owned),
+                parent_call_id: ctx.parent_call_id.map(str::to_owned),
+                parent_cell_id: ctx.parent_cell_id.map(str::to_owned),
+                runtime_tool_call_id: ctx.runtime_tool_call_id.map(str::to_owned),
+                execution_id: active_tool_dispatch_timing()
+                    .map(|timing| timing.execution_id().0.clone()),
                 command: exec_input.command.to_vec(),
                 cwd: exec_input.cwd.clone(),
                 parsed_cmd: exec_input.parsed_cmd.to_vec(),
@@ -1151,6 +1183,8 @@ mod tests {
     use super::*;
     use crate::session::tests::make_session_and_context_with_dynamic_tools_and_rx;
     use crate::session::turn_context::TurnEnvironment;
+    use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
+    use crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_exec_server::LOCAL_FS;
     use codex_protocol::AgentPath;
@@ -1169,6 +1203,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
+    use tokio::time::Instant;
 
     #[test]
     fn authoritative_non_git_uncertain_command_identity_is_unchanged() {
@@ -1177,6 +1212,52 @@ mod tests {
             Some(false)
         );
         assert_eq!(observed_workspace_identity_changed(None, None), None);
+    }
+
+    #[tokio::test]
+    async fn nested_command_begin_event_carries_canonical_parent_and_execution_ids() {
+        let (session, turn, rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        let dir = tempdir().expect("tempdir");
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute cwd");
+        let source = ToolCallSource::CodeMode {
+            cell_id: "cell-7".to_string(),
+            parent_call_id: Some("outer-exec-3".to_string()),
+            runtime_tool_call_id: "runtime-call-11".to_string(),
+        };
+        let timing = Arc::new(ToolDispatchTiming::new(Instant::now(), /*eager*/ true));
+        let execution_id = timing.execution_id().0.clone();
+
+        scope_tool_dispatch_timing(Arc::clone(&timing), async {
+            emit_exec_command_begin(
+                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "nested-command-5", None)
+                    .with_call_source(&source),
+                &["rg".to_string(), "needle".to_string()],
+                &cwd,
+                &[],
+                ExecCommandSource::Agent,
+                None,
+                None,
+            )
+            .await;
+        })
+        .await;
+
+        let event = rx_event.recv().await.expect("item started event");
+        let EventMsg::ItemStarted(event) = event.msg else {
+            panic!("expected item started event");
+        };
+        let TurnItem::CommandExecution(item) = event.item else {
+            panic!("expected command execution item");
+        };
+        assert_eq!(item.id, "nested-command-5");
+        assert_eq!(item.parent_call_id.as_deref(), Some("outer-exec-3"));
+        assert_eq!(item.parent_cell_id.as_deref(), Some("cell-7"));
+        assert_eq!(
+            item.runtime_tool_call_id.as_deref(),
+            Some("runtime-call-11")
+        );
+        assert_eq!(item.execution_id.as_deref(), Some(execution_id.as_str()));
     }
 
     async fn enable_typed_task_for_repo(

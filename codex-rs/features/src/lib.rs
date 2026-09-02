@@ -138,6 +138,10 @@ pub enum Feature {
     KnownDeltaStore,
     /// Allow turns to start while selected executors are still starting.
     DeferredExecutor,
+    /// Inject the fork's per-turn task-model guidance fragment ahead of the
+    /// other injected context. Off by default: it costs roughly 3k tokens per
+    /// request and its provenance vocabulary leaks into final answers.
+    TaskModelGuidance,
     /// Enable runtime metrics snapshots via a manual reader.
     RuntimeMetrics,
     /// Enable startup memory extraction and file-backed memory consolidation.
@@ -780,6 +784,12 @@ define_features! {
         key: "deferred_executor",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::TaskModelGuidance,
+        key: "task_model_guidance",
+        stage: Stage::Stable,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::CodeMode,

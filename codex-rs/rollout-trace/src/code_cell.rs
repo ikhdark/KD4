@@ -133,7 +133,9 @@ impl CodeCellTraceContext {
 
 fn code_cell_status_for_runtime_response(response: &RuntimeResponse) -> CodeCellRuntimeStatus {
     match response {
-        RuntimeResponse::Yielded { .. } => CodeCellRuntimeStatus::Yielded,
+        RuntimeResponse::Yielded { .. } | RuntimeResponse::ExplicitYield { .. } => {
+            CodeCellRuntimeStatus::Yielded
+        }
         RuntimeResponse::Terminated { .. } => CodeCellRuntimeStatus::Terminated,
         RuntimeResponse::Result { error_text, .. } => {
             if error_text.is_some() {

@@ -129,6 +129,9 @@ async fn exec_command_cancellation_waits_for_confirmed_process_cleanup() {
     let command = vec![program.clone(), "-c".to_string(), script.clone()];
     let (session, mut turn) = make_session_and_context().await;
     turn.permission_profile = PermissionProfile::Disabled;
+    tokio::fs::create_dir_all(turn.config.codex_home.as_path())
+        .await
+        .expect("create test codex home");
     session
         .services
         .exec_policy
@@ -274,6 +277,7 @@ async fn late_unified_validation_denial_records_suppressed_timing() {
     };
     let skipped = {
         let mut authorization = turn.validation_authorization.write().await;
+        *authorization = crate::validation_admission::ValidationAuthorization::enabled();
         assert!(authorization.update_from_user_input("do not run tests"));
         crate::validation_admission::prohibited_skip_for(&authorization, &invocation, true)
             .expect("test denial suppresses the validation")
@@ -605,13 +609,21 @@ async fn identical_tagged_validation_rg_misses_both_launch() {
     let (session, turn) = make_session_and_context().await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
-    let workspace_cwd = turn
-        .environments
-        .single_local_environment_cwd()
-        .expect("test turn has one local environment");
-    let repo_root =
-        get_git_repo_root(workspace_cwd.as_path()).expect("test cwd is in a git repository");
-    let search_target = repo_root.join("codex-rs/core/src/tools/command_execution.rs");
+    {
+        let mut authorization = turn.validation_authorization.write().await;
+        *authorization = crate::validation_admission::ValidationAuthorization::enabled();
+    }
+    let validation_repository = tempfile::tempdir().expect("temporary validation repository");
+    let git_init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(validation_repository.path())
+        .output()
+        .expect("initialize validation repository");
+    assert!(git_init.status.success());
+    let search_target = validation_repository.path().join("search-target.txt");
+    tokio::fs::write(&search_target, "present\n")
+        .await
+        .expect("write validation search target");
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
             "kind": "argv",
@@ -619,11 +631,12 @@ async fn identical_tagged_validation_rg_misses_both_launch() {
             "args": [
                 "-n",
                 "__codex_validation_unmatched_probe__",
-                search_target,
+                search_target.clone(),
             ],
             "validation": {
-                "covered_paths": ["codex-rs/core/src/tools/command_execution.rs"],
+                "covered_paths": [search_target],
             },
+            "workdir": validation_repository.path(),
             "yield_time_ms": 10_000,
         })
         .to_string(),
@@ -652,14 +665,18 @@ async fn identical_tagged_validation_rg_misses_both_launch() {
     assert_eq!(launches.process_launches, 2);
     assert_eq!(first.code_mode_result(&payload)["exit_code"], 1);
     assert_eq!(second.code_mode_result(&payload)["exit_code"], 1);
+    let counters = turn
+        .turn_timing_state
+        .complete_snapshot()
+        .protocol_timing()
+        .counters;
     assert_eq!(
-        turn.turn_timing_state
-            .complete_snapshot()
-            .protocol_timing()
-            .counters
-            .executed_validation_count,
-        2,
+        counters.executed_validation_count, 2,
         "every launched validation must publish exactly one result",
+    );
+    assert!(
+        counters.executed_validation_duration_ns > 0,
+        "failed validations must retain their measured execution duration",
     );
 }
 

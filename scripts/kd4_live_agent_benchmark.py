@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 from collections import Counter, deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -171,8 +172,225 @@ INVALID_CASES = (
     "١s",
 )
 
-REPORT_SCHEMA_VERSION = 6
-TURN_TRACE_SCHEMA_VERSION = 2
+
+@dataclass(frozen=True)
+class BenchmarkTask:
+    """One deterministic task shape in the paired live-agent suite."""
+
+    task_id: str
+    shape: str
+    prompt: str
+    files: dict[str, str]
+    editable_files: tuple[str, ...]
+    hidden_verifier: str
+
+
+_DURATION_HIDDEN_VERIFIER = """
+import importlib.util
+from pathlib import Path
+
+path = Path(__KD4_ROOT__) / "duration.py"
+spec = importlib.util.spec_from_file_location('bench_duration', path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+parse_duration = module.parse_duration
+valid = __KD4_VALID_CASES__
+invalid = __KD4_INVALID_CASES__
+for text, expected in valid.items():
+    actual = parse_duration(text)
+    assert type(actual) is int and actual == expected, (text, expected, actual)
+for text in invalid:
+    try:
+        parse_duration(text)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(('expected ValueError', text))
+"""
+
+_DIAGNOSTIC_TASK_FILES = {
+    ".gitignore": "__pycache__/\n*.pyc\n",
+    "AGENTS.md": """# Task instructions
+
+- Diagnose the failing behavior before editing.
+- Modify only `slugify.py`.
+- Use only the Python standard library.
+- Run `python -m unittest -q` before finishing.
+""",
+    "README.md": """# Slug normalization
+
+`normalize_slug(value)` must return a lowercase ASCII slug. Strip surrounding
+whitespace, replace every run of non-alphanumeric ASCII characters with one
+hyphen, and remove leading or trailing hyphens. Raise `ValueError` for non-string
+inputs, non-ASCII text, or inputs that contain no ASCII letters or digits.
+""",
+    "slugify.py": """import re
+
+
+def normalize_slug(value: str) -> str:
+    return value.strip().lower().replace(" ", "-")
+""",
+    "test_slugify.py": """import unittest
+
+from slugify import normalize_slug
+
+
+class NormalizeSlugTests(unittest.TestCase):
+    def test_words_and_punctuation(self):
+        self.assertEqual(normalize_slug("  Alpha, beta!  "), "alpha-beta")
+
+    def test_runs_collapse(self):
+        self.assertEqual(normalize_slug("A___B   C"), "a-b-c")
+
+    def test_empty_is_rejected(self):
+        with self.assertRaises(ValueError):
+            normalize_slug("---")
+
+
+if __name__ == "__main__":
+    unittest.main()
+""",
+}
+
+_DIAGNOSTIC_HIDDEN_VERIFIER = """
+import importlib.util
+from pathlib import Path
+
+path = Path(__KD4_ROOT__) / "slugify.py"
+spec = importlib.util.spec_from_file_location('bench_slugify', path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+normalize_slug = module.normalize_slug
+valid = {
+    "Simple": "simple",
+    "  Alpha, beta!  ": "alpha-beta",
+    "A___B   C": "a-b-c",
+    "--one--two--": "one-two",
+    "v2 API": "v2-api",
+}
+for text, expected in valid.items():
+    actual = normalize_slug(text)
+    assert type(actual) is str and actual == expected, (text, expected, actual)
+for value in ("", "---", "café", None, 42):
+    try:
+        normalize_slug(value)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(('expected ValueError', value))
+"""
+
+_MULTI_FILE_TASK_FILES = {
+    ".gitignore": "__pycache__/\n*.pyc\n",
+    "AGENTS.md": """# Task instructions
+
+- Modify only `inventory/parser.py` and `inventory/report.py`.
+- Use only the Python standard library.
+- Run `python -m unittest -q` before finishing.
+""",
+    "README.md": """# Inventory report
+
+`parse_rows(text)` parses non-empty CSV lines in the exact form `name,quantity`.
+Names are trimmed and must be non-empty. Quantities are non-negative ASCII
+integers. Malformed rows raise `ValueError`. `render_report(text)` returns names
+in input order as `name: quantity`, followed by `TOTAL: n`; an empty input returns
+only `TOTAL: 0`.
+""",
+    "inventory/__init__.py": "",
+    "inventory/parser.py": """def parse_rows(text: str) -> list[tuple[str, int]]:
+    return [(line, 1) for line in text.splitlines() if line]
+""",
+    "inventory/report.py": """from .parser import parse_rows
+
+
+def render_report(text: str) -> str:
+    rows = parse_rows(text)
+    return "\\n".join(f"{name}: {quantity}" for name, quantity in rows)
+""",
+    "test_inventory.py": """import unittest
+
+from inventory.parser import parse_rows
+from inventory.report import render_report
+
+
+class InventoryTests(unittest.TestCase):
+    def test_parse_rows(self):
+        self.assertEqual(parse_rows("apples,2\\npears,3"), [("apples", 2), ("pears", 3)])
+
+    def test_render_report(self):
+        self.assertEqual(
+            render_report("apples,2\\npears,3"),
+            "apples: 2\\npears: 3\\nTOTAL: 5",
+        )
+
+    def test_invalid_quantity(self):
+        with self.assertRaises(ValueError):
+            parse_rows("apples,-1")
+
+
+if __name__ == "__main__":
+    unittest.main()
+""",
+}
+
+_MULTI_FILE_HIDDEN_VERIFIER = """
+import sys
+from pathlib import Path
+
+root = Path(__KD4_ROOT__)
+sys.path.insert(0, str(root))
+from inventory.parser import parse_rows
+from inventory.report import render_report
+
+assert parse_rows("") == []
+assert parse_rows(" apples ,002\\npears,0") == [("apples", 2), ("pears", 0)]
+assert render_report("") == "TOTAL: 0"
+assert render_report(" apples ,2\\npears,3") == "apples: 2\\npears: 3\\nTOTAL: 5"
+for text in ("missing", ",1", "name,", "name,-1", "name,1.5", "name,١", "a,1,2"):
+    try:
+        parse_rows(text)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(('expected ValueError', text))
+"""
+
+DEFAULT_BENCHMARK_TASK = BenchmarkTask(
+    task_id="duration_parser",
+    shape="single_file_edit",
+    prompt=TASK_PROMPT,
+    files=FIXTURE_FILES,
+    editable_files=("duration.py",),
+    hidden_verifier=_DURATION_HIDDEN_VERIFIER,
+)
+BENCHMARK_TASKS = (
+    DEFAULT_BENCHMARK_TASK,
+    BenchmarkTask(
+        task_id="slug_diagnostic",
+        shape="diagnostic_fix",
+        prompt="""Diagnose and fix `normalize_slug` so it satisfies `README.md`. Modify
+only `slugify.py`, run `python -m unittest -q`, and work until the tests pass.
+""",
+        files=_DIAGNOSTIC_TASK_FILES,
+        editable_files=("slugify.py",),
+        hidden_verifier=_DIAGNOSTIC_HIDDEN_VERIFIER,
+    ),
+    BenchmarkTask(
+        task_id="inventory_multi_file",
+        shape="multi_file_edit",
+        prompt="""Implement the inventory parser and report contract in `README.md`.
+Modify only `inventory/parser.py` and `inventory/report.py`, run
+`python -m unittest -q`, and work until the tests pass.
+""",
+        files=_MULTI_FILE_TASK_FILES,
+        editable_files=("inventory/parser.py", "inventory/report.py"),
+        hidden_verifier=_MULTI_FILE_HIDDEN_VERIFIER,
+    ),
+)
+BENCHMARK_TASKS_BY_ID = {task.task_id: task for task in BENCHMARK_TASKS}
+
+REPORT_SCHEMA_VERSION = 8
+TURN_TRACE_SCHEMA_VERSION = 3
 REQUIRED_TEST_COMMAND = "python -m unittest -q"
 # Hard ceiling for each post-turn check. Both run agent-authored code, so an
 # unbounded wait lets one bad run stall the entire benchmark.
@@ -283,6 +501,11 @@ MAX_RETAINED_MODEL_REQUESTS = 512
 MAX_RETAINED_TOOL_CALLS = 512
 MAX_RETAINED_COMMANDS = 512
 MAX_COMMAND_TEXT_CHARS = 1_000
+MAX_MODEL_VISIBLE_EVIDENCE_CHARS = 4_000
+MAX_RETAINED_FAILURE_EVIDENCE = 128
+# A JSONL command-start event is emitted after spawn. Keep the fallback narrow
+# enough that it cannot silently pair unrelated commands in a busy turn.
+MAX_COMMAND_SPAWN_LINK_DELTA_MS = 2_000
 MAX_RETAINED_REQUIRED_TEST_ATTEMPTS = 256
 MAX_QUEUED_STDOUT_LINES = 64
 MAX_STREAM_LINE_CHARS = 4_000_000
@@ -463,9 +686,29 @@ def text_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def fixture_manifest() -> dict[str, str]:
+def resolve_benchmark_tasks(task_ids: list[str] | tuple[str, ...] | None) -> tuple[BenchmarkTask, ...]:
+    """Resolve an explicit task selection without silently broadening it."""
+    if not task_ids:
+        return (DEFAULT_BENCHMARK_TASK,)
+    if "all" in task_ids:
+        if len(task_ids) != 1:
+            raise ValueError("`all` cannot be combined with individual task IDs")
+        return BENCHMARK_TASKS
+    unknown = sorted(set(task_ids) - set(BENCHMARK_TASKS_BY_ID))
+    if unknown:
+        raise ValueError("unknown benchmark task(s): " + ", ".join(unknown))
+    # Preserve CLI order while refusing duplicate work that would corrupt pair
+    # identity and make a task appear to have more repetitions than it did.
+    if len(set(task_ids)) != len(task_ids):
+        raise ValueError("benchmark task IDs must be unique")
+    return tuple(BENCHMARK_TASKS_BY_ID[task_id] for task_id in task_ids)
+
+
+def fixture_manifest(
+    task: BenchmarkTask = DEFAULT_BENCHMARK_TASK,
+) -> dict[str, str]:
     return {
-        name: text_sha256(content) for name, content in sorted(FIXTURE_FILES.items())
+        name: text_sha256(content) for name, content in sorted(task.files.items())
     }
 
 
@@ -524,8 +767,10 @@ def fixture_git_env() -> dict[str, str]:
     return env
 
 
-def create_fixture(root: Path) -> str:
-    for relative, content in FIXTURE_FILES.items():
+def create_fixture(
+    root: Path, task: BenchmarkTask = DEFAULT_BENCHMARK_TASK
+) -> str:
+    for relative, content in task.files.items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8", newline="\n")
@@ -566,9 +811,11 @@ def create_fixture(root: Path) -> str:
     ).strip()
 
 
-def protected_fixture_failures(root: Path) -> list[str]:
+def protected_fixture_failures(
+    root: Path, task: BenchmarkTask = DEFAULT_BENCHMARK_TASK
+) -> list[str]:
     failures: list[str] = []
-    for protected in (".gitignore", "README.md", "test_duration.py", "AGENTS.md"):
+    for protected in sorted(set(task.files) - set(task.editable_files)):
         try:
             # Universal-newline reads make CRLF/LF differences irrelevant while
             # preserving every substantive character in the protected file.
@@ -576,7 +823,7 @@ def protected_fixture_failures(root: Path) -> list[str]:
         except (OSError, UnicodeError):
             failures.append(f"{protected} was modified")
             continue
-        if actual != FIXTURE_FILES[protected]:
+        if actual != task.files[protected]:
             failures.append(f"{protected} was modified")
     return failures
 
@@ -587,10 +834,12 @@ _IGNORED_WORKSPACE_NAMES = frozenset({".git", "__pycache__"})
 _IGNORED_WORKSPACE_SUFFIXES = (".pyc", ".pyo")
 
 
-def added_workspace_files(root: Path) -> list[str]:
+def added_workspace_files(
+    root: Path, task: BenchmarkTask = DEFAULT_BENCHMARK_TASK
+) -> list[str]:
     """Files present in the workspace that the fixture never created.
 
-    The contract is `Modify only duration.py`, so a new module is a violation
+    Each task has an explicit editable-file allowlist, so a new module is a violation
     even though every protected file still matches. It also explains an
     otherwise cryptic verifier failure: the hidden verifier runs under `-I`, so
     the workspace is off `sys.path` and a `duration.py` importing a sibling the
@@ -603,40 +852,32 @@ def added_workspace_files(root: Path) -> list[str]:
             continue
         if path.is_dir() or path.suffix in _IGNORED_WORKSPACE_SUFFIXES:
             continue
-        if relative.as_posix() not in FIXTURE_FILES:
+        if relative.as_posix() not in task.files:
             added.append(relative.as_posix())
     return added
 
 
-def verify_fixture(root: Path) -> tuple[bool, list[str]]:
-    failures = protected_fixture_failures(root)
+def _render_hidden_verifier(root: Path, task: BenchmarkTask) -> str:
+    verifier = task.hidden_verifier.replace("__KD4_ROOT__", repr(str(root)))
+    if task.task_id == DEFAULT_BENCHMARK_TASK.task_id:
+        verifier = verifier.replace("__KD4_VALID_CASES__", repr(VALID_CASES))
+        verifier = verifier.replace("__KD4_INVALID_CASES__", repr(INVALID_CASES))
+    if "__KD4_" in verifier:
+        raise ValueError(f"unresolved hidden-verifier placeholder for {task.task_id}")
+    return verifier
+
+
+def verify_fixture(
+    root: Path, task: BenchmarkTask = DEFAULT_BENCHMARK_TASK
+) -> tuple[bool, list[str]]:
+    failures = protected_fixture_failures(root, task)
+    editable = ", ".join(task.editable_files)
     failures.extend(
-        f"{path} was added; only duration.py may be modified"
-        for path in added_workspace_files(root)
+        f"{path} was added; only {editable} may be modified"
+        for path in added_workspace_files(root, task)
     )
 
-    verifier = f"""
-import importlib.util
-from pathlib import Path
-
-path = Path({str(root / "duration.py")!r})
-spec = importlib.util.spec_from_file_location('bench_duration', path)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-parse_duration = module.parse_duration
-valid = {VALID_CASES!r}
-invalid = {INVALID_CASES!r}
-for text, expected in valid.items():
-    actual = parse_duration(text)
-    assert type(actual) is int and actual == expected, (text, expected, actual)
-for text in invalid:
-    try:
-        parse_duration(text)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError(('expected ValueError', text))
-"""
+    verifier = _render_hidden_verifier(root, task)
     env = os.environ.copy()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
 
@@ -1094,6 +1335,7 @@ def build_agent_command(
     reasoning_effort: str,
     personality: str,
     code_mode: str,
+    task: BenchmarkTask = DEFAULT_BENCHMARK_TASK,
 ) -> list[str]:
     code_mode_enabled = "true" if code_mode == "enabled" else "false"
     return [
@@ -1117,7 +1359,7 @@ def build_agent_command(
         "danger-full-access",
         "-C",
         str(workspace),
-        TASK_PROMPT,
+        task.prompt,
     ]
 
 
@@ -1207,21 +1449,52 @@ def is_required_test_command(command: str) -> bool:
     )
 
 
+# A trailing segment that re-exits with the suite's own status. Both the POSIX
+# `exit $?` and the PowerShell `exit $LASTEXITCODE` forms, plus the explicit
+# PowerShell guard, forward the status the harness needs.
+_EXIT_PROPAGATION_SEGMENT = re.compile(
+    r"(?ix)^\s*(?:"
+    r"exit\s+\$(?:\?|lastexitcode)"
+    r"|if\s*\(\s*\$lastexitcode\s+-ne\s+0\s*\)\s*\{\s*exit\s+\$lastexitcode\s*;?\s*\}"
+    r")\s*;?\s*$"
+)
+
+
 def required_test_exit_code_reflects_suite(command: str) -> bool:
     """Whether exit code 0 can be read as the required suite passing.
 
     `python -m unittest -q || true` exits 0 however the suite behaved, so a
-    matching segment proves a pass only when no exit-masking separator stands
-    between it and the end of its payload. Detection stays separate: a masked
-    invocation still counts as an observed attempt, it just cannot count as a
-    passing one.
+    matching segment proves a pass only when the payload's exit status is the
+    suite's own. That holds in two shapes: the suite is the last segment and no
+    earlier `||` fallback could have skipped it, or the only segment after it
+    re-exits with `$?` / `$LASTEXITCODE`. Anything else (a trailing `echo`, a
+    pipeline into `tail`, `|| true`, `exit 0`) masks the status. Detection
+    stays separate: a masked invocation still counts as an observed attempt, it
+    just cannot count as a passing one.
     """
-    # Parsing general shell control flow is not a sound way to recover the exit
-    # status of one nested process. Trust only an exact innermost invocation;
-    # pipelines and commands before or after it are attempts, never proof of a
-    # passing suite.
     payload = shell_script_payloads(command)[-1]
-    return _REQUIRED_TEST_PATTERN.fullmatch(payload.strip()) is not None
+    parts = [part.strip() for part in _SHELL_SEGMENT_CAPTURE.split(payload)]
+    segments = parts[0::2]
+    separators = parts[1::2]
+    matches = [
+        index
+        for index, segment in enumerate(segments)
+        if _REQUIRED_TEST_PATTERN.fullmatch(segment) is not None
+    ]
+    if not matches:
+        return False
+    index = matches[-1]
+    if "||" in separators[:index]:
+        # `true || python -m unittest -q` never runs the suite yet exits 0.
+        return False
+    following_segments = segments[index + 1 :]
+    if not following_segments:
+        return True
+    return (
+        len(following_segments) == 1
+        and separators[index] in {";", "&&"}
+        and _EXIT_PROPAGATION_SEGMENT.fullmatch(following_segments[0]) is not None
+    )
 
 
 def _segment_leader(segment: str) -> tuple[str, str | None]:
@@ -1358,6 +1631,129 @@ def _command_text(value: Any) -> str:
     return str(value)
 
 
+_COMMAND_IDENTITY_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("callId", ("call_id", "callId", "tool_call_id", "toolCallId")),
+    (
+        "parentCallId",
+        (
+            "parent_call_id",
+            "parentCallId",
+            "parent_tool_call_id",
+            "parentToolCallId",
+        ),
+    ),
+    ("cellId", ("cell_id", "cellId")),
+    ("parentCellId", ("parent_cell_id", "parentCellId")),
+    (
+        "runtimeToolCallId",
+        ("runtime_tool_call_id", "runtimeToolCallId"),
+    ),
+    ("executionId", ("execution_id", "executionId")),
+    (
+        "samplingGenerationId",
+        ("sampling_generation_id", "samplingGenerationId"),
+    ),
+)
+
+
+def command_event_identity(item: dict[str, Any]) -> dict[str, str | None]:
+    """Normalize command identity without confusing a synthetic JSONL item ID.
+
+    The exec JSONL contract uses snake_case while terminal timing uses
+    camelCase. Accepting both also lets the harness compare older and newer
+    instrumented builds with the same exact-linking path.
+    """
+
+    identity: dict[str, str | None] = {}
+    for canonical_name, aliases in _COMMAND_IDENTITY_ALIASES:
+        value = next(
+            (
+                item.get(alias)
+                for alias in aliases
+                if isinstance(item.get(alias), str) and item.get(alias)
+            ),
+            None,
+        )
+        identity[canonical_name] = str(value) if value is not None else None
+    return identity
+
+
+def bounded_text_evidence(
+    value: Any, *, max_chars: int = MAX_MODEL_VISIBLE_EVIDENCE_CHARS
+) -> dict[str, Any] | None:
+    """Return reviewable text evidence with a lossless size/hash envelope."""
+
+    if not isinstance(value, str):
+        return None
+    return {
+        "textPrefix": value[:max_chars],
+        "textChars": len(value),
+        "textTruncated": len(value) > max_chars,
+        "textSha256": text_sha256(value),
+    }
+
+
+def failure_evidence_from_event(
+    *,
+    event_type: str,
+    event: dict[str, Any],
+    item: dict[str, Any],
+    item_type: Any,
+    item_id: str | None,
+    sequence: int,
+    observed_ms: float,
+) -> dict[str, Any] | None:
+    """Retain failed command/cell/error evidence without retaining full output."""
+
+    status = str(item.get("status", "")).lower()
+    exit_code = item.get("exit_code")
+    failed = (
+        event_type in {"error", "turn.failed"}
+        or str(item_type) == "error"
+        or status in {"failed", "declined", "error"}
+        or (
+            event_type == "item.completed"
+            and isinstance(exit_code, int)
+            and not isinstance(exit_code, bool)
+            and exit_code != 0
+        )
+    )
+    if not failed:
+        return None
+
+    text_parts: list[str] = []
+
+    def retain_text(value: Any) -> None:
+        if isinstance(value, str) and value and value not in text_parts:
+            text_parts.append(value)
+
+    for key in ("aggregated_output", "message", "output", "text"):
+        retain_text(item.get(key))
+    item_error = item.get("error")
+    if isinstance(item_error, dict):
+        retain_text(item_error.get("message"))
+    else:
+        retain_text(item_error)
+    event_error = event.get("error")
+    if isinstance(event_error, dict):
+        retain_text(event_error.get("message"))
+    else:
+        retain_text(event_error)
+    retain_text(event.get("message"))
+    full_text = "\n".join(text_parts)
+    return {
+        "eventType": event_type,
+        "itemType": None if item_type is None else str(item_type),
+        "itemId": item_id,
+        **command_event_identity(item),
+        "sequence": sequence,
+        "observedMs": observed_ms,
+        "status": item.get("status"),
+        "exitCode": exit_code,
+        "modelVisibleText": bounded_text_evidence(full_text),
+    }
+
+
 def required_test_covers_final_workspace_state(
     last_successful_test_sequence: int | None,
     last_workspace_mutation_sequence: int | None,
@@ -1390,6 +1786,7 @@ def record_command_event(
     if record_key not in records:
         records[record_key] = {
             "itemId": item_id,
+            **command_event_identity(item),
             "command": full_command[:MAX_COMMAND_TEXT_CHARS],
             "commandChars": len(full_command),
             "commandTruncated": len(full_command) > MAX_COMMAND_TEXT_CHARS,
@@ -1408,9 +1805,13 @@ def record_command_event(
             "kind": "other",
             "mutating": False,
             "passed": False,
+            "modelVisibleOutput": None,
         }
         order.append(record_key)
     record = records[record_key]
+    for identity_name, identity_value in command_event_identity(item).items():
+        if identity_value is not None:
+            record[identity_name] = identity_value
     if command_present:
         record["command"] = full_command[:MAX_COMMAND_TEXT_CHARS]
         record["commandChars"] = len(full_command)
@@ -1436,6 +1837,9 @@ def record_command_event(
         record["completedSequence"] = sequence
         record["completedObservedMs"] = observed_ms
         record["completedObservedAtUnixMs"] = observed_at_unix_ms
+        record["modelVisibleOutput"] = bounded_text_evidence(
+            item.get("aggregated_output")
+        )
     record["observedDurationMs"] = _rounded_delta_ms(
         record["completedObservedMs"], record["startedObservedMs"]
     )
@@ -1832,6 +2236,7 @@ def truncate_turn_trace(trace: dict[str, Any]) -> dict[str, int]:
         ("modelRequests", MAX_RETAINED_MODEL_REQUESTS),
         ("toolCalls", MAX_RETAINED_TOOL_CALLS),
         ("commands", MAX_RETAINED_COMMANDS),
+        ("failureEvidence", MAX_RETAINED_FAILURE_EVIDENCE),
     ):
         rows = trace.get(key)
         if isinstance(rows, list) and len(rows) > cap:
@@ -1898,6 +2303,7 @@ def build_turn_trace(
     terminal_observed_ms: float | None,
     commands: list[dict[str, Any]],
     item_events: list[dict[str, Any]],
+    failure_evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a queryable request/tool/command trace and explicit censor record."""
 
@@ -1924,6 +2330,9 @@ def build_turn_trace(
         "modelRequests": max(0, len(valid_requests) - MAX_RETAINED_MODEL_REQUESTS),
         "toolCalls": max(0, len(valid_tool_calls) - MAX_RETAINED_TOOL_CALLS),
         "commands": max(0, len(commands) - MAX_RETAINED_COMMANDS),
+        "failureEvidence": max(
+            0, len(failure_evidence or []) - MAX_RETAINED_FAILURE_EVIDENCE
+        ),
     }
     requests = valid_requests[:MAX_RETAINED_MODEL_REQUESTS]
     tool_calls = valid_tool_calls[:MAX_RETAINED_TOOL_CALLS]
@@ -1979,6 +2388,9 @@ def build_turn_trace(
         )
 
     trace_commands = [dict(command) for command in commands]
+    retained_failure_evidence = list(
+        (failure_evidence or [])[:MAX_RETAINED_FAILURE_EVIDENCE]
+    )
     command_candidates = [
         (index, tool_call)
         for index, tool_call in enumerate(tool_calls)
@@ -1989,28 +2401,80 @@ def build_turn_trace(
     command_to_tool: dict[int, tuple[int, str]] = {}
     chronological_fallback_reasons: list[str] = []
 
-    # `codex exec` normally synthesizes JSONL item IDs, but retain an exact-ID
-    # path for builds that expose a core identity now or in the future.
+    # Prefer identities propagated from the runtime. JSONL item IDs are display
+    # identities allocated by `codex exec` and are deliberately not used here.
     for command_index, command in enumerate(trace_commands):
-        item_id = command.get("itemId")
-        if not isinstance(item_id, str):
-            continue
-        exact_matches = [
-            candidate_index
-            for candidate_index, tool_call in command_candidates
-            if candidate_index in unmatched_candidate_indexes
-            and item_id
-            in {
-                str(tool_call.get(key))
-                for key in ("callId", "runtimeToolCallId", "executionId")
-                if tool_call.get(key) is not None
-            }
-        ]
-        if len(exact_matches) == 1:
-            candidate_index = exact_matches[0]
-            command_to_tool[command_index] = (candidate_index, "exact_identity")
-            unmatched_candidate_indexes.remove(candidate_index)
-            unmatched_command_indexes.remove(command_index)
+        for identity_name, method in (
+            ("runtimeToolCallId", "exact_runtime_tool_call_id"),
+            ("executionId", "exact_execution_id"),
+            ("callId", "exact_call_id"),
+        ):
+            identity_value = command.get(identity_name)
+            if not isinstance(identity_value, str) or not identity_value:
+                continue
+            exact_matches = [
+                candidate_index
+                for candidate_index, tool_call in command_candidates
+                if candidate_index in unmatched_candidate_indexes
+                and tool_call.get(identity_name) == identity_value
+            ]
+            if len(exact_matches) == 1:
+                candidate_index = exact_matches[0]
+                command_to_tool[command_index] = (candidate_index, method)
+                unmatched_candidate_indexes.remove(candidate_index)
+                unmatched_command_indexes.remove(command_index)
+                break
+
+    # Older builds do not put runtime IDs on command items. Accept spawn-time
+    # linkage only as a complete, order-preserving assignment
+    # over the remaining one-to-one population. Partial greedy matches can steal
+    # the first tool from a later command and corrupt every row that follows.
+    ambiguous_spawn_linkage = False
+    command_spawn_times: list[tuple[float, int]] = []
+    candidate_spawn_times: list[tuple[float, int]] = []
+    if _is_number(runtime_started_at_unix_ms):
+        for command_index in unmatched_command_indexes:
+            observed = trace_commands[command_index].get("startedObservedAtUnixMs")
+            if _is_number(observed):
+                command_spawn_times.append(
+                    (
+                        float(observed) - float(runtime_started_at_unix_ms),
+                        command_index,
+                    )
+                )
+        for candidate_index, tool_call in command_candidates:
+            if candidate_index not in unmatched_candidate_indexes:
+                continue
+            spawned = tool_call.get("processSpawnedAtMs")
+            if _is_number(spawned):
+                candidate_spawn_times.append((float(spawned), candidate_index))
+    complete_spawn_population = (
+        bool(unmatched_command_indexes)
+        and len(command_spawn_times) == len(unmatched_command_indexes)
+        and len(candidate_spawn_times) == len(unmatched_candidate_indexes)
+        and len(command_spawn_times) == len(candidate_spawn_times)
+    )
+    if complete_spawn_population:
+        ordered_commands = sorted(command_spawn_times)
+        ordered_candidates = sorted(candidate_spawn_times)
+        command_times = [value for value, _ in ordered_commands]
+        candidate_times = [value for value, _ in ordered_candidates]
+        ambiguous_spawn_linkage = (
+            len(set(command_times)) != len(command_times)
+            or len(set(candidate_times)) != len(candidate_times)
+        )
+        spawn_pairs = list(zip(ordered_commands, ordered_candidates, strict=True))
+        if not ambiguous_spawn_linkage and all(
+            abs(command_time - candidate_time) <= MAX_COMMAND_SPAWN_LINK_DELTA_MS
+            for (command_time, _), (candidate_time, _) in spawn_pairs
+        ):
+            for (_, command_index), (_, candidate_index) in spawn_pairs:
+                command_to_tool[command_index] = (
+                    candidate_index,
+                    "nearest_process_spawn",
+                )
+                unmatched_command_indexes.remove(command_index)
+                unmatched_candidate_indexes.remove(candidate_index)
 
     # Synthetic item IDs cannot be joined to core call IDs. Only correlate by
     # chronology when the remaining populations are complete and one-to-one;
@@ -2032,6 +2496,10 @@ def build_turn_trace(
     elif tool_call_timing_overflow > 0:
         chronological_fallback_reasons.append(
             f"the runtime omitted {tool_call_timing_overflow} tool timing record(s)"
+        )
+    if ambiguous_spawn_linkage:
+        chronological_fallback_reasons.append(
+            "process-spawn timing did not identify a unique mutual nearest match"
         )
     if retention_overflow["toolCalls"]:
         chronological_fallback_reasons.append(
@@ -2404,6 +2872,7 @@ def build_turn_trace(
         "toolCalls": augmented_tool_calls,
         "commands": trace_commands,
         "itemEvents": item_events,
+        "failureEvidence": retained_failure_evidence,
         "retentionOverflow": retention_overflow,
         "linkage": {
             "commandToToolMethods": dict(sorted(linkage_methods.items())),
@@ -2413,10 +2882,10 @@ def build_turn_trace(
                 "disabledReasons": chronological_fallback_reasons,
                 "runtimeToolCallTimingOverflow": tool_call_timing_overflow,
                 "note": (
-                    "`codex exec --json` currently emits synthetic item IDs. "
-                    "Ordinal linkage is derived, never exact, and is used only "
-                    "for complete one-to-one populations with no runtime ledger "
-                    "overflow."
+                    "Runtime call/execution IDs are exact. A nearest-spawn link "
+                    "uses the runtime and harness wall-clock bridge. Ordinal "
+                    "linkage is derived, never exact, and is used only for "
+                    "complete one-to-one populations with no runtime ledger overflow."
                 ),
             },
             "unmatchedCommandItemIds": [
@@ -2609,13 +3078,16 @@ def _run_agent_impl(
     code_mode: str,
     auth_source: Path,
     timeout_seconds: int,
+    task: BenchmarkTask,
     _process_holder: list[subprocess.Popen[str]],
 ) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix=f"kd4-live-{label}-{repetition}-") as temp:
+    with tempfile.TemporaryDirectory(
+        prefix=f"kd4-live-{task.task_id}-{label}-{repetition}-"
+    ) as temp:
         temp_root = Path(temp)
         workspace = temp_root / "workspace"
         workspace.mkdir()
-        fixture_revision = create_fixture(workspace)
+        fixture_revision = create_fixture(workspace, task)
         home = temp_root / "home"
         prepare_home(home, auth_source)
 
@@ -2626,6 +3098,7 @@ def _run_agent_impl(
             reasoning_effort=reasoning_effort,
             personality=personality,
             code_mode=code_mode,
+            task=task,
         )
         env = os.environ.copy()
         env["CODEX_HOME"] = str(home)
@@ -2708,6 +3181,8 @@ def _run_agent_impl(
         last_workspace_mutation_sequence: int | None = None
         command_execution_failures = 0
         actual_command_count = 0
+        command_fingerprints: Counter[tuple[str, str]] = Counter()
+        duplicate_command_count = 0
         command_kind_counts: Counter[str] = Counter()
         mutating_command_count = 0
         model_wait_ms: float | None = None
@@ -2721,6 +3196,8 @@ def _run_agent_impl(
         command_record_overflow = 0
         item_events: list[dict[str, Any]] = []
         item_event_overflow = 0
+        failure_evidence: list[dict[str, Any]] = []
+        failure_evidence_overflow = 0
         event_sequence = 0
         turn_started_observed_ms: float | None = None
         terminal_payload: dict[str, Any] | None = None
@@ -2785,6 +3262,11 @@ def _run_agent_impl(
             item = item_value if isinstance(item_value, dict) else {}
             item_type = item.get("type")
             item_id = item.get("id") if isinstance(item.get("id"), str) else None
+            event_identity = {
+                key: value
+                for key, value in command_event_identity(item).items()
+                if value is not None
+            }
             if item_type:
                 item_counts[str(item_type)] += 1
             event_sequence += 1
@@ -2800,6 +3282,7 @@ def _run_agent_impl(
                         "eventType": event_type,
                         "itemType": None if item_type is None else str(item_type),
                         "itemId": item_id,
+                        **event_identity,
                     }
                 )
             else:
@@ -2812,6 +3295,7 @@ def _run_agent_impl(
                             "eventType": event_type,
                             "itemId": item_id,
                             "itemType": None if item_type is None else str(item_type),
+                            **event_identity,
                             "observedMs": offset_ms,
                             "observedAtUnixMs": _unix_ms_from_offset(
                                 process_started_at_unix_ms, offset_ms
@@ -2820,6 +3304,20 @@ def _run_agent_impl(
                     )
                 else:
                     item_event_overflow += 1
+            failure_row = failure_evidence_from_event(
+                event_type=event_type,
+                event=event,
+                item=item,
+                item_type=item_type,
+                item_id=item_id,
+                sequence=event_sequence,
+                observed_ms=offset_ms,
+            )
+            if failure_row is not None:
+                if len(failure_evidence) < MAX_RETAINED_FAILURE_EVIDENCE:
+                    failure_evidence.append(failure_row)
+                else:
+                    failure_evidence_overflow += 1
             if event_type == "item.completed" and item_type == "file_change":
                 last_workspace_mutation_sequence = event_sequence
             if event_type == "turn.started" and turn_started_observed_ms is None:
@@ -2862,6 +3360,13 @@ def _run_agent_impl(
                 if event_type == "item.completed":
                     actual_command_count += 1
                     command_kind_counts[str(record["kind"])] += 1
+                    fingerprint = (
+                        str(record["kind"]),
+                        str(record.get("commandSha256") or ""),
+                    )
+                    command_fingerprints[fingerprint] += 1
+                    if command_fingerprints[fingerprint] > 1:
+                        duplicate_command_count += 1
                     if record["mutating"] is True:
                         mutating_command_count += 1
                         last_workspace_mutation_sequence = event_sequence
@@ -2916,7 +3421,7 @@ def _run_agent_impl(
         if readers_drained:
             process.stdout.close()
             process.stderr.close()
-        verifier_passed, verifier_failures = verify_fixture(workspace)
+        verifier_passed, verifier_failures = verify_fixture(workspace, task)
 
         reasons: list[str] = []
         if timed_out:
@@ -2939,7 +3444,7 @@ def _run_agent_impl(
             last_successful_required_test_sequence,
             last_workspace_mutation_sequence,
         )
-        added_files = added_workspace_files(workspace)
+        added_files = added_workspace_files(workspace, task)
         task_contract_compliant = (
             outcome_correct and required_test_passed and not added_files
         )
@@ -2982,6 +3487,7 @@ def _run_agent_impl(
             ),
             commands=[command_records[key] for key in command_order],
             item_events=item_events,
+            failure_evidence=failure_evidence,
         )
         attach_stream_evidence(
             trace, derived_rounds, command_count=actual_command_count
@@ -2993,6 +3499,13 @@ def _run_agent_impl(
         trace_summary = summarize_turn_trace(trace)
         trace_summary["commandKinds"] = dict(sorted(command_kind_counts.items()))
         trace_summary["mutatingCommands"] = mutating_command_count
+        ttfo_ms = None if ttfo_ns is None else round(ttfo_ns / 1_000_000, 3)
+        latency_explanation = explain_turn_latency(
+            trace,
+            completion_ms=completion_ms,
+            wall_clock_ms=wall_clock_ms,
+            ttfo_ms=ttfo_ms,
+        )
         trace["retentionOverflow"] = truncate_turn_trace(trace)
         trace["retentionOverflow"].update(
             {
@@ -3001,11 +3514,17 @@ def _run_agent_impl(
                 "diagnosticTextLines": diagnostic_text_overflow,
                 "stderrLines": stderr_line_overflow,
                 "overLimitJsonlLines": stdout_truncated_lines,
+                "failureEvidence": trace["retentionOverflow"].get(
+                    "failureEvidence", 0
+                )
+                + failure_evidence_overflow,
             }
         )
         return {
             "variant": label,
             "repetition": repetition,
+            "taskId": task.task_id,
+            "taskShape": task.shape,
             "fixtureRevision": fixture_revision,
             "success": outcome_correct,
             "outcomeCorrect": outcome_correct,
@@ -3039,7 +3558,10 @@ def _run_agent_impl(
                 "lastWorkspaceMutationSequence": last_workspace_mutation_sequence,
                 "testAttempts": required_test_attempts,
                 "testAttemptOverflow": required_test_attempt_overflow,
-                "editableFile": "duration.py",
+                "editableFile": (
+                    task.editable_files[0] if len(task.editable_files) == 1 else None
+                ),
+                "editableFiles": list(task.editable_files),
                 "addedFiles": added_files,
             },
             "diagnostics": diagnostics,
@@ -3048,7 +3570,8 @@ def _run_agent_impl(
             "modelWaitMs": model_wait_ms,
             "continuationCount": continuation_count,
             "actualCommandCount": actual_command_count,
-            "ttfoMs": None if ttfo_ns is None else round(ttfo_ns / 1_000_000, 3),
+            "duplicateCommandCount": duplicate_command_count,
+            "ttfoMs": ttfo_ms,
             "exitCode": exit_code,
             "terminalEvent": terminal_event,
             "eventCounts": dict(sorted(event_counts.items())),
@@ -3060,6 +3583,7 @@ def _run_agent_impl(
             # explicit while the top-level counts still cover the full stream.
             "turnTrace": trace,
             "turnTraceSummary": trace_summary,
+            "latencyExplanation": latency_explanation,
             "continuationNarrative": [
                 request["narrative"]
                 for request in trace["modelRequests"]
@@ -3088,6 +3612,7 @@ def run_agent(
     code_mode: str,
     auth_source: Path,
     timeout_seconds: int,
+    task: BenchmarkTask = DEFAULT_BENCHMARK_TASK,
 ) -> dict[str, Any]:
     """Run one agent with unconditional process-tree cleanup."""
     processes: list[subprocess.Popen[str]] = []
@@ -3102,6 +3627,7 @@ def run_agent(
             code_mode=code_mode,
             auth_source=auth_source,
             timeout_seconds=timeout_seconds,
+            task=task,
             _process_holder=processes,
         )
     finally:
@@ -3116,6 +3642,16 @@ def run_agent(
                     stream.close()
 
 
+def percentile_nearest_rank(values: list[float | int], percentile: float) -> float | None:
+    if not values:
+        return None
+    if percentile <= 0 or percentile > 100:
+        raise ValueError("percentile must be in (0, 100]")
+    ordered = sorted(float(value) for value in values)
+    index = max(0, math.ceil(percentile / 100 * len(ordered)) - 1)
+    return round(ordered[index], 3)
+
+
 def distribution(values: list[float]) -> dict[str, Any] | None:
     if not values:
         return None
@@ -3123,6 +3659,7 @@ def distribution(values: list[float]) -> dict[str, Any] | None:
         "count": len(values),
         "averageMs": round(statistics.fmean(values), 3),
         "medianMs": round(statistics.median(values), 3),
+        "p90Ms": percentile_nearest_rank(values, 90),
         "minMs": round(min(values), 3),
         "maxMs": round(max(values), 3),
     }
@@ -3135,8 +3672,545 @@ def count_distribution(values: list[int]) -> dict[str, Any] | None:
         "count": len(values),
         "average": round(statistics.fmean(values), 3),
         "median": round(statistics.median(values), 3),
+        "p90": percentile_nearest_rank(values, 90),
         "min": min(values),
         "max": max(values),
+    }
+
+
+def _ns_as_ms(value: Any) -> float | None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return round(value / 1_000_000, 3)
+
+
+def _share_percent(part: float | None, whole: float | None) -> float | None:
+    if part is None or whole is None or whole <= 0:
+        return None
+    return round(part / whole * 100, 3)
+
+
+def _sum_numeric(records: list[dict[str, Any]], key: str) -> float:
+    return round(
+        sum(
+            float(record[key])
+            for record in records
+            if _is_number(record.get(key)) and float(record[key]) >= 0
+        ),
+        3,
+    )
+
+
+def explain_turn_latency(
+    trace: dict[str, Any],
+    *,
+    completion_ms: float | None,
+    wall_clock_ms: float | None,
+    ttfo_ms: float | None,
+) -> dict[str, Any]:
+    """Turn raw timing into an evidence-backed answer to "why was this slow?".
+
+    Harness observations are available for both variants. Runtime ownership and
+    model-request detail are reported only when the measured build emitted a
+    valid terminal timing profile; a missing profile stays an explicit unknown.
+    """
+    commands = [
+        command
+        for command in trace.get("commands", [])
+        if isinstance(command, dict)
+    ]
+    command_execution_ms = _sum_numeric(commands, "observedDurationMs")
+    next_action_latencies = [
+        float(next_action["latencyMs"])
+        for command in commands
+        if isinstance((next_action := command.get("nextObservedAction")), dict)
+        and _is_number(next_action.get("latencyMs"))
+        and float(next_action["latencyMs"]) >= 0
+    ]
+    endpoint_ms = completion_ms if completion_ms is not None else wall_clock_ms
+    mutation_times = [
+        float(command["completedObservedMs"])
+        for command in commands
+        if command.get("mutating") is True
+        and _is_number(command.get("completedObservedMs"))
+    ]
+    mutation_times.extend(
+        float(event["observedMs"])
+        for event in trace.get("itemEvents", [])
+        if isinstance(event, dict)
+        and event.get("eventType") == "item.completed"
+        and event.get("itemType") == "file_change"
+        and _is_number(event.get("observedMs"))
+    )
+    test_times = [
+        float(command["completedObservedMs"])
+        for command in commands
+        if command.get("requiredTest") is True
+        and _is_number(command.get("completedObservedMs"))
+    ]
+    first_mutation_ms = min(mutation_times) if mutation_times else None
+    first_test_ms = min(test_times) if test_times else None
+    observed = {
+        "elapsedEndpoint": "turn.completed" if completion_ms is not None else "process observation ended",
+        "elapsedMs": endpoint_ms,
+        "ttfoMs": ttfo_ms,
+        "postFirstOutputMs": (
+            round(endpoint_ms - ttfo_ms, 3)
+            if endpoint_ms is not None
+            and ttfo_ms is not None
+            and endpoint_ms >= ttfo_ms
+            else None
+        ),
+        "commandCount": len(commands),
+        "commandExecutionObservedMs": command_execution_ms,
+        "commandExecutionSharePercent": _share_percent(
+            command_execution_ms, endpoint_ms
+        ),
+        "commandCompletionToNextActionMs": distribution(next_action_latencies),
+        "commandCompletionToNextActionTotalMs": round(
+            sum(next_action_latencies), 3
+        ),
+        "firstWorkspaceMutationObservedMs": (
+            round(first_mutation_ms, 3) if first_mutation_ms is not None else None
+        ),
+        "firstRequiredTestCompletedObservedMs": (
+            round(first_test_ms, 3) if first_test_ms is not None else None
+        ),
+        "requiredTestToTerminalMs": (
+            round(endpoint_ms - first_test_ms, 3)
+            if endpoint_ms is not None
+            and first_test_ms is not None
+            and endpoint_ms >= first_test_ms
+            else None
+        ),
+        "note": (
+            "Command duration and command-completion-to-next-action intervals are "
+            "measured from this harness's JSONL observation clock for both builds. "
+            "The latter includes whatever happened before the next visible action "
+            "and is not, by itself, a pure model-latency measurement."
+        ),
+    }
+
+    timing = trace.get("terminalTiming")
+    timing_valid = (
+        isinstance(timing, dict)
+        and bool(timing)
+        and timing.get("profileValid") is True
+        and isinstance(timing.get("exclusive"), dict)
+        and isinstance(timing.get("unions"), dict)
+    )
+    findings: list[str] = []
+    if not timing_valid:
+        findings.append(
+            f"The harness observed {len(commands)} command(s) taking "
+            f"{command_execution_ms / 1000:.3f}s in total, but this build emitted "
+            "no valid internal timing profile, so remote model time cannot be "
+            "separated from local orchestration."
+        )
+        return {
+            "status": "harness_only",
+            "observed": observed,
+            "instrumentedRuntime": {
+                "available": False,
+                "reason": trace.get("censoring", {}).get("timingMissingReason"),
+            },
+            "findings": findings,
+            "remainingUnknowns": [
+                "model-versus-local ownership inside this build",
+                "model request count, request phases, context growth, and retries",
+            ],
+        }
+
+    assert isinstance(timing, dict)
+    exclusive = timing.get("exclusive", {})
+    unions = timing.get("unions", {})
+    local = timing.get("local", {})
+    counters = timing.get("counters", {})
+    requests = [
+        request
+        for request in trace.get("modelRequests", [])
+        if isinstance(request, dict)
+    ]
+    machine_ms = _ns_as_ms(timing.get("machineDurationNs"))
+    ownership_ms = {
+        name: value
+        for name, value in (
+            ("modelOnlyMs", _ns_as_ms(exclusive.get("modelOnlyNs"))),
+            ("toolOnlyMs", _ns_as_ms(exclusive.get("toolOnlyNs"))),
+            ("modelPlusToolMs", _ns_as_ms(exclusive.get("modelPlusToolNs"))),
+            ("orchestrationMs", _ns_as_ms(exclusive.get("orchestrationNs"))),
+            ("finalizationMs", _ns_as_ms(exclusive.get("finalizationNs"))),
+            ("unclassifiedMs", _ns_as_ms(exclusive.get("unclassifiedNs"))),
+        )
+        if value is not None
+    }
+    dominant_owner = (
+        max(ownership_ms, key=ownership_ms.get) if ownership_ms else None
+    )
+    ownership_share = {
+        name.replace("Ms", "Percent"): _share_percent(value, machine_ms)
+        for name, value in ownership_ms.items()
+    }
+    request_waits_ms = [
+        round(request["modelStreamWaitNs"] / 1_000_000, 3)
+        for request in requests
+        if isinstance(request.get("modelStreamWaitNs"), int)
+        and not isinstance(request.get("modelStreamWaitNs"), bool)
+        and request["modelStreamWaitNs"] >= 0
+    ]
+    top_slow_rounds = sorted(
+        (
+            {
+                "generationIndex": request.get("generationIndex"),
+                "purpose": request.get("generationPurpose"),
+                "classification": request.get(
+                    "continuationClassification", {}
+                ).get("primary"),
+                "modelStreamWaitMs": round(
+                    request["modelStreamWaitNs"] / 1_000_000, 3
+                ),
+                "decisionLatencyMs": _ns_as_ms(request.get("decisionLatencyNs")),
+                "inputTokens": request.get("tokenUsage", {}).get("inputTokens"),
+                "cachedInputTokens": request.get("tokenUsage", {}).get(
+                    "cachedInputTokens"
+                ),
+                "outputTokens": request.get("outputTokens"),
+                "reasoningOutputTokens": request.get("reasoningOutputTokens"),
+                "progressKinds": request.get("progressKinds", []),
+            }
+            for request in requests
+            if isinstance(request.get("modelStreamWaitNs"), int)
+            and not isinstance(request.get("modelStreamWaitNs"), bool)
+        ),
+        key=lambda row: row["modelStreamWaitMs"],
+        reverse=True,
+    )[:5]
+    token_totals = {
+        key: sum(
+            int(request.get("tokenUsage", {}).get(key, 0))
+            for request in requests
+            if isinstance(request.get("tokenUsage"), dict)
+            and isinstance(request["tokenUsage"].get(key, 0), int)
+            and not isinstance(request["tokenUsage"].get(key, 0), bool)
+        )
+        for key in (
+            "inputTokens",
+            "cachedInputTokens",
+            "visibleOutputTokens",
+            "reasoningTokens",
+            "totalTokens",
+        )
+    }
+    provider_inputs = [
+        request.get("tokenUsage", {}).get("inputTokens")
+        for request in requests
+        if isinstance(request.get("tokenUsage"), dict)
+        and isinstance(request["tokenUsage"].get("inputTokens"), int)
+        and not isinstance(request["tokenUsage"].get("inputTokens"), bool)
+    ]
+    selected_counters = {
+        key: counters.get(key)
+        for key in (
+            "logicalGenerationCount",
+            "modelRequestCount",
+            "modelRetryCount",
+            "modelFallbackCount",
+            "samePurposeContinuationCount",
+            "failureDiagnosisCount",
+            "waitOnlyGenerationCount",
+            "internallyDrainedWaitCount",
+            "noProgressDirectiveCount",
+            "provenLoopActivationCount",
+            "toolCallCount",
+            "toolOutputTruncationCount",
+            "toolOutputProjectionTruncationCount",
+            "toolOutputArtifactCreationCount",
+            "toolOutputArtifactReuseCount",
+            "attributableRecoveryGenerationCount",
+            "truncationInducedContinuationCount",
+        )
+        if isinstance(counters, dict) and counters.get(key) is not None
+    }
+    purpose_breakdown = []
+    if isinstance(counters, dict):
+        for purpose in counters.get("purposeAggregates", []):
+            if not isinstance(purpose, dict):
+                continue
+            purpose_breakdown.append(
+                {
+                    "purpose": purpose.get("purpose"),
+                    "generations": purpose.get("generations"),
+                    "modelStreamWaitMs": _ns_as_ms(
+                        purpose.get("modelStreamWaitNs")
+                    ),
+                    "decisionLatencyMs": _ns_as_ms(
+                        purpose.get("decisionLatencyNs")
+                    ),
+                    "inputTokens": purpose.get("inputTokens"),
+                    "cachedInputTokens": purpose.get("cachedInputTokens"),
+                    "outputTokens": purpose.get("outputTokens"),
+                    "reasoningOutputTokens": purpose.get(
+                        "reasoningOutputTokens"
+                    ),
+                }
+            )
+    runtime = {
+        "available": True,
+        "profileValid": timing.get("profileValid"),
+        "classificationComplete": timing.get("classificationComplete"),
+        "machineDurationMs": machine_ms,
+        "exclusiveOwnershipMs": ownership_ms,
+        "exclusiveOwnershipSharePercent": ownership_share,
+        "dominantOwner": dominant_owner,
+        "requestPhaseUnionMs": {
+            name: value
+            for name, value in (
+                ("requestWaitMs", _ns_as_ms(unions.get("modelRequestWaitUnionNs"))),
+                ("streamWaitMs", _ns_as_ms(unions.get("modelStreamWaitUnionNs"))),
+                (
+                    "streamProcessingMs",
+                    _ns_as_ms(unions.get("modelStreamProcessingUnionNs")),
+                ),
+            )
+            if value is not None
+        },
+        "localActivityUnionMs": {
+            key.removesuffix("UnionNs") + "Ms": value
+            for key in (
+                "preparationUnionNs",
+                "planningUnionNs",
+                "compactionUnionNs",
+                "persistenceUnionNs",
+                "serializationUnionNs",
+                "routerBuildUnionNs",
+                "startupPrewarmWaitUnionNs",
+                "executorReadinessWaitUnionNs",
+            )
+            if (value := _ns_as_ms(local.get(key))) is not None
+        },
+        "modelStreamWaitPerRequestMs": distribution(request_waits_ms),
+        "purposeBreakdown": purpose_breakdown,
+        "counters": selected_counters,
+        "tokenTotalsAcrossRequests": token_totals,
+        "providerInputGrowth": {
+            "firstRequestTokens": provider_inputs[0] if provider_inputs else None,
+            "lastRequestTokens": provider_inputs[-1] if provider_inputs else None,
+            "deltaTokens": (
+                provider_inputs[-1] - provider_inputs[0]
+                if provider_inputs
+                else None
+            ),
+        },
+        "topSlowModelRounds": top_slow_rounds,
+        "note": (
+            "Exclusive ownership is an additive runtime partition of agent-active "
+            "time. Request phases, local-activity unions, token totals, purposes, "
+            "and counters are overlapping diagnostics and must not be added to it."
+        ),
+    }
+    model_ms = ownership_ms.get("modelOnlyMs")
+    model_share = ownership_share.get("modelOnlyPercent")
+    if model_ms is not None:
+        findings.append(
+            f"Model-only activity used {model_ms / 1000:.3f}s"
+            + (
+                f" ({model_share:.1f}% of agent-active time)"
+                if model_share is not None
+                else ""
+            )
+            + f"; observed command execution used {command_execution_ms / 1000:.3f}s."
+        )
+    generation_count = selected_counters.get("logicalGenerationCount")
+    stream_wait_ms = runtime["requestPhaseUnionMs"].get("streamWaitMs")
+    if isinstance(generation_count, int) and stream_wait_ms is not None:
+        findings.append(
+            f"The turn made {generation_count} model generation(s), including "
+            f"{max(0, generation_count - 1)} continuation(s), accumulating "
+            f"{stream_wait_ms / 1000:.3f}s of model-stream wait."
+        )
+    recovery_count = selected_counters.get("attributableRecoveryGenerationCount")
+    if isinstance(recovery_count, int) and recovery_count > 0:
+        findings.append(
+            f"Runtime counters attributed {recovery_count} generation(s) to "
+            "tool-output projection recovery; see the adjacent truncation and "
+            "artifact counters for the recorded mechanism."
+        )
+    if provider_inputs:
+        findings.append(
+            f"Provider input grew from {provider_inputs[0]} tokens on the first "
+            f"request to {provider_inputs[-1]} on the last."
+        )
+    return {
+        "status": "instrumented",
+        "observed": observed,
+        "instrumentedRuntime": runtime,
+        "findings": findings,
+        "remainingUnknowns": [
+            "which prompt or guidance rule caused a stochastic model decision",
+            "server-side queueing versus inference inside model-stream wait",
+        ],
+    }
+
+
+def summarize_latency_explanations(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    explained_runs = [
+        (run, explanation)
+        for run in runs
+        if isinstance((explanation := run.get("latencyExplanation")), dict)
+    ]
+    explanations = [explanation for _, explanation in explained_runs]
+    observed_rows = [
+        explanation.get("observed", {}) for explanation in explanations
+    ]
+    runtimes = [
+        explanation["instrumentedRuntime"]
+        for explanation in explanations
+        if explanation.get("instrumentedRuntime", {}).get("available") is True
+    ]
+
+    def observed_distribution(key: str) -> dict[str, Any] | None:
+        return distribution(
+            [
+                float(row[key])
+                for row in observed_rows
+                if _is_number(row.get(key))
+            ]
+        )
+
+    ownership_totals: Counter[str] = Counter()
+    purpose_wait_totals: Counter[str] = Counter()
+    counter_totals: Counter[str] = Counter()
+    token_totals: Counter[str] = Counter()
+    machine_total_ms = 0.0
+    top_rounds: list[dict[str, Any]] = []
+    for run, explanation in explained_runs:
+        runtime = explanation.get("instrumentedRuntime", {})
+        if runtime.get("available") is not True:
+            continue
+        if _is_number(runtime.get("machineDurationMs")):
+            machine_total_ms += float(runtime["machineDurationMs"])
+        ownership_totals.update(
+            {
+                key: float(value)
+                for key, value in runtime.get("exclusiveOwnershipMs", {}).items()
+                if _is_number(value)
+            }
+        )
+        for purpose in runtime.get("purposeBreakdown", []):
+            if isinstance(purpose, dict) and _is_number(
+                purpose.get("modelStreamWaitMs")
+            ):
+                purpose_wait_totals[str(purpose.get("purpose") or "unreported")] += (
+                    float(purpose["modelStreamWaitMs"])
+                )
+        counter_totals.update(
+            {
+                key: int(value)
+                for key, value in runtime.get("counters", {}).items()
+                if isinstance(value, int) and not isinstance(value, bool)
+            }
+        )
+        token_totals.update(
+            {
+                key: int(value)
+                for key, value in runtime.get(
+                    "tokenTotalsAcrossRequests", {}
+                ).items()
+                if isinstance(value, int) and not isinstance(value, bool)
+            }
+        )
+        for round_row in runtime.get("topSlowModelRounds", []):
+            if isinstance(round_row, dict):
+                top_rounds.append(
+                    {"repetition": run.get("repetition"), **round_row}
+                )
+
+    ownership_shares = {
+        key.replace("Ms", "Percent"): _share_percent(value, machine_total_ms)
+        for key, value in ownership_totals.items()
+    }
+    findings: list[str] = []
+    if runtimes:
+        model_ms = ownership_totals.get("modelOnlyMs", 0.0)
+        model_share = ownership_shares.get("modelOnlyPercent")
+        findings.append(
+            f"Across {len(runtimes)} instrumented run(s), model-only activity used "
+            f"{model_ms / 1000:.3f}s"
+            + (
+                f" ({model_share:.1f}% of measured agent-active time)."
+                if model_share is not None
+                else "."
+            )
+        )
+        generations = counter_totals.get("logicalGenerationCount", 0)
+        findings.append(
+            f"Those runs made {generations} model generation(s), so "
+            f"{max(0, generations - len(runtimes))} were continuations after the "
+            "initial request."
+        )
+        recovery = counter_totals.get("attributableRecoveryGenerationCount", 0)
+        if recovery:
+            findings.append(
+                f"Runtime counters attributed {recovery} generation(s) to "
+                "tool-output projection recovery."
+            )
+    else:
+        findings.append(
+            "No run emitted a valid internal timing profile; only harness-level "
+            "latency and command behavior can be explained for this variant."
+        )
+    return {
+        "runs": len(runs),
+        "explainedRuns": len(explanations),
+        "instrumentedRuns": len(runtimes),
+        "harnessObserved": {
+            "postFirstOutputMs": observed_distribution("postFirstOutputMs"),
+            "commandExecutionObservedMs": observed_distribution(
+                "commandExecutionObservedMs"
+            ),
+            "commandCompletionToNextActionTotalMs": observed_distribution(
+                "commandCompletionToNextActionTotalMs"
+            ),
+            "firstWorkspaceMutationObservedMs": observed_distribution(
+                "firstWorkspaceMutationObservedMs"
+            ),
+            "firstRequiredTestCompletedObservedMs": observed_distribution(
+                "firstRequiredTestCompletedObservedMs"
+            ),
+            "requiredTestToTerminalMs": observed_distribution(
+                "requiredTestToTerminalMs"
+            ),
+        },
+        "instrumentedRuntime": {
+            "available": bool(runtimes),
+            "availableRuns": len(runtimes),
+            "unavailableRuns": len(runs) - len(runtimes),
+            "agentActiveTotalMs": round(machine_total_ms, 3),
+            "exclusiveOwnershipTotalMs": {
+                key: round(value, 3)
+                for key, value in sorted(ownership_totals.items())
+            },
+            "exclusiveOwnershipSharePercent": dict(
+                sorted(ownership_shares.items())
+            ),
+            "modelStreamWaitMsByPurpose": {
+                key: round(value, 3)
+                for key, value in sorted(purpose_wait_totals.items())
+            },
+            "counterTotals": dict(sorted(counter_totals.items())),
+            "tokenTotalsAcrossRequests": dict(sorted(token_totals.items())),
+            "topSlowModelRounds": sorted(
+                top_rounds,
+                key=lambda row: row.get("modelStreamWaitMs", 0),
+                reverse=True,
+            )[:10],
+        },
+        "findings": findings,
+        "note": (
+            "The harness-observed section is comparable across builds. Internal "
+            "ownership, request phases, counters, and tokens are comparable only "
+            "when both builds emit compatible timing profiles."
+        ),
     }
 
 
@@ -3167,6 +4241,17 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
         if run.get("continuationCount") is not None
     ]
     actual_commands = [run.get("actualCommandCount", 0) for run in runs]
+    duplicate_commands = [run.get("duplicateCommandCount", 0) for run in runs]
+    logical_generations = [
+        int(value)
+        for run in runs
+        if (value := _run_metric(run, "logicalGenerationCount")) is not None
+    ]
+    total_tokens = [
+        int(value)
+        for run in runs
+        if (value := _run_metric(run, "totalTokens")) is not None
+    ]
     tests_ran = sum(
         run.get("taskContract", {}).get("successfulTestObserved", False) for run in runs
     )
@@ -3263,7 +4348,11 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
             "status": timing_status,
             "availableRuns": timing_available_runs,
             "unavailableRuns": len(runs) - timing_available_runs,
-            "metrics": ["modelWait", "continuationCount"],
+            "metrics": [
+                "modelWait",
+                "continuationCount",
+                "latencyExplanation.instrumentedRuntime",
+            ],
             "note": (
                 "Emitted from the `timing` block of the terminal turn event. "
                 "Builds without that instrumentation report null, which means "
@@ -3273,6 +4362,9 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
             ),
         },
         "actualCommandCount": count_distribution(actual_commands),
+        "duplicateCommandCount": count_distribution(duplicate_commands),
+        "logicalGenerationCount": count_distribution(logical_generations),
+        "totalTokens": count_distribution(total_tokens),
         "testsRan": {
             "runs": tests_ran,
             "ratePercent": round(tests_ran / len(runs) * 100, 3),
@@ -3290,6 +4382,7 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
             "ratePercent": compliance_rate,
         },
         "diagnosticCategoryCounts": dict(sorted(diagnostic_counts.items())),
+        "latencyExplanation": summarize_latency_explanations(runs),
         # Continuation structure. These break the single `continuationCount`
         # into the classes a reader can act on, and each count is backed by the
         # per-request rows in `turnTrace.modelRequests` of the same run.
@@ -3363,6 +4456,7 @@ def timing_metric_comparability(
             "continuationCount",
             "continuationClassification",
             "runtimeToolToNextRequestDispatchMs",
+            "latencyExplanation.instrumentedRuntime",
         ],
         "headToHeadComparable": not unavailable,
         "unavailableVariants": unavailable,
@@ -3376,13 +4470,138 @@ def timing_metric_comparability(
     }
 
 
+def comparison_latency_explanation(
+    *,
+    fork_label: str,
+    fork_summary: dict[str, Any],
+    upstream_label: str,
+    upstream_summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Plain, bounded interpretation of the measured completion-time gap."""
+    fork_completion = fork_summary.get("successfulCompletionTime") or {}
+    upstream_completion = upstream_summary.get("successfulCompletionTime") or {}
+    fork_commands = fork_summary.get("actualCommandCount") or {}
+    upstream_commands = upstream_summary.get("actualCommandCount") or {}
+    fork_latency = fork_summary.get("latencyExplanation", {})
+    upstream_latency = upstream_summary.get("latencyExplanation", {})
+    fork_internal = fork_latency.get("instrumentedRuntime", {})
+    upstream_internal = upstream_latency.get("instrumentedRuntime", {})
+    findings: list[str] = []
+    fork_median = fork_completion.get("medianMs")
+    upstream_median = upstream_completion.get("medianMs")
+    if _is_number(fork_median) and _is_number(upstream_median):
+        ratio = (
+            float(fork_median) / float(upstream_median)
+            if float(upstream_median) > 0
+            else None
+        )
+        findings.append(
+            f"Median completion was {float(fork_median) / 1000:.3f}s for "
+            f"{fork_label} and {float(upstream_median) / 1000:.3f}s for "
+            f"{upstream_label}, a "
+            f"{abs(float(fork_median) - float(upstream_median)) / 1000:.3f}s gap"
+            + (f" ({ratio:.2f}x)." if ratio is not None else ".")
+        )
+    if _is_number(fork_commands.get("median")) and _is_number(
+        upstream_commands.get("median")
+    ):
+        findings.append(
+            f"Median command count was {fork_commands['median']} for {fork_label} "
+            f"and {upstream_commands['median']} for {upstream_label}; more tool "
+            "rounds create more opportunities to wait for another model decision."
+        )
+    fork_observed = fork_latency.get("harnessObserved", {})
+    upstream_observed = upstream_latency.get("harnessObserved", {})
+    fork_command_ms = fork_observed.get("commandExecutionObservedMs") or {}
+    upstream_command_ms = upstream_observed.get("commandExecutionObservedMs") or {}
+    if _is_number(fork_command_ms.get("medianMs")) and _is_number(
+        upstream_command_ms.get("medianMs")
+    ):
+        findings.append(
+            "Median harness-observed command execution was only "
+            f"{float(fork_command_ms['medianMs']) / 1000:.3f}s for {fork_label} "
+            f"and {float(upstream_command_ms['medianMs']) / 1000:.3f}s for "
+            f"{upstream_label}; command processes themselves do not explain the "
+            "end-to-end gap."
+        )
+    if fork_internal.get("available") is True:
+        ownership = fork_internal.get("exclusiveOwnershipTotalMs", {})
+        shares = fork_internal.get("exclusiveOwnershipSharePercent", {})
+        model_ms = ownership.get("modelOnlyMs")
+        tool_ms = ownership.get("toolOnlyMs")
+        orchestration_ms = ownership.get("orchestrationMs")
+        model_share = shares.get("modelOnlyPercent")
+        if _is_number(model_ms):
+            findings.append(
+                f"Inside {fork_label}, model-only activity accounted for "
+                f"{float(model_ms) / 1000:.3f}s"
+                + (
+                    f" ({float(model_share):.1f}% of measured agent-active time)."
+                    if _is_number(model_share)
+                    else "."
+                )
+            )
+        if _is_number(tool_ms) and _is_number(orchestration_ms):
+            findings.append(
+                f"Across the instrumented {fork_label} runs, tool-only activity "
+                f"used {float(tool_ms) / 1000:.3f}s and local orchestration used "
+                f"{float(orchestration_ms) / 1000:.3f}s."
+            )
+        counters = fork_internal.get("counterTotals", {})
+        generations = counters.get("logicalGenerationCount")
+        retries = counters.get("modelRetryCount")
+        fallbacks = counters.get("modelFallbackCount")
+        recoveries = counters.get("attributableRecoveryGenerationCount")
+        if isinstance(generations, int):
+            instrumented_runs = fork_internal.get("availableRuns")
+            initial_rounds = (
+                instrumented_runs if isinstance(instrumented_runs, int) else 0
+            )
+            findings.append(
+                f"{fork_label} made {generations} sequential model generation(s), "
+                f"including {max(0, generations - initial_rounds)} continuation(s); "
+                f"the runtime recorded {retries or 0} model retries, "
+                f"{fallbacks or 0} fallback(s), and {recoveries or 0} "
+                "tool-output recovery generation(s)."
+            )
+    internal_comparable = (
+        fork_internal.get("available") is True
+        and upstream_internal.get("available") is True
+    )
+    if not internal_comparable:
+        findings.append(
+            "The builds do not both expose compatible internal timing, so the "
+            "benchmark can explain the instrumented side and compare visible "
+            "behavior, but cannot assign the cross-build gap to model service "
+            "versus local orchestration on both sides."
+        )
+    return {
+        "question": "Why did one end-to-end task take longer?",
+        "findings": findings,
+        "internalOwnershipHeadToHeadComparable": internal_comparable,
+        "evidenceBoundary": (
+            "Completion, TTFO, command behavior, and JSONL phase markers are "
+            "measured by the same harness for both builds. Internal ownership "
+            "and model-request details require compatible timing profiles from "
+            "both measured binaries."
+        ),
+    }
+
+
 PAIRED_METRICS = (
     "completionMs",
     "wallClockMs",
     "ttfoMs",
+    "postFirstOutputMs",
     "modelWaitMs",
     "continuationCount",
+    "logicalGenerationCount",
     "actualCommandCount",
+    "duplicateCommandCount",
+    "firstWorkspaceMutationMs",
+    "firstRequiredTestMs",
+    "requiredTestToTerminalMs",
+    "totalTokens",
     "nonProgressContinuations",
     "verificationContinuations",
     "retryContinuations",
@@ -3401,6 +4620,9 @@ _TERMINAL_ONLY_METRICS = frozenset(
         "completionMs",
         "modelWaitMs",
         "continuationCount",
+        "logicalGenerationCount",
+        "totalTokens",
+        "requiredTestToTerminalMs",
         "nonProgressContinuations",
         "verificationContinuations",
         "retryContinuations",
@@ -3427,6 +4649,38 @@ def _run_metric(run: dict[str, Any], metric: str) -> float | int | None:
         )
     if metric == "actualCommandCount":
         return run.get("actualCommandCount")
+    if metric == "duplicateCommandCount":
+        return run.get("duplicateCommandCount", 0)
+    explanation = run.get("latencyExplanation")
+    observed = (
+        explanation.get("observed", {}) if isinstance(explanation, dict) else {}
+    )
+    if metric in {
+        "postFirstOutputMs",
+        "firstWorkspaceMutationMs",
+        "firstRequiredTestMs",
+        "requiredTestToTerminalMs",
+    }:
+        observed_key = {
+            "postFirstOutputMs": "postFirstOutputMs",
+            "firstWorkspaceMutationMs": "firstWorkspaceMutationObservedMs",
+            "firstRequiredTestMs": "firstRequiredTestCompletedObservedMs",
+            "requiredTestToTerminalMs": "requiredTestToTerminalMs",
+        }[metric]
+        value = observed.get(observed_key)
+        return value if _is_number(value) else None
+    runtime = (
+        explanation.get("instrumentedRuntime", {})
+        if isinstance(explanation, dict)
+        else {}
+    )
+    if runtime.get("available") is True:
+        if metric == "logicalGenerationCount":
+            value = runtime.get("counters", {}).get("logicalGenerationCount")
+            return value if _is_number(value) else None
+        if metric == "totalTokens":
+            value = runtime.get("tokenTotalsAcrossRequests", {}).get("totalTokens")
+            return value if _is_number(value) else None
     summary = run.get("turnTraceSummary")
     if not isinstance(summary, dict):
         return None
@@ -3466,7 +4720,9 @@ def sign_test_p_value(positive: int, negative: int) -> float | None:
 
     Over five or fewer non-zero differences the only attainable two-sided
     p-values are 1.0, 0.625, 0.5, 0.375, 0.25, 0.125, and 0.0625. Six non-zero
-    differences add 0.03125, which is why the balanced default uses six pairs.
+    differences add 0.03125, and the balanced default of ten pairs reaches
+    0.00195, so a batch can lose several pairs to ties or exclusions and still
+    attain p <= 0.05.
     The count of non-zero differences sets the actual floor and drops below the
     repetition count whenever a pair ties or is excluded, so the value a metric
     reached is its own `signTestTwoSidedP`, not the design-wide best case.
@@ -3492,6 +4748,7 @@ def paired_comparison(
     """
     eligibility: list[dict[str, Any]] = []
     for pair in pairs:
+        task_id = str(pair.get("taskId") or DEFAULT_BENCHMARK_TASK.task_id)
         fork_run = pair["currentFork"]
         upstream_run = pair["upstreamC"]
         both_outcome_correct = all(
@@ -3505,6 +4762,8 @@ def paired_comparison(
         eligibility.append(
             {
                 "repetition": pair["repetition"],
+                "taskId": task_id,
+                "pairKey": f"{task_id}:{pair['repetition']}",
                 "bothOutcomeCorrect": both_outcome_correct,
                 "bothTaskContractCompliant": both_contract_compliant,
                 "eligibleForPerformance": (
@@ -3512,10 +4771,11 @@ def paired_comparison(
                 ),
             }
         )
-    eligible_by_repetition = {
-        entry["repetition"]: entry["eligibleForPerformance"] for entry in eligibility
+    eligible_by_pair = {
+        (entry["taskId"], entry["repetition"]): entry["eligibleForPerformance"]
+        for entry in eligibility
     }
-    eligible_pairs = sum(eligible_by_repetition.values())
+    eligible_pairs = sum(eligible_by_pair.values())
     total_pairs = len(pairs)
 
     results: dict[str, Any] = {}
@@ -3523,6 +4783,8 @@ def paired_comparison(
         terminal_only = metric in _TERMINAL_ONLY_METRICS
         deltas: list[dict[str, Any]] = []
         for pair in pairs:
+            task_id = str(pair.get("taskId") or DEFAULT_BENCHMARK_TASK.task_id)
+            pair_key = (task_id, int(pair["repetition"]))
             fork_run = pair["currentFork"]
             upstream_run = pair["upstreamC"]
             fork_value = _run_metric(fork_run, metric)
@@ -3535,6 +4797,8 @@ def paired_comparison(
             deltas.append(
                 {
                     "repetition": pair["repetition"],
+                    "taskId": task_id,
+                    "pairKey": f"{task_id}:{pair['repetition']}",
                     "fork": fork_value,
                     "upstream": upstream_value,
                     "delta": (
@@ -3543,9 +4807,7 @@ def paired_comparison(
                         else round(fork_value - upstream_value, 3)
                     ),
                     "eitherSideRightCensored": censored,
-                    "jointlyCorrectAndCompliant": eligible_by_repetition[
-                        pair["repetition"]
-                    ],
+                    "jointlyCorrectAndCompliant": eligible_by_pair[pair_key],
                 }
             )
         # Censoring only invalidates a metric that needs the terminal turn event.
@@ -3664,6 +4926,12 @@ def attribution_scope(*, repetitions: int) -> dict[str, Any]:
                 "Across the paired repetitions, the per-pair difference in each "
                 "reported metric together with its sign counts."
             ),
+            (
+                "For a build with a valid timing profile, the additive split of "
+                "agent-active time into model-only, tool-only, overlapping, local "
+                "orchestration, finalization, and unclassified ownership, plus its "
+                "recorded request count, retries, context growth, and token totals."
+            ),
         ],
         "unsupportedClaims": [
             (
@@ -3680,6 +4948,10 @@ def attribution_scope(*, repetitions: int) -> dict[str, Any]:
                 "That a round classified `necessary` was in fact required. That "
                 "class is the residual after the other predicates fail to match."
             ),
+            (
+                "How model-stream wait divides between provider queueing, inference, "
+                "and network transit. The client observes their combined wait only."
+            ),
         ],
         "continuationClasses": {
             "labels": list(REQUEST_CLASSES),
@@ -3688,7 +4960,8 @@ def attribution_scope(*, repetitions: int) -> dict[str, Any]:
         },
         "designLimits": {
             "repetitionsPerVariant": repetitions,
-            "pairing": "same fixture and repetition, alternating execution order",
+            "pairing": "same task fixture and repetition, alternating execution order",
+            "requiredTaskShapes": [task.shape for task in BENCHMARK_TASKS],
             "smallestAttainableTwoSidedSignTestP": sign_test_p_value(repetitions, 0),
             "censoring": (
                 "Timed-out runs are right-censored: they carry no terminal timing "
@@ -3705,8 +4978,238 @@ def attribution_scope(*, repetitions: int) -> dict[str, Any]:
                 "Raise repetitions until the paired sign test can attain the intended "
                 "alpha, or replace the point comparison with an interval."
             ),
-            "Extend the fixture set so a result is not conditional on one task.",
+            "Extend beyond the three required task shapes before generalizing broadly.",
         ],
+    }
+
+
+ABLATION_FEATURES = (
+    "reasoning_governor",
+    "wait_draining",
+    "code_mode_admission",
+    "code_mode_history",
+    "tool_batching",
+    "terminalization",
+    "artifact_projection",
+    "prompt_contract",
+)
+
+# Counts cannot increase at all. Time and token measurements get a small live-
+# service tolerance, but both the median and tail must remain inside it for
+# every task shape; an aggregate win cannot conceal one regressed task.
+REGRESSION_GATE_METRICS: dict[str, float] = {
+    "completionMs": 1.05,
+    "postFirstOutputMs": 1.05,
+    "modelWaitMs": 1.05,
+    "logicalGenerationCount": 1.0,
+    "actualCommandCount": 1.0,
+    "duplicateCommandCount": 1.0,
+    "firstWorkspaceMutationMs": 1.10,
+    "firstRequiredTestMs": 1.10,
+    "requiredTestToTerminalMs": 1.05,
+    "totalTokens": 1.05,
+}
+MIN_GATE_REPETITIONS_PER_TASK = 6
+
+
+def _gate_exit_compliant(run: dict[str, Any]) -> bool:
+    return (
+        run.get("terminalEvent") == "turn.completed"
+        and run.get("taskContractCompliant") is True
+        and run.get("taskContract", {}).get("successfulTestObserved") is True
+    )
+
+
+def _ratio_limit_passes(candidate: float, control: float, max_ratio: float) -> bool:
+    if control == 0:
+        return candidate <= 0
+    return candidate <= control * max_ratio
+
+
+def _gate_for_pairs(
+    pairs: list[dict[str, Any]],
+    *,
+    fork_label: str,
+    upstream_label: str,
+) -> dict[str, Any]:
+    candidate_runs = [pair["currentFork"] for pair in pairs]
+    control_runs = [pair["upstreamC"] for pair in pairs]
+    count = len(pairs)
+
+    def outcome_row(name: str, predicate: Any) -> dict[str, Any]:
+        candidate_passes = sum(bool(predicate(run)) for run in candidate_runs)
+        control_passes = sum(bool(predicate(run)) for run in control_runs)
+        return {
+            "name": name,
+            "candidatePasses": candidate_passes,
+            "controlPasses": control_passes,
+            "total": count,
+            "passed": candidate_passes == count and candidate_passes >= control_passes,
+            "rule": "candidate must pass every run and may not trail the control",
+        }
+
+    outcomes = {
+        "correctness": outcome_row(
+            "outcome correctness",
+            lambda run: run.get("outcomeCorrect", run.get("success", False)) is True,
+        ),
+        "taskContractCompliance": outcome_row(
+            "task-contract compliance",
+            lambda run: run.get("taskContractCompliant") is True,
+        ),
+        "exitCompliance": outcome_row("required-test and terminal exit", _gate_exit_compliant),
+    }
+
+    metric_rows: dict[str, Any] = {}
+    for metric, max_ratio in REGRESSION_GATE_METRICS.items():
+        usable: list[tuple[float, float]] = []
+        for pair in pairs:
+            candidate = pair["currentFork"]
+            control = pair["upstreamC"]
+            jointly_eligible = all(
+                run.get("outcomeCorrect", run.get("success", False)) is True
+                and run.get("taskContractCompliant") is True
+                for run in (candidate, control)
+            )
+            if not jointly_eligible:
+                continue
+            candidate_value = _run_metric(candidate, metric)
+            control_value = _run_metric(control, metric)
+            if candidate_value is None or control_value is None:
+                continue
+            usable.append((float(candidate_value), float(control_value)))
+        candidate_values = [candidate for candidate, _ in usable]
+        control_values = [control for _, control in usable]
+        if not usable:
+            metric_rows[metric] = {
+                "status": "not_evaluable",
+                "passed": False,
+                "usablePairs": 0,
+                "maxCandidateToControlRatio": max_ratio,
+                "reason": "no jointly correct, compliant pair reported both values",
+            }
+            continue
+        candidate_median = float(statistics.median(candidate_values))
+        control_median = float(statistics.median(control_values))
+        candidate_p90 = percentile_nearest_rank(candidate_values, 90)
+        control_p90 = percentile_nearest_rank(control_values, 90)
+        assert candidate_p90 is not None and control_p90 is not None
+        median_passed = _ratio_limit_passes(
+            candidate_median, control_median, max_ratio
+        )
+        p90_passed = _ratio_limit_passes(candidate_p90, control_p90, max_ratio)
+        metric_rows[metric] = {
+            "status": "passed" if median_passed and p90_passed else "failed",
+            "passed": median_passed and p90_passed,
+            "usablePairs": len(usable),
+            "maxCandidateToControlRatio": max_ratio,
+            "median": {
+                "candidate": round(candidate_median, 3),
+                "control": round(control_median, 3),
+                "passed": median_passed,
+            },
+            "p90": {
+                "candidate": candidate_p90,
+                "control": control_p90,
+                "passed": p90_passed,
+            },
+        }
+
+    passed = all(row["passed"] for row in outcomes.values()) and all(
+        row["passed"] for row in metric_rows.values()
+    )
+    return {
+        "candidate": fork_label,
+        "control": upstream_label,
+        "pairs": count,
+        "passed": passed,
+        "outcomes": outcomes,
+        "metrics": metric_rows,
+    }
+
+
+def build_regression_gate(
+    pairs: list[dict[str, Any]],
+    *,
+    fork_label: str,
+    upstream_label: str,
+    experiment_feature: str | None,
+) -> dict[str, Any]:
+    """Evaluate one declared feature across every required benchmark shape."""
+    task_groups: dict[str, list[dict[str, Any]]] = {}
+    task_shapes: dict[str, str] = {}
+    for pair in pairs:
+        task_id = str(pair.get("taskId") or DEFAULT_BENCHMARK_TASK.task_id)
+        task_groups.setdefault(task_id, []).append(pair)
+        task_shapes[task_id] = str(
+            pair.get("taskShape") or DEFAULT_BENCHMARK_TASK.shape
+        )
+    required_task_ids = {task.task_id for task in BENCHMARK_TASKS}
+    repetitions_ok = all(
+        len(task_groups.get(task_id, [])) >= MIN_GATE_REPETITIONS_PER_TASK
+        for task_id in required_task_ids
+    )
+    task_set_ok = set(task_groups) == required_task_ids
+    feature_ok = experiment_feature in ABLATION_FEATURES
+    task_gates = {
+        task_id: {
+            "shape": task_shapes.get(task_id),
+            **_gate_for_pairs(
+                task_pairs,
+                fork_label=fork_label,
+                upstream_label=upstream_label,
+            ),
+        }
+        for task_id, task_pairs in sorted(task_groups.items())
+    }
+    structural = {
+        "oneDeclaredFeature": {
+            "passed": feature_ok,
+            "value": experiment_feature,
+            "allowed": list(ABLATION_FEATURES),
+            "note": (
+                "The harness records the assigned feature; binary/source identity "
+                "binds the two conditions, while the operator remains responsible "
+                "for building a pair that differs only in this feature."
+            ),
+        },
+        "requiredTaskSet": {
+            "passed": task_set_ok,
+            "required": sorted(required_task_ids),
+            "observed": sorted(task_groups),
+        },
+        "minimumRepetitionsPerTask": {
+            "passed": repetitions_ok,
+            "required": MIN_GATE_REPETITIONS_PER_TASK,
+            "observed": {
+                task_id: len(task_groups.get(task_id, []))
+                for task_id in sorted(required_task_ids)
+            },
+        },
+    }
+    passed = (
+        all(row["passed"] for row in structural.values())
+        and bool(task_gates)
+        and all(task_gate["passed"] for task_gate in task_gates.values())
+    )
+    return {
+        "passed": passed,
+        "status": "passed" if passed else "failed",
+        "experimentFeature": experiment_feature,
+        "structuralRequirements": structural,
+        "thresholds": {
+            metric: {"maxCandidateToControlRatio": ratio}
+            for metric, ratio in REGRESSION_GATE_METRICS.items()
+        },
+        "taskGates": task_gates,
+        "aggregateDiagnosticOnly": _gate_for_pairs(
+            pairs, fork_label=fork_label, upstream_label=upstream_label
+        ),
+        "decisionRule": (
+            "Every structural requirement, outcome check, median, and p90 must "
+            "pass independently for every task. The aggregate is diagnostic and "
+            "cannot rescue a failed task shape."
+        ),
     }
 
 
@@ -3716,6 +5219,7 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
     fork_root = args.fork_root.resolve()
     upstream_root = args.upstream_root.resolve()
     auth_source = args.auth_source.resolve()
+    tasks = resolve_benchmark_tasks(getattr(args, "tasks", None))
     for path in (fork_binary, upstream_binary, auth_source):
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -3756,59 +5260,68 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
     }
 
     pairs: list[dict[str, Any]] = []
-    for repetition in range(1, args.repetitions + 1):
-        upstream_first = repetition % 2 == 1
-        order = (
-            (
-                ("upstreamC", args.upstream_label, upstream_binary),
-                ("currentFork", args.fork_label, fork_binary),
+    for task in tasks:
+        for repetition in range(1, args.repetitions + 1):
+            upstream_first = repetition % 2 == 1
+            order = (
+                (
+                    ("upstreamC", args.upstream_label, upstream_binary),
+                    ("currentFork", args.fork_label, fork_binary),
+                )
+                if upstream_first
+                else (
+                    ("currentFork", args.fork_label, fork_binary),
+                    ("upstreamC", args.upstream_label, upstream_binary),
+                )
             )
-            if upstream_first
-            else (
-                ("currentFork", args.fork_label, fork_binary),
-                ("upstreamC", args.upstream_label, upstream_binary),
+            runs: dict[str, dict[str, Any]] = {}
+            for role, label, binary in order:
+                _, _, expected_binary_sha256 = binary_baselines[role]
+                require_binary_sha256(binary, expected_binary_sha256, label)
+                print(
+                    f"task {task.task_id}, pair {repetition}/{args.repetitions}: "
+                    f"starting {label}",
+                    flush=True,
+                )
+                run = run_agent(
+                    binary=binary,
+                    label=label,
+                    repetition=repetition,
+                    model=args.model,
+                    reasoning_effort=args.reasoning_effort,
+                    personality=args.personality,
+                    code_mode=args.code_mode,
+                    auth_source=auth_source,
+                    timeout_seconds=args.timeout_seconds,
+                    task=task,
+                )
+                require_binary_sha256(binary, expected_binary_sha256, label)
+                runs[role] = run
+                print(
+                    f"task {task.task_id}, pair {repetition}/{args.repetitions}: "
+                    f"{label} outcomeCorrect={run['outcomeCorrect']} "
+                    f"taskContractCompliant={run['taskContractCompliant']} "
+                    f"completionMs={run['completionMs']} "
+                    f"modelWaitMs={run['modelWaitMs']} "
+                    f"continuations={run['continuationCount']} "
+                    f"commands={run['actualCommandCount']} "
+                    f"failures={run['failureReasons']}",
+                    flush=True,
+                )
+            pairs.append(
+                {
+                    "taskId": task.task_id,
+                    "taskShape": task.shape,
+                    "repetition": repetition,
+                    "order": (
+                        f"{args.upstream_label},{args.fork_label}"
+                        if upstream_first
+                        else f"{args.fork_label},{args.upstream_label}"
+                    ),
+                    "currentFork": runs["currentFork"],
+                    "upstreamC": runs["upstreamC"],
+                }
             )
-        )
-        runs: dict[str, dict[str, Any]] = {}
-        for role, label, binary in order:
-            _, _, expected_binary_sha256 = binary_baselines[role]
-            require_binary_sha256(binary, expected_binary_sha256, label)
-            print(f"pair {repetition}/{args.repetitions}: starting {label}", flush=True)
-            run = run_agent(
-                binary=binary,
-                label=label,
-                repetition=repetition,
-                model=args.model,
-                reasoning_effort=args.reasoning_effort,
-                personality=args.personality,
-                code_mode=args.code_mode,
-                auth_source=auth_source,
-                timeout_seconds=args.timeout_seconds,
-            )
-            require_binary_sha256(binary, expected_binary_sha256, label)
-            runs[role] = run
-            print(
-                f"pair {repetition}/{args.repetitions}: {label} "
-                f"outcomeCorrect={run['outcomeCorrect']} "
-                f"taskContractCompliant={run['taskContractCompliant']} "
-                f"completionMs={run['completionMs']} "
-                f"modelWaitMs={run['modelWaitMs']} "
-                f"continuations={run['continuationCount']} "
-                f"commands={run['actualCommandCount']} failures={run['failureReasons']}",
-                flush=True,
-            )
-        pairs.append(
-            {
-                "repetition": repetition,
-                "order": (
-                    f"{args.upstream_label},{args.fork_label}"
-                    if upstream_first
-                    else f"{args.fork_label},{args.upstream_label}"
-                ),
-                "currentFork": runs["currentFork"],
-                "upstreamC": runs["upstreamC"],
-            }
-        )
 
     fork_runs = [pair["currentFork"] for pair in pairs]
     upstream_runs = [pair["upstreamC"] for pair in pairs]
@@ -3839,9 +5352,37 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
         upstream_label=args.upstream_label,
         upstream_summary=upstream_summary,
     )
+    latency_explanation = comparison_latency_explanation(
+        fork_label=args.fork_label,
+        fork_summary=fork_summary,
+        upstream_label=args.upstream_label,
+        upstream_summary=upstream_summary,
+    )
     paired = paired_comparison(
         pairs, fork_label=args.fork_label, upstream_label=args.upstream_label
     )
+    task_results = {}
+    for task in tasks:
+        task_pairs = [pair for pair in pairs if pair["taskId"] == task.task_id]
+        task_results[task.task_id] = {
+            "shape": task.shape,
+            "currentFork": summarize(
+                [pair["currentFork"] for pair in task_pairs]
+            ),
+            "upstreamC": summarize([pair["upstreamC"] for pair in task_pairs]),
+            "pairedComparison": paired_comparison(
+                task_pairs,
+                fork_label=args.fork_label,
+                upstream_label=args.upstream_label,
+            ),
+        }
+    regression_gate = build_regression_gate(
+        pairs,
+        fork_label=args.fork_label,
+        upstream_label=args.upstream_label,
+        experiment_feature=getattr(args, "experiment_feature", None),
+    )
+    gate_mode = getattr(args, "gate_mode", "off")
     return {
         "schemaVersion": REPORT_SCHEMA_VERSION,
         "kind": (
@@ -3850,23 +5391,42 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
             else "paired-live-agent-task"
         ),
         "capturedAt": datetime.now(timezone.utc).isoformat(),
-        "scope": "input-identical live coding task",
+        "scope": f"{len(tasks)} paired live coding task shape(s), input-identical within each pair",
         "currentFork": fork_identity,
         "upstreamC": {
             **upstream_identity,
             "immutableReference": default_comparison,
         },
         "methodology": {
-            "taskPrompt": TASK_PROMPT,
+            "taskPrompt": tasks[0].prompt if len(tasks) == 1 else None,
+            "taskSuite": [
+                {
+                    "taskId": task.task_id,
+                    "shape": task.shape,
+                    "prompt": task.prompt,
+                    "editableFiles": list(task.editable_files),
+                    "fixtureFiles": fixture_manifest(task),
+                }
+                for task in tasks
+            ],
             "fixtureManifestSha256": text_sha256(
-                json.dumps(fixture_manifest(), sort_keys=True, separators=(",", ":"))
+                json.dumps(
+                    {
+                        task.task_id: fixture_manifest(task)
+                        for task in tasks
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
             ),
-            "fixtureFiles": fixture_manifest(),
+            "fixtureFiles": {
+                task.task_id: fixture_manifest(task) for task in tasks
+            },
             "outcomeCorrectnessCheck": "unchanged task files, visible unittest suite, and external hidden cases",
             "taskContractComplianceCheck": (
                 f"outcome correctness, an observed successful `{REQUIRED_TEST_COMMAND}` "
                 "command execution before the turn finished, and no file added "
-                "beyond the fixture (the contract permits editing `duration.py` only); "
+                "beyond each fixture's explicit editable-file allowlist; "
                 "a test invocation whose exit code is unconditionally replaced by a "
                 "trailing `||`, `;`, or `&` records an attempt but never a pass"
             ),
@@ -3883,6 +5443,8 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "verifierTimeoutSeconds": VERIFIER_TIMEOUT_SECONDS,
             "repetitionsPerVariant": args.repetitions,
+            "taskCount": len(tasks),
+            "totalPairs": len(pairs),
             "pairOrder": f"alternating; {args.upstream_label} first in odd repetitions",
             # Strict alternation cannot balance an odd repetition count, so the
             # residual order effect is reported rather than described as
@@ -3892,6 +5454,14 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
                 fork_label=args.fork_label,
                 upstream_label=args.upstream_label,
             ),
+            "experiment": {
+                "feature": getattr(args, "experiment_feature", None),
+                "gateMode": gate_mode,
+                "featureIsolation": (
+                    "one declared ablation per report; source and binary hashes bind "
+                    "the assigned conditions"
+                ),
+            },
             "comparisonLabels": {
                 "currentForkRole": args.fork_label,
                 "upstreamCRole": args.upstream_label,
@@ -3915,9 +5485,11 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
                 "remain comparable."
             ),
             "latencyInterpretation": (
-                "This benchmark distinguishes TTFO from post-TTFO completion. Similar "
-                "TTFO with much slower completion is evidence of a post-TTFO "
-                "harness/tool-loop problem; it does not establish an inference-speed problem."
+                "This benchmark distinguishes TTFO from post-TTFO completion and "
+                "records command execution, command-to-next-action gaps, milestone "
+                "times, and—when emitted by the build—exclusive runtime ownership "
+                "plus each model round. A long post-TTFO interval identifies where "
+                "the delay occurred; it does not by itself establish inference speed."
             ),
             "turnTrace": {
                 "schemaVersion": TURN_TRACE_SCHEMA_VERSION,
@@ -3932,13 +5504,15 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
                     "Command lifecycles retain bounded command text plus its original "
                     "length, truncation flag, and full-text SHA-256, JSONL item ID, status, exit code, "
                     "sequence numbers, monotonic offsets, and derived Unix timestamps. "
-                    "Aggregate command counts cover the full observed stream."
+                    "Failed commands, failed cells, and error events also retain a "
+                    "bounded model-visible text prefix with original length and full-text "
+                    "SHA-256. Aggregate command counts cover the full observed stream."
                 ),
                 "linkage": (
-                    "Tool calls carry exact runtime generation identity. JSONL command "
-                    "item IDs are synthetic, so fallback command-to-tool linkage is "
-                    "explicitly marked ordinal and is disabled for overflowed, invalid, "
-                    "incomplete, or non-one-to-one populations."
+                    "Tool calls and command events carry runtime call/execution identity. "
+                    "When an older build omits it, a unique mutual nearest process-spawn "
+                    "match is tried before the explicitly marked chronological fallback; "
+                    "ambiguous, overflowed, invalid, or incomplete populations are not guessed."
                 ),
                 "censoring": (
                     "A run without a terminal event is right-censored. The harness keeps "
@@ -3956,6 +5530,13 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
                     "`latencyToNextAction` fields are sharper but exist only where the "
                     "build emits timing."
                 ),
+                "latencyExplanation": (
+                    "Each run and variant summary answers why it was slow using an "
+                    "additive ownership split, sequential model-round count, retry "
+                    "and recovery counters, context growth, tokens, slowest rounds, "
+                    "and harness-observed command/milestone timing. Missing internal "
+                    "instrumentation remains unknown rather than being inferred."
+                ),
             },
             "pairedAnalysis": (
                 "Both variants run the same fixture in the same repetition with the order "
@@ -3970,31 +5551,40 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
                 "it does not. No stage observes guidance rules as causes, so no round is "
                 "attributed to one."
             ),
+            "regressionGate": (
+                "Correctness, exact required-test/terminal compliance, median, and p90 "
+                "are checked independently for every task shape; aggregate improvements "
+                "cannot conceal a task-specific regression."
+            ),
         },
         "results": {
             "currentFork": fork_summary,
             "upstreamC": upstream_summary,
             "timingMetricComparability": timing_comparability,
+            "latencyExplanation": latency_explanation,
             "pairedComparison": paired,
+            "byTask": task_results,
+            "regressionGate": {"mode": gate_mode, **regression_gate},
             "attributionScope": attribution_scope(repetitions=args.repetitions),
             "pairs": pairs,
         },
         "limitations": [
             (
-                "This is one fixed coding task repeated "
-                f"{args.repetitions} times per variant, not a broad task suite."
+                f"This suite covers {len(tasks)} small deterministic task shape(s), "
+                "not the full distribution of real repository work."
             ),
             "Live model behavior is intentionally stochastic even with identical inputs and settings.",
             "Completion-time summaries include outcome-correct runs only; every incorrect or noncompliant run remains explicit in the pair records.",
             "The external verifier adjudicates success after the timed agent turn and is not included in completion time.",
             "The recorded build command is provenance supplied by the benchmark operator; the report independently binds the candidate to a clean commit/tree and binary SHA-256.",
             "modelWait and continuationCount depend on build-side timing instrumentation and are omitted for variants that do not emit it; they are not comparable unless both variants report timingInstrumentation.available=true.",
+            "A recorded model-stream wait combines provider queueing, inference, and network transit; this client-side benchmark cannot split those server-facing components.",
             "completionMs is recorded only for runs that reached a terminal turn event; runs without one report wallClockMs instead.",
             "Timed-out runs are right-censored: no terminal turn event means no terminal timing record, so they are absent from build-emitted timing distributions and terminal-only paired deltas. Harness-observed metrics keep those pairs because censoring correlates with being slow; results.pairs[].turnTrace.censoring records the floors each censored run still proves.",
-            "`codex exec --json` renumbers thread items, so a command is joined to its model round by the timing ledger's call identity when the build exposes one and otherwise by an explicitly labelled one-to-one chronological match; results.pairs[].turnTrace.linkage names the method used and lists anything it refused to join.",
+            "`codex exec --json` renumbers thread items, so a command is joined to its model round by the timing ledger's call identity when the build exposes one, then by a complete order-preserving process-spawn match, and only then by an explicitly labelled one-to-one chronological fallback; results.pairs[].turnTrace.linkage names the method used and lists anything it refused to join.",
             "Continuation classes restate runtime-recorded facts (purpose, attempt kind, state-change flags, linked commands). They are observational labels, and the `necessary` class is the residual after the other predicates fail to match.",
             "No stage of this pipeline observes guidance rules, prompt clauses, or configuration as causes of a continuation, so the report cannot attribute a round to one; results.attributionScope states this and what would be needed to establish it.",
-            "The exact paired sign test is reported with its attainable p-value floor; the small, single-task design does not by itself license a broad significance claim.",
+            "The exact paired sign test is reported with its attainable p-value floor; this small suite does not by itself license a broad significance claim.",
             "Command kinds and the mutating flag are derived from the command text with a conservative allowlist; an unrecognized program is reported as `other` rather than assigned to a category the text does not establish.",
         ],
     }
@@ -4129,16 +5719,22 @@ def self_test() -> None:
     # replaces the suite's exit code still records an attempt, never a pass.
     for trusted in (
         "python -m unittest -q",
-        "cd repo && python -m unittest -q",
-        "python -m unittest -q && echo done",
-        "python -m unittest -q 2>&1 | tail -5",
         'bash -lc "python -m unittest -q"',
+        "cd repo && python -m unittest -q",
+        "python -m unittest -q; exit $?",
+        "python -m unittest -q; exit $LASTEXITCODE",
+        "python -m unittest -q; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
     ):
         assert required_test_exit_code_reflects_suite(trusted), trusted
     for masked in (
         "python -m unittest -q || true",
         "python -m unittest -q; echo done",
+        "python -m unittest -q; exit 0",
         'bash -lc "python -m unittest -q || true"',
+        "python -m unittest -q && echo done",
+        "python -m unittest -q 2>&1 | tail -5",
+        "false || python -m unittest -q",
+        "true || python -m unittest -q",
     ):
         assert is_required_test_command(masked), masked
         assert not required_test_exit_code_reflects_suite(masked), masked
@@ -4192,7 +5788,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--code-mode", choices=("enabled", "disabled"), default="enabled"
     )
-    parser.add_argument("--repetitions", type=int, default=6)
+    parser.add_argument(
+        "--tasks",
+        nargs="+",
+        choices=("all", *BENCHMARK_TASKS_BY_ID),
+        default=["all"],
+        help="task IDs to run; the enforced gate requires the complete suite",
+    )
+    parser.add_argument(
+        "--experiment-feature",
+        choices=ABLATION_FEATURES,
+        help="the single optimization assigned between candidate and control",
+    )
+    parser.add_argument(
+        "--gate-mode",
+        choices=("off", "advisory", "enforce"),
+        default="enforce",
+    )
+    parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--timeout-seconds", type=int, default=600)
     args = parser.parse_args()
     if args.fork_label == args.upstream_label:
@@ -4208,6 +5821,22 @@ def parse_args() -> argparse.Namespace:
         )
     if args.self_test:
         return args
+    try:
+        selected_tasks = resolve_benchmark_tasks(args.tasks)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.gate_mode != "off" and args.experiment_feature is None:
+        parser.error(
+            "--experiment-feature is required when the regression gate is active"
+        )
+    if args.gate_mode == "enforce":
+        if {task.task_id for task in selected_tasks} != set(BENCHMARK_TASKS_BY_ID):
+            parser.error("--gate-mode enforce requires --tasks all")
+        if args.repetitions < MIN_GATE_REPETITIONS_PER_TASK:
+            parser.error(
+                "--gate-mode enforce requires at least "
+                f"{MIN_GATE_REPETITIONS_PER_TASK} repetitions per task"
+            )
     required = (
         "fork_binary",
         "upstream_binary",
@@ -4234,6 +5863,9 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report["results"], indent=2), flush=True)
+    gate = report["results"]["regressionGate"]
+    if gate.get("mode") == "enforce" and gate.get("passed") is not True:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

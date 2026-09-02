@@ -2716,6 +2716,8 @@ fn reasoning_governor_resets_for_every_accepted_context_change() {
         client_id: None,
     };
     let response_item = TurnInput::ResponseItem(assistant_output_text("context"));
+    let internal_response_item =
+        TurnInput::InternalResponseItem(assistant_output_text("internal context"));
     let mailbox_item = TurnInput::InterAgentCommunication(InterAgentCommunication::new(
         AgentPath::root(),
         AgentPath::try_from("/root/worker").expect("agent path"),
@@ -2727,6 +2729,7 @@ fn reasoning_governor_resets_for_every_accepted_context_change() {
     assert!(resets_reasoning_governor(&user_input));
     assert!(!resets_reasoning_governor(&empty_user_input));
     assert!(resets_reasoning_governor(&response_item));
+    assert!(!resets_reasoning_governor(&internal_response_item));
     assert!(resets_reasoning_governor(&mailbox_item));
 }
 

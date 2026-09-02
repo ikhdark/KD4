@@ -31,7 +31,7 @@ pub(crate) fn create_wait_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: codex_code_mode::WAIT_TOOL_NAME.to_string(),
         description: format!(
-            "Waits on a yielded `{}` cell and returns new output or completion.\n{}",
+            "Resumes a genuinely live `{}` cell and returns new output or completion.\n{}",
             codex_code_mode::PUBLIC_TOOL_NAME,
             codex_code_mode::build_wait_tool_description().trim()
         ),
@@ -60,7 +60,7 @@ mod tests {
             ToolSpec::Function(ResponsesApiTool {
                 name: codex_code_mode::WAIT_TOOL_NAME.to_string(),
                 description: format!(
-                    "Waits on a yielded `{}` cell and returns new output or completion.\n{}",
+                    "Resumes a genuinely live `{}` cell and returns new output or completion.\n{}",
                     codex_code_mode::PUBLIC_TOOL_NAME,
                     codex_code_mode::build_wait_tool_description().trim()
                 ),

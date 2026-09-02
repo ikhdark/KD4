@@ -3712,6 +3712,10 @@ impl ModelClientSession {
                     timing.record_model_request_token_categories(
                         measurements.request_token_categories(),
                     );
+                    timing.record_model_request_cache_identity(
+                        measurements.fixed_prefix_reuse_eligible,
+                        prompt_cache_key.as_deref(),
+                    );
                 }
                 ModelAttemptGuard::new(
                     attempt_task_telemetry,
@@ -4200,6 +4204,10 @@ impl ModelClientSession {
                         if let Some(timing) = turn_timing.as_ref() {
                             timing.record_model_request_token_categories(
                                 measurements.request_token_categories(),
+                            );
+                            timing.record_model_request_cache_identity(
+                                measurements.fixed_prefix_reuse_eligible,
+                                prompt_cache_key.as_deref(),
                             );
                         }
                         ModelAttemptGuard::new(

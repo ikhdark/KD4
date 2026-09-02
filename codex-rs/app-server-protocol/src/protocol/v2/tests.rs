@@ -2810,6 +2810,10 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     let command_item = TurnItem::CommandExecution(CommandExecutionItem {
         id: "exec-1".to_string(),
         process_id: Some("pid-1".to_string()),
+        parent_call_id: Some("outer-exec".to_string()),
+        parent_cell_id: Some("cell-7".to_string()),
+        runtime_tool_call_id: Some("runtime-tool-3".to_string()),
+        execution_id: Some("tool-execution-9".to_string()),
         command: vec!["echo".to_string(), "done".to_string()],
         cwd: PathUri::from_abs_path(&test_path_buf("/tmp").abs()),
         parsed_cmd: vec![codex_protocol::parse_command::ParsedCommand::Unknown {
@@ -2833,6 +2837,10 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             command: "echo done".to_string(),
             cwd: LegacyAppPathString::from_abs_path(&test_path_buf("/tmp").abs()),
             process_id: Some("pid-1".to_string()),
+            parent_call_id: Some("outer-exec".to_string()),
+            parent_cell_id: Some("cell-7".to_string()),
+            runtime_tool_call_id: Some("runtime-tool-3".to_string()),
+            execution_id: Some("tool-execution-9".to_string()),
             source: CommandExecutionSource::Agent,
             status: CommandExecutionStatus::Completed,
             command_actions: vec![CommandAction::Unknown {
@@ -3130,6 +3138,10 @@ fn core_windows_command_execution_uses_windows_display_quoting() {
     let command_item = TurnItem::CommandExecution(CommandExecutionItem {
         id: "exec-windows".to_string(),
         process_id: None,
+        parent_call_id: None,
+        parent_cell_id: None,
+        runtime_tool_call_id: None,
+        execution_id: None,
         command: vec![
             r"C:\Program Files\PowerShell\7\pwsh.exe".to_string(),
             "-Command".to_string(),
