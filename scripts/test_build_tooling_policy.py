@@ -3240,7 +3240,27 @@ elif tool == "just" and args == ["--summary"]:
         self.assertIsNotNone(powershell(), "PowerShell is required on the Windows host")
         self.assert_migrated_contracts("windows_installer")
 
-    def test_maintenance_audit_contracts_through_subprocess_cli(self) -> None:
+    def test_maintenance_policy_through_root_maintenance_cli(self) -> None:
+        helpers = (
+            ("audit", self._assert_maintenance_audit_contracts_through_subprocess_cli),
+            (
+                "changed routes",
+                self._assert_maintenance_changed_routes_through_subprocess_cli,
+            ),
+            (
+                "command contracts",
+                self._assert_maintenance_command_contracts_through_subprocess_cli,
+            ),
+            (
+                "parser contract",
+                self._assert_maintenance_parser_contract_through_subprocess_cli,
+            ),
+        )
+        for contract, helper in helpers:
+            with self.subTest(contract=contract):
+                helper()
+
+    def _assert_maintenance_audit_contracts_through_subprocess_cli(self) -> None:
         current_tree = subprocess.run(
             [
                 sys.executable,
@@ -3505,7 +3525,7 @@ elif tool == "just" and args == ["--summary"]:
                 )
             )
 
-    def test_maintenance_changed_routes_through_subprocess_cli(self) -> None:
+    def _assert_maintenance_changed_routes_through_subprocess_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
             self._materialize_root_maintenance_fixture(fixture_root)
@@ -3759,6 +3779,28 @@ elif tool == "just" and args == ["--summary"]:
                 before_uv,
             )
 
+            before_lint_uv = sum(
+                call["tool"] == "uv" for call in self._fake_tool_calls(log_path)
+            )
+            documentation_only_lint = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["lint-python", "--changed", "docs/runtime-policy.md"],
+                env,
+            )
+            self.assertEqual(
+                documentation_only_lint.returncode,
+                0,
+                documentation_only_lint.stderr,
+            )
+            self.assertIn(
+                "No matching changed Python files to lint.",
+                documentation_only_lint.stdout,
+            )
+            self.assertEqual(
+                sum(call["tool"] == "uv" for call in self._fake_tool_calls(log_path)),
+                before_lint_uv,
+            )
+
             before_uv = len(uv_calls)
             unmapped = self._run_root_maintenance_fixture(
                 fixture_root,
@@ -3776,7 +3818,7 @@ elif tool == "just" and args == ["--summary"]:
                 before_uv,
             )
 
-    def test_maintenance_command_contracts_through_subprocess_cli(self) -> None:
+    def _assert_maintenance_command_contracts_through_subprocess_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
             self._materialize_root_maintenance_fixture(fixture_root)
@@ -3843,7 +3885,7 @@ elif tool == "just" and args == ["--summary"]:
             self.assertEqual(missing.returncode, 127)
             self.assertIn("Could not run uv", missing.stderr)
 
-    def test_maintenance_parser_contract_through_subprocess_cli(self) -> None:
+    def _assert_maintenance_parser_contract_through_subprocess_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture_root = Path(temp_dir)
             self._materialize_root_maintenance_fixture(fixture_root)

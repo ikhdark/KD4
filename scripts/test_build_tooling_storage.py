@@ -852,7 +852,7 @@ while not release.exists():
             self._assert_ok(result)
             self.assertEqual(Path(first_output.read_text(encoding="utf-8")), warmer.resolve())
 
-    def test_disk_cli_warns_when_the_target_exceeds_its_budget(self) -> None:
+    def test_disk_cli_warns_when_the_target_exceeds_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             status = self._copy_status_runtime(root)

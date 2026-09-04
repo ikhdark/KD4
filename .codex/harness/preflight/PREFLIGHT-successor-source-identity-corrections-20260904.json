@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:successor-source-identity-corrections-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "scripts/test_build_tooling_policy.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_build_tooling_storage.py",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "exact-live-successor-source-identities"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:successor-source-identity-corrections-20260904",
+  "validation_commands": [
+    "python scripts/root_maintenance.py test-python --module scripts.test_build_tooling_policy.BuildToolingPolicyRuntimeTest.test_maintenance_policy_through_root_maintenance_cli",
+    "python scripts/root_maintenance.py test-python --module scripts.test_build_tooling_storage.BuildToolingStorageCliTest.test_disk_cli_warns_when_the_target_exceeds_budget",
+    "python -m unittest scripts.test_build_tooling_policy scripts.test_build_tooling_storage"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-successor-source-identity-corrections",
+    "cargo_home": "C:\\Users\\kuh\\.cargo"
+  },
+  "workspace_strategy": "shared"
+}
