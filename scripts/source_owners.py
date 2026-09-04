@@ -1169,6 +1169,14 @@ def architecture_slice(
 
     for owner_id in selected_ids:
         owner = selected[owner_id]
+        exact_generated_targets = {
+            relationship["target"]
+            for relationship in graph["relationships"]
+            if relationship["source"] == f"owner:{owner_id}"
+            and relationship["kind"] == "generates"
+            and CATEGORY_FACETS[relationship["category"]]
+            == "generated_artifacts"
+        }
         for entry in owner.get("primary_entries", []):
             facets["registration_and_entrypoints"].append(
                 {
@@ -1203,6 +1211,8 @@ def architecture_slice(
             )
             coverage["tests_and_contracts"].add(owner_id)
         for generated in owner.get("generated_mirrors", []):
+            if f"generated:{generated}" in exact_generated_targets:
+                continue
             facets["generated_artifacts"].append(
                 {
                     "kind": "generated_consumer",

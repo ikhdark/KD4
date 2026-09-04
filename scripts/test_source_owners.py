@@ -1263,6 +1263,45 @@ id = "alpha"
                 manifest.stat().st_size,
             )
 
+    def test_architecture_slice_prefers_exact_generator_over_generic_mirror_edge_through_cli(
+        self,
+    ) -> None:
+        with temporary_repository() as root:
+            write_fixture(root, "generator.py", "def build():\n    pass\n")
+            write_fixture(root, "generated.json", "{}\n")
+            write_fixture(
+                root,
+                "source_owners.toml",
+                manifest_text(
+                    """
+[[owners]]
+id = "alpha"
+roots = ["generator.py"]
+generated_mirrors = ["generated.json"]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:generated.json"
+confidence = "generated"
+evidence = [{ path = "generator.py", symbol = "build" }]
+"""
+                ),
+            )
+
+            slice_ = self.output_json(
+                run_source_owners_cli(
+                    root,
+                    "slice",
+                    extra=("--owner", "alpha"),
+                )
+            )
+
+            generated = slice_["generated_artifacts"]["relationships"]
+            self.assertEqual(len(generated), 1)
+            self.assertEqual(generated[0]["kind"], "generated_by")
+            self.assertEqual(generated[0]["evidence"], "generator.py::build")
+
     def test_architecture_slice_ranks_unicode_focus_terms_through_cli(
         self,
     ) -> None:
@@ -1404,6 +1443,19 @@ primary_entries = [{ path = "source.rs", symbol = "locate" }]
                     ("invariants", "canonical-command-gate-separation"),
                     ("invariants", "immutable-baseline-reconciliation"),
                     ("invariants", "cross-language-validation-contract-parity"),
+                ),
+            ),
+            (
+                ("replacement-admission-certification",),
+                "dormant replacement admission caller supplied successor boundary",
+                (
+                    ("control_and_data_flow", "scripts/replacement_admission.py"),
+                    ("callers_and_consumers", "test_replacement_admission.py"),
+                    ("configuration_and_gates", "replacement-admissions-v1.json"),
+                    ("registration_and_entrypoints", "scripts/replacement_admission.py"),
+                    ("tests_and_contracts", "test_replacement_admission.py"),
+                    ("invariants", "replacement-admission-dormant-projection"),
+                    ("invariants", "replacement-successor-catalog-boundary"),
                 ),
             ),
             (

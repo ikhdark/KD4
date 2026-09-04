@@ -1,7 +1,7 @@
 {
-  "index_sha256": "756fd10308ffdb3bc9a77bd4018d4ccc6fb0c22cd0fe4a1bd107c7a92a4b368f",
+  "index_sha256": "83bf9a51aa55aa1f80cb9c97972a3d9bb8e42407f5f0ba2d255a532d1d44d43b",
   "index_version": 1,
-  "manifest_sha256": "c8a2579b16f4c646262a8066a969dc25ebf9b872af42842966d2377156bd5411",
+  "manifest_sha256": "15bb38dde59dfacbc344178ef57d5cdde3fbc7b8eeef3cd1b0bebc3f11ffddb5",
   "omitted": {
     "relationships": 0
   },
@@ -807,6 +807,93 @@
           ],
           "cwd": "codex-rs",
           "id": "planning-focused",
+          "role": "focused_tests"
+        }
+      ]
+    },
+    {
+      "configuration": [
+        ".codex/validation/replacement-admissions-v1.schema.json",
+        ".codex/validation/replacement-admissions-v1.json",
+        ".codex/validation/frozen-test-inventory-v1.json",
+        ".codex/validation/test-replacements-v1.json",
+        ".codex/validation/stage2-incorrect-behaviors-v1.txt"
+      ],
+      "facet_exclusions": {
+        "generated_artifacts": "The dormant admission layer owns no checked-in generated mirror; its projection is written only to a caller-selected path."
+      },
+      "feature_ids": [
+        "completion-proof"
+      ],
+      "generated_artifacts": [],
+      "id": "replacement-admission-certification",
+      "invariants": [
+        {
+          "evidence": [
+            {
+              "path": "scripts/replacement_admission.py",
+              "symbol": "materialize_projection"
+            }
+          ],
+          "id": "replacement-admission-dormant-projection",
+          "kind": "semantic",
+          "statement": "Replacement admission validates or writes a caller-selected projection but does not mutate the V2 inventory, ledger, or completion-proof result.",
+          "tests": [
+            "scripts/test_replacement_admission.py"
+          ]
+        },
+        {
+          "evidence": [
+            {
+              "path": "scripts/replacement_admission.py",
+              "symbol": "_load_successor_catalog"
+            }
+          ],
+          "id": "replacement-successor-catalog-boundary",
+          "kind": "compatibility",
+          "statement": "Nonempty admissions require an exact caller-supplied successor catalog; the dormant validator does not authenticate currentness or infer, normalize, or manufacture successor identities from predecessor hints.",
+          "tests": [
+            "scripts/test_replacement_admission.py"
+          ]
+        }
+      ],
+      "primary_entries": [
+        {
+          "ambiguous": true,
+          "path": "scripts/replacement_admission.py",
+          "symbol": "main"
+        }
+      ],
+      "roots": [
+        "scripts/replacement_admission.py",
+        ".codex/validation/replacement-admissions-v1.schema.json",
+        ".codex/validation/replacement-admissions-v1.json"
+      ],
+      "tests": [
+        "scripts/test_replacement_admission.py",
+        "scripts/test_source_owners.py"
+      ],
+      "validation": [
+        {
+          "argv": [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.test_replacement_admission"
+          ],
+          "cwd": ".",
+          "id": "replacement-admission-cli-focused",
+          "role": "focused_tests"
+        },
+        {
+          "argv": [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.test_source_owners.SourceOwnersCliTest.test_repository_slices_retain_representative_relationships_through_cli"
+          ],
+          "cwd": ".",
+          "id": "replacement-admission-source-owner-focused",
           "role": "focused_tests"
         }
       ]
@@ -1766,19 +1853,6 @@
       "target": "path:justfile"
     },
     {
-      "category": "tests_contracts",
-      "confidence": "declared",
-      "evidence": [
-        {
-          "path": "scripts/test_source_owners.py",
-          "symbol": "test_repository_slices_retain_representative_relationships_through_cli"
-        }
-      ],
-      "kind": "validated_by",
-      "source": "owner:completion-proof-certification",
-      "target": "path:scripts/test_source_owners.py"
-    },
-    {
       "category": "callers_consumers",
       "confidence": "compiler_resolved",
       "evidence": [
@@ -2215,6 +2289,46 @@
       "kind": "validated_by",
       "source": "owner:planning-architecture-runtime",
       "target": "path:codex-rs/core/src/tools/handlers/plan_tests.rs"
+    },
+    {
+      "category": "callers_consumers",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "path": "scripts/test_replacement_admission.py",
+          "symbol": "run_cli"
+        }
+      ],
+      "kind": "consumed_by",
+      "source": "owner:replacement-admission-certification",
+      "target": "path:scripts/test_replacement_admission.py"
+    },
+    {
+      "category": "configuration",
+      "confidence": "compiler_resolved",
+      "evidence": [
+        {
+          "ambiguous": true,
+          "path": "scripts/replacement_admission.py",
+          "symbol": "validate_manifest"
+        }
+      ],
+      "kind": "reads_config",
+      "source": "owner:replacement-admission-certification",
+      "target": "config:.codex/validation/replacement-admissions-v1.json"
+    },
+    {
+      "category": "control_flow",
+      "confidence": "declared",
+      "evidence": [
+        {
+          "path": "scripts/replacement_admission.py",
+          "symbol": "main"
+        }
+      ],
+      "kind": "calls",
+      "source": "owner:replacement-admission-certification",
+      "target": "path:scripts/replacement_admission.py"
     },
     {
       "category": "callers_consumers",
@@ -2876,7 +2990,7 @@
       "target": "path:scripts/test_workflow_preflight.py"
     }
   ],
-  "repository_revision": "manifest:c8a2579b16f4c646262a8066a969dc25ebf9b872af42842966d2377156bd5411:sources:325429162c36ca3ae88527a49daca677366b0e320450719bd3d96c439ace86f0",
+  "repository_revision": "manifest:15bb38dde59dfacbc344178ef57d5cdde3fbc7b8eeef3cd1b0bebc3f11ffddb5:sources:fe46ece9986da1a9fdc8c4d72195d2ab89761d82c11c6c9054522c653873d730",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

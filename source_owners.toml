@@ -1106,13 +1106,6 @@ confidence = "declared"
 evidence = [{ path = "justfile", symbol = "completion-focused validation_id:" }]
 
 [[owners.relationships]]
-category = "tests_contracts"
-kind = "validated_by"
-target = "path:scripts/test_source_owners.py"
-confidence = "declared"
-evidence = [{ path = "scripts/test_source_owners.py", symbol = "test_repository_slices_retain_representative_relationships_through_cli" }]
-
-[[owners.relationships]]
 category = "generated_artifacts"
 kind = "generates"
 target = "generated:.codex/validation/frozen-test-inventory-v1.json"
@@ -1207,6 +1200,85 @@ role = "focused_tests"
 id = "inventory-v2-rust-focused"
 cwd = "codex-rs"
 argv = ["cargo", "test", "-p", "codex-validation-contracts"]
+role = "focused_tests"
+
+[[owners]]
+id = "replacement-admission-certification"
+feature_ids = ["completion-proof"]
+concern_ids = ["replacement-admission", "replacement-successor-catalog", "baseline-replacement-mapping"]
+aliases = ["replacement admission", "successor catalog"]
+phrases = ["dormant replacement mapping admission and caller-supplied successor boundary"]
+roots = [
+    "scripts/replacement_admission.py",
+    ".codex/validation/replacement-admissions-v1.schema.json",
+    ".codex/validation/replacement-admissions-v1.json",
+]
+primary_entries = [
+    { path = "scripts/replacement_admission.py", symbol = "main", ambiguous = true },
+]
+instructions = ["AGENTS.md"]
+consumers = []
+contracts = [
+    ".codex/validation/replacement-admissions-v1.schema.json",
+    ".codex/validation/replacement-admissions-v1.json",
+    ".codex/validation/frozen-test-inventory-v1.json",
+    ".codex/validation/test-replacements-v1.json",
+    ".codex/validation/stage2-incorrect-behaviors-v1.txt",
+]
+generated_mirrors = []
+tests = [
+    "scripts/test_replacement_admission.py",
+    "scripts/test_source_owners.py",
+]
+
+[owners.facet_exclusions]
+generated_artifacts = "The dormant admission layer owns no checked-in generated mirror; its projection is written only to a caller-selected path."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:scripts/replacement_admission.py"
+confidence = "declared"
+evidence = [{ path = "scripts/replacement_admission.py", symbol = "main" }]
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "config:.codex/validation/replacement-admissions-v1.json"
+confidence = "compiler_resolved"
+evidence = [{ path = "scripts/replacement_admission.py", symbol = "validate_manifest", ambiguous = true }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:scripts/test_replacement_admission.py"
+confidence = "compiler_resolved"
+evidence = [{ path = "scripts/test_replacement_admission.py", symbol = "run_cli" }]
+
+[[owners.invariants]]
+id = "replacement-admission-dormant-projection"
+kind = "semantic"
+statement = "Replacement admission validates or writes a caller-selected projection but does not mutate the V2 inventory, ledger, or completion-proof result."
+evidence = [{ path = "scripts/replacement_admission.py", symbol = "materialize_projection" }]
+tests = ["scripts/test_replacement_admission.py"]
+
+[[owners.invariants]]
+id = "replacement-successor-catalog-boundary"
+kind = "compatibility"
+statement = "Nonempty admissions require an exact caller-supplied successor catalog; the dormant validator does not authenticate currentness or infer, normalize, or manufacture successor identities from predecessor hints."
+evidence = [{ path = "scripts/replacement_admission.py", symbol = "_load_successor_catalog" }]
+tests = ["scripts/test_replacement_admission.py"]
+
+[[owners.validation]]
+id = "replacement-admission-cli-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_replacement_admission"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "replacement-admission-source-owner-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_source_owners.SourceOwnersCliTest.test_repository_slices_retain_representative_relationships_through_cli"]
 role = "focused_tests"
 
 [[owners]]
