@@ -18,6 +18,10 @@
           ".codex"
         ],
         [
+          ".codex/validation/frozen-test-inventory-v2-recovery-transition-receipts.json",
+          ".codex"
+        ],
+        [
           ".codex/validation/frozen-test-inventory-v2.json",
           ".codex"
         ],
@@ -79,15 +83,16 @@
     "cross-language-validation-contract-parity"
   ],
   "dependencies": [],
-  "expires_at": "2026-09-04T04:34:14.690512+00:00",
+  "expires_at": "2026-09-04T06:12:32.126504+00:00",
   "generated_output_owner": "stage1.inventory-recovery.doctest.v1.local-recapture",
   "generated_outputs": [
     ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json",
     ".codex/validation/frozen-test-inventory-v2-recoveries.json",
+    ".codex/validation/frozen-test-inventory-v2-recovery-transition-receipts.json",
     ".codex/validation/frozen-test-inventory-v2.json",
     ".codex/validation/test-replacements-v2.json"
   ],
-  "manifest_fingerprint": "74cd8585c6afc71a4b2e758bd3d0692d7182d09b52e7d8d745fa54aa5eada2ad",
+  "manifest_fingerprint": "a4c67cc882bf343d37ee0ec90bf62a9f402eab176dcd2621a1f9ec27691a18bc",
   "path_claims": [
     {
       "path": ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json",
@@ -99,6 +104,10 @@
     },
     {
       "path": ".codex/validation/frozen-test-inventory-v2-recoveries.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/validation/frozen-test-inventory-v2-recovery-transition-receipts.json",
       "recursive": false
     },
     {
@@ -146,14 +155,14 @@
       "recursive": false
     }
   ],
-  "recorded_at": "2026-09-04T03:34:14.690512+00:00",
+  "recorded_at": "2026-09-04T05:12:32.126504+00:00",
   "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
   "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
   "root_task_id": "completion-proof-migration-20260902",
   "schema_version": 1,
   "starting_revision": {
-    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
-    "workspace_fingerprint": "06fb0ebf22f8c0ea29463e5bf1705b9ca49f9946b6a1c297c56ee1b414110d06"
+    "commit": "586b9eb5fb44fdedb9917b172207cb001268695b",
+    "workspace_fingerprint": "1890eec8a4a6d1c15353c2b276b36fbd2ae28dbe5bd04adcbbbffa18fa693fc6"
   },
   "validation_commands": [
     "python -m unittest scripts.test_completion_proof_inventory_v2 scripts.test_materialize_completion_proof_inventory_v2",

@@ -43,6 +43,7 @@ from scripts.completion_proof_inventory_v2 import validate_frozen_test_inventory
 from scripts.completion_proof_inventory_v2 import validate_doctest_recapture_packet_v1
 from scripts.completion_proof_inventory_v2 import validate_inventory_ledger_predecessor_closure
 from scripts.completion_proof_inventory_v2 import validate_inventory_recovery_authority_v1
+from scripts.completion_proof_inventory_v2 import validate_recovery_transition_receipt_v1
 from scripts.completion_proof_inventory_v2 import validate_test_replacement_ledger_v2
 from scripts.rust_test_runner import Manifest
 from scripts.rust_test_runner import RunnerError
@@ -56,6 +57,12 @@ V2_RECOVERY_PATH = ".codex/validation/frozen-test-inventory-v2-recoveries.json"
 V2_DOCTEST_RECAPTURE_PATH = (
     ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json"
 )
+V2_UNITTEST_RECAPTURE_PATH = (
+    ".codex/validation/frozen-test-inventory-v2-unittest-recapture.json"
+)
+V2_RECOVERY_TRANSITION_RECEIPTS_PATH = (
+    ".codex/validation/frozen-test-inventory-v2-recovery-transition-receipts.json"
+)
 V2_LEDGER_PATH = ".codex/validation/test-replacements-v2.json"
 RUST_TEST_MANIFEST_PATH = "codex-rs/.config/kd4-rust-tests.toml"
 BASELINE_COMMIT = "60bb133fa0a4f25e83851ab16d8c462e5f42ff95"
@@ -68,6 +75,13 @@ EXPECTED_REPOSITORY_IDENTITY_SHA256 = (
     "f386e4786f3a61829ecdd61e764fa9d65eddbd08f2902745c6480bce448573cc"
 )
 RECAPTURE_TOOLCHAIN = "1.95.0-x86_64-pc-windows-msvc"
+EXPECTED_UNITTEST_LEDGER_IDENTITY_COUNT = 909
+EXPECTED_UNITTEST_RECAPTURE_PARENT_COUNT = 893
+EXPECTED_UNITTEST_HIDDEN_REPLACEMENT_COUNT = 16
+UNITTEST_RECAPTURE_UNAVAILABLE = (
+    "authenticated freeze workspace is unavailable; refusing bare-commit unittest "
+    "recapture"
+)
 
 ROUTE_VALIDATION_IDS = {
     "argument-comment-lint-native": "tools.argument-comment-lint.native",
@@ -900,13 +914,36 @@ def _recovery_authority(
     doctest_recapture: dict[str, Any] | None,
     repo_root: Path,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    unittest_parents = sorted(
+    unittest_ledger_identities = sorted(
         row["baseline_id"]
         for row in frozen_inventory["tests"]
         if row["framework"] == "python-unittest"
     )
-    if len(unittest_parents) != 909:
-        raise MaterializationError(f"expected 909 frozen unittest parents, got {len(unittest_parents)}")
+    hidden_unittest_replacements = [
+        baseline_id
+        for baseline_id in unittest_ledger_identities
+        if baseline_id.startswith("hidden-at-freeze-v1::python-unittest::")
+    ]
+    unittest_recapture_parents = [
+        baseline_id
+        for baseline_id in unittest_ledger_identities
+        if not baseline_id.startswith("hidden-at-freeze-v1::python-unittest::")
+    ]
+    if len(unittest_ledger_identities) != EXPECTED_UNITTEST_LEDGER_IDENTITY_COUNT:
+        raise MaterializationError(
+            "expected 909 frozen unittest ledger identities, got "
+            f"{len(unittest_ledger_identities)}"
+        )
+    if len(unittest_recapture_parents) != EXPECTED_UNITTEST_RECAPTURE_PARENT_COUNT:
+        raise MaterializationError(
+            "expected 893 freeze-discovered unittest recapture parents, got "
+            f"{len(unittest_recapture_parents)}"
+        )
+    if len(hidden_unittest_replacements) != EXPECTED_UNITTEST_HIDDEN_REPLACEMENT_COUNT:
+        raise MaterializationError(
+            "expected 16 hidden unittest replacement identities, got "
+            f"{len(hidden_unittest_replacements)}"
+        )
     doctest_targets = sorted(
         {
             f"{context['package_name']}::{context['target_kind']}::{context['target_name']}"
@@ -958,7 +995,7 @@ def _recovery_authority(
             "gap_id": "gap.unittest-subtest-expansion",
             "kind": "unittest",
             "legacy_evidence": {
-                "frozen_parent_count": 909,
+                "frozen_parent_count": EXPECTED_UNITTEST_LEDGER_IDENTITY_COUNT,
                 "historical_subtest_call_count": None,
                 "kind": "unittest",
             },
@@ -969,12 +1006,12 @@ def _recovery_authority(
                         "output_sha256": predecessor_entry_sha256s[parent],
                         "parent_id": parent,
                     }
-                    for parent in unittest_parents
+                    for parent in unittest_recapture_parents
                 ],
                 "kind": "unittest",
                 "reasons": ["historical-subtest-count-unknown", "parent-output-recapture-required"],
-                "required_parent_count": 909,
-                "required_parent_ids": unittest_parents,
+                "required_parent_count": EXPECTED_UNITTEST_RECAPTURE_PARENT_COUNT,
+                "required_parent_ids": unittest_recapture_parents,
             },
             "recovery_id": "inventory-recovery.unittest.v1",
             "resolution": None,
@@ -996,66 +1033,85 @@ def _recovery_authority(
         "kd4.inventory-recovery-authority.self.v1", recovery
     )
     validate_inventory_recovery_authority_v1(recovery)
-    if doctest_recapture is None:
-        return recovery, []
+    transition_receipts: list[dict[str, Any]] = []
 
-    validate_doctest_recapture_packet_v1(doctest_recapture)
-    authority_before_semantic_sha256 = recovery["semantic_sha256"]
-    children = doctest_recovered_child_sources_v1(doctest_recapture)
-    child_obligation_ids = sorted(
-        "inventory-v2-recovered."
-        + proof_hash("kd4.recovered-child-identity.v1", child)
-        for child in children
-    )
-    parent_container_ids = sorted(DOCTEST_RECAPTURE_PARENT_TARGETS)
-    transition = {
-        "authority_before_semantic_sha256": authority_before_semantic_sha256,
-        "child_obligation_ids": child_obligation_ids,
-        "frozen_source_authority_sha256": proof_hash(
-            "kd4.frozen-source-authority.v1", frozen_source_authority
-        ),
-        "parent_container_ids": parent_container_ids,
-        "recapture_receipt_sha256": doctest_recapture["receipt_sha256"],
-        "schema_version": 1,
-    }
-    transition["receipt_sha256"] = proof_hash(
-        "kd4.recovery-transition-receipt.v1", transition
-    )
-    records[0] = {
-        **records[0],
-        "current_audit": {
-            **records[0]["current_audit"],
-            "raw_count": doctest_recapture["raw_occurrence_count"],
-        },
-        "legacy_evidence": {
-            **records[0]["legacy_evidence"],
-            "historical_raw_count": doctest_recapture["raw_occurrence_count"],
-        },
-        "pending_requirement": None,
-        "resolution": {
-            "child_sources": children,
+    def finalize_recovery() -> dict[str, Any]:
+        value = {
+            "format_id": "kd4.inventory-recovery-authority.v1",
+            "frozen_source_authority": frozen_source_authority,
+            "records": records,
+            "schema_version": 1,
+        }
+        validate_recovery_source_anchors(value, frozen_inventory, repo_root)
+        value["semantic_sha256"] = proof_hash(
+            "kd4.inventory-recovery-authority.semantic.v1", value
+        )
+        value["self_hash"] = proof_hash(
+            "kd4.inventory-recovery-authority.self.v1", value
+        )
+        validate_inventory_recovery_authority_v1(value)
+        return value
+
+    def transition_for(
+        *,
+        authority_before_semantic_sha256: str,
+        children: list[dict[str, Any]],
+        parent_container_ids: list[str],
+        recapture_receipt_sha256: str,
+    ) -> dict[str, Any]:
+        transition = {
+            "authority_before_semantic_sha256": authority_before_semantic_sha256,
+            "child_obligation_ids": sorted(
+                "inventory-v2-recovered."
+                + proof_hash("kd4.recovered-child-identity.v1", child)
+                for child in children
+            ),
+            "frozen_source_authority_sha256": proof_hash(
+                "kd4.frozen-source-authority.v1", frozen_source_authority
+            ),
             "parent_container_ids": parent_container_ids,
-            "parent_recapture_outputs": [],
-            "recapture_receipt_sha256": doctest_recapture["receipt_sha256"],
-        },
-        "state": "resolved",
-        "transition_receipt_sha256": transition["receipt_sha256"],
-    }
-    recovery = {
-        "format_id": "kd4.inventory-recovery-authority.v1",
-        "frozen_source_authority": frozen_source_authority,
-        "records": records,
-        "schema_version": 1,
-    }
-    validate_recovery_source_anchors(recovery, frozen_inventory, repo_root)
-    recovery["semantic_sha256"] = proof_hash(
-        "kd4.inventory-recovery-authority.semantic.v1", recovery
-    )
-    recovery["self_hash"] = proof_hash(
-        "kd4.inventory-recovery-authority.self.v1", recovery
-    )
-    validate_inventory_recovery_authority_v1(recovery)
-    return recovery, [transition]
+            "recapture_receipt_sha256": recapture_receipt_sha256,
+            "schema_version": 1,
+        }
+        transition["receipt_sha256"] = proof_hash(
+            "kd4.recovery-transition-receipt.v1", transition
+        )
+        return transition
+
+    if doctest_recapture is not None:
+        validate_doctest_recapture_packet_v1(doctest_recapture)
+        children = doctest_recovered_child_sources_v1(doctest_recapture)
+        parent_container_ids = sorted(DOCTEST_RECAPTURE_PARENT_TARGETS)
+        transition = transition_for(
+            authority_before_semantic_sha256=recovery["semantic_sha256"],
+            children=children,
+            parent_container_ids=parent_container_ids,
+            recapture_receipt_sha256=doctest_recapture["receipt_sha256"],
+        )
+        records[0] = {
+            **records[0],
+            "current_audit": {
+                **records[0]["current_audit"],
+                "raw_count": doctest_recapture["raw_occurrence_count"],
+            },
+            "legacy_evidence": {
+                **records[0]["legacy_evidence"],
+                "historical_raw_count": doctest_recapture["raw_occurrence_count"],
+            },
+            "pending_requirement": None,
+            "resolution": {
+                "child_sources": children,
+                "parent_container_ids": parent_container_ids,
+                "parent_recapture_outputs": [],
+                "recapture_receipt_sha256": doctest_recapture["receipt_sha256"],
+            },
+            "state": "resolved",
+            "transition_receipt_sha256": transition["receipt_sha256"],
+        }
+        transition_receipts.append(transition)
+        recovery = finalize_recovery()
+
+    return recovery, transition_receipts
 
 
 def _typed_v1_exception_provenance(
@@ -1079,9 +1135,13 @@ def _typed_v1_exception_provenance(
 
 
 def build_materialized_bundle(
-    repo_root: Path, doctest_recapture_raw: bytes | None = None
+    repo_root: Path,
+    doctest_recapture_raw: bytes | None = None,
+    unittest_recapture_raw: bytes | None = None,
 ) -> dict[str, Any]:
     repo_root = repo_root.resolve()
+    if unittest_recapture_raw is not None:
+        raise MaterializationError(UNITTEST_RECAPTURE_UNAVAILABLE)
     doctest_recapture: dict[str, Any] | None = None
     if doctest_recapture_raw is not None:
         try:
@@ -1284,6 +1344,8 @@ def build_materialized_bundle(
         doctest_recapture=doctest_recapture,
         repo_root=repo_root,
     )
+    for transition_receipt in transition_receipts:
+        validate_recovery_transition_receipt_v1(transition_receipt)
     recovery_raw = canonical_jcs(recovery)
     schema_resources = [
         {"path": path, "raw_sha256": raw_sha256, "schema_id": schema_id}
@@ -1509,11 +1571,14 @@ def build_materialized_bundle(
         transition_receipts,
         issuer,
         doctest_recapture_raw,
+        None,
+        None,
     )
 
     documents = {
         V2_INVENTORY_PATH: inventory,
         V2_RECOVERY_PATH: recovery,
+        V2_RECOVERY_TRANSITION_RECEIPTS_PATH: transition_receipts,
         V2_LEDGER_PATH: ledger,
     }
     raw_documents = {path: canonical_jcs(document) for path, document in documents.items()}
@@ -1545,13 +1610,13 @@ def build_materialized_bundle(
                 "inventory_declarations": len(declarations),
                 "ledger_rows": len(ledger_rows),
                 "recovery_records": len(recovery["records"]),
+                "recovery_transition_receipts": len(transition_receipts),
                 "source_only_declarations": len(SOURCE_ONLY_SPECS),
             },
             "disposition_counts": dict(sorted(disposition_counts.items())),
             "framework_counts": dict(sorted(framework_counts.items())),
-            "intended_count": EXPECTED_DECLARATION_COUNT,
-            "selected_count": len(declarations),
-            "executed_count": len(ledger_rows),
+            "executed_test_count": 0,
+            "materialized_declaration_count": len(declarations),
             "mode": (
                 "doctest-recovery-materialization"
                 if doctest_recapture is not None
@@ -1559,6 +1624,11 @@ def build_materialized_bundle(
             ),
         },
     }
+
+
+def recapture_unittests(repo_root: Path) -> dict[str, Any]:
+    del repo_root
+    raise MaterializationError(UNITTEST_RECAPTURE_UNAVAILABLE)
 
 
 def _write_or_check(bundle: dict[str, Any], output_root: Path, *, write: bool) -> None:
@@ -1596,10 +1666,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output-root", type=Path)
-    parser.add_argument(
+    doctest_packet_source = parser.add_mutually_exclusive_group()
+    doctest_packet_source.add_argument(
         "--doctest-recapture-packet",
         type=Path,
         help="use this exact canonical packet while materializing",
+    )
+    doctest_packet_source.add_argument(
+        "--without-doctest-recapture-packet",
+        action="store_true",
+        help="materialize the pre-recapture dormant state even when the repository has a saved packet",
+    )
+    unittest_packet_source = parser.add_mutually_exclusive_group()
+    unittest_packet_source.add_argument(
+        "--unittest-recapture-packet",
+        type=Path,
+        help="use this exact canonical unittest packet while materializing",
+    )
+    unittest_packet_source.add_argument(
+        "--without-unittest-recapture-packet",
+        action="store_true",
+        help="omit unittest recapture even when the repository has a saved packet",
     )
     parser.add_argument(
         "--cargo-target-dir",
@@ -1610,13 +1697,14 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--write", action="store_true")
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--recapture-doctests", action="store_true")
+    mode.add_argument("--recapture-unittests", action="store_true")
     args = parser.parse_args(argv)
     output_root = (args.output_root or args.repo_root).resolve()
     try:
         if args.recapture_doctests:
-            if args.doctest_recapture_packet is not None:
+            if args.doctest_recapture_packet is not None or args.without_doctest_recapture_packet:
                 raise MaterializationError(
-                    "--doctest-recapture-packet is invalid during a direct recapture"
+                    "doctest packet selection is invalid during a direct recapture"
                 )
             cargo_target_dir = args.cargo_target_dir or (
                 args.repo_root / "codex-rs" / "target-doctest-recapture-v1"
@@ -1643,11 +1731,39 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
-        packet_path = args.doctest_recapture_packet or (
-            args.repo_root / V2_DOCTEST_RECAPTURE_PATH
+        if args.recapture_unittests:
+            recapture_unittests(args.repo_root)
+        if args.without_doctest_recapture_packet:
+            recapture_raw = None
+        elif args.doctest_recapture_packet is not None:
+            packet_path = args.doctest_recapture_packet
+            if not packet_path.is_file():
+                raise MaterializationError(
+                    "explicit --doctest-recapture-packet does not exist or is not a file: "
+                    f"{packet_path}"
+                )
+            recapture_raw = packet_path.read_bytes()
+        else:
+            packet_path = args.repo_root / V2_DOCTEST_RECAPTURE_PATH
+            recapture_raw = packet_path.read_bytes() if packet_path.is_file() else None
+        if args.without_unittest_recapture_packet:
+            unittest_recapture_raw = None
+        elif args.unittest_recapture_packet is not None:
+            unittest_packet_path = args.unittest_recapture_packet
+            if not unittest_packet_path.is_file():
+                raise MaterializationError(
+                    "explicit --unittest-recapture-packet does not exist or is not a file: "
+                    f"{unittest_packet_path}"
+                )
+            raise MaterializationError(UNITTEST_RECAPTURE_UNAVAILABLE)
+        else:
+            unittest_packet_path = args.repo_root / V2_UNITTEST_RECAPTURE_PATH
+            if unittest_packet_path.is_file():
+                raise MaterializationError(UNITTEST_RECAPTURE_UNAVAILABLE)
+            unittest_recapture_raw = None
+        bundle = build_materialized_bundle(
+            args.repo_root, recapture_raw, unittest_recapture_raw
         )
-        recapture_raw = packet_path.read_bytes() if packet_path.is_file() else None
-        bundle = build_materialized_bundle(args.repo_root, recapture_raw)
         _write_or_check(bundle, output_root, write=args.write)
     except (MaterializationError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"inventory-v2 materialization failed: {exc}", file=sys.stderr)

@@ -56,7 +56,7 @@ INVENTORY_V2_SCHEMA_IDS = (
     "kd4://validation/test-replacements-v2.schema.json",
 )
 INVENTORY_V2_SCHEMA_RAW_SHA256S = (
-    "a87685f8058676078c21f70d26121d2a6a92223b4a06b396951589ace0c8985b",
+    "8412a18a13ae6f93b8efd18552e0be1422e957ebde5bde24512e8ce87d8bc09f",
     "06d7134aa77d6fa63fea9e7a0094fa76f4c2cca74c6ddad4a55078a09909732a",
     "1753d9bbca80f85ace51f9622e4cf228e91e0dfae94f82691a9a4935b2482c19",
     "b83d9fd5a535d358d3da6a9b06652dfc9390877813b5b5f85e01fd56b90e9c78",
@@ -91,6 +91,34 @@ DOCTEST_RECAPTURE_PARENT_TARGETS = {
     "bottom_pane::multi_select_picker::MultiSelectPickerBuilder (line 706)":
         "codex-tui::lib::codex_tui",
 }
+
+UNITTEST_RECAPTURE_FORMAT_ID = "kd4.unittest-recapture.v1"
+UNITTEST_RECAPTURE_BASELINE_COMMIT = DOCTEST_RECAPTURE_BASELINE_COMMIT
+UNITTEST_RECAPTURE_SOURCE_TREE_SHA256 = DOCTEST_RECAPTURE_SOURCE_TREE_SHA256
+UNITTEST_RECAPTURE_REPOSITORY_IDENTITY_SHA256 = (
+    DOCTEST_RECAPTURE_REPOSITORY_IDENTITY_SHA256
+)
+UNITTEST_RECAPTURE_PARENT_RECORDS_SHA256 = (
+    "a46a941721c872655dcb1c4ca55c070b9f48008a451d0df283f2d69957c2dd07"
+)
+# The V1 freeze recorded a dirty-workspace fingerprint, but the authenticated
+# overlay bytes needed to reproduce its 893 executable unittest parents have
+# not yet been recovered.  A packet cannot be accepted from the bare commit
+# or from a self-asserted site manifest.  This authority is populated only from
+# independently recovered freeze provenance.
+UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256: str | None = None
+UNITTEST_V1_HIDDEN_PARENT_IDS_SHA256 = (
+    "936330f9e9a23c8d628f651a1ed31b3f4ea836a06cf152a6acf09cff898ebc40"
+)
+UNITTEST_V1_REPLACEMENT_PARENT_IDS_SHA256 = (
+    "59202883ef32488ae9a488345b2401400794d961e5d539c58fd6364e86f25fe1"
+)
+UNITTEST_V1_EXECUTABLE_REPLACEMENT_PARENT_IDS_SHA256 = (
+    "208d6735c1413d94c503a453331889fe5709b8eca540cf9c13993c42f9bb8cf7"
+)
+UNITTEST_V1_UNRESOLVED_PARENT_IDS_SHA256 = (
+    "d1e66a89d1a943b60f6516bc9550102306919d6ae673bee4027595a3df8036f7"
+)
 
 
 def require_nfc(value: str) -> None:
@@ -2060,6 +2088,8 @@ def validate_inventory_ledger_predecessor_closure(
     transition_receipts: list[Any],
     applicability_issuer: "ActiveHostApplicabilityIssuerV1",
     doctest_recapture_raw: bytes | None = None,
+    unittest_recapture_raw: bytes | None = None,
+    predecessor_ledger_raw: bytes | None = None,
 ) -> None:
     validate_frozen_test_inventory_v2(inventory)
     validate_test_replacement_ledger_v2(ledger)
@@ -2125,7 +2155,7 @@ def validate_inventory_ledger_predecessor_closure(
         if obligation_id in rows_by_obligation:
             raise InventoryV2ContractError("ledger has duplicate obligation rows")
         rows_by_obligation[obligation_id] = row
-    if set(rows_by_obligation) != set(declarations_by_obligation):
+    if not set(declarations_by_obligation).issubset(rows_by_obligation):
         raise InventoryV2ContractError(
             "ledger rows do not exactly cover every inventory declaration obligation"
         )
@@ -2169,7 +2199,94 @@ def validate_inventory_ledger_predecessor_closure(
                 "doctest recapture input must be exact canonical JSON bytes"
             )
         validate_doctest_recapture_packet_v1(doctest_recapture)
+    unittest_recapture: Any = None
+    if unittest_recapture_raw is not None:
+        if not isinstance(unittest_recapture_raw, bytes):
+            raise InventoryV2ContractError("unittest recapture input must be exact bytes")
+        try:
+            unittest_recapture = json.loads(unittest_recapture_raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InventoryV2ContractError("unittest recapture is invalid JSON") from exc
+        if canonical_jcs(unittest_recapture) != unittest_recapture_raw:
+            raise InventoryV2ContractError(
+                "unittest recapture input must be exact canonical JSON bytes"
+            )
+        validate_unittest_recapture_packet_v1(unittest_recapture)
+    predecessor_ledger: Any = None
+    if predecessor_ledger_raw is not None:
+        if not isinstance(predecessor_ledger_raw, bytes):
+            raise InventoryV2ContractError("predecessor ledger input must be exact bytes")
+        if hashlib.sha256(predecessor_ledger_raw).hexdigest() != FROZEN_V1_LEDGER_RAW_SHA256:
+            raise InventoryV2ContractError("predecessor ledger raw SHA-256 mismatch")
+        try:
+            predecessor_ledger = json.loads(predecessor_ledger_raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InventoryV2ContractError("predecessor ledger is invalid JSON") from exc
+    authority_state_records = json.loads(json.dumps(recovery["records"]))
+    for index, record in enumerate(authority_state_records):
+        if record["state"] != "resolved":
+            continue
+        if record["kind"] == "doctest":
+            record["current_audit"]["raw_count"] = None
+            record["legacy_evidence"]["historical_raw_count"] = None
+            record["pending_requirement"] = {
+                "baseline_commit": recovery["frozen_source_authority"]["baseline_commit"],
+                "kind": "doctest",
+                "reasons": ["historical-raw-count-unknown", "off-host-recapture-required"],
+                "required_package_targets": sorted(
+                    target for _, target in DOCTEST_RECAPTURE_PACKAGE_SPECS
+                ),
+            }
+        else:
+            if unittest_recapture is None:
+                raise InventoryV2ContractError(
+                    "resolved unittest recovery requires the exact typed recapture packet"
+                )
+            record["legacy_evidence"]["historical_subtest_call_count"] = None
+            record["pending_requirement"] = {
+                "baseline_commit": recovery["frozen_source_authority"]["baseline_commit"],
+                "expected_parent_output_sha256s": [
+                    {
+                        "output_sha256": parent["predecessor_entry_sha256"],
+                        "parent_id": parent["baseline_id"],
+                    }
+                    for parent in unittest_recapture["parent_records"]
+                ],
+                "kind": "unittest",
+                "reasons": [
+                    "historical-subtest-count-unknown",
+                    "parent-output-recapture-required",
+                ],
+                "required_parent_count": 893,
+                "required_parent_ids": [
+                    parent["baseline_id"]
+                    for parent in unittest_recapture["parent_records"]
+                ],
+            }
+        record["resolution"] = None
+        record["state"] = "pending"
+        record["transition_receipt_sha256"] = None
+        authority_state_records[index] = record
+    for index, final_record in enumerate(recovery["records"]):
+        if final_record["state"] != "resolved":
+            continue
+        receipt = receipts_by_hash[final_record["transition_receipt_sha256"]]
+        authority_before = {
+            "format_id": recovery["format_id"],
+            "frozen_source_authority": recovery["frozen_source_authority"],
+            "records": authority_state_records,
+            "schema_version": recovery["schema_version"],
+        }
+        expected_before_sha256 = proof_hash(
+            "kd4.inventory-recovery-authority.semantic.v1", authority_before
+        )
+        if receipt["authority_before_semantic_sha256"] != expected_before_sha256:
+            raise InventoryV2ContractError(
+                "recovery transition does not bind the actual predecessor authority"
+            )
+        authority_state_records[index] = json.loads(json.dumps(final_record))
     recovered_parents: dict[str, tuple[list[str], str]] = {}
+    recovered_child_ids: set[str] = set()
     for record in recovery["records"]:
         if record["state"] != "resolved":
             continue
@@ -2196,6 +2313,32 @@ def validate_inventory_ledger_predecessor_closure(
                 raise InventoryV2ContractError(
                     "doctest recovery does not exactly materialize its typed recapture packet"
                 )
+        elif record["kind"] == "unittest":
+            if unittest_recapture is None:
+                raise InventoryV2ContractError(
+                    "resolved unittest recovery requires the exact typed recapture packet"
+                )
+            expected_children = unittest_recovered_child_sources_v1(unittest_recapture)
+            expected_outputs = [
+                {
+                    "output_sha256": parent["predecessor_entry_sha256"],
+                    "parent_id": parent["baseline_id"],
+                }
+                for parent in unittest_recapture["parent_records"]
+            ]
+            if (
+                resolution["recapture_receipt_sha256"]
+                != unittest_recapture["receipt_sha256"]
+                or resolution["child_sources"] != expected_children
+                or resolution["parent_container_ids"]
+                != [record["baseline_id"] for record in unittest_recapture["parent_records"]]
+                or resolution["parent_recapture_outputs"] != expected_outputs
+                or record["legacy_evidence"]["historical_subtest_call_count"]
+                != unittest_recapture["total_counts"]["subtest_occurrence_count"]
+            ):
+                raise InventoryV2ContractError(
+                    "unittest recovery does not exactly materialize its typed recapture packet"
+                )
         if (
             receipt["child_obligation_ids"] != child_ids
             or receipt["parent_container_ids"] != resolution["parent_container_ids"]
@@ -2217,6 +2360,19 @@ def validate_inventory_ledger_predecessor_closure(
                     f"recovery parent {parent!r} appears in more than one recovery record"
                 )
             recovered_parents[parent] = (parent_children, receipt["receipt_sha256"])
+        if record["kind"] == "unittest":
+            recovered_child_ids.update(child_ids)
+    expected_obligations = set(declarations_by_obligation) | recovered_child_ids
+    if set(rows_by_obligation) != expected_obligations:
+        raise InventoryV2ContractError(
+            "ledger rows do not exactly cover every inventory declaration and recovered-child obligation"
+        )
+    for child_id in recovered_child_ids:
+        child_row = rows_by_obligation[child_id]
+        if child_row["baseline_id"] is not None or child_row["disposition"] != {"kind": "unresolved"}:
+            raise InventoryV2ContractError(
+                "recovered child obligation must be a separate baseline-null unresolved row"
+            )
     observed_recovered_parents: set[str] = set()
     for row in ledger["rows"]:
         disposition = row["disposition"]
@@ -2232,10 +2388,130 @@ def validate_inventory_ledger_predecessor_closure(
                 "recovered-container row does not bind its recovery transition"
             )
         observed_recovered_parents.add(baseline_id)
-    if observed_recovered_parents != set(recovered_parents):
+    expected_container_parents = {
+        parent
+        for record in recovery["records"]
+        if record["state"] == "resolved" and record["kind"] == "doctest"
+        for parent in record["resolution"]["parent_container_ids"]
+    }
+    if observed_recovered_parents != expected_container_parents:
         raise InventoryV2ContractError(
             "recovered-container rows do not exactly cover resolved recovery parents"
         )
+    if unittest_recapture is not None:
+        if predecessor_ledger is None:
+            raise InventoryV2ContractError(
+                "resolved unittest recovery requires exact predecessor ledger bytes"
+            )
+        executable_parent_ids = {
+            record["baseline_id"] for record in unittest_recapture["parent_records"]
+        }
+        predecessor_unittest_ids = sorted(
+            row["baseline_id"]
+            for row in predecessor_ledger.get("rows", [])
+            if isinstance(row, dict)
+            and isinstance(row.get("baseline_id"), str)
+            and (
+                row["baseline_id"].startswith("python-unittest::")
+                or row["baseline_id"].startswith(
+                    "hidden-at-freeze-v1::python-unittest::"
+                )
+            )
+        )
+        hidden_parent_ids = sorted(
+            parent
+            for parent in predecessor_unittest_ids
+            if parent.startswith("hidden-at-freeze-v1::python-unittest::")
+        )
+        unittest_parent_ids = set(predecessor_unittest_ids)
+        if (
+            len(unittest_parent_ids) != 909
+            or len(executable_parent_ids) != 893
+            or len(hidden_parent_ids) != 16
+            or proof_hash(
+                "kd4.unittest-hidden-ledger-parent-ids.v1", hidden_parent_ids
+            )
+            != UNITTEST_V1_HIDDEN_PARENT_IDS_SHA256
+            or unittest_parent_ids != executable_parent_ids | set(hidden_parent_ids)
+            or executable_parent_ids & set(hidden_parent_ids)
+        ):
+            raise InventoryV2ContractError(
+                "unittest predecessor partition must preserve 909 ledger parents, "
+                "893 executable parents, and 16 hidden replacement-only parents"
+            )
+        replacement_ids = sorted(
+            row["baseline_id"] for row in ledger["rows"]
+            if row["baseline_id"] in unittest_parent_ids
+            and row["disposition"]["kind"] == "replacement"
+        )
+        unresolved_ids = sorted(
+            row["baseline_id"] for row in ledger["rows"]
+            if row["baseline_id"] in unittest_parent_ids
+            and row["disposition"]["kind"] == "unresolved"
+        )
+        executable_replacement_ids = sorted(
+            parent for parent in replacement_ids if parent in executable_parent_ids
+        )
+        if (
+            len(replacement_ids) != 536
+            or proof_hash("kd4.unittest-parent-replacement-ids.v1", replacement_ids)
+            != UNITTEST_V1_REPLACEMENT_PARENT_IDS_SHA256
+            or len(executable_replacement_ids) != 520
+            or proof_hash(
+                "kd4.unittest-parent-replacement-ids.v1",
+                executable_replacement_ids,
+            )
+            != UNITTEST_V1_EXECUTABLE_REPLACEMENT_PARENT_IDS_SHA256
+            or len(unresolved_ids) != 373
+            or proof_hash("kd4.unittest-parent-unresolved-ids.v1", unresolved_ids)
+            != UNITTEST_V1_UNRESOLVED_PARENT_IDS_SHA256
+            or set(replacement_ids) | set(unresolved_ids) != unittest_parent_ids
+            or not set(hidden_parent_ids).issubset(replacement_ids)
+        ):
+            raise InventoryV2ContractError(
+                "unittest parent dispositions do not preserve the exact 536 replacement "
+                "(520 executable plus 16 hidden) and 373 unresolved split"
+            )
+        predecessor_rows = {
+            row["baseline_id"]: row
+            for row in predecessor_ledger.get("rows", [])
+            if isinstance(row, dict) and row.get("baseline_id") in unittest_parent_ids
+        }
+        if set(predecessor_rows) != unittest_parent_ids:
+            raise InventoryV2ContractError(
+                "predecessor ledger does not exactly cover the 909 unittest parents"
+            )
+        for parent in unittest_parent_ids:
+            old = predecessor_rows[parent]
+            current = rows_by_obligation[
+                next(
+                    obligation_id
+                    for obligation_id, baseline_id in expected_baseline_by_obligation.items()
+                    if baseline_id == parent
+                )
+            ]["disposition"]
+            old_hash = proof_hash("kd4.frozen-v1-replacement-ledger-row.v1", old)
+            if old.get("resolution") == "unresolved":
+                if current != {"kind": "unresolved"}:
+                    raise InventoryV2ContractError(
+                        "unittest unresolved parent disposition changed"
+                    )
+            elif old.get("resolution") == "replacement":
+                hint = current.get("contract", {}).get("legacy_replacement_hint")
+                if (
+                    current.get("kind") != "replacement"
+                    or hint != {
+                        "predecessor_row_sha256": old_hash,
+                        "replacement_ids": sorted(old.get("replacement_ids", [])),
+                    }
+                ):
+                    raise InventoryV2ContractError(
+                        "unittest replacement parent mapping changed"
+                    )
+            else:
+                raise InventoryV2ContractError(
+                    "unittest predecessor parent has an unknown disposition"
+                )
     for row in ledger["rows"]:
         disposition = row["disposition"]
         if disposition["kind"] != "exception" or disposition["exception"]["kind"] != "accepted":
@@ -2307,6 +2583,555 @@ def _expected_doctest_command(package_name: str) -> list[str]:
         "cargo", "test", "--locked", "--offline", "-p", package_name,
         "--doc", "--", "--list", "--format", "terse",
     ]
+
+
+def _validate_unittest_artifact_v1(value: Any, label: str) -> bytes:
+    artifact = _require_object(
+        value, {"base64", "byte_count", "sha256"}, f"{label} artifact"
+    )
+    raw = _decode_recapture_artifact(
+        artifact["base64"], artifact["sha256"], label
+    )
+    if _require_integer(artifact["byte_count"], 0, f"{label} byte_count") != len(raw):
+        raise InventoryV2ContractError(f"{label} artifact byte count mismatch")
+    return raw
+
+
+def _unittest_site_id_v1(site: Any) -> str:
+    projection = {
+        key: site[key]
+        for key in ("column", "line", "parent_baseline_id", "path")
+    }
+    return "unittest-site." + proof_hash(
+        "kd4.unittest-recapture-source-site.v1", projection
+    )
+
+
+def _unittest_manifest_projection_v1(
+    parent_baseline_id: str, occurrences: list[Any]
+) -> dict[str, Any]:
+    return {
+        "method_body_observed": True,
+        "parent_baseline_id": parent_baseline_id,
+        "site_ids": sorted({item["declared_site_id"] for item in occurrences}),
+        "subtest_occurrence_count": len(occurrences),
+    }
+
+
+def unittest_subtest_manifests_v1(value: Any) -> list[dict[str, Any]]:
+    """Return the canonical per-parent manifests bound by a unittest packet."""
+
+    validate_unittest_recapture_packet_v1(value)
+    occurrences_by_parent: dict[str, list[Any]] = {
+        record["baseline_id"]: [] for record in value["parent_records"]
+    }
+    for occurrence in value["subtest_occurrences"]:
+        occurrences_by_parent[occurrence["parent_baseline_id"]].append(occurrence)
+    manifests = []
+    for parent, occurrences in occurrences_by_parent.items():
+        projection = _unittest_manifest_projection_v1(parent, occurrences)
+        manifests.append(
+            {
+                **projection,
+                "manifest_sha256": proof_hash(
+                    "kd4.unittest-subtest-manifest.v1",
+                    {"occurrences": occurrences, **projection},
+                ),
+            }
+        )
+    return sorted(manifests, key=lambda item: item["parent_baseline_id"])
+
+
+def unittest_recovered_child_sources_v1(value: Any) -> list[dict[str, Any]]:
+    """Materialize separate unresolved child obligations from a unittest packet."""
+
+    validate_unittest_recapture_packet_v1(value)
+    children: list[dict[str, Any]] = []
+    for record in value["parent_records"]:
+        parent = record["baseline_id"]
+        children.append(
+            {
+                "canonical_parameter_projection": None,
+                "child_kind": "unittest-method-body",
+                "declared_site_id": None,
+                "executable_identity": {
+                    "kind": "test",
+                    "route_id": "test-route.python-unittest.v1",
+                    "test_id": parent,
+                    "validation_id": "python.unittest.recapture",
+                },
+                "gap_id": "gap.unittest-subtest-expansion",
+                "occurrence_ordinal": None,
+                "parent_baseline_id": parent,
+            }
+        )
+    for occurrence in value["subtest_occurrences"]:
+        parent = occurrence["parent_baseline_id"]
+        children.append(
+            {
+                "canonical_parameter_projection": occurrence[
+                    "canonical_context_projection"
+                ],
+                "child_kind": "unittest-subtest",
+                "declared_site_id": occurrence["declared_site_id"],
+                "executable_identity": {
+                    "kind": "test",
+                    "route_id": "test-route.python-unittest.v1",
+                    "test_id": parent,
+                    "validation_id": "python.unittest.recapture",
+                },
+                "gap_id": "gap.unittest-subtest-expansion",
+                "occurrence_ordinal": occurrence["occurrence_ordinal"],
+                "parent_baseline_id": parent,
+            }
+        )
+    return sorted(children, key=_validate_recovered_child_source_v1)
+
+
+def validate_unittest_recapture_packet_v1(value: Any) -> None:
+    """Validate a complete baseline unittest recapture without rewriting parents."""
+
+    fields = {
+        "artifacts", "attempt_id", "baseline_commit", "format_id",
+        "frozen_inventory_raw_sha256", "output_bindings", "parent_manifests",
+        "network_isolation", "parent_records", "parent_results", "python_identity", "receipt_sha256",
+        "repository_identity_sha256", "schema_version", "source_audit",
+        "source_isolation", "source_site_manifest", "source_tree_sha256", "subtest_occurrences",
+        "total_counts", "worker_identity",
+    }
+    _require_object(value, fields, "UnittestRecapturePacketV1")
+    canonical_jcs(value)
+    _require_schema_version(value["schema_version"], 1, "UnittestRecapturePacketV1")
+    if value["format_id"] != UNITTEST_RECAPTURE_FORMAT_ID:
+        raise InventoryV2ContractError("invalid unittest recapture packet format")
+    _require_nonempty_nfc(value["attempt_id"], "attempt_id")
+    expected_authorities = {
+        "baseline_commit": UNITTEST_RECAPTURE_BASELINE_COMMIT,
+        "frozen_inventory_raw_sha256": FROZEN_V1_INVENTORY_RAW_SHA256,
+        "repository_identity_sha256": UNITTEST_RECAPTURE_REPOSITORY_IDENTITY_SHA256,
+        "source_tree_sha256": UNITTEST_RECAPTURE_SOURCE_TREE_SHA256,
+    }
+    if any(value[key] != expected for key, expected in expected_authorities.items()):
+        raise InventoryV2ContractError("unittest recapture frozen authority mismatch")
+    if UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256 is None:
+        raise InventoryV2ContractError(
+            "unittest recapture freeze-overlay source authority is unavailable"
+        )
+
+    isolation = _require_object(
+        value["source_isolation"],
+        {
+            "checkout_command", "clean_after", "clean_before", "clone_command",
+            "clone_config", "clone_kind", "clone_source_path", "core_autocrlf",
+            "execution_working_directory", "git_hooks_disabled", "head_commit",
+            "isolated_checkout_path", "kind",
+            "source_repository_identity_sha256", "source_tree_sha256",
+            "global_git_config_disabled", "system_git_config_disabled",
+        },
+        "UnittestSourceIsolationV1",
+    )
+    clone_source_path = _require_nonempty_nfc(
+        isolation["clone_source_path"], "clone source path"
+    )
+    isolated_checkout_path = _require_nonempty_nfc(
+        isolation["isolated_checkout_path"], "isolated checkout path"
+    )
+    hooks_path = _require_nonempty_nfc(
+        isolation["clone_config"].get("git_hooks_path")
+        if isinstance(isolation["clone_config"], dict)
+        else None,
+        "disabled Git hooks path",
+    )
+    if (
+        isolation["kind"] != "detached-checkout"
+        or isolation["clone_kind"] != "local-no-hardlinks-no-checkout"
+        or isolation["clone_command"] != [
+            "git", "clone", "--local", "--no-hardlinks", "--no-checkout",
+            "--config", "core.autocrlf=false", "--config",
+            f"core.hooksPath={hooks_path}", clone_source_path,
+            isolated_checkout_path,
+        ]
+        or isolation["clone_config"] != {
+            "core_autocrlf": False,
+            "git_hooks_path": hooks_path,
+            "hardlinks": False,
+            "local": True,
+            "no_checkout": True,
+        }
+        or isolation["checkout_command"] != [
+            "git", "-C", isolated_checkout_path, "checkout", "--detach",
+            "--force", UNITTEST_RECAPTURE_BASELINE_COMMIT,
+        ]
+        or isolation["clean_before"] is not True
+        or isolation["clean_after"] is not True
+        or isolation["core_autocrlf"] is not False
+        or isolation["git_hooks_disabled"] is not True
+        or isolation["global_git_config_disabled"] is not True
+        or isolation["system_git_config_disabled"] is not True
+        or isolation["execution_working_directory"] != "."
+        or isolation["head_commit"] != UNITTEST_RECAPTURE_BASELINE_COMMIT
+        or isolation["source_repository_identity_sha256"]
+        != UNITTEST_RECAPTURE_REPOSITORY_IDENTITY_SHA256
+        or isolation["source_tree_sha256"] != UNITTEST_RECAPTURE_SOURCE_TREE_SHA256
+    ):
+        raise InventoryV2ContractError("unittest recapture was not an isolated clean checkout")
+
+    python_identity = _require_object(
+        value["python_identity"],
+        {
+            "executable_path", "executable_sha256", "implementation", "major", "minor", "micro", "soabi",
+            "version_base64", "version_sha256",
+        },
+        "UnittestPythonIdentityV1",
+    )
+    if python_identity["implementation"] != "CPython":
+        raise InventoryV2ContractError("unittest recapture requires CPython")
+    _require_nonempty_nfc(python_identity["executable_path"], "Python executable path")
+    _require_sha256_field(python_identity["executable_sha256"], "Python executable_sha256")
+    for field in ("major", "minor", "micro"):
+        _require_integer(python_identity[field], 0, f"Python {field}")
+    _require_nonempty_nfc(python_identity["soabi"], "Python SOABI")
+    _decode_recapture_artifact(
+        python_identity["version_base64"], python_identity["version_sha256"],
+        "Python version",
+    )
+    worker = _require_object(
+        value["worker_identity"],
+        {"command_argv", "environment_sha256", "worker_id", "worker_sha256"},
+        "UnittestWorkerIdentityV1",
+    )
+    _require_nonempty_nfc(worker["worker_id"], "worker_id")
+    _require_sha256_field(worker["environment_sha256"], "environment_sha256")
+    _require_sha256_field(worker["worker_sha256"], "worker_sha256")
+    if not isinstance(worker["command_argv"], list) or not worker["command_argv"]:
+        raise InventoryV2ContractError("unittest worker command must be nonempty")
+    for arg in worker["command_argv"]:
+        _require_nonempty_nfc(arg, "worker command argument")
+    network = _require_object(
+        value["network_isolation"],
+        {
+            "codex_executable_path", "codex_executable_sha256",
+            "codex_network_allow_local_binding", "command_argv", "fail_closed",
+            "kind", "profile", "proxy_environment", "sandbox_available",
+        },
+        "UnittestNetworkIsolationV1",
+    )
+    codex_path = _require_nonempty_nfc(
+        network["codex_executable_path"], "Codex executable path"
+    )
+    _require_sha256_field(
+        network["codex_executable_sha256"], "Codex executable SHA-256"
+    )
+    command = network["command_argv"]
+    if (
+        network["kind"] != "codex-windows-sandbox"
+        or network["profile"] != ":workspace"
+        or network["sandbox_available"] is not True
+        or network["fail_closed"] is not True
+        or not isinstance(command, list)
+        or len(command) < 8
+        or command[:5] != [codex_path, "sandbox", "-P", ":workspace", "-C"]
+        or command[5] != isolated_checkout_path
+        or command[6] != "--"
+        or command[7:] != worker["command_argv"]
+        or worker["command_argv"][0] != python_identity["executable_path"]
+    ):
+        raise InventoryV2ContractError(
+            "unittest worker did not use the exact public Codex sandbox boundary"
+        )
+    for arg in command:
+        _require_nonempty_nfc(arg, "sandbox command argument")
+    if network["proxy_environment"] != {
+        "ALL_PROXY": None,
+        "HTTPS_PROXY": None,
+        "HTTP_PROXY": None,
+        "NO_PROXY": None,
+        "all_proxy": None,
+        "https_proxy": None,
+        "http_proxy": None,
+        "no_proxy": None,
+    } or network["codex_network_allow_local_binding"] != "1":
+        raise InventoryV2ContractError(
+            "unittest sandbox must clear proxies and explicitly allow loopback binding"
+        )
+
+    parents = value["parent_records"]
+    if not isinstance(parents, list) or len(parents) != 893:
+        raise InventoryV2ContractError(
+            "unittest recapture must bind exactly 893 executable parents"
+        )
+    parent_ids: list[str] = []
+    for record in parents:
+        _require_object(
+            record, {"baseline_id", "native_id", "predecessor_entry_sha256"},
+            "UnittestParentRecordV1",
+        )
+        baseline_id = _require_nonempty_nfc(record["baseline_id"], "baseline_id")
+        native_id = _require_nonempty_nfc(record["native_id"], "native_id")
+        _require_sha256_field(
+            record["predecessor_entry_sha256"], "predecessor_entry_sha256"
+        )
+        if not baseline_id.endswith("python-unittest::" + native_id):
+            raise InventoryV2ContractError("unittest parent native identity mismatch")
+        parent_ids.append(baseline_id)
+    if parent_ids != sorted(set(parent_ids)):
+        raise InventoryV2ContractError("unittest parent records must be sorted and unique")
+    if proof_hash("kd4.unittest-recapture-parent-record-set.v1", parents) != UNITTEST_RECAPTURE_PARENT_RECORDS_SHA256:
+        raise InventoryV2ContractError(
+            "unittest parent record set is not the frozen 893-parent executable set"
+        )
+    parent_set = set(parent_ids)
+
+    sites = value["source_site_manifest"]
+    if not isinstance(sites, list):
+        raise InventoryV2ContractError("unittest source-site manifest must be an array")
+    site_by_id: dict[str, Any] = {}
+    for site in sites:
+        _require_object(
+            site,
+            {"column", "declared_site_id", "line", "parent_baseline_id", "path"},
+            "UnittestSourceSiteV1",
+        )
+        require_strict_repository_path(site["path"])
+        _require_integer(site["line"], 1, "source site line")
+        _require_integer(site["column"], 1, "source site column")
+        if site["parent_baseline_id"] not in parent_set:
+            raise InventoryV2ContractError("unittest source site has an unknown parent")
+        if site["declared_site_id"] != _unittest_site_id_v1(site):
+            raise InventoryV2ContractError("unittest source site ID mismatch")
+        if site["declared_site_id"] in site_by_id:
+            raise InventoryV2ContractError("duplicate unittest source site ID")
+        site_by_id[site["declared_site_id"]] = site
+    if sites != sorted(sites, key=lambda item: item["declared_site_id"]):
+        raise InventoryV2ContractError("unittest source-site manifest must be sorted")
+    source_audit = _require_object(
+        value["source_audit"],
+        {
+            "embedded_non_ast_marker_count", "executable_ast_site_count",
+            "source_file_count", "source_site_manifest_sha256", "textual_marker_count",
+        },
+        "UnittestSourceAuditV1",
+    )
+    expected_manifest_sha256 = proof_hash(
+        "kd4.unittest-recapture-source-site-manifest.v1", sites
+    )
+    if source_audit != {
+        "embedded_non_ast_marker_count": 1,
+        "executable_ast_site_count": 68,
+        "source_file_count": 22,
+        "source_site_manifest_sha256": UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256,
+        "textual_marker_count": 69,
+    } or expected_manifest_sha256 != UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256 or len(sites) != 68 or len({site["path"] for site in sites}) != 22:
+        raise InventoryV2ContractError("unittest recapture source audit mismatch")
+
+    occurrences = value["subtest_occurrences"]
+    if not isinstance(occurrences, list):
+        raise InventoryV2ContractError("unittest subtest occurrences must be an array")
+    occurrence_keys: list[tuple[str, str, int]] = []
+    occurrences_by_parent: dict[str, list[Any]] = {parent: [] for parent in parent_ids}
+    for occurrence in occurrences:
+        _require_object(
+            occurrence,
+            {
+                "canonical_context_projection", "declared_site_id",
+                "occurrence_ordinal", "parent_baseline_id",
+            },
+            "UnittestSubtestOccurrenceV1",
+        )
+        parent = occurrence["parent_baseline_id"]
+        site_id = occurrence["declared_site_id"]
+        ordinal = _require_integer(
+            occurrence["occurrence_ordinal"], 0, "subtest occurrence ordinal"
+        )
+        if parent not in parent_set or site_id not in site_by_id or site_by_id[site_id]["parent_baseline_id"] != parent:
+            raise InventoryV2ContractError("unittest subtest occurrence has an unknown parent/site")
+        validate_canonical_parameter_projection_v1(
+            occurrence["canonical_context_projection"]
+        )
+        occurrence_keys.append((parent, site_id, ordinal))
+        occurrences_by_parent[parent].append(occurrence)
+    if occurrence_keys != sorted(set(occurrence_keys)):
+        raise InventoryV2ContractError("unittest subtest occurrences must be sorted and unique")
+    ordinal_groups: dict[tuple[str, str], list[int]] = {}
+    for parent, site_id, ordinal in occurrence_keys:
+        ordinal_groups.setdefault((parent, site_id), []).append(ordinal)
+    if any(ordinals != list(range(len(ordinals))) for ordinals in ordinal_groups.values()):
+        raise InventoryV2ContractError("unittest subtest ordinals must be contiguous per parent/site")
+
+    expected_manifests = []
+    for parent in parent_ids:
+        projection = _unittest_manifest_projection_v1(parent, occurrences_by_parent[parent])
+        expected_manifests.append(
+            {
+                **projection,
+                "manifest_sha256": proof_hash(
+                    "kd4.unittest-subtest-manifest.v1",
+                    {"occurrences": occurrences_by_parent[parent], **projection},
+                ),
+            }
+        )
+    if value["parent_manifests"] != expected_manifests:
+        raise InventoryV2ContractError("unittest parent manifests do not match occurrences")
+
+    artifacts = _require_object(
+        value["artifacts"],
+        {"parent_manifest", "report", "stderr", "stdout"},
+        "UnittestArtifactsV1",
+    )
+    artifact_raw = {
+        name: _validate_unittest_artifact_v1(artifacts[name], f"unittest {name}")
+        for name in ("parent_manifest", "report", "stderr", "stdout")
+    }
+    try:
+        parent_manifest = parse_canonical_jcs(artifact_raw["parent_manifest"])
+    except InventoryV2ContractError as exc:
+        raise InventoryV2ContractError(
+            "unittest parent manifest artifact must be canonical JSON"
+        ) from exc
+    if parent_manifest != {
+        "baseline_commit": UNITTEST_RECAPTURE_BASELINE_COMMIT,
+        "format_id": "kd4.unittest-parent-manifest.v1",
+        "frozen_inventory_raw_sha256": FROZEN_V1_INVENTORY_RAW_SHA256,
+        "parent_records": parents,
+        "schema_version": 1,
+        "source_tree_sha256": UNITTEST_RECAPTURE_SOURCE_TREE_SHA256,
+    }:
+        raise InventoryV2ContractError(
+            "unittest parent manifest does not bind the frozen parent records"
+        )
+    results = value["parent_results"]
+    bindings = value["output_bindings"]
+    if (
+        not isinstance(results, list)
+        or not isinstance(bindings, list)
+        or len(results) != 893
+        or len(bindings) != 893
+    ):
+        raise InventoryV2ContractError(
+            "unittest results/output bindings must cover 893 executable parents"
+        )
+    binding_by_parent: dict[str, Any] = {}
+    for binding in bindings:
+        _require_object(
+            binding,
+            {"parent_baseline_id", "parent_result_sha256", "report_sha256", "stderr_sha256", "stdout_sha256"},
+            "UnittestOutputBindingV1",
+        )
+        parent = binding["parent_baseline_id"]
+        if parent in binding_by_parent or parent not in parent_set:
+            raise InventoryV2ContractError("unittest output binding parent mismatch")
+        for name in ("report", "stderr", "stdout"):
+            if binding[f"{name}_sha256"] != artifacts[name]["sha256"]:
+                raise InventoryV2ContractError("unittest output binding artifact mismatch")
+        _require_sha256_field(binding["parent_result_sha256"], "parent_result_sha256")
+        binding_by_parent[parent] = binding
+    if [item["parent_baseline_id"] for item in bindings] != parent_ids:
+        raise InventoryV2ContractError("unittest output bindings must be parent sorted")
+    terminal_count = 0
+    for result, parent in zip(results, parent_ids):
+        _require_object(
+            result,
+            {"parent_baseline_id", "selected", "skip_reason", "started", "terminal_result"},
+            "UnittestParentResultV1",
+        )
+        if result["parent_baseline_id"] != parent or result["selected"] is not True or result["started"] is not True:
+            raise InventoryV2ContractError("unittest parent was not exactly selected and started")
+        terminal = result["terminal_result"]
+        if terminal != "passed" or result["skip_reason"] is not None:
+            raise InventoryV2ContractError("every unittest parent must pass without a skip reason")
+        result_sha = proof_hash("kd4.unittest-parent-result.v1", result)
+        if binding_by_parent[parent]["parent_result_sha256"] != result_sha:
+            raise InventoryV2ContractError("unittest output binding parent result mismatch")
+        terminal_count += 1
+
+    try:
+        report = parse_canonical_jcs(artifact_raw["report"])
+    except InventoryV2ContractError as exc:
+        raise InventoryV2ContractError(
+            "unittest report artifact must be canonical JSON"
+        ) from exc
+    report_counts = {
+        "selected_parent_count": 893,
+        "started_parent_count": 893,
+        "subtest_occurrence_count": len(occurrences),
+        "terminal_parent_count": terminal_count,
+    }
+    expected_report = {
+        "format_id": "kd4.unittest-execution-report.v1",
+        "frozen_inventory_raw_sha256": FROZEN_V1_INVENTORY_RAW_SHA256,
+        "output_binding_results": [
+            {
+                "parent_baseline_id": binding["parent_baseline_id"],
+                "parent_result_sha256": binding["parent_result_sha256"],
+            }
+            for binding in bindings
+        ],
+        "parent_manifest_sha256": artifacts["parent_manifest"]["sha256"],
+        "parent_results": results,
+        "schema_version": 1,
+        "selection": {
+            "intended_count": 893,
+            "intended_native_ids": [record["native_id"] for record in parents],
+            "selected_count": 893,
+            "selected_native_ids": [record["native_id"] for record in parents],
+        },
+        "socket_policy": "loopback-only",
+        "source_site_manifest": sites,
+        "subtest_occurrences": occurrences,
+        "total_counts": report_counts,
+        "untrusted_observations": {
+            "checkout": {
+                "clean_after": isolation["clean_after"],
+                "clean_before": isolation["clean_before"],
+                "execution_working_directory": isolation[
+                    "execution_working_directory"
+                ],
+                "head_commit": isolation["head_commit"],
+                "source_tree_sha256": isolation["source_tree_sha256"],
+            },
+            "environment": {
+                "codex_network_allow_local_binding": network[
+                    "codex_network_allow_local_binding"
+                ],
+                "proxy_environment": network["proxy_environment"],
+            },
+            "process": {
+                "command_argv": worker["command_argv"],
+                "python_executable_path": python_identity["executable_path"],
+                "python_executable_sha256": python_identity["executable_sha256"],
+                "worker_sha256": worker["worker_sha256"],
+            },
+        },
+    }
+    if report != expected_report:
+        raise InventoryV2ContractError(
+            "unittest report semantic execution content mismatch"
+        )
+
+    counts = _require_object(
+        value["total_counts"],
+        {
+            "method_body_child_count", "parent_record_count", "recovered_child_count",
+            "selected_parent_count", "started_parent_count", "subtest_occurrence_count",
+            "terminal_parent_count",
+        },
+        "UnittestTotalCountsV1",
+    )
+    expected_counts = {
+        "method_body_child_count": 893,
+        "parent_record_count": 893,
+        "recovered_child_count": 893 + len(occurrences),
+        "selected_parent_count": 893,
+        "started_parent_count": 893,
+        "subtest_occurrence_count": len(occurrences),
+        "terminal_parent_count": terminal_count,
+    }
+    if counts != expected_counts:
+        raise InventoryV2ContractError("unittest recapture total counts mismatch")
+    _require_sha256_field(value["receipt_sha256"], "receipt_sha256")
+    projection = {key: item for key, item in value.items() if key != "receipt_sha256"}
+    if value["receipt_sha256"] != proof_hash("kd4.unittest-recapture-receipt.v1", projection):
+        raise InventoryV2ContractError("unittest recapture receipt hash mismatch")
 
 
 def validate_doctest_recapture_packet_v1(value: Any) -> None:
@@ -2534,6 +3359,9 @@ def validate_canonical_parameter_projection_v1(value: Any) -> None:
         _require_object(value, {"kind", "value"}, "string parameter")
         if not isinstance(value["value"], str) or not unicodedata.is_normalized("NFC", value["value"]):
             raise InventoryV2ContractError("string parameter value must be an NFC string")
+    elif kind == "repository-path":
+        _require_object(value, {"kind", "value"}, "repository-path parameter")
+        require_strict_repository_path(value["value"])
     elif kind == "bytes":
         _require_object(value, {"base64url", "kind"}, "bytes parameter")
         encoded = value["base64url"]
@@ -2687,7 +3515,6 @@ def _validate_recovery_record_v1(value: Any) -> None:
         if (
             actual_sites != sorted(actual_sites)
             or len(set(actual_sites)) != len(actual_sites)
-            or legacy["historical_subtest_call_count"] is not None
         ):
             raise InventoryV2ContractError(
                 "unittest recovery evidence must use deterministic unique source anchors"
@@ -2719,15 +3546,23 @@ def _validate_recovery_record_v1(value: Any) -> None:
         _require_sorted_unique_strings(pending.get("reasons"), "recovery reasons", nonempty=True)
         if kind == "unittest":
             _require_object(pending, {"baseline_commit", "expected_parent_output_sha256s", "kind", "reasons", "required_parent_count", "required_parent_ids"}, "unittest pending requirement")
-            if _require_integer(pending["required_parent_count"], 0, "required_parent_count") != 909:
-                raise InventoryV2ContractError("unittest pending requirement must cover 909 parents")
+            if _require_integer(pending["required_parent_count"], 0, "required_parent_count") != 893:
+                raise InventoryV2ContractError(
+                    "unittest pending requirement must cover 893 executable parents"
+                )
             parent_ids = _require_sorted_unique_strings(pending["required_parent_ids"], "required_parent_ids", nonempty=True)
             outputs = pending["expected_parent_output_sha256s"]
-            if len(parent_ids) != 909 or not isinstance(outputs, list) or len(outputs) != 909:
-                raise InventoryV2ContractError("unittest pending requirement must cover all 909 parents")
+            if len(parent_ids) != 893 or not isinstance(outputs, list) or len(outputs) != 893:
+                raise InventoryV2ContractError(
+                    "unittest pending requirement must cover all 893 executable parents"
+                )
             output_ids = [_validate_parent_output(output) for output in outputs]
             if output_ids != parent_ids or any(a >= b for a, b in zip(output_ids, output_ids[1:])):
                 raise InventoryV2ContractError("parent output tuples must exactly cover required parent IDs")
+            if legacy["historical_subtest_call_count"] is not None:
+                raise InventoryV2ContractError(
+                    "pending unittest recovery cannot claim a historical subtest count"
+                )
         else:
             _require_object(pending, {"baseline_commit", "kind", "reasons", "required_package_targets"}, "doctest pending requirement")
             _require_sorted_unique_strings(pending["required_package_targets"], "required_package_targets", nonempty=True)
@@ -2760,8 +3595,10 @@ def _validate_recovery_record_v1(value: Any) -> None:
         if output_ids and any(a >= b for a, b in zip(output_ids, output_ids[1:])):
             raise InventoryV2ContractError("parent_recapture_outputs must be sorted and unique")
         if kind == "unittest":
-            if len(outputs) != 909 or output_ids != parents:
-                raise InventoryV2ContractError("resolved unittest recovery must cover all 909 parent containers")
+            if len(outputs) != 893 or output_ids != parents:
+                raise InventoryV2ContractError(
+                    "resolved unittest recovery must cover all 893 executable parent containers"
+                )
             if any(
                 child["child_kind"] not in {"unittest-method-body", "unittest-subtest"}
                 or child["parent_baseline_id"] not in set(parents)
@@ -2783,6 +3620,13 @@ def _validate_recovery_record_v1(value: Any) -> None:
                     ).append(child["occurrence_ordinal"])
             if any(sorted(ordinals) != list(range(len(ordinals))) for ordinals in occurrence_groups.values()):
                 raise InventoryV2ContractError("subtest occurrences must be contiguous and zero-based per parent/site")
+            subtest_count = sum(
+                child["child_kind"] == "unittest-subtest" for child in children
+            )
+            if legacy["historical_subtest_call_count"] != subtest_count:
+                raise InventoryV2ContractError(
+                    "resolved unittest historical subtest count must equal recovered subtest children"
+                )
         else:
             if outputs or len(parents) != 5:
                 raise InventoryV2ContractError("doctest recovery requires exactly five parent containers")
@@ -2881,28 +3725,47 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Validate canonical KD4 Inventory V2 contract artifacts"
     )
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
         "--validate-doctest-recapture",
         type=Path,
         help="validate one canonical typed doctest recapture packet",
     )
+    group.add_argument(
+        "--validate-unittest-recapture",
+        type=Path,
+        help="validate one canonical typed unittest recapture packet",
+    )
     args = parser.parse_args(argv)
-    if args.validate_doctest_recapture is None:
-        parser.error("--validate-doctest-recapture is required")
+    artifact_path = (
+        args.validate_unittest_recapture
+        if args.validate_unittest_recapture is not None
+        else args.validate_doctest_recapture
+    )
     try:
-        raw = args.validate_doctest_recapture.read_bytes()
+        raw = artifact_path.read_bytes()
         value = parse_canonical_jcs(raw)
-        validate_doctest_recapture_packet_v1(value)
+        if args.validate_unittest_recapture is not None:
+            validate_unittest_recapture_packet_v1(value)
+            result = {
+                "artifact_sha256": hashlib.sha256(raw).hexdigest(),
+                "parent_record_count": value["total_counts"]["parent_record_count"],
+                "result": "valid-unittest-recapture",
+                "subtest_occurrence_count": value["total_counts"]["subtest_occurrence_count"],
+            }
+        else:
+            validate_doctest_recapture_packet_v1(value)
+            result = {
+                "artifact_sha256": hashlib.sha256(raw).hexdigest(),
+                "raw_occurrence_count": value["raw_occurrence_count"],
+                "result": "valid-doctest-recapture",
+            }
     except (OSError, InventoryV2ContractError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         print(f"inventory-v2 validation failed: {exc}", file=sys.stderr)
         return 1
     print(
         json.dumps(
-            {
-                "artifact_sha256": hashlib.sha256(raw).hexdigest(),
-                "raw_occurrence_count": value["raw_occurrence_count"],
-                "result": "valid-doctest-recapture",
-            },
+            result,
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -2916,9 +3779,12 @@ __all__ = [
     "INVENTORY_V2_SCHEMA_IDS",
     "DOCTEST_RECAPTURE_PACKAGE_SPECS",
     "DOCTEST_RECAPTURE_PARENT_TARGETS",
+    "UNITTEST_RECAPTURE_FORMAT_ID",
     "canonical_jcs",
     "decode_selection_request_v1",
     "doctest_recovered_child_sources_v1",
+    "unittest_recovered_child_sources_v1",
+    "unittest_subtest_manifests_v1",
     "encode_selection_request_v1",
     "parse_canonical_jcs",
     "proof_hash",
@@ -2937,6 +3803,7 @@ __all__ = [
     "validate_cargo_build_context_observation_v1",
     "validate_cargo_target_context_spec_v1",
     "validate_doctest_recapture_packet_v1",
+    "validate_unittest_recapture_packet_v1",
     "validate_executable_inventory_entry_v2",
     "validate_execution_input_contract_v1",
     "validate_frozen_test_inventory_v2",

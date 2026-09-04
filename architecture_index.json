@@ -1,7 +1,7 @@
 {
-  "index_sha256": "0559a754d204f482a48f1704bcaccc5de621f3bcfd07893ef836a5c917b9c665",
+  "index_sha256": "756fd10308ffdb3bc9a77bd4018d4ccc6fb0c22cd0fe4a1bd107c7a92a4b368f",
   "index_version": 1,
-  "manifest_sha256": "f58979aeaf05fd589b539bd5b0387225d1ece6505a98101953729ba6141959f7",
+  "manifest_sha256": "c8a2579b16f4c646262a8066a969dc25ebf9b872af42842966d2377156bd5411",
   "omitted": {
     "relationships": 0
   },
@@ -237,8 +237,10 @@
       "generated_artifacts": [
         ".codex/validation/frozen-test-inventory-v1.json",
         ".codex/validation/test-replacements-v1.json",
+        ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json",
         ".codex/validation/frozen-test-inventory-v2.json",
         ".codex/validation/frozen-test-inventory-v2-recoveries.json",
+        ".codex/validation/frozen-test-inventory-v2-recovery-transition-receipts.json",
         ".codex/validation/test-replacements-v2.json"
       ],
       "id": "completion-proof-certification",
@@ -303,6 +305,11 @@
           "symbol": "validate_frozen_test_inventory_v2"
         },
         {
+          "ambiguous": true,
+          "path": "scripts/materialize_completion_proof_inventory_v2.py",
+          "symbol": "main"
+        },
+        {
           "path": "codex-rs/validation-contracts/src/inventory_v2.rs",
           "symbol": "FrozenTestInventoryV2"
         }
@@ -310,12 +317,14 @@
       "roots": [
         "scripts/completion_proof.py",
         "scripts/completion_proof_inventory_v2.py",
+        "scripts/materialize_completion_proof_inventory_v2.py",
         "codex-rs/validation-contracts",
         ".codex/validation"
       ],
       "tests": [
         "scripts/test_completion_proof.py",
         "scripts/test_completion_proof_inventory_v2.py",
+        "scripts/test_materialize_completion_proof_inventory_v2.py",
         "codex-rs/validation-contracts/tests/cross_language_vectors.rs",
         "codex-rs/core/tests/suite/completion_proof_gate.rs",
         "scripts/test_source_owners.py"
@@ -1670,6 +1679,58 @@
       "confidence": "generated",
       "evidence": [
         {
+          "path": "scripts/materialize_completion_proof_inventory_v2.py",
+          "symbol": "recapture_doctests"
+        }
+      ],
+      "kind": "generates",
+      "source": "owner:completion-proof-certification",
+      "target": "generated:.codex/validation/frozen-test-inventory-v2-doctest-recapture.json"
+    },
+    {
+      "category": "generated_artifacts",
+      "confidence": "generated",
+      "evidence": [
+        {
+          "path": "scripts/materialize_completion_proof_inventory_v2.py",
+          "symbol": "build_materialized_bundle"
+        }
+      ],
+      "kind": "generates",
+      "source": "owner:completion-proof-certification",
+      "target": "generated:.codex/validation/frozen-test-inventory-v2-recoveries.json"
+    },
+    {
+      "category": "generated_artifacts",
+      "confidence": "generated",
+      "evidence": [
+        {
+          "path": "scripts/materialize_completion_proof_inventory_v2.py",
+          "symbol": "build_materialized_bundle"
+        }
+      ],
+      "kind": "generates",
+      "source": "owner:completion-proof-certification",
+      "target": "generated:.codex/validation/frozen-test-inventory-v2-recovery-transition-receipts.json"
+    },
+    {
+      "category": "generated_artifacts",
+      "confidence": "generated",
+      "evidence": [
+        {
+          "path": "scripts/materialize_completion_proof_inventory_v2.py",
+          "symbol": "build_materialized_bundle"
+        }
+      ],
+      "kind": "generates",
+      "source": "owner:completion-proof-certification",
+      "target": "generated:.codex/validation/frozen-test-inventory-v2.json"
+    },
+    {
+      "category": "generated_artifacts",
+      "confidence": "generated",
+      "evidence": [
+        {
           "path": "scripts/completion_proof.py",
           "symbol": "_freeze_inventory"
         }
@@ -1677,6 +1738,19 @@
       "kind": "generates",
       "source": "owner:completion-proof-certification",
       "target": "generated:.codex/validation/test-replacements-v1.json"
+    },
+    {
+      "category": "generated_artifacts",
+      "confidence": "generated",
+      "evidence": [
+        {
+          "path": "scripts/materialize_completion_proof_inventory_v2.py",
+          "symbol": "build_materialized_bundle"
+        }
+      ],
+      "kind": "generates",
+      "source": "owner:completion-proof-certification",
+      "target": "generated:.codex/validation/test-replacements-v2.json"
     },
     {
       "category": "runtime_registration",
@@ -2802,7 +2876,7 @@
       "target": "path:scripts/test_workflow_preflight.py"
     }
   ],
-  "repository_revision": "manifest:f58979aeaf05fd589b539bd5b0387225d1ece6505a98101953729ba6141959f7:sources:c823bb97326666b22fbec2a353395ecfa8b0c16a3147097eaa06a9796a644902",
+  "repository_revision": "manifest:c8a2579b16f4c646262a8066a969dc25ebf9b872af42842966d2377156bd5411:sources:325429162c36ca3ae88527a49daca677366b0e320450719bd3d96c439ace86f0",
   "schema_version": 2,
   "status": "complete",
   "unresolved": []

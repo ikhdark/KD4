@@ -6,6 +6,9 @@ import hmac
 import json
 from pathlib import Path
 import re
+import subprocess
+import sys
+import tempfile
 import unittest
 import unicodedata
 
@@ -22,6 +25,7 @@ from scripts.completion_proof_inventory_v2 import INVENTORY_V2_SCHEMA_PATHS
 from scripts.completion_proof_inventory_v2 import INVENTORY_V2_SCHEMA_RAW_SHA256S
 from scripts.completion_proof_inventory_v2 import canonical_jcs
 from scripts.completion_proof_inventory_v2 import decode_selection_request_v1
+from scripts.completion_proof_inventory_v2 import doctest_recovered_child_sources_v1
 from scripts.completion_proof_inventory_v2 import encode_selection_request_v1
 from scripts.completion_proof_inventory_v2 import proof_hash
 from scripts.completion_proof_inventory_v2 import inventory_declaration_id_v2
@@ -52,6 +56,7 @@ from scripts.completion_proof_inventory_v2 import validate_selection_request_v1
 from scripts.completion_proof_inventory_v2 import validate_target_applicability_projection_v1
 from scripts.completion_proof_inventory_v2 import validate_test_replacement_ledger_v2
 from scripts.completion_proof_inventory_v2 import validate_trusted_defect_receipt_v1
+from scripts.completion_proof_inventory_v2 import validate_unittest_recapture_packet_v1
 from scripts.completion_proof_inventory_v2 import validate_validation_receipt_projection_v1
 
 
@@ -59,8 +64,46 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 VECTORS_PATH = REPO_ROOT / "scripts/fixtures/completion_proof_v2_cross_language_vectors.json"
 
 
+def _unittest_recapture_fail_closed_packet_v1() -> dict[str, object]:
+    """Return the smallest closed packet that reaches the unavailable authority."""
+
+    return {
+        "artifacts": {},
+        "attempt_id": "fail-closed-contract-test",
+        "baseline_commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+        "format_id": "kd4.unittest-recapture.v1",
+        "frozen_inventory_raw_sha256": FROZEN_V1_INVENTORY_RAW_SHA256,
+        "network_isolation": {},
+        "output_bindings": [],
+        "parent_manifests": [],
+        "parent_records": [],
+        "parent_results": [],
+        "python_identity": {},
+        "receipt_sha256": "0" * 64,
+        "repository_identity_sha256": (
+            "f386e4786f3a61829ecdd61e764fa9d65eddbd08f2902745c6480bce448573cc"
+        ),
+        "schema_version": 1,
+        "source_audit": {},
+        "source_isolation": {},
+        "source_site_manifest": [],
+        "source_tree_sha256": (
+            "654591dd1ddda7a77312172ec7c70e60e80990590c7c74a7c3b08a445279d90e"
+        ),
+        "subtest_occurrences": [],
+        "total_counts": {},
+        "worker_identity": {},
+    }
+
+
 def _full_scale_integration_fixture_v2() -> dict[str, object]:
     """Build a temporary, non-canonical 15,547-row bundle for both validators."""
+    doctest_recapture_raw = (
+        REPO_ROOT
+        / ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json"
+    ).read_bytes()
+    doctest_recapture = json.loads(doctest_recapture_raw)
+    assert canonical_jcs(doctest_recapture) == doctest_recapture_raw
     frozen_inventory = json.loads(
         (REPO_ROOT / ".codex/validation/frozen-test-inventory-v1.json").read_text(
             encoding="utf-8"
@@ -373,7 +416,7 @@ def _full_scale_integration_fixture_v2() -> dict[str, object]:
         declarations.append(declaration)
     declarations.sort(key=canonical_jcs)
 
-    parents = [f"parent-{index:03d}" for index in range(909)]
+    parents = [f"parent-{index:03d}" for index in range(893)]
     outputs = [
         {"output_sha256": "f" * 64, "parent_id": parent} for parent in parents
     ]
@@ -410,33 +453,16 @@ def _full_scale_integration_fixture_v2() -> dict[str, object]:
         },
     ]
     frozen_source_authority = {
-        "baseline_commit": "baseline",
-        "repository_identity_sha256": "1" * 64,
-        "source_tree_sha256": "2" * 64,
+        "baseline_commit": doctest_recapture["baseline_commit"],
+        "repository_identity_sha256": doctest_recapture[
+            "repository_identity_sha256"
+        ],
+        "source_tree_sha256": doctest_recapture["source_tree_sha256"],
     }
-    recovery_parents = baseline_ids[:5]
-    recovered_children = []
-    for ordinal, parent in enumerate(recovery_parents):
-        recovered_children.append(
-            {
-                "canonical_parameter_projection": None,
-                "child_kind": "doctest",
-                "declared_site_id": None,
-                "executable_identity": {
-                    "kind": "test",
-                    "route_id": "test-route.rust-doctest.v1",
-                    "test_id": f"recovered-doctest-{ordinal}",
-                    "validation_id": "validate.rust-doctest",
-                },
-                "gap_id": "gap.doctest",
-                "occurrence_ordinal": 0,
-                "parent_baseline_id": parent,
-            }
-        )
-    recovered_children.sort(
-        key=lambda child: "inventory-v2-recovered."
-        + proof_hash("kd4.recovered-child-identity.v1", child)
+    recovery_parents = sorted(
+        row["parent_baseline_id"] for row in doctest_recapture["parent_counts"]
     )
+    recovered_children = doctest_recovered_child_sources_v1(doctest_recapture)
     recovered_child_ids = sorted(
         "inventory-v2-recovered."
         + proof_hash("kd4.recovered-child-identity.v1", child)
@@ -449,7 +475,7 @@ def _full_scale_integration_fixture_v2() -> dict[str, object]:
             "kd4.frozen-source-authority.v1", frozen_source_authority
         ),
         "parent_container_ids": recovery_parents,
-        "recapture_receipt_sha256": "4" * 64,
+        "recapture_receipt_sha256": doctest_recapture["receipt_sha256"],
         "schema_version": 1,
     }
     transition_receipt["receipt_sha256"] = proof_hash(
@@ -463,14 +489,16 @@ def _full_scale_integration_fixture_v2() -> dict[str, object]:
                 "current_audit": {
                     "declared_count": 5,
                     "kind": "doctest",
-                    "raw_count": None,
+                    "raw_count": doctest_recapture["raw_occurrence_count"],
                     "unique_count": 5,
                 },
-                "gap_id": "gap.doctest",
+                "gap_id": "gap.doctest-raw-versus-unique",
                 "kind": "doctest",
                 "legacy_evidence": {
                     "frozen_unique_count": 5,
-                    "historical_raw_count": None,
+                    "historical_raw_count": doctest_recapture[
+                        "raw_occurrence_count"
+                    ],
                     "kind": "doctest",
                 },
                 "pending_requirement": None,
@@ -479,7 +507,9 @@ def _full_scale_integration_fixture_v2() -> dict[str, object]:
                     "child_sources": recovered_children,
                     "parent_container_ids": recovery_parents,
                     "parent_recapture_outputs": [],
-                    "recapture_receipt_sha256": "4" * 64,
+                    "recapture_receipt_sha256": doctest_recapture[
+                        "receipt_sha256"
+                    ],
                 },
                 "state": "resolved",
                 "transition_receipt_sha256": transition_receipt["receipt_sha256"],
@@ -500,11 +530,11 @@ def _full_scale_integration_fixture_v2() -> dict[str, object]:
                     "kind": "unittest",
                 },
                 "pending_requirement": {
-                    "baseline_commit": "baseline",
+                    "baseline_commit": frozen_source_authority["baseline_commit"],
                     "expected_parent_output_sha256s": outputs,
                     "kind": "unittest",
                     "reasons": ["pending"],
-                    "required_parent_count": 909,
+                    "required_parent_count": 893,
                     "required_parent_ids": parents,
                 },
                 "recovery_id": "b.unittest",
@@ -515,6 +545,47 @@ def _full_scale_integration_fixture_v2() -> dict[str, object]:
         ],
         "schema_version": 1,
     }
+    pending_records = json.loads(json.dumps(recovery["records"]))
+    pending_doctest = pending_records[0]
+    pending_doctest["current_audit"]["raw_count"] = None
+    pending_doctest["legacy_evidence"]["historical_raw_count"] = None
+    pending_doctest["pending_requirement"] = {
+        "baseline_commit": frozen_source_authority["baseline_commit"],
+        "kind": "doctest",
+        "reasons": [
+            "historical-raw-count-unknown",
+            "off-host-recapture-required",
+        ],
+        "required_package_targets": [
+            "codex-core::lib::codex_core",
+            "codex-rollout::lib::codex_rollout",
+            "codex-state::lib::codex_state",
+            "codex-tui::lib::codex_tui",
+        ],
+    }
+    pending_doctest["resolution"] = None
+    pending_doctest["state"] = "pending"
+    pending_doctest["transition_receipt_sha256"] = None
+    transition_receipt["authority_before_semantic_sha256"] = proof_hash(
+        "kd4.inventory-recovery-authority.semantic.v1",
+        {
+            "format_id": recovery["format_id"],
+            "frozen_source_authority": frozen_source_authority,
+            "records": pending_records,
+            "schema_version": 1,
+        },
+    )
+    transition_receipt["receipt_sha256"] = proof_hash(
+        "kd4.recovery-transition-receipt.v1",
+        {
+            key: value
+            for key, value in transition_receipt.items()
+            if key != "receipt_sha256"
+        },
+    )
+    recovery["records"][0]["transition_receipt_sha256"] = transition_receipt[
+        "receipt_sha256"
+    ]
     recovery["semantic_sha256"] = proof_hash(
         "kd4.inventory-recovery-authority.semantic.v1", recovery
     )
@@ -702,6 +773,7 @@ def _full_scale_integration_fixture_v2() -> dict[str, object]:
             "recovery_records": len(recovery["records"]),
         },
         **documents,
+        "doctest_recapture": doctest_recapture,
         "transition_receipts": [transition_receipt],
     }
 
@@ -791,8 +863,185 @@ def _validate_schema_instance(
 
 
 class InventoryV2SharedContractTests(unittest.TestCase):
+    def test_checked_in_v1_unittest_partition_is_893_executable_and_16_hidden(self) -> None:
+        frozen_inventory = json.loads(
+            (
+                REPO_ROOT
+                / ".codex/validation/frozen-test-inventory-v1.json"
+            ).read_text(encoding="utf-8")
+        )
+        predecessor_ledger = json.loads(
+            (
+                REPO_ROOT / ".codex/validation/test-replacements-v1.json"
+            ).read_text(encoding="utf-8")
+        )
+        unittest_entries = sorted(
+            (
+                entry
+                for entry in frozen_inventory["tests"]
+                if entry["framework"] == "python-unittest"
+            ),
+            key=lambda entry: entry["baseline_id"],
+        )
+        hidden_ids = sorted(
+            entry["baseline_id"]
+            for entry in unittest_entries
+            if entry["baseline_id"].startswith(
+                "hidden-at-freeze-v1::python-unittest::"
+            )
+        )
+        hidden_set = set(hidden_ids)
+        executable_entries = [
+            entry
+            for entry in unittest_entries
+            if entry["baseline_id"] not in hidden_set
+        ]
+        executable_records = [
+            {
+                "baseline_id": entry["baseline_id"],
+                "native_id": entry["native_id"],
+                "predecessor_entry_sha256": proof_hash(
+                    "kd4.frozen-v1-inventory-entry.v1", entry
+                ),
+            }
+            for entry in executable_entries
+        ]
+        rows_by_id = {
+            row["baseline_id"]: row for row in predecessor_ledger["rows"]
+        }
+        replacement_ids = sorted(
+            entry["baseline_id"]
+            for entry in unittest_entries
+            if rows_by_id[entry["baseline_id"]]["resolution"] == "replacement"
+        )
+        executable_replacement_ids = sorted(
+            baseline_id
+            for baseline_id in replacement_ids
+            if baseline_id not in hidden_set
+        )
+        unresolved_ids = sorted(
+            entry["baseline_id"]
+            for entry in unittest_entries
+            if rows_by_id[entry["baseline_id"]]["resolution"] == "unresolved"
+        )
+
+        self.assertEqual(len(unittest_entries), 909)
+        self.assertEqual(len(executable_records), 893)
+        self.assertEqual(len(hidden_ids), 16)
+        self.assertEqual(
+            proof_hash(
+                "kd4.unittest-recapture-parent-record-set.v1",
+                executable_records,
+            ),
+            "a46a941721c872655dcb1c4ca55c070b9f48008a451d0df283f2d69957c2dd07",
+        )
+        self.assertEqual(
+            proof_hash("kd4.unittest-hidden-ledger-parent-ids.v1", hidden_ids),
+            "936330f9e9a23c8d628f651a1ed31b3f4ea836a06cf152a6acf09cff898ebc40",
+        )
+        self.assertEqual(len(replacement_ids), 536)
+        self.assertEqual(
+            proof_hash("kd4.unittest-parent-replacement-ids.v1", replacement_ids),
+            "59202883ef32488ae9a488345b2401400794d961e5d539c58fd6364e86f25fe1",
+        )
+        self.assertEqual(len(executable_replacement_ids), 520)
+        self.assertEqual(
+            proof_hash(
+                "kd4.unittest-parent-replacement-ids.v1",
+                executable_replacement_ids,
+            ),
+            "208d6735c1413d94c503a453331889fe5709b8eca540cf9c13993c42f9bb8cf7",
+        )
+        self.assertEqual(len(unresolved_ids), 373)
+        self.assertEqual(
+            proof_hash("kd4.unittest-parent-unresolved-ids.v1", unresolved_ids),
+            "d1e66a89d1a943b60f6516bc9550102306919d6ae673bee4027595a3df8036f7",
+        )
+        self.assertTrue(hidden_set.issubset(replacement_ids))
+        for entry in unittest_entries:
+            if entry["baseline_id"] not in hidden_set:
+                continue
+            self.assertEqual(
+                rows_by_id[entry["baseline_id"]]["replacement_ids"],
+                ["python-unittest::" + entry["native_id"]],
+            )
+
+    def test_unittest_recapture_public_validator_and_cli_fail_closed(self) -> None:
+        packet = _unittest_recapture_fail_closed_packet_v1()
+        with self.assertRaisesRegex(
+            InventoryV2ContractError,
+            "freeze-overlay source authority is unavailable",
+        ):
+            validate_unittest_recapture_packet_v1(packet)
+
+        tampered = json.loads(json.dumps(packet))
+        tampered["baseline_commit"] = "0" * 40
+        with self.assertRaisesRegex(
+            InventoryV2ContractError, "frozen authority mismatch"
+        ):
+            validate_unittest_recapture_packet_v1(tampered)
+
+        with tempfile.TemporaryDirectory() as temporary_name:
+            packet_path = Path(temporary_name) / "unittest-recapture.json"
+            packet_path.write_bytes(canonical_jcs(packet))
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts/completion_proof_inventory_v2.py"),
+                    "--validate-unittest-recapture",
+                    str(packet_path),
+                ],
+                cwd=REPO_ROOT,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(
+            b"unittest recapture freeze-overlay source authority is unavailable",
+            completed.stderr,
+        )
+
+    def test_repository_path_parameter_projection_rejects_noncanonical_paths(self) -> None:
+        validate_canonical_parameter_projection_v1(
+            {"kind": "repository-path", "value": "scripts/test_example.py"}
+        )
+        for path in (
+            "/scripts/test_example.py",
+            "scripts\\test_example.py",
+            "scripts/../test_example.py",
+            "C:/scripts/test_example.py",
+            "//server/share/test_example.py",
+            "scripts/e\u0301.py",
+        ):
+            with self.subTest(path=path), self.assertRaises(
+                InventoryV2ContractError
+            ):
+                validate_canonical_parameter_projection_v1(
+                    {"kind": "repository-path", "value": path}
+                )
+
     def test_full_scale_fixture_validates_with_cross_language_hash_anchors(self) -> None:
         bundle = _full_scale_integration_fixture_v2()
+        doctest_recapture_raw = canonical_jcs(bundle["doctest_recapture"])
+        self.assertEqual(
+            doctest_recapture_raw,
+            (
+                REPO_ROOT
+                / ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json"
+            ).read_bytes(),
+        )
+        doctest_record = next(
+            record
+            for record in bundle["recovery"]["records"]
+            if record["kind"] == "doctest"
+        )
+        self.assertEqual(
+            doctest_record["resolution"]["child_sources"],
+            doctest_recovered_child_sources_v1(bundle["doctest_recapture"]),
+        )
         self.assertEqual(
             bundle["counts"],
             {
@@ -804,22 +1053,22 @@ class InventoryV2SharedContractTests(unittest.TestCase):
         self.assertEqual(
             bundle["artifact_sha256"],
             {
-                "inventory": "dc56bb7b791cf0f02b371c401b1102008630128fde3d1004a36cbd0c38585cf8",
-                "ledger": "41180629e2a756c57cd355a566532b555237e546060ee836020c6982b7d5d887",
-                "recovery": "a6667bd8e3ea1359a0fcfa6e597c413d472f84d8fb541fafdfd6bc484c7a7e7f",
+                "inventory": "e0ddc09c36fe346e511256a6fd1011f3892606e3150e2c045ccae14cdfb6807a",
+                "ledger": "651f98d60ca3e0c6755dfecf87c46e251494ad6f05397aa502ca1a4c4a000eb6",
+                "recovery": "2d6e7ee1aa26ce1094f93f38152f63fc54e6db7c569a8e7acf51a709896a1712",
             },
         )
         self.assertEqual(
             bundle["inventory"]["authority"]["semantic_sha256"],
-            "d45c12c1ebce43c55a2a7f290bc1ac7340e65c8b304cc6f54aeb1498d0ec2db0",
+            "46b2bde1834a893f7d9851a92cb10e3ac2b2348555288a873f14941040d79288",
         )
         self.assertEqual(
             bundle["ledger"]["semantic_sha256"],
-            "eaf80a458a8efc80057a877af5854379caad6d52c4722d0e3bc44ecacc1bf95c",
+            "134ed74a5ac1ca9c4d3c5080ec441439b1081895f31f180214f2432dee490db8",
         )
         self.assertEqual(
             bundle["recovery"]["semantic_sha256"],
-            "8b4738293b8483e92856b86bba71cd35eeae5b29bbf750f6f52022e14417cea9",
+            "34b80e4f41d380d6e9c83e3182a80f7d35250b3284973dee75dcb67802a6dde0",
         )
         validate_inventory_recovery_authority_v1(bundle["recovery"])
         validate_frozen_test_inventory_v2(bundle["inventory"])
@@ -865,12 +1114,78 @@ class InventoryV2SharedContractTests(unittest.TestCase):
         with self.assertRaisesRegex(InventoryV2ContractError, "exact canonical JSON bytes"):
             validate_inventory_ledger_predecessor_closure(
                 bundle["inventory"], bundle["ledger"], recovery_raw + b"\n",
-                bundle["transition_receipts"], issuer
+                bundle["transition_receipts"], issuer, doctest_recapture_raw
             )
         validate_inventory_ledger_predecessor_closure(
             bundle["inventory"], bundle["ledger"], recovery_raw,
-            bundle["transition_receipts"], issuer
+            bundle["transition_receipts"], issuer, doctest_recapture_raw
         )
+        predecessor_ledger_raw = (
+            REPO_ROOT / ".codex/validation/test-replacements-v1.json"
+        ).read_bytes()
+        with self.assertRaisesRegex(
+            InventoryV2ContractError,
+            "freeze-overlay source authority is unavailable",
+        ):
+            validate_inventory_ledger_predecessor_closure(
+                bundle["inventory"],
+                bundle["ledger"],
+                recovery_raw,
+                bundle["transition_receipts"],
+                issuer,
+                doctest_recapture_raw,
+                canonical_jcs(_unittest_recapture_fail_closed_packet_v1()),
+                predecessor_ledger_raw,
+            )
+
+        tampered_receipt = json.loads(json.dumps(bundle["doctest_recapture"]))
+        tampered_receipt["receipt_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            InventoryV2ContractError, "doctest recapture receipt hash mismatch"
+        ):
+            validate_inventory_ledger_predecessor_closure(
+                bundle["inventory"], bundle["ledger"], recovery_raw,
+                bundle["transition_receipts"], issuer,
+                canonical_jcs(tampered_receipt),
+            )
+
+        tampered_children = json.loads(json.dumps(bundle["doctest_recapture"]))
+        first_run = tampered_children["runs"][0]
+        first_occurrence = first_run["raw_occurrences"][0]
+        duplicate_occurrence = json.loads(json.dumps(first_occurrence))
+        duplicate_occurrence["global_ordinal"] = 1
+        duplicate_occurrence["parent_ordinal"] = 1
+        first_run["raw_occurrences"].append(duplicate_occurrence)
+        first_run["selected_count"] += 1
+        stdout = base64.b64decode(first_run["stdout_base64"])
+        stdout += (first_occurrence["raw_listing_line"] + "\n").encode("utf-8")
+        first_run["stdout_base64"] = base64.b64encode(stdout).decode("ascii")
+        first_run["stdout_sha256"] = hashlib.sha256(stdout).hexdigest()
+        for run in tampered_children["runs"][1:]:
+            for occurrence in run["raw_occurrences"]:
+                occurrence["global_ordinal"] += 1
+        matching_parent_count = next(
+            row
+            for row in tampered_children["parent_counts"]
+            if row["parent_baseline_id"] == first_occurrence["parent_baseline_id"]
+        )
+        matching_parent_count["raw_count"] += 1
+        tampered_children["raw_occurrence_count"] += 1
+        tampered_children.pop("receipt_sha256")
+        tampered_children["receipt_sha256"] = proof_hash(
+            "kd4.doctest-recapture-receipt.v1", tampered_children
+        )
+        self.assertEqual(len(doctest_recovered_child_sources_v1(tampered_children)), 6)
+        with self.assertRaisesRegex(
+            InventoryV2ContractError,
+            "doctest recovery does not exactly materialize its typed recapture packet",
+        ):
+            validate_inventory_ledger_predecessor_closure(
+                bundle["inventory"], bundle["ledger"], recovery_raw,
+                bundle["transition_receipts"], issuer,
+                canonical_jcs(tampered_children),
+            )
+
         forged = json.loads(json.dumps(bundle["ledger"]))
         forged["rows"][0]["obligation_id"] = "inventory-obligation-v2.forged"
         forged["rows"].sort(key=canonical_jcs)
@@ -881,7 +1196,7 @@ class InventoryV2SharedContractTests(unittest.TestCase):
         ):
             validate_inventory_ledger_predecessor_closure(
                 bundle["inventory"], forged, recovery_raw,
-                bundle["transition_receipts"], issuer
+                bundle["transition_receipts"], issuer, doctest_recapture_raw
             )
         del forged
 
@@ -903,7 +1218,7 @@ class InventoryV2SharedContractTests(unittest.TestCase):
         ):
             validate_inventory_ledger_predecessor_closure(
                 bundle["inventory"], omitted, recovery_raw,
-                bundle["transition_receipts"], issuer
+                bundle["transition_receipts"], issuer, doctest_recapture_raw
             )
         del omitted
 
@@ -919,7 +1234,7 @@ class InventoryV2SharedContractTests(unittest.TestCase):
         ):
             validate_inventory_ledger_predecessor_closure(
                 bundle["inventory"], duplicate, recovery_raw,
-                bundle["transition_receipts"], issuer
+                bundle["transition_receipts"], issuer, doctest_recapture_raw
             )
         del duplicate
 
@@ -938,7 +1253,7 @@ class InventoryV2SharedContractTests(unittest.TestCase):
         ):
             validate_inventory_ledger_predecessor_closure(
                 bundle["inventory"], unknown, recovery_raw,
-                bundle["transition_receipts"], issuer
+                bundle["transition_receipts"], issuer, doctest_recapture_raw
             )
         del unknown
 
@@ -967,7 +1282,7 @@ class InventoryV2SharedContractTests(unittest.TestCase):
         ):
             validate_inventory_ledger_predecessor_closure(
                 bundle["inventory"], substituted, recovery_raw,
-                bundle["transition_receipts"], issuer
+                bundle["transition_receipts"], issuer, doctest_recapture_raw
             )
 
     def test_inventory_v2_schema_and_shared_type_hash_vectors_match_rust(self) -> None:
@@ -2008,7 +2323,7 @@ class InventoryV2SharedContractTests(unittest.TestCase):
         ledger["self_hash"] = proof_hash("kd4.test-replacement-ledger.v2.self", ledger)
         validate_test_replacement_ledger_v2(ledger)
 
-        parents = [f"parent-{index:03d}" for index in range(909)]
+        parents = [f"parent-{index:03d}" for index in range(893)]
         outputs = [{"output_sha256": "f" * 64, "parent_id": parent} for parent in parents]
         sites = [
             {"column": 18, "line": 868, "parent_id": "FilteringArgumentPolicyTest.test_package_and_target_overrides_are_rejected_through_cli", "path": "scripts/test_rust_test_runner.py"},
@@ -2019,7 +2334,7 @@ class InventoryV2SharedContractTests(unittest.TestCase):
         ]
         records = [
             {"current_audit": {"declared_count": 5, "kind": "doctest", "raw_count": None, "unique_count": 5}, "gap_id": "gap.doctest", "kind": "doctest", "legacy_evidence": {"frozen_unique_count": 5, "historical_raw_count": None, "kind": "doctest"}, "pending_requirement": {"baseline_commit": "baseline", "kind": "doctest", "reasons": ["pending"], "required_package_targets": ["codex-core"]}, "recovery_id": "a.doctest", "resolution": None, "state": "pending", "transition_receipt_sha256": None},
-            {"current_audit": {"executable_ast_call_count": 62, "excluded_embedded_fixture_count": 1, "kind": "unittest", "runner_site_observations": sites, "text_call_count": 63}, "gap_id": "gap.unittest", "kind": "unittest", "legacy_evidence": {"frozen_parent_count": 909, "historical_subtest_call_count": None, "kind": "unittest"}, "pending_requirement": {"baseline_commit": "baseline", "expected_parent_output_sha256s": outputs, "kind": "unittest", "reasons": ["pending"], "required_parent_count": 909, "required_parent_ids": parents}, "recovery_id": "b.unittest", "resolution": None, "state": "pending", "transition_receipt_sha256": None},
+            {"current_audit": {"executable_ast_call_count": 62, "excluded_embedded_fixture_count": 1, "kind": "unittest", "runner_site_observations": sites, "text_call_count": 63}, "gap_id": "gap.unittest", "kind": "unittest", "legacy_evidence": {"frozen_parent_count": 909, "historical_subtest_call_count": None, "kind": "unittest"}, "pending_requirement": {"baseline_commit": "baseline", "expected_parent_output_sha256s": outputs, "kind": "unittest", "reasons": ["pending"], "required_parent_count": 893, "required_parent_ids": parents}, "recovery_id": "b.unittest", "resolution": None, "state": "pending", "transition_receipt_sha256": None},
         ]
         recovery = {"format_id": "kd4.inventory-recovery-authority.v1", "frozen_source_authority": {"baseline_commit": "baseline", "repository_identity_sha256": "1" * 64, "source_tree_sha256": "2" * 64}, "records": records, "schema_version": 1}
         recovery["semantic_sha256"] = proof_hash("kd4.inventory-recovery-authority.semantic.v1", recovery)
@@ -2059,7 +2374,11 @@ class InventoryV2SharedContractTests(unittest.TestCase):
             if value.get("type") == "string" and not any(
                 key in value for key in ("const", "enum", "pattern")
             ):
-                self.assertEqual(value.get("format"), "kd4-nfc-string", location)
+                self.assertIn(
+                    value.get("format"),
+                    {"kd4-nfc-string", "kd4-repository-path"},
+                    location,
+                )
             for key, nested in value.items():
                 self._assert_freeform_strings_require_nfc(nested, f"{location}/{key}")
         elif isinstance(value, list):

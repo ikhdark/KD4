@@ -6,6 +6,8 @@ use crate::canonical::validate_sorted_unique_nfc_strings;
 use crate::path::StrictRepositoryPathV1;
 use crate::runner::TestRouteIdV1;
 use crate::selection::ExecutableIdentityV1;
+use crate::selection::TestIdV1;
+use crate::selection::ValidationIdV1;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
@@ -28,13 +30,30 @@ pub struct FrozenSourceAuthorityV1 {
     pub source_tree_sha256: Sha256HexV1,
 }
 
-pub const DOCTEST_RECAPTURE_BASELINE_COMMIT: &str =
-    "60bb133fa0a4f25e83851ab16d8c462e5f42ff95";
+pub const DOCTEST_RECAPTURE_BASELINE_COMMIT: &str = "60bb133fa0a4f25e83851ab16d8c462e5f42ff95";
 pub const DOCTEST_RECAPTURE_SOURCE_TREE_SHA256: &str =
     "654591dd1ddda7a77312172ec7c70e60e80990590c7c74a7c3b08a445279d90e";
 pub const DOCTEST_RECAPTURE_REPOSITORY_IDENTITY_SHA256: &str =
     "f386e4786f3a61829ecdd61e764fa9d65eddbd08f2902745c6480bce448573cc";
 pub const DOCTEST_RECAPTURE_TOOLCHAIN: &str = "1.95.0-x86_64-pc-windows-msvc";
+pub const UNITTEST_RECAPTURE_BASELINE_COMMIT: &str = DOCTEST_RECAPTURE_BASELINE_COMMIT;
+pub const UNITTEST_RECAPTURE_SOURCE_TREE_SHA256: &str = DOCTEST_RECAPTURE_SOURCE_TREE_SHA256;
+pub const UNITTEST_RECAPTURE_REPOSITORY_IDENTITY_SHA256: &str =
+    DOCTEST_RECAPTURE_REPOSITORY_IDENTITY_SHA256;
+pub const UNITTEST_RECAPTURE_FROZEN_INVENTORY_RAW_SHA256: &str =
+    "df230a7683f0f31f1aae4d3f7644af39cec67b09fadf8f3f1e6c60729d18196a";
+pub const UNITTEST_RECAPTURE_PARENT_RECORDS_SHA256: &str =
+    "a46a941721c872655dcb1c4ca55c070b9f48008a451d0df283f2d69957c2dd07";
+pub const UNITTEST_FROZEN_LEDGER_PARENT_COUNT: usize = 909;
+pub const UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT: usize = 893;
+pub const UNITTEST_HIDDEN_AT_FREEZE_PARENT_COUNT: usize = 16;
+// The frozen inventory recorded the dirty workspace fingerprint, but not the
+// authenticated overlay bytes required to reproduce the executable 893-parent
+// source tree. The other 16 frozen ledger identities were admitted later as
+// hidden-at-freeze replacements and are not recapture executions or children.
+// Keep this authority absent until that provenance is independently recovered;
+// recapture packets must fail closed in the meantime.
+pub const UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256: Option<&str> = None;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -109,6 +128,307 @@ pub struct DoctestRecapturePacketV1 {
     pub source_isolation: DoctestSourceIsolationV1,
     pub source_tree_sha256: Sha256HexV1,
     pub toolchain: DoctestToolchainV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestArtifactV1 {
+    pub base64: String,
+    pub byte_count: u64,
+    pub sha256: Sha256HexV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestArtifactsV1 {
+    pub parent_manifest: UnittestArtifactV1,
+    pub report: UnittestArtifactV1,
+    pub stderr: UnittestArtifactV1,
+    pub stdout: UnittestArtifactV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestCloneConfigV1 {
+    pub core_autocrlf: bool,
+    pub git_hooks_path: String,
+    pub hardlinks: bool,
+    pub local: bool,
+    pub no_checkout: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestSourceIsolationV1 {
+    pub checkout_command: Vec<String>,
+    pub clean_after: bool,
+    pub clean_before: bool,
+    pub clone_command: Vec<String>,
+    pub clone_config: UnittestCloneConfigV1,
+    pub clone_kind: String,
+    pub clone_source_path: String,
+    pub core_autocrlf: bool,
+    pub execution_working_directory: String,
+    pub git_hooks_disabled: bool,
+    pub global_git_config_disabled: bool,
+    pub head_commit: String,
+    pub isolated_checkout_path: String,
+    pub kind: String,
+    pub source_repository_identity_sha256: Sha256HexV1,
+    pub source_tree_sha256: Sha256HexV1,
+    pub system_git_config_disabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestPythonIdentityV1 {
+    pub executable_path: String,
+    pub executable_sha256: Sha256HexV1,
+    pub implementation: String,
+    pub major: u64,
+    pub micro: u64,
+    pub minor: u64,
+    pub soabi: String,
+    pub version_base64: String,
+    pub version_sha256: Sha256HexV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestWorkerIdentityV1 {
+    pub command_argv: Vec<String>,
+    pub environment_sha256: Sha256HexV1,
+    pub worker_id: String,
+    pub worker_sha256: Sha256HexV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestProxyEnvironmentV1 {
+    #[serde(rename = "ALL_PROXY")]
+    pub all_proxy_upper: Option<String>,
+    #[serde(rename = "HTTPS_PROXY")]
+    pub https_proxy_upper: Option<String>,
+    #[serde(rename = "HTTP_PROXY")]
+    pub http_proxy_upper: Option<String>,
+    #[serde(rename = "NO_PROXY")]
+    pub no_proxy_upper: Option<String>,
+    pub all_proxy: Option<String>,
+    pub https_proxy: Option<String>,
+    pub http_proxy: Option<String>,
+    pub no_proxy: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestNetworkIsolationV1 {
+    pub codex_executable_path: String,
+    pub codex_executable_sha256: Sha256HexV1,
+    pub codex_network_allow_local_binding: String,
+    pub command_argv: Vec<String>,
+    pub fail_closed: bool,
+    pub kind: String,
+    pub profile: String,
+    pub proxy_environment: UnittestProxyEnvironmentV1,
+    pub sandbox_available: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestParentRecordV1 {
+    pub baseline_id: String,
+    pub native_id: String,
+    pub predecessor_entry_sha256: Sha256HexV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestSourceSiteV1 {
+    pub column: u64,
+    pub declared_site_id: String,
+    pub line: u64,
+    pub parent_baseline_id: String,
+    pub path: StrictRepositoryPathV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestSourceAuditV1 {
+    pub embedded_non_ast_marker_count: u64,
+    pub executable_ast_site_count: u64,
+    pub source_file_count: u64,
+    pub source_site_manifest_sha256: Sha256HexV1,
+    pub textual_marker_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestSubtestOccurrenceV1 {
+    pub canonical_context_projection: CanonicalParameterProjectionV1,
+    pub declared_site_id: String,
+    pub occurrence_ordinal: u64,
+    pub parent_baseline_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestParentManifestV1 {
+    pub manifest_sha256: Sha256HexV1,
+    pub method_body_observed: bool,
+    pub parent_baseline_id: String,
+    pub site_ids: Vec<String>,
+    pub subtest_occurrence_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestOutputBindingV1 {
+    pub parent_baseline_id: String,
+    pub parent_result_sha256: Sha256HexV1,
+    pub report_sha256: Sha256HexV1,
+    pub stderr_sha256: Sha256HexV1,
+    pub stdout_sha256: Sha256HexV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnittestTerminalResultV1 {
+    Passed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestParentResultV1 {
+    pub parent_baseline_id: String,
+    pub selected: bool,
+    pub skip_reason: Option<String>,
+    pub started: bool,
+    pub terminal_result: UnittestTerminalResultV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestTotalCountsV1 {
+    pub method_body_child_count: u64,
+    pub parent_record_count: u64,
+    pub recovered_child_count: u64,
+    pub selected_parent_count: u64,
+    pub started_parent_count: u64,
+    pub subtest_occurrence_count: u64,
+    pub terminal_parent_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestOutputBindingResultV1 {
+    pub parent_baseline_id: String,
+    pub parent_result_sha256: Sha256HexV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestParentManifestArtifactV1 {
+    pub baseline_commit: String,
+    pub format_id: String,
+    pub frozen_inventory_raw_sha256: Sha256HexV1,
+    pub parent_records: Vec<UnittestParentRecordV1>,
+    pub schema_version: u8,
+    pub source_tree_sha256: Sha256HexV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestExecutionReportV1 {
+    pub format_id: String,
+    pub frozen_inventory_raw_sha256: Sha256HexV1,
+    pub output_binding_results: Vec<UnittestOutputBindingResultV1>,
+    pub parent_manifest_sha256: Sha256HexV1,
+    pub parent_results: Vec<UnittestParentResultV1>,
+    pub schema_version: u8,
+    pub selection: UnittestExecutionSelectionV1,
+    pub socket_policy: String,
+    pub source_site_manifest: Vec<UnittestSourceSiteV1>,
+    pub subtest_occurrences: Vec<UnittestSubtestOccurrenceV1>,
+    pub total_counts: UnittestExecutionCountsV1,
+    pub untrusted_observations: UnittestUntrustedObservationsV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestExecutionSelectionV1 {
+    pub intended_count: u64,
+    pub intended_native_ids: Vec<String>,
+    pub selected_count: u64,
+    pub selected_native_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestUntrustedCheckoutObservationV1 {
+    pub clean_after: bool,
+    pub clean_before: bool,
+    pub execution_working_directory: String,
+    pub head_commit: String,
+    pub source_tree_sha256: Sha256HexV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestExecutionCountsV1 {
+    pub selected_parent_count: u64,
+    pub started_parent_count: u64,
+    pub subtest_occurrence_count: u64,
+    pub terminal_parent_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestUntrustedEnvironmentObservationV1 {
+    pub codex_network_allow_local_binding: String,
+    pub proxy_environment: UnittestProxyEnvironmentV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestUntrustedProcessObservationV1 {
+    pub command_argv: Vec<String>,
+    pub python_executable_path: String,
+    pub python_executable_sha256: Sha256HexV1,
+    pub worker_sha256: Sha256HexV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestUntrustedObservationsV1 {
+    pub checkout: UnittestUntrustedCheckoutObservationV1,
+    pub environment: UnittestUntrustedEnvironmentObservationV1,
+    pub process: UnittestUntrustedProcessObservationV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestRecapturePacketV1 {
+    pub artifacts: UnittestArtifactsV1,
+    pub attempt_id: String,
+    pub baseline_commit: String,
+    pub format_id: String,
+    pub frozen_inventory_raw_sha256: Sha256HexV1,
+    pub network_isolation: UnittestNetworkIsolationV1,
+    pub output_bindings: Vec<UnittestOutputBindingV1>,
+    pub parent_manifests: Vec<UnittestParentManifestV1>,
+    pub parent_records: Vec<UnittestParentRecordV1>,
+    pub parent_results: Vec<UnittestParentResultV1>,
+    pub python_identity: UnittestPythonIdentityV1,
+    pub receipt_sha256: Sha256HexV1,
+    pub repository_identity_sha256: Sha256HexV1,
+    pub schema_version: u8,
+    pub source_audit: UnittestSourceAuditV1,
+    pub source_isolation: UnittestSourceIsolationV1,
+    pub source_site_manifest: Vec<UnittestSourceSiteV1>,
+    pub source_tree_sha256: Sha256HexV1,
+    pub subtest_occurrences: Vec<UnittestSubtestOccurrenceV1>,
+    pub total_counts: UnittestTotalCountsV1,
+    pub worker_identity: UnittestWorkerIdentityV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +514,9 @@ pub enum CanonicalParameterProjectionV1 {
     String {
         value: String,
     },
+    RepositoryPath {
+        value: StrictRepositoryPathV1,
+    },
     Bytes {
         base64url: String,
     },
@@ -227,6 +550,7 @@ impl CanonicalParameterProjectionV1 {
         match self {
             Self::Null | Self::Boolean { .. } | Self::Integer { .. } => Ok(()),
             Self::String { value } => crate::canonical::validate_nfc(value),
+            Self::RepositoryPath { .. } => Ok(()),
             Self::Bytes { base64url } => {
                 if base64url.contains('=')
                     || base64url
@@ -371,6 +695,731 @@ impl RecoveredChildSourceV1 {
     }
 }
 
+impl UnittestRecapturePacketV1 {
+    pub const FORMAT_ID: &'static str = "kd4.unittest-recapture.v1";
+    pub const PARENT_RECORD_SET_HASH_DOMAIN: &'static str =
+        "kd4.unittest-recapture-parent-record-set.v1";
+    pub const PARENT_RESULT_HASH_DOMAIN: &'static str = "kd4.unittest-parent-result.v1";
+    pub const RECEIPT_HASH_DOMAIN: &'static str = "kd4.unittest-recapture-receipt.v1";
+    pub const SOURCE_SITE_MANIFEST_HASH_DOMAIN: &'static str =
+        "kd4.unittest-recapture-source-site-manifest.v1";
+    pub const SOURCE_SITE_HASH_DOMAIN: &'static str = "kd4.unittest-recapture-source-site.v1";
+    pub const SUBTEST_MANIFEST_HASH_DOMAIN: &'static str = "kd4.unittest-subtest-manifest.v1";
+
+    pub fn validate(&self) -> Result<(), ContractError> {
+        crate::canonical::canonical_jcs_of(self)?;
+        validate_nonempty_nfc(&self.attempt_id, "attempt ID")?;
+        if self.schema_version != 1
+            || self.format_id != Self::FORMAT_ID
+            || self.baseline_commit != UNITTEST_RECAPTURE_BASELINE_COMMIT
+            || self.frozen_inventory_raw_sha256.as_str()
+                != UNITTEST_RECAPTURE_FROZEN_INVENTORY_RAW_SHA256
+            || self.repository_identity_sha256.as_str()
+                != UNITTEST_RECAPTURE_REPOSITORY_IDENTITY_SHA256
+            || self.source_tree_sha256.as_str() != UNITTEST_RECAPTURE_SOURCE_TREE_SHA256
+        {
+            return Err(ContractError::InvalidContract(
+                "unittest recapture frozen authority mismatch".to_owned(),
+            ));
+        }
+        let frozen_source_site_manifest_sha256 = UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256
+            .ok_or_else(|| {
+                ContractError::InvalidContract(
+                    "unittest recapture freeze-overlay source authority is unavailable".to_owned(),
+                )
+            })?;
+
+        validate_nonempty_nfc(
+            &self.source_isolation.clone_source_path,
+            "clone source path",
+        )?;
+        validate_nonempty_nfc(
+            &self.source_isolation.isolated_checkout_path,
+            "isolated checkout path",
+        )?;
+        validate_nonempty_nfc(
+            &self.source_isolation.clone_config.git_hooks_path,
+            "disabled Git hooks path",
+        )?;
+        let expected_hooks_config = format!(
+            "core.hooksPath={}",
+            self.source_isolation.clone_config.git_hooks_path
+        );
+        if self.source_isolation.kind != "detached-checkout"
+            || self.source_isolation.clone_kind != "local-no-hardlinks-no-checkout"
+            || !self
+                .source_isolation
+                .clone_command
+                .iter()
+                .map(String::as_str)
+                .eq([
+                    "git",
+                    "clone",
+                    "--local",
+                    "--no-hardlinks",
+                    "--no-checkout",
+                    "--config",
+                    "core.autocrlf=false",
+                    "--config",
+                    expected_hooks_config.as_str(),
+                    self.source_isolation.clone_source_path.as_str(),
+                    self.source_isolation.isolated_checkout_path.as_str(),
+                ])
+            || self.source_isolation.clone_config.core_autocrlf
+            || self.source_isolation.clone_config.hardlinks
+            || !self.source_isolation.clone_config.local
+            || !self.source_isolation.clone_config.no_checkout
+            || !self
+                .source_isolation
+                .checkout_command
+                .iter()
+                .map(String::as_str)
+                .eq([
+                    "git",
+                    "-C",
+                    self.source_isolation.isolated_checkout_path.as_str(),
+                    "checkout",
+                    "--detach",
+                    "--force",
+                    UNITTEST_RECAPTURE_BASELINE_COMMIT,
+                ])
+            || !self.source_isolation.clean_before
+            || !self.source_isolation.clean_after
+            || self.source_isolation.core_autocrlf
+            || !self.source_isolation.git_hooks_disabled
+            || !self.source_isolation.global_git_config_disabled
+            || !self.source_isolation.system_git_config_disabled
+            || self.source_isolation.execution_working_directory != "."
+            || self.source_isolation.head_commit != UNITTEST_RECAPTURE_BASELINE_COMMIT
+            || self
+                .source_isolation
+                .source_repository_identity_sha256
+                .as_str()
+                != UNITTEST_RECAPTURE_REPOSITORY_IDENTITY_SHA256
+            || self.source_isolation.source_tree_sha256.as_str()
+                != UNITTEST_RECAPTURE_SOURCE_TREE_SHA256
+        {
+            return Err(ContractError::InvalidContract(
+                "unittest recapture was not an isolated clean checkout".to_owned(),
+            ));
+        }
+        if self.python_identity.implementation != "CPython" {
+            return Err(ContractError::InvalidContract(
+                "unittest recapture requires CPython".to_owned(),
+            ));
+        }
+        validate_nonempty_nfc(
+            &self.python_identity.executable_path,
+            "Python executable path",
+        )?;
+        validate_nonempty_nfc(&self.python_identity.soabi, "Python SOABI")?;
+        decode_artifact(
+            &self.python_identity.version_base64,
+            &self.python_identity.version_sha256,
+            "Python version",
+        )?;
+        validate_nonempty_nfc(&self.worker_identity.worker_id, "worker ID")?;
+        if self.worker_identity.command_argv.is_empty() {
+            return Err(ContractError::InvalidContract(
+                "unittest worker command must be nonempty".to_owned(),
+            ));
+        }
+        for argument in &self.worker_identity.command_argv {
+            validate_nonempty_nfc(argument, "worker command argument")?;
+        }
+        let network = &self.network_isolation;
+        validate_nonempty_nfc(&network.codex_executable_path, "Codex executable path")?;
+        if network.kind != "codex-windows-sandbox"
+            || network.profile != ":workspace"
+            || !network.sandbox_available
+            || !network.fail_closed
+            || network.command_argv.len() < 8
+            || network.command_argv.iter().take(5).map(String::as_str).ne([
+                network.codex_executable_path.as_str(),
+                "sandbox",
+                "-P",
+                ":workspace",
+                "-C",
+            ])
+            || network.command_argv.get(5).map(String::as_str)
+                != Some(self.source_isolation.isolated_checkout_path.as_str())
+            || network.command_argv.get(6).map(String::as_str) != Some("--")
+            || network
+                .command_argv
+                .iter()
+                .skip(7)
+                .ne(self.worker_identity.command_argv.iter())
+            || self
+                .worker_identity
+                .command_argv
+                .first()
+                .map(String::as_str)
+                != Some(self.python_identity.executable_path.as_str())
+        {
+            return Err(ContractError::InvalidContract(
+                "unittest worker did not use the exact public Codex sandbox boundary".to_owned(),
+            ));
+        }
+        for argument in &network.command_argv {
+            validate_nonempty_nfc(argument, "sandbox command argument")?;
+        }
+        if network.proxy_environment
+            != (UnittestProxyEnvironmentV1 {
+                all_proxy_upper: None,
+                https_proxy_upper: None,
+                http_proxy_upper: None,
+                no_proxy_upper: None,
+                all_proxy: None,
+                https_proxy: None,
+                http_proxy: None,
+                no_proxy: None,
+            })
+            || network.codex_network_allow_local_binding != "1"
+        {
+            return Err(ContractError::InvalidContract(
+                "unittest sandbox must clear proxies and explicitly allow loopback binding"
+                    .to_owned(),
+            ));
+        }
+
+        if self.parent_records.len() != UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT {
+            return Err(ContractError::InvalidContract(
+                "unittest recapture must bind exactly 893 executable parents".to_owned(),
+            ));
+        }
+        let mut parent_ids = Vec::with_capacity(self.parent_records.len());
+        for record in &self.parent_records {
+            validate_nonempty_nfc(&record.baseline_id, "unittest baseline ID")?;
+            validate_nonempty_nfc(&record.native_id, "unittest native ID")?;
+            if !record
+                .baseline_id
+                .ends_with(&format!("python-unittest::{}", record.native_id))
+            {
+                return Err(ContractError::InvalidContract(
+                    "unittest parent native identity mismatch".to_owned(),
+                ));
+            }
+            parent_ids.push(record.baseline_id.clone());
+        }
+        ensure_sorted_unique(&parent_ids, "unittest parent records")?;
+        let parent_record_set_sha256 =
+            proof_hash(Self::PARENT_RECORD_SET_HASH_DOMAIN, &self.parent_records)?;
+        if parent_record_set_sha256.as_str() != UNITTEST_RECAPTURE_PARENT_RECORDS_SHA256 {
+            return Err(ContractError::InvalidContract(
+                "unittest parent record set is not the frozen executable 893-parent set".to_owned(),
+            ));
+        }
+
+        let parent_set = parent_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut site_by_id = std::collections::BTreeMap::<&str, &UnittestSourceSiteV1>::new();
+        let mut site_ids = Vec::with_capacity(self.source_site_manifest.len());
+        for site in &self.source_site_manifest {
+            validate_nonempty_nfc(&site.declared_site_id, "declared unittest site ID")?;
+            if site.line == 0
+                || site.column == 0
+                || !parent_set.contains(site.parent_baseline_id.as_str())
+                || site.declared_site_id != unittest_source_site_id_v1(site)?
+                || site_by_id
+                    .insert(site.declared_site_id.as_str(), site)
+                    .is_some()
+            {
+                return Err(ContractError::InvalidContract(
+                    "unittest source site identity, parent, or coordinates mismatch".to_owned(),
+                ));
+            }
+            site_ids.push(site.declared_site_id.clone());
+        }
+        ensure_sorted_unique(&site_ids, "unittest source-site manifest")?;
+        let source_site_manifest_sha256 = proof_hash(
+            Self::SOURCE_SITE_MANIFEST_HASH_DOMAIN,
+            &self.source_site_manifest,
+        )?;
+        let distinct_source_paths = self
+            .source_site_manifest
+            .iter()
+            .map(|site| &site.path)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        if self.source_audit.embedded_non_ast_marker_count != 1
+            || self.source_audit.executable_ast_site_count != 68
+            || self.source_audit.source_file_count != 22
+            || self.source_audit.source_site_manifest_sha256.as_str()
+                != frozen_source_site_manifest_sha256
+            || self.source_audit.textual_marker_count != 69
+            || source_site_manifest_sha256.as_str() != frozen_source_site_manifest_sha256
+            || self.source_site_manifest.len() != 68
+            || distinct_source_paths != 22
+        {
+            return Err(ContractError::InvalidContract(
+                "unittest recapture source audit mismatch".to_owned(),
+            ));
+        }
+
+        let mut occurrence_keys = Vec::with_capacity(self.subtest_occurrences.len());
+        let mut occurrences_by_parent = parent_ids
+            .iter()
+            .map(|parent| (parent.as_str(), Vec::<&UnittestSubtestOccurrenceV1>::new()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for occurrence in &self.subtest_occurrences {
+            occurrence.canonical_context_projection.validate()?;
+            let site = site_by_id
+                .get(occurrence.declared_site_id.as_str())
+                .ok_or_else(|| {
+                    ContractError::InvalidContract(
+                        "unittest subtest occurrence has an unknown parent/site".to_owned(),
+                    )
+                })?;
+            let parent_occurrences = occurrences_by_parent
+                .get_mut(occurrence.parent_baseline_id.as_str())
+                .ok_or_else(|| {
+                    ContractError::InvalidContract(
+                        "unittest subtest occurrence has an unknown parent/site".to_owned(),
+                    )
+                })?;
+            if site.parent_baseline_id != occurrence.parent_baseline_id {
+                return Err(ContractError::InvalidContract(
+                    "unittest subtest occurrence has an unknown parent/site".to_owned(),
+                ));
+            }
+            occurrence_keys.push((
+                occurrence.parent_baseline_id.as_str(),
+                occurrence.declared_site_id.as_str(),
+                occurrence.occurrence_ordinal,
+            ));
+            parent_occurrences.push(occurrence);
+        }
+        if occurrence_keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ContractError::InvalidContract(
+                "unittest subtest occurrences must be sorted and unique".to_owned(),
+            ));
+        }
+        let mut ordinal_groups = std::collections::BTreeMap::<(&str, &str), Vec<u64>>::new();
+        for (parent, site, ordinal) in occurrence_keys {
+            ordinal_groups
+                .entry((parent, site))
+                .or_default()
+                .push(ordinal);
+        }
+        if ordinal_groups
+            .values()
+            .any(|ordinals| ordinals.iter().copied().ne(0..ordinals.len() as u64))
+        {
+            return Err(ContractError::InvalidContract(
+                "unittest subtest ordinals must be contiguous per parent/site".to_owned(),
+            ));
+        }
+
+        let expected_manifests = derive_unittest_manifests_v1(&parent_ids, &occurrences_by_parent)?;
+        if self.parent_manifests != expected_manifests {
+            return Err(ContractError::InvalidContract(
+                "unittest parent manifests do not match occurrences".to_owned(),
+            ));
+        }
+
+        let parent_manifest_raw = self
+            .artifacts
+            .parent_manifest
+            .validate("unittest parent_manifest")?;
+        let report_raw = self.artifacts.report.validate("unittest report")?;
+        self.artifacts.stderr.validate("unittest stderr")?;
+        self.artifacts.stdout.validate("unittest stdout")?;
+        let parent_manifest_value = crate::canonical::parse_canonical_jcs(&parent_manifest_raw)
+            .map_err(|_| {
+                ContractError::InvalidContract(
+                    "unittest parent manifest artifact must be canonical JSON".to_owned(),
+                )
+            })?;
+        let parent_manifest: UnittestParentManifestArtifactV1 =
+            serde_json::from_value(parent_manifest_value).map_err(|_| {
+                ContractError::InvalidContract(
+                    "unittest parent manifest does not bind the frozen parent records".to_owned(),
+                )
+            })?;
+        if parent_manifest
+            != (UnittestParentManifestArtifactV1 {
+                baseline_commit: UNITTEST_RECAPTURE_BASELINE_COMMIT.to_owned(),
+                format_id: "kd4.unittest-parent-manifest.v1".to_owned(),
+                frozen_inventory_raw_sha256: self.frozen_inventory_raw_sha256.clone(),
+                parent_records: self.parent_records.clone(),
+                schema_version: 1,
+                source_tree_sha256: self.source_tree_sha256.clone(),
+            })
+        {
+            return Err(ContractError::InvalidContract(
+                "unittest parent manifest does not bind the frozen parent records".to_owned(),
+            ));
+        }
+        if self.parent_results.len() != UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT
+            || self.output_bindings.len() != UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT
+        {
+            return Err(ContractError::InvalidContract(
+                "unittest results/output bindings must cover 893 executable parents".to_owned(),
+            ));
+        }
+        let mut binding_ids = Vec::with_capacity(self.output_bindings.len());
+        let mut binding_by_parent =
+            std::collections::BTreeMap::<&str, &UnittestOutputBindingV1>::new();
+        for binding in &self.output_bindings {
+            if !parent_set.contains(binding.parent_baseline_id.as_str())
+                || binding.report_sha256 != self.artifacts.report.sha256
+                || binding.stderr_sha256 != self.artifacts.stderr.sha256
+                || binding.stdout_sha256 != self.artifacts.stdout.sha256
+                || binding_by_parent
+                    .insert(binding.parent_baseline_id.as_str(), binding)
+                    .is_some()
+            {
+                return Err(ContractError::InvalidContract(
+                    "unittest output binding parent or artifact mismatch".to_owned(),
+                ));
+            }
+            binding_ids.push(binding.parent_baseline_id.clone());
+        }
+        if binding_ids != parent_ids {
+            return Err(ContractError::InvalidContract(
+                "unittest output bindings must be parent sorted".to_owned(),
+            ));
+        }
+
+        let mut terminal_count = 0_u64;
+        for (result, parent) in self.parent_results.iter().zip(&parent_ids) {
+            if result.parent_baseline_id != *parent || !result.selected || !result.started {
+                return Err(ContractError::InvalidContract(
+                    "unittest parent was not exactly selected and started".to_owned(),
+                ));
+            }
+            if result.terminal_result != UnittestTerminalResultV1::Passed
+                || result.skip_reason.is_some()
+            {
+                return Err(ContractError::InvalidContract(
+                    "every unittest parent must pass without a skip reason".to_owned(),
+                ));
+            }
+            let result_sha256 = proof_hash(Self::PARENT_RESULT_HASH_DOMAIN, result)?;
+            if binding_by_parent[parent.as_str()].parent_result_sha256 != result_sha256 {
+                return Err(ContractError::InvalidContract(
+                    "unittest output binding parent result mismatch".to_owned(),
+                ));
+            }
+            terminal_count += 1;
+        }
+
+        let report_value = crate::canonical::parse_canonical_jcs(&report_raw).map_err(|_| {
+            ContractError::InvalidContract(
+                "unittest report artifact must be canonical JSON".to_owned(),
+            )
+        })?;
+        let report: UnittestExecutionReportV1 =
+            serde_json::from_value(report_value).map_err(|_| {
+                ContractError::InvalidContract(
+                    "unittest report semantic execution content mismatch".to_owned(),
+                )
+            })?;
+        let expected_report = UnittestExecutionReportV1 {
+            format_id: "kd4.unittest-execution-report.v1".to_owned(),
+            frozen_inventory_raw_sha256: self.frozen_inventory_raw_sha256.clone(),
+            output_binding_results: self
+                .output_bindings
+                .iter()
+                .map(|binding| UnittestOutputBindingResultV1 {
+                    parent_baseline_id: binding.parent_baseline_id.clone(),
+                    parent_result_sha256: binding.parent_result_sha256.clone(),
+                })
+                .collect(),
+            parent_manifest_sha256: self.artifacts.parent_manifest.sha256.clone(),
+            parent_results: self.parent_results.clone(),
+            schema_version: 1,
+            selection: UnittestExecutionSelectionV1 {
+                intended_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
+                intended_native_ids: self
+                    .parent_records
+                    .iter()
+                    .map(|record| record.native_id.clone())
+                    .collect(),
+                selected_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
+                selected_native_ids: self
+                    .parent_records
+                    .iter()
+                    .map(|record| record.native_id.clone())
+                    .collect(),
+            },
+            socket_policy: "loopback-only".to_owned(),
+            source_site_manifest: self.source_site_manifest.clone(),
+            subtest_occurrences: self.subtest_occurrences.clone(),
+            total_counts: UnittestExecutionCountsV1 {
+                selected_parent_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
+                started_parent_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
+                subtest_occurrence_count: self.subtest_occurrences.len() as u64,
+                terminal_parent_count: terminal_count,
+            },
+            untrusted_observations: UnittestUntrustedObservationsV1 {
+                checkout: UnittestUntrustedCheckoutObservationV1 {
+                    clean_after: self.source_isolation.clean_after,
+                    clean_before: self.source_isolation.clean_before,
+                    execution_working_directory: self
+                        .source_isolation
+                        .execution_working_directory
+                        .clone(),
+                    head_commit: self.source_isolation.head_commit.clone(),
+                    source_tree_sha256: self.source_isolation.source_tree_sha256.clone(),
+                },
+                environment: UnittestUntrustedEnvironmentObservationV1 {
+                    codex_network_allow_local_binding: self
+                        .network_isolation
+                        .codex_network_allow_local_binding
+                        .clone(),
+                    proxy_environment: self.network_isolation.proxy_environment.clone(),
+                },
+                process: UnittestUntrustedProcessObservationV1 {
+                    command_argv: self.worker_identity.command_argv.clone(),
+                    python_executable_path: self.python_identity.executable_path.clone(),
+                    python_executable_sha256: self.python_identity.executable_sha256.clone(),
+                    worker_sha256: self.worker_identity.worker_sha256.clone(),
+                },
+            },
+        };
+        if report != expected_report {
+            return Err(ContractError::InvalidContract(
+                "unittest report semantic execution content mismatch".to_owned(),
+            ));
+        }
+
+        let subtest_occurrence_count = self.subtest_occurrences.len() as u64;
+        let expected_counts = UnittestTotalCountsV1 {
+            method_body_child_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
+            parent_record_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
+            recovered_child_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64
+                + subtest_occurrence_count,
+            selected_parent_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
+            started_parent_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
+            subtest_occurrence_count,
+            terminal_parent_count: terminal_count,
+        };
+        if self.total_counts != expected_counts {
+            return Err(ContractError::InvalidContract(
+                "unittest recapture total counts mismatch".to_owned(),
+            ));
+        }
+        let expected_receipt = proof_hash(
+            Self::RECEIPT_HASH_DOMAIN,
+            &UnittestRecaptureReceiptProjectionV1 {
+                artifacts: &self.artifacts,
+                attempt_id: &self.attempt_id,
+                baseline_commit: &self.baseline_commit,
+                format_id: &self.format_id,
+                frozen_inventory_raw_sha256: &self.frozen_inventory_raw_sha256,
+                network_isolation: &self.network_isolation,
+                output_bindings: &self.output_bindings,
+                parent_manifests: &self.parent_manifests,
+                parent_records: &self.parent_records,
+                parent_results: &self.parent_results,
+                python_identity: &self.python_identity,
+                repository_identity_sha256: &self.repository_identity_sha256,
+                schema_version: self.schema_version,
+                source_audit: &self.source_audit,
+                source_isolation: &self.source_isolation,
+                source_site_manifest: &self.source_site_manifest,
+                source_tree_sha256: &self.source_tree_sha256,
+                subtest_occurrences: &self.subtest_occurrences,
+                total_counts: &self.total_counts,
+                worker_identity: &self.worker_identity,
+            },
+        )?;
+        if self.receipt_sha256 != expected_receipt {
+            return Err(ContractError::InvalidContract(
+                "unittest recapture receipt hash mismatch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn subtest_manifests(&self) -> Result<Vec<UnittestParentManifestV1>, ContractError> {
+        self.validate()?;
+        let parent_ids = self
+            .parent_records
+            .iter()
+            .map(|record| record.baseline_id.clone())
+            .collect::<Vec<_>>();
+        let mut occurrences_by_parent = parent_ids
+            .iter()
+            .map(|parent| (parent.as_str(), Vec::<&UnittestSubtestOccurrenceV1>::new()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for occurrence in &self.subtest_occurrences {
+            occurrences_by_parent
+                .get_mut(occurrence.parent_baseline_id.as_str())
+                .expect("validated unittest occurrence has a known parent")
+                .push(occurrence);
+        }
+        derive_unittest_manifests_v1(&parent_ids, &occurrences_by_parent)
+    }
+
+    pub fn recovered_child_sources(&self) -> Result<Vec<RecoveredChildSourceV1>, ContractError> {
+        self.validate()?;
+        let validation_id = ValidationIdV1::parse("python.unittest.recapture")?;
+        let mut children = Vec::with_capacity(
+            self.parent_records
+                .len()
+                .saturating_add(self.subtest_occurrences.len()),
+        );
+        for record in &self.parent_records {
+            children.push(RecoveredChildSourceV1 {
+                canonical_parameter_projection: None,
+                child_kind: RecoveredChildKindV1::UnittestMethodBody,
+                declared_site_id: None,
+                executable_identity: ExecutableIdentityV1::Test {
+                    route_id: TestRouteIdV1::PythonUnittest,
+                    test_id: TestIdV1::parse(record.baseline_id.clone())?,
+                    validation_id: validation_id.clone(),
+                },
+                gap_id: "gap.unittest-subtest-expansion".to_owned(),
+                occurrence_ordinal: None,
+                parent_baseline_id: record.baseline_id.clone(),
+            });
+        }
+        for occurrence in &self.subtest_occurrences {
+            children.push(RecoveredChildSourceV1 {
+                canonical_parameter_projection: Some(
+                    occurrence.canonical_context_projection.clone(),
+                ),
+                child_kind: RecoveredChildKindV1::UnittestSubtest,
+                declared_site_id: Some(occurrence.declared_site_id.clone()),
+                executable_identity: ExecutableIdentityV1::Test {
+                    route_id: TestRouteIdV1::PythonUnittest,
+                    test_id: TestIdV1::parse(occurrence.parent_baseline_id.clone())?,
+                    validation_id: validation_id.clone(),
+                },
+                gap_id: "gap.unittest-subtest-expansion".to_owned(),
+                occurrence_ordinal: Some(occurrence.occurrence_ordinal),
+                parent_baseline_id: occurrence.parent_baseline_id.clone(),
+            });
+        }
+        let mut keyed_children = children
+            .into_iter()
+            .map(|child| Ok((child.obligation_id()?, child)))
+            .collect::<Result<Vec<_>, ContractError>>()?;
+        keyed_children.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(keyed_children.into_iter().map(|(_, child)| child).collect())
+    }
+
+    pub fn parent_recapture_outputs(&self) -> Result<Vec<ParentRecaptureOutputV1>, ContractError> {
+        self.validate()?;
+        Ok(self
+            .parent_records
+            .iter()
+            .map(|record| ParentRecaptureOutputV1 {
+                output_sha256: record.predecessor_entry_sha256.clone(),
+                parent_id: record.baseline_id.clone(),
+            })
+            .collect())
+    }
+}
+
+impl UnittestArtifactV1 {
+    fn validate(&self, label: &str) -> Result<Vec<u8>, ContractError> {
+        let raw = decode_artifact(&self.base64, &self.sha256, label)?;
+        if self.byte_count != raw.len() as u64 {
+            return Err(ContractError::InvalidContract(format!(
+                "{label} artifact byte count mismatch"
+            )));
+        }
+        Ok(raw)
+    }
+}
+
+#[derive(Serialize)]
+struct UnittestSourceSiteHashProjectionV1<'a> {
+    column: u64,
+    line: u64,
+    parent_baseline_id: &'a str,
+    path: &'a StrictRepositoryPathV1,
+}
+
+fn unittest_source_site_id_v1(site: &UnittestSourceSiteV1) -> Result<String, ContractError> {
+    Ok(format!(
+        "unittest-site.{}",
+        proof_hash(
+            UnittestRecapturePacketV1::SOURCE_SITE_HASH_DOMAIN,
+            &UnittestSourceSiteHashProjectionV1 {
+                column: site.column,
+                line: site.line,
+                parent_baseline_id: &site.parent_baseline_id,
+                path: &site.path,
+            },
+        )?
+    ))
+}
+
+#[derive(Serialize)]
+struct UnittestManifestHashProjectionV1<'a, 'b> {
+    method_body_observed: bool,
+    occurrences: &'a [&'b UnittestSubtestOccurrenceV1],
+    parent_baseline_id: &'a str,
+    site_ids: &'a [String],
+    subtest_occurrence_count: u64,
+}
+
+fn derive_unittest_manifests_v1(
+    parent_ids: &[String],
+    occurrences_by_parent: &std::collections::BTreeMap<&str, Vec<&UnittestSubtestOccurrenceV1>>,
+) -> Result<Vec<UnittestParentManifestV1>, ContractError> {
+    parent_ids
+        .iter()
+        .map(|parent| {
+            let occurrences = &occurrences_by_parent[parent.as_str()];
+            let site_ids = occurrences
+                .iter()
+                .map(|occurrence| occurrence.declared_site_id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let subtest_occurrence_count = occurrences.len() as u64;
+            let manifest_sha256 = proof_hash(
+                UnittestRecapturePacketV1::SUBTEST_MANIFEST_HASH_DOMAIN,
+                &UnittestManifestHashProjectionV1 {
+                    method_body_observed: true,
+                    occurrences,
+                    parent_baseline_id: parent,
+                    site_ids: &site_ids,
+                    subtest_occurrence_count,
+                },
+            )?;
+            Ok(UnittestParentManifestV1 {
+                manifest_sha256,
+                method_body_observed: true,
+                parent_baseline_id: parent.clone(),
+                site_ids,
+                subtest_occurrence_count,
+            })
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct UnittestRecaptureReceiptProjectionV1<'a> {
+    artifacts: &'a UnittestArtifactsV1,
+    attempt_id: &'a str,
+    baseline_commit: &'a str,
+    format_id: &'a str,
+    frozen_inventory_raw_sha256: &'a Sha256HexV1,
+    network_isolation: &'a UnittestNetworkIsolationV1,
+    output_bindings: &'a [UnittestOutputBindingV1],
+    parent_manifests: &'a [UnittestParentManifestV1],
+    parent_records: &'a [UnittestParentRecordV1],
+    parent_results: &'a [UnittestParentResultV1],
+    python_identity: &'a UnittestPythonIdentityV1,
+    repository_identity_sha256: &'a Sha256HexV1,
+    schema_version: u8,
+    source_audit: &'a UnittestSourceAuditV1,
+    source_isolation: &'a UnittestSourceIsolationV1,
+    source_site_manifest: &'a [UnittestSourceSiteV1],
+    source_tree_sha256: &'a Sha256HexV1,
+    subtest_occurrences: &'a [UnittestSubtestOccurrenceV1],
+    total_counts: &'a UnittestTotalCountsV1,
+    worker_identity: &'a UnittestWorkerIdentityV1,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryResolutionV1 {
@@ -459,8 +1508,7 @@ impl DoctestRecapturePacketV1 {
             DOCTEST_RECAPTURE_BASELINE_COMMIT,
         ];
         if self.source_isolation.kind != "git-archive"
-            || self.source_isolation.archive_command
-                != expected_archive.map(str::to_owned).to_vec()
+            || self.source_isolation.archive_command != expected_archive.map(str::to_owned).to_vec()
         {
             return Err(ContractError::InvalidContract(
                 "doctest recapture did not use the exact git archive".to_owned(),
@@ -515,8 +1563,17 @@ impl DoctestRecapturePacketV1 {
         let mut global_ordinal = 0_u64;
         for (run, (package_name, target_id)) in self.runs.iter().zip(package_specs) {
             let expected_command = [
-                "cargo", "test", "--locked", "--offline", "-p", package_name, "--doc", "--",
-                "--list", "--format", "terse",
+                "cargo",
+                "test",
+                "--locked",
+                "--offline",
+                "-p",
+                package_name,
+                "--doc",
+                "--",
+                "--list",
+                "--format",
+                "terse",
             ]
             .map(str::to_owned)
             .to_vec();
@@ -530,11 +1587,7 @@ impl DoctestRecapturePacketV1 {
                     "doctest package target, command, or exit outcome mismatch".to_owned(),
                 ));
             }
-            let stdout = decode_artifact(
-                &run.stdout_base64,
-                &run.stdout_sha256,
-                "doctest stdout",
-            )?;
+            let stdout = decode_artifact(&run.stdout_base64, &run.stdout_sha256, "doctest stdout")?;
             decode_artifact(&run.stderr_base64, &run.stderr_sha256, "doctest stderr")?;
             let stdout = std::str::from_utf8(&stdout).map_err(|_| {
                 ContractError::InvalidContract("doctest stdout must be UTF-8".to_owned())
@@ -645,9 +1698,9 @@ fn decode_artifact(
     expected_sha256: &Sha256HexV1,
     label: &str,
 ) -> Result<Vec<u8>, ContractError> {
-    let raw = STANDARD.decode(encoded).map_err(|_| {
-        ContractError::InvalidContract(format!("{label} must be standard base64"))
-    })?;
+    let raw = STANDARD
+        .decode(encoded)
+        .map_err(|_| ContractError::InvalidContract(format!("{label} must be standard base64")))?;
     if STANDARD.encode(&raw) != encoded
         || format!("{:x}", Sha256::digest(&raw)) != expected_sha256.as_str()
     {
@@ -803,7 +1856,11 @@ impl InventoryRecoveryRecordV1 {
                     historical_subtest_call_count,
                 },
                 RecoveryCurrentAuditV1::Unittest { .. },
-            ) if *frozen_parent_count == 909 && historical_subtest_call_count.is_none() => {}
+            ) if *frozen_parent_count == UNITTEST_FROZEN_LEDGER_PARENT_COUNT as u64
+                && matches!(
+                    (self.state, historical_subtest_call_count),
+                    (RecoveryStateV1::Pending, None) | (RecoveryStateV1::Resolved, Some(_))
+                ) => {}
             (
                 RecoveryLegacyEvidenceV1::Doctest {
                     frozen_unique_count,
@@ -814,9 +1871,7 @@ impl InventoryRecoveryRecordV1 {
                     raw_count,
                     unique_count,
                 },
-            ) if *frozen_unique_count == 5
-                && *declared_count == 5
-                && *unique_count == 5 => {}
+            ) if *frozen_unique_count == 5 && *declared_count == 5 && *unique_count == 5 => {}
             _ => {
                 return Err(ContractError::InvalidContract(
                     "legacy/current recovery evidence must preserve the exact pending gaps"
@@ -852,9 +1907,7 @@ impl InventoryRecoveryRecordV1 {
             ) != (63, 62, 1)
                 || runner_site_observations.len() != 5
                 || source_anchors.iter().any(|(line, column, _, path)| {
-                    *line == 0
-                        || *column == 0
-                        || *path != "scripts/test_rust_test_runner.py"
+                    *line == 0 || *column == 0 || *path != "scripts/test_rust_test_runner.py"
                 })
                 || source_anchors.windows(2).any(|pair| pair[0] >= pair[1])
             {
@@ -881,12 +1934,14 @@ impl InventoryRecoveryRecordV1 {
             ) => {
                 if baseline_commit.is_empty()
                     || reasons.is_empty()
-                    || *required_parent_count != 909
-                    || required_parent_ids.len() != 909
-                    || expected_parent_output_sha256s.len() != 909
+                    || *required_parent_count != UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64
+                    || required_parent_ids.len() != UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT
+                    || expected_parent_output_sha256s.len()
+                        != UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT
                 {
                     return Err(ContractError::InvalidContract(
-                        "pending unittest recovery must cover all 909 frozen parents".to_owned(),
+                        "pending unittest recovery must cover all 893 executable parents"
+                            .to_owned(),
                     ));
                 }
                 crate::canonical::validate_nfc(baseline_commit)?;
@@ -922,7 +1977,10 @@ impl InventoryRecoveryRecordV1 {
                             historical_raw_count: None,
                             ..
                         },
-                        RecoveryCurrentAuditV1::Doctest { raw_count: None, .. }
+                        RecoveryCurrentAuditV1::Doctest {
+                            raw_count: None,
+                            ..
+                        }
                     )
                 ) =>
             {
@@ -957,9 +2015,12 @@ impl InventoryRecoveryRecordV1 {
         ensure_sorted_unique(&child_ids, "recovered child IDs")?;
         ensure_sorted_unique(&resolution.parent_container_ids, "parent container IDs")?;
         if self.kind == RecoveryKindV1::Unittest {
-            if resolution.parent_recapture_outputs.len() != 909 {
+            if resolution.parent_recapture_outputs.len()
+                != UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT
+            {
                 return Err(ContractError::InvalidContract(
-                    "resolved unittest recovery must prove all 909 parent outputs".to_owned(),
+                    "resolved unittest recovery must prove all 893 executable parent outputs"
+                        .to_owned(),
                 ));
             }
             let parents = resolution
@@ -986,7 +2047,7 @@ impl InventoryRecoveryRecordV1 {
                 })
             {
                 return Err(ContractError::InvalidContract(
-                    "all 909 unittest parents must become containers with one method-body child"
+                    "resolved unittest recovery must cover exactly the 893 executable parents with one method-body child; hidden-at-freeze ledger identities must not be included"
                         .to_owned(),
                 ));
             }
@@ -1009,6 +2070,23 @@ impl InventoryRecoveryRecordV1 {
             }) {
                 return Err(ContractError::InvalidContract(
                     "subtest occurrences must be contiguous and zero-based per parent/site"
+                        .to_owned(),
+                ));
+            }
+            let recovered_subtest_count = resolution
+                .child_sources
+                .iter()
+                .filter(|child| child.child_kind == RecoveredChildKindV1::UnittestSubtest)
+                .count() as u64;
+            if !matches!(
+                &self.legacy_evidence,
+                RecoveryLegacyEvidenceV1::Unittest {
+                    historical_subtest_call_count: Some(historical),
+                    ..
+                } if *historical == recovered_subtest_count
+            ) {
+                return Err(ContractError::InvalidContract(
+                    "resolved unittest historical subtest count must equal every recovered subtest occurrence"
                         .to_owned(),
                 ));
             }

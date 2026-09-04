@@ -1,80 +1,5 @@
 {
-  "advisories": [
-    {
-      "assignment_id": "stage1.inventory-recovery.doctest.v1.local-recapture",
-      "contracts": [],
-      "kind": "claim_overlap",
-      "paths": [
-        [
-          ".codex",
-          ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json"
-        ],
-        [
-          ".codex",
-          ".codex/validation/frozen-test-inventory-v2-recoveries.schema.json"
-        ],
-        [
-          ".codex",
-          ".codex/validation/frozen-test-inventory-v2-recoveries.json"
-        ],
-        [
-          ".codex",
-          ".codex/validation/frozen-test-inventory-v2.json"
-        ],
-        [
-          ".codex",
-          ".codex/validation/test-replacements-v2.json"
-        ],
-        [
-          "SOURCEMAP.md",
-          "SOURCEMAP.md"
-        ],
-        [
-          "scripts",
-          "scripts/completion_proof_inventory_v2.py"
-        ],
-        [
-          "scripts",
-          "scripts/materialize_completion_proof_inventory_v2.py"
-        ],
-        [
-          "scripts",
-          "scripts/test_completion_proof_inventory_v2.py"
-        ],
-        [
-          "scripts",
-          "scripts/test_materialize_completion_proof_inventory_v2.py"
-        ],
-        [
-          "scripts",
-          "scripts/fixtures/completion_proof_v2_cross_language_vectors.json"
-        ],
-        [
-          "codex-rs",
-          "codex-rs/validation-contracts/src/recovery.rs"
-        ],
-        [
-          "codex-rs",
-          "codex-rs/validation-contracts/src/inventory_v2.rs"
-        ],
-        [
-          "codex-rs",
-          "codex-rs/validation-contracts/tests/cross_language_vectors.rs"
-        ]
-      ]
-    },
-    {
-      "assignment_id": "worker:just-shell-test-gap-implementation-20260903",
-      "contracts": [],
-      "kind": "claim_overlap",
-      "paths": [
-        [
-          "scripts",
-          "scripts/test_build_tooling.py"
-        ]
-      ]
-    }
-  ],
+  "advisories": [],
   "assignment_id": "root:completion-proof-migration-20260902",
   "cargo_lane": {
     "cargo_home": "C:\\Users\\kuh\\.cargo",
@@ -89,14 +14,14 @@
     "stage2-incorrect-behavior-log"
   ],
   "dependencies": [],
-  "expires_at": "2026-09-04T06:19:32.913090+00:00",
+  "expires_at": "2026-09-04T08:20:32.804072+00:00",
   "generated_output_owner": "root:completion-proof-migration-20260902",
   "generated_outputs": [
     ".codex/validation/test-replacements-v1.json",
     ".codex/validation/test-replacements-v2.json",
     ".codex/validation/stage2-incorrect-behaviors-v1.txt"
   ],
-  "manifest_fingerprint": "7c631f17bd6c8acb52acf754e55f5b6a8055d585e859f9dd4c89e32303818b4a",
+  "manifest_fingerprint": "3eabf66cef60c8c777922747ac7b0976f3c1b7d654bf7252c84231a5c24e3b42",
   "path_claims": [
     {
       "path": ".codex",
@@ -139,14 +64,14 @@
       "recursive": true
     }
   ],
-  "recorded_at": "2026-09-04T04:19:32.913090+00:00",
+  "recorded_at": "2026-09-04T07:20:32.804072+00:00",
   "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
   "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
   "root_task_id": "completion-proof-migration-20260902",
   "schema_version": 1,
   "starting_revision": {
-    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
-    "workspace_fingerprint": "71d4a019060cc1ab023ff07634caaf1913dc8487324272b522ac8821bc8693f4"
+    "commit": "586b9eb5fb44fdedb9917b172207cb001268695b",
+    "workspace_fingerprint": "224f76fe81fec0f163a9ba0f6f16d3d414361a715eac48b3ad3e4bcb472aa9d7"
   },
   "validation_commands": [
     "just source-map-check",

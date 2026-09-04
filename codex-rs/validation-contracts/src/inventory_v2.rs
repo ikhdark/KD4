@@ -14,6 +14,7 @@ use crate::runner::TestRouteIdV1;
 use crate::runner::TestRunnerKindV1;
 use crate::selection::ActionIdV1;
 use crate::selection::ExecutableIdentityV1;
+use crate::selection::TestIdV1;
 use crate::selection::ValidationIdV1;
 use serde::Deserialize;
 use serde::Serialize;
@@ -21,6 +22,21 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+
+const UNITTEST_V1_LEDGER_PARENT_COUNT: usize = 909;
+const UNITTEST_V1_EXECUTABLE_PARENT_COUNT: usize = 893;
+const UNITTEST_V1_HIDDEN_PARENT_COUNT: usize = 16;
+const UNITTEST_V1_REPLACEMENT_PARENT_COUNT: usize = 536;
+const UNITTEST_V1_EXECUTABLE_REPLACEMENT_PARENT_COUNT: usize = 520;
+const UNITTEST_V1_UNRESOLVED_PARENT_COUNT: usize = 373;
+const UNITTEST_V1_HIDDEN_PARENT_IDS_SHA256: &str =
+    "936330f9e9a23c8d628f651a1ed31b3f4ea836a06cf152a6acf09cff898ebc40";
+const UNITTEST_V1_REPLACEMENT_PARENT_IDS_SHA256: &str =
+    "59202883ef32488ae9a488345b2401400794d961e5d539c58fd6364e86f25fe1";
+const UNITTEST_V1_EXECUTABLE_REPLACEMENT_PARENT_IDS_SHA256: &str =
+    "208d6735c1413d94c503a453331889fe5709b8eca540cf9c13993c42f9bb8cf7";
+const UNITTEST_V1_UNRESOLVED_PARENT_IDS_SHA256: &str =
+    "d1e66a89d1a943b60f6516bc9550102306919d6ae673bee4027595a3df8036f7";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -860,8 +876,8 @@ pub enum ReplacementContractDispositionV1 {
 }
 
 impl ReplacementContractDispositionV1 {
-    pub fn validate(&self) -> Result<(), ContractError> {
-        let legacy_hint = match self {
+    fn legacy_replacement_hint(&self) -> &LegacyReplacementHintV1 {
+        match self {
             Self::PendingReview {
                 legacy_replacement_hint,
                 ..
@@ -874,7 +890,11 @@ impl ReplacementContractDispositionV1 {
                 legacy_replacement_hint,
                 ..
             } => legacy_replacement_hint,
-        };
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let legacy_hint = self.legacy_replacement_hint();
         legacy_hint.validate()?;
         let (candidate, selector) = match self {
             Self::PendingReview { .. } => return Ok(()),
@@ -1100,7 +1120,7 @@ impl FrozenTestInventoryV2 {
         const EXPECTED: [(&str, &str, &str); 5] = [
             (
                 ".codex/validation/frozen-test-inventory-v2-recoveries.schema.json",
-                "a87685f8058676078c21f70d26121d2a6a92223b4a06b396951589ace0c8985b",
+                "8412a18a13ae6f93b8efd18552e0be1422e957ebde5bde24512e8ce87d8bc09f",
                 "kd4://validation/frozen-test-inventory-v2-recoveries.schema.json",
             ),
             (
@@ -1933,12 +1953,14 @@ pub fn validate_inventory_ledger_predecessor_closure(
     transition_receipts: &[crate::recovery::RecoveryTransitionReceiptV1],
     applicability_issuer: &crate::applicability::ActiveHostApplicabilityIssuerV1,
 ) -> Result<(), ContractError> {
-    validate_inventory_ledger_predecessor_closure_with_recapture(
+    validate_inventory_ledger_predecessor_closure_with_recaptures(
         inventory,
         ledger,
         recovery_raw,
         transition_receipts,
         applicability_issuer,
+        None,
+        None,
         None,
     )
 }
@@ -1950,6 +1972,28 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recapture(
     transition_receipts: &[crate::recovery::RecoveryTransitionReceiptV1],
     applicability_issuer: &crate::applicability::ActiveHostApplicabilityIssuerV1,
     doctest_recapture_raw: Option<&[u8]>,
+) -> Result<(), ContractError> {
+    validate_inventory_ledger_predecessor_closure_with_recaptures(
+        inventory,
+        ledger,
+        recovery_raw,
+        transition_receipts,
+        applicability_issuer,
+        doctest_recapture_raw,
+        None,
+        None,
+    )
+}
+
+pub fn validate_inventory_ledger_predecessor_closure_with_recaptures(
+    inventory: &FrozenTestInventoryV2,
+    ledger: &TestReplacementLedgerV2,
+    recovery_raw: &[u8],
+    transition_receipts: &[crate::recovery::RecoveryTransitionReceiptV1],
+    applicability_issuer: &crate::applicability::ActiveHostApplicabilityIssuerV1,
+    doctest_recapture_raw: Option<&[u8]>,
+    unittest_recapture_raw: Option<&[u8]>,
+    predecessor_ledger_raw: Option<&[u8]>,
 ) -> Result<(), ContractError> {
     inventory.validate()?;
     ledger.validate()?;
@@ -1998,6 +2042,7 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recapture(
             "replacement ledger baseline rows",
         )?;
     let mut declarations_by_obligation = BTreeMap::new();
+    let mut declarations_by_baseline = BTreeMap::new();
     let mut expected_baseline_by_obligation = BTreeMap::new();
     for declaration in &inventory.declaration_universe {
         let obligation_id = declaration.obligation_id()?;
@@ -2011,6 +2056,15 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recapture(
         }
         expected_baseline_by_obligation
             .insert(obligation_id, declaration.baseline_id().map(str::to_owned));
+        if let Some(baseline_id) = declaration.baseline_id()
+            && declarations_by_baseline
+                .insert(baseline_id.to_owned(), declaration)
+                .is_some()
+        {
+            return Err(ContractError::InvalidContract(
+                "inventory declarations have duplicate baseline IDs".to_owned(),
+            ));
+        }
     }
     let mut rows_by_obligation = BTreeMap::new();
     for row in &ledger.rows {
@@ -2023,20 +2077,19 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recapture(
             ));
         }
     }
-    if rows_by_obligation
+    if !declarations_by_obligation
         .keys()
-        .ne(declarations_by_obligation.keys())
+        .all(|obligation_id| rows_by_obligation.contains_key(obligation_id))
     {
         return Err(ContractError::InvalidContract(
-            "ledger rows do not exactly cover every inventory declaration obligation".to_owned(),
+            "ledger rows do not cover every inventory declaration obligation".to_owned(),
         ));
     }
-    for (obligation_id, row) in &rows_by_obligation {
-        if &row.baseline_id
-            != expected_baseline_by_obligation
-                .get(obligation_id)
-                .expect("obligation key sets were compared")
-        {
+    for (obligation_id, expected_baseline) in &expected_baseline_by_obligation {
+        let row = rows_by_obligation
+            .get(obligation_id)
+            .expect("declaration obligations were checked above");
+        if &row.baseline_id != expected_baseline {
             return Err(ContractError::InvalidContract(
                 "ledger baseline identity does not match its exact inventory declaration"
                     .to_owned(),
@@ -2086,7 +2139,140 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recapture(
             Ok(packet)
         })
         .transpose()?;
+    let unittest_recapture = unittest_recapture_raw
+        .map(|raw| {
+            let value = parse_canonical_jcs(raw)?;
+            let packet: crate::recovery::UnittestRecapturePacketV1 = serde_json::from_value(value)
+                .map_err(|error| ContractError::InvalidJson(error.to_string()))?;
+            packet.validate()?;
+            Ok(packet)
+        })
+        .transpose()?;
+    let predecessor_ledger: Option<serde_json::Value> = predecessor_ledger_raw
+        .map(|raw| {
+            let raw_sha256 = Sha256HexV1::parse(format!("{:x}", Sha256::digest(raw)))?;
+            if raw_sha256
+                != inventory
+                    .predecessor_reconciliation
+                    .frozen_ledger_raw_sha256
+            {
+                return Err(ContractError::InvalidContract(
+                    "predecessor ledger raw SHA-256 mismatch".to_owned(),
+                ));
+            }
+            serde_json::from_slice(raw)
+                .map_err(|error| ContractError::InvalidJson(error.to_string()))
+        })
+        .transpose()?;
+
+    let mut authority_state_records = recovery.records.clone();
+    for record in &mut authority_state_records {
+        if !matches!(record.state, crate::recovery::RecoveryStateV1::Resolved) {
+            continue;
+        }
+        match record.kind {
+            crate::recovery::RecoveryKindV1::Doctest => {
+                let crate::recovery::RecoveryCurrentAuditV1::Doctest { raw_count, .. } =
+                    &mut record.current_audit
+                else {
+                    unreachable!("recovery validation checked kind alignment")
+                };
+                *raw_count = None;
+                let crate::recovery::RecoveryLegacyEvidenceV1::Doctest {
+                    historical_raw_count,
+                    ..
+                } = &mut record.legacy_evidence
+                else {
+                    unreachable!("recovery validation checked kind alignment")
+                };
+                *historical_raw_count = None;
+                record.pending_requirement =
+                    Some(crate::recovery::RecoveryPendingRequirementV1::Doctest {
+                        baseline_commit: recovery.frozen_source_authority.baseline_commit.clone(),
+                        reasons: vec![
+                            "historical-raw-count-unknown".to_owned(),
+                            "off-host-recapture-required".to_owned(),
+                        ],
+                        required_package_targets: vec![
+                            "codex-core::lib::codex_core".to_owned(),
+                            "codex-rollout::lib::codex_rollout".to_owned(),
+                            "codex-state::lib::codex_state".to_owned(),
+                            "codex-tui::lib::codex_tui".to_owned(),
+                        ],
+                    });
+            }
+            crate::recovery::RecoveryKindV1::Unittest => {
+                let packet = unittest_recapture.as_ref().ok_or_else(|| {
+                    ContractError::InvalidContract(
+                        "resolved unittest recovery requires the exact typed recapture packet"
+                            .to_owned(),
+                    )
+                })?;
+                let crate::recovery::RecoveryLegacyEvidenceV1::Unittest {
+                    historical_subtest_call_count,
+                    ..
+                } = &mut record.legacy_evidence
+                else {
+                    unreachable!("recovery validation checked kind alignment")
+                };
+                *historical_subtest_call_count = None;
+                record.pending_requirement =
+                    Some(crate::recovery::RecoveryPendingRequirementV1::Unittest {
+                        baseline_commit: recovery.frozen_source_authority.baseline_commit.clone(),
+                        expected_parent_output_sha256s: packet.parent_recapture_outputs()?,
+                        reasons: vec![
+                            "historical-subtest-count-unknown".to_owned(),
+                            "parent-output-recapture-required".to_owned(),
+                        ],
+                        required_parent_ids: packet
+                            .parent_records
+                            .iter()
+                            .map(|parent| parent.baseline_id.clone())
+                            .collect(),
+                        required_parent_count: UNITTEST_V1_EXECUTABLE_PARENT_COUNT as u64,
+                    });
+            }
+        }
+        record.resolution = None;
+        record.state = crate::recovery::RecoveryStateV1::Pending;
+        record.transition_receipt_sha256 = None;
+    }
+    #[derive(Serialize)]
+    struct RecoveryAuthorityPredecessorProjectionV1<'a> {
+        format_id: &'a str,
+        frozen_source_authority: &'a crate::recovery::FrozenSourceAuthorityV1,
+        records: &'a [crate::recovery::InventoryRecoveryRecordV1],
+        schema_version: u8,
+    }
+    for (index, record) in recovery.records.iter().enumerate() {
+        if !matches!(record.state, crate::recovery::RecoveryStateV1::Resolved) {
+            continue;
+        }
+        let receipt_hash = record
+            .transition_receipt_sha256
+            .as_ref()
+            .expect("recovery validation requires resolved receipt hash");
+        let receipt = receipts_by_hash
+            .get(receipt_hash.as_str())
+            .expect("receipt key sets were checked above");
+        let authority_before = proof_hash(
+            "kd4.inventory-recovery-authority.semantic.v1",
+            &RecoveryAuthorityPredecessorProjectionV1 {
+                format_id: &recovery.format_id,
+                frozen_source_authority: &recovery.frozen_source_authority,
+                records: &authority_state_records,
+                schema_version: recovery.schema_version,
+            },
+        )?;
+        if receipt.authority_before_semantic_sha256 != authority_before {
+            return Err(ContractError::InvalidContract(
+                "recovery transition does not bind the actual predecessor authority".to_owned(),
+            ));
+        }
+        authority_state_records[index] = record.clone();
+    }
     let mut recovered_parents = BTreeMap::<String, (Vec<String>, Sha256HexV1)>::new();
+    let mut recovered_unittest_children = BTreeSet::new();
     for record in &recovery.records {
         if !matches!(record.state, crate::recovery::RecoveryStateV1::Resolved) {
             continue;
@@ -2119,57 +2305,96 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recapture(
                         .to_owned(),
                 )
             })?;
-            let mut expected_occurrences = packet
+            let mut expected_child_pairs = packet
                 .runs
                 .iter()
                 .flat_map(|run| &run.raw_occurrences)
                 .map(|occurrence| {
-                    (
-                        occurrence.parent_baseline_id.as_str(),
-                        occurrence.parent_ordinal,
-                        format!(
-                            "{}::recovered-raw-occurrence:{}",
-                            occurrence.parent_baseline_id, occurrence.parent_ordinal
-                        ),
-                    )
-                })
-                .collect::<Vec<_>>();
-            expected_occurrences.sort();
-            let mut actual_occurrences = resolution
-                .child_sources
-                .iter()
-                .map(|child| {
-                    let test_id = match &child.executable_identity {
-                        crate::selection::ExecutableIdentityV1::Test { test_id, .. } => {
-                            test_id.as_str().to_owned()
-                        }
-                        _ => String::new(),
+                    let child = crate::recovery::RecoveredChildSourceV1 {
+                        canonical_parameter_projection: None,
+                        child_kind: crate::recovery::RecoveredChildKindV1::Doctest,
+                        declared_site_id: None,
+                        executable_identity: ExecutableIdentityV1::Test {
+                            route_id: TestRouteIdV1::RustDoctest,
+                            test_id: TestIdV1::parse(format!(
+                                "{}::recovered-raw-occurrence:{}",
+                                occurrence.parent_baseline_id, occurrence.parent_ordinal
+                            ))?,
+                            validation_id: ValidationIdV1::parse(
+                                "rust.doctest.workspace".to_owned(),
+                            )?,
+                        },
+                        gap_id: "gap.doctest-raw-versus-unique".to_owned(),
+                        occurrence_ordinal: Some(occurrence.parent_ordinal),
+                        parent_baseline_id: occurrence.parent_baseline_id.clone(),
                     };
-                    (
-                        child.parent_baseline_id.as_str(),
-                        child.occurrence_ordinal.unwrap_or(u64::MAX),
-                        test_id,
-                    )
+                    Ok((child.obligation_id()?, child))
                 })
+                .collect::<Result<Vec<_>, ContractError>>()?;
+            expected_child_pairs.sort_by(|left, right| left.0.cmp(&right.0));
+            let expected_children = expected_child_pairs
+                .into_iter()
+                .map(|(_, child)| child)
                 .collect::<Vec<_>>();
-            actual_occurrences.sort();
-            let expected_parents = [
-                "rust-doctest::core\\src\\client.rs - client::ModelClient (line 1696)",
-                "rust-doctest::rollout\\src\\recorder.rs - recorder::RolloutRecorder (line 84)",
-                "rust-doctest::state\\src\\log_db.rs - log_db (line 10)",
-                "rust-doctest::tui\\src\\bottom_pane\\multi_select_picker.rs - bottom_pane::multi_select_picker (line 14)",
-                "rust-doctest::tui\\src\\bottom_pane\\multi_select_picker.rs - bottom_pane::multi_select_picker::MultiSelectPickerBuilder (line 706)",
-            ]
-            .map(str::to_owned)
-            .to_vec();
+            let expected_parents = packet
+                .parent_counts
+                .iter()
+                .map(|parent| parent.parent_baseline_id.clone())
+                .collect::<Vec<_>>();
             if resolution.recapture_receipt_sha256 != packet.receipt_sha256
                 || resolution.parent_container_ids != expected_parents
-                || actual_occurrences != expected_occurrences
+                || resolution.child_sources != expected_children
             {
                 return Err(ContractError::InvalidContract(
                     "doctest recovery does not exactly materialize its typed recapture packet"
                         .to_owned(),
                 ));
+            }
+        } else {
+            let packet = unittest_recapture.as_ref().ok_or_else(|| {
+                ContractError::InvalidContract(
+                    "resolved unittest recovery requires the exact typed recapture packet"
+                        .to_owned(),
+                )
+            })?;
+            let expected_children = packet.recovered_child_sources()?;
+            let expected_parents = packet
+                .parent_records
+                .iter()
+                .map(|parent| parent.baseline_id.clone())
+                .collect::<Vec<_>>();
+            let expected_outputs = packet.parent_recapture_outputs()?;
+            let historical_subtest_call_count = match &record.legacy_evidence {
+                crate::recovery::RecoveryLegacyEvidenceV1::Unittest {
+                    historical_subtest_call_count,
+                    ..
+                } => *historical_subtest_call_count,
+                _ => unreachable!("recovery validation checked kind alignment"),
+            };
+            if resolution.recapture_receipt_sha256 != packet.receipt_sha256
+                || resolution.parent_container_ids != expected_parents
+                || resolution.parent_recapture_outputs != expected_outputs
+                || resolution.child_sources != expected_children
+                || historical_subtest_call_count
+                    != Some(packet.total_counts.subtest_occurrence_count)
+            {
+                return Err(ContractError::InvalidContract(
+                    "unittest recovery does not exactly materialize its typed recapture packet"
+                        .to_owned(),
+                ));
+            }
+            for child_id in &child_ids {
+                if declarations_by_obligation.contains_key(child_id) {
+                    return Err(ContractError::InvalidContract(
+                        "unittest recovered child collides with a declaration obligation"
+                            .to_owned(),
+                    ));
+                }
+                if !recovered_unittest_children.insert(child_id.clone()) {
+                    return Err(ContractError::InvalidContract(
+                        "unittest recovered child appears more than once".to_owned(),
+                    ));
+                }
             }
         }
         if receipt.child_obligation_ids != child_ids
@@ -2180,6 +2405,9 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recapture(
             return Err(ContractError::InvalidContract(
                 "recovery transition receipt does not bind its exact resolved record".to_owned(),
             ));
+        }
+        if !matches!(record.kind, crate::recovery::RecoveryKindV1::Doctest) {
+            continue;
         }
         for parent in &resolution.parent_container_ids {
             let mut parent_children = child_pairs
@@ -2199,6 +2427,30 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recapture(
                     "recovery parent {parent:?} appears in more than one recovery record"
                 )));
             }
+        }
+    }
+    let expected_obligations = declarations_by_obligation
+        .keys()
+        .cloned()
+        .chain(recovered_unittest_children.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if rows_by_obligation.keys().cloned().collect::<BTreeSet<_>>() != expected_obligations {
+        return Err(ContractError::InvalidContract(
+            "ledger rows do not exactly cover declaration and recovered-child obligations"
+                .to_owned(),
+        ));
+    }
+    for child_id in &recovered_unittest_children {
+        let row = rows_by_obligation
+            .get(child_id)
+            .expect("ledger obligation set was checked above");
+        if row.baseline_id.is_some()
+            || !matches!(&row.disposition, ReplacementLedgerDispositionV2::Unresolved)
+        {
+            return Err(ContractError::InvalidContract(
+                "recovered child obligation must be a separate baseline-null unresolved row"
+                    .to_owned(),
+            ));
         }
     }
     let mut observed_recovered_parents = BTreeSet::new();
@@ -2232,6 +2484,252 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recapture(
             "recovered-container rows do not exactly cover resolved recovery parents".to_owned(),
         ));
     }
+    if let Some(packet) = &unittest_recapture {
+        let predecessor_ledger = predecessor_ledger.as_ref().ok_or_else(|| {
+            ContractError::InvalidContract(
+                "unittest recovery requires exact predecessor ledger bytes".to_owned(),
+            )
+        })?;
+        let predecessor_rows = predecessor_ledger
+            .get("rows")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                ContractError::InvalidContract(
+                    "predecessor ledger has no canonical row array".to_owned(),
+                )
+            })?;
+        let parent_manifests = packet
+            .subtest_manifests()?
+            .into_iter()
+            .map(|manifest| (manifest.parent_baseline_id.clone(), manifest))
+            .collect::<BTreeMap<_, _>>();
+        let packet_parents = packet
+            .parent_records
+            .iter()
+            .map(|parent| (parent.baseline_id.clone(), parent))
+            .collect::<BTreeMap<_, _>>();
+        let unittest_parent_ids = declarations_by_baseline
+            .iter()
+            .filter_map(|(baseline_id, declaration)| {
+                matches!(
+                    &declaration.entry().executable_identity,
+                    ExecutableIdentityV1::Test {
+                        route_id: TestRouteIdV1::PythonUnittest,
+                        ..
+                    }
+                )
+                .then_some(baseline_id.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let hidden_parent_ids = unittest_parent_ids
+            .iter()
+            .filter(|baseline_id| baseline_id.starts_with("hidden-at-freeze-v1::python-unittest::"))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let executable_parent_ids = unittest_parent_ids
+            .difference(&hidden_parent_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let packet_parent_ids = packet_parents.keys().cloned().collect::<BTreeSet<_>>();
+        let manifest_parent_ids = parent_manifests.keys().cloned().collect::<BTreeSet<_>>();
+        let hidden_parent_ids_for_hash = hidden_parent_ids.iter().cloned().collect::<Vec<_>>();
+        if unittest_parent_ids.len() != UNITTEST_V1_LEDGER_PARENT_COUNT
+            || executable_parent_ids.len() != UNITTEST_V1_EXECUTABLE_PARENT_COUNT
+            || hidden_parent_ids.len() != UNITTEST_V1_HIDDEN_PARENT_COUNT
+            || proof_hash(
+                "kd4.unittest-hidden-ledger-parent-ids.v1",
+                &hidden_parent_ids_for_hash,
+            )?
+            .as_str()
+                != UNITTEST_V1_HIDDEN_PARENT_IDS_SHA256
+            || packet_parent_ids != executable_parent_ids
+            || manifest_parent_ids != executable_parent_ids
+        {
+            return Err(ContractError::InvalidContract(
+                "unittest predecessor partition must preserve 909 ledger parents, 893 executable parents, and 16 hidden replacement-only parents"
+                    .to_owned(),
+            ));
+        }
+        if packet
+            .recovered_child_sources()?
+            .iter()
+            .any(|child| hidden_parent_ids.contains(&child.parent_baseline_id))
+        {
+            return Err(ContractError::InvalidContract(
+                "hidden-at-freeze unittest parents cannot become recovered children".to_owned(),
+            ));
+        }
+        let mut predecessor_rows_by_baseline = BTreeMap::new();
+        for predecessor_row in predecessor_rows {
+            let Some(baseline_id) = predecessor_row
+                .get("baseline_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            if unittest_parent_ids.contains(baseline_id)
+                && predecessor_rows_by_baseline
+                    .insert(baseline_id.to_owned(), predecessor_row)
+                    .is_some()
+            {
+                return Err(ContractError::InvalidContract(
+                    "predecessor ledger repeats a unittest parent".to_owned(),
+                ));
+            }
+        }
+        if predecessor_rows_by_baseline
+            .keys()
+            .ne(unittest_parent_ids.iter())
+        {
+            return Err(ContractError::InvalidContract(
+                "predecessor ledger does not exactly cover the 909 unittest parents".to_owned(),
+            ));
+        }
+        let mut replacement_ids = Vec::new();
+        let mut executable_replacement_ids = Vec::new();
+        let mut unresolved_ids = Vec::new();
+        for baseline_id in &unittest_parent_ids {
+            let declaration = *declarations_by_baseline.get(baseline_id).ok_or_else(|| {
+                ContractError::InvalidContract(
+                    "unittest recapture parent has no frozen inventory declaration".to_owned(),
+                )
+            })?;
+            let InventoryDeclarationV2::FrozenBaseline {
+                entry,
+                predecessor_entry_sha256,
+                ..
+            } = declaration
+            else {
+                unreachable!("baseline map only contains frozen declarations")
+            };
+            if !matches!(
+                &entry.executable_identity,
+                ExecutableIdentityV1::Test {
+                    route_id: TestRouteIdV1::PythonUnittest,
+                    test_id,
+                    validation_id,
+                } if test_id.as_str() == baseline_id.as_str()
+                    && validation_id == &entry.validation_id
+            ) {
+                return Err(ContractError::InvalidContract(
+                    "unittest parent declaration does not bind its exact frozen identity"
+                        .to_owned(),
+                ));
+            }
+            if executable_parent_ids.contains(baseline_id) {
+                let parent_record = packet_parents
+                    .get(baseline_id)
+                    .expect("packet parent set was checked above");
+                let manifest = parent_manifests
+                    .get(baseline_id)
+                    .expect("packet manifest set was checked above");
+                if predecessor_entry_sha256 != &parent_record.predecessor_entry_sha256
+                    || !matches!(
+                        &entry.runner_selector,
+                        RunnerSelectorV1::PythonUnittest {
+                            parent_test_id,
+                            subtest_manifest_sha256,
+                            ..
+                        } if parent_test_id == &parent_record.native_id
+                            && subtest_manifest_sha256 == &manifest.manifest_sha256
+                    )
+                {
+                    return Err(ContractError::InvalidContract(
+                        "executable unittest parent declaration does not bind its exact packet identity and manifest"
+                            .to_owned(),
+                    ));
+                }
+            }
+            let obligation_id = declaration.obligation_id()?;
+            let current = &rows_by_obligation
+                .get(&obligation_id)
+                .expect("declaration obligations were checked above")
+                .disposition;
+            let predecessor_row = predecessor_rows_by_baseline
+                .get(baseline_id)
+                .expect("predecessor row key set was checked above");
+            match predecessor_row
+                .get("resolution")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("unresolved") => {
+                    unresolved_ids.push(baseline_id.clone());
+                    if !matches!(current, ReplacementLedgerDispositionV2::Unresolved) {
+                        return Err(ContractError::InvalidContract(
+                            "unittest unresolved parent disposition changed".to_owned(),
+                        ));
+                    }
+                }
+                Some("replacement") => {
+                    replacement_ids.push(baseline_id.clone());
+                    if executable_parent_ids.contains(baseline_id) {
+                        executable_replacement_ids.push(baseline_id.clone());
+                    }
+                    let mut expected_replacement_ids = predecessor_row
+                        .get("replacement_ids")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| {
+                            ContractError::InvalidContract(
+                                "predecessor replacement has no replacement IDs".to_owned(),
+                            )
+                        })?
+                        .iter()
+                        .map(|value| {
+                            value.as_str().map(str::to_owned).ok_or_else(|| {
+                                ContractError::InvalidContract(
+                                    "predecessor replacement ID is not a string".to_owned(),
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    expected_replacement_ids.sort();
+                    let predecessor_row_sha256 =
+                        proof_hash("kd4.frozen-v1-replacement-ledger-row.v1", predecessor_row)?;
+                    let ReplacementLedgerDispositionV2::Replacement { contract, .. } = current
+                    else {
+                        return Err(ContractError::InvalidContract(
+                            "unittest replacement parent disposition changed".to_owned(),
+                        ));
+                    };
+                    let legacy_hint = contract.legacy_replacement_hint();
+                    if legacy_hint.predecessor_row_sha256 != predecessor_row_sha256
+                        || legacy_hint.replacement_ids != expected_replacement_ids
+                    {
+                        return Err(ContractError::InvalidContract(
+                            "unittest replacement parent mapping changed".to_owned(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(ContractError::InvalidContract(
+                        "unittest predecessor parent has an unknown disposition".to_owned(),
+                    ));
+                }
+            }
+        }
+        if replacement_ids.len() != UNITTEST_V1_REPLACEMENT_PARENT_COUNT
+            || proof_hash("kd4.unittest-parent-replacement-ids.v1", &replacement_ids)?.as_str()
+                != UNITTEST_V1_REPLACEMENT_PARENT_IDS_SHA256
+            || executable_replacement_ids.len() != UNITTEST_V1_EXECUTABLE_REPLACEMENT_PARENT_COUNT
+            || proof_hash(
+                "kd4.unittest-parent-replacement-ids.v1",
+                &executable_replacement_ids,
+            )?
+            .as_str()
+                != UNITTEST_V1_EXECUTABLE_REPLACEMENT_PARENT_IDS_SHA256
+            || unresolved_ids.len() != UNITTEST_V1_UNRESOLVED_PARENT_COUNT
+            || proof_hash("kd4.unittest-parent-unresolved-ids.v1", &unresolved_ids)?.as_str()
+                != UNITTEST_V1_UNRESOLVED_PARENT_IDS_SHA256
+            || !hidden_parent_ids
+                .iter()
+                .all(|parent| replacement_ids.binary_search(parent).is_ok())
+        {
+            return Err(ContractError::InvalidContract(
+                "unittest parent dispositions do not preserve the exact 536 replacement (520 executable plus 16 hidden) and 373 unresolved split"
+                    .to_owned(),
+            ));
+        }
+    }
     for row in &ledger.rows {
         let ReplacementLedgerDispositionV2::Exception {
             exception:
@@ -2245,9 +2743,9 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recapture(
         else {
             continue;
         };
-        let declaration = declarations_by_obligation
-            .get(&row.obligation_id)
-            .expect("ledger/declaration obligation key sets were compared");
+        let Some(declaration) = declarations_by_obligation.get(&row.obligation_id) else {
+            continue;
+        };
         if row.baseline_id.is_none()
             && !matches!(
                 declaration,

@@ -1041,10 +1041,11 @@ feature_ids = ["completion-proof"]
 concern_ids = ["terminal-certification", "frozen-test-inventory", "validation-contracts"]
 aliases = ["completion proof", "frozen test inventory"]
 phrases = ["canonical completion certification and inventory reconciliation"]
-roots = ["scripts/completion_proof.py", "scripts/completion_proof_inventory_v2.py", "codex-rs/validation-contracts", ".codex/validation"]
+roots = ["scripts/completion_proof.py", "scripts/completion_proof_inventory_v2.py", "scripts/materialize_completion_proof_inventory_v2.py", "codex-rs/validation-contracts", ".codex/validation"]
 primary_entries = [
     { path = "scripts/completion_proof.py", symbol = "main", ambiguous = true },
     { path = "scripts/completion_proof_inventory_v2.py", symbol = "validate_frozen_test_inventory_v2" },
+    { path = "scripts/materialize_completion_proof_inventory_v2.py", symbol = "main", ambiguous = true },
     { path = "codex-rs/validation-contracts/src/inventory_v2.rs", symbol = "FrozenTestInventoryV2" },
 ]
 instructions = ["AGENTS.md"]
@@ -1061,13 +1062,16 @@ contracts = [
 generated_mirrors = [
     ".codex/validation/frozen-test-inventory-v1.json",
     ".codex/validation/test-replacements-v1.json",
+    ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json",
     ".codex/validation/frozen-test-inventory-v2.json",
     ".codex/validation/frozen-test-inventory-v2-recoveries.json",
+    ".codex/validation/frozen-test-inventory-v2-recovery-transition-receipts.json",
     ".codex/validation/test-replacements-v2.json",
 ]
 tests = [
     "scripts/test_completion_proof.py",
     "scripts/test_completion_proof_inventory_v2.py",
+    "scripts/test_materialize_completion_proof_inventory_v2.py",
     "codex-rs/validation-contracts/tests/cross_language_vectors.rs",
     "codex-rs/core/tests/suite/completion_proof_gate.rs",
     "scripts/test_source_owners.py",
@@ -1121,6 +1125,41 @@ kind = "generates"
 target = "generated:.codex/validation/test-replacements-v1.json"
 confidence = "generated"
 evidence = [{ path = "scripts/completion_proof.py", symbol = "_freeze_inventory" }]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:.codex/validation/frozen-test-inventory-v2-doctest-recapture.json"
+confidence = "generated"
+evidence = [{ path = "scripts/materialize_completion_proof_inventory_v2.py", symbol = "recapture_doctests" }]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:.codex/validation/frozen-test-inventory-v2-recoveries.json"
+confidence = "generated"
+evidence = [{ path = "scripts/materialize_completion_proof_inventory_v2.py", symbol = "build_materialized_bundle" }]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:.codex/validation/frozen-test-inventory-v2-recovery-transition-receipts.json"
+confidence = "generated"
+evidence = [{ path = "scripts/materialize_completion_proof_inventory_v2.py", symbol = "build_materialized_bundle" }]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:.codex/validation/frozen-test-inventory-v2.json"
+confidence = "generated"
+evidence = [{ path = "scripts/materialize_completion_proof_inventory_v2.py", symbol = "build_materialized_bundle" }]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:.codex/validation/test-replacements-v2.json"
+confidence = "generated"
+evidence = [{ path = "scripts/materialize_completion_proof_inventory_v2.py", symbol = "build_materialized_bundle" }]
 
 [[owners.invariants]]
 id = "canonical-command-gate-separation"

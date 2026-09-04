@@ -25,6 +25,8 @@ use codex_validation_contracts::inventory_v2::frozen_baseline_obligation_id;
 use codex_validation_contracts::inventory_v2::missing_baseline_declaration_id;
 use codex_validation_contracts::inventory_v2::missing_baseline_obligation_id;
 use codex_validation_contracts::inventory_v2::validate_inventory_ledger_predecessor_closure;
+use codex_validation_contracts::inventory_v2::validate_inventory_ledger_predecessor_closure_with_recapture;
+use codex_validation_contracts::inventory_v2::validate_inventory_ledger_predecessor_closure_with_recaptures;
 use codex_validation_contracts::path::StrictRepositoryPathV1;
 use codex_validation_contracts::receipts::ConfirmedFailureClassificationV1;
 use codex_validation_contracts::receipts::ConfirmedFailureReceiptV1;
@@ -40,6 +42,7 @@ use codex_validation_contracts::receipts::ValidationAttemptClassificationV1;
 use codex_validation_contracts::receipts::ValidationReceiptProjectionV1;
 use codex_validation_contracts::recovery::CanonicalParameterProjectionV1;
 use codex_validation_contracts::recovery::InventoryRecoveryAuthorityV1;
+use codex_validation_contracts::recovery::RecoveredChildSourceV1;
 use codex_validation_contracts::recovery::RecoveryTransitionReceiptV1;
 use codex_validation_contracts::runner::RunnerSelectorV1;
 use codex_validation_contracts::runner::TestRouteIdV1;
@@ -58,6 +61,8 @@ use serde_json::Value;
 use serde_json::json;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::process::Command;
 
 #[derive(Debug, Deserialize)]
@@ -727,6 +732,160 @@ fn active_host_applicability_is_authority_authenticated() {
 }
 
 #[test]
+fn frozen_unittest_ledger_partitions_hidden_rows_from_executable_recapture() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("validation-contracts is nested under codex-rs");
+    let frozen_inventory: Value = serde_json::from_slice(
+        &std::fs::read(repo_root.join(".codex/validation/frozen-test-inventory-v1.json"))
+            .expect("frozen V1 inventory is readable"),
+    )
+    .expect("frozen V1 inventory parses");
+    let predecessor_ledger: Value = serde_json::from_slice(
+        &std::fs::read(repo_root.join(".codex/validation/test-replacements-v1.json"))
+            .expect("frozen V1 replacement ledger is readable"),
+    )
+    .expect("frozen V1 replacement ledger parses");
+
+    let unittest_parent_ids = frozen_inventory["tests"]
+        .as_array()
+        .expect("frozen V1 inventory has tests")
+        .iter()
+        .filter(|entry| entry["framework"] == "python-unittest")
+        .map(|entry| {
+            entry["baseline_id"]
+                .as_str()
+                .expect("unittest baseline ID is a string")
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    let hidden_parent_ids = unittest_parent_ids
+        .iter()
+        .filter(|baseline_id| baseline_id.starts_with("hidden-at-freeze-v1::python-unittest::"))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let executable_parent_ids = unittest_parent_ids
+        .difference(&hidden_parent_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(unittest_parent_ids.len(), 909);
+    assert_eq!(executable_parent_ids.len(), 893);
+    assert_eq!(hidden_parent_ids.len(), 16);
+    assert!(executable_parent_ids.is_disjoint(&hidden_parent_ids));
+    assert_eq!(
+        executable_parent_ids
+            .union(&hidden_parent_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        unittest_parent_ids
+    );
+    let hidden_parent_ids_for_hash = hidden_parent_ids.iter().cloned().collect::<Vec<_>>();
+    assert_eq!(
+        proof_hash(
+            "kd4.unittest-hidden-ledger-parent-ids.v1",
+            &hidden_parent_ids_for_hash,
+        )
+        .expect("hidden unittest set hashes")
+        .as_str(),
+        "936330f9e9a23c8d628f651a1ed31b3f4ea836a06cf152a6acf09cff898ebc40"
+    );
+
+    let predecessor_rows = predecessor_ledger["rows"]
+        .as_array()
+        .expect("frozen V1 ledger has rows")
+        .iter()
+        .filter_map(|row| {
+            let baseline_id = row["baseline_id"].as_str()?;
+            unittest_parent_ids
+                .contains(baseline_id)
+                .then_some((baseline_id.to_owned(), row))
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        predecessor_rows.keys().cloned().collect::<BTreeSet<_>>(),
+        unittest_parent_ids,
+        "the predecessor ledger must retain every one of the 909 unittest identities"
+    );
+    let replacement_ids = predecessor_rows
+        .iter()
+        .filter(|(_, row)| row["resolution"] == "replacement")
+        .map(|(baseline_id, _)| baseline_id.clone())
+        .collect::<Vec<_>>();
+    let executable_replacement_ids = replacement_ids
+        .iter()
+        .filter(|baseline_id| executable_parent_ids.contains(*baseline_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unresolved_ids = predecessor_rows
+        .iter()
+        .filter(|(_, row)| row["resolution"] == "unresolved")
+        .map(|(baseline_id, _)| baseline_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(replacement_ids.len(), 536);
+    assert_eq!(executable_replacement_ids.len(), 520);
+    assert_eq!(unresolved_ids.len(), 373);
+    assert_eq!(
+        proof_hash("kd4.unittest-parent-replacement-ids.v1", &replacement_ids,)
+            .expect("all replacement unittest IDs hash")
+            .as_str(),
+        "59202883ef32488ae9a488345b2401400794d961e5d539c58fd6364e86f25fe1"
+    );
+    assert_eq!(
+        proof_hash(
+            "kd4.unittest-parent-replacement-ids.v1",
+            &executable_replacement_ids,
+        )
+        .expect("executable replacement unittest IDs hash")
+        .as_str(),
+        "208d6735c1413d94c503a453331889fe5709b8eca540cf9c13993c42f9bb8cf7"
+    );
+    assert_eq!(
+        proof_hash("kd4.unittest-parent-unresolved-ids.v1", &unresolved_ids)
+            .expect("unresolved unittest IDs hash")
+            .as_str(),
+        "d1e66a89d1a943b60f6516bc9550102306919d6ae673bee4027595a3df8036f7"
+    );
+    for hidden_parent_id in &hidden_parent_ids {
+        let row = predecessor_rows
+            .get(hidden_parent_id)
+            .expect("hidden parent has its frozen ledger row");
+        assert_eq!(row["resolution"], "replacement");
+        let native_id = hidden_parent_id
+            .strip_prefix("hidden-at-freeze-v1::")
+            .expect("hidden identity has the authenticated prefix");
+        assert_eq!(row["replacement_ids"], json!([native_id]));
+        assert!(!executable_parent_ids.contains(hidden_parent_id));
+    }
+    assert!(
+        codex_validation_contracts::recovery::UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256
+            .is_none(),
+        "no synthetic accepted packet may replace the unavailable freeze-site authority"
+    );
+
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let python_constants = Command::new(python)
+        .args([
+            "-c",
+            "from scripts.completion_proof_inventory_v2 import UNITTEST_V1_HIDDEN_PARENT_IDS_SHA256, UNITTEST_V1_REPLACEMENT_PARENT_IDS_SHA256, UNITTEST_V1_EXECUTABLE_REPLACEMENT_PARENT_IDS_SHA256, UNITTEST_V1_UNRESOLVED_PARENT_IDS_SHA256; print('|'.join([UNITTEST_V1_HIDDEN_PARENT_IDS_SHA256, UNITTEST_V1_REPLACEMENT_PARENT_IDS_SHA256, UNITTEST_V1_EXECUTABLE_REPLACEMENT_PARENT_IDS_SHA256, UNITTEST_V1_UNRESOLVED_PARENT_IDS_SHA256]))",
+        ])
+        .current_dir(repo_root)
+        .output()
+        .expect("Python exposes the unittest partition anchors");
+    assert!(
+        python_constants.status.success(),
+        "Python partition anchor lookup failed: {}",
+        String::from_utf8_lossy(&python_constants.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(python_constants.stdout)
+            .expect("Python partition anchors are UTF-8")
+            .trim(),
+        "936330f9e9a23c8d628f651a1ed31b3f4ea836a06cf152a6acf09cff898ebc40|59202883ef32488ae9a488345b2401400794d961e5d539c58fd6364e86f25fe1|208d6735c1413d94c503a453331889fe5709b8eca540cf9c13993c42f9bb8cf7|d1e66a89d1a943b60f6516bc9550102306919d6ae673bee4027595a3df8036f7"
+    );
+}
+
+#[test]
 fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -757,9 +916,9 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
         })
     );
     let expected_artifact_hashes = json!({
-        "inventory": "dc56bb7b791cf0f02b371c401b1102008630128fde3d1004a36cbd0c38585cf8",
-        "ledger": "41180629e2a756c57cd355a566532b555237e546060ee836020c6982b7d5d887",
-        "recovery": "a6667bd8e3ea1359a0fcfa6e597c413d472f84d8fb541fafdfd6bc484c7a7e7f",
+        "inventory": "e0ddc09c36fe346e511256a6fd1011f3892606e3150e2c045ccae14cdfb6807a",
+        "ledger": "651f98d60ca3e0c6755dfecf87c46e251494ad6f05397aa502ca1a4c4a000eb6",
+        "recovery": "2d6e7ee1aa26ce1094f93f38152f63fc54e6db7c569a8e7acf51a709896a1712",
     });
     assert_eq!(bundle["artifact_sha256"], expected_artifact_hashes);
     for name in ["inventory", "ledger", "recovery"] {
@@ -771,15 +930,15 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
     }
     assert_eq!(
         bundle["inventory"]["authority"]["semantic_sha256"],
-        "d45c12c1ebce43c55a2a7f290bc1ac7340e65c8b304cc6f54aeb1498d0ec2db0"
+        "46b2bde1834a893f7d9851a92cb10e3ac2b2348555288a873f14941040d79288"
     );
     assert_eq!(
         bundle["ledger"]["semantic_sha256"],
-        "eaf80a458a8efc80057a877af5854379caad6d52c4722d0e3bc44ecacc1bf95c"
+        "134ed74a5ac1ca9c4d3c5080ec441439b1081895f31f180214f2432dee490db8"
     );
     assert_eq!(
         bundle["recovery"]["semantic_sha256"],
-        "8b4738293b8483e92856b86bba71cd35eeae5b29bbf750f6f52022e14417cea9"
+        "34b80e4f41d380d6e9c83e3182a80f7d35250b3284973dee75dcb67802a6dde0"
     );
 
     let inventory: FrozenTestInventoryV2 =
@@ -852,27 +1011,224 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
     );
     let recovery_raw =
         canonical_jcs(&bundle["recovery"]).expect("full-scale recovery authority canonicalizes");
+    let doctest_recapture_raw = canonical_jcs(&bundle["doctest_recapture"])
+        .expect("full-scale doctest recapture packet canonicalizes");
     let mut noncanonical_recovery_raw = recovery_raw.clone();
     noncanonical_recovery_raw.push(b'\n');
     assert!(
-        validate_inventory_ledger_predecessor_closure(
+        validate_inventory_ledger_predecessor_closure_with_recapture(
             &inventory,
             &ledger,
             &noncanonical_recovery_raw,
             &transition_receipts,
             &issuer,
+            Some(&doctest_recapture_raw),
         )
         .is_err(),
         "closure rejects noncanonical recovery bytes instead of reconstructing a raw hash"
     );
-    validate_inventory_ledger_predecessor_closure(
+    assert!(
+        validate_inventory_ledger_predecessor_closure(
+            &inventory,
+            &ledger,
+            &recovery_raw,
+            &transition_receipts,
+            &issuer,
+        )
+        .is_err(),
+        "resolved doctest closure rejects an omitted typed recapture packet"
+    );
+    validate_inventory_ledger_predecessor_closure_with_recapture(
         &inventory,
         &ledger,
         &recovery_raw,
         &transition_receipts,
         &issuer,
+        Some(&doctest_recapture_raw),
     )
     .expect("full-scale predecessor closure validates in Rust");
+    validate_inventory_ledger_predecessor_closure_with_recaptures(
+        &inventory,
+        &ledger,
+        &recovery_raw,
+        &transition_receipts,
+        &issuer,
+        Some(&doctest_recapture_raw),
+        None,
+        None,
+    )
+    .expect("strongest closure preserves pending-unittest Python/Rust parity");
+    assert!(
+        validate_inventory_ledger_predecessor_closure_with_recaptures(
+            &inventory,
+            &ledger,
+            &recovery_raw,
+            &transition_receipts,
+            &issuer,
+            Some(&doctest_recapture_raw),
+            Some(&doctest_recapture_raw),
+            None,
+        )
+        .is_err(),
+        "strongest closure rejects a foreign typed packet in the unittest slot"
+    );
+
+    let mut authority_tampered_receipts_value = bundle["transition_receipts"].clone();
+    let authority_tampered_receipt = authority_tampered_receipts_value
+        .as_array_mut()
+        .expect("transition receipts are an array")
+        .iter_mut()
+        .find(|receipt| {
+            receipt["recapture_receipt_sha256"] == bundle["doctest_recapture"]["receipt_sha256"]
+        })
+        .expect("fixture has a doctest transition receipt");
+    authority_tampered_receipt["authority_before_semantic_sha256"] = json!("f".repeat(64));
+    refresh_transition_receipt_hash(authority_tampered_receipt);
+    let authority_tampered_receipt_hash = authority_tampered_receipt["receipt_sha256"].clone();
+    let authority_tampered_receipts: Vec<RecoveryTransitionReceiptV1> =
+        serde_json::from_value(authority_tampered_receipts_value)
+            .expect("authority-tampered receipts parse");
+    for receipt in &authority_tampered_receipts {
+        receipt
+            .validate()
+            .expect("authority-tampered receipt remains internally valid");
+    }
+
+    let mut authority_tampered_recovery_value = bundle["recovery"].clone();
+    let authority_tampered_doctest_record = authority_tampered_recovery_value["records"]
+        .as_array_mut()
+        .expect("recovery records are an array")
+        .iter_mut()
+        .find(|record| record["kind"] == "doctest")
+        .expect("fixture has a doctest recovery");
+    authority_tampered_doctest_record["transition_receipt_sha256"] =
+        authority_tampered_receipt_hash.clone();
+    refresh_recovery_hashes(&mut authority_tampered_recovery_value);
+    let authority_tampered_recovery_raw = canonical_jcs(&authority_tampered_recovery_value)
+        .expect("authority-tampered recovery canonicalizes");
+
+    let mut authority_tampered_inventory_value = bundle["inventory"].clone();
+    authority_tampered_inventory_value["recovery_authority"]["raw_sha256"] = json!(format!(
+        "{:x}",
+        Sha256::digest(&authority_tampered_recovery_raw)
+    ));
+    authority_tampered_inventory_value["recovery_authority"]["semantic_sha256"] =
+        authority_tampered_recovery_value["semantic_sha256"].clone();
+    authority_tampered_inventory_value["recovery_authority"]["self_hash"] =
+        authority_tampered_recovery_value["self_hash"].clone();
+    refresh_inventory_hashes(&mut authority_tampered_inventory_value);
+    let authority_tampered_inventory: FrozenTestInventoryV2 =
+        serde_json::from_value(authority_tampered_inventory_value.clone())
+            .expect("authority-tampered inventory parses");
+    authority_tampered_inventory
+        .validate()
+        .expect("authority-tampered inventory remains internally valid");
+
+    let mut authority_tampered_ledger_value = bundle["ledger"].clone();
+    authority_tampered_ledger_value["inventory_authority"] = json!({
+        "path": ".codex/validation/frozen-test-inventory-v2.json",
+        "raw_sha256": authority_tampered_inventory_value["authority"]["raw_sha256"],
+        "semantic_sha256": authority_tampered_inventory_value["authority"]["semantic_sha256"],
+        "self_hash": authority_tampered_inventory_value["authority"]["self_hash"],
+    });
+    let authority_tampered_container = authority_tampered_ledger_value["rows"]
+        .as_array_mut()
+        .expect("ledger rows are an array")
+        .iter_mut()
+        .find(|row| row["disposition"]["kind"] == "recovered-container")
+        .expect("fixture has a recovered doctest container");
+    authority_tampered_container["disposition"]["transition_receipt_sha256"] =
+        authority_tampered_receipt_hash;
+    refresh_ledger_hashes(&mut authority_tampered_ledger_value);
+    let authority_tampered_ledger: TestReplacementLedgerV2 =
+        serde_json::from_value(authority_tampered_ledger_value)
+            .expect("authority-tampered ledger parses");
+    authority_tampered_ledger
+        .validate()
+        .expect("authority-tampered ledger remains internally valid");
+    let error = validate_inventory_ledger_predecessor_closure_with_recaptures(
+        &authority_tampered_inventory,
+        &authority_tampered_ledger,
+        &authority_tampered_recovery_raw,
+        &authority_tampered_receipts,
+        &issuer,
+        Some(&doctest_recapture_raw),
+        None,
+        None,
+    )
+    .expect_err("closure rejects a self-consistently rehashed false predecessor authority");
+    assert!(
+        error.to_string().contains("actual predecessor authority"),
+        "transition tampering must be rejected against reconstructed authority: {error}"
+    );
+
+    let mut child_tampered_recovery_value = bundle["recovery"].clone();
+    let doctest_record = child_tampered_recovery_value["records"]
+        .as_array_mut()
+        .expect("recovery records are an array")
+        .iter_mut()
+        .find(|record| record["kind"] == "doctest")
+        .expect("fixture has a resolved doctest record");
+    doctest_record["resolution"]["child_sources"]
+        .as_array_mut()
+        .expect("doctest child sources are an array")[0]["executable_identity"]["validation_id"] =
+        json!("rust.doctest.tampered");
+    sort_recovered_children(doctest_record);
+    refresh_recovery_hashes(&mut child_tampered_recovery_value);
+    let child_tampered_recovery_raw = canonical_jcs(&child_tampered_recovery_value)
+        .expect("child-tampered recovery authority canonicalizes");
+    let child_tampered_recovery: InventoryRecoveryAuthorityV1 =
+        serde_json::from_value(child_tampered_recovery_value.clone())
+            .expect("child-tampered recovery parses");
+    child_tampered_recovery
+        .validate()
+        .expect("child-tampered recovery remains internally valid");
+
+    let mut child_tampered_inventory_value = bundle["inventory"].clone();
+    child_tampered_inventory_value["recovery_authority"]["raw_sha256"] = json!(format!(
+        "{:x}",
+        Sha256::digest(&child_tampered_recovery_raw)
+    ));
+    child_tampered_inventory_value["recovery_authority"]["semantic_sha256"] =
+        child_tampered_recovery_value["semantic_sha256"].clone();
+    child_tampered_inventory_value["recovery_authority"]["self_hash"] =
+        child_tampered_recovery_value["self_hash"].clone();
+    refresh_inventory_hashes(&mut child_tampered_inventory_value);
+    let child_tampered_inventory: FrozenTestInventoryV2 =
+        serde_json::from_value(child_tampered_inventory_value.clone())
+            .expect("child-tampered inventory parses");
+    child_tampered_inventory
+        .validate()
+        .expect("child-tampered inventory remains internally valid");
+
+    let mut child_tampered_ledger_value = bundle["ledger"].clone();
+    child_tampered_ledger_value["inventory_authority"] = json!({
+        "path": ".codex/validation/frozen-test-inventory-v2.json",
+        "raw_sha256": child_tampered_inventory_value["authority"]["raw_sha256"],
+        "semantic_sha256": child_tampered_inventory_value["authority"]["semantic_sha256"],
+        "self_hash": child_tampered_inventory_value["authority"]["self_hash"],
+    });
+    refresh_ledger_hashes(&mut child_tampered_ledger_value);
+    let child_tampered_ledger: TestReplacementLedgerV2 =
+        serde_json::from_value(child_tampered_ledger_value).expect("child-tampered ledger parses");
+    child_tampered_ledger
+        .validate()
+        .expect("child-tampered ledger remains internally valid");
+    let error = validate_inventory_ledger_predecessor_closure_with_recapture(
+        &child_tampered_inventory,
+        &child_tampered_ledger,
+        &child_tampered_recovery_raw,
+        &transition_receipts,
+        &issuer,
+        Some(&doctest_recapture_raw),
+    )
+    .expect_err("packet closure rejects a different doctest validation identity");
+    assert!(
+        error
+            .to_string()
+            .contains("doctest recovery does not exactly materialize"),
+        "tampering must be rejected by exact typed-packet child comparison: {error}"
+    );
 
     let mut forged_value = bundle["ledger"].clone();
     forged_value["rows"][0]["obligation_id"] = json!("inventory-obligation-v2.forged");
@@ -883,12 +1239,13 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
         .validate()
         .expect("forged ledger has internally consistent hashes");
     assert!(
-        validate_inventory_ledger_predecessor_closure(
+        validate_inventory_ledger_predecessor_closure_with_recapture(
             &inventory,
             &forged,
             &recovery_raw,
             &transition_receipts,
             &issuer,
+            Some(&doctest_recapture_raw),
         )
         .is_err(),
         "closure rejects a forged obligation even after ledger hashes are recomputed"
@@ -916,12 +1273,13 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
             .validate()
             .expect("omitted ledger has internally consistent hashes");
         assert!(
-            validate_inventory_ledger_predecessor_closure(
+            validate_inventory_ledger_predecessor_closure_with_recapture(
                 &inventory,
                 &omitted,
                 &recovery_raw,
                 &transition_receipts,
                 &issuer,
+                Some(&doctest_recapture_raw),
             )
             .is_err(),
             "closure rejects an omitted missing-baseline declaration row"
@@ -944,12 +1302,13 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
             .validate()
             .expect("duplicate ledger has internally consistent hashes");
         assert!(
-            validate_inventory_ledger_predecessor_closure(
+            validate_inventory_ledger_predecessor_closure_with_recapture(
                 &inventory,
                 &duplicate,
                 &recovery_raw,
                 &transition_receipts,
                 &issuer,
+                Some(&doctest_recapture_raw),
             )
             .is_err(),
             "closure rejects duplicate nonbaseline obligation rows"
@@ -976,12 +1335,13 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
             .validate()
             .expect("unknown-obligation ledger has internally consistent hashes");
         assert!(
-            validate_inventory_ledger_predecessor_closure(
+            validate_inventory_ledger_predecessor_closure_with_recapture(
                 &inventory,
                 &unknown,
                 &recovery_raw,
                 &transition_receipts,
                 &issuer,
+                Some(&doctest_recapture_raw),
             )
             .is_err(),
             "closure rejects an unknown substituted nonbaseline obligation"
@@ -1020,12 +1380,13 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
             .validate()
             .expect("provenance-substituted ledger has internally consistent hashes");
         assert!(
-            validate_inventory_ledger_predecessor_closure(
+            validate_inventory_ledger_predecessor_closure_with_recapture(
                 &inventory,
                 &substituted,
                 &recovery_raw,
                 &transition_receipts,
                 &issuer,
+                Some(&doctest_recapture_raw),
             )
             .is_err(),
             "closure rejects baseline-null exception provenance from another declaration"
@@ -1562,6 +1923,66 @@ fn refresh_inventory_hashes(inventory: &mut Value) {
         .expect("authority projection hashes")
         .to_string(),
     );
+}
+
+fn refresh_recovery_hashes(recovery: &mut Value) {
+    let semantic_projection = json!({
+        "format_id": recovery["format_id"],
+        "frozen_source_authority": recovery["frozen_source_authority"],
+        "records": recovery["records"],
+        "schema_version": recovery["schema_version"],
+    });
+    recovery["semantic_sha256"] = Value::String(
+        proof_hash(
+            InventoryRecoveryAuthorityV1::SEMANTIC_HASH_DOMAIN,
+            &semantic_projection,
+        )
+        .expect("recovery semantic projection hashes")
+        .to_string(),
+    );
+    let self_projection = json!({
+        "format_id": recovery["format_id"],
+        "frozen_source_authority": recovery["frozen_source_authority"],
+        "records": recovery["records"],
+        "schema_version": recovery["schema_version"],
+        "semantic_sha256": recovery["semantic_sha256"],
+    });
+    recovery["self_hash"] = Value::String(
+        proof_hash(
+            InventoryRecoveryAuthorityV1::SELF_HASH_DOMAIN,
+            &self_projection,
+        )
+        .expect("recovery self projection hashes")
+        .to_string(),
+    );
+}
+
+fn refresh_transition_receipt_hash(receipt: &mut Value) {
+    let projection = json!({
+        "authority_before_semantic_sha256": receipt["authority_before_semantic_sha256"],
+        "child_obligation_ids": receipt["child_obligation_ids"],
+        "frozen_source_authority_sha256": receipt["frozen_source_authority_sha256"],
+        "parent_container_ids": receipt["parent_container_ids"],
+        "recapture_receipt_sha256": receipt["recapture_receipt_sha256"],
+        "schema_version": receipt["schema_version"],
+    });
+    receipt["receipt_sha256"] = Value::String(
+        proof_hash(RecoveryTransitionReceiptV1::HASH_DOMAIN, &projection)
+            .expect("transition receipt projection hashes")
+            .to_string(),
+    );
+}
+
+fn sort_recovered_children(record: &mut Value) {
+    record["resolution"]["child_sources"]
+        .as_array_mut()
+        .expect("recovered child sources are an array")
+        .sort_by_key(|child| {
+            serde_json::from_value::<RecoveredChildSourceV1>(child.clone())
+                .expect("recovered child source parses")
+                .obligation_id()
+                .expect("recovered child obligation hashes")
+        });
 }
 
 fn refresh_ledger_hashes(ledger: &mut Value) {
