@@ -11,11 +11,15 @@ use crate::config::ConfigBuilder;
 use crate::context::ContextualUserFragment;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
+use crate::tasks::SessionTask;
+use crate::tasks::SessionTaskResult;
+use crate::tasks::TurnTaskResult;
 use crate::thread_manager::StartThreadOptions;
 use assert_matches::assert_matches;
 use codex_agent_graph_store::AgentGraphStore;
 use codex_agent_graph_store::AgentGraphStoreError;
 use codex_agent_graph_store::AgentGraphStoreFuture;
+use codex_agent_graph_store::LocalAgentGraphStore;
 use codex_agent_graph_store::ThreadSpawnEdgeStatus;
 use codex_agent_task_store::AcceptanceCriterion;
 use codex_agent_task_store::AgentRole;
@@ -57,6 +61,8 @@ use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::PathUri;
 use core_test_support::responses::strip_response_item_ids;
 use pretty_assertions::assert_eq;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::sleep;
@@ -191,6 +197,35 @@ impl AgentControlHarness {
         }
     }
 
+    async fn new_with_local_agent_graph_store() -> (Self, Arc<LocalAgentGraphStore>) {
+        let (home, config) = test_config().await;
+        let state_db = init_state_db(&config).await;
+        let graph_store = Arc::new(LocalAgentGraphStore::new(
+            state_db
+                .clone()
+                .expect("local state should be available for agent graph tests"),
+        ));
+        let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+            CodexAuth::from_api_key("dummy"),
+            config.model_provider.clone(),
+            config.codex_home.to_path_buf(),
+            std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            state_db.clone(),
+        )
+        .with_agent_graph_store_for_tests(Some(graph_store.clone()));
+        let control = manager.agent_control();
+        (
+            Self {
+                _home: home,
+                config,
+                state_db,
+                manager,
+                control,
+            },
+            graph_store,
+        )
+    }
+
     async fn start_thread(&self) -> (ThreadId, Arc<CodexThread>) {
         let new_thread = self
             .manager
@@ -301,6 +336,137 @@ impl AgentGraphStore for FailingAgentGraphStore {
         _status_filter: Option<ThreadSpawnEdgeStatus>,
     ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>> {
         Box::pin(std::future::ready(Ok(Vec::new())))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TestGraphProjection {
+    descendants: Vec<ThreadId>,
+    edges: Vec<(ThreadId, ThreadId, ThreadSpawnEdgeStatus)>,
+    duplicate_open_child: Option<ThreadId>,
+}
+
+#[derive(Default)]
+struct ScriptedAgentGraphStore {
+    projections: std::sync::Mutex<Vec<TestGraphProjection>>,
+    active_projection: AtomicUsize,
+    descendant_reads: AtomicUsize,
+}
+
+impl ScriptedAgentGraphStore {
+    fn new(projections: Vec<TestGraphProjection>) -> Self {
+        Self {
+            projections: std::sync::Mutex::new(projections),
+            active_projection: AtomicUsize::new(0),
+            descendant_reads: AtomicUsize::new(0),
+        }
+    }
+
+    fn projection(&self) -> TestGraphProjection {
+        let projections = self
+            .projections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = self
+            .active_projection
+            .load(Ordering::SeqCst)
+            .min(projections.len().saturating_sub(1));
+        projections
+            .get(index)
+            .cloned()
+            .unwrap_or(TestGraphProjection {
+                descendants: Vec::new(),
+                edges: Vec::new(),
+                duplicate_open_child: None,
+            })
+    }
+}
+
+impl AgentGraphStore for ScriptedAgentGraphStore {
+    fn upsert_thread_spawn_edge(
+        &self,
+        _parent_thread_id: ThreadId,
+        _child_thread_id: ThreadId,
+        _status: ThreadSpawnEdgeStatus,
+    ) -> AgentGraphStoreFuture<'_, ()> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn set_thread_spawn_edge_status(
+        &self,
+        _child_thread_id: ThreadId,
+        _status: ThreadSpawnEdgeStatus,
+    ) -> AgentGraphStoreFuture<'_, ()> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn list_thread_spawn_children(
+        &self,
+        parent_thread_id: ThreadId,
+        status_filter: Option<ThreadSpawnEdgeStatus>,
+    ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>> {
+        let projection = self.projection();
+        let mut children = projection
+            .edges
+            .iter()
+            .filter(|(parent, _, status)| {
+                *parent == parent_thread_id && status_filter.is_none_or(|filter| filter == *status)
+            })
+            .map(|(_, child, _)| *child)
+            .collect::<Vec<_>>();
+        if status_filter == Some(ThreadSpawnEdgeStatus::Open)
+            && let Some(duplicate) = projection.duplicate_open_child
+            && children.contains(&duplicate)
+        {
+            children.push(duplicate);
+        }
+        Box::pin(std::future::ready(Ok(children)))
+    }
+
+    fn list_thread_spawn_descendants(
+        &self,
+        _root_thread_id: ThreadId,
+        _status_filter: Option<ThreadSpawnEdgeStatus>,
+    ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>> {
+        let read = self.descendant_reads.fetch_add(1, Ordering::SeqCst);
+        let projection_count = self
+            .projections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        self.active_projection.store(
+            read.min(projection_count.saturating_sub(1)),
+            Ordering::SeqCst,
+        );
+        Box::pin(std::future::ready(Ok(self.projection().descendants)))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FinalMessageTask;
+
+impl SessionTask for FinalMessageTask {
+    fn kind(&self) -> crate::state::TaskKind {
+        crate::state::TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.descendant_quiescence_finalization"
+    }
+
+    fn run(
+        self: Arc<Self>,
+        _session: Arc<crate::session::session::Session>,
+        _ctx: Arc<crate::session::turn_context::TurnContext>,
+        _input: Vec<crate::session::TurnInput>,
+        _cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async {
+            Ok(TurnTaskResult {
+                last_agent_message: Some("must remain buffered".to_string()),
+                ..Default::default()
+            })
+        })
     }
 }
 
@@ -542,6 +708,429 @@ async fn legacy_resume_reports_spawn_graph_read_failure() {
             .contains("failed to load persisted thread-spawn children"),
         "unexpected error: {error}"
     );
+}
+
+#[tokio::test]
+async fn terminal_publication_rejects_persisted_open_direct_child() {
+    let (harness, graph_store) = AgentControlHarness::new_with_local_agent_graph_store().await;
+    let (root_thread_id, _root_thread) = harness.start_thread().await;
+    let child_thread_id = ThreadId::new();
+    graph_store
+        .upsert_thread_spawn_edge(root_thread_id, child_thread_id, ThreadSpawnEdgeStatus::Open)
+        .await
+        .expect("persist open direct child");
+
+    let Err(error) = harness
+        .control
+        .begin_terminal_publication(root_thread_id)
+        .await
+    else {
+        panic!("persisted open child must block terminal publication");
+    };
+
+    assert_matches!(
+        error,
+        CodexErr::UnsupportedOperation(message)
+            if message.contains(&child_thread_id.to_string())
+                && message.contains("persisted open")
+    );
+}
+
+#[tokio::test]
+async fn terminal_publication_rejects_persisted_open_grandchild_below_closed_parent() {
+    let (harness, graph_store) = AgentControlHarness::new_with_local_agent_graph_store().await;
+    let (root_thread_id, _root_thread) = harness.start_thread().await;
+    let child_thread_id = ThreadId::new();
+    let grandchild_thread_id = ThreadId::new();
+    graph_store
+        .upsert_thread_spawn_edge(
+            root_thread_id,
+            child_thread_id,
+            ThreadSpawnEdgeStatus::Closed,
+        )
+        .await
+        .expect("persist closed direct child");
+    graph_store
+        .upsert_thread_spawn_edge(
+            child_thread_id,
+            grandchild_thread_id,
+            ThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("persist open grandchild");
+
+    let Err(error) = harness
+        .control
+        .begin_terminal_publication(root_thread_id)
+        .await
+    else {
+        panic!("open grandchild below a closed parent must block terminal publication");
+    };
+
+    assert_matches!(
+        error,
+        CodexErr::UnsupportedOperation(message)
+            if message.contains(&grandchild_thread_id.to_string())
+                && message.contains("persisted open")
+                && !message.contains(&format!("{child_thread_id} (persisted open)"))
+    );
+}
+
+#[tokio::test]
+async fn terminal_publication_accepts_fully_closed_persisted_tree() {
+    let (harness, graph_store) = AgentControlHarness::new_with_local_agent_graph_store().await;
+    let (root_thread_id, _root_thread) = harness.start_thread().await;
+    let child_thread_id = ThreadId::new();
+    let grandchild_thread_id = ThreadId::new();
+    graph_store
+        .upsert_thread_spawn_edge(
+            root_thread_id,
+            child_thread_id,
+            ThreadSpawnEdgeStatus::Closed,
+        )
+        .await
+        .expect("persist closed direct child");
+    graph_store
+        .upsert_thread_spawn_edge(
+            child_thread_id,
+            grandchild_thread_id,
+            ThreadSpawnEdgeStatus::Closed,
+        )
+        .await
+        .expect("persist closed grandchild");
+
+    let closing_guard = harness
+        .control
+        .begin_terminal_publication(root_thread_id)
+        .await
+        .expect("fully closed persisted tree should allow terminal publication");
+
+    drop(closing_guard);
+}
+
+#[tokio::test]
+async fn terminal_publication_fails_closed_on_persisted_graph_read_error() {
+    let (home, config) = test_config().await;
+    let graph_store = Arc::new(FailingAgentGraphStore::failing_list());
+    let harness =
+        AgentControlHarness::new_with_config_and_agent_graph_store(home, config, Some(graph_store))
+            .await;
+    let (root_thread_id, _root_thread) = harness.start_thread().await;
+
+    let Err(error) = harness
+        .control
+        .begin_terminal_publication(root_thread_id)
+        .await
+    else {
+        panic!("persisted graph read failure must block terminal publication");
+    };
+
+    assert_matches!(
+        error,
+        CodexErr::Fatal(message)
+            if message.contains("failed to load persisted thread-spawn children")
+    );
+}
+
+#[tokio::test]
+async fn terminal_publication_uses_manager_issued_root_for_fork_lineage() {
+    let original_root_thread_id = ThreadId::new();
+    let fork_thread_id = ThreadId::new();
+    let child_thread_id = ThreadId::new();
+    let (harness, graph_store) = AgentControlHarness::new_with_local_agent_graph_store().await;
+    graph_store
+        .upsert_thread_spawn_edge(
+            original_root_thread_id,
+            child_thread_id,
+            ThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("persist open child below the original root");
+    let control = harness
+        .control
+        .clone()
+        .with_terminal_quiescence_root_thread_id(original_root_thread_id);
+
+    let Err(error) = control.begin_terminal_publication(fork_thread_id).await else {
+        panic!("an open descendant of the original task root must block a fork");
+    };
+
+    assert_matches!(
+        error,
+        CodexErr::UnsupportedOperation(message)
+            if message.contains(&child_thread_id.to_string())
+                && message.contains("persisted open")
+    );
+}
+
+#[tokio::test]
+async fn terminal_publication_rejects_closed_edge_reparenting_between_reads() {
+    let root_thread_id = ThreadId::new();
+    let child_thread_id = ThreadId::new();
+    let grandchild_thread_id = ThreadId::new();
+    let graph_store = Arc::new(ScriptedAgentGraphStore::new(vec![
+        TestGraphProjection {
+            descendants: vec![child_thread_id, grandchild_thread_id],
+            edges: vec![
+                (
+                    root_thread_id,
+                    child_thread_id,
+                    ThreadSpawnEdgeStatus::Closed,
+                ),
+                (
+                    child_thread_id,
+                    grandchild_thread_id,
+                    ThreadSpawnEdgeStatus::Closed,
+                ),
+            ],
+            duplicate_open_child: None,
+        },
+        TestGraphProjection {
+            descendants: vec![child_thread_id, grandchild_thread_id],
+            edges: vec![
+                (
+                    root_thread_id,
+                    grandchild_thread_id,
+                    ThreadSpawnEdgeStatus::Closed,
+                ),
+                (
+                    grandchild_thread_id,
+                    child_thread_id,
+                    ThreadSpawnEdgeStatus::Closed,
+                ),
+            ],
+            duplicate_open_child: None,
+        },
+    ]));
+    let (home, config) = test_config().await;
+    let harness =
+        AgentControlHarness::new_with_config_and_agent_graph_store(home, config, Some(graph_store))
+            .await;
+
+    let Err(error) = harness
+        .control
+        .begin_terminal_publication(root_thread_id)
+        .await
+    else {
+        panic!("closed-edge reparenting must invalidate terminal readiness");
+    };
+
+    assert_matches!(
+        error,
+        CodexErr::Fatal(message)
+            if message.contains("topology changed while terminal publication readiness was read")
+    );
+}
+
+#[tokio::test]
+async fn terminal_publication_rejects_duplicate_open_child_projection() {
+    let root_thread_id = ThreadId::new();
+    let child_thread_id = ThreadId::new();
+    let graph_store = Arc::new(ScriptedAgentGraphStore::new(vec![TestGraphProjection {
+        descendants: vec![child_thread_id],
+        edges: vec![(root_thread_id, child_thread_id, ThreadSpawnEdgeStatus::Open)],
+        duplicate_open_child: Some(child_thread_id),
+    }]));
+    let (home, config) = test_config().await;
+    let harness =
+        AgentControlHarness::new_with_config_and_agent_graph_store(home, config, Some(graph_store))
+            .await;
+
+    let Err(error) = harness
+        .control
+        .begin_terminal_publication(root_thread_id)
+        .await
+    else {
+        panic!("duplicate open-child rows must block terminal publication");
+    };
+
+    assert_matches!(
+        error,
+        CodexErr::Fatal(message)
+            if message.contains("open child projection")
+                && message.contains("duplicate thread IDs")
+    );
+}
+
+#[tokio::test]
+async fn real_task_finalization_checks_original_fork_lineage_and_hides_output() {
+    let original_root_thread_id = ThreadId::new();
+    let child_thread_id = ThreadId::new();
+    let (harness, graph_store) = AgentControlHarness::new_with_local_agent_graph_store().await;
+    graph_store
+        .upsert_thread_spawn_edge(
+            original_root_thread_id,
+            child_thread_id,
+            ThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("persist open child below the original root");
+    let (mut session, turn_context, rx) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut session)
+        .expect("test session should still have one owner")
+        .services
+        .agent_control = harness
+        .control
+        .clone()
+        .with_terminal_quiescence_root_thread_id(original_root_thread_id);
+
+    session
+        .start_task(turn_context, Vec::new(), FinalMessageTask)
+        .await;
+    let terminal = timeout(Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("session event channel remains open");
+            if let EventMsg::TurnComplete(completed) = event.msg {
+                break completed;
+            }
+        }
+    })
+    .await
+    .expect("real task finalization should emit a terminal event");
+
+    assert_eq!(terminal.last_agent_message, None);
+    assert_eq!(terminal.surfaced_result, None);
+    let error = terminal
+        .error
+        .expect("quiescence failure should be surfaced");
+    assert!(error.message.contains(&child_thread_id.to_string()));
+    assert!(error.message.contains("persisted open"));
+}
+
+#[tokio::test]
+async fn real_fork_task_finalization_checks_its_current_descendants_and_hides_output() {
+    let original_root_thread_id = ThreadId::new();
+    let child_thread_id = ThreadId::new();
+    let (harness, graph_store) = AgentControlHarness::new_with_local_agent_graph_store().await;
+    let (mut session, turn_context, rx) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let fork_thread_id = session.thread_id;
+    graph_store
+        .upsert_thread_spawn_edge(fork_thread_id, child_thread_id, ThreadSpawnEdgeStatus::Open)
+        .await
+        .expect("persist open child below the current fork");
+    let barrier = Arc::new(AgentControlTestBarrier::default());
+    harness
+        .control
+        .set_after_terminal_tree_freeze_barrier(Some(Arc::clone(&barrier)));
+    Arc::get_mut(&mut session)
+        .expect("test session should still have one owner")
+        .services
+        .agent_control = harness
+        .control
+        .clone()
+        .with_terminal_quiescence_root_thread_id(original_root_thread_id);
+
+    session
+        .start_task(turn_context, Vec::new(), FinalMessageTask)
+        .await;
+
+    timeout(Duration::from_secs(2), barrier.wait_until_reached())
+        .await
+        .expect("real fork finalization should freeze terminal publication roots");
+    let spawn_error = timeout(
+        Duration::from_secs(2),
+        harness.control.spawn_agent(
+            harness.config.clone(),
+            text_input("must be rejected while fork terminal output is buffered"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: fork_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        ),
+    )
+    .await
+    .expect("fork spawn admission should reject without waiting")
+    .expect_err("terminal finalization must freeze the current fork root");
+    assert!(spawn_error.to_string().contains("is closing"));
+    harness.control.set_after_terminal_tree_freeze_barrier(None);
+    barrier.release_one();
+
+    let terminal = timeout(Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("session event channel remains open");
+            if let EventMsg::TurnComplete(completed) = event.msg {
+                break completed;
+            }
+        }
+    })
+    .await
+    .expect("real fork finalization should emit a terminal event");
+
+    assert_eq!(terminal.last_agent_message, None);
+    assert_eq!(terminal.surfaced_result, None);
+    let error = terminal
+        .error
+        .expect("the fork's open descendant should block terminal publication");
+    assert!(error.message.contains(&child_thread_id.to_string()));
+    assert!(error.message.contains("persisted open"));
+}
+
+#[tokio::test]
+async fn real_task_finalization_holds_spawn_freeze_and_hides_output() {
+    let harness = AgentControlHarness::new().await;
+    let (mut session, turn_context, rx) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let root_thread_id = session.thread_id;
+    harness
+        .control
+        .register_session_root(root_thread_id, /*parent_thread_id*/ None);
+    let barrier = Arc::new(AgentControlTestBarrier::default());
+    harness
+        .control
+        .set_after_terminal_tree_freeze_barrier(Some(Arc::clone(&barrier)));
+    Arc::get_mut(&mut session)
+        .expect("test session should still have one owner")
+        .services
+        .agent_control = harness
+        .control
+        .clone()
+        .with_terminal_quiescence_root_thread_id(root_thread_id);
+    session
+        .start_task(turn_context, Vec::new(), FinalMessageTask)
+        .await;
+
+    timeout(Duration::from_secs(2), barrier.wait_until_reached())
+        .await
+        .expect("real finalization should freeze the agent tree");
+    let spawn_error = timeout(
+        Duration::from_secs(2),
+        harness.control.spawn_agent(
+            harness.config.clone(),
+            text_input("must be rejected while terminal output is buffered"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        ),
+    )
+    .await
+    .expect("spawn admission should reject without waiting")
+    .expect_err("terminal finalization must freeze child admission");
+    assert!(spawn_error.to_string().contains("is closing"));
+    harness.control.set_after_terminal_tree_freeze_barrier(None);
+    barrier.release_one();
+
+    let terminal = timeout(Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("session event channel remains open");
+            if let EventMsg::TurnComplete(completed) = event.msg {
+                break completed;
+            }
+        }
+    })
+    .await
+    .expect("real task finalization should emit a terminal event");
+    assert_eq!(terminal.last_agent_message, None);
+    assert_eq!(terminal.surfaced_result, None);
+    assert!(terminal.error.is_some());
 }
 
 #[tokio::test]
@@ -3214,7 +3803,7 @@ async fn completion_watcher_emits_terminal_metrics_for_missing_typed_receipt() {
     let child_agent_path = AgentPath::root()
         .join("worker_a")
         .expect("child agent path");
-    coordinator
+    let binding = coordinator
         .bind_agent_task(AgentTaskBindingDraft {
             assignment_id: assignment.assignment_id,
             attempt_id: attempt.attempt_id,
@@ -3231,7 +3820,7 @@ async fn completion_watcher_emits_terminal_metrics_for_missing_typed_receipt() {
         agent_nickname: None,
         agent_role: Some("worker".to_string()),
     });
-    assert!(coordinator.record_task_usage_for_source(&child_source, 0, 0));
+    assert!(coordinator.record_task_usage_for_binding(&binding, 0, 0));
     harness.control.maybe_start_completion_watcher(
         child_thread_id,
         Some(child_source.clone()),
@@ -3269,7 +3858,7 @@ async fn completion_watcher_emits_terminal_metrics_for_missing_typed_receipt() {
                 .as_ref()
                 .is_some_and(|receipt| receipt.status == AgentStatusClaim::NeedsMain);
             let metric_runtime_was_removed = missing_receipt_was_sealed
-                && !coordinator.record_task_usage_for_source(&child_source, 0, 0);
+                && !coordinator.record_task_usage_for_binding(&binding, 0, 0);
             if metric_runtime_was_removed {
                 break;
             }
@@ -3279,25 +3868,44 @@ async fn completion_watcher_emits_terminal_metrics_for_missing_typed_receipt() {
     .await
     .expect("completion watcher should seal and emit the missing-receipt outcome");
 
+    let expected_status = AgentStatus::Errored(
+        "durable typed receipt status: needs_main: typed agent /root/worker_a finished with status Completed(Some(\"done\")) without submitting a receipt"
+            .to_string(),
+    );
+    let expected_message = crate::session_prefix::format_subagent_notification_message(
+        child_agent_path.as_str(),
+        &expected_status,
+    );
+
     timeout(Duration::from_secs(5), async {
         loop {
-            let history_items = parent_thread
-                .codex
-                .session
-                .clone_history()
-                .await
-                .raw_items()
-                .to_vec();
-            if history_contains_text(&history_items, "needs_main")
-                && history_contains_text(&history_items, "blocked")
-            {
+            let history = parent_thread.codex.session.clone_history().await;
+            let found = history.raw_items().iter().any(|item| {
+                matches!(
+                    item,
+                    ResponseItem::Message { role, content, .. }
+                        if role == "user"
+                            && content.as_slice()
+                                == [ContentItem::InputText {
+                                    text: expected_message.clone(),
+                                }]
+                )
+            });
+            if found {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("completion watcher should notify the parent with the durable blocked outcome");
+    .expect("completion watcher should record the durable missing-receipt outcome");
+    assert!(
+        !harness.manager.captured_ops().into_iter().any(
+            |(thread_id, operation)| thread_id == parent_thread_id
+                && matches!(operation, Op::InterAgentCommunication { .. })
+        ),
+        "the legacy completion watcher must not submit a V2 communication"
+    );
 }
 
 #[tokio::test]

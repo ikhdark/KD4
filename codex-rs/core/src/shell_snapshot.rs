@@ -36,6 +36,7 @@ use codex_utils_pty::ManagedRootProcess;
 use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
 use codex_utils_pty::configure_windows_command_args;
 use codex_utils_pty::run_windows_process_operation;
+use codex_utils_pty::with_windows_child_creation;
 use tokio::fs;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -816,9 +817,11 @@ async fn run_script_with_timeout_with_args(
         .await
         .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))??;
     let spawn_timeout = timeout_deadline.saturating_duration_since(tokio::time::Instant::now());
-    let mut child = run_windows_process_operation(spawn_timeout, move || handler.spawn())
-        .await
-        .with_context(|| format!("Failed to execute {shell_name}"))?;
+    let mut child = run_windows_process_operation(spawn_timeout, move || {
+        with_windows_child_creation(|_| handler.spawn())
+    })
+    .await
+    .with_context(|| format!("Failed to execute {shell_name}"))?;
     let process_id = child.id().context("Snapshot command had no process id")?;
     if let Err(err) = managed.attach_and_resume(process_id) {
         let _ = managed.terminate();

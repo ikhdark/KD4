@@ -2,7 +2,9 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::path::Path;
+use std::process::ExitStatus;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -25,10 +27,54 @@ use codex_protocol::protocol::HookHandlerType;
 use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
 #[cfg(windows)]
 use codex_utils_pty::run_windows_process_operation;
+#[cfg(windows)]
+use codex_utils_pty::with_windows_child_creation;
 
 const HOOK_STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
 const HOOK_STREAM_READ_BUFFER_BYTES: usize = 16 * 1024;
 const HOOK_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct ContainedProcessTree {
+    managed: Arc<codex_utils_pty::ManagedRootProcess>,
+    process_group_id: Option<u32>,
+    armed: bool,
+}
+
+impl ContainedProcessTree {
+    fn new(managed: codex_utils_pty::ManagedRootProcess, process_group_id: Option<u32>) -> Self {
+        Self {
+            managed: Arc::new(managed),
+            process_group_id,
+            armed: true,
+        }
+    }
+
+    fn terminate_descendants(&self) -> io::Result<()> {
+        #[cfg(windows)]
+        self.managed.terminate()?;
+        #[cfg(not(windows))]
+        let _ = &self.managed;
+
+        if let Some(process_group_id) = self.process_group_id {
+            codex_utils_pty::process_group::kill_process_group(process_group_id)?;
+        }
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ContainedProcessTree {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(err) = self.terminate_descendants()
+        {
+            tracing::warn!("failed to terminate cancelled hook process tree: {err:?}");
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct CommandRunResult {
@@ -69,9 +115,75 @@ pub(crate) async fn run_command(
         handler,
         input_json,
         cwd,
-        codex_utils_pty::ManagedRootProcess::reserve_with_reclaim(),
+        codex_utils_pty::ManagedRootProcess::reserve_strict_with_reclaim(),
     )
     .await
+}
+
+/// Run one argv-based legacy hook while retaining ownership of its complete process tree.
+///
+/// The optional timeout covers process admission and execution. Dropping this future also
+/// terminates the process tree, so cancellation cannot leave a detached hook descendant alive.
+pub(crate) async fn run_contained_command(
+    mut command: Command,
+    execution_timeout: Option<Duration>,
+) -> io::Result<ExitStatus> {
+    command.kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(WINDOWS_CREATE_SUSPENDED);
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(codex_utils_pty::process_group::detach_from_tty);
+    }
+
+    let execution_deadline =
+        execution_timeout.map(|duration| tokio::time::Instant::now() + duration);
+    let run = async {
+        let managed = codex_utils_pty::ManagedRootProcess::reserve_strict_with_reclaim().await?;
+        #[cfg(windows)]
+        let mut child = run_windows_process_operation(
+            windows_operation_timeout(execution_deadline),
+            move || with_windows_child_creation(|_| command.spawn()),
+        )
+        .await?;
+        #[cfg(not(windows))]
+        let mut child = command.spawn()?;
+        let process_group_id = child.id();
+        let mut process_tree = ContainedProcessTree::new(managed, process_group_id);
+
+        #[cfg(windows)]
+        {
+            let Some(process_id) = process_group_id else {
+                let _ = terminate_command_tree(&mut child, &mut process_tree).await;
+                return Err(io::Error::other("spawned hook process has no process id"));
+            };
+            if let Err(err) =
+                attach_and_resume_with_timeout(&process_tree, process_id, execution_deadline).await
+            {
+                let _ = terminate_command_tree(&mut child, &mut process_tree).await;
+                return Err(io::Error::other(format!(
+                    "failed to contain hook process: {err}"
+                )));
+            }
+        }
+
+        let status = child.wait().await;
+        let containment = terminate_command_tree(&mut child, &mut process_tree).await;
+        let status = status?;
+        containment?;
+        Ok(status)
+    };
+
+    match (execution_timeout, execution_deadline) {
+        (Some(duration), Some(deadline)) => timeout_at(deadline, run).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("hook timed out after {}s", duration.as_secs()),
+            )
+        })?,
+        (None, None) => run.await,
+        _ => unreachable!("execution timeout and deadline must be set together"),
+    }
 }
 
 async fn run_command_with_reservation(
@@ -125,26 +237,29 @@ async fn run_command_with_reservation(
     #[cfg(windows)]
     let spawn_timeout = timeout_deadline.saturating_duration_since(tokio::time::Instant::now());
     #[cfg(windows)]
-    let mut child =
-        match run_windows_process_operation(spawn_timeout, move || command.spawn()).await {
-            Ok(child) => child,
-            Err(err) if err.kind() == io::ErrorKind::TimedOut => {
-                return finish_timeout(started_at, started, handler.timeout_sec);
-            }
-            Err(err) => {
-                return finish_command_run(
-                    started_at,
-                    started,
-                    CommandRunCompletion {
-                        exit_code: None,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        error: Some(err.to_string()),
-                        outcome: "spawn_error",
-                    },
-                );
-            }
-        };
+    let mut child = match run_windows_process_operation(spawn_timeout, move || {
+        with_windows_child_creation(|_| command.spawn())
+    })
+    .await
+    {
+        Ok(child) => child,
+        Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+            return finish_timeout(started_at, started, handler.timeout_sec);
+        }
+        Err(err) => {
+            return finish_command_run(
+                started_at,
+                started,
+                CommandRunCompletion {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some(err.to_string()),
+                    outcome: "spawn_error",
+                },
+            );
+        }
+    };
     #[cfg(not(windows))]
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -163,10 +278,13 @@ async fn run_command_with_reservation(
         }
     };
 
+    let process_group_id = child.id();
+    let mut process_tree = ContainedProcessTree::new(managed, process_group_id);
+
     #[cfg(windows)]
     {
-        let Some(process_id) = child.id() else {
-            terminate_command_tree(&mut child, &managed).await;
+        let Some(process_id) = process_group_id else {
+            let _ = terminate_command_tree(&mut child, &mut process_tree).await;
             return finish_command_run(
                 started_at,
                 started,
@@ -179,30 +297,39 @@ async fn run_command_with_reservation(
                 },
             );
         };
-        if let Err(err) = managed.attach_and_resume(process_id) {
-            terminate_command_tree(&mut child, &managed).await;
-            return finish_command_run(
-                started_at,
-                started,
-                CommandRunCompletion {
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    error: Some(format!("failed to contain hook process: {err}")),
-                    outcome: "spawn_error",
-                },
-            );
+        match attach_and_resume_with_timeout(&process_tree, process_id, Some(timeout_deadline))
+            .await
+        {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+                let _ = terminate_command_tree(&mut child, &mut process_tree).await;
+                return finish_timeout(started_at, started, handler.timeout_sec);
+            }
+            Err(err) => {
+                let _ = terminate_command_tree(&mut child, &mut process_tree).await;
+                return finish_command_run(
+                    started_at,
+                    started,
+                    CommandRunCompletion {
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error: Some(format!("failed to contain hook process: {err}")),
+                        outcome: "spawn_error",
+                    },
+                );
+            }
         }
     }
 
     if tokio::time::Instant::now() >= timeout_deadline {
-        terminate_command_tree(&mut child, &managed).await;
+        let _ = terminate_command_tree(&mut child, &mut process_tree).await;
         return finish_timeout(started_at, started, handler.timeout_sec);
     }
 
     let stdin = child.stdin.take();
     let Some(stdout) = child.stdout.take() else {
-        terminate_command_tree(&mut child, &managed).await;
+        let _ = terminate_command_tree(&mut child, &mut process_tree).await;
         return finish_command_run(
             started_at,
             started,
@@ -216,7 +343,7 @@ async fn run_command_with_reservation(
         );
     };
     let Some(stderr) = child.stderr.take() else {
-        terminate_command_tree(&mut child, &managed).await;
+        let _ = terminate_command_tree(&mut child, &mut process_tree).await;
         return finish_command_run(
             started_at,
             started,
@@ -240,14 +367,40 @@ async fn run_command_with_reservation(
             Err(err) => Err(err),
         }
     };
-    let wait_for_output = async {
-        let ((), status, stdout, stderr) = tokio::try_join!(
+    let read_output = async {
+        let ((), stdout, stderr) = tokio::try_join!(
             async { write_stdin.await.map_err(CommandRunError::Stdin) },
-            async { child.wait().await.map_err(CommandRunError::Wait) },
             async { capture_output(stdout).await.map_err(CommandRunError::Wait) },
             async { capture_output(stderr).await.map_err(CommandRunError::Wait) },
         )?;
-        Ok::<_, CommandRunError>((status, stdout, stderr))
+        Ok::<_, CommandRunError>((stdout, stderr))
+    };
+    let wait_for_output = async {
+        tokio::pin!(read_output);
+        tokio::select! {
+            status = child.wait() => {
+                let status = status.map_err(CommandRunError::Wait)?;
+                terminate_command_tree(&mut child, &mut process_tree)
+                    .await
+                    .map_err(CommandRunError::Containment)?;
+                let (stdout, stderr) = read_output.await?;
+                Ok::<_, CommandRunError>((status, stdout, stderr))
+            }
+            output = &mut read_output => {
+                let (stdout, stderr) = match output {
+                    Ok(output) => output,
+                    Err(err) => {
+                        let _ = terminate_command_tree(&mut child, &mut process_tree).await;
+                        return Err(err);
+                    }
+                };
+                let status = child.wait().await.map_err(CommandRunError::Wait)?;
+                terminate_command_tree(&mut child, &mut process_tree)
+                    .await
+                    .map_err(CommandRunError::Containment)?;
+                Ok((status, stdout, stderr))
+            }
+        }
     };
     match timeout_at(timeout_deadline, wait_for_output).await {
         Ok(Ok((status, stdout, stderr))) => {
@@ -278,12 +431,16 @@ async fn run_command_with_reservation(
             )
         }
         Ok(Err(err)) => {
-            terminate_command_tree(&mut child, &managed).await;
+            let _ = terminate_command_tree(&mut child, &mut process_tree).await;
             let (error, outcome) = match err {
                 CommandRunError::Stdin(err) => {
                     (format!("failed to write hook stdin: {err}"), "stdin_error")
                 }
                 CommandRunError::Wait(err) => (err.to_string(), "wait_error"),
+                CommandRunError::Containment(err) => (
+                    format!("failed to terminate hook process descendants: {err}"),
+                    "containment_error",
+                ),
             };
             finish_command_run(
                 started_at,
@@ -298,41 +455,57 @@ async fn run_command_with_reservation(
             )
         }
         Err(_) => {
-            terminate_command_tree(&mut child, &managed).await;
+            let _ = terminate_command_tree(&mut child, &mut process_tree).await;
             finish_timeout(started_at, started, handler.timeout_sec)
         }
     }
 }
 
+#[cfg(windows)]
+fn windows_operation_timeout(deadline: Option<tokio::time::Instant>) -> Duration {
+    deadline
+        .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .unwrap_or(codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT)
+}
+
+#[cfg(windows)]
+async fn attach_and_resume_with_timeout(
+    process_tree: &ContainedProcessTree,
+    process_id: u32,
+    deadline: Option<tokio::time::Instant>,
+) -> io::Result<()> {
+    let managed = Arc::clone(&process_tree.managed);
+    run_windows_process_operation(windows_operation_timeout(deadline), move || {
+        managed.attach_and_resume(process_id)
+    })
+    .await
+}
+
 async fn terminate_command_tree(
     child: &mut tokio::process::Child,
-    managed: &codex_utils_pty::ManagedRootProcess,
-) {
-    #[cfg(windows)]
-    if let Err(err) = managed.terminate() {
-        tracing::warn!("failed to terminate hook process Job Object: {err:?}");
-    }
-    #[cfg(not(windows))]
-    let _ = managed;
-
-    if let Some(process_group_id) = child.id()
-        && let Err(err) = codex_utils_pty::process_group::kill_process_group(process_group_id)
-    {
-        tracing::warn!("failed to kill hook process group {process_group_id}: {err:?}");
-    }
-    match terminate_with_timeout(HOOK_TERMINATION_TIMEOUT, child.kill()).await {
+    process_tree: &mut ContainedProcessTree,
+) -> io::Result<()> {
+    let descendant_result = process_tree.terminate_descendants();
+    let child_result = match terminate_with_timeout(HOOK_TERMINATION_TIMEOUT, child.kill()).await {
         Ok(Err(err))
             if err.kind() != io::ErrorKind::InvalidInput
                 && err.kind() != io::ErrorKind::NotFound =>
         {
-            tracing::warn!("failed to kill hook process: {err:?}");
+            Err(err)
         }
-        Err(_) => tracing::warn!(
-            "timed out after {:?} while killing hook process",
-            HOOK_TERMINATION_TIMEOUT
-        ),
-        _ => {}
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "timed out after {:?} while killing hook process",
+                HOOK_TERMINATION_TIMEOUT
+            ),
+        )),
+        _ => Ok(()),
+    };
+    if descendant_result.is_ok() {
+        process_tree.disarm();
     }
+    descendant_result.and(child_result)
 }
 
 async fn terminate_with_timeout<F>(
@@ -348,6 +521,7 @@ where
 enum CommandRunError {
     Stdin(io::Error),
     Wait(io::Error),
+    Containment(io::Error),
 }
 
 #[derive(Default)]
@@ -564,6 +738,101 @@ mod tests {
         }
     }
 
+    fn redirected_descendant_command(
+        directory: &Path,
+        keep_root_alive: bool,
+    ) -> (String, std::path::PathBuf, std::path::PathBuf) {
+        let started = directory.join("descendant-started.txt");
+        let escaped = directory.join("descendant-escaped.txt");
+
+        #[cfg(windows)]
+        let command = {
+            let child_script = directory.join("redirected-descendant.ps1");
+            let stdout = directory.join("redirected-descendant.stdout");
+            let stderr = directory.join("redirected-descendant.stderr");
+            let quote = |path: &Path| path.to_string_lossy().replace('\'', "''");
+            std::fs::write(
+                &child_script,
+                format!(
+                    "Set-Content -LiteralPath '{}' -Value started\nStart-Sleep -Seconds 2\nSet-Content -LiteralPath '{}' -Value escaped\n",
+                    quote(&started),
+                    quote(&escaped),
+                ),
+            )
+            .expect("write redirected descendant script");
+            format!(
+                "$null = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-File', '{}') -WindowStyle Hidden -RedirectStandardOutput '{}' -RedirectStandardError '{}'; while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 10 }}{}",
+                quote(&child_script),
+                quote(&stdout),
+                quote(&stderr),
+                quote(&started),
+                if keep_root_alive {
+                    "; Start-Sleep -Seconds 60"
+                } else {
+                    ""
+                },
+            )
+        };
+
+        #[cfg(not(windows))]
+        let command = {
+            let stdout = directory.join("redirected-descendant.stdout");
+            let stderr = directory.join("redirected-descendant.stderr");
+            let quote = |path: &Path| path.to_string_lossy().replace('\'', "'\\''");
+            format!(
+                "(printf started > '{}'; sleep 2; printf escaped > '{}') </dev/null > '{}' 2> '{}' & while [ ! -f '{}' ]; do sleep 0.01; done{}",
+                quote(&started),
+                quote(&escaped),
+                quote(&stdout),
+                quote(&stderr),
+                quote(&started),
+                if keep_root_alive { "; sleep 60" } else { "" },
+            )
+        };
+
+        (command, started, escaped)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_explicit_breakaway_attempt_helper() {
+        use std::os::windows::process::CommandExt as _;
+
+        let Some(child_script) = std::env::var_os("CODEX_HOOK_BREAKAWAY_CHILD_SCRIPT") else {
+            return;
+        };
+        let denied = std::env::var_os("CODEX_HOOK_BREAKAWAY_DENIED_MARKER")
+            .expect("breakaway denied marker");
+        let launched = std::env::var_os("CODEX_HOOK_BREAKAWAY_LAUNCHED_MARKER")
+            .expect("breakaway launched marker");
+
+        let spawn = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-File"])
+            .arg(child_script)
+            // CREATE_BREAKAWAY_FROM_JOB: a strict hook Job must reject this flag.
+            .creation_flags(0x0100_0000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+
+        match spawn {
+            Err(error) => {
+                std::fs::write(denied, error.to_string()).expect("write breakaway denied marker");
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(5),
+                    "explicit Job breakaway should fail with access denied"
+                );
+            }
+            Ok(child) => {
+                std::fs::write(launched, child.id().to_string())
+                    .expect("write breakaway launched marker");
+                panic!("strict hook Job allowed explicit descendant breakaway");
+            }
+        }
+    }
+
     #[cfg(windows)]
     fn explicit_test_shell() -> CommandShell {
         CommandShell {
@@ -683,6 +952,118 @@ mod tests {
             !marker.exists(),
             "a descendant survived the hook timeout and wrote {}",
             marker.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_hook_terminates_redirected_descendants_before_returning() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("absolute cwd");
+        let (command, started, escaped) =
+            redirected_descendant_command(temp_dir.path(), /*keep_root_alive*/ false);
+        let handler = test_handler(command, 15, &cwd);
+
+        let result = run_command(&explicit_test_shell(), &handler, 0, "{}", cwd.as_path()).await;
+
+        assert_eq!(result.exit_code, Some(0), "{:?}", result.error);
+        assert_eq!(result.error, None);
+        assert!(started.exists(), "the descendant did not actually start");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !escaped.exists(),
+            "a redirected descendant survived successful hook completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_hook_terminates_redirected_descendants() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("absolute cwd");
+        let (command, started, escaped) =
+            redirected_descendant_command(temp_dir.path(), /*keep_root_alive*/ true);
+        let handler = test_handler(command, 30, &cwd);
+        let shell = explicit_test_shell();
+
+        let hook_task =
+            tokio::spawn(
+                async move { run_command(&shell, &handler, 0, "{}", cwd.as_path()).await },
+            );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("redirected descendant should start");
+
+        hook_task.abort();
+        assert!(
+            hook_task
+                .await
+                .expect_err("aborted hook task should not complete")
+                .is_cancelled()
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !escaped.exists(),
+            "a redirected descendant survived hook cancellation"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn configured_hook_denies_explicit_windows_job_breakaway() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let cwd = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf()).expect("absolute cwd");
+        let child_script = temp_dir.path().join("breakaway-child.ps1");
+        let denied = temp_dir.path().join("breakaway-denied.txt");
+        let launched = temp_dir.path().join("breakaway-launched.txt");
+        let escaped = temp_dir.path().join("breakaway-escaped.txt");
+        let quote = |path: &Path| path.to_string_lossy().replace('\'', "''");
+        std::fs::write(
+            &child_script,
+            format!(
+                "Start-Sleep -Seconds 2\nSet-Content -LiteralPath '{}' -Value escaped\n",
+                quote(&escaped),
+            ),
+        )
+        .expect("write breakaway child script");
+
+        let test_executable = std::env::current_exe().expect("current test executable");
+        let command = format!(
+            "& '{}' --exact 'engine::command_runner::tests::windows_explicit_breakaway_attempt_helper' --nocapture",
+            quote(&test_executable),
+        );
+        let mut handler = test_handler(command, 10, &cwd);
+        handler.env.insert(
+            "CODEX_HOOK_BREAKAWAY_CHILD_SCRIPT".to_string(),
+            child_script.to_string_lossy().into_owned(),
+        );
+        handler.env.insert(
+            "CODEX_HOOK_BREAKAWAY_DENIED_MARKER".to_string(),
+            denied.to_string_lossy().into_owned(),
+        );
+        handler.env.insert(
+            "CODEX_HOOK_BREAKAWAY_LAUNCHED_MARKER".to_string(),
+            launched.to_string_lossy().into_owned(),
+        );
+
+        let result = run_command(&explicit_test_shell(), &handler, 0, "{}", cwd.as_path()).await;
+
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr);
+        assert_eq!(result.error, None);
+        assert!(
+            denied.exists(),
+            "the explicit breakaway attempt did not run"
+        );
+        assert!(
+            !launched.exists(),
+            "the explicit breakaway attempt succeeded"
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !escaped.exists(),
+            "an explicitly broken-away hook descendant survived"
         );
     }
 

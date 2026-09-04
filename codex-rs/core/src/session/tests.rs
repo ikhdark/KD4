@@ -430,7 +430,6 @@ fn raw_response_event_needs_no_post_dispatch_copy() {
 
     let prepared = PreparedEventDispatch::new(&source, /*show_raw_agent_reasoning*/ false);
 
-    assert!(prepared.terminal_source.is_none());
     assert!(prepared.legacy_events.is_empty());
 }
 
@@ -8248,6 +8247,10 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
         Some(config.multi_agent_version_from_features()),
+        crate::completion_proof::CompletionProofSessionAuthority::root_terminal_owner(
+            crate::completion_proof::CompletionProofRuntimeRegistry::new(),
+            config.cwd.as_path(),
+        ),
     )
     .await?;
 
@@ -8416,6 +8419,12 @@ where
             config.background_terminal_max_timeout,
         ),
         command_execution: crate::tools::command_execution::CommandExecutionLedger::default(),
+        completion_proof: crate::completion_proof::CompletionProofLedger::load_or_new(
+            config.codex_home.to_path_buf(),
+            session_configuration.cwd().as_path(),
+            true,
+        )
+        .await,
         plan_store: crate::plan_store::PlanStore::default(),
         elicitations: crate::elicitation::ElicitationService::new(),
         analytics_events_client: AnalyticsEventsClient::new(

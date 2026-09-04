@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "assignment_id": "root:test-store-feature-impl-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+  "path_claims": [
+    { "path": "codex-rs/core/Cargo.toml", "recursive": false },
+    { "path": "codex-rs/core/src/completion_proof.rs", "recursive": false },
+    { "path": "codex-rs/core/src/test_support.rs", "recursive": false },
+    { "path": "codex-rs/core/src/tools/handlers/shell.rs", "recursive": false },
+    { "path": "codex-rs/core/tests/common/test_codex.rs", "recursive": false },
+    { "path": "codex-rs/core/tests/suite/compact_resume_fork.rs", "recursive": false },
+    { "path": "codex-rs/core/tests/suite/completion_proof_gate.rs", "recursive": false },
+    { "path": "scripts/rust_test_runner.py", "recursive": false },
+    { "path": "scripts/test_rust_test_runner.py", "recursive": false },
+    { "path": "codex-rs/.config/nextest.toml", "recursive": false },
+    { "path": "codex-rs/cli/tests/completion_proof.rs", "recursive": false },
+    { "path": "codex-rs/app-server/tests/common/test_app_server.rs", "recursive": false },
+    { "path": "codex-rs/app-server/tests/suite/v2/client_metadata.rs", "recursive": false },
+    { "path": "codex-rs/app-server/tests/suite/v2/turn_start.rs", "recursive": false },
+    { "path": "codex-rs/mcp-server/tests/common/mcp_process.rs", "recursive": false },
+    { "path": "codex-rs/mcp-server/tests/suite/codex_tool.rs", "recursive": false },
+    { "path": "scripts/test_build_tooling_policy.py", "recursive": false },
+    { "path": "justfile", "recursive": false }
+  ],
+  "contract_claims": [
+    "private-completion-proof-test-store",
+    "trusted-rust-runner-feature-selection",
+    "physical-credential-nonmutation",
+    "completion-proof-real-subprocess-tests"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "root:test-store-feature-impl-20260903",
+  "validation_commands": [
+    "python -m unittest scripts.test_rust_test_runner",
+    "python -m unittest scripts.test_build_tooling_policy",
+    "python scripts/rust_test_runner.py run-target --no-fail-fast core_cli_workspace -E test(suite::completion_proof_gate::explicit_admission_not_session_source_selects_terminal_authority) | test(suite::completion_proof_gate::differently_cased_windows_paths_preserve_repository_and_rollout_identity) | test(suite::completion_proof_gate::canonical_proof_survives_same_process_compact_resume_and_authorized_root_fork)",
+    "python scripts/rust_test_runner.py run-target --no-fail-fast app_server_all -E test(suite::v2::client_metadata::cold_resume_of_legacy_internal_source_still_requires_root_completion_proof_v2) | test(suite::v2::client_metadata::same_process_resume_reuses_completion_proof_but_restart_does_not_v2)",
+    "python scripts/rust_test_runner.py run-target mcp_server_all -E test(suite::codex_tool::logical_generation_limit_reaches_mcp_as_failed_turn_complete)",
+    "python scripts/rust_test_runner.py run-target cli_completion_proof",
+    "python scripts/rust_test_runner.py run-target app_server_all -E test(suite::v2::turn_start::blocked_completion_proof_reaches_app_server_as_failed_turn_without_launching_runner)",
+    "python scripts/rust_test_runner.py run-target mcp_server_all -E test(suite::codex_tool::blocked_completion_proof_reaches_mcp_as_error_without_launching_runner)"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

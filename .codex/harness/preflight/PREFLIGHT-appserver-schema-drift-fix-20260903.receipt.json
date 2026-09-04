@@ -1,0 +1,92 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/app-server-protocol/schema",
+          "codex-rs"
+        ],
+        [
+          "sdk/python/src/openai_codex/api.py",
+          "sdk"
+        ],
+        [
+          "sdk/python/src/openai_codex/generated/v2_all.py",
+          "sdk"
+        ],
+        [
+          "scripts/app_server_schema_runtime_check.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_dev_environment.py",
+          "scripts"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:appserver-schema-drift-fix-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\scoop\\persist\\rustup\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\appserver-schema-drift-fix"
+  },
+  "contract_claims": [
+    "app-server-schema-generated-output-drift-correction",
+    "python-sdk-app-server-schema-consumer-parity",
+    "app-server-stable-schema-additive-union-compatibility"
+  ],
+  "dependencies": [
+    "worker:appserver-schema-nonempty-fix-20260903"
+  ],
+  "expires_at": "2026-09-04T03:01:55.146614+00:00",
+  "generated_output_owner": "worker:appserver-schema-drift-fix-20260903",
+  "generated_outputs": [
+    "codex-rs/app-server-protocol/schema",
+    "sdk/python/src/openai_codex/api.py",
+    "sdk/python/src/openai_codex/generated/v2_all.py"
+  ],
+  "manifest_fingerprint": "209ffa9fca76c1a0966d86dccb4f658df5ca48bd6db372854ca57235315be9a9",
+  "path_claims": [
+    {
+      "path": "codex-rs/app-server-protocol/schema",
+      "recursive": true
+    },
+    {
+      "path": "sdk/python/src/openai_codex/api.py",
+      "recursive": false
+    },
+    {
+      "path": "sdk/python/src/openai_codex/generated/v2_all.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/app_server_schema_runtime_check.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_dev_environment.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T02:01:55.146614+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "de5ea714d9d3d08fb8fefb6dfc49ec1017cb33455a22ac374d54f95bc1701003"
+  },
+  "validation_commands": [
+    "just app-server-schema-regenerate worker-appserver-schema-drift-fix-20260903",
+    "python -m unittest scripts.test_dev_environment.AppServerSchemaRuntimeCliTest.test_cli_allows_optional_properties_inside_existing_union_branch_and_rejects_new_union_alternative",
+    "just app-server-schema-protocol-check",
+    "just app-server-schema-check"
+  ],
+  "validation_owner": "worker:appserver-schema-drift-fix-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "assignment_id": "root:source-map-check-only-fix-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+  "path_claims": [
+    { "path": "scripts/source_map_check.py", "recursive": false },
+    { "path": "scripts/test_source_map_check.py", "recursive": false },
+    { "path": "justfile", "recursive": false },
+    { "path": "scripts/completion_proof.py", "recursive": false },
+    { "path": "scripts/test_completion_proof.py", "recursive": false },
+    { "path": ".codex/validation/completion-proof.toml", "recursive": false }
+  ],
+  "contract_claims": [
+    "source-map-read-only-consistency-validation",
+    "source-map-synchronizing-maintenance"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "root:source-map-check-only-fix-20260903",
+  "validation_commands": [
+    "python -m unittest scripts.test_source_map_check",
+    "python -m unittest scripts.test_completion_proof"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target/source-map-check-only-fix",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

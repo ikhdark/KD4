@@ -1,3 +1,4 @@
+use crate::install_canonical_proof_wfp_filters_for_account;
 use crate::install_wfp_filters_for_account;
 use crate::setup_error::sanitize_setup_metric_tag_value;
 use anyhow::Result;
@@ -169,5 +170,65 @@ where
     };
 
     emit_wfp_setup_metric_safely(codex_home, otel, offline_username, &metric, &mut log);
+    install_result.map(|_| ())
+}
+
+/// Installs the strict completion-proof filters for the dedicated sandbox
+/// account. This is intentionally separate from ordinary offline proxy
+/// configuration: certification may reach true loopback and nothing else.
+pub fn install_canonical_proof_wfp_filters<F>(
+    codex_home: &Path,
+    canonical_proof_username: &str,
+    otel: Option<&StatsigMetricsSettings>,
+    mut log: F,
+) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    let install_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        install_canonical_proof_wfp_filters_for_account(canonical_proof_username)
+    })) {
+        Ok(result) => result,
+        Err(panic_payload) => {
+            let error = panic_payload_to_string(panic_payload);
+            Err(anyhow::anyhow!(
+                "canonical completion-proof WFP setup panicked: {error}"
+            ))
+        }
+    };
+
+    let metric = match &install_result {
+        Ok(installed_filter_count) => {
+            log(&format!(
+                "canonical completion-proof WFP setup succeeded for {canonical_proof_username} with {installed_filter_count} installed filters"
+            ));
+            WfpSetupMetric {
+                outcome: WfpSetupMetricOutcome::Success,
+                target_account: canonical_proof_username.to_string(),
+                installed_filter_count: *installed_filter_count,
+                error: None,
+            }
+        }
+        Err(err) => {
+            let error = err.to_string();
+            log(&format!(
+                "canonical completion-proof WFP setup failed for {canonical_proof_username}: {error}"
+            ));
+            WfpSetupMetric {
+                outcome: WfpSetupMetricOutcome::Failure,
+                target_account: canonical_proof_username.to_string(),
+                installed_filter_count: 0,
+                error: Some(error),
+            }
+        }
+    };
+
+    emit_wfp_setup_metric_safely(
+        codex_home,
+        otel,
+        canonical_proof_username,
+        &metric,
+        &mut log,
+    );
     install_result.map(|_| ())
 }

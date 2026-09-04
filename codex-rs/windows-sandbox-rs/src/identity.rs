@@ -2,12 +2,15 @@ use crate::dpapi;
 use crate::logging::debug_log;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::setup::SandboxNetworkIdentity;
+use crate::setup::SandboxSetupRequest;
 use crate::setup::SandboxUserRecord;
 use crate::setup::SandboxUsersFile;
 use crate::setup::SetupMarker;
+use crate::setup::SetupRootOverrides;
 use crate::setup::gather_read_roots;
 use crate::setup::gather_write_roots_for_permissions;
 use crate::setup::offline_proxy_settings_from_env;
+use crate::setup::resolve_sandbox_setup_paths;
 use crate::setup::run_elevated_setup_with_proxy_settings;
 use crate::setup::run_setup_refresh_with_overrides_and_proxy_settings;
 use crate::setup::sandbox_users_path;
@@ -18,9 +21,12 @@ use anyhow::anyhow;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 struct SandboxIdentity {
@@ -32,6 +38,54 @@ struct SandboxIdentity {
 pub struct SandboxCreds {
     pub username: String,
     pub password: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CanonicalWindowsSandboxLaunchSpec {
+    permissions: ResolvedWindowsSandboxPermissions,
+    command_cwd: String,
+    codex_home: String,
+    read_roots: Vec<String>,
+    write_roots: Vec<String>,
+    deny_read_paths: Vec<String>,
+    deny_write_paths: Vec<String>,
+    read_roots_include_platform_defaults: bool,
+    proxy_enforced: bool,
+    proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+    network_identity: SandboxNetworkIdentity,
+    offline_proxy_settings: crate::setup::OfflineProxySettings,
+}
+
+struct PreparedCanonicalWindowsSandboxLaunchState {
+    attempt_id: String,
+    launch_identity: String,
+    spec: CanonicalWindowsSandboxLaunchSpec,
+    credentials: SandboxCreds,
+}
+
+/// One-shot credentials prepared for one exact canonical certification launch.
+///
+/// The credentials and resolved permission specification are intentionally
+/// opaque and have no serialization representation. Clones share one consumed
+/// state, so only one elevated launch can claim the prepared credentials.
+#[derive(Clone)]
+pub struct PreparedCanonicalWindowsSandboxLaunch {
+    state: Arc<Mutex<Option<PreparedCanonicalWindowsSandboxLaunchState>>>,
+}
+
+impl fmt::Debug for PreparedCanonicalWindowsSandboxLaunch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedCanonicalWindowsSandboxLaunch")
+            .field("state", &"opaque")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AcquiredSandboxCreds {
+    pub(crate) credentials: SandboxCreds,
+    pub(crate) used_prepared_launch: bool,
 }
 
 /// Returns true when the on-disk setup artifacts exist and match the current
@@ -134,12 +188,399 @@ fn select_identity(
     let chosen = match network_identity {
         SandboxNetworkIdentity::Offline => users.offline,
         SandboxNetworkIdentity::Online => users.online,
+        SandboxNetworkIdentity::CanonicalProof => users.canonical_proof,
     };
     let password = decode_password(&chosen)?;
     Ok(Some(SandboxIdentity {
         username: chosen.username,
         password,
     }))
+}
+
+fn normalized_path_identity(path: &Path) -> String {
+    path.as_os_str()
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+fn normalized_path_identities(paths: Vec<PathBuf>) -> Vec<String> {
+    let mut identities = paths
+        .iter()
+        .map(|path| normalized_path_identity(path))
+        .collect::<Vec<_>>();
+    identities.sort_unstable();
+    identities.dedup();
+    identities
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_canonical_windows_sandbox_launch_spec(
+    permissions: &ResolvedWindowsSandboxPermissions,
+    command_cwd: &Path,
+    env_map: &HashMap<String, String>,
+    codex_home: &Path,
+    read_roots_override: Option<&[PathBuf]>,
+    additional_read_roots: &[PathBuf],
+    read_roots_include_platform_defaults: bool,
+    write_roots_override: Option<&[PathBuf]>,
+    deny_read_paths_override: &[PathBuf],
+    deny_write_paths_override: &[PathBuf],
+    proxy_enforced: bool,
+    proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+) -> Result<CanonicalWindowsSandboxLaunchSpec> {
+    let mut needed_read = read_roots_override
+        .map(<[PathBuf]>::to_vec)
+        .unwrap_or_else(|| gather_read_roots(command_cwd, permissions, env_map, codex_home));
+    extend_read_roots(&mut needed_read, additional_read_roots);
+    let needed_write = write_roots_override
+        .map(<[PathBuf]>::to_vec)
+        .unwrap_or_else(|| gather_write_roots_for_permissions(permissions, command_cwd, env_map));
+    let network_identity =
+        SandboxNetworkIdentity::from_permissions(permissions, proxy_enforced, env_map);
+    if network_identity != SandboxNetworkIdentity::CanonicalProof {
+        anyhow::bail!(
+            "prepared canonical Windows sandbox launch is missing its private attempt identity"
+        );
+    }
+    let marker = load_marker(codex_home)?;
+    let offline_proxy_settings = desired_offline_proxy_settings(
+        marker.as_ref(),
+        proxy_settings_mode,
+        env_map,
+        network_identity,
+    );
+    let request = SandboxSetupRequest {
+        permissions,
+        command_cwd,
+        env_map,
+        codex_home,
+        proxy_enforced,
+    };
+    let paths = resolve_sandbox_setup_paths(
+        &request,
+        &SetupRootOverrides {
+            read_roots: Some(needed_read),
+            read_roots_include_platform_defaults,
+            write_roots: Some(needed_write),
+            deny_read_paths: Some(deny_read_paths_override.to_vec()),
+            deny_write_paths: Some(deny_write_paths_override.to_vec()),
+        },
+    );
+    Ok(CanonicalWindowsSandboxLaunchSpec {
+        permissions: permissions.clone(),
+        command_cwd: normalized_path_identity(command_cwd),
+        codex_home: normalized_path_identity(codex_home),
+        read_roots: normalized_path_identities(paths.read_roots),
+        write_roots: normalized_path_identities(paths.write_roots),
+        deny_read_paths: normalized_path_identities(paths.deny_read_paths),
+        deny_write_paths: normalized_path_identities(paths.deny_write_paths),
+        read_roots_include_platform_defaults,
+        proxy_enforced,
+        proxy_settings_mode,
+        network_identity,
+        offline_proxy_settings,
+    })
+}
+
+impl PreparedCanonicalWindowsSandboxLaunch {
+    fn new(
+        attempt_id: String,
+        launch_identity: String,
+        spec: CanonicalWindowsSandboxLaunchSpec,
+        credentials: SandboxCreds,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(Some(
+                PreparedCanonicalWindowsSandboxLaunchState {
+                    attempt_id,
+                    launch_identity,
+                    spec,
+                    credentials,
+                },
+            ))),
+        }
+    }
+
+    fn consume(
+        self,
+        attempt_id: &str,
+        launch_identity: &str,
+        command_cwd: &Path,
+        spec: CanonicalWindowsSandboxLaunchSpec,
+    ) -> Result<SandboxCreds> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("prepared canonical Windows sandbox launch state was poisoned"))?;
+        let prepared = state.take().ok_or_else(|| {
+            anyhow!("prepared canonical Windows sandbox launch was already consumed")
+        })?;
+        let mut mismatches = Vec::new();
+        if prepared.attempt_id != attempt_id {
+            mismatches.push("attempt identity");
+        }
+        if prepared.launch_identity != launch_identity {
+            mismatches.push("launch identity");
+        }
+        // Permission profiles can differ only in incidental entry ordering
+        // after the shell sandbox transform. Bind to their resolved access
+        // semantics for this cwd; the exact effective roots and deny paths are
+        // compared separately below.
+        if !prepared
+            .spec
+            .permissions
+            .is_semantically_equivalent_to(&spec.permissions, command_cwd)
+        {
+            mismatches.push("permissions");
+        }
+        if prepared.spec.command_cwd != spec.command_cwd {
+            mismatches.push("command cwd");
+        }
+        if prepared.spec.codex_home != spec.codex_home {
+            mismatches.push("Codex home");
+        }
+        if prepared.spec.read_roots != spec.read_roots {
+            mismatches.push("read roots");
+        }
+        if prepared.spec.write_roots != spec.write_roots {
+            mismatches.push("write roots");
+        }
+        if prepared.spec.deny_read_paths != spec.deny_read_paths {
+            mismatches.push("denied read paths");
+        }
+        if prepared.spec.deny_write_paths != spec.deny_write_paths {
+            mismatches.push("denied write paths");
+        }
+        if prepared.spec.read_roots_include_platform_defaults
+            != spec.read_roots_include_platform_defaults
+        {
+            mismatches.push("platform read-root policy");
+        }
+        if prepared.spec.proxy_enforced != spec.proxy_enforced {
+            mismatches.push("proxy enforcement");
+        }
+        if prepared.spec.proxy_settings_mode != spec.proxy_settings_mode {
+            mismatches.push("proxy settings mode");
+        }
+        if prepared.spec.network_identity != spec.network_identity {
+            mismatches.push("network identity");
+        }
+        if prepared.spec.offline_proxy_settings != spec.offline_proxy_settings {
+            mismatches.push("offline proxy settings");
+        }
+        if !mismatches.is_empty() {
+            anyhow::bail!(
+                "prepared canonical Windows sandbox launch does not match the reserved attempt and exact effective sandbox specification ({})",
+                mismatches.join(", ")
+            );
+        }
+        Ok(prepared.credentials)
+    }
+}
+
+/// Prepare credentials and ACLs once before the canonical watcher handoff.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_canonical_windows_sandbox_launch(
+    attempt_id: &str,
+    launch_identity: &str,
+    permissions: &ResolvedWindowsSandboxPermissions,
+    command_cwd: &Path,
+    env_map: &HashMap<String, String>,
+    codex_home: &Path,
+    read_roots_override: Option<&[PathBuf]>,
+    additional_read_roots: &[PathBuf],
+    read_roots_include_platform_defaults: bool,
+    write_roots_override: Option<&[PathBuf]>,
+    deny_read_paths_override: &[PathBuf],
+    deny_write_paths_override: &[PathBuf],
+    proxy_enforced: bool,
+    proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+) -> Result<PreparedCanonicalWindowsSandboxLaunch> {
+    prepare_canonical_windows_sandbox_launch_with_credentials(
+        attempt_id,
+        launch_identity,
+        permissions,
+        command_cwd,
+        env_map,
+        codex_home,
+        read_roots_override,
+        additional_read_roots,
+        read_roots_include_platform_defaults,
+        write_roots_override,
+        deny_read_paths_override,
+        deny_write_paths_override,
+        proxy_enforced,
+        proxy_settings_mode,
+        || {
+            require_logon_sandbox_creds_with_additional_read_roots(
+                permissions,
+                command_cwd,
+                env_map,
+                codex_home,
+                read_roots_override,
+                additional_read_roots,
+                read_roots_include_platform_defaults,
+                write_roots_override,
+                deny_read_paths_override,
+                deny_write_paths_override,
+                proxy_enforced,
+                proxy_settings_mode,
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_canonical_windows_sandbox_launch_with_credentials(
+    attempt_id: &str,
+    launch_identity: &str,
+    permissions: &ResolvedWindowsSandboxPermissions,
+    command_cwd: &Path,
+    env_map: &HashMap<String, String>,
+    codex_home: &Path,
+    read_roots_override: Option<&[PathBuf]>,
+    additional_read_roots: &[PathBuf],
+    read_roots_include_platform_defaults: bool,
+    write_roots_override: Option<&[PathBuf]>,
+    deny_read_paths_override: &[PathBuf],
+    deny_write_paths_override: &[PathBuf],
+    proxy_enforced: bool,
+    proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+    prepare_credentials: impl FnOnce() -> Result<SandboxCreds>,
+) -> Result<PreparedCanonicalWindowsSandboxLaunch> {
+    if attempt_id.trim().is_empty() || launch_identity.trim().is_empty() {
+        anyhow::bail!("canonical Windows sandbox launch binding must not be empty");
+    }
+    let credentials = prepare_credentials()?;
+    // Resolve after setup succeeds so the capability is bound to the settled
+    // marker and the exact effective roots the later launch will observe.
+    let spec = resolve_canonical_windows_sandbox_launch_spec(
+        permissions,
+        command_cwd,
+        env_map,
+        codex_home,
+        read_roots_override,
+        additional_read_roots,
+        read_roots_include_platform_defaults,
+        write_roots_override,
+        deny_read_paths_override,
+        deny_write_paths_override,
+        proxy_enforced,
+        proxy_settings_mode,
+    )?;
+    Ok(PreparedCanonicalWindowsSandboxLaunch::new(
+        attempt_id.to_string(),
+        launch_identity.to_string(),
+        spec,
+        credentials,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn acquire_logon_sandbox_creds_for_launch(
+    prepared_launch: Option<PreparedCanonicalWindowsSandboxLaunch>,
+    launch_identity: Option<&str>,
+    permissions: &ResolvedWindowsSandboxPermissions,
+    command_cwd: &Path,
+    env_map: &HashMap<String, String>,
+    codex_home: &Path,
+    read_roots_override: Option<&[PathBuf]>,
+    additional_read_roots: &[PathBuf],
+    read_roots_include_platform_defaults: bool,
+    write_roots_override: Option<&[PathBuf]>,
+    deny_read_paths_override: &[PathBuf],
+    deny_write_paths_override: &[PathBuf],
+    proxy_enforced: bool,
+    proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+) -> Result<AcquiredSandboxCreds> {
+    acquire_logon_sandbox_creds_for_launch_with_fallback(
+        prepared_launch,
+        launch_identity,
+        permissions,
+        command_cwd,
+        env_map,
+        codex_home,
+        read_roots_override,
+        additional_read_roots,
+        read_roots_include_platform_defaults,
+        write_roots_override,
+        deny_read_paths_override,
+        deny_write_paths_override,
+        proxy_enforced,
+        proxy_settings_mode,
+        || {
+            require_logon_sandbox_creds_with_additional_read_roots(
+                permissions,
+                command_cwd,
+                env_map,
+                codex_home,
+                read_roots_override,
+                additional_read_roots,
+                read_roots_include_platform_defaults,
+                write_roots_override,
+                deny_read_paths_override,
+                deny_write_paths_override,
+                proxy_enforced,
+                proxy_settings_mode,
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn acquire_logon_sandbox_creds_for_launch_with_fallback(
+    prepared_launch: Option<PreparedCanonicalWindowsSandboxLaunch>,
+    launch_identity: Option<&str>,
+    permissions: &ResolvedWindowsSandboxPermissions,
+    command_cwd: &Path,
+    env_map: &HashMap<String, String>,
+    codex_home: &Path,
+    read_roots_override: Option<&[PathBuf]>,
+    additional_read_roots: &[PathBuf],
+    read_roots_include_platform_defaults: bool,
+    write_roots_override: Option<&[PathBuf]>,
+    deny_read_paths_override: &[PathBuf],
+    deny_write_paths_override: &[PathBuf],
+    proxy_enforced: bool,
+    proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+    fallback: impl FnOnce() -> Result<SandboxCreds>,
+) -> Result<AcquiredSandboxCreds> {
+    let Some(prepared_launch) = prepared_launch else {
+        return Ok(AcquiredSandboxCreds {
+            credentials: fallback()?,
+            used_prepared_launch: false,
+        });
+    };
+    let launch_identity = launch_identity.ok_or_else(|| {
+        anyhow!("prepared canonical Windows sandbox launch is missing its launch identity")
+    })?;
+    let attempt_id = env_map
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("CODEX_COMPLETION_PROOF_ATTEMPT_ID"))
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!("prepared canonical Windows sandbox launch is missing its attempt identity")
+        })?;
+    let spec = resolve_canonical_windows_sandbox_launch_spec(
+        permissions,
+        command_cwd,
+        env_map,
+        codex_home,
+        read_roots_override,
+        additional_read_roots,
+        read_roots_include_platform_defaults,
+        write_roots_override,
+        deny_read_paths_override,
+        deny_write_paths_override,
+        proxy_enforced,
+        proxy_settings_mode,
+    )?;
+    Ok(AcquiredSandboxCreds {
+        credentials: prepared_launch.consume(attempt_id, launch_identity, command_cwd, spec)?,
+        used_prepared_launch: true,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -195,7 +636,8 @@ pub(crate) fn require_logon_sandbox_creds_with_additional_read_roots(
     let needed_write = write_roots_override
         .map(<[PathBuf]>::to_vec)
         .unwrap_or_else(|| gather_write_roots_for_permissions(permissions, command_cwd, env_map));
-    let network_identity = SandboxNetworkIdentity::from_permissions(permissions, proxy_enforced);
+    let network_identity =
+        SandboxNetworkIdentity::from_permissions(permissions, proxy_enforced, env_map);
     let marker = load_marker(codex_home)?;
     let desired_offline_proxy_settings = desired_offline_proxy_settings(
         marker.as_ref(),
@@ -302,6 +744,12 @@ fn desired_offline_proxy_settings(
     env_map: &HashMap<String, String>,
     network_identity: SandboxNetworkIdentity,
 ) -> crate::setup::OfflineProxySettings {
+    if network_identity == SandboxNetworkIdentity::CanonicalProof {
+        return marker.map_or_else(
+            || offline_proxy_settings_from_env(env_map, network_identity),
+            SetupMarker::offline_proxy_settings,
+        );
+    }
     match (marker, proxy_settings_mode) {
         (Some(marker), crate::WindowsSandboxProxySettingsMode::Preserve)
             if marker.version_matches() =>
@@ -346,14 +794,21 @@ pub(crate) fn refresh_logon_sandbox_creds(
 
 #[cfg(test)]
 mod tests {
+    use super::SandboxCreds;
+    use super::acquire_logon_sandbox_creds_for_launch_with_fallback;
     use super::desired_offline_proxy_settings;
     use super::extend_read_roots;
+    use super::prepare_canonical_windows_sandbox_launch_with_credentials;
     use super::remove_sandbox_users_file;
     use crate::WindowsSandboxProxySettingsMode;
+    use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
     use crate::setup::SandboxNetworkIdentity;
     use crate::setup::SetupMarker;
     use crate::setup::sandbox_users_path;
+    use codex_protocol::models::PermissionProfile;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
@@ -425,5 +880,227 @@ mod tests {
             .proxy_ports,
             vec![8080]
         );
+    }
+
+    #[test]
+    fn canonical_proof_setup_preserves_offline_settings_across_version_upgrade() {
+        let marker = SetupMarker {
+            version: crate::setup::SETUP_VERSION - 1,
+            offline_username: "offline".to_string(),
+            online_username: "online".to_string(),
+            created_at: None,
+            proxy_ports: vec![7890],
+            allow_local_binding: false,
+        };
+        let env_map = HashMap::from([
+            (
+                "HTTP_PROXY".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            ),
+            (
+                "CODEX_NETWORK_ALLOW_LOCAL_BINDING".to_string(),
+                "1".to_string(),
+            ),
+        ]);
+
+        assert_eq!(
+            desired_offline_proxy_settings(
+                Some(&marker),
+                WindowsSandboxProxySettingsMode::Reconcile,
+                &env_map,
+                SandboxNetworkIdentity::CanonicalProof,
+            ),
+            marker.offline_proxy_settings()
+        );
+    }
+
+    #[test]
+    fn prepared_canonical_launch_prepares_once_and_never_falls_back_after_handoff() {
+        let workspace = TempDir::new().expect("workspace tempdir");
+        let codex_home = TempDir::new().expect("codex home tempdir");
+        let workspace_root = AbsolutePathBuf::from_absolute_path(workspace.path().to_path_buf())
+            .expect("absolute workspace root");
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                &PermissionProfile::workspace_write(),
+                std::slice::from_ref(&workspace_root),
+            )
+            .expect("resolved permissions");
+        let env_map = HashMap::from([(
+            "CODEX_COMPLETION_PROOF_ATTEMPT_ID".to_string(),
+            "attempt-1".to_string(),
+        )]);
+        let read_roots = vec![workspace.path().to_path_buf()];
+        let write_roots = vec![workspace.path().to_path_buf()];
+        let preparations = Cell::new(0);
+        let post_handoff_fallbacks = Cell::new(0);
+
+        let prepared = prepare_canonical_windows_sandbox_launch_with_credentials(
+            "attempt-1",
+            "just completion-proof",
+            &permissions,
+            workspace.path(),
+            &env_map,
+            codex_home.path(),
+            Some(&read_roots),
+            &[],
+            false,
+            Some(&write_roots),
+            &[],
+            &[],
+            false,
+            WindowsSandboxProxySettingsMode::Reconcile,
+            || {
+                preparations.set(preparations.get() + 1);
+                Ok(SandboxCreds {
+                    username: "prepared-user".to_string(),
+                    password: "prepared-password".to_string(),
+                })
+            },
+        )
+        .expect("prepare canonical launch");
+        let replay = prepared.clone();
+
+        let acquired = acquire_logon_sandbox_creds_for_launch_with_fallback(
+            Some(prepared),
+            Some("just completion-proof"),
+            &permissions,
+            workspace.path(),
+            &env_map,
+            codex_home.path(),
+            Some(&read_roots),
+            &[],
+            false,
+            Some(&write_roots),
+            &[],
+            &[],
+            false,
+            WindowsSandboxProxySettingsMode::Reconcile,
+            || {
+                post_handoff_fallbacks.set(post_handoff_fallbacks.get() + 1);
+                Ok(SandboxCreds {
+                    username: "fallback-user".to_string(),
+                    password: "fallback-password".to_string(),
+                })
+            },
+        )
+        .expect("consume prepared launch");
+
+        assert_eq!(1, preparations.get());
+        assert_eq!(0, post_handoff_fallbacks.get());
+        assert!(acquired.used_prepared_launch);
+        assert_eq!("prepared-user", acquired.credentials.username);
+
+        let error = acquire_logon_sandbox_creds_for_launch_with_fallback(
+            Some(replay),
+            Some("just completion-proof"),
+            &permissions,
+            workspace.path(),
+            &env_map,
+            codex_home.path(),
+            Some(&read_roots),
+            &[],
+            false,
+            Some(&write_roots),
+            &[],
+            &[],
+            false,
+            WindowsSandboxProxySettingsMode::Reconcile,
+            || {
+                post_handoff_fallbacks.set(post_handoff_fallbacks.get() + 1);
+                Ok(SandboxCreds {
+                    username: "fallback-user".to_string(),
+                    password: "fallback-password".to_string(),
+                })
+            },
+        )
+        .expect_err("prepared launch must be single use");
+        assert!(error.to_string().contains("already consumed"));
+        assert_eq!(0, post_handoff_fallbacks.get());
+    }
+
+    #[test]
+    fn prepared_canonical_launch_spec_mismatch_burns_the_capability() {
+        let workspace = TempDir::new().expect("workspace tempdir");
+        let codex_home = TempDir::new().expect("codex home tempdir");
+        let workspace_root = AbsolutePathBuf::from_absolute_path(workspace.path().to_path_buf())
+            .expect("absolute workspace root");
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                &PermissionProfile::workspace_write(),
+                std::slice::from_ref(&workspace_root),
+            )
+            .expect("resolved permissions");
+        let env_map = HashMap::from([(
+            "CODEX_COMPLETION_PROOF_ATTEMPT_ID".to_string(),
+            "attempt-2".to_string(),
+        )]);
+        let read_roots = vec![workspace.path().to_path_buf()];
+        let write_roots = vec![workspace.path().to_path_buf()];
+        let mismatched_write_roots = vec![workspace.path().join("different-write-root")];
+        let prepared = prepare_canonical_windows_sandbox_launch_with_credentials(
+            "attempt-2",
+            "just completion-proof",
+            &permissions,
+            workspace.path(),
+            &env_map,
+            codex_home.path(),
+            Some(&read_roots),
+            &[],
+            false,
+            Some(&write_roots),
+            &[],
+            &[],
+            false,
+            WindowsSandboxProxySettingsMode::Reconcile,
+            || {
+                Ok(SandboxCreds {
+                    username: "prepared-user".to_string(),
+                    password: "prepared-password".to_string(),
+                })
+            },
+        )
+        .expect("prepare canonical launch");
+        let replay = prepared.clone();
+
+        let mismatch = acquire_logon_sandbox_creds_for_launch_with_fallback(
+            Some(prepared),
+            Some("just completion-proof"),
+            &permissions,
+            workspace.path(),
+            &env_map,
+            codex_home.path(),
+            Some(&read_roots),
+            &[],
+            false,
+            Some(&mismatched_write_roots),
+            &[],
+            &[],
+            false,
+            WindowsSandboxProxySettingsMode::Reconcile,
+            || unreachable!("prepared launch mismatch must not refresh credentials"),
+        )
+        .expect_err("changed effective roots must be rejected");
+        assert!(mismatch.to_string().contains("does not match"));
+
+        let replay_error = acquire_logon_sandbox_creds_for_launch_with_fallback(
+            Some(replay),
+            Some("just completion-proof"),
+            &permissions,
+            workspace.path(),
+            &env_map,
+            codex_home.path(),
+            Some(&read_roots),
+            &[],
+            false,
+            Some(&write_roots),
+            &[],
+            &[],
+            false,
+            WindowsSandboxProxySettingsMode::Reconcile,
+            || unreachable!("prepared launch replay must not refresh credentials"),
+        )
+        .expect_err("mismatch must consume the capability");
+        assert!(replay_error.to_string().contains("already consumed"));
     }
 }

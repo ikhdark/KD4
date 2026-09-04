@@ -1,0 +1,78 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "source_owners.toml",
+          "source_owners.toml"
+        ],
+        [
+          "scripts/test_source_owners.py",
+          "scripts"
+        ],
+        [
+          "SOURCEMAP.md",
+          "SOURCEMAP.md"
+        ],
+        [
+          "architecture_index.json",
+          "architecture_index.json"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "root:workflow-preflight-owner-mapping-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-workflow-preflight-owner-mapping"
+  },
+  "contract_claims": [
+    "workflow-preflight-coordination-owner-index"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-04T02:36:40.933687+00:00",
+  "generated_output_owner": "root:workflow-preflight-owner-mapping-20260903",
+  "generated_outputs": [
+    "SOURCEMAP.md",
+    "architecture_index.json"
+  ],
+  "manifest_fingerprint": "bc4b37cf95544b258f1002a2c0d243090133618d9e32618363fd0582729f50de",
+  "path_claims": [
+    {
+      "path": "source_owners.toml",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_source_owners.py",
+      "recursive": false
+    },
+    {
+      "path": "SOURCEMAP.md",
+      "recursive": false
+    },
+    {
+      "path": "architecture_index.json",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T01:36:40.933687+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "a9a8235bca7cb3914ffe6d937b622e41f7d699f7a7534c69d03e6c2259eef845"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_source_owners.SourceOwnersCliTest.test_workflow_preflight_coordination_slice_resolves_cli_contract_and_consumers",
+    "python scripts/source_owners.py slice --owner workflow-preflight-coordination --focus \"workflow preflight CLI template harness consumers and focused tests\" --max-relationships 32",
+    "just source-map-check"
+  ],
+  "validation_owner": "root:workflow-preflight-owner-mapping-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

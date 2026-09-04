@@ -36,7 +36,10 @@ async fn approval_key_includes_environment_id_and_approval_scope() {
         },
         known_delta: None,
         validation_launch: None,
-        workspace_operation_root: None,
+        workspace_operation: None,
+        canonical_proof_repository_root: None,
+        canonical_proof_report_write_root: None,
+        prepared_canonical_windows_sandbox_launch: None,
     };
     let runtime = ShellRuntime::for_shell_command();
     let original_key = runtime.approval_keys(&request);
@@ -91,7 +94,10 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
         },
         known_delta: None,
         validation_launch: None,
-        workspace_operation_root: None,
+        workspace_operation: None,
+        canonical_proof_repository_root: None,
+        canonical_proof_report_write_root: None,
+        prepared_canonical_windows_sandbox_launch: None,
     };
     let runtime = ShellRuntime::for_shell_command();
 

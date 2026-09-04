@@ -42,9 +42,10 @@ use windows_sys::Win32::Security::CheckTokenMembership;
 use windows_sys::Win32::Security::FreeSid;
 use windows_sys::Win32::Security::SECURITY_NT_AUTHORITY;
 
-pub const SETUP_VERSION: u32 = 7;
+pub const SETUP_VERSION: u32 = 8;
 pub const OFFLINE_USERNAME: &str = "CodexSandboxOffline";
 pub const ONLINE_USERNAME: &str = "CodexSandboxOnline";
+pub const CANONICAL_PROOF_USERNAME: &str = "CodexSandboxProof";
 const ERROR_CANCELLED: u32 = 1223;
 const SECURITY_BUILTIN_DOMAIN_RID: u32 = 0x0000_0020;
 const DOMAIN_ALIAS_RID_ADMINS: u32 = 0x0000_0220;
@@ -105,6 +106,14 @@ pub struct SetupRootOverrides {
     pub write_roots: Option<Vec<PathBuf>>,
     pub deny_read_paths: Option<Vec<PathBuf>>,
     pub deny_write_paths: Option<Vec<PathBuf>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedSandboxSetupPaths {
+    pub(crate) read_roots: Vec<PathBuf>,
+    pub(crate) write_roots: Vec<PathBuf>,
+    pub(crate) deny_read_paths: Vec<PathBuf>,
+    pub(crate) deny_write_paths: Vec<PathBuf>,
 }
 
 pub fn run_setup_refresh(
@@ -234,9 +243,7 @@ fn run_setup_refresh_inner(
     if !request.permissions.is_enforceable_by_windows_sandbox() {
         anyhow::bail!("unsupported filesystem permissions for Windows sandbox setup");
     }
-    let (read_roots, write_roots) = build_payload_roots(&request, &overrides);
-    let deny_read_paths = build_payload_deny_read_paths(overrides.deny_read_paths);
-    let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
+    let paths = resolve_sandbox_setup_paths(&request, &overrides);
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
     let payload = SetupPayload {
@@ -245,10 +252,10 @@ fn run_setup_refresh_inner(
         online_username: ONLINE_USERNAME.to_string(),
         codex_home: request.codex_home.to_path_buf(),
         command_cwd: request.command_cwd.to_path_buf(),
-        read_roots,
-        write_roots,
-        deny_read_paths,
-        deny_write_paths,
+        read_roots: paths.read_roots,
+        write_roots: paths.write_roots,
+        deny_read_paths: paths.deny_read_paths,
+        deny_write_paths: paths.deny_write_paths,
         proxy_ports: offline_proxy_settings.proxy_ports,
         allow_local_binding: offline_proxy_settings.allow_local_binding,
         otel: None,
@@ -284,9 +291,20 @@ fn run_setup_refresh_inner(
         ),
         Some(&sbx_dir),
     );
-    let status = cmd.status().map_err(|err| {
+    let mut child =
+        codex_utils_pty::with_windows_child_creation(|_| cmd.spawn()).map_err(|err| {
+            let message = format!(
+                "setup refresh failed to launch helper: helper={}, cwd={}, log={}, error={err}",
+                exe.display(),
+                cwd.display(),
+                log_path.display()
+            );
+            log_note(&format!("setup refresh: {message}"), Some(&sbx_dir));
+            failure(SetupErrorCode::OrchestratorHelperLaunchFailed, message)
+        })?;
+    let status = child.wait().map_err(|err| {
         let message = format!(
-            "setup refresh failed to launch helper: helper={}, cwd={}, log={}, error={err}",
+            "setup refresh failed while waiting for helper: helper={}, cwd={}, log={}, error={err}",
             exe.display(),
             cwd.display(),
             log_path.display()
@@ -374,6 +392,7 @@ pub struct SandboxUsersFile {
     pub version: u32,
     pub offline: SandboxUserRecord,
     pub online: SandboxUserRecord,
+    pub canonical_proof: SandboxUserRecord,
 }
 
 impl SandboxUsersFile {
@@ -572,14 +591,21 @@ pub(crate) struct OfflineProxySettings {
 pub(crate) enum SandboxNetworkIdentity {
     Offline,
     Online,
+    CanonicalProof,
 }
 
 impl SandboxNetworkIdentity {
     pub(crate) fn from_permissions(
         permissions: &ResolvedWindowsSandboxPermissions,
         proxy_enforced: bool,
+        env_map: &HashMap<String, String>,
     ) -> Self {
-        if proxy_enforced || !permissions.network_policy().is_enabled() {
+        if env_map.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("CODEX_COMPLETION_PROOF_ATTEMPT_ID")
+                && !value.trim().is_empty()
+        }) {
+            Self::CanonicalProof
+        } else if proxy_enforced || !permissions.network_policy().is_enabled() {
             Self::Offline
         } else {
             Self::Online
@@ -628,8 +654,11 @@ fn offline_proxy_settings_for_request(
     offline_proxy_settings_override: Option<&OfflineProxySettings>,
 ) -> OfflineProxySettings {
     offline_proxy_settings_override.cloned().unwrap_or_else(|| {
-        let network_identity =
-            SandboxNetworkIdentity::from_permissions(request.permissions, request.proxy_enforced);
+        let network_identity = SandboxNetworkIdentity::from_permissions(
+            request.permissions,
+            request.proxy_enforced,
+            request.env_map,
+        );
         offline_proxy_settings_from_env(request.env_map, network_identity)
     })
 }
@@ -761,6 +790,14 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
         )
     })?;
     let payload_b64 = BASE64_STANDARD.encode(payload_json.as_bytes());
+    log_note(
+        &format!(
+            "setup orchestrator: launching helper={} version={} elevated={needs_elevation}",
+            exe.display(),
+            payload.version,
+        ),
+        Some(&sandbox_dir(codex_home)),
+    );
     let cleared_report = match clear_setup_error_report(codex_home) {
         Ok(()) => true,
         Err(err) => {
@@ -775,19 +812,26 @@ fn run_setup_exe(payload: &SetupPayload, needs_elevation: bool, codex_home: &Pat
     };
 
     if !needs_elevation {
-        let status = Command::new(&exe)
+        let mut command = Command::new(&exe);
+        command
             .arg(&payload_b64)
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|err| {
+            .stderr(Stdio::null());
+        let mut child =
+            codex_utils_pty::with_windows_child_creation(|_| command.spawn()).map_err(|err| {
                 failure(
                     SetupErrorCode::OrchestratorHelperLaunchFailed,
                     format!("failed to launch setup helper (non-elevated): {err}"),
                 )
             })?;
+        let status = child.wait().map_err(|err| {
+            failure(
+                SetupErrorCode::OrchestratorHelperLaunchFailed,
+                format!("failed while waiting for setup helper (non-elevated): {err}"),
+            )
+        })?;
         if !status.success() {
             return Err(report_helper_failure(
                 codex_home,
@@ -888,9 +932,7 @@ fn run_elevated_setup_inner(
             format!("failed to create sandbox dir {}: {err}", sbx_dir.display()),
         )
     })?;
-    let (read_roots, write_roots) = build_payload_roots(&request, &overrides);
-    let deny_read_paths = build_payload_deny_read_paths(overrides.deny_read_paths);
-    let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
+    let paths = resolve_sandbox_setup_paths(&request, &overrides);
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
     let payload = SetupPayload {
@@ -899,10 +941,10 @@ fn run_elevated_setup_inner(
         online_username: ONLINE_USERNAME.to_string(),
         codex_home: request.codex_home.to_path_buf(),
         command_cwd: request.command_cwd.to_path_buf(),
-        read_roots,
-        write_roots,
-        deny_read_paths,
-        deny_write_paths,
+        read_roots: paths.read_roots,
+        write_roots: paths.write_roots,
+        deny_read_paths: paths.deny_read_paths,
+        deny_write_paths: paths.deny_write_paths,
         proxy_ports: offline_proxy_settings.proxy_ports,
         allow_local_binding: offline_proxy_settings.allow_local_binding,
         real_user: std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string()),
@@ -1021,6 +1063,22 @@ fn build_payload_deny_read_paths(explicit_deny_read_paths: Option<Vec<PathBuf>>)
     // Keep the configured spelling here so the ACL layer can plan both the
     // lexical path and any existing canonical target for reparse-point aliases.
     explicit_deny_read_paths.unwrap_or_default()
+}
+
+pub(crate) fn resolve_sandbox_setup_paths(
+    request: &SandboxSetupRequest<'_>,
+    overrides: &SetupRootOverrides,
+) -> ResolvedSandboxSetupPaths {
+    let (read_roots, write_roots) = build_payload_roots(request, overrides);
+    ResolvedSandboxSetupPaths {
+        read_roots,
+        write_roots,
+        deny_read_paths: build_payload_deny_read_paths(overrides.deny_read_paths.clone()),
+        deny_write_paths: build_payload_deny_write_paths(
+            request,
+            overrides.deny_write_paths.clone(),
+        ),
+    }
 }
 
 fn expand_user_profile_root(roots: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -1436,6 +1494,38 @@ mod tests {
     }
 
     #[test]
+    fn canonical_proof_attempt_selects_dedicated_identity_before_permission_policy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        fs::create_dir_all(&command_cwd).expect("create workspace");
+        let permissions = permissions_for(
+            &PermissionProfile::read_only(),
+            workspace_roots_for(&command_cwd).as_slice(),
+        );
+        let env = HashMap::from([(
+            "codex_completion_proof_attempt_id".to_string(),
+            "attempt-1".to_string(),
+        )]);
+
+        assert_eq!(
+            super::SandboxNetworkIdentity::from_permissions(
+                &permissions,
+                /*proxy_enforced*/ false,
+                &env,
+            ),
+            super::SandboxNetworkIdentity::CanonicalProof
+        );
+        assert_eq!(
+            super::SandboxNetworkIdentity::from_permissions(
+                &permissions,
+                /*proxy_enforced*/ false,
+                &HashMap::new(),
+            ),
+            super::SandboxNetworkIdentity::Offline
+        );
+    }
+
+    #[test]
     fn offline_proxy_settings_capture_proxy_ports_and_local_binding_for_offline_identity() {
         let mut env = HashMap::new();
         env.insert(
@@ -1477,6 +1567,28 @@ mod tests {
 
         assert_eq!(
             marker.request_mismatch_reason(super::SandboxNetworkIdentity::Online, &desired),
+            None
+        );
+    }
+
+    #[test]
+    fn setup_marker_request_mismatch_reason_ignores_proxy_drift_for_canonical_proof_identity() {
+        let marker = super::SetupMarker {
+            version: super::SETUP_VERSION,
+            offline_username: "offline".to_string(),
+            online_username: "online".to_string(),
+            created_at: None,
+            proxy_ports: vec![3128],
+            allow_local_binding: false,
+        };
+        let desired = super::OfflineProxySettings {
+            proxy_ports: vec![],
+            allow_local_binding: true,
+        };
+
+        assert_eq!(
+            marker
+                .request_mismatch_reason(super::SandboxNetworkIdentity::CanonicalProof, &desired,),
             None
         );
     }

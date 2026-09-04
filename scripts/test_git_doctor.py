@@ -1,91 +1,159 @@
 from __future__ import annotations
 
-import contextlib
-import io
 import json
+import os
 import subprocess
+import sys
+import tempfile
 import unittest
-from unittest import mock
-
-from scripts import git_doctor
-
-
-def completed(returncode: int, *, stdout: str = "", stderr: str = ""):
-    return subprocess.CompletedProcess(["git"], returncode, stdout, stderr)
+from pathlib import Path
 
 
 class GitDoctorTest(unittest.TestCase):
-    def test_repository_root_probe_failure_is_fatal(self) -> None:
-        with mock.patch.object(
-            git_doctor,
-            "run_git",
-            return_value=completed(128, stderr="fatal: not a git repository\n"),
-        ):
-            with self.assertRaisesRegex(
-                git_doctor.RepositoryProbeError, "not a git repository"
-            ):
-                git_doctor.build_report(1.0)
+    def initialize_repository(self, root: Path) -> dict[str, str]:
+        initialized = subprocess.run(
+            ["git", "init", "--quiet", str(root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        configured = subprocess.run(
+            ["git", "-C", str(root), "config", "core.fsmonitor", "true"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        env = os.environ.copy()
+        env.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_DIR": str(root / ".git"),
+                "GIT_WORK_TREE": str(root),
+            }
+        )
+        return env
 
-    def test_nonzero_status_is_reported_and_main_fails(self) -> None:
-        def run_git(args, *, timeout=5.0):
-            del timeout
-            if args[0] == "rev-parse":
-                return completed(0, stdout="/repo\n")
-            if args[0] == "config":
-                return completed(1)
-            return completed(128, stderr="fatal: broken index\n")
+    def run_cli(
+        self,
+        env: dict[str, str],
+        *args: str,
+    ) -> subprocess.CompletedProcess[str]:
+        script = Path(__file__).with_name("git_doctor.py").resolve()
+        return subprocess.run(
+            [sys.executable, str(script), *args],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
-        with (
-            mock.patch.object(git_doctor, "run_git", side_effect=run_git),
-            mock.patch.object(git_doctor, "path_kind", return_value="windows"),
-            mock.patch.object(
-                git_doctor, "unreadable_pytest_cache_dirs", return_value=()
-            ),
-        ):
-            report = git_doctor.build_report(1.0)
+    def test_cli_reports_repository_root_probe_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_DIR": str(root / "missing.git"),
+                    "GIT_WORK_TREE": str(root),
+                }
+            )
+            completed = self.run_cli(env, "--json")
 
-        self.assertTrue(report.status_failed)
-        self.assertEqual(report.status_return_code, 128)
-        self.assertEqual(report.status_error, "fatal: broken index")
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("git doctor failed", completed.stderr)
+        self.assertIn("not a git repository", completed.stderr)
 
-        output = io.StringIO()
-        with (
-            mock.patch.object(git_doctor, "build_report", return_value=report),
-            contextlib.redirect_stdout(output),
-        ):
-            self.assertEqual(git_doctor.main(["--json"]), 1)
-        self.assertTrue(json.loads(output.getvalue())["status_failed"])
+    def test_cli_reports_corrupt_index_status_failure_as_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = self.initialize_repository(root)
+            tracked = root / "tracked.txt"
+            tracked.write_text("tracked\n", encoding="utf-8")
+            added = subprocess.run(
+                ["git", "-C", str(root), "add", "tracked.txt"],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(added.returncode, 0, added.stderr)
+            (root / ".git" / "index").write_bytes(b"broken index")
+            completed = self.run_cli(env, "--json", "--timeout", "5")
 
-    def test_status_timeout_is_distinct_from_command_failure(self) -> None:
-        with mock.patch.object(
-            git_doctor,
-            "run_git",
-            side_effect=subprocess.TimeoutExpired(["git", "status"], 1.0),
-        ):
-            result = git_doctor.timed_status(1.0)
-        self.assertTrue(result.timed_out)
-        self.assertFalse(result.failed)
-        self.assertIsNone(result.return_code)
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        report = json.loads(completed.stdout)
+        self.assertTrue(report["status_failed"])
+        self.assertFalse(report["status_timed_out"])
+        self.assertNotEqual(report["status_return_code"], 0)
+        self.assertIn("index", report["status_error"].lower())
 
-    def test_git_boolean_spellings_are_equivalent(self) -> None:
-        for value in ("true", "yes", "on", "1", "TRUE", " Yes "):
-            with self.subTest(value=value):
-                self.assertTrue(git_doctor.git_boolean_enabled(value))
-                self.assertFalse(
-                    any(
-                        "untracked cache" in item
-                        for item in git_doctor.recommendations("windows", "true", value)
+    def test_cli_reports_zero_second_status_timeout_distinctly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = self.initialize_repository(root)
+            completed = self.run_cli(env, "--json", "--timeout", "0")
+
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        report = json.loads(completed.stdout)
+        self.assertTrue(report["status_timed_out"])
+        self.assertFalse(report["status_failed"])
+        self.assertIsNone(report["status_return_code"])
+
+    def test_cli_treats_git_boolean_spellings_equivalently(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = self.initialize_repository(root)
+            cases = (
+                ("true", False),
+                ("yes", False),
+                ("on", False),
+                ("1", False),
+                ("TRUE", False),
+                (" Yes ", False),
+                ("false", True),
+                ("no", True),
+                ("off", True),
+                ("0", True),
+                (None, True),
+                ("invalid", True),
+            )
+            for value, expects_recommendation in cases:
+                with self.subTest(value=value):
+                    command = [
+                        "git",
+                        "-C",
+                        str(root),
+                        "config",
+                    ]
+                    if value is None:
+                        subprocess.run(
+                            [*command, "--unset-all", "core.untrackedCache"],
+                            env=env,
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                        )
+                    else:
+                        configured = subprocess.run(
+                            [*command, "core.untrackedCache", value],
+                            env=env,
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertEqual(configured.returncode, 0, configured.stderr)
+                    completed = self.run_cli(env, "--json", "--timeout", "5")
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    recommendations = json.loads(completed.stdout)["recommendations"]
+                    has_recommendation = any(
+                        "untracked cache" in item for item in recommendations
                     )
-                )
-        for value in ("false", "no", "off", "0", None, "invalid"):
-            with self.subTest(value=value):
-                self.assertFalse(git_doctor.git_boolean_enabled(value))
-                self.assertTrue(
-                    any(
-                        "untracked cache" in item
-                        for item in git_doctor.recommendations("windows", "true", value)
-                    )
-                )
+                    self.assertEqual(has_recommendation, expects_recommendation)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Stdio;
 
+use codex_utils_pty::with_windows_child_creation;
 use color_eyre::eyre::Report;
 use color_eyre::eyre::Result;
 use tempfile::Builder;
@@ -76,12 +77,11 @@ pub(crate) async fn run_editor(seed: &str, editor_cmd: &[String]) -> Result<Stri
         command.args(&editor_cmd[1..]).arg(&temp_path);
         command
     };
-    let status = cmd
-        .stdin(Stdio::inherit())
+    cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await?;
+        .stderr(Stdio::inherit());
+    let mut child = with_windows_child_creation(|_| cmd.spawn())?;
+    let status = child.wait().await?;
 
     if !status.success() {
         return Err(Report::msg(format!("editor exited with status {status}")));

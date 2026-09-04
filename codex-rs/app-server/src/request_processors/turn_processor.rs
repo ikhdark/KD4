@@ -1217,6 +1217,9 @@ impl TurnRequestProcessor {
                         None,
                         Some(AnalyticsJsonRpcError::Input(InputError::Empty)),
                     ),
+                    SteerInputError::CompletionProofInstructionRejected { message } => {
+                        (message, None, None)
+                    }
                     SteerInputError::PendingInputLimitExceeded {
                         max_items,
                         max_bytes,

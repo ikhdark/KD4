@@ -428,6 +428,142 @@ argv = ["cargo", "nextest", "run", "-p", "codex-protocol"]
 role = "focused_tests"
 
 [[owners]]
+id = "configuration-generated-contracts"
+concern_ids = ["config-schema", "thread-config-proto", "generated-configuration"]
+aliases = ["config schema generator", "thread config protobuf"]
+phrases = ["generated configuration schema and thread config contract"]
+roots = [
+    "scripts/config_schema_check.py",
+    "codex-rs/core/src/bin/config_schema.rs",
+    "codex-rs/config/src/schema.rs",
+    "codex-rs/config/scripts/generate-proto.ps1",
+    "codex-rs/config/examples/generate-proto.rs",
+    "codex-rs/config/src/thread_config/proto/codex.thread_config.v1.proto",
+]
+primary_entries = [
+    { path = "scripts/config_schema_check.py", symbol = "main", ambiguous = true },
+    { path = "codex-rs/core/src/bin/config_schema.rs", symbol = "main", ambiguous = true },
+    { path = "codex-rs/config/examples/generate-proto.rs", symbol = "main", ambiguous = true },
+]
+instructions = ["AGENTS.md"]
+consumers = [
+    "codex-rs/core/src/config/schema_tests.rs",
+    "codex-rs/config/src/thread_config/remote.rs",
+]
+contracts = [
+    "codex-rs/config/src/schema.rs",
+    "codex-rs/config/src/thread_config/proto/codex.thread_config.v1.proto",
+]
+generated_mirrors = [
+    "codex-rs/core/config.schema.json",
+    "codex-rs/config/src/thread_config/proto/codex.thread_config.v1.rs",
+]
+tests = [
+    "scripts/test_dev_environment.py",
+    "scripts/test_generate_config_proto.py",
+    "codex-rs/core/src/config/schema_tests.rs",
+]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/core/src/bin/config_schema.rs"
+confidence = "declared"
+evidence = [{ path = "scripts/config_schema_check.py", symbol = "regenerate_schema" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/config/examples/generate-proto.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/config/scripts/generate-proto.ps1", symbol = "generate-proto" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/core/src/config/schema_tests.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/config/schema_tests.rs", symbol = "config_schema_matches_fixture" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/config/src/thread_config/remote.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/config/src/thread_config/remote.rs", symbol = "mod proto" }]
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "config:codex-rs/config/src/thread_config/proto/codex.thread_config.v1.proto"
+confidence = "generated"
+evidence = [{ path = "codex-rs/config/scripts/generate-proto.ps1", symbol = "$sourceProto" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:justfile"
+confidence = "declared"
+evidence = [
+    { path = "justfile", symbol = "generate-config-proto-check:" },
+    { path = "justfile", symbol = "config-schema-check:" },
+]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/test_generate_config_proto.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_generate_config_proto.py", symbol = "GenerateConfigProtoTest" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/test_dev_environment.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_dev_environment.py", symbol = "ConfigSchemaCliTest" }]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:codex-rs/core/config.schema.json"
+confidence = "generated"
+evidence = [{ path = "scripts/config_schema_check.py", symbol = "GENERATED_OUTPUTS" }]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:codex-rs/config/src/thread_config/proto/codex.thread_config.v1.rs"
+confidence = "generated"
+evidence = [{ path = "codex-rs/config/scripts/generate-proto.ps1", symbol = "$checkedGenerated" }]
+
+[[owners.invariants]]
+id = "generated-configuration-source-parity"
+kind = "compatibility"
+statement = "Checked-in configuration schema and thread-config protobuf outputs must match their exact source generators and remain usable through their production consumers."
+evidence = [
+    { path = "scripts/config_schema_check.py", symbol = "regenerate_schema" },
+    { path = "codex-rs/config/scripts/generate-proto.ps1", symbol = "$isCurrent" },
+]
+tests = [
+    "scripts/test_dev_environment.py",
+    "scripts/test_generate_config_proto.py",
+    "codex-rs/core/src/config/schema_tests.rs",
+]
+
+[[owners.validation]]
+id = "config-schema-generated-focused"
+cwd = "."
+argv = ["just", "config-schema-check"]
+role = "generated_contract_check"
+
+[[owners.validation]]
+id = "config-proto-generated-focused"
+cwd = "."
+argv = ["just", "generate-config-proto-check"]
+role = "generated_contract_check"
+
+[[owners]]
 id = "shared-utility-crates"
 concern_ids = ["shared-utilities", "build-metadata", "certificate-parsing"]
 aliases = ["codex utility crates", "shared low-level helpers"]
@@ -589,7 +725,7 @@ category = "tests_contracts"
 kind = "validated_by"
 target = "path:scripts/test_source_owners.py"
 confidence = "declared"
-evidence = [{ path = "scripts/test_source_owners.py", symbol = "SourceOwnersTest" }]
+evidence = [{ path = "scripts/test_source_owners.py", symbol = "SourceOwnersCliTest" }]
 
 [[owners.relationships]]
 category = "generated_artifacts"
@@ -609,6 +745,429 @@ tests = ["scripts/test_source_owners.py"]
 id = "source-owner-focused"
 cwd = "."
 argv = ["python", "-m", "unittest", "scripts.test_source_owners"]
+role = "focused_tests"
+
+[[owners]]
+id = "repository-maintenance-runners"
+concern_ids = ["root-maintenance", "source-map-check", "rust-test-selection"]
+aliases = ["maintenance runners", "repository validation runners"]
+phrases = ["repository maintenance and exact Rust validation routing"]
+roots = [
+    "scripts/just-shell.py",
+    "scripts/readme_toc.py",
+    "scripts/root_maintenance.py",
+    "scripts/source_map_check.py",
+    "scripts/rust_test_runner.py",
+]
+primary_entries = [
+    { path = "scripts/just-shell.py", symbol = "main", ambiguous = true },
+    { path = "scripts/readme_toc.py", symbol = "main", ambiguous = true },
+    { path = "scripts/root_maintenance.py", symbol = "main", ambiguous = true },
+    { path = "scripts/source_map_check.py", symbol = "main", ambiguous = true },
+    { path = "scripts/rust_test_runner.py", symbol = "main", ambiguous = true },
+]
+instructions = ["AGENTS.md"]
+consumers = ["justfile", "scripts/completion_proof.py"]
+contracts = [
+    "source_owners.toml",
+    "codex-rs/.config/kd4-rust-tests.toml",
+    ".codex/validation/completion-proof.toml",
+]
+generated_mirrors = []
+tests = [
+    "scripts/test_build_tooling.py",
+    "scripts/test_build_tooling_policy.py",
+    "scripts/test_readme_toc.py",
+    "scripts/test_source_map_check.py",
+    "scripts/test_rust_test_runner.py",
+]
+
+[owners.facet_exclusions]
+generated_artifacts = "SOURCEMAP.md and architecture_index.json are generated by source-owner-index; these runners only validate or orchestrate their source inputs."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:scripts/just-shell.py"
+confidence = "declared"
+evidence = [
+    { path = "justfile", symbol = "export JUST_SHELL :=" },
+    { path = "justfile", symbol = "set shell :=" },
+    { path = "justfile", symbol = "set windows-shell :=" },
+]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "owner:source-owner-index"
+confidence = "declared"
+evidence = [{ path = "justfile", symbol = "source-map-check:" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:scripts/readme_toc.py"
+confidence = "declared"
+evidence = [{ path = "justfile", symbol = "source-map-check:" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "owner:completion-proof-certification"
+confidence = "declared"
+evidence = [{ path = "scripts/completion_proof.py", symbol = "_production_typed_validation_spec" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:scripts/build_tooling_test_support.py"
+confidence = "compiler_resolved"
+evidence = [{ path = "scripts/build_tooling_test_support.py", symbol = "load_just_shell_module" }]
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "config:codex-rs/.config/kd4-rust-tests.toml"
+confidence = "manifest_derived"
+evidence = [{ path = "scripts/rust_test_runner.py", symbol = "DEFAULT_MANIFEST" }]
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "config:source_owners.toml"
+confidence = "declared"
+evidence = [{ path = "justfile", symbol = "source-map-check:" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:justfile"
+confidence = "declared"
+evidence = [
+    { path = "justfile", symbol = "audit-scripts *args:" },
+    { path = "justfile", symbol = "core-test-manifest-check:" },
+    { path = "justfile", symbol = "source-map-check:" },
+]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/test_build_tooling.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_build_tooling.py", symbol = "BuildToolingEnvironmentTest" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/test_build_tooling_policy.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_build_tooling_policy.py", symbol = "BuildToolingPolicyRuntimeTest" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/test_readme_toc.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_readme_toc.py", symbol = "ReadmeTocTest" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/test_source_map_check.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_source_map_check.py", symbol = "SourceMapCheckTest" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/test_rust_test_runner.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_rust_test_runner.py", symbol = "CliRunnerTestCase" }]
+
+[[owners.invariants]]
+id = "maintenance-runner-route-fidelity"
+kind = "semantic"
+statement = "Supported maintenance recipes use the configured just shell adapter, canonical validation specifications reach the exact repository runners and their declared ownership or Rust-selection inputs, and focused completion proof consumes those maintenance validation routes."
+evidence = [
+    { path = "justfile", symbol = "export JUST_SHELL :=" },
+    { path = "justfile", symbol = "set shell :=" },
+    { path = "scripts/build_tooling_test_support.py", symbol = "load_just_shell_module" },
+    { path = "justfile", symbol = "audit-scripts *args:" },
+    { path = "justfile", symbol = "source-map-check:" },
+    { path = "scripts/readme_toc.py", symbol = "main" },
+    { path = "justfile", symbol = "core-test-manifest-check:" },
+    { path = "scripts/completion_proof.py", symbol = "_production_typed_validation_spec" },
+]
+tests = [
+    "scripts/test_build_tooling.py",
+    "scripts/test_build_tooling_policy.py",
+    "scripts/test_readme_toc.py",
+    "scripts/test_source_map_check.py",
+    "scripts/test_rust_test_runner.py",
+]
+
+[[owners.validation]]
+id = "maintenance-owner-closure-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_source_owners.SourceOwnersCliTest.test_repository_slices_retain_representative_relationships_through_cli"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "readme-toc-owner-closure-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_source_owners.SourceOwnersCliTest.test_repository_maintenance_slice_resolves_readme_toc_cli_and_test"]
+role = "focused_tests"
+
+[[owners]]
+id = "workflow-preflight-coordination"
+feature_ids = ["completion-proof"]
+concern_ids = ["workflow-preflight", "shared-worktree-coordination", "assignment-lease-registry"]
+aliases = ["workflow preflight", "preflight coordination"]
+phrases = ["shared worktree workflow preflight claims and lease coordination"]
+roots = ["scripts/workflow_preflight.py"]
+primary_entries = [{ path = "scripts/workflow_preflight.py", symbol = "main", ambiguous = true }]
+instructions = ["AGENTS.md", ".codex/harness/workflow.md"]
+consumers = [
+    "justfile",
+    ".codex/harness/workflow.md",
+    ".codex/harness/README.md",
+]
+contracts = [".codex/harness/templates/PREFLIGHT.json"]
+generated_mirrors = []
+tests = [
+    "scripts/test_workflow_preflight.py",
+    "scripts/test_source_owners.py",
+]
+
+[owners.facet_exclusions]
+generated_artifacts = "Workflow preflight writes task receipts and private Git-metadata registry state at runtime; it has no checked-in generated mirror."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:scripts/workflow_preflight.py"
+confidence = "declared"
+evidence = [
+    { path = "justfile", symbol = "workflow-preflight manifest output:" },
+    { path = "justfile", symbol = "workflow-preflight-release assignment_id:" },
+]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:justfile"
+confidence = "declared"
+evidence = [
+    { path = "justfile", symbol = "workflow-preflight manifest output:" },
+    { path = "justfile", symbol = "workflow-preflight-release assignment_id:" },
+]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:.codex/harness/workflow.md"
+confidence = "declared"
+evidence = [{ path = ".codex/harness/workflow.md", symbol = "just workflow-preflight <manifest> <receipt>" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:.codex/harness/README.md"
+confidence = "declared"
+evidence = [{ path = ".codex/harness/README.md", symbol = "just workflow-preflight <manifest> <receipt>" }]
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "config:.codex/harness/templates/PREFLIGHT.json"
+confidence = "declared"
+evidence = [
+    { path = "scripts/workflow_preflight.py", symbol = "REQUIRED_FIELDS" },
+    { path = ".codex/harness/workflow.md", symbol = "templates/PREFLIGHT.json" },
+]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:justfile"
+confidence = "declared"
+evidence = [
+    { path = "justfile", symbol = "workflow-preflight manifest output:" },
+    { path = "justfile", symbol = "workflow-preflight-release assignment_id:" },
+]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/test_workflow_preflight.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_workflow_preflight.py", symbol = "WorkflowPreflightTest" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/test_source_owners.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_source_owners.py", symbol = "test_workflow_preflight_coordination_slice_resolves_cli_contract_and_consumers" }]
+
+[[owners.invariants]]
+id = "workflow-preflight-contract-fidelity"
+kind = "compatibility"
+statement = "Both supported just recipes route through the workflow-preflight CLI, whose accepted manifest fields remain aligned with the harness template and whose claims, leases, registry behavior, and release path are exercised through the subprocess CLI tests."
+evidence = [
+    { path = "scripts/workflow_preflight.py", symbol = "REQUIRED_FIELDS" },
+    { path = "scripts/workflow_preflight.py", symbol = "main" },
+    { path = "justfile", symbol = "workflow-preflight manifest output:" },
+    { path = "justfile", symbol = "workflow-preflight-release assignment_id:" },
+    { path = ".codex/harness/templates/PREFLIGHT.json" },
+]
+tests = ["scripts/test_workflow_preflight.py", "scripts/test_source_owners.py"]
+
+[[owners.validation]]
+id = "workflow-preflight-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_workflow_preflight"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "workflow-preflight-owner-closure-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_source_owners.SourceOwnersCliTest.test_workflow_preflight_coordination_slice_resolves_cli_contract_and_consumers"]
+role = "focused_tests"
+
+[[owners]]
+id = "completion-proof-certification"
+feature_ids = ["completion-proof"]
+concern_ids = ["terminal-certification", "frozen-test-inventory", "validation-contracts"]
+aliases = ["completion proof", "frozen test inventory"]
+phrases = ["canonical completion certification and inventory reconciliation"]
+roots = ["scripts/completion_proof.py", "scripts/completion_proof_inventory_v2.py", "codex-rs/validation-contracts", ".codex/validation"]
+primary_entries = [
+    { path = "scripts/completion_proof.py", symbol = "main", ambiguous = true },
+    { path = "scripts/completion_proof_inventory_v2.py", symbol = "validate_frozen_test_inventory_v2" },
+    { path = "codex-rs/validation-contracts/src/inventory_v2.rs", symbol = "FrozenTestInventoryV2" },
+]
+instructions = ["AGENTS.md"]
+consumers = ["codex-rs/core/src/completion_proof.rs"]
+contracts = [
+    ".codex/validation/completion-proof.toml",
+    ".codex/validation/frozen-test-inventory-v2-recoveries.schema.json",
+    ".codex/validation/frozen-test-inventory-v2.schema.json",
+    ".codex/validation/inventory-shared-types-v1.schema.json",
+    ".codex/validation/selection-request-v1.schema.json",
+    ".codex/validation/test-replacements-v2.schema.json",
+    "scripts/fixtures/completion_proof_v2_cross_language_vectors.json",
+]
+generated_mirrors = [
+    ".codex/validation/frozen-test-inventory-v1.json",
+    ".codex/validation/test-replacements-v1.json",
+    ".codex/validation/frozen-test-inventory-v2.json",
+    ".codex/validation/frozen-test-inventory-v2-recoveries.json",
+    ".codex/validation/test-replacements-v2.json",
+]
+tests = [
+    "scripts/test_completion_proof.py",
+    "scripts/test_completion_proof_inventory_v2.py",
+    "codex-rs/validation-contracts/tests/cross_language_vectors.rs",
+    "codex-rs/core/tests/suite/completion_proof_gate.rs",
+    "scripts/test_source_owners.py",
+]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:scripts/completion_proof.py"
+confidence = "declared"
+evidence = [{ path = "justfile", symbol = "completion-proof:" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/core/src/completion_proof.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/completion_proof.rs", symbol = "KD4_TRUSTED_BUNDLE_MEMBERS" }]
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "config:.codex/validation/completion-proof.toml"
+confidence = "compiler_resolved"
+evidence = [{ path = "scripts/completion_proof.py", symbol = "load_config" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:justfile"
+confidence = "declared"
+evidence = [{ path = "justfile", symbol = "completion-focused validation_id:" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:scripts/test_source_owners.py"
+confidence = "declared"
+evidence = [{ path = "scripts/test_source_owners.py", symbol = "test_repository_slices_retain_representative_relationships_through_cli" }]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:.codex/validation/frozen-test-inventory-v1.json"
+confidence = "generated"
+evidence = [{ path = "scripts/completion_proof.py", symbol = "_freeze_inventory" }]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:.codex/validation/test-replacements-v1.json"
+confidence = "generated"
+evidence = [{ path = "scripts/completion_proof.py", symbol = "_freeze_inventory" }]
+
+[[owners.invariants]]
+id = "canonical-command-gate-separation"
+kind = "semantic"
+statement = "Only the explicit canonical command launches whole-repository validation; the compiled CompletionProofGate verifies its current artifact without launching validation."
+evidence = [
+    { path = "justfile", symbol = "completion-proof:" },
+    { path = "codex-rs/core/src/completion_proof.rs", symbol = "completion_artifact_is_current" },
+]
+tests = ["scripts/test_completion_proof.py", "codex-rs/core/tests/suite/completion_proof_gate.rs"]
+
+[[owners.invariants]]
+id = "immutable-baseline-reconciliation"
+kind = "compatibility"
+statement = "Every evolving inventory and replacement identity reconciles against the immutable V1 frozen inventory and replacement ledger rather than losing a baseline test through discovery drift."
+evidence = [{ path = "scripts/completion_proof_inventory_v2.py", symbol = "validate_predecessor_artifact_reconciliation_v1" }]
+tests = ["scripts/test_completion_proof_inventory_v2.py", "codex-rs/validation-contracts/tests/cross_language_vectors.rs"]
+
+[[owners.invariants]]
+id = "cross-language-validation-contract-parity"
+kind = "compatibility"
+statement = "Python inventory validation and the production-dormant Rust contract crate accept the same canonical vectors and bind the same schema resources."
+evidence = [{ path = "scripts/fixtures/completion_proof_v2_cross_language_vectors.json" }]
+tests = ["scripts/test_completion_proof_inventory_v2.py", "codex-rs/validation-contracts/tests/cross_language_vectors.rs"]
+
+[[owners.validation]]
+id = "completion-proof-source-owner-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_source_owners.SourceOwnersCliTest.test_repository_slices_retain_representative_relationships_through_cli"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "completion-proof-runner-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_completion_proof"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "inventory-v2-python-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_completion_proof_inventory_v2"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "inventory-v2-rust-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-validation-contracts"]
 role = "focused_tests"
 
 [[owners]]
@@ -719,6 +1278,92 @@ id = "tool-output-focused"
 cwd = "codex-rs"
 argv = ["just", "core-test-fast", "core_lib", "-E", "test(tools::command_output_artifact::hardening_tests)"]
 role = "focused_tests"
+
+[[owners]]
+id = "exec-server-relay-contracts"
+concern_ids = ["exec-server-relay", "relay-proto", "generated-relay-contract"]
+aliases = ["relay protobuf", "exec server relay contract"]
+phrases = ["generated exec-server relay protobuf contract"]
+roots = [
+    "codex-rs/exec-server/examples/generate-relay-proto.rs",
+    "codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.proto",
+]
+primary_entries = [{ path = "codex-rs/exec-server/examples/generate-relay-proto.rs", symbol = "main", ambiguous = true }]
+instructions = ["AGENTS.md"]
+consumers = [
+    "codex-rs/exec-server/src/relay_proto.rs",
+    "codex-rs/exec-server/src/relay.rs",
+]
+contracts = ["codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.proto"]
+generated_mirrors = ["codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.rs"]
+tests = [
+    "codex-rs/exec-server/examples/generate-relay-proto.rs",
+    "codex-rs/exec-server/tests/relay.rs",
+]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Relay protobuf parity is selected by its explicit generator check command rather than an ambient repository feature gate."
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.proto"
+confidence = "generated"
+evidence = [{ path = "codex-rs/exec-server/examples/generate-relay-proto.rs", symbol = "PROTO_FILE" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/exec-server/src/relay_proto.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/exec-server/src/relay_proto.rs", symbol = "mod generated" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "consumed_by"
+target = "path:codex-rs/exec-server/src/relay.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/exec-server/src/relay.rs", symbol = "use crate::relay_proto" }]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:justfile"
+confidence = "declared"
+evidence = [{ path = "justfile", symbol = "generate-exec-server-relay-proto-check:" }]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:codex-rs/exec-server/tests/relay.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/exec-server/tests/relay.rs" }]
+
+[[owners.relationships]]
+category = "generated_artifacts"
+kind = "generates"
+target = "generated:codex-rs/exec-server/src/proto/codex.exec_server.relay.v1.rs"
+confidence = "generated"
+evidence = [{ path = "codex-rs/exec-server/examples/generate-relay-proto.rs", symbol = "GENERATED_FILE" }]
+
+[[owners.invariants]]
+id = "relay-proto-source-parity"
+kind = "compatibility"
+statement = "The checked-in exec-server relay protobuf binding must match its exact source proto and remain connected to the production relay module."
+evidence = [
+    { path = "codex-rs/exec-server/examples/generate-relay-proto.rs", symbol = "sync_generated" },
+    { path = "codex-rs/exec-server/src/relay_proto.rs", symbol = "mod generated" },
+]
+tests = [
+    "codex-rs/exec-server/examples/generate-relay-proto.rs",
+    "codex-rs/exec-server/tests/relay.rs",
+]
+
+[[owners.validation]]
+id = "exec-server-relay-proto-generated-focused"
+cwd = "."
+argv = ["just", "generate-exec-server-relay-proto-check"]
+role = "generated_contract_check"
 
 [[owners]]
 id = "app-server-protocol-contracts"

@@ -1,0 +1,406 @@
+{
+  "$id": "kd4://validation/child-validation-journal-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "KD4 CompletionProofChildValidationJournalV1 record",
+  "type": "object",
+  "unevaluatedProperties": false,
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "canonicalUuid": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:$@/+-]*$"
+    },
+    "identifierList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/identifier"
+      },
+      "uniqueItems": true
+    },
+    "nonemptyIdentifierList": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/identifierList"
+        },
+        {
+          "minItems": 1
+        }
+      ]
+    },
+    "processIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pid",
+        "executable_path",
+        "executable_sha256",
+        "argv_sha256",
+        "started_at_unix_ns"
+      ],
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "executable_path": {
+          "type": "string",
+          "pattern": "^(?:/|[A-Za-z]:[\\\\/]|\\\\\\\\[^\\\\/]+[\\\\/][^\\\\/]+(?:[\\\\/]|$))"
+        },
+        "executable_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "argv_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "started_at_unix_ns": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action_id",
+        "action_execution_id",
+        "classification",
+        "actually_executed",
+        "result_code"
+      ],
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "action_execution_id": {
+          "$ref": "#/$defs/canonicalUuid"
+        },
+        "classification": {
+          "enum": [
+            "confirmed_pass",
+            "confirmed_validation_failure",
+            "pre_result_error"
+          ]
+        },
+        "actually_executed": {
+          "type": "boolean"
+        },
+        "result_code": {
+          "enum": [
+            "passed",
+            "failed",
+            "error"
+          ]
+        }
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "report_type",
+    "record_type",
+    "sequence",
+    "previous_record_sha256",
+    "record_sha256",
+    "proof_attempt_id",
+    "proof_execution_id",
+    "proof_receipt_nonce",
+    "proof_scope",
+    "validation_id",
+    "validation_type",
+    "input_contract_digest",
+    "emitted_at_unix_ns"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "report_type": {
+      "const": "CompletionProofChildValidationJournalV1"
+    },
+    "record_type": {
+      "enum": [
+        "header",
+        "action_started",
+        "action_result",
+        "infrastructure_error",
+        "seal"
+      ]
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "previous_record_sha256": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/digest"
+        }
+      ]
+    },
+    "record_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "proof_attempt_id": {
+      "$ref": "#/$defs/canonicalUuid"
+    },
+    "proof_execution_id": {
+      "$ref": "#/$defs/canonicalUuid"
+    },
+    "proof_receipt_nonce": {
+      "$ref": "#/$defs/digest"
+    },
+    "proof_scope": {
+      "$ref": "#/$defs/identifier"
+    },
+    "validation_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "validation_type": {
+      "$ref": "#/$defs/identifier"
+    },
+    "input_contract_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "emitted_at_unix_ns": {
+      "type": "integer",
+      "minimum": 1
+    }
+  },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "record_type": {
+              "const": "header"
+            },
+            "producer": {
+              "$ref": "#/$defs/processIdentity"
+            },
+            "intended_ids": {
+              "$ref": "#/$defs/nonemptyIdentifierList"
+            },
+            "intended_count": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "selected_ids": {
+              "$ref": "#/$defs/nonemptyIdentifierList"
+            },
+            "selected_count": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "producer",
+            "intended_ids",
+            "intended_count",
+            "selected_ids",
+            "selected_count"
+          ]
+        },
+        {
+          "properties": {
+            "record_type": {
+              "const": "action_started"
+            },
+            "action_id": {
+              "$ref": "#/$defs/identifier"
+            },
+            "action_execution_id": {
+              "$ref": "#/$defs/canonicalUuid"
+            },
+            "subject_count": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "subjects_sha256": {
+              "$ref": "#/$defs/digest"
+            },
+            "process": {
+              "$ref": "#/$defs/processIdentity"
+            }
+          },
+          "required": [
+            "action_id",
+            "action_execution_id",
+            "subject_count",
+            "subjects_sha256",
+            "process"
+          ]
+        },
+        {
+          "properties": {
+            "record_type": {
+              "const": "action_result"
+            },
+            "action_id": {
+              "$ref": "#/$defs/identifier"
+            },
+            "action_execution_id": {
+              "$ref": "#/$defs/canonicalUuid"
+            },
+            "subject_count": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "subjects_sha256": {
+              "$ref": "#/$defs/digest"
+            },
+            "classification": {
+              "enum": [
+                "confirmed_pass",
+                "confirmed_validation_failure",
+                "pre_result_error"
+              ]
+            },
+            "actually_executed": {
+              "type": "boolean"
+            },
+            "result_code": {
+              "enum": [
+                "passed",
+                "failed",
+                "error"
+              ]
+            },
+            "exit_code": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "diagnostic": {
+              "type": "string"
+            },
+            "ended_at_unix_ns": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "process_executable_sha256_after": {
+              "$ref": "#/$defs/digest"
+            }
+          },
+          "required": [
+            "action_id",
+            "action_execution_id",
+            "subject_count",
+            "subjects_sha256",
+            "classification",
+            "actually_executed",
+            "result_code",
+            "exit_code",
+            "diagnostic",
+            "ended_at_unix_ns",
+            "process_executable_sha256_after"
+          ]
+        },
+        {
+          "properties": {
+            "record_type": {
+              "const": "infrastructure_error"
+            },
+            "phase": {
+              "$ref": "#/$defs/identifier"
+            },
+            "diagnostic": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "phase",
+            "diagnostic"
+          ]
+        },
+        {
+          "properties": {
+            "record_type": {
+              "const": "seal"
+            },
+            "intended_ids": {
+              "$ref": "#/$defs/nonemptyIdentifierList"
+            },
+            "intended_count": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "selected_ids": {
+              "$ref": "#/$defs/nonemptyIdentifierList"
+            },
+            "selected_count": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "started_ids": {
+              "$ref": "#/$defs/identifierList"
+            },
+            "started_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "terminal_ids": {
+              "$ref": "#/$defs/identifierList"
+            },
+            "terminal_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "executed_ids": {
+              "$ref": "#/$defs/identifierList"
+            },
+            "executed_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "outcomes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/outcome"
+              }
+            },
+            "sealed_prefix_sha256": {
+              "$ref": "#/$defs/digest"
+            },
+            "producer_ended_at_unix_ns": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "producer_executable_sha256_after": {
+              "$ref": "#/$defs/digest"
+            }
+          },
+          "required": [
+            "intended_ids",
+            "intended_count",
+            "selected_ids",
+            "selected_count",
+            "started_ids",
+            "started_count",
+            "terminal_ids",
+            "terminal_count",
+            "executed_ids",
+            "executed_count",
+            "outcomes",
+            "sealed_prefix_sha256",
+            "producer_ended_at_unix_ns",
+            "producer_executable_sha256_after"
+          ]
+        }
+      ]
+    }
+  ]
+}

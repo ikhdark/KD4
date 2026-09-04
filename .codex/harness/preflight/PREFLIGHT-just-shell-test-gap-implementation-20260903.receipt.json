@@ -1,0 +1,52 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts/test_build_tooling.py",
+          "scripts"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:just-shell-test-gap-implementation-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\none",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\none"
+  },
+  "contract_claims": [
+    "just-shell-python-cpu-runtime-boundary",
+    "just-shell-probe-cache-concurrent-publication",
+    "just-shell-probe-timeout-termination"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-04T04:30:50.538670+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "2f993614729251fea8ed58063ffc248db2ec4454f77c77349702b3414eef8775",
+  "path_claims": [
+    {
+      "path": "scripts/test_build_tooling.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T03:30:50.538670+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "9e9060959bde600f394cf4a44e0b84853b9853ee5c4e95765c14fc8dfb6cff49"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_build_tooling.BuildToolingEnvironmentTest.test_just_shell_cli_configures_python_environment",
+    "python -m unittest scripts.test_build_tooling.BuildToolingEnvironmentTest.test_just_shell_cli_renders_and_validates_powershell"
+  ],
+  "validation_owner": "worker:just-shell-test-gap-implementation-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

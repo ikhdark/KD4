@@ -10,8 +10,10 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use std::path::Prefix;
+use std::process::Stdio;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_pty::with_windows_child_creation;
 
 pub use crate::command_safety::PowershellDirectArgvCandidate;
 
@@ -345,9 +347,14 @@ pub fn try_find_powershell_executable_blocking() -> Option<AbsolutePathBuf> {
 /// has installed pwsh.exe, it may not be available in the system PATH, in which
 /// case we attempt to locate it via other means.
 pub fn try_find_pwsh_executable_blocking() -> Option<AbsolutePathBuf> {
-    if let Some(ps_home) = std::process::Command::new("cmd")
+    let mut command = std::process::Command::new("cmd");
+    command
         .args(["/C", "pwsh", "-NoProfile", "-Command", "$PSHOME"])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(ps_home) = with_windows_child_creation(|_| command.spawn())
+        .and_then(|child| child.wait_with_output())
         .ok()
         .and_then(|out| {
             if !out.status.success() {
@@ -390,9 +397,14 @@ fn try_find_powershellish_executable_in_path(candidates: &[&str]) -> Option<Abso
 
 fn is_powershellish_executable_available(powershell_or_pwsh_exe: &std::path::Path) -> bool {
     // This test works for both powershell.exe and pwsh.exe.
-    std::process::Command::new(powershell_or_pwsh_exe)
+    let mut command = std::process::Command::new(powershell_or_pwsh_exe);
+    command
         .args(["-NoLogo", "-NoProfile", "-Command", "Write-Output ok"])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    with_windows_child_creation(|_| command.spawn())
+        .and_then(|child| child.wait_with_output())
         .map(|output| output.status.success())
         .unwrap_or(false)
 }

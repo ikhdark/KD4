@@ -51,6 +51,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::process::Stdio;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing::instrument;
@@ -1495,8 +1496,16 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
         command.current_dir(cwd);
     }
 
-    let output = command
-        .output()
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn());
+    #[cfg(not(windows))]
+    let child = command.spawn();
+    let output = child
+        .and_then(|child| child.wait_with_output())
         .map_err(|err| format!("failed to run git {}: {err}", args.join(" ")))?;
     if output.status.success() {
         return Ok(());

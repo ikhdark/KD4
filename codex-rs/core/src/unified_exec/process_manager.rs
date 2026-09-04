@@ -177,6 +177,14 @@ fn build_unified_exec_environment(
     )
 }
 
+fn strip_completion_proof_private_env(env: &mut HashMap<String, String>) {
+    env.retain(|name, _| {
+        !name
+            .to_ascii_uppercase()
+            .starts_with("CODEX_COMPLETION_PROOF_")
+    });
+}
+
 fn exec_env_policy_from_shell_policy(
     policy: &ShellEnvironmentPolicy,
 ) -> codex_exec_server::ExecEnvPolicy {
@@ -275,6 +283,7 @@ struct PreparedProcessHandles {
     pause_state: Option<watch::Receiver<bool>>,
     session: Option<Arc<crate::session::session::Session>>,
     network_approval: Option<DeferredNetworkApproval>,
+    completion_proof: Option<crate::completion_proof::UnifiedExecCompletionProof>,
     call_id: String,
     hook_command: String,
     process_id: u32,
@@ -694,6 +703,10 @@ async fn emit_failed_initial_exec_end_if_unstored(
         wall_time,
         context.source.clone(),
         context.tracker.clone(),
+        request
+            .completion_proof
+            .as_ref()
+            .is_some_and(crate::completion_proof::UnifiedExecCompletionProof::is_canonical),
     )
     .await;
 }
@@ -968,6 +981,7 @@ impl UnifiedExecProcessManager {
                     wall_time,
                     context.source.clone(),
                     context.tracker.clone(),
+                    false,
                 )
                 .await;
                 self.release_process_id(request.process_id).await;
@@ -1048,6 +1062,8 @@ impl UnifiedExecProcessManager {
                         .known_delta
                         .as_ref()
                         .map(|_| known_delta_executor_started_at),
+                    request.workspace_operation.clone(),
+                    request.completion_proof.clone(),
                 )
                 .await;
             store_result?;
@@ -1233,6 +1249,10 @@ impl UnifiedExecProcessManager {
                 wall_time,
                 context.source.clone(),
                 context.tracker.clone(),
+                request
+                    .completion_proof
+                    .as_ref()
+                    .is_some_and(crate::completion_proof::UnifiedExecCompletionProof::is_canonical),
             )
             .await;
 
@@ -1315,6 +1335,7 @@ impl UnifiedExecProcessManager {
             pause_state,
             session,
             network_approval,
+            completion_proof,
             call_id,
             hook_command,
             process_id,
@@ -1465,7 +1486,7 @@ impl UnifiedExecProcessManager {
         let text = String::from_utf8_lossy(&collected).to_string();
         let original_token_count = approx_token_count(&text);
 
-        let response = ExecCommandToolOutput {
+        let mut response = ExecCommandToolOutput {
             event_call_id,
             chunk_id,
             wall_time,
@@ -1480,6 +1501,13 @@ impl UnifiedExecProcessManager {
             raw_output_artifact: process.raw_output_artifact().await,
             repair_notice: None,
         };
+
+        if response.process_exited
+            && let Some(completion_proof) = completion_proof
+        {
+            let outcome = completion_proof.await_outcome().await;
+            outcome.apply_to_exec_command_output(&mut response);
+        }
 
         Ok(response)
     }
@@ -1554,6 +1582,7 @@ impl UnifiedExecProcessManager {
             pause_state,
             session,
             network_approval: entry.network_approval.clone(),
+            completion_proof: entry.completion_proof.clone(),
             call_id: entry.call_id.clone(),
             hook_command: entry.hook_command.clone(),
             process_id: entry.process_id,
@@ -1582,6 +1611,8 @@ impl UnifiedExecProcessManager {
         registration: &mut PendingProcessRegistration,
         known_delta: Option<crate::tools::known_delta_store::PreparedKnownDelta>,
         known_delta_executor_started_at: Option<Instant>,
+        workspace_operation: Option<crate::workspace_operation_gate::WorkspaceOperationLease>,
+        completion_proof: Option<crate::completion_proof::UnifiedExecCompletionProof>,
     ) -> Result<(), UnifiedExecError> {
         let command_execution_id = context
             .session
@@ -1604,6 +1635,7 @@ impl UnifiedExecProcessManager {
             hook_command,
             tty,
             network_approval,
+            completion_proof: completion_proof.clone(),
             session: Arc::downgrade(&context.session),
             last_used: started_at,
         };
@@ -1667,6 +1699,33 @@ impl UnifiedExecProcessManager {
             return Err(UnifiedExecError::process_failed(message));
         }
 
+        // The process-store registration is now durable. From this point on,
+        // cleanup belongs to the stored entry and its watcher rather than the
+        // caller-side pending-registration guard.
+        registration.commit();
+
+        if completion_proof
+            .as_ref()
+            .is_some_and(|proof| !proof.transfer_to_watcher())
+        {
+            let _ = process.terminate_confirmed().await;
+            self.release_process_id(process_id).await;
+            context
+                .session
+                .services
+                .command_execution
+                .finish_running_process_with_execution_id(
+                    process_id,
+                    command_execution_id,
+                    &parent_tool_execution_id,
+                    Some(-1),
+                )
+                .await;
+            return Err(UnifiedExecError::process_failed(
+                "completion-proof attempt ownership changed before watcher commit".to_string(),
+            ));
+        }
+
         spawn_exit_watcher(
             Arc::clone(&process),
             Arc::clone(&context.session),
@@ -1685,8 +1744,9 @@ impl UnifiedExecProcessManager {
             known_delta,
             known_delta_executor_started_at,
             tool_dispatch_timing,
+            workspace_operation,
+            completion_proof,
         );
-        registration.commit();
         Ok(())
     }
 
@@ -1709,6 +1769,11 @@ impl UnifiedExecProcessManager {
         raw_output_artifact: Option<crate::tools::command_output_artifact::RawOutputArtifact>,
         environment: &codex_exec_server::Environment,
         pending_spawns: &PendingSpawnRegistration,
+        completion_proof: Option<&crate::completion_proof::UnifiedExecCompletionProof>,
+        prepared_canonical_windows_sandbox_launch: Option<
+            codex_windows_sandbox::PreparedCanonicalWindowsSandboxLaunch,
+        >,
+        canonical_windows_sandbox_launch_identity: Option<&str>,
     ) -> Result<Arc<UnifiedExecProcess>, ToolError> {
         let mut request = if environment.is_remote() {
             attempt.env_for_exec_server(
@@ -1724,6 +1789,10 @@ impl UnifiedExecProcessManager {
         .map_err(ToolError::Codex)?;
         request.windows_sandbox_additional_read_roots = additional_read_roots;
         request.exec_server_env_config = exec_server_env_config;
+        request.prepared_canonical_windows_sandbox_launch =
+            prepared_canonical_windows_sandbox_launch;
+        request.canonical_windows_sandbox_launch_identity =
+            canonical_windows_sandbox_launch_identity.map(str::to_string);
         self.open_session_with_prepared_exec_env(
             process_id,
             &request,
@@ -1732,6 +1801,7 @@ impl UnifiedExecProcessManager {
             raw_output_artifact,
             environment,
             pending_spawns,
+            completion_proof,
         )
         .await
         .map_err(|err| match err {
@@ -1755,8 +1825,17 @@ impl UnifiedExecProcessManager {
         raw_output_artifact: Option<crate::tools::command_output_artifact::RawOutputArtifact>,
         environment: &codex_exec_server::Environment,
         pending_spawns: &PendingSpawnRegistration,
+        completion_proof: Option<&crate::completion_proof::UnifiedExecCompletionProof>,
     ) -> Result<Arc<UnifiedExecProcess>, UnifiedExecError> {
         let inherited_fds = spawn_lifecycle.inherited_fds();
+
+        // Keep private proof values out of the Debug-bearing ExecRequest. Seal
+        // them into a launch-only copy after all ordinary environment and
+        // snapshot processing, immediately before the process boundary.
+        let mut launch_env = request.env.clone();
+        if let Some(completion_proof) = completion_proof {
+            completion_proof.seal_private_environment(&mut launch_env);
+        }
 
         if request.sandbox == codex_sandboxing::SandboxType::WindowsRestrictedToken {
             // TODO(anp): Keep PathUri through the Windows sandbox launch boundary.
@@ -1791,36 +1870,86 @@ impl UnifiedExecProcessManager {
                 .and_then(|overrides| overrides.write_roots_override.clone());
             let spawned = match request.windows_sandbox_level {
                 codex_protocol::config_types::WindowsSandboxLevel::Elevated => {
-                    codex_windows_sandbox::spawn_windows_sandbox_session_elevated_for_permission_profile(
-                        &request.permission_profile,
-                        request.windows_sandbox_workspace_roots.as_slice(),
-                        request.codex_home.as_path(),
-                        request.command.clone(),
-                        native_cwd.as_path(),
-                        request.env.clone(),
-                        request.network.is_some(),
-                        None,
-                        elevated_read_roots_override.as_deref(),
-                        &request.windows_sandbox_additional_read_roots,
-                        elevated_read_roots_include_platform_defaults,
-                        elevated_write_roots_override.as_deref(),
-                        &additional_deny_read_paths,
-                        &additional_deny_write_paths,
-                        tty,
-                        tty,
-                        request.windows_sandbox_private_desktop,
-                    )
-                    .await
+                    match request.prepared_canonical_windows_sandbox_launch.clone() {
+                        Some(prepared_launch) => {
+                            let Some(canonical_launch_identity) =
+                                request.canonical_windows_sandbox_launch_identity.as_deref()
+                            else {
+                                return Err(UnifiedExecError::create_process(
+                                    "prepared canonical Windows launch is missing its exact launch identity"
+                                        .to_string(),
+                                ));
+                            };
+                            codex_windows_sandbox::spawn_windows_sandbox_session_elevated_with_prepared_canonical_launch(
+                                &request.permission_profile,
+                                request.windows_sandbox_workspace_roots.as_slice(),
+                                request.codex_home.as_path(),
+                                request.command.clone(),
+                                native_cwd.as_path(),
+                                launch_env.clone(),
+                                request.network.is_some(),
+                                None,
+                                elevated_read_roots_override.as_deref(),
+                                &request.windows_sandbox_additional_read_roots,
+                                elevated_read_roots_include_platform_defaults,
+                                elevated_write_roots_override.as_deref(),
+                                &additional_deny_read_paths,
+                                &additional_deny_write_paths,
+                                tty,
+                                tty,
+                                request.windows_sandbox_private_desktop,
+                                prepared_launch,
+                                canonical_launch_identity,
+                            )
+                            .await
+                        }
+                        None => {
+                            if request.canonical_windows_sandbox_launch_identity.is_some() {
+                                return Err(UnifiedExecError::create_process(
+                                    "canonical Windows launch is missing its prepared one-shot capability"
+                                        .to_string(),
+                                ));
+                            }
+                            codex_windows_sandbox::spawn_windows_sandbox_session_elevated_for_permission_profile(
+                                &request.permission_profile,
+                                request.windows_sandbox_workspace_roots.as_slice(),
+                                request.codex_home.as_path(),
+                                request.command.clone(),
+                                native_cwd.as_path(),
+                                launch_env.clone(),
+                                request.network.is_some(),
+                                None,
+                                elevated_read_roots_override.as_deref(),
+                                &request.windows_sandbox_additional_read_roots,
+                                elevated_read_roots_include_platform_defaults,
+                                elevated_write_roots_override.as_deref(),
+                                &additional_deny_read_paths,
+                                &additional_deny_write_paths,
+                                tty,
+                                tty,
+                                request.windows_sandbox_private_desktop,
+                            )
+                            .await
+                        }
+                    }
                 }
                 codex_protocol::config_types::WindowsSandboxLevel::RestrictedToken
                 | codex_protocol::config_types::WindowsSandboxLevel::Disabled => {
+                    if request.prepared_canonical_windows_sandbox_launch.is_some()
+                        || request.canonical_windows_sandbox_launch_identity.is_some()
+                    {
+                        return Err(UnifiedExecError::create_process(
+                            "prepared canonical Windows launch requires the elevated sandbox backend"
+                                .to_string(),
+                        ));
+                    }
                     codex_windows_sandbox::spawn_windows_sandbox_session_legacy(
                         &request.permission_profile,
                         request.windows_sandbox_workspace_roots.as_slice(),
                         request.codex_home.as_path(),
                         request.command.clone(),
                         native_cwd.as_path(),
-                        request.env.clone(),
+                        launch_env.clone(),
                         None,
                         &additional_deny_read_paths,
                         &additional_deny_write_paths,
@@ -1845,6 +1974,11 @@ impl UnifiedExecProcessManager {
             .await;
         }
         if environment.is_remote() {
+            if completion_proof.is_some() {
+                return Err(UnifiedExecError::create_process(
+                    "completion-proof validation cannot launch in a remote environment".to_string(),
+                ));
+            }
             if !inherited_fds.is_empty() {
                 return Err(UnifiedExecError::create_process(
                     "remote exec-server does not support inherited file descriptors".to_string(),
@@ -1883,7 +2017,7 @@ impl UnifiedExecProcessManager {
                 program,
                 args,
                 native_cwd.as_path(),
-                &request.env,
+                &launch_env,
                 &request.arg0,
                 codex_utils_pty::TerminalSize::default(),
                 &inherited_fds,
@@ -1894,7 +2028,7 @@ impl UnifiedExecProcessManager {
                 program,
                 args,
                 native_cwd.as_path(),
-                &request.env,
+                &launch_env,
                 &request.arg0,
                 &inherited_fds,
             )
@@ -1921,11 +2055,25 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
         pending_spawns: PendingSpawnRegistration,
     ) -> Result<(UnifiedExecLaunch, Option<DeferredNetworkApproval>), UnifiedExecError> {
-        let (env, local_policy_env) = build_unified_exec_environment(context);
+        let (mut env, mut local_policy_env) = build_unified_exec_environment(context);
+        let mut exec_server_env_policy = exec_env_policy_from_shell_policy(
+            &context.turn.config.permissions.shell_environment_policy,
+        );
+        let mut explicit_env_overrides = context
+            .turn
+            .config
+            .permissions
+            .shell_environment_policy
+            .r#set
+            .clone();
+        if request.completion_proof.is_some() {
+            strip_completion_proof_private_env(&mut env);
+            strip_completion_proof_private_env(&mut local_policy_env);
+            strip_completion_proof_private_env(&mut exec_server_env_policy.r#set);
+            strip_completion_proof_private_env(&mut explicit_env_overrides);
+        }
         let exec_server_env_config = ExecServerEnvConfig {
-            policy: exec_env_policy_from_shell_policy(
-                &context.turn.config.permissions.shell_environment_policy,
-            ),
+            policy: exec_server_env_policy,
             local_policy_env,
         };
         let mut orchestrator = ToolOrchestrator::new();
@@ -2029,13 +2177,7 @@ impl UnifiedExecProcessManager {
             turn_environment: request.turn_environment.clone(),
             env,
             exec_server_env_config: Some(exec_server_env_config),
-            explicit_env_overrides: context
-                .turn
-                .config
-                .permissions
-                .shell_environment_policy
-                .r#set
-                .clone(),
+            explicit_env_overrides,
             network: request.network.clone(),
             tty: request.tty,
             sandbox_permissions: request.sandbox_permissions,
@@ -2048,6 +2190,13 @@ impl UnifiedExecProcessManager {
                 .known_delta
                 .as_ref()
                 .and_then(|prepared| prepared.hit().cloned()),
+            workspace_operation: request.workspace_operation.clone(),
+            completion_proof: request.completion_proof.clone(),
+            canonical_proof_repository_root: request.canonical_proof_repository_root.clone(),
+            canonical_proof_report_write_root: request.canonical_proof_report_write_root.clone(),
+            prepared_canonical_windows_sandbox_launch: request
+                .prepared_canonical_windows_sandbox_launch
+                .clone(),
         };
         let tool_ctx = ToolCtx {
             session: context.session.clone(),

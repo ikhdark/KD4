@@ -1,0 +1,115 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/core/src/spawn.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/core/src/shell_snapshot.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/hooks/src/engine/command_runner.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/rmcp-client/src/stdio_server_launcher.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/exec-server/src/client_transport.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/exec-server/src/fs_sandbox.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/exec-server/src/connection.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/app-server/src/request_processors/feedback_doctor_report.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/code-mode/src/remote_session/connection.rs",
+          "codex-rs"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:windows-process-coordinator-live-launchers-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-windows-process-coordinator-live-launchers"
+  },
+  "contract_claims": [
+    "windows-first-party-live-launcher-coordination"
+  ],
+  "dependencies": [
+    "worker:windows-process-coordinator-pty-20260903"
+  ],
+  "expires_at": "2026-09-03T14:07:13.029627+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "b9059e67fe3bfa7d4ea646aaf23662f258e9d0a851da101a7051ecbe4323c6f6",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/src/spawn.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/src/shell_snapshot.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/hooks/src/engine/command_runner.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/rmcp-client/src/stdio_server_launcher.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/exec-server/src/client_transport.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/exec-server/src/fs_sandbox.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/exec-server/src/connection.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/app-server/src/request_processors/feedback_doctor_report.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/code-mode/src/remote_session/connection.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T13:07:13.029627+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "d8011b21843074e535ac5aa09ee69c5f308219393ade7828bf3b9b1d308d548b"
+  },
+  "validation_commands": [
+    "cargo check -p codex-core -p codex-hooks -p codex-rmcp-client -p codex-exec-server -p codex-app-server -p codex-code-mode --target x86_64-pc-windows-msvc"
+  ],
+  "validation_owner": "worker:windows-process-coordinator-live-launchers-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

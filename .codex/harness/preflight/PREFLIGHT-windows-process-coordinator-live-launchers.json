@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:windows-process-coordinator-live-launchers-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {"path": "codex-rs/core/src/spawn.rs", "recursive": false},
+    {"path": "codex-rs/core/src/shell_snapshot.rs", "recursive": false},
+    {"path": "codex-rs/hooks/src/engine/command_runner.rs", "recursive": false},
+    {"path": "codex-rs/rmcp-client/src/stdio_server_launcher.rs", "recursive": false},
+    {"path": "codex-rs/exec-server/src/client_transport.rs", "recursive": false},
+    {"path": "codex-rs/exec-server/src/fs_sandbox.rs", "recursive": false},
+    {"path": "codex-rs/exec-server/src/connection.rs", "recursive": false},
+    {"path": "codex-rs/app-server/src/request_processors/feedback_doctor_report.rs", "recursive": false},
+    {"path": "codex-rs/code-mode/src/remote_session/connection.rs", "recursive": false}
+  ],
+  "contract_claims": ["windows-first-party-live-launcher-coordination"],
+  "dependencies": ["worker:windows-process-coordinator-pty-20260903"],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:windows-process-coordinator-live-launchers-20260903",
+  "validation_commands": ["cargo check -p codex-core -p codex-hooks -p codex-rmcp-client -p codex-exec-server -p codex-app-server -p codex-code-mode --target x86_64-pc-windows-msvc"],
+  "cargo_lane": {"target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target-windows-process-coordinator-live-launchers", "cargo_home": "C:/Users/kuh/.cargo"},
+  "workspace_strategy": "shared"
+}

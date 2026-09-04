@@ -6,8 +6,12 @@ use std::fs::File;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
@@ -51,10 +55,14 @@ const GIT_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKSPACE_GENERATION_DEADLINE: Duration = Duration::from_secs(5);
 const WORKSPACE_GENERATION_MAX_PATHS: usize = 256;
 const WORKSPACE_GENERATION_MAX_DECLARED_BYTES: u64 = 64 * 1024 * 1024;
+const WORKSPACE_GENERATION_MAX_INDEX_BYTES: usize = 128 * 1024 * 1024;
+const WORKSPACE_GENERATION_MAX_INDEX_PATHS: usize = 1_000_000;
 const WORKSPACE_WATCHER_DEBOUNCE: Duration = Duration::from_millis(50);
+const SOURCE_WATCHER_BARRIER_TIMEOUT: Duration = Duration::from_secs(2);
+const SOURCE_WATCHER_BARRIER_POLL: Duration = Duration::from_millis(10);
+const SOURCE_WATCHER_BARRIER_PREFIX: &str = ".completion-proof-watcher-barrier-";
 const SOURCE_CHANGE_JOURNAL_CAPACITY: usize = 4_096;
 const RETAINED_REPOSITORY_CAPACITY: usize = 64;
-const GENERATED_CODEX_EVAL_PATHSPEC: &str = ":(exclude).codex/evals/**";
 const PROJECT_DISCOVERY_REUSE_METRIC: &str = "codex.project_discovery_reuse";
 const ROOT_DISCOVERY_CONCURRENCY: usize = 4;
 static NEXT_WATCHER_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -274,27 +282,38 @@ fn workspace_generation_status_args() -> &'static [&'static str] {
         "--untracked-files=all",
         "--",
         ".",
-        GENERATED_CODEX_EVAL_PATHSPEC,
+    ]
+}
+
+fn workspace_generation_index_args() -> &'static [&'static str] {
+    &[
+        "ls-files", "--cached", "--stage", "-v", "-f", "-z", "--", ".",
     ]
 }
 
 async fn capture_workspace_generation_marker(
     repo_root: PathBuf,
 ) -> Option<WorkspaceEvidenceIdentity> {
-    let (head, status) = tokio::join!(
+    let (head, index, status) = tokio::join!(
         workspace_generation_git_output(&repo_root, &["rev-parse", "--verify", "HEAD"]),
+        workspace_generation_git_output(&repo_root, workspace_generation_index_args()),
         workspace_generation_git_output(&repo_root, workspace_generation_status_args()),
     );
+    let index = index?;
+    workspace_generation_index(&index)?;
     let status = status?;
-    let paths = workspace_generation_paths(&status);
+    let paths = workspace_generation_paths(&status)?;
     let metadata = workspace_generation_metadata(repo_root.clone(), paths).await?;
 
     let mut index_hasher = Sha256::new();
-    index_hasher.update(b"KD4_WORKSPACE_INDEX_GENERATION_V1\n");
-    index_hasher.update(&status);
+    index_hasher.update(b"KD4_WORKSPACE_INDEX_GENERATION_V2\n");
+    index_hasher.update(&index);
     let mut worktree_hasher = Sha256::new();
-    worktree_hasher.update(b"KD4_WORKSPACE_WORKTREE_GENERATION_V1\n");
+    worktree_hasher.update(b"KD4_WORKSPACE_WORKTREE_GENERATION_V2\n");
+    worktree_hasher.update(&index);
+    worktree_hasher.update(b"\0status\0");
     worktree_hasher.update(&status);
+    worktree_hasher.update(b"\0manifest\0");
     worktree_hasher.update(&metadata.manifest);
 
     Some(WorkspaceEvidenceIdentity {
@@ -310,31 +329,178 @@ async fn capture_workspace_generation_marker(
     })
 }
 
-fn workspace_generation_paths(status: &[u8]) -> Vec<String> {
-    let mut paths = status
+fn workspace_generation_index(index: &[u8]) -> Option<()> {
+    if index.len() > WORKSPACE_GENERATION_MAX_INDEX_BYTES {
+        return None;
+    }
+    if index.is_empty() {
+        return Some(());
+    }
+    if index.last() != Some(&0) {
+        return None;
+    }
+
+    let mut paths = BTreeSet::new();
+    let mut casefolded_paths = BTreeMap::new();
+    let mut path_count = 0_usize;
+    for record in index[..index.len().saturating_sub(1)].split(|byte| *byte == 0) {
+        if record.is_empty() {
+            return None;
+        }
+        path_count = path_count.checked_add(1)?;
+        if path_count > WORKSPACE_GENERATION_MAX_INDEX_PATHS {
+            return None;
+        }
+
+        let tab = record.iter().position(|byte| *byte == b'\t')?;
+        let header = record.get(..tab)?;
+        let raw_path = record.get(tab.checked_add(1)?..)?;
+        if raw_path.is_empty() {
+            return None;
+        }
+        let fields = header.split(|byte| *byte == b' ').collect::<Vec<_>>();
+        let [tag, mode, object_id, stage] = fields.as_slice() else {
+            return None;
+        };
+        if tag.len() != 1
+            || mode.len() != 6
+            || !mode.iter().all(|byte| matches!(byte, b'0'..=b'7'))
+            || !matches!(object_id.len(), 40 | 64)
+            || !object_id
+                .iter()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            || stage.len() != 1
+            || !matches!(stage[0], b'0'..=b'3')
+        {
+            return None;
+        }
+        let path = strict_workspace_generation_path(raw_path)?;
+        if *tag != b"H" || *stage != b"0" {
+            return None;
+        }
+        match *mode {
+            b"100644" | b"100755" => {}
+            b"120000" if !workspace_generation_test_surface_candidate(&path) => {}
+            b"160000" => return None,
+            _ => return None,
+        }
+        if !paths.insert(path.clone()) {
+            return None;
+        }
+        let casefolded = path.to_lowercase();
+        if casefolded_paths
+            .insert(casefolded, path.clone())
+            .is_some_and(|previous| previous != path)
+        {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn workspace_generation_test_surface_candidate(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let python_test =
+        name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py"));
+    let javascript_config = ["jest", "playwright", "vitest"].iter().any(|runner| {
+        ["cjs", "cts", "js", "mjs", "mts", "ts"]
+            .iter()
+            .any(|suffix| name == format!("{runner}.config.{suffix}"))
+    });
+    let javascript_test = ["test", "spec"].iter().any(|kind| {
+        ["cjs", "cts", "js", "jsx", "mjs", "mts", "ts", "tsx"]
+            .iter()
+            .any(|suffix| name.ends_with(&format!(".{kind}.{suffix}")))
+    });
+    path == "justfile"
+        || name == "Cargo.toml"
+        || python_test
+        || matches!(
+            name,
+            "package.json" | "pyproject.toml" | "pytest.ini" | "setup.cfg" | "tox.ini"
+        )
+        || javascript_config
+        || javascript_test
+        || name.ends_with("_test.go")
+        || name.ends_with(".bats")
+}
+
+fn workspace_generation_paths(status: &[u8]) -> Option<Vec<String>> {
+    if status.is_empty() {
+        return Some(Vec::new());
+    }
+    if status.last() != Some(&0) {
+        return None;
+    }
+
+    let records = status[..status.len().saturating_sub(1)]
         .split(|byte| *byte == 0)
-        .filter_map(|record| {
-            let field_index: usize = match record.first().copied() {
-                Some(b'1') => 8,
-                Some(b'2') => 9,
-                Some(b'u') => 10,
-                Some(b'?') => {
-                    return std::str::from_utf8(record.get(2..)?)
-                        .ok()
-                        .map(str::to_string);
-                }
-                _ => return None,
-            };
-            record
-                .splitn(field_index.saturating_add(1), |byte| *byte == b' ')
-                .nth(field_index)
-                .and_then(|path| std::str::from_utf8(path).ok())
-                .map(str::to_string)
-        })
         .collect::<Vec<_>>();
-    paths.sort();
-    paths.dedup();
-    paths
+    let mut paths = BTreeSet::new();
+    let mut index = 0;
+    while index < records.len() {
+        let record = records[index];
+        if record.is_empty() {
+            return None;
+        }
+        match record.first().copied() {
+            Some(b'1') => {
+                paths.insert(strict_workspace_generation_path(porcelain_record_path(
+                    record, 8,
+                )?)?);
+            }
+            Some(b'2') => {
+                paths.insert(strict_workspace_generation_path(porcelain_record_path(
+                    record, 9,
+                )?)?);
+                index = index.checked_add(1)?;
+                paths.insert(strict_workspace_generation_path(*records.get(index)?)?);
+            }
+            Some(b'u') => {
+                paths.insert(strict_workspace_generation_path(porcelain_record_path(
+                    record, 10,
+                )?)?);
+            }
+            Some(b'?') if record.get(1) == Some(&b' ') => {
+                paths.insert(strict_workspace_generation_path(record.get(2..)?)?);
+            }
+            _ => return None,
+        }
+        index = index.checked_add(1)?;
+    }
+    Some(paths.into_iter().collect())
+}
+
+fn porcelain_record_path(record: &[u8], field_index: usize) -> Option<&[u8]> {
+    if record.get(1) != Some(&b' ') {
+        return None;
+    }
+    record
+        .splitn(field_index.saturating_add(1), |byte| *byte == b' ')
+        .nth(field_index)
+}
+
+fn strict_workspace_generation_path(raw_path: &[u8]) -> Option<String> {
+    let path = std::str::from_utf8(raw_path).ok()?;
+    let windows_drive = path.as_bytes().get(1) == Some(&b':')
+        && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic);
+    if path.is_empty()
+        || path.contains('\\')
+        || Path::new(path).is_absolute()
+        || path.starts_with('/')
+        || windows_drive
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        || path.chars().any(|character| character.is_control())
+        || path.eq_ignore_ascii_case(".git")
+        || path
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".git/"))
+    {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 fn workspace_head_identity(head: Option<Vec<u8>>) -> Option<String> {
@@ -364,22 +530,30 @@ async fn workspace_generation_metadata(
 
         for path in paths {
             let absolute = repo_root.join(&path);
-            let metadata = std::fs::symlink_metadata(&absolute).ok()?;
-            let declared_bytes = if metadata.is_file() {
-                metadata.len()
-            } else {
-                0
+            let metadata = match std::fs::symlink_metadata(&absolute) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return None,
             };
+            let declared_bytes = metadata
+                .as_ref()
+                .filter(|metadata| metadata.is_file())
+                .map_or(0, std::fs::Metadata::len);
             if observed_declared_bytes.saturating_add(declared_bytes)
                 > WORKSPACE_GENERATION_MAX_DECLARED_BYTES
             {
                 return None;
             }
-            let kind = if metadata.file_type().is_symlink() {
+            let kind = if metadata.is_none() {
+                "missing"
+            } else if metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.file_type().is_symlink())
+            {
                 "symlink"
-            } else if metadata.is_file() {
+            } else if metadata.as_ref().is_some_and(std::fs::Metadata::is_file) {
                 "file"
-            } else if metadata.is_dir() {
+            } else if metadata.as_ref().is_some_and(std::fs::Metadata::is_dir) {
                 "directory"
             } else {
                 "other"
@@ -390,12 +564,15 @@ async fn workspace_generation_metadata(
             manifest.push(0);
             manifest.extend_from_slice(declared_bytes.to_string().as_bytes());
             manifest.push(0);
-            if metadata.file_type().is_symlink() {
+            if metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.file_type().is_symlink())
+            {
                 let target = std::fs::read_link(&absolute).ok()?;
                 manifest.extend_from_slice(
                     format!("{:x}", Sha256::digest(target.to_string_lossy().as_bytes())).as_bytes(),
                 );
-            } else if metadata.is_file() {
+            } else if metadata.as_ref().is_some_and(std::fs::Metadata::is_file) {
                 let remaining =
                     WORKSPACE_GENERATION_MAX_DECLARED_BYTES.saturating_sub(observed_declared_bytes);
                 let mut content = Vec::new();
@@ -427,8 +604,12 @@ async fn workspace_generation_git_output(repo_root: &Path, args: &[&str]) -> Opt
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = command.output().await.ok()?;
+    let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn()).ok()?;
+    let output = child.wait_with_output().await.ok()?;
     output.status.success().then_some(output.stdout)
 }
 
@@ -513,11 +694,74 @@ struct CachedWorkspaceEvidenceIdentity {
 struct RetainedSourceWatchRegistration {
     generation: u64,
     _registration: WatchRegistration,
+    barrier: SourceWatcherBarrier,
+}
+
+struct SourceWatcherBarrier {
+    path: PathBuf,
+    file: StdMutex<Option<File>>,
+}
+
+impl SourceWatcherBarrier {
+    fn establish(repo_root: &Path) -> Option<Self> {
+        let barrier_parent = AbsolutePathBuf::from_absolute_path(repo_root)
+            .ok()
+            .and_then(|repo_root| resolve_git_dirs(&repo_root).map(|(git_dir, _, _)| git_dir))
+            .filter(|git_dir| git_dir.is_dir())
+            .unwrap_or_else(|| repo_root.to_path_buf());
+        let path = barrier_parent.join(format!(
+            "{SOURCE_WATCHER_BARRIER_PREFIX}{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .ok()?;
+        file.write_all(&0_u64.to_le_bytes()).ok()?;
+        Some(Self {
+            path,
+            file: StdMutex::new(Some(file)),
+        })
+    }
+
+    fn signal(&self, sequence: u64) -> bool {
+        let mut retained_file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut file = match retained_file.take() {
+            Some(file) => file,
+            None => {
+                let Ok(file) = std::fs::OpenOptions::new().write(true).open(&self.path) else {
+                    return false;
+                };
+                file
+            }
+        };
+        let signaled = file.seek(SeekFrom::Start(0)).is_ok()
+            && file.write_all(&sequence.to_le_bytes()).is_ok();
+        drop(file);
+        signaled
+    }
+}
+
+impl Drop for SourceWatcherBarrier {
+    fn drop(&mut self) {
+        let file = self
+            .file
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(file);
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 #[derive(Default)]
 struct RepositoryRetention {
-    source_watch_registrations: HashMap<PathBuf, RetainedSourceWatchRegistration>,
+    source_watch_registrations: HashMap<PathBuf, Arc<RetainedSourceWatchRegistration>>,
     latest_workspace_evidence: HashMap<PathBuf, CachedWorkspaceEvidenceIdentity>,
     access_order: VecDeque<PathBuf>,
     next_registration_generation: u64,
@@ -587,6 +831,7 @@ pub(crate) struct GitWorkspaceCache {
     watcher_reliable: AtomicBool,
     watcher_subscriber: Option<FileWatcherSubscriber>,
     source_watcher_generation: AtomicU64,
+    source_watcher_barrier_sequence: AtomicU64,
     source_watcher_reliable: AtomicBool,
     source_watcher_subscriber: Option<FileWatcherSubscriber>,
     repository_retention: StdMutex<RepositoryRetention>,
@@ -617,9 +862,25 @@ pub(crate) struct SourcePathChangeObservation {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct SourcePathChangeHandoff {
+    pub(crate) exact_paths: Vec<PathBuf>,
+    pub(crate) had_non_runtime_change: bool,
+    pub(crate) continuation: SourcePathChangeObservation,
+}
+
+impl SourcePathChangeHandoff {
+    pub(crate) fn classifiable_exact_paths(&self) -> Option<Vec<PathBuf>> {
+        (!self.had_non_runtime_change || !self.exact_paths.is_empty())
+            .then(|| self.exact_paths.clone())
+    }
+}
+
+#[derive(Clone, Debug)]
 struct SourceChangeEvent {
     generation: u64,
+    exact_paths: Option<Vec<PathBuf>>,
     exact_path_keys: Option<Vec<String>>,
+    runtime_owned_path_keys: BTreeSet<String>,
     subtree_keys: Option<Vec<String>>,
 }
 
@@ -631,47 +892,83 @@ struct SourceChangeJournal {
     exact_path_generations: HashMap<String, VecDeque<u64>>,
     subtree_generations: HashMap<String, VecDeque<u64>>,
     coarse_generations: VecDeque<u64>,
+    active_runtime_owned_exact_path_keys: BTreeSet<String>,
     #[cfg(test)]
     freshness_lookup_count: usize,
 }
 
 impl SourceChangeJournal {
     fn record(&mut self, generation: u64, changed_paths: Option<Vec<PathBuf>>) {
-        let (exact_path_keys, subtree_keys) = if let Some(changed_paths) = changed_paths {
-            let exact_path_keys = changed_paths
-                .iter()
-                .map(|path| source_change_path_key(path))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            let subtree_keys = changed_paths
-                .iter()
-                .flat_map(|path| path.ancestors())
-                .map(source_change_path_key)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            for key in &exact_path_keys {
-                self.exact_path_generations
-                    .entry(key.clone())
-                    .or_default()
-                    .push_back(generation);
-            }
-            for key in &subtree_keys {
-                self.subtree_generations
-                    .entry(key.clone())
-                    .or_default()
-                    .push_back(generation);
-            }
-            (Some(exact_path_keys), Some(subtree_keys))
-        } else {
-            self.coarse_generations.push_back(generation);
-            (None, None)
-        };
+        let (exact_paths, exact_path_keys, runtime_owned_path_keys, subtree_keys) =
+            if let Some(changed_paths) = changed_paths {
+                let exact_paths = changed_paths
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let exact_path_keys = exact_paths
+                    .iter()
+                    .map(|path| source_change_path_key(path))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let runtime_owned_exact_paths = exact_paths
+                    .iter()
+                    .filter(|path| {
+                        self.active_runtime_owned_exact_path_keys
+                            .contains(&source_change_path_key(path))
+                    })
+                    .collect::<Vec<_>>();
+                let runtime_owned_path_keys = exact_paths
+                    .iter()
+                    .filter(|path| {
+                        runtime_owned_exact_paths
+                            .iter()
+                            .any(|runtime_owned| path_is_same_or_descendant(runtime_owned, path))
+                    })
+                    .map(|path| source_change_path_key(path))
+                    .collect::<BTreeSet<_>>();
+                let evidence_paths = exact_paths.iter().filter(|path| {
+                    !runtime_owned_path_keys.contains(&source_change_path_key(path))
+                });
+                let subtree_keys = evidence_paths
+                    .flat_map(|path| path.ancestors())
+                    .map(source_change_path_key)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                for key in exact_path_keys
+                    .iter()
+                    .filter(|key| !runtime_owned_path_keys.contains(*key))
+                {
+                    self.exact_path_generations
+                        .entry(key.clone())
+                        .or_default()
+                        .push_back(generation);
+                }
+                for key in &subtree_keys {
+                    self.subtree_generations
+                        .entry(key.clone())
+                        .or_default()
+                        .push_back(generation);
+                }
+                (
+                    Some(exact_paths),
+                    Some(exact_path_keys),
+                    runtime_owned_path_keys,
+                    Some(subtree_keys),
+                )
+            } else {
+                self.coarse_generations.push_back(generation);
+                (None, None, BTreeSet::new(), None)
+            };
         self.latest_generation = generation;
         self.events.push_back(SourceChangeEvent {
             generation,
+            exact_paths,
             exact_path_keys,
+            runtime_owned_path_keys,
             subtree_keys,
         });
         while self.events.len() > SOURCE_CHANGE_JOURNAL_CAPACITY {
@@ -731,11 +1028,86 @@ impl SourceChangeJournal {
         false
     }
 
+    fn exact_path_reported_since(&self, generation: u64, path: &Path) -> bool {
+        let key = source_change_path_key(path);
+        self.events.iter().any(|event| {
+            event.generation > generation
+                && event
+                    .exact_path_keys
+                    .as_ref()
+                    .is_some_and(|paths| paths.iter().any(|path| path == &key))
+        })
+    }
+
+    fn exact_paths_since(&self, observation: &SourcePathChangeObservation) -> Option<Vec<PathBuf>> {
+        if self.retained_floor != 0 && observation.watcher_generation <= self.retained_floor {
+            return None;
+        }
+        let mut changed = BTreeSet::new();
+        for event in self
+            .events
+            .iter()
+            .filter(|event| event.generation > observation.watcher_generation)
+        {
+            let paths = event.exact_paths.as_ref()?;
+            for path in paths {
+                if event
+                    .runtime_owned_path_keys
+                    .contains(&source_change_path_key(path))
+                    // Windows may report the watched directory and its parents
+                    // while delivering a concrete child-path event. Those
+                    // coarse paths do not identify changed repository content;
+                    // retain only exact descendants of the repository root.
+                    || path_is_same_or_descendant(&observation.repo_root, path)
+                {
+                    continue;
+                }
+                let affects_observation = path_is_same_or_descendant(&observation.path, path)
+                    || (observation.recursive
+                        && path_is_same_or_descendant(path, &observation.path));
+                if affects_observation {
+                    changed.insert(path.clone());
+                }
+            }
+        }
+        Some(changed.into_iter().collect())
+    }
+
     fn record_freshness_lookup(&mut self) {
         #[cfg(test)]
         {
             self.freshness_lookup_count += 1;
         }
+    }
+}
+
+struct RuntimeOwnedSourcePathRegistration<'a> {
+    journal: &'a StdMutex<SourceChangeJournal>,
+    path_key: String,
+}
+
+impl<'a> RuntimeOwnedSourcePathRegistration<'a> {
+    fn register(
+        journal: &'a StdMutex<SourceChangeJournal>,
+        path: &Path,
+    ) -> Option<RuntimeOwnedSourcePathRegistration<'a>> {
+        let path_key = source_change_path_key(path);
+        let inserted = journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_runtime_owned_exact_path_keys
+            .insert(path_key.clone());
+        inserted.then_some(RuntimeOwnedSourcePathRegistration { journal, path_key })
+    }
+}
+
+impl Drop for RuntimeOwnedSourcePathRegistration<'_> {
+    fn drop(&mut self) {
+        self.journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_runtime_owned_exact_path_keys
+            .remove(&self.path_key);
     }
 }
 
@@ -813,6 +1185,7 @@ impl GitWorkspaceCache {
             watcher_reliable: AtomicBool::new(watcher_subscriber.is_some()),
             watcher_subscriber,
             source_watcher_generation: AtomicU64::new(0),
+            source_watcher_barrier_sequence: AtomicU64::new(0),
             source_watcher_reliable: AtomicBool::new(source_watcher_subscriber.is_some()),
             source_watcher_subscriber,
             repository_retention: StdMutex::new(RepositoryRetention::default()),
@@ -1300,12 +1673,7 @@ impl GitWorkspaceCache {
     }
 
     fn record_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) -> u64 {
-        let changed_paths = changed_paths.map(|paths| {
-            paths
-                .into_iter()
-                .filter(|path| !is_generated_codex_eval_path(path))
-                .collect::<Vec<_>>()
-        });
+        let changed_paths = changed_paths;
         self.record_filtered_source_change_event(changed_paths)
     }
 
@@ -1352,21 +1720,29 @@ impl GitWorkspaceCache {
                 if let Some(registration) = retention.source_watch_registrations.get(&repo_root) {
                     registration.generation
                 } else {
+                    let barrier = SourceWatcherBarrier::establish(&repo_root)?;
                     let registration = self
                         .source_watcher_subscriber
                         .as_ref()?
-                        .register_paths(vec![WatchPath {
-                            path: repo_root.clone(),
-                            recursive: true,
-                        }])
+                        .register_paths(vec![
+                            WatchPath {
+                                path: repo_root.clone(),
+                                recursive: true,
+                            },
+                            WatchPath {
+                                path: barrier.path.clone(),
+                                recursive: false,
+                            },
+                        ])
                         .ok()?;
                     let generation = retention.allocate_registration_generation();
                     retention.source_watch_registrations.insert(
                         repo_root.clone(),
-                        RetainedSourceWatchRegistration {
+                        Arc::new(RetainedSourceWatchRegistration {
                             generation,
                             _registration: registration,
-                        },
+                            barrier,
+                        }),
                     );
                     generation
                 };
@@ -1382,6 +1758,20 @@ impl GitWorkspaceCache {
             path,
             recursive,
         })
+    }
+
+    /// Starts a root-scoped observation only after a watcher barrier has
+    /// drained events that predate the interval.
+    pub(crate) async fn begin_source_path_change_observation_after_barrier(
+        &self,
+        repo_root: &Path,
+    ) -> Option<SourcePathChangeObservation> {
+        let initial = self
+            .begin_source_path_change_observation(repo_root, repo_root, /*recursive*/ true)?;
+        let handoff = self
+            .finish_source_path_change_observation_and_continue(&initial)
+            .await?;
+        Some(handoff.continuation)
     }
 
     pub(crate) fn source_path_change_observation_is_current(
@@ -1427,6 +1817,124 @@ impl GitWorkspaceCache {
         !journal.path_changed_since(observation)
     }
 
+    /// Completes a source-path observation with an OS-watcher barrier and
+    /// returns every exact path reported during the interval. `None` means the
+    /// watcher, journal, or barrier could not provide trustworthy evidence.
+    pub(crate) async fn finish_source_path_change_observation(
+        &self,
+        observation: &SourcePathChangeObservation,
+    ) -> Option<Vec<PathBuf>> {
+        self.finish_source_path_change_observation_and_continue(observation)
+            .await
+            .and_then(|handoff| handoff.classifiable_exact_paths())
+    }
+
+    /// Completes an observation and returns a continuation token from the same
+    /// journal snapshot. This lets callers hand off a long-lived observation
+    /// without creating a nested barrier or leaving an unchecked interval.
+    pub(crate) async fn finish_source_path_change_observation_and_continue(
+        &self,
+        observation: &SourcePathChangeObservation,
+    ) -> Option<SourcePathChangeHandoff> {
+        if observation.watcher_epoch != self.watcher_epoch
+            || !observation.recursive
+            || observation.path != observation.repo_root
+        {
+            return None;
+        }
+        let source_watch = self.source_observation_registration(observation)?;
+
+        let sequence = self
+            .source_watcher_barrier_sequence
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let barrier_path = source_watch.barrier.path.clone();
+        let _runtime_owned_barrier = RuntimeOwnedSourcePathRegistration::register(
+            &self.source_change_journal,
+            &barrier_path,
+        )?;
+
+        let signal_generation = self.reliable_source_watcher_generation()?;
+        let source_watch_for_signal = Arc::clone(&source_watch);
+        if !tokio::task::spawn_blocking(move || source_watch_for_signal.barrier.signal(sequence))
+            .await
+            .ok()?
+        {
+            return None;
+        }
+        if !self
+            .wait_for_exact_source_path_event(signal_generation, &barrier_path)
+            .await
+        {
+            return None;
+        }
+
+        let current_generation = self.reliable_source_watcher_generation()?;
+        let mut journal = self
+            .source_change_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if journal.latest_generation != current_generation {
+            return None;
+        }
+        let had_non_runtime_change = journal.path_changed_since(observation);
+        let exact_paths = journal.exact_paths_since(observation)?;
+        let continuation = SourcePathChangeObservation {
+            watcher_epoch: observation.watcher_epoch,
+            watcher_generation: current_generation,
+            registration_generation: observation.registration_generation,
+            repo_root: observation.repo_root.clone(),
+            path: observation.path.clone(),
+            recursive: observation.recursive,
+        };
+        Some(SourcePathChangeHandoff {
+            exact_paths,
+            had_non_runtime_change,
+            continuation,
+        })
+    }
+
+    fn source_observation_registration(
+        &self,
+        observation: &SourcePathChangeObservation,
+    ) -> Option<Arc<RetainedSourceWatchRegistration>> {
+        let mut retention = self
+            .repository_retention
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let registration = retention
+            .source_watch_registrations
+            .get(&observation.repo_root)
+            .filter(|registration| registration.generation == observation.registration_generation)?
+            .clone();
+        retention.touch(&observation.repo_root);
+        Some(registration)
+    }
+
+    async fn wait_for_exact_source_path_event(&self, generation: u64, path: &Path) -> bool {
+        let deadline = tokio::time::Instant::now() + SOURCE_WATCHER_BARRIER_TIMEOUT;
+        loop {
+            let Some(current_generation) = self.reliable_source_watcher_generation() else {
+                return false;
+            };
+            let observed = {
+                let journal = self
+                    .source_change_journal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                journal.latest_generation == current_generation
+                    && journal.exact_path_reported_since(generation, path)
+            };
+            if observed {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(SOURCE_WATCHER_BARRIER_POLL).await;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn take_source_change_freshness_lookup_count_for_test(&self) -> usize {
         let mut journal = self
@@ -1459,11 +1967,7 @@ impl GitWorkspaceCache {
                 };
                 dunce::canonicalize(&absolute).unwrap_or(absolute)
             })
-            .filter(|path| !is_generated_codex_eval_path(path))
             .collect::<Vec<_>>();
-        if paths.is_empty() && !changed_paths.is_empty() {
-            return;
-        }
         self.host_mutation_generation.fetch_add(1, Ordering::AcqRel);
         self.record_filtered_source_change_event((!paths.is_empty()).then_some(paths));
     }
@@ -1536,15 +2040,6 @@ fn record_project_discovery_reuse(
     }
 }
 
-fn is_generated_codex_eval_path(path: &Path) -> bool {
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    let normalized = normalized.to_ascii_lowercase();
-    normalized == ".codex/evals"
-        || normalized.starts_with(".codex/evals/")
-        || normalized.ends_with("/.codex/evals")
-        || normalized.contains("/.codex/evals/")
-}
-
 fn canonical_workspace_evidence_root(repo_root: &Path) -> PathBuf {
     dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf())
 }
@@ -1554,7 +2049,12 @@ fn path_is_same_or_descendant(path: &Path, ancestor: &Path) -> bool {
 }
 
 fn source_change_path_key(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/").to_lowercase()
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
 }
 
 fn path_is_same_or_descendant_with_case_sensitivity(
@@ -1681,11 +2181,17 @@ async fn collect_project_namespace(cwd: &Path) -> Option<String> {
         .args(["-c", "core.fsmonitor=false"])
         .args(["rev-list", "--max-parents=0", "HEAD"])
         .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = timeout(GIT_DEPENDENCY_TIMEOUT, command.output())
-        .await
-        .ok()?
-        .ok()?;
+    let output = timeout(GIT_DEPENDENCY_TIMEOUT, async {
+        let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn())?;
+        child.wait_with_output().await
+    })
+    .await
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1756,11 +2262,17 @@ async fn git_config_signature(executable: &Path, cwd: &Path) -> Option<[u8; 32]>
             "--list",
         ])
         .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = timeout(GIT_DEPENDENCY_TIMEOUT, command.output())
-        .await
-        .ok()?
-        .ok()?;
+    let output = timeout(GIT_DEPENDENCY_TIMEOUT, async {
+        let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn())?;
+        child.wait_with_output().await
+    })
+    .await
+    .ok()?
+    .ok()?;
     output
         .status
         .success()

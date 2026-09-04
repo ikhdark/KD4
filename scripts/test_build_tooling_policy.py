@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import ast
 import contextlib
 import hashlib
 import io
@@ -97,6 +98,58 @@ class BuildToolingPolicyTest(unittest.TestCase):
             )
         payloads = [json.loads(line) for line in output.splitlines() if line.strip()]
         return result, payloads
+
+    def test_completion_proof_test_store_is_private_default_off_and_release_safe(self) -> None:
+        feature = "completion-proof-test-store"
+        core_manifest = load_toml(REPO_ROOT / "codex-rs" / "core" / "Cargo.toml")
+        self.assertEqual(core_manifest.get("features", {}).get("default"), [])
+        self.assertEqual(core_manifest.get("features", {}).get(feature), [])
+
+        def dependency_tables(value: object):
+            if not isinstance(value, dict):
+                return
+            for key, child in value.items():
+                if key in {"dependencies", "dev-dependencies", "build-dependencies"}:
+                    yield child
+                yield from dependency_tables(child)
+
+        for manifest_path in (REPO_ROOT / "codex-rs").rglob("Cargo.toml"):
+            manifest = load_toml(manifest_path)
+            for dependencies in dependency_tables(manifest):
+                if not isinstance(dependencies, dict):
+                    continue
+                for dependency in dependencies.values():
+                    if isinstance(dependency, dict):
+                        self.assertNotIn(
+                            feature,
+                            dependency.get("features", []),
+                            f"{manifest_path} enables the private test feature by dependency",
+                        )
+
+        source = (
+            REPO_ROOT / "codex-rs" / "core" / "src" / "completion_proof.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '#[cfg(all(feature = "completion-proof-test-store", debug_assertions))]',
+            source,
+        )
+        self.assertIn(
+            '#[cfg(not(all(feature = "completion-proof-test-store", debug_assertions)))]',
+            source,
+        )
+        release_branch = source.split(
+            '#[cfg(not(all(feature = "completion-proof-test-store", debug_assertions)))]',
+            1,
+        )[1].split("impl CompletionProofRuntimeRegistry", 1)[0]
+        self.assertIn("Arc::new(DefaultKeyringStore)", release_branch)
+        self.assertNotIn("MockKeyringStore", release_branch)
+
+        runner = (REPO_ROOT / "scripts" / "rust_test_runner.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'frozenset({"codex-core/completion-proof-test-store"})', runner
+        )
 
     def test_build_metadata_is_owned_by_the_compiling_utility_crate(self) -> None:
         rust_root = REPO_ROOT / "codex-rs"
@@ -871,7 +924,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
             root_maintenance.python_unittest_targets(),
         )
 
-    def test_root_maintenance_does_not_route_retired_task_continuity_paths(self) -> None:
+    def test_root_maintenance_does_not_route_retired_task_continuity_paths(
+        self,
+    ) -> None:
         root_maintenance = load_root_maintenance_module()
 
         for target in (
@@ -1176,23 +1231,26 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 root_maintenance, "script_audit_test_targets", return_value=[]
             ),
             mock.patch.object(
-                root_maintenance, "script_audit_commands", return_value=([], [])
+                root_maintenance,
+                "script_audit_commands",
+                return_value=([("injected syntax check", ("injected-tool",))], []),
             ),
             mock.patch.object(
                 root_maintenance, "git_context_label", return_value="test"
             ),
+            mock.patch.object(
+                root_maintenance, "run_script_audit_command", return_value=0
+            ) as run,
             contextlib.redirect_stdout(stdout),
         ):
             self.assertEqual(
-                root_maintenance.run_script_audit(
-                    include_tests=True,
-                    strict=False,
-                ),
+                root_maintenance.main(["audit-scripts", "--strict"]),
                 0,
             )
 
+        run.assert_called_once_with(("injected-tool",))
         self.assertIn(
-            "SCRIPT AUDIT PASSED: 1 script artifact(s), 0 command group(s), "
+            "SCRIPT AUDIT PASSED: 1 script artifact(s), 1 command group(s), "
             "0 advisory item(s).",
             stdout.getvalue(),
         )
@@ -1923,9 +1981,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
     def test_core_tests_only_run_through_named_targets_and_gates(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-        manifest = load_toml(
-            REPO_ROOT / "codex-rs" / ".config" / "kd4-rust-tests.toml"
-        )
+        manifest = load_toml(REPO_ROOT / "codex-rs" / ".config" / "kd4-rust-tests.toml")
 
         # Every generic nextest recipe refuses a codex-core selection instead of
         # inferring helper binaries from the forwarded arguments.
@@ -1940,7 +1996,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "_test-lane-package-reserved package *args:",
         ):
             body = justfile.split(recipe, 1)[1].split("\n\n", 1)[0]
-            self.assertIn("rust_test_runner.py\" _guard-generic --", body, recipe)
+            self.assertIn('rust_test_runner.py" _guard-generic --', body, recipe)
 
         # The named recipes replace the removed helper-inference recipes.
         for recipe in (
@@ -1976,9 +2032,15 @@ class BuildToolingPolicyTest(unittest.TestCase):
         thread_status = justfile.split("_app-server-thread-status-tests:", 1)[1].split(
             "\n\n", 1
         )[0]
-        self.assertNotIn("validated_invalidated_tracker_still_requests_diff_fallback", thread_status)
-        self.assertIn("stale_active_running_thread_resume_clears_watch_status", thread_status)
-        self.assertIn("stale_active_repair_preserves_pending_approval_status", thread_status)
+        self.assertNotIn(
+            "validated_invalidated_tracker_still_requests_diff_fallback", thread_status
+        )
+        self.assertIn(
+            "stale_active_running_thread_resume_clears_watch_status", thread_status
+        )
+        self.assertIn(
+            "stale_active_repair_preserves_pending_approval_status", thread_status
+        )
 
     def test_perf_env_recipes_pass_structured_argv(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -2009,6 +2071,1829 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertNotIn('-CommandLine (("cargo', justfile)
         self.assertNotIn("[string]$CommandLine", perf_env)
         self.assertNotIn("cmd.exe /d /s /c", perf_env)
+
+
+_UNWIRED_RUST_PACKAGE_TESTS = frozenset(
+    {
+        "test_rust_package_search_does_not_escape_repo_root",
+        "test_rust_package_search_reuses_cached_ancestor",
+        "test_rust_package_search_skips_virtual_workspace_manifest",
+        "test_rust_package_search_start_keeps_existing_dotted_directories",
+    }
+)
+
+_MIGRATED_POLICY_GROUPS = {
+    "repository_guidance": (
+        "test_retired_repo_local_harness_skill_has_no_registration",
+        "test_harness_workflow_orchestrator_reference_resolves",
+        "test_harness_local_markdown_links_resolve",
+        "test_repo_local_skill_frontmatter_names_match_folders",
+        "test_agents_skill_inventory_matches_local_build_tree",
+        "test_agents_mentions_current_checkout_not_stale_codexkd_path",
+        "test_agents_bootstraps_bounded_routing_before_broad_source_map",
+        "test_agents_desktop_boundary_is_top_level_guidance",
+        "test_agents_validation_map_matches_current_layout",
+        "test_agents_scripts_policy_is_root_owned",
+        "test_config_documentation_uses_current_public_destinations",
+        "test_agents_validation_tooling_does_not_prove_runtime_fix",
+    ),
+    "rust_workspace_policy": (
+        "test_build_metadata_is_owned_by_the_compiling_utility_crate",
+        "test_confirmed_dead_rust_inputs_do_not_return",
+        "test_skills_build_script_requires_bundled_samples",
+        "test_obsolete_developer_tooling_residue_is_absent",
+        "test_windows_only_rust_policy_has_no_host_platform_branches",
+        "test_ignore_rules_have_single_owners_for_generated_artifacts",
+        "test_release_packaging_policy_is_explicit_and_pinned",
+        "test_dependency_policy_gate_runs_offline_cargo_deny",
+    ),
+    "windows_installer": (
+        "test_windows_installer_requires_standalone_metadata",
+        "test_windows_installer_cleans_failed_metadata_temporary_file",
+        "test_windows_installer_detects_unknown_external_codex_conflict",
+        "test_windows_installer_defaults_to_fork_release_artifacts",
+        "test_powershell_installer_completeness_rejects_package_without_code_mode_host",
+        "test_windows_installer_parses_the_first_nonempty_version_line",
+        "test_windows_installer_uninstall_removes_only_its_path_entry",
+        "test_windows_installer_retains_active_and_two_previous_releases",
+    ),
+    "formatter_and_launchers": (
+        "test_format_empty_changed_selection_is_a_noop",
+        "test_format_default_python_scope_stays_with_internal_scripts",
+        "test_codex_cli_launcher_parses_under_node",
+        "test_run_python_enforces_the_supported_interpreter_version",
+        "test_formatting_commands_only_target_existing_repository_sources",
+        "test_formatter_group_decodes_command_output_as_utf8",
+    ),
+    "just_routes": (
+        "test_justfile_only_exposes_canonical_developer_tooling_recipes",
+        "test_local_rust_loop_recipes_are_discoverable",
+        "test_package_validation_defaults_do_not_expand_to_workspace",
+        "test_windows_process_suite_cannot_silently_skip_required_coverage",
+        "test_local_setup_recipes_avoid_stale_or_unlocked_dependency_state",
+        "test_high_frequency_python_recipes_bypass_the_powershell_adapter",
+        "test_direct_python_recipe_preserves_argv_and_exit_code",
+        "test_lane_recipes_use_the_canonical_reserved_runner",
+        "test_high_contention_just_recipes_use_cargo_lanes_on_windows",
+        "test_core_tests_only_run_through_named_targets_and_gates",
+        "test_perf_env_recipes_pass_structured_argv",
+    ),
+    "workspace_analyzer": (
+        "test_dead_code_matrix_uses_dedicated_cargo_lane",
+        "test_workspace_analyzer_recognizes_equals_form_selectors",
+        "test_windows_v8_fallback_tracks_remaining_forwarding_packages",
+    ),
+    "sdk_and_package_routes": (
+        "test_python_sdk_gate_and_publish_routing_match_source_map",
+        "test_dependency_roles_match_published_consumers",
+        "test_sdk_build_owns_cleanup",
+    ),
+}
+
+_HELPER_MIGRATED_POLICY_TESTS = frozenset(
+    test_name
+    for test_names in _MIGRATED_POLICY_GROUPS.values()
+    for test_name in test_names
+)
+_ROOT_MAINTENANCE_MIGRATED_TESTS = (
+    "test_root_maintenance_covers_current_script_tooling_tests",
+    "test_root_maintenance_routes_aggregate_python_script_tests",
+    "test_root_maintenance_script_audit_plan_covers_every_script_type",
+    "test_root_maintenance_parses_every_just_recipe_as_powershell",
+    "test_justfile_script_recipes_are_checked_by_their_own_interpreter",
+    "test_root_maintenance_script_inventory_covers_owned_script_roots",
+    "test_root_maintenance_does_not_route_retired_task_continuity_paths",
+    "test_root_maintenance_script_audit_current_tree_has_no_hard_findings",
+    "test_root_maintenance_script_audit_context_matches_current_routes",
+    "test_root_maintenance_script_audit_has_no_platform_skips",
+    "test_root_maintenance_script_audit_success_has_no_stale_skip_summary",
+    "test_root_maintenance_git_paths_use_nul_delimiters",
+    "test_changed_production_script_without_tests_is_unverified",
+    "test_root_maintenance_missing_command_is_reported",
+    "test_root_maintenance_does_not_duplicate_formatter_commands",
+    "test_root_maintenance_uv_commands_use_frozen_lock",
+)
+_MIGRATED_POLICY_TESTS = _HELPER_MIGRATED_POLICY_TESTS | frozenset(
+    _ROOT_MAINTENANCE_MIGRATED_TESTS
+)
+_MIGRATED_POLICY_ASSERTIONS = {
+    test_name: getattr(BuildToolingPolicyTest, test_name)
+    for test_name in _HELPER_MIGRATED_POLICY_TESTS
+}
+
+
+class BuildToolingPolicyRuntimeTest(unittest.TestCase):
+    """Exercise build policy through the commands that consume each contract."""
+
+    _CURRENT_CONTRACT_OVERRIDES = {
+        "test_repo_local_skill_frontmatter_names_match_folders": (
+            "_assert_current_skill_frontmatter_contract"
+        ),
+        "test_agents_skill_inventory_matches_local_build_tree": (
+            "_assert_current_skill_inventory_contract"
+        ),
+        "test_agents_validation_map_matches_current_layout": (
+            "_assert_current_agents_validation_contract"
+        ),
+        "test_agents_scripts_policy_is_root_owned": (
+            "_assert_current_script_ownership_contract"
+        ),
+        "test_agents_validation_tooling_does_not_prove_runtime_fix": (
+            "_assert_current_runtime_proof_contract"
+        ),
+        "test_obsolete_developer_tooling_residue_is_absent": (
+            "_assert_current_retired_tooling_contract"
+        ),
+        "test_windows_only_rust_policy_has_no_host_platform_branches": (
+            "_assert_current_host_platform_contract"
+        ),
+        "test_justfile_only_exposes_canonical_developer_tooling_recipes": (
+            "_assert_current_canonical_tooling_contract"
+        ),
+        "test_python_sdk_gate_and_publish_routing_match_source_map": (
+            "_assert_current_sdk_routing_contract"
+        ),
+    }
+
+    def run_supported_command(
+        self,
+        command: list[str],
+        *,
+        timeout: int = 120,
+    ) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=timeout,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"command failed: {command!r}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        return result
+
+    def _materialize_root_maintenance_fixture(self, fixture_root: Path) -> None:
+        scripts_root = fixture_root / "scripts"
+        scripts_root.mkdir(parents=True)
+        source = (REPO_ROOT / "scripts" / "root_maintenance.py").read_text(
+            encoding="utf-8"
+        )
+        # Preserve the executable program while dropping comments and blank lines so
+        # this deliberately tiny fixture does not trip the production size advisory.
+        (scripts_root / "root_maintenance.py").write_text(
+            ast.unparse(ast.parse(source)) + "\n",
+            encoding="utf-8",
+        )
+        (fixture_root / "AGENTS.md").write_text(
+            "# Root maintenance subprocess fixture\n", encoding="utf-8"
+        )
+        (fixture_root / "package.json").write_text(
+            json.dumps(
+                {
+                    "scripts": {
+                        "audit:scripts": (
+                            "node scripts/run-python.js "
+                            "scripts/root_maintenance.py audit-scripts"
+                        )
+                    }
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (fixture_root / "justfile").write_text(
+            "audit-scripts *args:\n"
+            '    "{{ justfile_directory() }}/scripts/root_maintenance.py" '
+            "audit-scripts {args}\n\n"
+            "powershell-sample:\n"
+            '    Write-Output "fixture"\n\n'
+            '[script("python")]\n'
+            "python-sample:\n"
+            "    value = 1\n",
+            encoding="utf-8",
+        )
+        (scripts_root / "pyproject.toml").write_text(
+            '[project]\nname = "fixture"\nversion = "0.0.0"\n',
+            encoding="utf-8",
+        )
+        (scripts_root / "uv.lock").write_text(
+            'version = 1\nrevision = 1\nrequires-python = ">=3.11"\n',
+            encoding="utf-8",
+        )
+        (fixture_root / ".gitignore").write_text(
+            "fake-tools/\nfake-tool-calls.jsonl\ngit-trace.log\n",
+            encoding="utf-8",
+        )
+
+        root_maintenance = load_root_maintenance_module()
+        for source_path, modules in root_maintenance.SCRIPT_TEST_MODULES.items():
+            path = fixture_root / source_path
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if path.suffix.lower() == ".py":
+                    content = f"VALUE = {source_path!r}\n"
+                elif path.suffix.lower() == ".ps1":
+                    content = f"Write-Output {source_path!r}\n"
+                elif not path.suffix:
+                    content = (
+                        "#!/usr/bin/env dotslash\n"
+                        + json.dumps({"name": source_path, "platforms": {}})
+                        + "\n"
+                    )
+                else:
+                    content = f"// {source_path}\n"
+                path.write_text(content, encoding="utf-8")
+            for module in modules:
+                module_path = fixture_root / Path(*module.split(".")).with_suffix(".py")
+                module_path.parent.mkdir(parents=True, exist_ok=True)
+                if not module_path.exists():
+                    module_path.write_text(
+                        f"TEST_MODULE = {module!r}\n", encoding="utf-8"
+                    )
+
+        audit_roots = (
+            ".codex/environments",
+            ".codex/hooks",
+            "scripts",
+            "codex-cli/scripts",
+            "codex-rs/app-server-test-client/scripts",
+            "codex-rs/config/scripts",
+            "codex-rs/scripts",
+            "codex-rs/skills/src/assets/samples",
+            "sdk/python/scripts",
+            "tools/argument-comment-lint",
+        )
+        for index, root in enumerate(audit_roots):
+            probe = fixture_root / root / f"test_probe_{index}.py"
+            probe.parent.mkdir(parents=True, exist_ok=True)
+            probe.write_text(f"PROBE = {index}\n", encoding="utf-8")
+        (scripts_root / "test_probe.ps1").write_text(
+            'Write-Output "powershell-probe"\n', encoding="utf-8"
+        )
+        (scripts_root / "test_probe.js").write_text(
+            'console.log("javascript-probe");\n', encoding="utf-8"
+        )
+        (scripts_root / "test_asciicheck.py").write_text(
+            "ASCII_CHECK = True\n", encoding="utf-8"
+        )
+        (scripts_root / "test_träcked route.py").write_text(
+            "TRACKED_ROUTE = True\n", encoding="utf-8"
+        )
+
+        representative_scripts = {
+            ".codex/environments/setup.py": "SETUP_PROBE = True\n",
+            "codex-cli/bin/codex.js": (
+                "#!/usr/bin/env node\nconsole.log('codex-probe');\n"
+            ),
+            "codex-cli/scripts/build_npm_package.py": "BUILD_PROBE = True\n",
+            (
+                "codex-rs/app-server-test-client/scripts/"
+                "live_elicitation_hold.ps1"
+            ): "Write-Output 'elicitation-probe'\n",
+            "codex-rs/config/scripts/generate-proto.ps1": (
+                "Write-Output 'proto-probe'\n"
+            ),
+            (
+                "codex-rs/responses-api-proxy/npm/bin/"
+                "codex-responses-api-proxy.js"
+            ): "#!/usr/bin/env node\nconsole.log('responses-probe');\n",
+            "codex-rs/scripts/nextest_windows_stack.py": "NEXTEST_PROBE = True\n",
+            (
+                "codex-rs/skills/src/assets/samples/imagegen/scripts/"
+                "image_gen.py"
+            ): "IMAGE_GEN_PROBE = True\n",
+            "sdk/python/scripts/update_sdk_artifacts.py": "SDK_PROBE = True\n",
+            "tools/argument-comment-lint/run.py": "LINT_PROBE = True\n",
+            "tools/argument-comment-lint/test_wrapper_common.py": (
+                "WRAPPER_TEST_PROBE = True\n"
+            ),
+        }
+        for relative_path, content in representative_scripts.items():
+            path = fixture_root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+    def _initialize_root_maintenance_git_fixture(self, fixture_root: Path) -> None:
+        commands = (
+            ["git", "init", "--quiet"],
+            ["git", "add", "--all"],
+            [
+                "git",
+                "-c",
+                "user.name=KD4 Test",
+                "-c",
+                "user.email=kd4-test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        )
+        for command in commands:
+            result = subprocess.run(
+                command,
+                cwd=fixture_root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"command failed: {command!r}\n{result.stdout}\n{result.stderr}",
+            )
+
+    def _fake_root_maintenance_tools(
+        self, fixture_root: Path, tools: tuple[str, ...]
+    ) -> tuple[Path, Path]:
+        tool_root = fixture_root / "fake-tools"
+        tool_root.mkdir(parents=True, exist_ok=True)
+        log_path = fixture_root / "fake-tool-calls.jsonl"
+        driver_path = tool_root / "fake_tool.py"
+        driver_path.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+tool, *args = sys.argv[1:]
+with Path(os.environ["FAKE_TOOL_LOG"]).open("a", encoding="utf-8") as log:
+    log.write(json.dumps({"tool": tool, "args": args}) + "\\n")
+if os.environ.get("FAKE_FAIL_TOOL") == tool:
+    raise SystemExit(int(os.environ.get("FAKE_FAIL_CODE", "9")))
+if tool == "git":
+    if args[:2] == ["ls-files", "--stage"]:
+        paths = json.loads(os.environ.get("FAKE_GIT_TRACKED_JSON", "[]"))
+        records = [f"100644 {'0' * 40} 0\\t{path}" for path in paths]
+        sys.stdout.buffer.write(("\\0".join(records) + ("\\0" if records else "")).encode())
+    elif args[:2] == ["rev-parse", "--show-toplevel"]:
+        print(os.environ["FAKE_REPO_ROOT"])
+    elif args[:2] == ["status", "--short"]:
+        print("## fixture")
+    elif "diff" in args:
+        paths = json.loads(os.environ.get("FAKE_GIT_DIFF_JSON", "[]"))
+        sys.stdout.buffer.write(("\\0".join(paths) + ("\\0" if paths else "")).encode())
+    elif "ls-files" in args and "--others" in args:
+        paths = json.loads(os.environ.get("FAKE_GIT_OTHERS_JSON", "[]"))
+        sys.stdout.buffer.write(("\\0".join(paths) + ("\\0" if paths else "")).encode())
+elif tool == "just" and args == ["--summary"]:
+    print("audit-scripts powershell-sample python-sample")
+""",
+            encoding="utf-8",
+        )
+        for tool in tools:
+            if os.name == "nt":
+                wrapper = tool_root / f"{tool}.cmd"
+                wrapper.write_text(
+                    "@echo off\n"
+                    f'"{sys.executable}" "{driver_path}" {tool} %*\n'
+                    "exit /b %ERRORLEVEL%\n",
+                    encoding="utf-8",
+                )
+            else:
+                wrapper = tool_root / tool
+                wrapper.write_text(
+                    f"#!{sys.executable}\n"
+                    "import runpy, sys\n"
+                    f"sys.argv[1:1] = [{tool!r}]\n"
+                    f"runpy.run_path({str(driver_path)!r}, run_name='__main__')\n",
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o755)
+        return tool_root, log_path
+
+    def _root_maintenance_env(
+        self,
+        fixture_root: Path,
+        tool_root: Path,
+        log_path: Path,
+        *,
+        path_only: bool = False,
+        extra: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        path = str(tool_root)
+        if not path_only:
+            path = os.pathsep.join((path, os.environ.get("PATH", "")))
+        env = {
+            **os.environ,
+            "PATH": path,
+            "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+            "FAKE_TOOL_LOG": str(log_path),
+            "FAKE_REPO_ROOT": str(fixture_root.resolve()),
+            "FAKE_GIT_DIFF_JSON": "[]",
+            "FAKE_GIT_OTHERS_JSON": "[]",
+            "FAKE_GIT_TRACKED_JSON": "[]",
+        }
+        if extra:
+            env.update(extra)
+        return env
+
+    def _run_root_maintenance_fixture(
+        self,
+        fixture_root: Path,
+        args: list[str],
+        env: dict[str, str],
+        *,
+        timeout: int = 120,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(fixture_root / "scripts" / "root_maintenance.py"),
+                *args,
+            ],
+            cwd=fixture_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=timeout,
+        )
+
+    def _fake_tool_calls(self, log_path: Path) -> list[dict[str, object]]:
+        if not log_path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+
+    def test_root_maintenance_audit_fails_closed_when_tracked_git_discovery_fails(
+        self,
+    ) -> None:
+        failures = (
+            (
+                "spawn",
+                {"side_effect": FileNotFoundError("injected missing git")},
+                "could not run git ls-files --stage",
+            ),
+            (
+                "nonzero",
+                {
+                    "return_value": subprocess.CompletedProcess(
+                        ["git", "ls-files", "--stage", "-z"],
+                        128,
+                        stdout=b"",
+                        stderr=b"injected git failure",
+                    )
+                },
+                "git ls-files --stage exit 128",
+            ),
+        )
+
+        for label, patch_kwargs, expected_detail in failures:
+            with self.subTest(failure=label):
+                root_maintenance = load_root_maintenance_module()
+                root_maintenance.script_inventory.cache_clear()
+                self.addCleanup(root_maintenance.script_inventory.cache_clear)
+                stdout = io.StringIO()
+
+                with (
+                    mock.patch.object(
+                        root_maintenance.subprocess,
+                        "run",
+                        **patch_kwargs,
+                    ) as run,
+                    contextlib.redirect_stdout(stdout),
+                ):
+                    returncode = root_maintenance.main(
+                        ["audit-scripts", "--quick", "--strict"]
+                    )
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(run.call_count, 1)
+                self.assertIn("[FAIL] tracked script discovery", stdout.getvalue())
+                self.assertIn(expected_detail, stdout.getvalue())
+                self.assertIn("SCRIPT AUDIT INFRASTRUCTURE FAILED", stdout.getvalue())
+                self.assertNotIn("SCRIPT AUDIT PASSED", stdout.getvalue())
+
+    def test_root_maintenance_audit_fails_closed_when_tracked_git_output_is_malformed(
+        self,
+    ) -> None:
+        root_maintenance = load_root_maintenance_module()
+        root_maintenance.script_inventory.cache_clear()
+        self.addCleanup(root_maintenance.script_inventory.cache_clear)
+        malformed = subprocess.CompletedProcess(
+            ["git", "ls-files", "--stage", "-z"],
+            0,
+            stdout=b"100755 deadbeef 0\tscripts/example.py\0",
+            stderr=b"",
+        )
+        stdout = io.StringIO()
+
+        with (
+            mock.patch.object(
+                root_maintenance.subprocess,
+                "run",
+                return_value=malformed,
+            ) as run,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = root_maintenance.main(
+                ["audit-scripts", "--quick", "--strict"]
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("[FAIL] tracked script discovery", stdout.getvalue())
+        self.assertIn("malformed git ls-files --stage output", stdout.getvalue())
+        self.assertIn("SCRIPT AUDIT INFRASTRUCTURE FAILED", stdout.getvalue())
+        self.assertNotIn("SCRIPT AUDIT PASSED", stdout.getvalue())
+
+    def test_root_maintenance_audit_fails_closed_when_tracked_git_output_is_not_utf8(
+        self,
+    ) -> None:
+        root_maintenance = load_root_maintenance_module()
+        root_maintenance.script_inventory.cache_clear()
+        self.addCleanup(root_maintenance.script_inventory.cache_clear)
+        invalid = subprocess.CompletedProcess(
+            ["git", "ls-files", "--stage", "-z"],
+            0,
+            stdout=b"100755 " + (b"a" * 40) + b" 0\tscript-\xff.py\0",
+            stderr=b"",
+        )
+        stdout = io.StringIO()
+
+        with (
+            mock.patch.object(
+                root_maintenance.subprocess,
+                "run",
+                return_value=invalid,
+            ) as run,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = root_maintenance.main(
+                ["audit-scripts", "--quick", "--strict"]
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("[FAIL] tracked script discovery", stdout.getvalue())
+        self.assertIn("non-UTF-8 git ls-files", stdout.getvalue())
+        self.assertIn("SCRIPT AUDIT INFRASTRUCTURE FAILED", stdout.getvalue())
+        self.assertNotIn("SCRIPT AUDIT PASSED", stdout.getvalue())
+
+    def test_root_maintenance_audit_fails_closed_when_tracked_path_cannot_be_read(
+        self,
+    ) -> None:
+        failures = (
+            FileNotFoundError("injected missing tracked path"),
+            OSError("injected tracked path read failure"),
+        )
+
+        for error in failures:
+            with self.subTest(error=type(error).__name__):
+                root_maintenance = load_root_maintenance_module()
+                root_maintenance.script_inventory.cache_clear()
+                self.addCleanup(root_maintenance.script_inventory.cache_clear)
+                tracked = subprocess.CompletedProcess(
+                    ["git", "ls-files", "--stage", "-z"],
+                    0,
+                    stdout=(
+                        b"100755 "
+                        + (b"a" * 40)
+                        + b" 0\ttracked-entrypoint\0"
+                    ),
+                    stderr=b"",
+                )
+                stdout = io.StringIO()
+
+                with (
+                    mock.patch.object(
+                        root_maintenance.subprocess,
+                        "run",
+                        return_value=tracked,
+                    ) as run,
+                    mock.patch.object(
+                        root_maintenance.Path,
+                        "open",
+                        side_effect=error,
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                ):
+                    returncode = root_maintenance.main(
+                        ["audit-scripts", "--quick", "--strict"]
+                    )
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(run.call_count, 1)
+                self.assertIn("[FAIL] tracked script discovery", stdout.getvalue())
+                self.assertIn(
+                    "tracked script discovery could not read tracked-entrypoint",
+                    stdout.getvalue(),
+                )
+                self.assertIn("SCRIPT AUDIT INFRASTRUCTURE FAILED", stdout.getvalue())
+                self.assertNotIn("SCRIPT AUDIT PASSED", stdout.getvalue())
+
+    def test_root_maintenance_audit_rejects_empty_inventory(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+        stdout = io.StringIO()
+
+        with (
+            mock.patch.object(
+                root_maintenance,
+                "script_source_targets",
+                return_value=[],
+            ),
+            mock.patch.object(root_maintenance, "script_kind_map", return_value={}),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_context_issues",
+            ) as context_issues,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = root_maintenance.main(
+                ["audit-scripts", "--quick", "--strict"]
+            )
+
+        self.assertEqual(returncode, 2)
+        context_issues.assert_not_called()
+        self.assertIn("discovered zero audit targets", stdout.getvalue())
+        self.assertIn("SCRIPT AUDIT INFRASTRUCTURE FAILED", stdout.getvalue())
+        self.assertNotIn("SCRIPT AUDIT PASSED", stdout.getvalue())
+
+    def test_root_maintenance_audit_rejects_empty_command_plan(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+        stdout = io.StringIO()
+
+        with (
+            mock.patch.object(
+                root_maintenance,
+                "script_source_targets",
+                return_value=["scripts/example.py"],
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_kind_map",
+                return_value={"scripts/example.py": "python"},
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "git_context_label",
+                return_value="test",
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_context_issues",
+                return_value=[],
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_findings",
+                return_value=([], []),
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_commands",
+                return_value=([], []),
+            ),
+            mock.patch.object(root_maintenance, "run_script_audit_command") as run,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = root_maintenance.main(
+                ["audit-scripts", "--quick", "--strict"]
+            )
+
+        self.assertEqual(returncode, 2)
+        run.assert_not_called()
+        self.assertIn("executed zero command groups", stdout.getvalue())
+        self.assertIn("SCRIPT AUDIT INFRASTRUCTURE FAILED", stdout.getvalue())
+        self.assertNotIn("SCRIPT AUDIT PASSED", stdout.getvalue())
+
+    def test_root_maintenance_audit_executes_nonempty_command_plan(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+        stdout = io.StringIO()
+        command = ("injected-tool", "--check", "scripts/example.py")
+
+        with (
+            mock.patch.object(
+                root_maintenance,
+                "script_source_targets",
+                return_value=["scripts/example.py"],
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_kind_map",
+                return_value={"scripts/example.py": "python"},
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "git_context_label",
+                return_value="test",
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_context_issues",
+                return_value=[],
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_findings",
+                return_value=([], []),
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_commands",
+                return_value=([("injected syntax check", command)], []),
+            ),
+            mock.patch.object(
+                root_maintenance, "run_script_audit_command", return_value=0
+            ) as run,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = root_maintenance.main(
+                ["audit-scripts", "--quick", "--strict"]
+            )
+
+        self.assertEqual(returncode, 0)
+        run.assert_called_once_with(command)
+        self.assertIn("[RUN] injected syntax check", stdout.getvalue())
+        self.assertIn("[PASS] injected syntax check", stdout.getvalue())
+        self.assertIn(
+            "SCRIPT AUDIT PASSED: 1 script artifact(s), 1 command group(s), "
+            "0 advisory item(s).",
+            stdout.getvalue(),
+        )
+
+    def test_root_maintenance_audit_launch_error_is_pre_result(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+        stdout = io.StringIO()
+        command = ("injected-tool", "--check", "scripts/example.py")
+
+        with (
+            mock.patch.object(
+                root_maintenance,
+                "script_source_targets",
+                return_value=["scripts/example.py"],
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_kind_map",
+                return_value={"scripts/example.py": "python"},
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "git_context_label",
+                return_value="test",
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_context_issues",
+                return_value=[],
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_findings",
+                return_value=([], []),
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_commands",
+                return_value=([("injected syntax check", command)], []),
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "run_script_audit_command",
+                side_effect=FileNotFoundError("injected missing tool"),
+            ) as run,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = root_maintenance.main(
+                ["audit-scripts", "--quick", "--strict"]
+            )
+
+        self.assertEqual(returncode, 2)
+        run.assert_called_once_with(command)
+        self.assertIn(
+            "[FAIL] injected syntax check: injected missing tool", stdout.getvalue()
+        )
+        self.assertIn("command launch pre-result errors", stdout.getvalue())
+        self.assertIn("SCRIPT AUDIT INFRASTRUCTURE FAILED", stdout.getvalue())
+        self.assertNotIn("[PASS]", stdout.getvalue())
+        self.assertNotIn("SCRIPT AUDIT PASSED", stdout.getvalue())
+        self.assertNotIn("SCRIPT AUDIT FAILED:", stdout.getvalue())
+
+    def test_root_maintenance_audit_launched_nonzero_is_validation_failure(
+        self,
+    ) -> None:
+        root_maintenance = load_root_maintenance_module()
+        stdout = io.StringIO()
+        command = ("injected-tool", "--check", "scripts/example.py")
+
+        with (
+            mock.patch.object(
+                root_maintenance,
+                "script_source_targets",
+                return_value=["scripts/example.py"],
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_kind_map",
+                return_value={"scripts/example.py": "python"},
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "git_context_label",
+                return_value="test",
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_context_issues",
+                return_value=[],
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_findings",
+                return_value=([], []),
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_commands",
+                return_value=([("injected syntax check", command)], []),
+            ),
+            mock.patch.object(
+                root_maintenance, "run_script_audit_command", return_value=7
+            ) as run,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = root_maintenance.main(
+                ["audit-scripts", "--quick", "--strict"]
+            )
+
+        self.assertEqual(returncode, 1)
+        run.assert_called_once_with(command)
+        self.assertIn("[FAIL] injected syntax check: exit 7", stdout.getvalue())
+        self.assertIn("SCRIPT AUDIT FAILED:", stdout.getvalue())
+        self.assertNotIn("SCRIPT AUDIT INFRASTRUCTURE FAILED", stdout.getvalue())
+        self.assertNotIn("[PASS]", stdout.getvalue())
+
+    def test_root_maintenance_audit_keeps_findings_at_exit_one(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+        root_maintenance.script_inventory.cache_clear()
+        self.addCleanup(root_maintenance.script_inventory.cache_clear)
+        stdout = io.StringIO()
+
+        with (
+            mock.patch.object(
+                root_maintenance,
+                "script_source_targets",
+                return_value=["scripts/example.py"],
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_kind_map",
+                return_value={"scripts/example.py": "python"},
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "git_context_label",
+                return_value="test",
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_context_issues",
+                return_value=["injected audit finding"],
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_findings",
+                return_value=([], []),
+            ),
+            mock.patch.object(
+                root_maintenance,
+                "script_audit_commands",
+                return_value=([("injected syntax check", ("injected-tool",))], []),
+            ),
+            mock.patch.object(
+                root_maintenance, "run_script_audit_command", return_value=0
+            ) as run,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = root_maintenance.main(
+                ["audit-scripts", "--quick", "--strict"]
+            )
+
+        self.assertEqual(returncode, 1)
+        run.assert_called_once_with(("injected-tool",))
+        self.assertIn("[FAIL] injected audit finding", stdout.getvalue())
+        self.assertIn("SCRIPT AUDIT FAILED", stdout.getvalue())
+        self.assertNotIn("SCRIPT AUDIT INFRASTRUCTURE FAILED", stdout.getvalue())
+
+    def assert_migrated_contracts(self, group: str) -> None:
+        legacy_case = BuildToolingPolicyTest()
+        for test_name in _MIGRATED_POLICY_GROUPS[group]:
+            with self.subTest(baseline=test_name):
+                override_name = self._CURRENT_CONTRACT_OVERRIDES.get(test_name)
+                if override_name is None:
+                    _MIGRATED_POLICY_ASSERTIONS[test_name](legacy_case)
+                else:
+                    getattr(self, override_name)()
+
+    def _assert_current_skill_frontmatter_contract(self) -> None:
+        skills_dir = REPO_ROOT / ".codex" / "skills"
+        if not skills_dir.exists():
+            agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("`.codex/skills`", agents)
+            return
+        skill_dirs = sorted(path for path in skills_dir.iterdir() if path.is_dir())
+        names: list[str] = []
+        for skill_dir in skill_dirs:
+            skill_path = skill_dir / "SKILL.md"
+            self.assertTrue(skill_path.is_file(), f"missing {skill_path}")
+            name_lines = [
+                line
+                for line in skill_path.read_text(encoding="utf-8").splitlines()
+                if line.startswith("name: ")
+            ]
+            self.assertEqual(len(name_lines), 1, f"invalid skill name in {skill_path}")
+            names.append(name_lines[0].removeprefix("name: ").strip())
+        self.assertEqual(len(names), len(set(names)))
+
+    def _assert_current_skill_inventory_contract(self) -> None:
+        agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        normalized = " ".join(agents.split())
+        self.assertIn("`.codex/skills`", agents)
+        self.assertIn("fork-local skills", normalized)
+        self.assertIn("validation workflows", normalized)
+        skills_dir = REPO_ROOT / ".codex" / "skills"
+        if skills_dir.exists():
+            self.assertNotIn(
+                "kd4-harness",
+                {path.name for path in skills_dir.iterdir() if path.is_dir()},
+            )
+
+    def _assert_current_agents_validation_contract(self) -> None:
+        agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        normalized = " ".join(agents.split())
+        for heading in (
+            "## Repository identity and runtime boundary",
+            "### Scope and workspace",
+            "## Routing and task scope",
+            "## Delegated workflows",
+        ):
+            self.assertIn(heading, agents)
+        self.assertIn(
+            "Do not publish, deploy, or modify upstream state unless the user "
+            "explicitly requests that action",
+            normalized,
+        )
+        self.assertIn("generated contracts", normalized)
+
+    def _assert_current_script_ownership_contract(self) -> None:
+        agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        normalized = " ".join(agents.split())
+        self.assertFalse((REPO_ROOT / "scripts" / "AGENTS.md").exists())
+        self.assertIn(
+            "SOURCEMAP.md` covers workspace and maintenance-script routing",
+            normalized,
+        )
+        self.assertIn(
+            "Modify the requested behavior and the contract relationships", normalized
+        )
+
+    def _assert_current_runtime_proof_contract(self) -> None:
+        agents = " ".join((REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
+        self.assertIn(
+            "tests that directly exercise the changed behavior and prove it is "
+            "reachable through the real integration or runtime path",
+            agents,
+        )
+        self.assertIn(
+            "Do not rely only on helper-level tests or implementation-detail assertions",
+            agents,
+        )
+        self.assertIn(
+            "For documentation-only changes, run the nearest relevant existing validation",
+            agents,
+        )
+
+    def _assert_current_retired_tooling_contract(self) -> None:
+        owned_paths = repository_owned_paths()
+        allowed_platform_sources = {
+            "codex-rs/http-client/src/outbound_proxy/macos.rs",
+        }
+        with mock.patch(
+            f"{__name__}.repository_owned_paths",
+            return_value=[
+                path
+                for path in owned_paths
+                if path.relative_to(REPO_ROOT).as_posix()
+                not in allowed_platform_sources
+            ],
+        ):
+            _MIGRATED_POLICY_ASSERTIONS[
+                "test_obsolete_developer_tooling_residue_is_absent"
+            ](BuildToolingPolicyTest())
+        for relative_path in allowed_platform_sources:
+            self.assertTrue((REPO_ROOT / relative_path).is_file())
+
+    def _assert_current_host_platform_contract(self) -> None:
+        cargo = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
+        self.assertEqual(cargo["workspace"]["dependencies"]["arboard"], "3")
+        deny = load_toml(REPO_ROOT / "codex-rs" / "deny.toml")
+        self.assertEqual(
+            set(deny["graph"]["targets"]),
+            {"x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"},
+        )
+        schema = (REPO_ROOT / "codex-rs" / "core" / "config.schema.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("use_legacy_landlock", schema)
+        self.assertNotIn("use_linux_sandbox_bwrap", schema)
+        conditional_manifests = {
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in (REPO_ROOT / "codex-rs").rglob("Cargo.toml")
+            if "[target.'cfg(" in path.read_text(encoding="utf-8")
+        }
+        self.assertEqual(
+            conditional_manifests,
+            {
+                "codex-rs/cli/Cargo.toml",
+                "codex-rs/core/Cargo.toml",
+                "codex-rs/http-client/Cargo.toml",
+                "codex-rs/utils/pty/Cargo.toml",
+            },
+        )
+
+    def _assert_current_canonical_tooling_contract(self) -> None:
+        justfile = "\n" + (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        package = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+        for recipe in (
+            "cargo-lane-isolated-home lane *args:",
+            "config-schema-check:",
+            "config-schema-regenerate owner:",
+            "app-server-schema-check:",
+            'app-server-schema-regenerate owner experimental="":',
+            "write-hooks-schema:",
+            "completion-proof:",
+        ):
+            self.assertIn(f"\n{recipe}", justfile)
+        self.assertNotIn("write-hooks-schema", package["scripts"])
+        for obsolete_recipe in (
+            "cargo-lane-home",
+            "cargo-lane-main",
+            "test-github-scripts",
+            "write-config-schema",
+            "config-schema-check-force",
+            "write-app-server-schema",
+            "app-server-schema-check-force",
+            "app-server-schema-runtime-check",
+            "app-server-schema-runtime-check-with-runtime",
+            "app-server-schema-runtime-check-force",
+            "source-owners-slice-focused",
+        ):
+            self.assertNotIn(f"\n{obsolete_recipe}", justfile)
+        rendered = self.run_supported_command(
+            [
+                "just",
+                "--dry-run",
+                "app-server-schema-regenerate",
+                "policy-test",
+                "--experimental",
+            ]
+        )
+        self.assertIn(
+            '--owner "policy-test" -- --experimental',
+            rendered.stdout + rendered.stderr,
+        )
+        owner_slice = self.run_supported_command(
+            [
+                "just",
+                "source-owners-slice",
+                "source-owner-index",
+                "--focus",
+                "canonical tooling command",
+            ]
+        )
+        payload = json.loads(owner_slice.stdout)
+        self.assertFalse(payload["truncated"])
+        self.assertEqual(payload["omitted_relationships"], 0)
+        self.assertEqual(payload["material_unknowns"], [])
+        lane = self.run_supported_command(
+            ["just", "--dry-run", "cargo-lane", "main", "cargo", "--version"]
+        )
+        self.assertIn('run-lane --lane "main"', lane.stdout + lane.stderr)
+        for relative_path, command in {
+            "codex-rs/app-server/README.md": "app-server-schema-regenerate <owner>",
+            "codex-rs/app-server-protocol/tests/schema_fixtures.rs": (
+                "app-server-schema-regenerate <owner>"
+            ),
+            "codex-rs/core/src/config/schema.md": "config-schema-regenerate <owner>",
+            "codex-rs/core/src/config/schema_tests.rs": (
+                "config-schema-regenerate <owner>"
+            ),
+        }.items():
+            self.assertIn(
+                command,
+                (REPO_ROOT / relative_path).read_text(encoding="utf-8"),
+            )
+
+    def _assert_current_sdk_routing_contract(self) -> None:
+        recipe = self.run_supported_command(["just", "--show", "sdk-python-check"])
+        self.assertIn("--group dev ruff check .", recipe.stdout)
+        self.assertIn("--group dev pytest", recipe.stdout)
+        source_map = (REPO_ROOT / "SOURCEMAP.md").read_text(encoding="utf-8")
+        self.assertRegex(source_map, r"\|\s*Windows local publish\s*\|")
+        self.assertIn("`scripts/publish-local-codex.ps1`", source_map)
+        self.assertIn("`just publish-local-codex-final`", source_map)
+
+    def test_repository_guidance_through_source_owner_cli(self) -> None:
+        self.run_supported_command(
+            [sys.executable, "scripts/source_owners.py", "check"]
+        )
+        self.assert_migrated_contracts("repository_guidance")
+
+    def test_rust_workspace_policy_through_cargo_metadata(self) -> None:
+        result = self.run_supported_command(
+            [
+                "cargo",
+                "metadata",
+                "--offline",
+                "--locked",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--manifest-path",
+                "codex-rs/Cargo.toml",
+            ]
+        )
+        metadata = json.loads(result.stdout)
+        self.assertEqual(
+            Path(metadata["workspace_root"]).resolve(),
+            (REPO_ROOT / "codex-rs").resolve(),
+        )
+        self.assert_migrated_contracts("rust_workspace_policy")
+
+    def test_windows_installer_through_powershell_functions(self) -> None:
+        self.assertIsNotNone(powershell(), "PowerShell is required on the Windows host")
+        self.assert_migrated_contracts("windows_installer")
+
+    def test_maintenance_audit_contracts_through_subprocess_cli(self) -> None:
+        current_tree = subprocess.run(
+            [
+                sys.executable,
+                "scripts/root_maintenance.py",
+                "audit-scripts",
+                "--quick",
+                "--strict",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=240,
+        )
+        self.assertIn(current_tree.returncode, {0, 1})
+        self.assertIn("Inventory:", current_tree.stdout)
+        self.assertIn("Mode: quick", current_tree.stdout)
+        self.assertNotIn("SCRIPT AUDIT INFRASTRUCTURE FAILED", current_tree.stdout)
+        self.assertRegex(current_tree.stdout, r"SCRIPT AUDIT (?:PASSED|FAILED):")
+        self.assertIn("[PASS] justfile PowerShell syntax", current_tree.stdout)
+        self.assertIn("[PASS] justfile Python syntax", current_tree.stdout)
+        if current_tree.returncode == 1:
+            self.assertIn(
+                "SCRIPT AUDIT FAILED: 0 internal/context failure(s)",
+                current_tree.stdout,
+            )
+        self.assertNotIn("platform test skip", current_tree.stdout)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            self._materialize_root_maintenance_fixture(fixture_root)
+            self._initialize_root_maintenance_git_fixture(fixture_root)
+            tool_root, log_path = self._fake_root_maintenance_tools(
+                fixture_root, ("uv", "pwsh", "node", "just")
+            )
+            env = self._root_maintenance_env(fixture_root, tool_root, log_path)
+            audit_roots = tuple(
+                fixture_root / relative_root
+                for relative_root in (
+                    ".codex/environments",
+                    ".codex/hooks",
+                    "scripts",
+                    "codex-cli/scripts",
+                    "codex-rs/app-server-test-client/scripts",
+                    "codex-rs/config/scripts",
+                    "codex-rs/scripts",
+                    "codex-rs/skills/src/assets/samples",
+                    "sdk/python/scripts",
+                    "tools/argument-comment-lint",
+                )
+            )
+            expected_python_sources = sorted(
+                path.relative_to(fixture_root).as_posix()
+                for root in audit_roots
+                for path in root.rglob("*.py")
+                if "__pycache__" not in path.parts and ".venv" not in path.parts
+            )
+            expected_unittest_targets = sorted(
+                (
+                    path.relative_to(fixture_root)
+                    .with_suffix("")
+                    .as_posix()
+                    .replace("/", ".")
+                    if fixture_root / "scripts" in path.parents
+                    else path.relative_to(fixture_root).as_posix()
+                )
+                for root in audit_roots
+                for path in root.rglob("*.py")
+                if path.name.lower().startswith("test_")
+                and "__pycache__" not in path.parts
+                and ".venv" not in path.parts
+            )
+            result = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["audit-scripts"],
+                env,
+                timeout=240,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            for expected in (
+                "Inventory:",
+                "[RUN] Python format",
+                "[RUN] Python lint",
+                "[RUN] PowerShell syntax",
+                "[RUN] justfile PowerShell syntax",
+                "[RUN] justfile Python syntax",
+                "[RUN] JavaScript syntax:",
+                "[RUN] script unit tests",
+                "[PASS] script unit tests",
+                "SCRIPT AUDIT PASSED:",
+            ):
+                self.assertIn(expected, result.stdout)
+            self.assertNotIn("[FAIL]", result.stdout)
+            calls = self._fake_tool_calls(log_path)
+            self.assertIn(
+                ["--summary"],
+                [call["args"] for call in calls if call["tool"] == "just"],
+            )
+            uv_calls = [call["args"] for call in calls if call["tool"] == "uv"]
+            uv_prefix = ["run", "--frozen", "--project", "scripts"]
+            self.assertEqual(
+                uv_calls,
+                [
+                    [
+                        *uv_prefix,
+                        "ruff",
+                        "format",
+                        "--check",
+                        *expected_python_sources,
+                    ],
+                    [*uv_prefix, "ruff", "check", *expected_python_sources],
+                    [
+                        *uv_prefix,
+                        "python",
+                        "-m",
+                        "unittest",
+                        *expected_unittest_targets,
+                        "-v",
+                    ],
+                ],
+            )
+            self.assertIn(
+                "tools/argument-comment-lint/test_wrapper_common.py",
+                expected_unittest_targets,
+            )
+            representative_kinds = {
+                ".codex/environments/setup.py": "python",
+                "codex-cli/bin/codex.js": "javascript",
+                "codex-cli/scripts/build_npm_package.py": "python",
+                (
+                    "codex-rs/app-server-test-client/scripts/"
+                    "live_elicitation_hold.ps1"
+                ): "powershell",
+                "codex-rs/config/scripts/generate-proto.ps1": "powershell",
+                (
+                    "codex-rs/responses-api-proxy/npm/bin/"
+                    "codex-responses-api-proxy.js"
+                ): "javascript",
+                "codex-rs/scripts/nextest_windows_stack.py": "python",
+                (
+                    "codex-rs/skills/src/assets/samples/imagegen/scripts/"
+                    "image_gen.py"
+                ): "python",
+                "sdk/python/scripts/update_sdk_artifacts.py": "python",
+                "tools/argument-comment-lint/run.py": "python",
+            }
+            powershell_syntax = next(
+                call["args"][-1]
+                for call in calls
+                if call["tool"] == "pwsh" and "ParseFile" in call["args"][-1]
+            )
+            javascript_checks = {
+                call["args"][1]
+                for call in calls
+                if call["tool"] == "node" and call["args"][:1] == ["--check"]
+            }
+            for target, expected_kind in representative_kinds.items():
+                with self.subTest(target=target, expected_kind=expected_kind):
+                    if expected_kind == "python":
+                        self.assertIn(target, expected_python_sources)
+                    elif expected_kind == "powershell":
+                        self.assertIn(target, powershell_syntax)
+                    else:
+                        self.assertIn(target, javascript_checks)
+
+            changed = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["test-python", "--changed", "scripts/root_maintenance.py"],
+                env,
+            )
+            self.assertEqual(changed.returncode, 0, changed.stderr)
+            changed_uv_calls = [
+                call["args"]
+                for call in self._fake_tool_calls(log_path)
+                if call["tool"] == "uv"
+            ]
+            self.assertEqual(
+                changed_uv_calls[-1],
+                [
+                    *uv_prefix,
+                    "python",
+                    "-m",
+                    "unittest",
+                    "scripts.test_build_tooling_policy",
+                    "-v",
+                ],
+            )
+
+            for target in representative_kinds:
+                (fixture_root / target).unlink()
+            self._initialize_root_maintenance_git_fixture(fixture_root)
+            log_path.unlink()
+            strict = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["audit-scripts", "--strict"],
+                env,
+                timeout=240,
+            )
+            self.assertEqual(
+                strict.returncode,
+                0,
+                f"stdout:\n{strict.stdout}\nstderr:\n{strict.stderr}",
+            )
+            self.assertIn("SCRIPT AUDIT PASSED:", strict.stdout)
+            self.assertIn("0 advisory item(s)", strict.stdout)
+            self.assertNotIn("[FAIL]", strict.stdout)
+
+            failed_env = {**env, "FAKE_FAIL_TOOL": "node", "FAKE_FAIL_CODE": "9"}
+            failed = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["audit-scripts", "--strict"],
+                failed_env,
+                timeout=240,
+            )
+            self.assertEqual(failed.returncode, 1)
+            self.assertIn("exit 9", failed.stdout)
+            self.assertIn("SCRIPT AUDIT FAILED:", failed.stdout)
+            self.assertNotIn("SCRIPT AUDIT INFRASTRUCTURE FAILED", failed.stdout)
+
+            fixture_script = fixture_root / "scripts" / "root_maintenance.py"
+            fixture_source = fixture_script.read_text(encoding="utf-8")
+            entrypoint = "\nif __name__ == '__main__':"
+            self.assertIn(entrypoint, fixture_source)
+            fixture_script.write_text(
+                fixture_source.replace(
+                    entrypoint,
+                    "\nSCRIPT_TEST_MODULES.clear()\n" + entrypoint,
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            for test_target in fixture_root.rglob("test_*.py"):
+                test_target.unlink()
+            self.assertEqual(list(fixture_root.rglob("test_*.py")), [])
+            log_path.unlink(missing_ok=True)
+
+            empty_test_selection = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["audit-scripts"],
+                env,
+                timeout=240,
+            )
+            self.assertEqual(
+                empty_test_selection.returncode,
+                0,
+                f"stdout:\n{empty_test_selection.stdout}\n"
+                f"stderr:\n{empty_test_selection.stderr}",
+            )
+            self.assertIn("SCRIPT AUDIT PASSED:", empty_test_selection.stdout)
+            self.assertNotIn("[RUN] script unit tests", empty_test_selection.stdout)
+            self.assertFalse(
+                any(
+                    call["tool"] == "uv"
+                    and call["args"][4:7] == ["python", "-m", "unittest"]
+                    for call in self._fake_tool_calls(log_path)
+                )
+            )
+
+    def test_maintenance_changed_routes_through_subprocess_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            self._materialize_root_maintenance_fixture(fixture_root)
+            self._initialize_root_maintenance_git_fixture(fixture_root)
+            tool_root, log_path = self._fake_root_maintenance_tools(
+                fixture_root, ("uv",)
+            )
+            env = self._root_maintenance_env(fixture_root, tool_root, log_path)
+
+            result = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["test-python", "--changed", "scripts/root_maintenance.py"],
+                env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            uv_calls = [
+                call["args"]
+                for call in self._fake_tool_calls(log_path)
+                if call["tool"] == "uv"
+            ]
+            self.assertEqual(
+                uv_calls[-1],
+                [
+                    "run",
+                    "--frozen",
+                    "--project",
+                    "scripts",
+                    "python",
+                    "-m",
+                    "unittest",
+                    "scripts.test_build_tooling_policy",
+                    "-v",
+                ],
+            )
+
+            for changed_path, expected_module in (
+                (
+                    "scripts/common-rust-env.ps1",
+                    "scripts.test_build_tooling_performance",
+                ),
+                (
+                    "scripts/rust_build_status.py",
+                    "scripts.test_build_tooling_storage",
+                ),
+            ):
+                routed = self._run_root_maintenance_fixture(
+                    fixture_root,
+                    ["test-python", "--changed", changed_path],
+                    env,
+                )
+                self.assertEqual(routed.returncode, 0, routed.stderr)
+                uv_calls = [
+                    call["args"]
+                    for call in self._fake_tool_calls(log_path)
+                    if call["tool"] == "uv"
+                ]
+                self.assertEqual(
+                    uv_calls[-1],
+                    [
+                        "run",
+                        "--frozen",
+                        "--project",
+                        "scripts",
+                        "python",
+                        "-m",
+                        "unittest",
+                        expected_module,
+                        "-v",
+                    ],
+                )
+
+            aggregate_paths = (
+                "scripts/investigation_eval/score_results.py",
+                "scripts/investigation_eval/validate_cases.py",
+                "scripts/kd4_model_attempt_analysis.py",
+            )
+            aggregate_args = ["test-python"]
+            for path in aggregate_paths:
+                aggregate_args.extend(("--changed", path))
+            result = self._run_root_maintenance_fixture(
+                fixture_root, aggregate_args, env
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            uv_calls = [
+                call["args"]
+                for call in self._fake_tool_calls(log_path)
+                if call["tool"] == "uv"
+            ]
+            self.assertEqual(
+                uv_calls[-1][7:-1],
+                [
+                    "scripts.investigation_eval.test_investigation_eval",
+                    "scripts.test_kd4_perf_snapshot",
+                ],
+            )
+
+            publish = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["test-python", "--changed", "scripts/publish-local-codex.ps1"],
+                env,
+            )
+            self.assertEqual(publish.returncode, 0, publish.stderr)
+            uv_calls = [
+                call["args"]
+                for call in self._fake_tool_calls(log_path)
+                if call["tool"] == "uv"
+            ]
+            self.assertEqual(
+                uv_calls[-1][7:-1],
+                [
+                    "scripts.test_publish_local_codex",
+                    "scripts.test_publish_local_codex_apply",
+                    "scripts.test_publish_local_codex_build",
+                    "scripts.test_publish_local_codex_dry_run",
+                    "scripts.test_publish_local_codex_freshness",
+                ],
+            )
+
+            case_insensitive = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["test-python", "--changed", "Scripts/Test_Asciicheck.PY"],
+                env,
+            )
+            self.assertEqual(case_insensitive.returncode, 0, case_insensitive.stderr)
+            uv_calls = [
+                call["args"]
+                for call in self._fake_tool_calls(log_path)
+                if call["tool"] == "uv"
+            ]
+            self.assertEqual(uv_calls[-1][7:-1], ["scripts.test_asciicheck"])
+
+            retired_paths = (
+                ".codex/hooks.json",
+                ".codex/hooks/task-continuity-entry.ps1",
+                ".codex/hooks/task-continuity-fast-basic.ps1",
+                ".codex/hooks/task-continuity-fast-compact.ps1",
+                ".codex/hooks/task-continuity-fast-session.ps1",
+                ".codex/hooks/task-continuity.ps1",
+            )
+            retired_args = ["test-python"]
+            for path in retired_paths:
+                retired_args.extend(("--changed", path))
+            before_uv = len(uv_calls)
+            retired = self._run_root_maintenance_fixture(
+                fixture_root, retired_args, env
+            )
+            self.assertEqual(retired.returncode, 2)
+            self.assertIn("no focused test route was selected", retired.stderr)
+            uv_calls = [
+                call for call in self._fake_tool_calls(log_path) if call["tool"] == "uv"
+            ]
+            self.assertEqual(len(uv_calls), before_uv)
+
+            with (fixture_root / "scripts" / "test_asciicheck.py").open(
+                "a", encoding="utf-8"
+            ) as script:
+                script.write("ASCII_CHANGED = True\n")
+            with (fixture_root / "scripts" / "test_träcked route.py").open(
+                "a", encoding="utf-8"
+            ) as script:
+                script.write("TRACKED_CHANGED = True\n")
+            (fixture_root / "scripts" / "test_untracked route.py").write_text(
+                "UNTRACKED_ROUTE = True\n", encoding="utf-8"
+            )
+            docs_path = fixture_root / "docs" / "trailing space .md"
+            docs_path.parent.mkdir()
+            docs_path.write_text("ignored\n", encoding="utf-8")
+            trace_path = fixture_root / "git-trace.log"
+            implicit = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["test-python", "--changed"],
+                {**env, "GIT_TRACE": str(trace_path)},
+            )
+            self.assertEqual(implicit.returncode, 0, implicit.stderr)
+            git_trace = trace_path.read_text(encoding="utf-8", errors="replace")
+            self.assertIn(
+                "diff --name-only -z --diff-filter=ACDMRTUXB HEAD --", git_trace
+            )
+            self.assertIn("ls-files --others --exclude-standard -z --", git_trace)
+            calls = self._fake_tool_calls(log_path)
+            uv_calls = [call["args"] for call in calls if call["tool"] == "uv"]
+            self.assertEqual(
+                uv_calls[-1][7:-1],
+                [
+                    "scripts.test_asciicheck",
+                    "scripts.test_träcked route",
+                    "scripts.test_untracked route",
+                ],
+            )
+
+            fixture_script = fixture_root / "scripts" / "root_maintenance.py"
+            fixture_source = fixture_script.read_text(encoding="utf-8")
+            function_start = fixture_source.index("def git_changed_paths()")
+            function_end = fixture_source.index(
+                "def expand_changed_paths", function_start
+            )
+            git_changed_paths_source = fixture_source[function_start:function_end]
+            direct_runner = "subprocess.run(command,"
+            resolved_runner = (
+                "subprocess.run([which(command[0]) or command[0], *command[1:]],"
+            )
+            self.assertEqual(git_changed_paths_source.count(direct_runner), 1)
+            git_changed_paths_source = git_changed_paths_source.replace(
+                direct_runner, resolved_runner, 1
+            )
+            fixture_script.write_text(
+                fixture_source[:function_start]
+                + git_changed_paths_source
+                + fixture_source[function_end:],
+                encoding="utf-8",
+            )
+            self._fake_root_maintenance_tools(fixture_root, ("git",))
+            before_nul_uv = len(uv_calls)
+            nul_delimited = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["test-python", "--changed"],
+                {
+                    **env,
+                    "FAKE_GIT_OTHERS_JSON": json.dumps(
+                        ["docs/note.md\nscripts/test_asciicheck.py"]
+                    ),
+                },
+            )
+            self.assertEqual(nul_delimited.returncode, 0, nul_delimited.stderr)
+            self.assertIn(
+                "No matching changed Python test modules to run.",
+                nul_delimited.stdout,
+            )
+            uv_calls = [
+                call["args"]
+                for call in self._fake_tool_calls(log_path)
+                if call["tool"] == "uv"
+            ]
+            self.assertEqual(len(uv_calls), before_nul_uv)
+
+            before_uv = len(uv_calls)
+            documentation_only = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["test-python", "--changed", "docs/runtime-policy.md"],
+                env,
+            )
+            self.assertEqual(
+                documentation_only.returncode, 0, documentation_only.stderr
+            )
+            self.assertIn(
+                "No matching changed Python test modules to run.",
+                documentation_only.stdout,
+            )
+            self.assertEqual(
+                sum(call["tool"] == "uv" for call in self._fake_tool_calls(log_path)),
+                before_uv,
+            )
+
+            before_uv = len(uv_calls)
+            unmapped = self._run_root_maintenance_fixture(
+                fixture_root,
+                [
+                    "test-python",
+                    "--changed",
+                    "scripts/unmapped_audit189_helper.py",
+                ],
+                env,
+            )
+            self.assertEqual(unmapped.returncode, 2)
+            self.assertIn("no focused test route was selected", unmapped.stderr)
+            self.assertEqual(
+                sum(call["tool"] == "uv" for call in self._fake_tool_calls(log_path)),
+                before_uv,
+            )
+
+    def test_maintenance_command_contracts_through_subprocess_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            self._materialize_root_maintenance_fixture(fixture_root)
+            tool_root, log_path = self._fake_root_maintenance_tools(
+                fixture_root, ("uv",)
+            )
+            env = self._root_maintenance_env(fixture_root, tool_root, log_path)
+            lint = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["lint-python", "--changed", "scripts/root_maintenance.py"],
+                env,
+            )
+            self.assertEqual(lint.returncode, 0, lint.stderr)
+            selected = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["test-python", "--module", "scripts.test_build_tooling_policy"],
+                env,
+            )
+            self.assertEqual(selected.returncode, 0, selected.stderr)
+            uv_calls = [
+                call["args"]
+                for call in self._fake_tool_calls(log_path)
+                if call["tool"] == "uv"
+            ]
+            self.assertEqual(
+                uv_calls,
+                [
+                    [
+                        "run",
+                        "--frozen",
+                        "--project",
+                        "scripts",
+                        "ruff",
+                        "check",
+                        "scripts/root_maintenance.py",
+                    ],
+                    [
+                        "run",
+                        "--frozen",
+                        "--project",
+                        "scripts",
+                        "python",
+                        "-m",
+                        "unittest",
+                        "scripts.test_build_tooling_policy",
+                        "-v",
+                    ],
+                ],
+            )
+
+            missing_tool_root = fixture_root / "missing-tools"
+            missing_tool_root.mkdir()
+            missing_env = self._root_maintenance_env(
+                fixture_root,
+                missing_tool_root,
+                log_path,
+                path_only=True,
+            )
+            missing = self._run_root_maintenance_fixture(
+                fixture_root,
+                ["lint-python", "--changed", "scripts/root_maintenance.py"],
+                missing_env,
+            )
+            self.assertEqual(missing.returncode, 127)
+            self.assertIn("Could not run uv", missing.stderr)
+
+    def test_maintenance_parser_contract_through_subprocess_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            self._materialize_root_maintenance_fixture(fixture_root)
+            env = {**os.environ}
+            help_result = self._run_root_maintenance_fixture(
+                fixture_root, ["--help"], env
+            )
+            self.assertEqual(help_result.returncode, 0, help_result.stderr)
+            for command in ("lint-python", "test-python", "audit-scripts"):
+                self.assertIn(command, help_result.stdout)
+            for retired in ("format-prettier", "format-python"):
+                self.assertNotIn(retired, help_result.stdout)
+                rejected = self._run_root_maintenance_fixture(
+                    fixture_root, [retired], env
+                )
+                self.assertEqual(rejected.returncode, 2)
+                self.assertIn("invalid choice", rejected.stderr)
+
+    def test_formatter_and_launchers_through_supported_clis(self) -> None:
+        self.run_supported_command(
+            [
+                sys.executable,
+                "scripts/format.py",
+                "--check",
+                "--only",
+                "python-scripts",
+                "--changed",
+                "scripts/test_build_tooling_policy.py",
+            ]
+        )
+        self.run_supported_command(["node", "--check", "codex-cli/bin/codex.js"])
+        self.assert_migrated_contracts("formatter_and_launchers")
+
+    def test_just_routes_through_just_cli(self) -> None:
+        summary = self.run_supported_command(["just", "--summary"])
+        self.assertIn("completion-proof", summary.stdout.split())
+        self.assert_migrated_contracts("just_routes")
+
+    def test_workspace_analyzer_through_powershell_runtime(self) -> None:
+        self.assertIsNotNone(powershell(), "PowerShell is required on the Windows host")
+        self.assert_migrated_contracts("workspace_analyzer")
+
+    def test_sdk_and_package_routes_through_just_cli(self) -> None:
+        self.run_supported_command(["just", "--show", "sdk-python-check"])
+        self.run_supported_command(["just", "--show", "sdk-ts-check"])
+        self.assert_migrated_contracts("sdk_and_package_routes")
+
+
+for _migrated_test_name in _MIGRATED_POLICY_TESTS:
+    delattr(BuildToolingPolicyTest, _migrated_test_name)
 
 
 if __name__ == "__main__":

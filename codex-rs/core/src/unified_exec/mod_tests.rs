@@ -135,6 +135,7 @@ async fn exec_command_with_tty(
                 .environment
                 .as_ref(),
             &PendingSpawnRegistration::default(),
+            None,
         )
         .await?;
     let context =
@@ -154,6 +155,7 @@ async fn exec_command_with_tty(
             tty,
             network_approval: None,
             session: Arc::downgrade(session),
+            completion_proof: None,
             last_used: started_at,
         };
         manager
@@ -358,6 +360,7 @@ async fn nonempty_write_stdin_yield_deadline_includes_process_reaction() -> anyh
             tty: true,
             network_approval: None,
             session: Arc::downgrade(&session),
+            completion_proof: None,
             last_used: Instant::now(),
         },
     );
@@ -752,6 +755,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             tty: true,
             network_approval: None,
             session: Arc::downgrade(&session),
+            completion_proof: None,
             last_used: Instant::now(),
         },
     );
@@ -826,6 +830,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
             tty: true,
             network_approval: None,
             session: Arc::downgrade(&session),
+            completion_proof: None,
             last_used,
         },
     );
@@ -895,6 +900,7 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
             None,
             &environment,
             &PendingSpawnRegistration::default(),
+            None,
         )
         .await?;
 

@@ -218,6 +218,7 @@ async fn store_process_for_test(
             tty: true,
             network_approval: None,
             session: Arc::downgrade(session),
+            completion_proof: None,
             last_used: Instant::now(),
         },
     );
@@ -727,6 +728,7 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
             tty: false,
             network_approval: None,
             session: Arc::downgrade(&session),
+            completion_proof: None,
             last_used: Instant::now(),
         },
     );

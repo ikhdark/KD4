@@ -1,8 +1,12 @@
 use crate::SkillsService;
 use crate::agent::AgentControl;
 use crate::agent::control::AgentExecutionGuard;
+use crate::agent::status::is_final;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
+use crate::completion_proof::CompletionProofRuntimeRegistry;
+use crate::completion_proof::CompletionProofSessionAuthority;
+use crate::completion_proof::same_canonical_completion_proof_path;
 use crate::config::Config;
 use crate::config::PermissionProfileSnapshot;
 use crate::config::ThreadStoreConfig;
@@ -55,6 +59,7 @@ use codex_protocol::persisted_thread_settings::reduce_persisted_thread_settings;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
@@ -86,6 +91,7 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -115,6 +121,35 @@ pub(crate) fn set_thread_manager_test_mode_for_tests(enabled: bool) {
 
 fn should_use_test_thread_manager_behavior() -> bool {
     FORCE_TEST_THREAD_MANAGER_BEHAVIOR.load(Ordering::Relaxed)
+}
+
+fn fresh_root_completion_proof_authority(
+    registry: Arc<CompletionProofRuntimeRegistry>,
+    cwd: &Path,
+) -> CompletionProofSessionAuthority {
+    CompletionProofSessionAuthority::root_terminal_owner(registry, cwd)
+}
+
+async fn registered_rollout_root_authority(
+    registry: Arc<CompletionProofRuntimeRegistry>,
+    cwd: &Path,
+    initial_history: &InitialHistory,
+) -> Option<CompletionProofSessionAuthority> {
+    let rollout_path = match initial_history {
+        InitialHistory::Resumed(resumed) => resumed.rollout_path.as_deref(),
+        InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
+    }?;
+    let (lineage_id, terminal_quiescence_root_thread_id) = registry
+        .registered_root_lineage_for_rollout(cwd, rollout_path)
+        .await?;
+    Some(
+        CompletionProofSessionAuthority::root_terminal_owner_for_existing_lineage(
+            registry,
+            cwd,
+            Some(lineage_id),
+            terminal_quiescence_root_thread_id,
+        ),
+    )
 }
 
 struct TempCodexHomeGuard {
@@ -252,6 +287,12 @@ pub struct StartThreadOptions {
     pub supports_openai_form_elicitation: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionProofAdmission {
+    RootTerminalOwner,
+    EvidenceContributor,
+}
+
 impl StartThreadOptions {
     pub fn with_dynamic_tools(
         mut self,
@@ -322,6 +363,7 @@ pub(crate) struct ThreadManagerState {
     session_source: SessionSource,
     installation_id: String,
     analytics_events_client: Option<AnalyticsEventsClient>,
+    completion_proof_registry: Arc<CompletionProofRuntimeRegistry>,
     // Captures submitted ops for testing purpose when test mode is enabled.
     ops_log: Option<SharedCapturedOps>,
 }
@@ -663,6 +705,7 @@ impl ThreadManager {
                 session_source,
                 installation_id,
                 analytics_events_client,
+                completion_proof_registry: CompletionProofRuntimeRegistry::new(),
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
@@ -804,6 +847,7 @@ impl ThreadManager {
                 session_source: SessionSource::Exec,
                 installation_id,
                 analytics_events_client: None,
+                completion_proof_registry: CompletionProofRuntimeRegistry::new(),
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
@@ -1088,14 +1132,36 @@ impl ThreadManager {
         &self,
         options: StartThreadOptions,
     ) -> CodexResult<NewThread> {
-        self.start_thread_with_options_and_fork_source(options, /*forked_from_thread_id*/ None)
-            .await
+        self.start_thread_with_options_and_fork_source(
+            options,
+            /*forked_from_thread_id*/ None,
+            CompletionProofAdmission::RootTerminalOwner,
+        )
+        .await
+    }
+
+    /// Starts a runtime-owned worker that may contribute evidence but can never publish terminal
+    /// completion for the repository root.
+    ///
+    /// This explicit admission is intentionally separate from [`Self::start_thread_with_options`].
+    /// Persisted or caller-supplied [`SessionSource`] metadata must never select proof authority.
+    pub async fn start_evidence_contributor_thread_with_options(
+        &self,
+        options: StartThreadOptions,
+    ) -> CodexResult<NewThread> {
+        self.start_thread_with_options_and_fork_source(
+            options,
+            /*forked_from_thread_id*/ None,
+            CompletionProofAdmission::EvidenceContributor,
+        )
+        .await
     }
 
     async fn start_thread_with_options_and_fork_source(
         &self,
         options: StartThreadOptions,
         forked_from_thread_id: Option<ThreadId>,
+        completion_proof_admission: CompletionProofAdmission,
     ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control();
         let (resumed_session_source, resumed_thread_source) = options
@@ -1104,6 +1170,18 @@ impl ThreadManager {
             .unwrap_or_else(|| (self.state.session_source.clone(), None));
         let session_source = options.session_source.unwrap_or(resumed_session_source);
         let thread_source = options.thread_source.or(resumed_thread_source);
+        let completion_proof_authority = match completion_proof_admission {
+            CompletionProofAdmission::RootTerminalOwner => fresh_root_completion_proof_authority(
+                Arc::clone(&self.state.completion_proof_registry),
+                options.config.cwd.as_path(),
+            ),
+            CompletionProofAdmission::EvidenceContributor => {
+                CompletionProofSessionAuthority::evidence_contributor(
+                    Arc::clone(&self.state.completion_proof_registry),
+                    options.config.cwd.as_path(),
+                )
+            }
+        };
         Box::pin(self.state.spawn_thread_with_source(
             options.config,
             options.initial_history,
@@ -1124,6 +1202,7 @@ impl ThreadManager {
             options.thread_extension_init,
             options.supports_openai_form_elicitation,
             /*user_shell_override*/ None,
+            completion_proof_authority,
         ))
         .await
     }
@@ -1161,8 +1240,12 @@ impl ThreadManager {
                 inherited_multi_agent_version,
             ),
         );
-        self.start_thread_with_options_and_fork_source(options, Some(forked_from_thread_id))
-            .await
+        self.start_thread_with_options_and_fork_source(
+            options,
+            Some(forked_from_thread_id),
+            CompletionProofAdmission::EvidenceContributor,
+        )
+        .await
     }
 
     pub async fn resume_thread_from_rollout(
@@ -1174,12 +1257,26 @@ impl ThreadManager {
         supports_openai_form_elicitation: bool,
     ) -> CodexResult<NewThread> {
         let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
-        Box::pin(self.resume_thread_with_history(
+        let completion_proof_authority = registered_rollout_root_authority(
+            Arc::clone(&self.state.completion_proof_registry),
+            config.cwd.as_path(),
+            &initial_history,
+        )
+        .await
+        .unwrap_or_else(|| {
+            fresh_root_completion_proof_authority(
+                Arc::clone(&self.state.completion_proof_registry),
+                config.cwd.as_path(),
+            )
+        });
+        Box::pin(self.resume_thread_with_history_and_settings_with_authority(
             config,
             initial_history,
             auth_manager,
             parent_trace,
             supports_openai_form_elicitation,
+            ThreadSettingsReconstruction::default(),
+            completion_proof_authority,
         ))
         .await
     }
@@ -1248,12 +1345,47 @@ impl ThreadManager {
     #[instrument(level = "trace", skip_all)]
     pub async fn resume_thread_with_history_and_settings(
         &self,
+        config: Config,
+        initial_history: InitialHistory,
+        auth_manager: Arc<AuthManager>,
+        parent_trace: Option<W3cTraceContext>,
+        supports_openai_form_elicitation: bool,
+        reconstruction: ThreadSettingsReconstruction,
+    ) -> CodexResult<NewThread> {
+        let completion_proof_authority = registered_rollout_root_authority(
+            Arc::clone(&self.state.completion_proof_registry),
+            config.cwd.as_path(),
+            &initial_history,
+        )
+        .await
+        .unwrap_or_else(|| {
+            fresh_root_completion_proof_authority(
+                Arc::clone(&self.state.completion_proof_registry),
+                config.cwd.as_path(),
+            )
+        });
+        self.resume_thread_with_history_and_settings_with_authority(
+            config,
+            initial_history,
+            auth_manager,
+            parent_trace,
+            supports_openai_form_elicitation,
+            reconstruction,
+            completion_proof_authority,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resume_thread_with_history_and_settings_with_authority(
+        &self,
         mut config: Config,
         initial_history: InitialHistory,
         auth_manager: Arc<AuthManager>,
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
         mut reconstruction: ThreadSettingsReconstruction,
+        completion_proof_authority: CompletionProofSessionAuthority,
     ) -> CodexResult<NewThread> {
         let mut persisted_settings =
             resolve_persisted_thread_settings(&initial_history, &mut reconstruction);
@@ -1298,6 +1430,7 @@ impl ThreadManager {
             /*thread_extension_init*/ ExtensionDataInit::default(),
             supports_openai_form_elicitation,
             /*user_shell_override*/ None,
+            completion_proof_authority,
         ))
         .await?;
         if let Err(err) = self
@@ -1337,6 +1470,10 @@ impl ThreadManager {
             self.state.environment_manager.as_ref(),
             &config.cwd,
         );
+        let completion_proof_authority = fresh_root_completion_proof_authority(
+            Arc::clone(&self.state.completion_proof_registry),
+            config.cwd.as_path(),
+        );
         Box::pin(self.state.spawn_thread(
             config,
             InitialHistory::New,
@@ -1352,6 +1489,7 @@ impl ThreadManager {
             /*thread_extension_init*/ ExtensionDataInit::default(),
             supports_openai_form_elicitation,
             /*user_shell_override*/ Some(user_shell_override),
+            completion_proof_authority,
         ))
         .await
     }
@@ -1373,6 +1511,18 @@ impl ThreadManager {
         let (session_source, thread_source) = initial_history
             .get_resumed_session_sources()
             .unwrap_or_else(|| (self.state.session_source.clone(), None));
+        let completion_proof_authority = registered_rollout_root_authority(
+            Arc::clone(&self.state.completion_proof_registry),
+            config.cwd.as_path(),
+            &initial_history,
+        )
+        .await
+        .unwrap_or_else(|| {
+            fresh_root_completion_proof_authority(
+                Arc::clone(&self.state.completion_proof_registry),
+                config.cwd.as_path(),
+            )
+        });
         Box::pin(self.state.spawn_thread_with_source(
             config,
             initial_history,
@@ -1393,6 +1543,7 @@ impl ThreadManager {
             /*thread_extension_init*/ ExtensionDataInit::default(),
             supports_openai_form_elicitation,
             /*user_shell_override*/ Some(user_shell_override),
+            completion_proof_authority,
         ))
         .await
     }
@@ -1627,6 +1778,10 @@ impl ThreadManager {
             InitialHistory::Forked(_) => history.forked_from_id(),
             InitialHistory::New | InitialHistory::Cleared => None,
         };
+        let source_rollout_path = match &history {
+            InitialHistory::Resumed(resumed) => resumed.rollout_path.clone(),
+            InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
+        };
         let multi_agent_version = self
             .state
             .effective_multi_agent_version_for_spawn(
@@ -1661,6 +1816,36 @@ impl ThreadManager {
             });
         self.validate_environment_selections(&environments)?;
         let agent_control = self.agent_control();
+        let mut source_tree_closing = None;
+        let mut completion_proof_authority = fresh_root_completion_proof_authority(
+            Arc::clone(&self.state.completion_proof_registry),
+            config.cwd.as_path(),
+        );
+        if source_thread_id.is_some()
+            && let Some(source_rollout_path) = source_rollout_path.as_deref()
+            && let Some((lineage_id, terminal_quiescence_root_thread_id)) = self
+                .state
+                .completion_proof_registry
+                .registered_root_lineage_for_rollout(config.cwd.as_path(), source_rollout_path)
+                .await
+            && is_final(
+                &agent_control
+                    .get_status(terminal_quiescence_root_thread_id)
+                    .await,
+            )
+            && let Ok(closing_guard) = agent_control
+                .begin_terminal_publication(terminal_quiescence_root_thread_id)
+                .await
+        {
+            completion_proof_authority =
+                CompletionProofSessionAuthority::root_terminal_owner_for_existing_lineage(
+                    Arc::clone(&self.state.completion_proof_registry),
+                    config.cwd.as_path(),
+                    Some(lineage_id),
+                    terminal_quiescence_root_thread_id,
+                );
+            source_tree_closing = Some(closing_guard);
+        }
         let new_thread = Box::pin(self.state.spawn_thread(
             config,
             history,
@@ -1676,6 +1861,7 @@ impl ThreadManager {
             /*thread_extension_init*/ ExtensionDataInit::default(),
             supports_openai_form_elicitation,
             /*user_shell_override*/ None,
+            completion_proof_authority,
         ))
         .await?;
         if let Err(err) = self
@@ -1691,6 +1877,7 @@ impl ThreadManager {
                 .await;
             return Err(err);
         }
+        drop(source_tree_closing);
         Ok(new_thread)
     }
 
@@ -1790,6 +1977,31 @@ impl ThreadManagerState {
         }
         thread
             .submit_with_preacquired_execution_guard(op, execution_guard)
+            .await
+    }
+
+    /// Send a typed-child completion through the parent's normal submission FIFO and wait for the
+    /// handler's real mailbox admission result. The acknowledgement capability never crosses the
+    /// public protocol boundary.
+    pub(crate) async fn send_typed_child_completion_with_admission(
+        &self,
+        thread_id: ThreadId,
+        communication: InterAgentCommunication,
+    ) -> CodexResult<String> {
+        let thread = self.get_thread(thread_id).await?;
+        if let Some(ops_log) = &self.ops_log
+            && let Ok(mut log) = ops_log.lock()
+        {
+            log.push((
+                thread_id,
+                Op::InterAgentCommunication {
+                    communication: communication.clone(),
+                },
+            ));
+        }
+        thread
+            .codex
+            .submit_typed_child_completion_with_admission(communication)
             .await
     }
 
@@ -2090,6 +2302,10 @@ impl ThreadManagerState {
         let environments = environments.unwrap_or_else(|| {
             default_thread_environment_selections(self.environment_manager.as_ref(), &config.cwd)
         });
+        let completion_proof_authority = CompletionProofSessionAuthority::evidence_contributor(
+            Arc::clone(&self.completion_proof_registry),
+            config.cwd.as_path(),
+        );
         Box::pin(self.spawn_thread_with_source(
             config,
             InitialHistory::New,
@@ -2110,6 +2326,7 @@ impl ThreadManagerState {
             /*thread_extension_init*/ ExtensionDataInit::default(),
             /*supports_openai_form_elicitation*/ false,
             /*user_shell_override*/ None,
+            completion_proof_authority,
         ))
         .await
     }
@@ -2130,6 +2347,10 @@ impl ThreadManagerState {
         let environments =
             default_thread_environment_selections(self.environment_manager.as_ref(), &config.cwd);
         let thread_source = initial_history.get_resumed_thread_source();
+        let completion_proof_authority = CompletionProofSessionAuthority::evidence_contributor(
+            Arc::clone(&self.completion_proof_registry),
+            config.cwd.as_path(),
+        );
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
@@ -2150,6 +2371,7 @@ impl ThreadManagerState {
             /*thread_extension_init*/ ExtensionDataInit::default(),
             /*supports_openai_form_elicitation*/ false,
             /*user_shell_override*/ None,
+            completion_proof_authority,
         ))
         .await
     }
@@ -2172,6 +2394,10 @@ impl ThreadManagerState {
         let environments = environments.unwrap_or_else(|| {
             default_thread_environment_selections(self.environment_manager.as_ref(), &config.cwd)
         });
+        let completion_proof_authority = CompletionProofSessionAuthority::evidence_contributor(
+            Arc::clone(&self.completion_proof_registry),
+            config.cwd.as_path(),
+        );
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
@@ -2192,6 +2418,7 @@ impl ThreadManagerState {
             thread_extension_init,
             /*supports_openai_form_elicitation*/ false,
             /*user_shell_override*/ None,
+            completion_proof_authority,
         ))
         .await
     }
@@ -2214,6 +2441,7 @@ impl ThreadManagerState {
         thread_extension_init: ExtensionDataInit,
         supports_openai_form_elicitation: bool,
         user_shell_override: Option<crate::shell::Shell>,
+        completion_proof_authority: CompletionProofSessionAuthority,
     ) -> CodexResult<NewThread> {
         Box::pin(self.spawn_thread_with_source(
             config,
@@ -2235,6 +2463,7 @@ impl ThreadManagerState {
             thread_extension_init,
             supports_openai_form_elicitation,
             user_shell_override,
+            completion_proof_authority,
         ))
         .await
     }
@@ -2261,6 +2490,7 @@ impl ThreadManagerState {
         thread_extension_init: ExtensionDataInit,
         supports_openai_form_elicitation: bool,
         user_shell_override: Option<crate::shell::Shell>,
+        completion_proof_authority: CompletionProofSessionAuthority,
     ) -> CodexResult<NewThread> {
         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
         let rollback_persistence_on_finalize_error = !is_resumed_thread && !config.ephemeral;
@@ -2272,10 +2502,31 @@ impl ThreadManagerState {
             if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
                 if thread.is_running() {
                     if let Some(requested_rollout_path) = resumed.rollout_path.as_deref()
-                        && thread.rollout_path().as_deref() != Some(requested_rollout_path)
+                        && !thread
+                            .rollout_path()
+                            .as_deref()
+                            .is_some_and(|live_rollout_path| {
+                                same_canonical_completion_proof_path(
+                                    live_rollout_path,
+                                    requested_rollout_path,
+                                )
+                            })
                     {
                         return Err(CodexErr::InvalidRequest(format!(
                             "thread {} is already running with a different rollout path",
+                            resumed.conversation_id
+                        )));
+                    }
+                    if completion_proof_authority.is_terminal_owner()
+                        != thread
+                            .codex
+                            .session
+                            .services
+                            .completion_proof
+                            .is_terminal_owner()
+                    {
+                        return Err(CodexErr::InvalidRequest(format!(
+                            "thread {} is already running with different completion-proof authority",
                             resumed.conversation_id
                         )));
                     }
@@ -2358,6 +2609,7 @@ impl ThreadManagerState {
             attestation_provider: self.attestation_provider.clone(),
             external_time_provider: self.external_time_provider.clone(),
             inherited_multi_agent_version: multi_agent_version,
+            completion_proof_authority,
         }))
         .await?;
         let new_thread = self

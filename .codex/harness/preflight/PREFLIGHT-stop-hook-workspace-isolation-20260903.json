@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "assignment_id": "root:stop-hook-workspace-isolation-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/src/session/turn_tests.rs",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "stop-hook-test-workspace-isolation"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "root:stop-hook-workspace-isolation-20260903",
+  "validation_commands": [
+    "just core-test-fast core_lib -E 'test(=session::turn::tests::stop_hook_continuation_reaches_the_final_response) | test(=session::turn::tests::direct_runtime_stop_hook_continuation_reaches_the_final_response)'",
+    "git diff --check -- codex-rs/core/src/session/turn_tests.rs"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

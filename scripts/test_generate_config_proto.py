@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 
-from dataclasses import dataclass
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
-
+from dataclasses import dataclass
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "codex-rs" / "config" / "scripts" / "generate-proto.ps1"
@@ -159,15 +158,22 @@ class GenerateConfigProtoTest(unittest.TestCase):
         )
         self.assertTrue(lane_args[-1].endswith("proto"), lane_args[-1])
 
-    def test_checked_binding_is_pinned_to_lf_in_worktrees(self) -> None:
-        attributes = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
-        self.assertIn(
-            "codex-rs/config/src/thread_config/proto/"
-            "codex.thread_config.v1.rs text eol=lf",
-            attributes.splitlines(),
+    def test_git_reports_checked_binding_as_lf_through_cli(self) -> None:
+        relative_path = (
+            "codex-rs/config/src/thread_config/proto/codex.thread_config.v1.rs"
         )
+        result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "check-attr", "eol", "--", relative_path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"{relative_path}: eol: lf")
 
-    def test_check_uses_default_cargo_home_and_locked_generation(self) -> None:
+    def test_cli_check_uses_default_cargo_home_and_locked_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = create_fixture(Path(temp_dir))
             generated_before = fixture.checked_generated.read_bytes()
@@ -188,7 +194,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
             self.assertFalse(generated_before.startswith(b"\xef\xbb\xbf"))
             self.assert_locked_lane_args(fixture)
 
-    def test_explicit_protoc_precedes_environment_and_default(self) -> None:
+    def test_cli_explicit_protoc_precedes_environment_and_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             fixture = create_fixture(temp_path)
@@ -214,7 +220,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
             self.assertNotIn(f"Using protoc: {env_protoc}", result.stdout)
             self.assert_locked_lane_args(fixture)
 
-    def test_stale_check_fails_without_replacing_binding_or_lock(self) -> None:
+    def test_cli_stale_check_fails_without_replacing_binding_or_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = create_fixture(
                 Path(temp_dir),
@@ -234,7 +240,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
             self.assertEqual(fixture.cargo_lock.read_bytes(), lock_before)
             self.assert_locked_lane_args(fixture)
 
-    def test_write_replaces_stale_binding_atomically_without_touching_lock(
+    def test_cli_write_replaces_stale_binding_atomically_without_touching_lock(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -264,16 +270,61 @@ class GenerateConfigProtoTest(unittest.TestCase):
             )
             self.assert_locked_lane_args(fixture)
 
-    def test_just_recipes_expose_write_arguments_and_named_check(self) -> None:
-        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-        windows_recipe = justfile.split("[windows]\ngenerate-config-proto *args:", 1)[1]
-        windows_recipe = windows_recipe.split("\n\n", 1)[0]
+    def test_just_cli_routes_write_arguments_and_named_check(self) -> None:
+        just = shutil.which("just")
+        if just is None:
+            self.skipTest("just is not available")
+        environment = os.environ.copy()
+        environment["CARGO_NET_OFFLINE"] = "true"
 
-        self.assertIn("Select-Object -Skip 1", windows_recipe)
-        self.assertIn('generate-proto.ps1" @forwarded_args', windows_recipe)
-        self.assertIn("generate-config-proto-check:", justfile)
-        self.assertIn('generate-proto.ps1" -Check', justfile)
-        self.assertNotIn("generate-proto.sh", justfile)
+        forwarded = subprocess.run(
+            [
+                just,
+                "--justfile",
+                str(REPO_ROOT / "justfile"),
+                "generate-config-proto",
+                "-Check",
+            ],
+            cwd=REPO_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=180,
+        )
+        self.assertEqual(
+            forwarded.returncode,
+            0,
+            f"stdout:\n{forwarded.stdout}\nstderr:\n{forwarded.stderr}",
+        )
+        forwarded_output = forwarded.stdout + forwarded.stderr
+        self.assertIn("Config proto is up to date:", forwarded_output)
+
+        named_check = subprocess.run(
+            [
+                just,
+                "--justfile",
+                str(REPO_ROOT / "justfile"),
+                "generate-config-proto-check",
+            ],
+            cwd=REPO_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=180,
+        )
+        self.assertEqual(
+            named_check.returncode,
+            0,
+            f"stdout:\n{named_check.stdout}\nstderr:\n{named_check.stderr}",
+        )
+        named_check_output = named_check.stdout + named_check.stderr
+        self.assertIn("Config proto is up to date:", named_check_output)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
@@ -138,6 +139,9 @@ async fn run_kda(
         .args(args)
         .args(["--format", "report-json", "--no-workspace-exec"])
         .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
 
     let output = tokio::select! {
@@ -146,7 +150,10 @@ async fn run_kda(
                 "KDA analysis was cancelled".to_string(),
             ));
         }
-        output = command.output() => output.map_err(|err| {
+        output = async {
+            let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn())?;
+            child.wait_with_output().await
+        } => output.map_err(|err| {
             FunctionCallError::RespondToModel(format!(
                 "failed to start `{}`: {err}",
                 program.display()

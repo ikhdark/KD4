@@ -12,8 +12,8 @@ use crate::ipc_framed::Message;
 use crate::ipc_framed::SpawnRequest;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::runner_client::RunnerTransport;
-use crate::runner_client::retry_runner_spawn_once;
 use crate::runner_client::spawn_runner_transport;
+use crate::runner_client::spawn_runner_with_optional_credential_refresh;
 use crate::spawn_prep::prepare_elevated_spawn_context_for_permissions;
 use anyhow::Result;
 use codex_protocol::models::PermissionProfile;
@@ -46,6 +46,7 @@ struct RunnerTransportRequest {
 fn spawn_runner_transport_with_retry<T>(
     sandbox_creds: SandboxCreds,
     request: &RunnerTransportRequest,
+    allow_credential_refresh: bool,
     mut spawn: impl FnMut(&Path, &Path, &SandboxCreds, Option<&Path>, SpawnRequest) -> Result<T>,
     refresh: impl FnOnce(
         &ResolvedWindowsSandboxPermissions,
@@ -62,9 +63,10 @@ fn spawn_runner_transport_with_retry<T>(
         crate::WindowsSandboxProxySettingsMode,
     ) -> Result<SandboxCreds>,
 ) -> Result<T> {
-    retry_runner_spawn_once(
+    spawn_runner_with_optional_credential_refresh(
         sandbox_creds,
         &request.spawn_request.command,
+        allow_credential_refresh,
         |sandbox_creds| {
             spawn(
                 &request.codex_home,
@@ -96,11 +98,13 @@ fn spawn_runner_transport_with_retry<T>(
 async fn spawn_runner_transport_task(
     sandbox_creds: SandboxCreds,
     request: RunnerTransportRequest,
+    allow_credential_refresh: bool,
 ) -> Result<RunnerTransport> {
     tokio::task::spawn_blocking(move || -> Result<_> {
         spawn_runner_transport_with_retry(
             sandbox_creds,
             &request,
+            allow_credential_refresh,
             spawn_runner_transport,
             refresh_logon_sandbox_creds,
         )
@@ -129,6 +133,8 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
     tty: bool,
     stdin_open: bool,
     use_private_desktop: bool,
+    prepared_canonical_windows_sandbox_launch: Option<crate::PreparedCanonicalWindowsSandboxLaunch>,
+    canonical_launch_identity: Option<&str>,
 ) -> Result<SpawnedProcess> {
     let deny_read_paths_override = deny_read_paths_override
         .iter()
@@ -161,9 +167,12 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
         &deny_write_paths_override,
         proxy_enforced,
         proxy_settings_mode,
+        prepared_canonical_windows_sandbox_launch,
+        canonical_launch_identity,
     )?;
 
     let sandbox_creds = elevated.sandbox_creds;
+    let allow_credential_refresh = !elevated.used_prepared_launch;
     let request = RunnerTransportRequest {
         permissions,
         codex_home: codex_home.to_path_buf(),
@@ -193,7 +202,8 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
         proxy_enforced,
         proxy_settings_mode,
     };
-    let transport = spawn_runner_transport_task(sandbox_creds, request).await?;
+    let transport =
+        spawn_runner_transport_task(sandbox_creds, request, allow_credential_refresh).await?;
     let (pipe_write, pipe_read) = transport.into_files();
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);

@@ -111,6 +111,34 @@ impl AgentRegistry {
         guard
     }
 
+    /// Atomically closes admission for the root and every agent currently registered in its
+    /// shared control plane. Persisted spawn edges that are not present in the registry can be
+    /// added to the returned guard before terminal publication.
+    pub(crate) fn begin_closing_registered_agent_tree(
+        self: &Arc<Self>,
+        root_thread_id: ThreadId,
+    ) -> AgentTreeClosingGuard {
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut thread_ids = active_agents
+            .agent_tree
+            .values()
+            .filter_map(|metadata| metadata.agent_id)
+            .collect::<HashSet<_>>();
+        thread_ids.insert(root_thread_id);
+        for thread_id in &thread_ids {
+            let count = active_agents.closing_threads.entry(*thread_id).or_default();
+            *count = count.saturating_add(1);
+        }
+        drop(active_agents);
+        AgentTreeClosingGuard {
+            state: Arc::clone(self),
+            thread_ids,
+        }
+    }
+
     pub(crate) fn release_spawned_thread(&self, thread_id: ThreadId) {
         let removed_counted_agent = {
             let mut active_agents = self

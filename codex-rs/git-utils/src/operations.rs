@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
 
 use crate::DISABLED_HOOKS_PATH;
 use crate::GitToolingError;
@@ -206,7 +207,12 @@ fn run_git_attempt(
         }
     }
     command.args(args);
-    Ok(command.output()?)
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn())?;
+    Ok(child.wait_with_output()?)
 }
 
 fn build_command_string(args: &[OsString]) -> String {

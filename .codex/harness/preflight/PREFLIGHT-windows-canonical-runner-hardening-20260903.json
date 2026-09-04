@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:windows-canonical-runner-hardening-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "scripts/completion_proof.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_completion_proof.py",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/windows-sandbox-rs/sandbox_smoketests.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_windows_sandbox_smoketests.py",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "canonical-windows-process-prerequisites",
+    "canonical-windows-sandbox-current-binary-identity"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:windows-canonical-runner-hardening-20260903",
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_windows_process_gate_requires_process_prerequisites",
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_windows_native_dispatch_preserves_leaf_execution_and_hashes",
+    "python -m unittest scripts.test_windows_sandbox_smoketests.WindowsSandboxSmokeModesTest.test_run_case_reports_exact_codex_binary_identity"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\windows-canonical-runner-hardening",
+    "cargo_home": "C:\\Users\\kuh\\.cargo"
+  },
+  "workspace_strategy": "shared"
+}

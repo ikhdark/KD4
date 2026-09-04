@@ -8,11 +8,13 @@
 //! attaching exactly the same JSON a user could copy from the CLI.
 
 use std::collections::BTreeMap;
+use std::process::Stdio;
 use std::time::Duration;
 
 use codex_core::config::Config;
 use codex_feedback::DOCTOR_REPORT_ATTACHMENT_FILENAME;
 use codex_feedback::FeedbackAttachment;
+use codex_utils_pty::with_windows_child_creation;
 use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -42,8 +44,22 @@ pub(crate) async fn doctor_feedback_report(config: &Config) -> Option<DoctorFeed
 
     let mut command = Command::new(&executable);
     command.arg("doctor").arg("--json");
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
     command.kill_on_drop(/*kill_on_drop*/ true);
-    let output = match timeout(DOCTOR_FEEDBACK_REPORT_TIMEOUT, command.output()).await {
+    let child = match with_windows_child_creation(|_| command.spawn()) {
+        Ok(child) => child,
+        Err(err) => {
+            warn!(
+                executable = %executable.display(),
+                error = %err,
+                "failed to run doctor report for feedback; skipping attachment"
+            );
+            return None;
+        }
+    };
+    let output = match timeout(DOCTOR_FEEDBACK_REPORT_TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(err)) => {
             warn!(

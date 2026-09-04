@@ -13,6 +13,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::strip_user_message_prefix;
+use codex_utils_pty::with_windows_child_creation;
 use regex::Regex;
 use regex::RegexBuilder;
 use serde_json::Value;
@@ -90,7 +91,7 @@ async fn ripgrep_rollout_paths(
 
     let search_term = case_insensitive_literal_regex(search_term)?;
     let mut command = rollout_ripgrep_command(rg_command, root, json_search_term);
-    let mut child = match command.spawn() {
+    let mut child = match with_windows_child_creation(|_| command.spawn()) {
         Ok(child) => child,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return Ok(None);

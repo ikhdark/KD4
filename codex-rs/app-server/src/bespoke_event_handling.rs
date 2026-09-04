@@ -1359,9 +1359,13 @@ async fn handle_turn_complete(
         additional_details: None,
     });
 
-    let (status, error) = match embedded_error.or(turn_summary.last_error) {
-        Some(error) => (TurnStatus::Failed, Some(error)),
-        None => (TurnStatus::Completed, None),
+    let (status, error, surfaced_result) = match embedded_error.or(turn_summary.last_error) {
+        Some(error) => (TurnStatus::Failed, Some(error), None),
+        None => (
+            TurnStatus::Completed,
+            None,
+            turn_complete_event.surfaced_result,
+        ),
     };
 
     emit_turn_completed_with_status(
@@ -1374,7 +1378,7 @@ async fn handle_turn_complete(
             completed_at: turn_complete_event.completed_at,
             duration_ms: turn_complete_event.duration_ms,
             timing: turn_complete_event.timing,
-            surfaced_result: turn_complete_event.surfaced_result,
+            surfaced_result,
             origin_connection_id: turn_summary.origin_connection_id,
         },
         outgoing,
@@ -2597,6 +2601,10 @@ mod tests {
                         command: completion_item.command.clone(),
                         cwd: completion_item.cwd.clone(),
                         process_id: None,
+                        parent_call_id: None,
+                        parent_cell_id: None,
+                        runtime_tool_call_id: None,
+                        execution_id: None,
                         source: CommandExecutionSource::Agent,
                         status: CommandExecutionStatus::InProgress,
                         command_actions: completion_item.command_actions.clone(),
@@ -3765,10 +3773,16 @@ mod tests {
             ThreadId::new(),
         );
 
+        let mut completion_event = turn_complete_event(&event_turn_id);
+        completion_event.surfaced_result = Some(codex_protocol::protocol::SurfacedToolResult {
+            adapter: "success-adapter".to_string(),
+            value: json!({"result": "success-looking payload"}),
+            canonical_message: Some("success-looking canonical message".to_string()),
+        });
         handle_turn_complete(
             conversation_id,
             event_turn_id.clone(),
-            turn_complete_event(&event_turn_id),
+            completion_event,
             &outgoing,
             &thread_state,
         )
@@ -3789,6 +3803,8 @@ mod tests {
                 );
                 assert_eq!(n.turn.completed_at, Some(TEST_TURN_COMPLETED_AT));
                 assert_eq!(n.turn.duration_ms, Some(TEST_TURN_DURATION_MS));
+                assert_eq!(n.turn.surfaced_result, None);
+                assert_eq!(n.surfaced_result, None);
             }
             other => bail!("unexpected message: {other:?}"),
         }

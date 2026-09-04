@@ -1,0 +1,68 @@
+{
+  "advisories": [],
+  "assignment_id": "worker:mcp-error-surface-remediation-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+  },
+  "contract_claims": [
+    "mcp-failed-turn-no-success-publication",
+    "mcp-terminal-request-cleanup",
+    "app-server-failed-turn-no-surfaced-result",
+    "app-server-history-failed-turn-no-surfaced-result"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-03T06:11:44.757360+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "ddd332e1cf48ab56994d97ec54a28b21f7988e5608525579047f6390152575ec",
+  "path_claims": [
+    {
+      "path": "codex-rs/mcp-server/src/codex_tool_runner.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/mcp-server/src/message_processor.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/mcp-server/tests/suite/codex_tool.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/mcp-server/tests/common/mcp_process.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/app-server/src/bespoke_event_handling.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/app-server-protocol/src/protocol/thread_history.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/turn_start.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T05:11:44.757360+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "fe3c23ed3bd090e6eacb91d70235442f42172e2767245c4466f5b360bfdf3aab"
+  },
+  "validation_commands": [
+    "just test-fast -p codex-mcp-server --lib -E 'test(codex_tool_runner::tests)'",
+    "just test-fast -p codex-mcp-server --lib -E 'test(=message_processor::tests::cancelled_notification_unregisters_request_when_thread_lookup_fails)'",
+    "just test-fast -p codex-mcp-server --test all -E 'test(=suite::codex_tool::blocked_completion_proof_reaches_mcp_as_error_without_launching_runner)'",
+    "just test-fast -p codex-app-server --lib -E 'test(=bespoke_event_handling::tests::test_handle_turn_complete_emits_failed_with_error)'",
+    "just test-fast -p codex-app-server --test all -E 'test(=suite::v2::turn_start::blocked_completion_proof_reaches_app_server_as_failed_turn_without_launching_runner)'"
+  ],
+  "validation_owner": "worker:mcp-error-surface-remediation-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

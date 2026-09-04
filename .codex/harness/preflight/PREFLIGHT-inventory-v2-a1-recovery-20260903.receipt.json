@@ -1,0 +1,133 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/validation/frozen-test-inventory-v2-recoveries.schema.json",
+          ".codex"
+        ],
+        [
+          ".codex/validation/frozen-test-inventory-v2.schema.json",
+          ".codex"
+        ],
+        [
+          ".codex/validation/inventory-shared-types-v1.schema.json",
+          ".codex"
+        ],
+        [
+          ".codex/validation/selection-request-v1.schema.json",
+          ".codex"
+        ],
+        [
+          ".codex/validation/test-replacements-v2.schema.json",
+          ".codex"
+        ],
+        [
+          "codex-rs/validation-contracts",
+          "codex-rs"
+        ],
+        [
+          "scripts/completion_proof_inventory_v2.py",
+          "scripts"
+        ],
+        [
+          "scripts/fixtures/completion_proof_v2_cross_language_vectors.json",
+          "scripts"
+        ],
+        [
+          "scripts/test_completion_proof_inventory_v2.py",
+          "scripts"
+        ],
+        [
+          "codex-rs/Cargo.toml",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/Cargo.lock",
+          "codex-rs"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:inventory-v2-a1-recovery-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-inventory-v2-a1"
+  },
+  "contract_claims": [
+    "dormant-frozen-test-inventory-v2-a1-contracts",
+    "validation-receipt-pre-result-partial-pass-discard-semantics",
+    "strict-selection-v1-nonzero-selection-and-exact-set",
+    "python-rust-cross-language-contract-conformance"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-03T22:14:13.550529+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "e8ca2338dd3b6d5c350db75873bdbcf5f84f386320db81e8a4ea24da28941691",
+  "path_claims": [
+    {
+      "path": ".codex/validation/frozen-test-inventory-v2-recoveries.schema.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/validation/frozen-test-inventory-v2.schema.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/validation/inventory-shared-types-v1.schema.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/validation/selection-request-v1.schema.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/validation/test-replacements-v2.schema.json",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts",
+      "recursive": true
+    },
+    {
+      "path": "scripts/completion_proof_inventory_v2.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/fixtures/completion_proof_v2_cross_language_vectors.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_completion_proof_inventory_v2.py",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/Cargo.toml",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/Cargo.lock",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T21:14:13.550529+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "6466237a219c75089d40949b168b0245f6630f950933cd5998d1259fff8a1a06"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof_inventory_v2",
+    "$env:CARGO_TARGET_DIR='C:/Users/kuh/Desktop/kd4/codex-rs/target-inventory-v2-a1'; cargo test --manifest-path codex-rs/Cargo.toml -p codex-validation-contracts"
+  ],
+  "validation_owner": "worker:inventory-v2-a1-recovery-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

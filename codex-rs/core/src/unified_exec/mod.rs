@@ -144,6 +144,12 @@ pub(crate) struct ExecCommandRequest {
     pub prefix_rule: Option<Vec<String>>,
     pub validation_launch: Option<crate::validation_admission::ValidationLaunchPlan>,
     pub known_delta: Option<PreparedKnownDelta>,
+    pub workspace_operation: Option<crate::workspace_operation_gate::WorkspaceOperationLease>,
+    pub completion_proof: Option<crate::completion_proof::UnifiedExecCompletionProof>,
+    pub canonical_proof_repository_root: Option<PathBuf>,
+    pub canonical_proof_report_write_root: Option<PathBuf>,
+    pub prepared_canonical_windows_sandbox_launch:
+        Option<codex_windows_sandbox::PreparedCanonicalWindowsSandboxLaunch>,
 }
 
 /// Retains every process created by sandbox retries until startup is either
@@ -277,6 +283,7 @@ struct ProcessEntry {
     hook_command: String,
     tty: bool,
     network_approval: Option<DeferredNetworkApproval>,
+    completion_proof: Option<crate::completion_proof::UnifiedExecCompletionProof>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
 }

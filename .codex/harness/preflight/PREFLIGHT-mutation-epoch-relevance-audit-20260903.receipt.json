@@ -1,0 +1,59 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts/completion_proof.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_completion_proof.py",
+          "scripts"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:mutation-epoch-relevance-audit-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-mutation-epoch-relevance-audit"
+  },
+  "contract_claims": [
+    "trusted-runner-validation-mutation-epoch-poisoning",
+    "trusted-runner-relevant-corrective-mutation-eligibility",
+    "trusted-runner-pre-result-error-neutrality"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-03T14:32:10.409495+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "5a5370eed10f29face76150b6f0e85ad4fec6a6e34224318015a750fca801f72",
+  "path_claims": [
+    {
+      "path": "scripts/completion_proof.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_completion_proof.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T13:32:10.409495+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "fdcab3d026c2106364065b7279bc570061b1d423ebc3c35a652a8d1ed84d8505"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_focused_cli_reports_declared_validation_failure scripts.test_completion_proof.CompletionProofCliTest.test_executed_failure_is_confirmed_and_reported_through_canonical_cli scripts.test_completion_proof.CompletionProofCliTest.test_untrusted_nonzero_exit_is_a_pre_result_error scripts.test_completion_proof.CompletionProofCliTest.test_later_infrastructure_error_retains_confirmed_failure scripts.test_completion_proof.CompletionProofCliTest.test_focused_rust_gate_preserves_failure_before_later_infrastructure_error scripts.test_completion_proof.CompletionProofCliTest.test_killed_canonical_runner_releases_lock_for_unchanged_retry"
+  ],
+  "validation_owner": "worker:mutation-epoch-relevance-audit-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

@@ -1,0 +1,69 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/windows-sandbox-rs/src/process.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/windows-sandbox-rs/src/lib.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/windows-sandbox-rs/src/setup.rs",
+          "codex-rs"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:windows-process-coordinator-sandbox-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-windows-process-coordinator-sandbox"
+  },
+  "contract_claims": [
+    "windows-sandbox-explicit-handle-inheritance",
+    "windows-sandbox-exact-handle-restoration",
+    "windows-sandbox-coordinator-compromise"
+  ],
+  "dependencies": [
+    "worker:windows-process-coordinator-pty-20260903"
+  ],
+  "expires_at": "2026-09-03T14:07:14.820838+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "51032821aabade66067b1ca394c77be0e3fbcd23e9ac159c0c01901b2abb0a98",
+  "path_claims": [
+    {
+      "path": "codex-rs/windows-sandbox-rs/src/process.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/windows-sandbox-rs/src/lib.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/windows-sandbox-rs/src/setup.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T13:07:14.820838+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "521a964180a45afb9fddc70393fc14c24ba54add8d8c6f495169caf9f37b204a"
+  },
+  "validation_commands": [
+    "cargo test -p codex-windows-sandbox --target x86_64-pc-windows-msvc"
+  ],
+  "validation_owner": "worker:windows-process-coordinator-sandbox-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

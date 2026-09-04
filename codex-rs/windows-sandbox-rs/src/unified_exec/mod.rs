@@ -68,6 +68,8 @@ pub async fn spawn_windows_sandbox_session_for_level(
             request.tty,
             request.stdin_open,
             request.use_private_desktop,
+            None,
+            None,
         )
         .await
     } else {
@@ -122,6 +124,53 @@ pub async fn spawn_windows_sandbox_session_legacy(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn spawn_windows_sandbox_session_elevated_with_prepared_canonical_launch(
+    permission_profile: &PermissionProfile,
+    workspace_roots: &[AbsolutePathBuf],
+    codex_home: &Path,
+    command: Vec<String>,
+    cwd: &Path,
+    env_map: HashMap<String, String>,
+    proxy_enforced: bool,
+    timeout_ms: Option<u64>,
+    read_roots_override: Option<&[PathBuf]>,
+    additional_read_roots: &[AbsolutePathBuf],
+    read_roots_include_platform_defaults: bool,
+    write_roots_override: Option<&[PathBuf]>,
+    deny_read_paths_override: &[AbsolutePathBuf],
+    deny_write_paths_override: &[AbsolutePathBuf],
+    tty: bool,
+    stdin_open: bool,
+    use_private_desktop: bool,
+    prepared_launch: crate::PreparedCanonicalWindowsSandboxLaunch,
+    canonical_launch_identity: &str,
+) -> Result<SpawnedProcess> {
+    backends::elevated::spawn_windows_sandbox_session_elevated_for_permission_profile(
+        permission_profile,
+        workspace_roots,
+        codex_home,
+        command,
+        cwd,
+        env_map,
+        proxy_enforced,
+        crate::WindowsSandboxProxySettingsMode::Reconcile,
+        timeout_ms,
+        read_roots_override,
+        additional_read_roots,
+        read_roots_include_platform_defaults,
+        write_roots_override,
+        deny_read_paths_override,
+        deny_write_paths_override,
+        tty,
+        stdin_open,
+        use_private_desktop,
+        Some(prepared_launch),
+        Some(canonical_launch_identity),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_windows_sandbox_session_elevated_for_permission_profile(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
@@ -160,6 +209,8 @@ pub async fn spawn_windows_sandbox_session_elevated_for_permission_profile(
         tty,
         stdin_open,
         use_private_desktop,
+        None,
+        None,
     )
     .await
 }

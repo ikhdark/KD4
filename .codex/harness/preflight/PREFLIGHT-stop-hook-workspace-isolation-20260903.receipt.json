@@ -1,0 +1,60 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:test-store-feature-impl-20260903",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/core/src/session/turn_tests.rs",
+          "codex-rs"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    }
+  ],
+  "assignment_id": "root:stop-hook-workspace-isolation-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+  },
+  "contract_claims": [
+    "stop-hook-test-workspace-isolation"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-03T22:12:16.601293+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "0cce64a01af7a639a53d2f6e44b01f25d247486c469e813c2df63b0a86142c8d",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/src/session/turn_tests.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T21:12:16.601293+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "5dfd7123cc85374cf4a0a65eaeddc784c78ae0e6d1ad3db56a475e5bd7dc5bd8"
+  },
+  "validation_commands": [
+    "just core-test-fast core_lib -E 'test(=session::turn::tests::stop_hook_continuation_reaches_the_final_response) | test(=session::turn::tests::direct_runtime_stop_hook_continuation_reaches_the_final_response)'",
+    "git diff --check -- codex-rs/core/src/session/turn_tests.rs"
+  ],
+  "validation_owner": "root:stop-hook-workspace-isolation-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

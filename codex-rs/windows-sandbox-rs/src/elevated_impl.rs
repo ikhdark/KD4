@@ -23,6 +23,9 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub deny_write_paths_override: &'a [AbsolutePathBuf],
     pub output_sink: Option<crate::CaptureOutputSink>,
     pub retained_bytes_cap: Option<usize>,
+    pub prepared_canonical_windows_sandbox_launch:
+        Option<crate::PreparedCanonicalWindowsSandboxLaunch>,
+    pub canonical_launch_identity: Option<&'a str>,
 }
 
 mod windows_impl {
@@ -33,8 +36,8 @@ mod windows_impl {
     use crate::env::ensure_non_interactive_pager;
     use crate::env::inherit_path_env;
     use crate::env::normalize_null_device_env;
+    use crate::identity::acquire_logon_sandbox_creds_for_launch;
     use crate::identity::refresh_logon_sandbox_creds;
-    use crate::identity::require_logon_sandbox_creds_with_additional_read_roots;
     use crate::ipc_framed::EmptyPayload;
     use crate::ipc_framed::FramedMessage;
     use crate::ipc_framed::Message;
@@ -47,8 +50,8 @@ mod windows_impl {
     use crate::logging::log_start;
     use crate::logging::log_success;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
-    use crate::runner_client::retry_runner_spawn_once;
     use crate::runner_client::spawn_runner_transport;
+    use crate::runner_client::spawn_runner_with_optional_credential_refresh;
     use crate::sandbox_utils::ensure_codex_home_exists;
     use crate::sandbox_utils::inject_git_safe_directory;
     use crate::setup::effective_write_roots_for_permissions;
@@ -122,6 +125,8 @@ mod windows_impl {
             deny_write_paths_override,
             output_sink,
             retained_bytes_cap,
+            prepared_canonical_windows_sandbox_launch,
+            canonical_launch_identity,
         } = request;
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
@@ -150,7 +155,9 @@ mod windows_impl {
 
         let logs_base_dir: Option<&Path> = Some(sandbox_base.as_path());
         log_start(&command, logs_base_dir);
-        let sandbox_creds = require_logon_sandbox_creds_with_additional_read_roots(
+        let acquired_creds = acquire_logon_sandbox_creds_for_launch(
+            prepared_canonical_windows_sandbox_launch,
+            canonical_launch_identity,
             &permissions,
             cwd,
             &env_map,
@@ -164,6 +171,8 @@ mod windows_impl {
             proxy_enforced,
             crate::WindowsSandboxProxySettingsMode::Reconcile,
         )?;
+        let sandbox_creds = acquired_creds.credentials;
+        let used_prepared_launch = acquired_creds.used_prepared_launch;
         // Build capability SID for ACL grants.
         let caps = load_or_create_cap_sids(codex_home)?;
         let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(cwd, &env_map);
@@ -208,9 +217,10 @@ mod windows_impl {
                 stdin_open: false,
                 use_private_desktop,
             };
-            let transport = retry_runner_spawn_once(
+            let transport = spawn_runner_with_optional_credential_refresh(
                 sandbox_creds,
                 &spawn_request.command,
+                !used_prepared_launch,
                 |sandbox_creds| {
                     spawn_runner_transport(
                         codex_home,

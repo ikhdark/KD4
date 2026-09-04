@@ -161,12 +161,15 @@ fn run_git_command_with_timeout(
     context: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run {context}: {err}"))?;
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn());
+    #[cfg(not(windows))]
+    let child = command.spawn();
+    let mut child = child.map_err(|err| format!("failed to run {context}: {err}"))?;
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {

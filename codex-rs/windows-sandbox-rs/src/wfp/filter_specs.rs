@@ -13,6 +13,8 @@ pub(super) enum ConditionSpec {
     NotLoopback,
     Protocol(u8),
     RemotePort(u16),
+    RemoteIpv4Network { address: u32, mask: u32 },
+    RemoteIpv6Network { address: [u8; 16], prefix_len: u8 },
 }
 
 #[derive(Clone, Copy)]

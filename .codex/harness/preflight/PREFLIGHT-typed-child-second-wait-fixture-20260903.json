@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:typed-child-second-wait-fixture-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/src/agent/role.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/tests/suite/subagent_notifications.rs",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "typed-child-durable-receipt-fixture-sequencing",
+    "typed-child-role-runtime-provider-preservation"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "python scripts/rust_test_runner.py --target-dir C:/Users/kuh/Desktop/kd4/codex-rs/target/typed-child-finalizer run-target --profile fast core_lib -- -E 'test(=agent::role::provider_preservation_tests::apply_explorer_role_preserves_live_model_provider)'",
+    "python scripts/rust_test_runner.py --target-dir C:/Users/kuh/Desktop/kd4/codex-rs/target/typed-child-finalizer run-target --profile fast core_agents_review -- -E 'test(suite::subagent_notifications::typed_v2_child_publishes_output_after_receipt_delivery) or test(suite::subagent_notifications::typed_v2_child_discards_output_when_receipt_delivery_fails)'"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target/typed-child-finalizer",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

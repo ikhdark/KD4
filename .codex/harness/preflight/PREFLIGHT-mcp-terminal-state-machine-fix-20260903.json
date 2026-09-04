@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:mcp-terminal-state-machine-fix-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "codex-rs/mcp-server/src/codex_tool_runner.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/mcp-server/tests/suite/codex_tool.rs",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "mcp-pending-status-error-dominates-successful-turn-complete",
+    "mcp-terminal-fallback-bounds-event-processing"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:mcp-terminal-state-machine-fix-20260903",
+  "validation_commands": [
+    "cargo test -p codex-mcp-server --lib codex_tool_runner::tests::pending_status_error_prevents_later_successful_turn_complete -- --exact --nocapture",
+    "cargo test -p codex-mcp-server --lib codex_tool_runner::tests::fallback_deadline_bounds_slow_event_handling -- --exact --nocapture",
+    "cargo test -p codex-mcp-server --lib codex_tool_runner::tests::fallback_response_does_not_hang_when_outgoing_queue_is_full -- --exact --nocapture",
+    "cargo test -p codex-mcp-server --lib codex_tool_runner::tests::runtime_loop_missing_turn_complete_returns_bounded_mcp_error -- --exact --nocapture",
+    "cargo test -p codex-mcp-server --lib codex_tool_runner::tests::turn_complete_error_event_path_returns_mcp_error_and_hides_success_payload -- --exact --nocapture"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target/mcp-terminal-state-machine-fix",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

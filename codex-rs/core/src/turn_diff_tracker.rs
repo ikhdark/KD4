@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::time::Duration;
@@ -551,13 +552,17 @@ impl TurnDiffTracker {
             .display_roots_by_environment
             .get(&path.environment_id)?;
         let relative_path = filesystem_path.strip_prefix(root).ok()?;
-        let output = ProcessCommand::new("git")
+        let mut command = ProcessCommand::new("git");
+        command
             .arg("-C")
             .arg(root)
             .args(["ls-files", "--stage", "--"])
             .arg(relative_path)
-            .output()
-            .ok()?;
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn()).ok()?;
+        let output = child.wait_with_output().ok()?;
         if !output.status.success() {
             return None;
         }

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:maintenance-owner-relations-fix-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+  "path_claims": [
+    { "path": "source_owners.toml", "recursive": false },
+    { "path": "scripts/test_source_owners.py", "recursive": false }
+  ],
+  "contract_claims": [
+    "stage1-maintenance-owner-closure",
+    "generated-config-contract-owner-closure",
+    "exec-server-relay-contract-owner-closure"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:maintenance-owner-relations-fix-20260903",
+  "validation_commands": [
+    "python -m unittest scripts.test_source_owners.SourceOwnersCliTest.test_repository_slices_retain_representative_relationships_through_cli"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target-maintenance-owner-relations-20260903",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

@@ -10,6 +10,7 @@ use crate::agent::AgentControl;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::attestation::AttestationProvider;
 use crate::client::ModelClient;
+use crate::completion_proof::CompletionProofLedger;
 use crate::config::NetworkProxyAuditMetadata;
 use crate::config::StartedNetworkProxy;
 use crate::current_time::TimeProvider;
@@ -65,6 +66,7 @@ pub(crate) struct SessionServices {
     pub(crate) mcp_startup_cancellation_token: Mutex<CancellationToken>,
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
     pub(crate) command_execution: CommandExecutionLedger,
+    pub(crate) completion_proof: CompletionProofLedger,
     pub(crate) plan_store: PlanStore,
     pub(crate) elicitations: ElicitationService,
     pub(crate) analytics_events_client: AnalyticsEventsClient,

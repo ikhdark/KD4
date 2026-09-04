@@ -847,8 +847,17 @@ async fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
         .args(["-c", "core.hooksPath=NUL", "-c", "core.fsmonitor=false"])
         .args(args)
         .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = timeout(GIT_TIMEOUT, command.output()).await.ok()?.ok()?;
+    let output = timeout(GIT_TIMEOUT, async {
+        let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn())?;
+        child.wait_with_output().await
+    })
+    .await
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -880,7 +889,7 @@ async fn git_resolve_blob(cwd: &Path, spec: &str) -> Option<String> {
         .stderr(Stdio::null())
         .kill_on_drop(true);
 
-    let mut child = command.spawn().ok()?;
+    let mut child = codex_utils_pty::with_windows_child_creation(|_| command.spawn()).ok()?;
     let mut stdin = child.stdin.take()?;
     let query = format!("{spec}\n");
     let output = timeout(GIT_TIMEOUT, async move {

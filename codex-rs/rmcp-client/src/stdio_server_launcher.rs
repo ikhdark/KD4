@@ -37,6 +37,7 @@ use codex_utils_pty::ManagedRootProcess;
 use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
 use codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT;
 use codex_utils_pty::run_windows_process_operation;
+use codex_utils_pty::with_windows_child_creation;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -254,9 +255,11 @@ impl LocalStdioServerLauncher {
 
         let (transport, stderr) =
             run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
-                TokioChildProcess::builder(command)
-                    .stderr(Stdio::piped())
-                    .spawn()
+                with_windows_child_creation(|_| {
+                    TokioChildProcess::builder(command)
+                        .stderr(Stdio::piped())
+                        .spawn()
+                })
             })
             .await?;
         let process_id = transport

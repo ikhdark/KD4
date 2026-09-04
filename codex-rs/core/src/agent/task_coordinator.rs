@@ -219,6 +219,50 @@ impl AgentTaskCoordinator {
         true
     }
 
+    /// Hydrate every durable task in the root lineage and prove that no assignment, validation,
+    /// or gate can still change the aggregate outcome. This reads existing durable state only;
+    /// it never launches validation.
+    pub(crate) async fn prepare_root_terminal_completion(
+        &self,
+        session_telemetry: &SessionTelemetry,
+    ) -> StoreResult<()> {
+        let Some(store) = self.store() else {
+            if self.has_bindings() {
+                return Err(StoreError::CorruptData(
+                    "typed task bindings exist without a durable task store".to_string(),
+                ));
+            }
+            return Ok(());
+        };
+        let root_session_id = self.root_session_id().ok_or_else(|| {
+            StoreError::CorruptData(
+                "durable typed task store is missing its private root lineage".to_string(),
+            )
+        })?;
+        let bindings = store
+            .list_agent_task_bindings(root_session_id.clone(), /*limit*/ None)
+            .await?;
+        for binding in bindings {
+            let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
+            if task.receipt.is_some() {
+                self.record_root_receipt_hydration_once(
+                    task.current_attempt.attempt_id,
+                    session_telemetry,
+                );
+            }
+        }
+        let quiescence = store.check_quiescence(root_session_id).await?;
+        if !quiescence.quiescent {
+            return Err(StoreError::CorruptData(format!(
+                "typed task tree is not quiescent: {} active assignments, {} running validations, {} pending gates",
+                quiescence.active_assignment_ids.len(),
+                quiescence.running_validation_call_ids.len(),
+                quiescence.pending_gate_assignment_ids.len(),
+            )));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) async fn create_assignment(
         &self,
@@ -380,15 +424,12 @@ impl AgentTaskCoordinator {
         Ok(binding)
     }
 
-    pub(crate) fn record_task_usage_for_source(
+    pub(crate) fn record_task_usage_for_binding(
         &self,
-        session_source: &SessionSource,
+        binding: &AgentTaskBinding,
         tokens: u64,
         calls: u64,
     ) -> bool {
-        let Some(binding) = self.binding_for_source(session_source) else {
-            return false;
-        };
         let mut metrics = self
             .metrics
             .lock()
@@ -458,12 +499,9 @@ impl AgentTaskCoordinator {
 
     pub(crate) async fn seal_missing_receipt(
         &self,
-        agent_path: &AgentPath,
+        binding: &AgentTaskBinding,
         summary: String,
     ) -> StoreResult<Option<AgentReceipt>> {
-        let Some(binding) = self.binding_for_agent_path(agent_path) else {
-            return Ok(None);
-        };
         let store = self.required_store()?;
         let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
         if task.current_attempt.attempt_id != binding.attempt_id
@@ -476,11 +514,7 @@ impl AgentTaskCoordinator {
             if binding_no_longer_needs_receipt(store.as_ref(), &binding).await? {
                 return Ok(None);
             }
-            tracing::warn!(
-                %error,
-                attempt_id = %binding.attempt_id,
-                "typed mutation evidence finalization was unavailable; sealing the missing receipt anyway"
-            );
+            return Err(error);
         }
         let receipt = ReceiptDraft {
             status: AgentStatusClaim::NeedsMain,
@@ -521,6 +555,22 @@ impl AgentTaskCoordinator {
                 }
             }
         }
+    }
+
+    pub(crate) async fn record_typed_child_terminal_delivery(
+        &self,
+        binding: &AgentTaskBinding,
+        delivered: bool,
+        summary: String,
+    ) -> StoreResult<bool> {
+        let store = self.required_store()?;
+        let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
+        if task.current_attempt.attempt_id != binding.attempt_id {
+            return Err(StoreError::AttemptNotActive(binding.attempt_id));
+        }
+        store
+            .record_typed_child_terminal_delivery(binding.attempt_id, delivered, summary)
+            .await
     }
 
     fn required_store(&self) -> StoreResult<Arc<LocalAgentTaskStore>> {

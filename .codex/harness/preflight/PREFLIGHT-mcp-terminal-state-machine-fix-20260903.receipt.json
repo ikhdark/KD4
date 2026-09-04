@@ -1,0 +1,62 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/mcp-server/src/codex_tool_runner.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/mcp-server/tests/suite/codex_tool.rs",
+          "codex-rs"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:mcp-terminal-state-machine-fix-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\mcp-terminal-state-machine-fix"
+  },
+  "contract_claims": [
+    "mcp-pending-status-error-dominates-successful-turn-complete",
+    "mcp-terminal-fallback-bounds-event-processing"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-03T21:36:31.297055+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "269fc14f06844c07f45f4895a8fd80aff4df7316185c93d000c5ee1a1a5ea61e",
+  "path_claims": [
+    {
+      "path": "codex-rs/mcp-server/src/codex_tool_runner.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/mcp-server/tests/suite/codex_tool.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T20:36:31.297055+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "4544c919a93ec9cb09d71cabb9429ccd1f5fc76cb33124bb58fa092d670c7bd1"
+  },
+  "validation_commands": [
+    "cargo test -p codex-mcp-server --lib codex_tool_runner::tests::pending_status_error_prevents_later_successful_turn_complete -- --exact --nocapture",
+    "cargo test -p codex-mcp-server --lib codex_tool_runner::tests::fallback_deadline_bounds_slow_event_handling -- --exact --nocapture",
+    "cargo test -p codex-mcp-server --lib codex_tool_runner::tests::fallback_response_does_not_hang_when_outgoing_queue_is_full -- --exact --nocapture",
+    "cargo test -p codex-mcp-server --lib codex_tool_runner::tests::runtime_loop_missing_turn_complete_returns_bounded_mcp_error -- --exact --nocapture",
+    "cargo test -p codex-mcp-server --lib codex_tool_runner::tests::turn_complete_error_event_path_returns_mcp_error_and_hides_success_payload -- --exact --nocapture"
+  ],
+  "validation_owner": "worker:mcp-terminal-state-machine-fix-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

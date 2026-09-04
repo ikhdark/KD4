@@ -910,6 +910,7 @@ impl Session {
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         external_time_provider: Option<Arc<dyn TimeProvider>>,
         multi_agent_version: Option<MultiAgentVersion>,
+        completion_proof_authority: crate::completion_proof::CompletionProofSessionAuthority,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
             "Configuring session: model={}; provider={:?}",
@@ -940,6 +941,19 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => resumed_history.conversation_id,
         };
+        // Session metadata is serialized input, so it never grants completion authority here.
+        // The manager-issued non-Serde capability either retains an already live root lineage or
+        // binds a fresh one. Contributors inherit only their private AgentControl task lineage.
+        let fallback_completion_proof_lineage_id = if completion_proof_authority.is_terminal_owner()
+            || agent_control.task_lineage_id().is_empty()
+        {
+            thread_id.to_string()
+        } else {
+            agent_control.task_lineage_id().to_string()
+        };
+        let completion_proof_session_lineage_id = completion_proof_authority
+            .bind_session_lineage_id(fallback_completion_proof_lineage_id)
+            .await;
         let rollback_created_persistence_on_error = !config.ephemeral
             && matches!(
                 &initial_history,
@@ -967,13 +981,22 @@ impl Session {
                 SessionId::from(thread_id)
             }
         });
+        let terminal_quiescence_root_thread_id =
+            completion_proof_authority.terminal_quiescence_root_thread_id(thread_id);
         let initial_auto_compact_window_ids = AutoCompactWindowIds::new_initial();
-        let agent_control = agent_control.with_session_id(
+        let agent_control = agent_control.with_session_and_task_lineage(
             session_id,
+            completion_proof_session_lineage_id.clone(),
             config
                 .effective_agent_max_threads(MultiAgentVersion::V2)
                 .unwrap_or(usize::MAX),
         );
+        let agent_control = match terminal_quiescence_root_thread_id {
+            Some(root_thread_id) => {
+                agent_control.with_terminal_quiescence_root_thread_id(root_thread_id)
+            }
+            None => agent_control,
+        };
         let time_provider = crate::current_time::resolve_time_provider(
             config.current_time_reminder.as_ref(),
             external_time_provider,
@@ -1167,7 +1190,10 @@ impl Session {
             {
                 agent_control
                     .task_coordinator()
-                    .initialize(Arc::clone(state_runtime), session_id.to_string())
+                    .initialize(
+                        Arc::clone(state_runtime),
+                        agent_control.task_lineage_id().to_string(),
+                    )
                     .await
                     .map_err(|error| {
                         anyhow::anyhow!("failed to initialize typed agent task store: {error}")
@@ -1178,6 +1204,15 @@ impl Session {
             } else {
                 None
             };
+            if let Some(rollout_path) = rollout_path.as_deref() {
+                completion_proof_authority
+                    .register_root_rollout(
+                        rollout_path,
+                        completion_proof_session_lineage_id.as_str(),
+                        terminal_quiescence_root_thread_id.unwrap_or(thread_id),
+                    )
+                    .await;
+            }
             let trace_agent_path = session_configuration
                 .session_source
                 .get_agent_path()
@@ -1332,6 +1367,9 @@ impl Session {
             // sessions still wait for their selected executor, while deferred sessions
             // retain a `starting` entry and finish initializing without blocking on it.
             let resolved_environments = turn_environments.snapshot().await;
+            // General session workspace discovery remains session-local. Completion-proof
+            // observation has a separate manager-private cache carried by its explicit
+            // authority, so an exec watcher cannot contend with or repurpose proof state.
             let git_workspace = GitWorkspaceCache::new();
             let initial_git_workspace = git_workspace
                 .snapshot_with_project_discovery(
@@ -1532,6 +1570,14 @@ impl Session {
                     session_configuration.cwd().as_path(),
                 )
                 .await;
+            let completion_proof =
+                crate::completion_proof::CompletionProofLedger::load_or_new_for_session(
+                    config.codex_home.to_path_buf(),
+                    session_configuration.cwd().as_path(),
+                    completion_proof_authority.clone(),
+                    completion_proof_session_lineage_id,
+                )
+                .await;
             let services = SessionServices {
                 // Initialize the MCP connection manager with an uninitialized
                 // instance. It will be replaced with one created via
@@ -1546,6 +1592,7 @@ impl Session {
                 mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
                 unified_exec_manager,
                 command_execution,
+                completion_proof,
                 plan_store: crate::plan_store::PlanStore::default(),
                 elicitations: crate::elicitation::ElicitationService::new(),
                 analytics_events_client,

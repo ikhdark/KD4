@@ -1,0 +1,41 @@
+{
+  "advisories": [],
+  "assignment_id": "worker:docs-policy-runtime-fix-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-docs-policy-runtime-fix"
+  },
+  "contract_claims": [
+    "completion-proof-nested-standard-document-classification"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-03T06:16:14.745469+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "c4c770ac84ebd11e608fa30c912a38c2f9648dbe077465444d382d6705b5120b",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/src/completion_proof.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/tests/suite/completion_proof_gate.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T05:16:14.745469+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "4b3fff8f2f717a45dd4ae382ef3d1b307a26f5f8b03ddfcfca20611047f922fe"
+  },
+  "validation_commands": [
+    "python scripts/rust_test_runner.py --target-dir C:/Users/kuh/Desktop/kd4/codex-rs/target-docs-policy-runtime-fix run-target --profile fast --no-fail-fast core_cli_workspace -- -E 'test(=suite::completion_proof_gate::documentation_only_change_uses_exact_configured_validation_through_real_session_path) | test(=suite::completion_proof_gate::isolated_non_documentation_files_require_canonical_proof_through_real_session_path)'"
+  ],
+  "validation_owner": "worker:docs-policy-runtime-fix-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

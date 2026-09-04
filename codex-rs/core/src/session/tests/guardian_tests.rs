@@ -636,6 +636,11 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         codex_thread_store::LocalThreadStoreConfig::from_config(&config),
         /*state_db*/ None,
     ));
+    let completion_proof_authority =
+        crate::completion_proof::CompletionProofSessionAuthority::evidence_contributor(
+            crate::completion_proof::CompletionProofRuntimeRegistry::new(),
+            config.cwd.as_path(),
+        );
 
     let CodexSpawnOk { codex, .. } = Codex::spawn(CodexSpawnArgs {
         config,
@@ -675,9 +680,15 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         attestation_provider: None,
         external_time_provider: None,
         inherited_multi_agent_version: None,
+        completion_proof_authority,
     })
     .await
     .expect("spawn guardian subagent");
+
+    assert!(
+        !codex.session.services.completion_proof.is_terminal_owner(),
+        "a guardian admitted through the private delegate path must remain an evidence contributor"
+    );
 
     assert_eq!(
         codex

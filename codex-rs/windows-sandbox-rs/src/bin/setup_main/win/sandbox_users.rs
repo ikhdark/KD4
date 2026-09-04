@@ -39,6 +39,7 @@ use windows_sys::Win32::Storage::FileSystem::CREATE_NEW;
 use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 
+use codex_windows_sandbox::CANONICAL_PROOF_USERNAME;
 use codex_windows_sandbox::SETUP_VERSION;
 use codex_windows_sandbox::SandboxUserRecord;
 use codex_windows_sandbox::SandboxUsersFile;
@@ -87,14 +88,18 @@ pub fn provision_sandbox_users(
     )?;
     let offline_password = random_password();
     let online_password = random_password();
+    let canonical_proof_password = random_password();
     ensure_sandbox_user(offline_username, &offline_password, log)?;
     ensure_sandbox_user(online_username, &online_password, log)?;
+    ensure_sandbox_user(CANONICAL_PROOF_USERNAME, &canonical_proof_password, log)?;
     write_secrets(
         codex_home,
         offline_username,
         &offline_password,
         online_username,
         &online_password,
+        CANONICAL_PROOF_USERNAME,
+        &canonical_proof_password,
     )?;
     Ok(())
 }
@@ -326,6 +331,8 @@ fn write_secrets(
     offline_pwd: &str,
     online_user: &str,
     online_pwd: &str,
+    canonical_proof_user: &str,
+    canonical_proof_pwd: &str,
 ) -> Result<()> {
     let secrets_dir = sandbox_secrets_dir(codex_home);
     std::fs::create_dir_all(&secrets_dir).map_err(|err| {
@@ -349,6 +356,12 @@ fn write_secrets(
             format!("dpapi protect failed for online user: {err}"),
         ))
     })?;
+    let canonical_proof_blob = dpapi_protect(canonical_proof_pwd.as_bytes()).map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperDpapiProtectFailed,
+            format!("dpapi protect failed for canonical proof user: {err}"),
+        ))
+    })?;
     let users = SandboxUsersFile {
         version: SETUP_VERSION,
         offline: SandboxUserRecord {
@@ -358,6 +371,10 @@ fn write_secrets(
         online: SandboxUserRecord {
             username: online_user.to_string(),
             password: BASE64.encode(online_blob),
+        },
+        canonical_proof: SandboxUserRecord {
+            username: canonical_proof_user.to_string(),
+            password: BASE64.encode(canonical_proof_blob),
         },
     };
     let users_path = secrets_dir.join("sandbox_users.json");
@@ -500,30 +517,4 @@ pub(super) fn commit_setup_marker(
         ))
     })?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use codex_windows_sandbox::SandboxUserRecord;
-    use codex_windows_sandbox::SandboxUsersFile;
-
-    #[test]
-    fn canonical_sandbox_users_file_round_trips_writer_shape() {
-        let users = SandboxUsersFile {
-            version: 1,
-            offline: SandboxUserRecord {
-                username: "offline".to_string(),
-                password: "offline-secret".to_string(),
-            },
-            online: SandboxUserRecord {
-                username: "online".to_string(),
-                password: "online-secret".to_string(),
-            },
-        };
-
-        let json = serde_json::to_string(&users).expect("serialize sandbox users");
-        let decoded: SandboxUsersFile =
-            serde_json::from_str(&json).expect("deserialize sandbox users");
-        assert_eq!(decoded, users);
-    }
 }

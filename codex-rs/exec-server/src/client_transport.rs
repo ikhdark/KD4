@@ -6,6 +6,7 @@ use codex_http_client::BuildCustomCaTransportError;
 use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_utils_pty::ManagedRootProcess;
 use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
+use codex_utils_pty::with_windows_child_creation;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
@@ -409,12 +410,13 @@ async fn spawn_stdio_command(
             .await
             .map_err(ExecServerError::Spawn)?,
     );
-    let mut child = stdio_command_process(stdio_command)
+    let mut command = stdio_command_process(stdio_command);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(ExecServerError::Spawn)?;
+        .stderr(Stdio::piped());
+    let mut child =
+        with_windows_child_creation(|_| command.spawn()).map_err(ExecServerError::Spawn)?;
     let Some(process_id) = child.id() else {
         let _ = child.start_kill();
         let _ = child.wait().await;

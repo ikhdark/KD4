@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:replacement-admission-foundation-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": ".codex/validation/replacement-admissions-v1.schema.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/validation/replacement-admissions-v1.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/replacement_admission.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_replacement_admission.py",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "dormant-replacement-admission-authority-v1",
+    "replacement-admission-bipartite-mapping-closure",
+    "replacement-admission-copy-replay-rejection"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:replacement-admission-foundation-20260903",
+  "validation_commands": [
+    "python -m unittest scripts.test_replacement_admission.ReplacementAdmissionCliTests.test_real_cli_accepts_empty_repository_manifest",
+    "python -m unittest scripts.test_replacement_admission.ReplacementAdmissionCliTests.test_real_cli_accepts_one_to_many_and_many_to_one_candidates",
+    "python -m unittest scripts.test_replacement_admission.ReplacementAdmissionCliTests.test_real_cli_rejects_missing_extra_stale_copied_and_replayed_admissions",
+    "python -m unittest scripts.test_replacement_admission"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target-replacement-admission-unused",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

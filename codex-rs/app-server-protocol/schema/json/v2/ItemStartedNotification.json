@@ -780,6 +780,13 @@
                 "null"
               ]
             },
+            "executionId": {
+              "description": "Unique dispatch execution id used by timing and lifecycle records.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "exitCode": {
               "description": "The command's exit code.",
               "format": "int32",
@@ -791,8 +798,29 @@
             "id": {
               "type": "string"
             },
+            "parentCallId": {
+              "description": "Model-visible exec call that owns a nested code-mode command.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "parentCellId": {
+              "description": "Stable code-mode cell that issued the nested command.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "processId": {
               "description": "Identifier for the underlying PTY process (when available).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "runtimeToolCallId": {
+              "description": "Runtime invocation id within the owning code-mode cell.",
               "type": [
                 "string",
                 "null"

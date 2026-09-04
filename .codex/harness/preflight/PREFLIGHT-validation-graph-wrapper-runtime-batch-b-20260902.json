@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:validation-graph-wrapper-runtime-batch-b-20260902",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "justfile",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_stage_npm_packages.py",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "wrapper.codex-cli",
+    "codex-cli-wrapper-check",
+    "codex-cli-javascript-launcher-runtime",
+    "responses-api-proxy-javascript-launcher-runtime"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:validation-graph-wrapper-runtime-batch-b-20260902",
+  "validation_commands": [
+    "python -m unittest scripts.test_stage_npm_packages.StageNpmPackagesTests.test_build_module_derives_platform_metadata_from_canonical_targets scripts.test_stage_npm_packages.StageNpmPackagesTests.test_responses_proxy_staging_is_windows_only",
+    "just codex-cli-wrapper-check",
+    "just completion-focused wrapper.codex-cli"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

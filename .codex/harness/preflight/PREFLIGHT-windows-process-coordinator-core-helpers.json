@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:windows-process-coordinator-core-helpers-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {"path": "codex-rs/core/src/git_workspace.rs", "recursive": false},
+    {"path": "codex-rs/core/src/tools/known_delta_store.rs", "recursive": false},
+    {"path": "codex-rs/core/src/tools/handlers/kda.rs", "recursive": false},
+    {"path": "codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs", "recursive": false},
+    {"path": "codex-rs/core/src/turn_diff_tracker.rs", "recursive": false}
+  ],
+  "contract_claims": ["windows-core-command-helper-coordination"],
+  "dependencies": ["worker:windows-process-coordinator-pty-20260903"],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:windows-process-coordinator-core-helpers-20260903",
+  "validation_commands": ["cargo check -p codex-core --target x86_64-pc-windows-msvc"],
+  "cargo_lane": {"target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target-windows-process-coordinator-core-helpers", "cargo_home": "C:/Users/kuh/.cargo"},
+  "workspace_strategy": "shared"
+}

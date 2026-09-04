@@ -1729,6 +1729,7 @@ version = "0.0.0"
 dependencies = [
  "chrono",
  "codex-state",
+ "codex-utils-pty",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -2489,6 +2490,7 @@ dependencies = [
  "codex-hooks",
  "codex-http-client",
  "codex-image-generation-extension",
+ "codex-keyring-store",
  "codex-login",
  "codex-mcp",
  "codex-memories-read",
@@ -2530,6 +2532,8 @@ dependencies = [
  "eventsource-stream",
  "fs2",
  "futures",
+ "glob",
+ "hmac 0.12.1",
  "http 1.5.0",
  "iana-time-zone",
  "image",
@@ -2601,6 +2605,7 @@ dependencies = [
  "codex-tools",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
+ "codex-utils-pty",
  "dirs",
  "flate2",
  "http 1.5.0",
@@ -2924,6 +2929,7 @@ dependencies = [
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
+ "codex-utils-pty",
  "futures",
  "gix",
  "pretty_assertions",
@@ -3102,6 +3108,7 @@ dependencies = [
  "codex-protocol",
  "codex-secrets",
  "codex-terminal-detection",
+ "codex-utils-pty",
  "codex-utils-template",
  "core_test_support",
  "http 1.5.0",
@@ -3605,6 +3612,7 @@ dependencies = [
  "codex-protocol",
  "codex-state",
  "codex-utils-absolute-path",
+ "codex-utils-pty",
  "futures",
  "pretty_assertions",
  "regex",
@@ -3678,6 +3686,7 @@ dependencies = [
  "base64 0.22.1",
  "codex-protocol",
  "codex-utils-absolute-path",
+ "codex-utils-pty",
  "pretty_assertions",
  "regex",
  "serde",
@@ -3875,6 +3884,7 @@ dependencies = [
  "codex-utils-image",
  "codex-utils-oss",
  "codex-utils-path-uri",
+ "codex-utils-pty",
  "codex-utils-sandbox-summary",
  "codex-utils-string",
  "codex-windows-sandbox",
@@ -4104,6 +4114,23 @@ name = "codex-utils-template"
 version = "0.0.0"
 dependencies = [
  "pretty_assertions",
+]
+
+[[package]]
+name = "codex-validation-contracts"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "hmac 0.12.1",
+ "jsonschema",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "syn 2.0.119",
+ "thiserror 2.0.20",
+ "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]

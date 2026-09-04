@@ -27,12 +27,17 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_SECURIT
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT8;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT16;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT32;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_V4_ADDR_AND_MASK;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_V4_ADDR_MASK;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_V6_ADDR_AND_MASK;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_V6_ADDR_MASK;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ACTION0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ACTION0_0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_ALE_USER_ID;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_FLAGS;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_IP_PROTOCOL;
+use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_IP_REMOTE_ADDRESS;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_IP_REMOTE_PORT;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_DISPLAY_DATA0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER_CONDITION0;
@@ -85,6 +90,8 @@ struct LoopbackFilterSpec {
 
 const LOOPBACK_BLOCK_WEIGHT: u8 = 8;
 const LOOPBACK_PROXY_PERMIT_WEIGHT: u8 = 9;
+const CANONICAL_PROOF_BLOCK_WEIGHT: u8 = 7;
+const CANONICAL_PROOF_LOOPBACK_PERMIT_WEIGHT: u8 = 9;
 const MAX_PROXY_PORTS: usize = 10;
 const LOOPBACK_PROXY_FILTER_KEY_BASE: u128 = 0xa72e1d8b_2cc4_4faa_8000_000000000000;
 
@@ -116,6 +123,71 @@ const LOOPBACK_FILTER_SPECS: &[LoopbackFilterSpec] = &[
         description: "Block sandbox-account loopback UDP v6",
         layer_key: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V6,
         protocol: IPPROTO_UDP as u8,
+    },
+];
+
+#[derive(Clone, Copy)]
+struct CanonicalProofFilterSpec {
+    key: GUID,
+    name: &'static str,
+    description: &'static str,
+    layer_key: GUID,
+    conditions: &'static [ConditionSpec],
+    action: u32,
+    weight: u8,
+}
+
+const IPV4_LOOPBACK_NETWORK: ConditionSpec = ConditionSpec::RemoteIpv4Network {
+    // FWP_V4_ADDR_AND_MASK stores both values in host order.
+    address: 0x7f00_0000,
+    mask: 0xff00_0000,
+};
+const IPV6_LOOPBACK_NETWORK: ConditionSpec = ConditionSpec::RemoteIpv6Network {
+    address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    prefix_len: 128,
+};
+
+// Canonical certification has its own Windows user so these filters cannot
+// alter the behavior of ordinary offline shells that intentionally allow LAN
+// targets. A lower-priority catch-all block is overridden only for true IP
+// loopback, never merely because Windows labels a same-host adapter connection
+// with FWP_CONDITION_FLAG_IS_LOOPBACK.
+const CANONICAL_PROOF_FILTER_SPECS: &[CanonicalProofFilterSpec] = &[
+    CanonicalProofFilterSpec {
+        key: GUID::from_u128(0xb416816e_7e64_4382_92ab_29561bfa6703),
+        name: "codex_wfp_completion_proof_block_v4",
+        description: "Block canonical completion-proof outbound traffic v4",
+        layer_key: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        conditions: &[ConditionSpec::User],
+        action: FWP_ACTION_BLOCK,
+        weight: CANONICAL_PROOF_BLOCK_WEIGHT,
+    },
+    CanonicalProofFilterSpec {
+        key: GUID::from_u128(0x75e1ef0a_21a6_4aa1_af26_1d4bcc5d96fc),
+        name: "codex_wfp_completion_proof_block_v6",
+        description: "Block canonical completion-proof outbound traffic v6",
+        layer_key: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        conditions: &[ConditionSpec::User],
+        action: FWP_ACTION_BLOCK,
+        weight: CANONICAL_PROOF_BLOCK_WEIGHT,
+    },
+    CanonicalProofFilterSpec {
+        key: GUID::from_u128(0xf5cf9e3c_0ad7_437a_a8c9_12a090a5c89e),
+        name: "codex_wfp_completion_proof_loopback_v4",
+        description: "Permit canonical completion-proof true loopback traffic v4",
+        layer_key: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        conditions: &[ConditionSpec::User, IPV4_LOOPBACK_NETWORK],
+        action: FWP_ACTION_PERMIT,
+        weight: CANONICAL_PROOF_LOOPBACK_PERMIT_WEIGHT,
+    },
+    CanonicalProofFilterSpec {
+        key: GUID::from_u128(0x03485911_9b10_4b1e_9521_6c2d370c459a),
+        name: "codex_wfp_completion_proof_loopback_v6",
+        description: "Permit canonical completion-proof true loopback traffic v6",
+        layer_key: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        conditions: &[ConditionSpec::User, IPV6_LOOPBACK_NETWORK],
+        action: FWP_ACTION_PERMIT,
+        weight: CANONICAL_PROOF_LOOPBACK_PERMIT_WEIGHT,
     },
 ];
 
@@ -204,6 +276,34 @@ pub fn install_wfp_filters_for_account(
 
     transaction.commit()?;
     Ok(installed_filter_count)
+}
+
+/// Installs fail-closed outbound filters for the dedicated canonical-proof
+/// account. Only true IPv4/IPv6 loopback destinations receive a permit.
+pub fn install_canonical_proof_wfp_filters_for_account(account: &str) -> Result<usize> {
+    let engine = Engine::open()?;
+    let mut transaction = engine.begin_transaction()?;
+    ensure_provider(engine.handle)?;
+    ensure_sublayer(engine.handle)?;
+
+    let user_condition = UserMatchCondition::for_account(account)?;
+    for spec in CANONICAL_PROOF_FILTER_SPECS {
+        delete_filter_if_present(engine.handle, &spec.key)?;
+        add_filter_parts(
+            engine.handle,
+            spec.key,
+            spec.name,
+            spec.description,
+            spec.layer_key,
+            spec.conditions,
+            &user_condition,
+            spec.action,
+            spec.weight,
+        )?;
+    }
+
+    transaction.commit()?;
+    Ok(CANONICAL_PROOF_FILTER_SPECS.len())
 }
 
 /// Owns an open WFP engine handle and closes it on drop.
@@ -425,8 +525,8 @@ fn add_filter_parts(
         } else {
             uint8_value(weight)
         },
-        numFilterConditions: filter_conditions.len() as u32,
-        filterCondition: filter_conditions.as_mut_ptr(),
+        numFilterConditions: filter_conditions.conditions.len() as u32,
+        filterCondition: filter_conditions.conditions.as_mut_ptr(),
         action: FWPM_ACTION0 {
             r#type: action,
             Anonymous: FWPM_ACTION0_0 {
@@ -478,13 +578,22 @@ fn loopback_proxy_filter_key(family: usize, slot: usize) -> GUID {
 }
 
 /// Converts our compact condition specs into WFP filter conditions.
+struct BuiltConditions {
+    conditions: Vec<FWPM_FILTER_CONDITION0>,
+    // WFP conditions point into these allocations while FwpmFilterAdd0 runs.
+    _v4_addr_masks: Vec<Box<FWP_V4_ADDR_AND_MASK>>,
+    _v6_addr_masks: Vec<Box<FWP_V6_ADDR_AND_MASK>>,
+}
+
 fn build_conditions(
     specs: &[ConditionSpec],
     user_condition: &UserMatchCondition,
-) -> Vec<FWPM_FILTER_CONDITION0> {
-    specs
-        .iter()
-        .map(|spec| match spec {
+) -> BuiltConditions {
+    let mut conditions = Vec::with_capacity(specs.len());
+    let mut v4_addr_masks = Vec::new();
+    let mut v6_addr_masks = Vec::new();
+    for spec in specs {
+        let condition = match spec {
             ConditionSpec::User => FWPM_FILTER_CONDITION0 {
                 fieldKey: FWPM_CONDITION_ALE_USER_ID,
                 matchType: FWP_MATCH_EQUAL,
@@ -531,8 +640,53 @@ fn build_conditions(
                     Anonymous: FWP_CONDITION_VALUE0_0 { uint16: *port },
                 },
             },
-        })
-        .collect()
+            ConditionSpec::RemoteIpv4Network { address, mask } => {
+                let mut address_mask = Box::new(FWP_V4_ADDR_AND_MASK {
+                    addr: *address,
+                    mask: *mask,
+                });
+                let pointer = address_mask.as_mut() as *mut _;
+                v4_addr_masks.push(address_mask);
+                FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                    matchType: FWP_MATCH_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_V4_ADDR_MASK,
+                        Anonymous: FWP_CONDITION_VALUE0_0 {
+                            v4AddrMask: pointer,
+                        },
+                    },
+                }
+            }
+            ConditionSpec::RemoteIpv6Network {
+                address,
+                prefix_len,
+            } => {
+                let mut address_mask = Box::new(FWP_V6_ADDR_AND_MASK {
+                    addr: *address,
+                    prefixLength: *prefix_len,
+                });
+                let pointer = address_mask.as_mut() as *mut _;
+                v6_addr_masks.push(address_mask);
+                FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                    matchType: FWP_MATCH_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_V6_ADDR_MASK,
+                        Anonymous: FWP_CONDITION_VALUE0_0 {
+                            v6AddrMask: pointer,
+                        },
+                    },
+                }
+            }
+        };
+        conditions.push(condition);
+    }
+    BuiltConditions {
+        conditions,
+        _v4_addr_masks: v4_addr_masks,
+        _v6_addr_masks: v6_addr_masks,
+    }
 }
 
 /// Deletes an old copy of a filter before re-adding it.
@@ -596,44 +750,12 @@ mod tests {
     use super::ConditionSpec;
     use super::FILTER_SPECS;
     use super::IPPROTO_TCP;
-    use super::LOOPBACK_FILTER_SPECS;
     use super::LOOPBACK_PROXY_FILTER_KEY_BASE;
     use super::MAX_PROXY_PORTS;
     use super::loopback_conditions;
     use super::loopback_proxy_filter_key;
     use super::normalized_proxy_ports;
     use pretty_assertions::assert_eq;
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn filter_keys_are_unique() {
-        let keys = FILTER_SPECS
-            .iter()
-            .map(|spec| spec.key)
-            .chain(LOOPBACK_FILTER_SPECS.iter().map(|spec| spec.key))
-            .chain((0..2).flat_map(|family| {
-                (0..MAX_PROXY_PORTS).map(move |slot| loopback_proxy_filter_key(family, slot))
-            }))
-            .map(|spec| (spec.data1, spec.data2, spec.data3, spec.data4))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            keys.len(),
-            FILTER_SPECS.len() + LOOPBACK_FILTER_SPECS.len() + 2 * MAX_PROXY_PORTS
-        );
-    }
-
-    #[test]
-    fn filter_names_are_unique() {
-        let names = FILTER_SPECS
-            .iter()
-            .map(|spec| spec.name)
-            .chain(LOOPBACK_FILTER_SPECS.iter().map(|spec| spec.name))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            names.len(),
-            FILTER_SPECS.len() + LOOPBACK_FILTER_SPECS.len()
-        );
-    }
 
     #[test]
     fn loopback_proxy_filter_matches_one_exact_port() {

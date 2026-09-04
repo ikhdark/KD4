@@ -288,6 +288,26 @@ pub(super) async fn user_input_or_turn_inner(
             .turn_metadata_state
             .set_responsesapi_client_metadata(responsesapi_client_metadata);
     }
+    if let Err(error) = sess
+        .observe_current_user_completion_proof_instruction(&items)
+        .await
+    {
+        let message =
+            format!("failed to record the current-user completion-proof instruction: {error}");
+        sess.send_event_raw(Event {
+            id: sub_id,
+            msg: EventMsg::Error(ErrorEvent {
+                message: message.clone(),
+                codex_error_info: Some(CodexErrorInfo::InternalServerError),
+            }),
+        })
+        .await;
+        if let Some((task_start_permit, admission)) = start_only_admission.take() {
+            drop(task_start_permit);
+            let _ = admission.send(Err(CodexErr::Fatal(message)));
+        }
+        return;
+    }
     current_context
         .update_validation_authorization(&items)
         .await;
@@ -339,10 +359,18 @@ pub async fn inter_agent_communication(
     communication: InterAgentCommunication,
 ) {
     let trigger_turn = communication.trigger_turn;
+    let admission_claim =
+        crate::session::claim_typed_child_completion_admission(sess.thread_id, &sub_id);
+    if admission_claim == crate::session::TypedChildCompletionAdmissionClaim::Cancelled {
+        return;
+    }
     let accepted = sess
         .input_queue
         .enqueue_mailbox_communication(communication)
         .await;
+    if admission_claim == crate::session::TypedChildCompletionAdmissionClaim::Active {
+        crate::session::resolve_typed_child_completion_admission(sess.thread_id, &sub_id, accepted);
+    }
     if !accepted {
         return;
     }
@@ -915,6 +943,7 @@ pub(super) async fn submission_loop(
             warn!("failed to shutdown thread persistence after submission channel closed: {err}");
         }
     }
+    crate::session::clear_typed_child_completion_admissions(sess.thread_id);
     debug!("Agent loop exited");
 }
 

@@ -8,6 +8,10 @@ version.workspace = true
 name = "codex_core"
 path = "src/lib.rs"
 
+[features]
+default = []
+completion-proof-test-store = []
+
 [[bin]]
 name = "codex-write-config-schema"
 path = "src/bin/config_schema.rs"
@@ -54,6 +58,7 @@ codex-execpolicy = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-hooks = { workspace = true }
 codex-http-client = { workspace = true }
+codex-keyring-store = { workspace = true }
 codex-network-proxy = { workspace = true }
 codex-otel = { workspace = true }
 codex-plugin = { workspace = true }
@@ -83,6 +88,9 @@ csv = { workspace = true }
 dunce = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
+fs2 = { workspace = true }
+glob = { workspace = true }
+hmac = { workspace = true }
 http = { workspace = true }
 iana-time-zone = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png", "webp"] }
@@ -106,8 +114,10 @@ similar = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
+    "io-util",
     "io-std",
     "macros",
+    "net",
     "process",
     "rt-multi-thread",
     "signal",
@@ -128,7 +138,11 @@ libc = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]

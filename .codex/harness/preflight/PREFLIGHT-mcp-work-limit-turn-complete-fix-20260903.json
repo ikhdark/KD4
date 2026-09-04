@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:mcp-work-limit-turn-complete-fix-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "codex-rs/mcp-server/src/codex_tool_runner.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/mcp-server/tests/suite/codex_tool.rs",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "mcp-work-limit-error-awaits-failed-turn-complete",
+    "mcp-terminal-error-bounded-fallback",
+    "mcp-work-limit-iserror-hides-success-metadata"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:mcp-work-limit-turn-complete-fix-20260903",
+  "validation_commands": [
+    "just test-fast -p codex-mcp-server --lib -E 'test(codex_tool_runner::tests)'",
+    "just test-fast -p codex-mcp-server --test all -E 'test(=suite::codex_tool::logical_generation_limit_reaches_mcp_as_failed_turn_complete)'"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

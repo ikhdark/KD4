@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
 import io
+import json
 import os
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -38,213 +41,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             )
         )
 
-    def test_local_just_shell_sets_sccache_without_probe(self) -> None:
-        just_shell = load_just_shell_module()
-
-        updates = just_shell.rust_tool_env(
-            {"PATH": "ignored"},
-            which=lambda program: f"/tools/{program}" if program == "sccache" else None,
-            repo_root=REPO_ROOT,
-        )
-
-        self.assertEqual(updates["RUSTC_WRAPPER"], "/tools/sccache")
-        self.assertEqual(updates["SCCACHE_BASEDIR"], str(REPO_ROOT))
-        self.assertEqual(updates["SCCACHE_CACHE_SIZE"], "80G")
-
-    def test_local_just_shell_sets_sccache_env_for_existing_sccache_wrapper(
-        self,
-    ) -> None:
-        just_shell = load_just_shell_module()
-
-        updates = just_shell.rust_tool_env(
-            {"RUSTC_WRAPPER": "sccache"},
-            which=lambda program: None,
-            repo_root=REPO_ROOT,
-        )
-
-        self.assertNotIn("RUSTC_WRAPPER", updates)
-        self.assertEqual(updates["SCCACHE_BASEDIR"], str(REPO_ROOT))
-        self.assertEqual(updates["SCCACHE_CACHE_SIZE"], "80G")
-
-    def test_local_just_shell_honors_sccache_cache_size_override(self) -> None:
-        just_shell = load_just_shell_module()
-
-        def which(program: str) -> str | None:
-            return f"/tools/{program}" if program == "sccache" else None
-
-        updates = just_shell.rust_tool_env(
-            {"CODEX_SCCACHE_CACHE_SIZE": "100G"},
-            which=which,
-            repo_root=REPO_ROOT,
-        )
-        self.assertEqual(updates["SCCACHE_CACHE_SIZE"], "100G")
-
-        blank_updates = just_shell.rust_tool_env(
-            {"CODEX_SCCACHE_CACHE_SIZE": "   "},
-            which=which,
-            repo_root=REPO_ROOT,
-        )
-        self.assertEqual(blank_updates["SCCACHE_CACHE_SIZE"], "80G")
-
-    def test_local_just_shell_keeps_existing_rust_wrapper(self) -> None:
-        just_shell = load_just_shell_module()
-
-        updates = just_shell.rust_tool_env(
-            {"RUSTC_WRAPPER": "existing-wrapper"},
-            which=lambda program: f"/tools/{program}" if program == "sccache" else None,
-        )
-
-        self.assertNotIn("RUSTC_WRAPPER", updates)
-        self.assertNotIn("SCCACHE_BASEDIR", updates)
-        self.assertNotIn("SCCACHE_CACHE_SIZE", updates)
-
-    def test_local_just_shell_restarts_stale_sccache_server_cache_size(self) -> None:
-        just_shell = load_just_shell_module()
-        calls = []
-        stats_calls = 0
-
-        def fake_run(command, **_kwargs):
-            nonlocal stats_calls
-            calls.append(command)
-            stdout = ""
-            if command[1:] == ["--show-stats"]:
-                stats_calls += 1
-                size = "10 GiB" if stats_calls == 1 else "80 GiB"
-                stdout = f"Max cache size                       {size}\n"
-            return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
-
-        restarted = just_shell.ensure_sccache_server_env(
-            {
-                "RUSTC_WRAPPER": "/tools/sccache",
-                "SCCACHE_CACHE_SIZE": "80G",
-            },
-            which=lambda program: f"/tools/{program}" if program == "sccache" else None,
-            run=fake_run,
-        )
-
-        self.assertTrue(restarted)
-        self.assertEqual(
-            calls,
-            [
-                ["/tools/sccache", "--show-stats"],
-                ["/tools/sccache", "--stop-server"],
-                ["/tools/sccache", "--start-server"],
-                ["/tools/sccache", "--show-stats"],
-            ],
-        )
-
-    def test_local_just_shell_compares_sccache_sizes_by_bytes(self) -> None:
-        just_shell = load_just_shell_module()
-
-        expected_sizes = {
-            "512M": "512 MiB",
-            "1T": "1 TiB",
-            "80GB": "80 GiB",
-            "80GiB": "80 GiB",
-            "1024G": "1 TiB",
-        }
-        for configured, reported in expected_sizes.items():
-            with self.subTest(configured=configured):
-                calls = []
-
-                def fake_run(command, **_kwargs):
-                    calls.append(command)
-                    return subprocess.CompletedProcess(
-                        command,
-                        0,
-                        stdout=f"Max cache size                       {reported}\n",
-                        stderr="",
-                    )
-
-                restarted = just_shell.ensure_sccache_server_env(
-                    {
-                        "RUSTC_WRAPPER": "/tools/sccache",
-                        "SCCACHE_CACHE_SIZE": configured,
-                    },
-                    which=lambda program: (
-                        f"/tools/{program}" if program == "sccache" else None
-                    ),
-                    run=fake_run,
-                )
-
-                self.assertFalse(restarted)
-                self.assertEqual(calls, [["/tools/sccache", "--show-stats"]])
-
-    def test_local_just_shell_does_not_cache_failed_sccache_restart(self) -> None:
-        just_shell = load_just_shell_module()
-        calls = []
-
-        def fake_run(command, **_kwargs):
-            calls.append(command)
-            if command[1:] == ["--show-stats"]:
-                return subprocess.CompletedProcess(
-                    command,
-                    0,
-                    stdout="Max cache size                       10 GiB\n",
-                    stderr="",
-                )
-            return subprocess.CompletedProcess(
-                command,
-                9 if command[1:] == ["--start-server"] else 0,
-                stdout="",
-                stderr="",
-            )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            restarted = just_shell.ensure_sccache_server_env(
-                {
-                    "RUSTC_WRAPPER": "/tools/sccache",
-                    "SCCACHE_CACHE_SIZE": "80G",
-                },
-                which=lambda program: (
-                    f"/tools/{program}" if program == "sccache" else None
-                ),
-                run=fake_run,
-                cache_dir=Path(tmp),
-            )
-
-        self.assertFalse(restarted)
-        self.assertEqual(calls[-1], ["/tools/sccache", "--start-server"])
-
-    def test_local_just_shell_caches_matching_sccache_server_cache_size(self) -> None:
-        just_shell = load_just_shell_module()
-        calls = []
-
-        def fake_run(command, **_kwargs):
-            calls.append(command)
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                stdout="Max cache size                       80 GiB\n",
-                stderr="",
-            )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            env = {
-                "RUSTC_WRAPPER": "/tools/sccache",
-                "SCCACHE_CACHE_SIZE": "80G",
-            }
-            first = just_shell.ensure_sccache_server_env(
-                env,
-                which=lambda program: (
-                    f"/tools/{program}" if program == "sccache" else None
-                ),
-                run=fake_run,
-                cache_dir=Path(tmp),
-            )
-            second = just_shell.ensure_sccache_server_env(
-                env,
-                which=lambda program: (
-                    f"/tools/{program}" if program == "sccache" else None
-                ),
-                run=fake_run,
-                cache_dir=Path(tmp),
-            )
-
-        self.assertFalse(first)
-        self.assertFalse(second)
-        self.assertEqual(calls, [["/tools/sccache", "--show-stats"]])
-
     def test_ci_does_not_override_rust_wrapper_or_linker(self) -> None:
         just_shell = load_just_shell_module()
 
@@ -255,333 +51,989 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         self.assertEqual(updates, {})
 
-    def test_windows_local_just_shell_uses_lld_link_when_available(self) -> None:
+    def test_just_shell_defaults_python_cpu_count_when_unavailable(self) -> None:
         just_shell = load_just_shell_module()
 
-        updates = just_shell.rust_tool_env(
-            {},
-            which=lambda program: (
-                "C:/LLVM/bin/lld-link.exe" if program == "lld-link" else None
-            ),
-        )
-
-        self.assertEqual(updates["CARGO_NET_GIT_FETCH_WITH_CLI"], "true")
-        self.assertEqual(
-            updates["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"],
-            "C:/LLVM/bin/lld-link.exe",
-        )
-        self.assertEqual(
-            updates["CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"],
-            "C:/LLVM/bin/lld-link.exe",
-        )
-
-    def test_windows_local_just_shell_uses_scoop_lld_link_when_not_on_path(
-        self,
-    ) -> None:
-        just_shell = load_just_shell_module()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            lld_link = root / "apps" / "llvm" / "current" / "bin" / "lld-link.exe"
-            lld_link.parent.mkdir(parents=True)
-            lld_link.write_text("", encoding="utf-8")
-
-            updates = just_shell.rust_tool_env(
-                {"SCOOP": str(root)},
-                which=lambda _program: None,
-            )
-
-        self.assertEqual(
-            updates["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"],
-            str(lld_link),
-        )
-
-    def test_windows_local_just_shell_keeps_existing_msvc_linker(self) -> None:
-        just_shell = load_just_shell_module()
-
-        updates = just_shell.rust_tool_env(
-            {"CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER": "link.exe"},
-            which=lambda program: (
-                "C:/LLVM/bin/lld-link.exe" if program == "lld-link" else None
-            ),
-        )
-
-        self.assertEqual(updates["CARGO_NET_GIT_FETCH_WITH_CLI"], "true")
-        self.assertNotIn("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER", updates)
-        self.assertEqual(
-            updates["CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"],
-            "C:/LLVM/bin/lld-link.exe",
-        )
-
-    def test_local_just_shell_prefers_scripts_venv_python_tools(self) -> None:
-        just_shell = load_just_shell_module()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            scripts_bin = root / "scripts" / ".venv" / "Scripts"
-            scripts_bin.mkdir(parents=True)
-            (scripts_bin / "python.exe").write_text("", encoding="utf-8")
-
-            updates = just_shell.python_tool_env(
-                {"PATH": "C:/Windows/System32"},
-                repo_root=root,
-            )
-
-        self.assertEqual(updates["VIRTUAL_ENV"], str(root / "scripts" / ".venv"))
-        self.assertEqual(updates["VIRTUAL_ENV_DISABLE_PROMPT"], "1")
-        self.assertEqual(
-            updates["PATH"],
-            f"{scripts_bin}{just_shell.os.pathsep}C:/Windows/System32",
-        )
-
-    def test_local_just_shell_limits_python_to_thirty_logical_cpus(self) -> None:
-        just_shell = load_just_shell_module()
-
-        with mock.patch.object(just_shell.os, "cpu_count", return_value=8):
-            self.assertEqual(
-                just_shell.python_cpu_env({}),
-                {"PYTHON_CPU_COUNT": "8"},
-            )
-        with mock.patch.object(just_shell.os, "cpu_count", return_value=64):
-            self.assertEqual(
-                just_shell.python_cpu_env({}),
-                {"PYTHON_CPU_COUNT": "30"},
-            )
         with mock.patch.object(just_shell.os, "cpu_count", return_value=None):
-            self.assertEqual(
-                just_shell.python_cpu_env({}),
-                {"PYTHON_CPU_COUNT": "1"},
-            )
-        self.assertEqual(
-            just_shell.python_cpu_env({"PYTHON_CPU_COUNT": "8"}),
-            {},
+            updates = just_shell.python_cpu_env({})
+
+        self.assertEqual(updates, {"PYTHON_CPU_COUNT": "1"})
+
+    _fake_tool_temp = None
+    _fake_tool_binary = None
+
+    @classmethod
+    def _compiled_fake_tool(cls) -> Path:
+        if cls._fake_tool_binary is not None:
+            return cls._fake_tool_binary
+
+        cls._fake_tool_temp = tempfile.TemporaryDirectory(prefix="just-shell-tools-")
+        build_dir = Path(cls._fake_tool_temp.name)
+        source = build_dir / "fake_tool.rs"
+        binary = build_dir / ("fake-tool.exe" if os.name == "nt" else "fake-tool")
+        source.write_text(
+            r'''use std::env;
+use std::fmt::Write as FmtWrite;
+use std::fs::{self, OpenOptions};
+use std::io::Write as IoWrite;
+use std::path::PathBuf;
+use std::process::exit;
+use std::thread;
+use std::time::Duration;
+
+fn hex(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        write!(&mut encoded, "{byte:02x}").unwrap();
+    }
+    encoded
+}
+
+fn record(role: &str, args: &[String]) {
+    let Some(path) = env::var_os("KD4_TEST_TOOL_RECORD") else {
+        return;
+    };
+    let mut line = hex(role);
+    for arg in args {
+        write!(&mut line, "\tA:{}", hex(arg)).unwrap();
+    }
+    for key in [
+        "PATH",
+        "VIRTUAL_ENV",
+        "VIRTUAL_ENV_DISABLE_PROMPT",
+        "PYTHONHOME",
+        "PYTHON_CPU_COUNT",
+        "CARGO_NET_GIT_FETCH_WITH_CLI",
+        "RUSTC_WRAPPER",
+        "SCCACHE_BASEDIR",
+        "SCCACHE_CACHE_SIZE",
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
+        "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER",
+    ] {
+        if let Ok(value) = env::var(key) {
+            write!(&mut line, "\tE:{key}:{}", hex(&value)).unwrap();
+        }
+    }
+    line.push('\n');
+    let mut output = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(PathBuf::from(path))
+        .unwrap();
+    output.write_all(line.as_bytes()).unwrap();
+}
+
+fn status_from_env(key: &str) -> i32 {
+    env::var(key).ok().and_then(|value| value.parse().ok()).unwrap_or(0)
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let executable = env::current_exe().unwrap();
+    let role = executable
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("fake-tool")
+        .to_ascii_lowercase();
+    record(&role, &args);
+
+    if role.contains("pwsh") {
+        if args.iter().any(|arg| arg == "-Command") {
+            match env::var("KD4_TEST_PWSH_PROBE_MODE").as_deref() {
+                Ok("old") => exit(1),
+                Ok("timeout") => {
+                    thread::sleep(Duration::from_secs(4));
+                    if let Some(path) = env::var_os("KD4_TEST_PWSH_TIMEOUT_MARKER") {
+                        fs::write(PathBuf::from(path), b"probe completed").unwrap();
+                    }
+                }
+                _ => {}
+            }
+        }
+        exit(status_from_env("KD4_TEST_PWSH_EXIT"));
+    }
+
+    if role.contains("sccache") {
+        match args.first().map(String::as_str) {
+            Some("--show-stats") => {
+                let state_path = env::var_os("KD4_TEST_SCCACHE_STATE").map(PathBuf::from);
+                let index = state_path
+                    .as_ref()
+                    .and_then(|path| fs::read_to_string(path).ok())
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let sequence = env::var("KD4_TEST_SCCACHE_STATS")
+                    .unwrap_or_else(|_| "80 GiB".to_string());
+                let values: Vec<&str> = sequence.split('|').collect();
+                let value = values
+                    .get(index)
+                    .or_else(|| values.last())
+                    .copied()
+                    .unwrap_or("80 GiB");
+                if let Some(path) = state_path {
+                    fs::write(path, (index + 1).to_string()).unwrap();
+                }
+                println!("Max cache size                       {value}");
+                exit(status_from_env("KD4_TEST_SCCACHE_STATS_EXIT"));
+            }
+            Some("--start-server") => exit(status_from_env("KD4_TEST_SCCACHE_START_EXIT")),
+            Some("--stop-server") => exit(status_from_env("KD4_TEST_SCCACHE_STOP_EXIT")),
+            _ => exit(0),
+        }
+    }
+}
+''',
+            encoding="utf-8",
+            newline="\n",
         )
-        self.assertEqual(just_shell.python_cpu_env({"CI": "true"}), {})
-
-    def test_local_just_shell_keeps_existing_virtualenv(self) -> None:
-        just_shell = load_just_shell_module()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            scripts_bin = root / "scripts" / ".venv" / "Scripts"
-            scripts_bin.mkdir(parents=True)
-            (scripts_bin / "python.exe").write_text("", encoding="utf-8")
-
-            updates = just_shell.python_tool_env(
-                {
-                    "PATH": "C:/Windows/System32",
-                    "VIRTUAL_ENV": "C:/other/.venv",
-                },
-                repo_root=root,
+        result = subprocess.run(
+            ["rustc", "--edition=2021", str(source), "-o", str(binary)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                "failed to compile just-shell fake tool:\n"
+                f"{result.stdout}\n{result.stderr}"
             )
+        cls._fake_tool_binary = binary
+        return binary
 
-        self.assertEqual(updates, {})
+    @staticmethod
+    def _tool_filename(name: str) -> str:
+        return f"{name}.exe" if os.name == "nt" else name
 
-    def test_local_just_shell_deduplicates_scripts_venv_path(self) -> None:
-        just_shell = load_just_shell_module()
+    @classmethod
+    def _install_fake_tools(cls, bin_dir: Path, *names: str) -> dict[str, Path]:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        source = cls._compiled_fake_tool()
+        installed = {}
+        for name in names:
+            destination = bin_dir / cls._tool_filename(name)
+            destination.write_bytes(source.read_bytes())
+            if os.name != "nt":
+                destination.chmod(destination.stat().st_mode | 0o111)
+            installed[name] = destination.resolve()
+        return installed
 
-        with tempfile.TemporaryDirectory() as temp_dir:
+    @staticmethod
+    def _prepare_just_shell_repo(root: Path) -> tuple[Path, Path]:
+        scripts_dir = root / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (root / "codex-rs").mkdir()
+        for name in ("just-shell.py", "rust_tool_env.py"):
+            source = REPO_ROOT / "scripts" / name
+            (scripts_dir / name).write_bytes(source.read_bytes())
+        return (
+            scripts_dir / "just-shell.py",
+            root / "codex-rs" / "target" / "just-shell",
+        )
+
+    @staticmethod
+    def _just_shell_env(bin_dir: Path, record_path: Path) -> dict[str, str]:
+        retained = (
+            "COMSPEC",
+            "PATHEXT",
+            "SYSTEMDRIVE",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "WINDIR",
+        )
+        env = {key: os.environ[key] for key in retained if key in os.environ}
+        env.update(
+            {
+                "KD4_TEST_TOOL_RECORD": str(record_path),
+                "PATH": str(bin_dir),
+                "PYTHONUTF8": "1",
+            }
+        )
+        return env
+
+    @staticmethod
+    def _run_just_shell(
+        script: Path,
+        env: dict[str, str],
+        command: str = "Write-Output ready",
+        recipe: str = "integration-test",
+        *args: str,
+        python_args: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-E",
+                *python_args,
+                str(script),
+                command,
+                recipe,
+                *args,
+            ],
+            cwd=script.parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=15,
+        )
+
+    @staticmethod
+    def _decode_tool_records(path: Path) -> list[dict[str, object]]:
+        if not path.exists():
+            return []
+
+        def decode(value: str) -> str:
+            return bytes.fromhex(value).decode("utf-8")
+
+        records = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            fields = line.split("\t")
+            record: dict[str, object] = {
+                "role": decode(fields[0]),
+                "args": [],
+                "env": {},
+            }
+            for field in fields[1:]:
+                kind, payload = field.split(":", 1)
+                if kind == "A":
+                    record["args"].append(decode(payload))
+                else:
+                    key, value = payload.split(":", 1)
+                    record["env"][key] = decode(value)
+            records.append(record)
+        return records
+
+    def _assert_just_shell_success(
+        self, result: subprocess.CompletedProcess[str]
+    ) -> None:
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    def _actual_pwsh_record(
+        self, records: list[dict[str, object]]
+    ) -> dict[str, object]:
+        matches = [
+            record
+            for record in records
+            if "pwsh" in record["role"] and "-CommandWithArgs" in record["args"]
+        ]
+        self.assertEqual(matches, matches[-1:], records)
+        return matches[0]
+
+    def test_just_shell_cli_applies_rust_sccache_environment_and_respects_overrides(
+        self,
+    ) -> None:
+        cases = (
+            ("default", {}, "80G", True),
+            ("cache-size-override", {"CODEX_SCCACHE_CACHE_SIZE": "100G"}, "100G", True),
+            (
+                "blank-cache-size-override",
+                {"CODEX_SCCACHE_CACHE_SIZE": "   "},
+                "80G",
+                True,
+            ),
+            ("existing-sccache-wrapper", {"RUSTC_WRAPPER": "sccache"}, "80G", True),
+            ("existing-wrapper", {"RUSTC_WRAPPER": "custom-wrapper"}, None, False),
+        )
+        for label, overrides, expected_size, expect_sccache in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(
+                prefix=f"just-shell-rust-{label}-"
+            ) as temp_dir:
+                root = Path(temp_dir)
+                script, _cache_dir = self._prepare_just_shell_repo(root)
+                bin_dir = root / "bin"
+                tools = self._install_fake_tools(bin_dir, "pwsh", "sccache")
+                record_path = root / "tool-records.tsv"
+                env = self._just_shell_env(bin_dir, record_path)
+                env.update(overrides)
+                env["KD4_TEST_SCCACHE_STATS"] = (
+                    f"{expected_size[:-1]} GiB" if expected_size else "80 GiB"
+                )
+
+                result = self._run_just_shell(
+                    script, env, "cargo check {args}", "check", "--workspace"
+                )
+
+                self._assert_just_shell_success(result)
+                records = self._decode_tool_records(record_path)
+                actual = self._actual_pwsh_record(records)
+                actual_env = actual["env"]
+                self.assertEqual(actual["args"][-2:], ["check", "--workspace"])
+                self.assertIn("@($args | Select-Object -Skip 1)", actual["args"][-3])
+                self.assertEqual(actual_env["CARGO_NET_GIT_FETCH_WITH_CLI"], "true")
+                if expect_sccache:
+                    expected_wrapper = overrides.get(
+                        "RUSTC_WRAPPER", str(tools["sccache"])
+                    )
+                    if os.path.isabs(expected_wrapper):
+                        self.assertEqual(
+                            os.path.normcase(actual_env["RUSTC_WRAPPER"]),
+                            os.path.normcase(expected_wrapper),
+                        )
+                    else:
+                        self.assertEqual(actual_env["RUSTC_WRAPPER"], expected_wrapper)
+                    self.assertEqual(actual_env["SCCACHE_BASEDIR"], str(root.resolve()))
+                    self.assertEqual(actual_env["SCCACHE_CACHE_SIZE"], expected_size)
+                    self.assertTrue(
+                        any(record["role"].startswith("sccache") for record in records),
+                        records,
+                    )
+                else:
+                    self.assertEqual(actual_env["RUSTC_WRAPPER"], "custom-wrapper")
+                    self.assertNotIn("SCCACHE_BASEDIR", actual_env)
+                    self.assertNotIn("SCCACHE_CACHE_SIZE", actual_env)
+                    self.assertFalse(
+                        any(record["role"].startswith("sccache") for record in records),
+                        records,
+                    )
+
+    def test_just_shell_cli_manages_sccache_server_and_probe_cache(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="just-shell-sccache-restart-"
+        ) as temp_dir:
             root = Path(temp_dir)
-            scripts_bin = root / "scripts" / ".venv" / "Scripts"
-            scripts_bin.mkdir(parents=True)
-            (scripts_bin / "python.exe").write_text("", encoding="utf-8")
-            existing_path = f"{scripts_bin}{just_shell.os.pathsep}C:/Windows/System32"
+            script, cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            self._install_fake_tools(bin_dir, "pwsh", "sccache")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+            env["KD4_TEST_SCCACHE_STATS"] = "10 GiB|80 GiB"
+            env["KD4_TEST_SCCACHE_STATE"] = str(root / "sccache-state")
 
-            updates = just_shell.python_tool_env(
-                {"PATH": existing_path},
-                repo_root=root,
-            )
+            first = self._run_just_shell(script, env, "cargo check")
+            second = self._run_just_shell(script, env, "cargo check")
 
-        self.assertEqual(updates["PATH"], existing_path)
-
-    def test_local_just_shell_warns_when_scripts_venv_is_missing(self) -> None:
-        just_shell = load_just_shell_module()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            (root / "scripts").mkdir()
-            (root / "scripts" / "uv.lock").write_text("", encoding="utf-8")
-            cache_dir = root / "cache"
-            stderr = io.StringIO()
-
-            updates = just_shell.python_tool_env(
-                {},
-                repo_root=root,
-                cache_dir=cache_dir,
-                stderr=stderr,
-            )
-            second_stderr = io.StringIO()
-            just_shell.python_tool_env(
-                {},
-                repo_root=root,
-                cache_dir=cache_dir,
-                stderr=second_stderr,
-            )
-
-        self.assertEqual(updates, {})
-        self.assertIn("scripts/.venv is missing", stderr.getvalue())
-        self.assertEqual(second_stderr.getvalue(), "")
-
-    def test_local_just_shell_rejects_directory_named_like_python(self) -> None:
-        just_shell = load_just_shell_module()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            python_dir = root / "scripts" / ".venv" / "Scripts" / "python.exe"
-            python_dir.mkdir(parents=True)
-
+            self._assert_just_shell_success(first)
+            self._assert_just_shell_success(second)
+            records = self._decode_tool_records(record_path)
+            sccache_args = [
+                record["args"]
+                for record in records
+                if record["role"].startswith("sccache")
+            ]
             self.assertEqual(
-                just_shell.python_tool_env({}, repo_root=root),
-                {},
+                sccache_args,
+                [
+                    ["--show-stats"],
+                    ["--stop-server"],
+                    ["--start-server"],
+                    ["--show-stats"],
+                ],
             )
-
-    def test_local_just_shell_tool_probe_has_timeout(self) -> None:
-        just_shell = load_just_shell_module()
-
-        with mock.patch.object(
-            just_shell.subprocess,
-            "run",
-            side_effect=just_shell.subprocess.TimeoutExpired(["tool"], 2),
-        ) as run:
-            self.assertFalse(just_shell.tool_runs(["tool"], timeout=2))
-
-        self.assertEqual(run.call_args.kwargs["timeout"], 2)
-
-    def test_local_just_shell_tool_probe_uses_persistent_cache(self) -> None:
-        just_shell = load_just_shell_module()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cache_dir = Path(temp_dir)
-            with mock.patch.object(just_shell, "tool_runs", return_value=True) as run:
-                self.assertTrue(
-                    just_shell.cached_tool_runs(
-                        ["tool", "--version"], cache_dir=cache_dir
-                    )
-                )
-            with mock.patch.object(
-                just_shell,
-                "tool_runs",
-                side_effect=AssertionError("probe should have been cached"),
-            ):
-                self.assertTrue(
-                    just_shell.cached_tool_runs(
-                        ["tool", "--version"], cache_dir=cache_dir
-                    )
-                )
-
-        run.assert_called_once()
-
-    def test_local_just_shell_does_not_keep_one_shot_process_probe_cache(
-        self,
-    ) -> None:
-        just_shell = load_just_shell_module()
-
-        with mock.patch.object(just_shell, "tool_runs", return_value=True) as run:
-            self.assertTrue(just_shell.cached_tool_runs(["tool", "--version"]))
-            self.assertTrue(just_shell.cached_tool_runs(["tool", "--version"]))
-
-        self.assertEqual(run.call_count, 2)
-
-    def test_local_just_shell_inconclusive_tool_probe_proceeds_without_cache(
-        self,
-    ) -> None:
-        just_shell = load_just_shell_module()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cache_dir = Path(temp_dir)
-            command = ["tool", "--version"]
-            with mock.patch.object(just_shell, "tool_runs", return_value=None) as run:
-                self.assertTrue(
-                    just_shell.cached_tool_runs(command, cache_dir=cache_dir)
-                )
-                self.assertTrue(
-                    just_shell.cached_tool_runs(command, cache_dir=cache_dir)
-                )
-
-            self.assertFalse(
-                just_shell.tool_run_cache_path(command, cache_dir).exists()
-            )
-
-        self.assertEqual(run.call_count, 2)
-
-    def test_local_just_shell_writes_probe_cache_by_atomic_replace(self) -> None:
-        just_shell = load_just_shell_module()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cache_dir = Path(temp_dir)
-            command = ["tool", "--version"]
-            original_replace = just_shell.os.replace
-            with mock.patch.object(
-                just_shell.os, "replace", wraps=original_replace
-            ) as replace:
-                just_shell.write_cached_tool_run(command, cache_dir, True)
-
-            self.assertTrue(just_shell.read_cached_tool_run(command, cache_dir))
-            replace.assert_called_once()
+            sccache_caches = list(cache_dir.glob("sccache*.probe"))
+            self.assertEqual(len(sccache_caches), 1, list(cache_dir.iterdir()))
+            self.assertEqual(sccache_caches[0].read_text(encoding="utf-8"), "ok")
             self.assertEqual(list(cache_dir.glob("*.tmp")), [])
 
-    def test_local_just_shell_tool_probe_cache_tracks_tool_identity(self) -> None:
-        just_shell = load_just_shell_module()
+        equivalent_sizes = (
+            ("512M", "512 MiB"),
+            ("1T", "1 TiB"),
+            ("80GB", "80 GiB"),
+            ("80GiB", "80 GiB"),
+            ("1024G", "1 TiB"),
+        )
+        for configured, reported in equivalent_sizes:
+            with (
+                self.subTest(configured=configured, reported=reported),
+                tempfile.TemporaryDirectory(
+                    prefix="just-shell-sccache-bytes-"
+                ) as temp_dir,
+            ):
+                root = Path(temp_dir)
+                script, cache_dir = self._prepare_just_shell_repo(root)
+                bin_dir = root / "bin"
+                self._install_fake_tools(bin_dir, "pwsh", "sccache")
+                record_path = root / "tool-records.tsv"
+                env = self._just_shell_env(bin_dir, record_path)
+                env["CODEX_SCCACHE_CACHE_SIZE"] = configured
+                env["KD4_TEST_SCCACHE_STATS"] = reported
 
-        with tempfile.TemporaryDirectory() as temp_dir:
+                first = self._run_just_shell(script, env, "cargo check")
+
+                self._assert_just_shell_success(first)
+                first_records = self._decode_tool_records(record_path)
+                first_sccache_args = [
+                    record["args"]
+                    for record in first_records
+                    if record["role"].startswith("sccache")
+                ]
+                self.assertEqual(first_sccache_args, [["--show-stats"]])
+                sccache_caches = list(cache_dir.glob("sccache*.probe"))
+                self.assertEqual(len(sccache_caches), 1, list(cache_dir.iterdir()))
+                self.assertEqual(sccache_caches[0].read_text(encoding="utf-8"), "ok")
+                self.assertEqual(list(cache_dir.glob("*.tmp")), [])
+
+                record_path.unlink()
+                second = self._run_just_shell(script, env, "cargo check")
+
+                self._assert_just_shell_success(second)
+                second_records = self._decode_tool_records(record_path)
+                self.assertEqual(
+                    [
+                        record["args"]
+                        for record in second_records
+                        if record["role"].startswith("sccache")
+                    ],
+                    [],
+                    second_records,
+                )
+                self.assertEqual(sccache_caches[0].read_text(encoding="utf-8"), "ok")
+                self.assertEqual(list(cache_dir.glob("*.tmp")), [])
+
+        with tempfile.TemporaryDirectory(
+            prefix="just-shell-sccache-failed-"
+        ) as temp_dir:
             root = Path(temp_dir)
-            tool = root / "tool.exe"
-            tool.write_text("one", encoding="utf-8")
-            first = just_shell.tool_run_cache_path([str(tool), "--version"], root)
-            tool.write_text("two larger", encoding="utf-8")
-            os.utime(tool, None)
-            second = just_shell.tool_run_cache_path([str(tool), "--version"], root)
+            script, cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            self._install_fake_tools(bin_dir, "pwsh", "sccache")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+            env["KD4_TEST_SCCACHE_STATS"] = "10 GiB"
+            env["KD4_TEST_SCCACHE_START_EXIT"] = "9"
 
-        self.assertNotEqual(first, second)
+            first = self._run_just_shell(script, env, "cargo check")
+            second = self._run_just_shell(script, env, "cargo check")
 
-    def test_local_just_shell_stderr_null_must_be_terminal(self) -> None:
-        just_shell = load_just_shell_module()
+            self._assert_just_shell_success(first)
+            self._assert_just_shell_success(second)
+            records = self._decode_tool_records(record_path)
+            sccache_args = [
+                record["args"]
+                for record in records
+                if record["role"].startswith("sccache")
+            ]
+            self.assertEqual(
+                sccache_args,
+                [
+                    ["--show-stats"],
+                    ["--stop-server"],
+                    ["--start-server"],
+                    ["--show-stats"],
+                    ["--stop-server"],
+                    ["--start-server"],
+                ],
+            )
+            self.assertEqual(list(cache_dir.glob("sccache*.probe")), [])
+            self.assertEqual(list(cache_dir.glob("*.tmp")), [])
 
-        self.assertEqual(
-            just_shell.render_command(
-                "tool {args} {stderr-null}", args="ARGS", stderr_null="ERR"
-            ),
-            "tool ARGS ERR",
-        )
-        with self.assertRaisesRegex(ValueError, "final token"):
-            just_shell.render_command(
-                "tool {stderr-null} | more", args="ARGS", stderr_null="ERR"
+    def test_just_shell_cli_configures_python_environment(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="just-shell-python-venv-") as temp_dir:
+            root = Path(temp_dir)
+            script, _cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            self._install_fake_tools(bin_dir, "pwsh")
+            venv_bin = root / "scripts" / ".venv" / "Scripts"
+            venv_bin.mkdir(parents=True)
+            (venv_bin / "python.exe").write_bytes(b"python marker")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+            env["PATH"] = os.pathsep.join((str(venv_bin), str(bin_dir), str(venv_bin)))
+            env["PYTHONHOME"] = str(root / "ignored-python-home")
+
+            result = self._run_just_shell(
+                script, env, python_args=("-X", "cpu_count=64")
             )
 
-    def test_local_just_shell_rejects_old_powershell(self) -> None:
-        just_shell = load_just_shell_module()
-        stderr = io.StringIO()
+            self._assert_just_shell_success(result)
+            actual = self._actual_pwsh_record(self._decode_tool_records(record_path))
+            actual_env = actual["env"]
+            path_parts = actual_env["PATH"].split(os.pathsep)
+            self.assertEqual(path_parts[0], str(venv_bin))
+            self.assertEqual(
+                sum(
+                    os.path.normcase(os.path.normpath(part))
+                    == os.path.normcase(os.path.normpath(venv_bin))
+                    for part in path_parts
+                ),
+                1,
+            )
+            self.assertEqual(actual_env["VIRTUAL_ENV"], str(root / "scripts" / ".venv"))
+            self.assertEqual(actual_env["VIRTUAL_ENV_DISABLE_PROMPT"], "1")
+            self.assertNotIn("PYTHONHOME", actual_env)
+            self.assertEqual(actual_env["PYTHON_CPU_COUNT"], "30")
 
-        result = just_shell.run_powershell(
-            "Write-Output hi",
-            "recipe",
-            [],
-            which=lambda program: "C:/pwsh.exe" if program == "pwsh.exe" else None,
-            can_run=lambda command: False,
-            stderr=stderr,
-        )
+        with tempfile.TemporaryDirectory(
+            prefix="just-shell-python-eight-cpus-"
+        ) as temp_dir:
+            root = Path(temp_dir)
+            script, _cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            self._install_fake_tools(bin_dir, "pwsh")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
 
-        self.assertEqual(result, 1)
-        self.assertIn("PowerShell 7.4", stderr.getvalue())
+            result = self._run_just_shell(
+                script, env, python_args=("-X", "cpu_count=8")
+            )
 
-    def test_local_just_shell_reports_powershell_launch_failure(self) -> None:
-        just_shell = load_just_shell_module()
-        stderr = io.StringIO()
+            self._assert_just_shell_success(result)
+            actual_env = self._actual_pwsh_record(
+                self._decode_tool_records(record_path)
+            )["env"]
+            self.assertEqual(actual_env["PYTHON_CPU_COUNT"], "8")
 
-        with mock.patch.object(
-            just_shell.subprocess, "run", side_effect=OSError("launch failed")
+        with tempfile.TemporaryDirectory(
+            prefix="just-shell-python-cpu-unavailable-"
+        ) as temp_dir:
+            root = Path(temp_dir)
+            script, _cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            self._install_fake_tools(bin_dir, "pwsh")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+            bootstrap = root / "run-just-shell-without-cpu-count.py"
+            bootstrap.write_text(
+                """import os
+import runpy
+import sys
+from pathlib import Path
+from unittest import mock
+
+script = Path(sys.argv[1])
+sys.argv = [str(script), *sys.argv[2:]]
+sys.path.insert(0, str(script.parent))
+with mock.patch.object(os, "cpu_count", return_value=None):
+    runpy.run_path(str(script), run_name="__main__")
+""",
+                encoding="utf-8",
+                newline="\n",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-E",
+                    str(bootstrap),
+                    str(script),
+                    "Write-Output ready",
+                    "integration-test",
+                ],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=15,
+            )
+
+            self._assert_just_shell_success(result)
+            actual_env = self._actual_pwsh_record(
+                self._decode_tool_records(record_path)
+            )["env"]
+            self.assertEqual(actual_env["PYTHON_CPU_COUNT"], "1")
+
+        with tempfile.TemporaryDirectory(
+            prefix="just-shell-python-existing-"
+        ) as temp_dir:
+            root = Path(temp_dir)
+            script, _cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            self._install_fake_tools(bin_dir, "pwsh")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+            env["VIRTUAL_ENV"] = str(root / "existing-venv")
+            env["PYTHON_CPU_COUNT"] = "7"
+            original_path = env["PATH"]
+
+            result = self._run_just_shell(
+                script, env, python_args=("-X", "cpu_count=64")
+            )
+
+            self._assert_just_shell_success(result)
+            actual_env = self._actual_pwsh_record(
+                self._decode_tool_records(record_path)
+            )["env"]
+            self.assertEqual(actual_env["VIRTUAL_ENV"], str(root / "existing-venv"))
+            self.assertEqual(actual_env["PYTHON_CPU_COUNT"], "7")
+            self.assertEqual(actual_env["PATH"], original_path)
+
+        with tempfile.TemporaryDirectory(prefix="just-shell-python-ci-") as temp_dir:
+            root = Path(temp_dir)
+            script, _cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            self._install_fake_tools(bin_dir, "pwsh")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+            env["CI"] = "true"
+
+            result = self._run_just_shell(
+                script, env, python_args=("-X", "cpu_count=64")
+            )
+
+            self._assert_just_shell_success(result)
+            actual_env = self._actual_pwsh_record(
+                self._decode_tool_records(record_path)
+            )["env"]
+            self.assertNotIn("PYTHON_CPU_COUNT", actual_env)
+
+        for label, make_python_directory in (
+            ("missing", False),
+            ("directory-named-python", True),
         ):
-            result = just_shell.run_powershell(
-                "Write-Output hi",
-                "recipe",
-                [],
-                which=lambda _program: "C:/pwsh.exe",
-                can_run=lambda _command: True,
-                stderr=stderr,
+            with self.subTest(label=label), tempfile.TemporaryDirectory(
+                prefix=f"just-shell-python-{label}-"
+            ) as temp_dir:
+                root = Path(temp_dir)
+                script, cache_dir = self._prepare_just_shell_repo(root)
+                bin_dir = root / "bin"
+                self._install_fake_tools(bin_dir, "pwsh")
+                (root / "scripts" / "uv.lock").write_text("", encoding="utf-8")
+                if make_python_directory:
+                    (root / "scripts" / ".venv" / "Scripts" / "python.exe").mkdir(
+                        parents=True
+                    )
+                record_path = root / "tool-records.tsv"
+                env = self._just_shell_env(bin_dir, record_path)
+
+                first = self._run_just_shell(script, env)
+                second = self._run_just_shell(script, env)
+
+                self._assert_just_shell_success(first)
+                self._assert_just_shell_success(second)
+                self.assertIn("scripts/.venv is missing", first.stderr)
+                self.assertNotIn("scripts/.venv is missing", second.stderr)
+                actuals = [
+                    record
+                    for record in self._decode_tool_records(record_path)
+                    if "-CommandWithArgs" in record["args"]
+                ]
+                self.assertEqual(len(actuals), 2)
+                self.assertTrue(
+                    all("VIRTUAL_ENV" not in record["env"] for record in actuals)
+                )
+                self.assertEqual(
+                    (cache_dir / "scripts-venv-missing.warn").read_text(
+                        encoding="utf-8"
+                    ),
+                    "warned",
+                )
+
+    def test_just_shell_cli_renders_and_validates_powershell(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="just-shell-pwsh-render-") as temp_dir:
+            root = Path(temp_dir)
+            script, _cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            self._install_fake_tools(bin_dir, "pwsh")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+
+            result = self._run_just_shell(
+                script,
+                env,
+                "Write-Output {args}; Get-Item missing {stderr-null}",
+                "render",
+                "one",
+                "two",
             )
 
-        self.assertEqual(result, 1)
-        self.assertIn("Failed to launch PowerShell", stderr.getvalue())
+            self._assert_just_shell_success(result)
+            actual = self._actual_pwsh_record(self._decode_tool_records(record_path))
+            self.assertEqual(
+                actual["args"],
+                [
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-CommandWithArgs",
+                    "Write-Output @($args | Select-Object -Skip 1); "
+                    "Get-Item missing 2>$null; exit $LASTEXITCODE",
+                    "render",
+                    "one",
+                    "two",
+                ],
+            )
+
+            invalid = self._run_just_shell(
+                script, env, "Write-Output {stderr-null}; Write-Output later"
+            )
+            self.assertEqual(invalid.returncode, 1)
+            self.assertIn("{stderr-null} must be the final token", invalid.stderr)
+
+        with tempfile.TemporaryDirectory(prefix="just-shell-pwsh-old-") as temp_dir:
+            root = Path(temp_dir)
+            script, cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            self._install_fake_tools(bin_dir, "pwsh")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+            env["KD4_TEST_PWSH_PROBE_MODE"] = "old"
+
+            result = self._run_just_shell(script, env)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("PowerShell 7.4 or newer is required", result.stderr)
+            records = self._decode_tool_records(record_path)
+            self.assertEqual(len(records), 1, records)
+            pwsh_caches = list(cache_dir.glob("pwsh*.probe"))
+            self.assertEqual(len(pwsh_caches), 1)
+            self.assertEqual(pwsh_caches[0].read_text(encoding="utf-8"), "fail")
+
+        with tempfile.TemporaryDirectory(prefix="just-shell-pwsh-missing-") as temp_dir:
+            root = Path(temp_dir)
+            script, _cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "empty-bin"
+            bin_dir.mkdir()
+            result = self._run_just_shell(
+                script, self._just_shell_env(bin_dir, root / "unused-records.tsv")
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("PowerShell ('pwsh') is required", result.stderr)
+
+        with tempfile.TemporaryDirectory(prefix="just-shell-pwsh-broken-") as temp_dir:
+            root = Path(temp_dir)
+            script, cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            broken = bin_dir / self._tool_filename("pwsh")
+            broken.write_bytes(b"not an executable")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+
+            first = self._run_just_shell(script, env)
+            second = self._run_just_shell(script, env)
+
+            self.assertEqual(first.returncode, 1)
+            self.assertEqual(second.returncode, 1)
+            self.assertIn("Failed to launch PowerShell", first.stderr)
+            self.assertIn("Failed to launch PowerShell", second.stderr)
+            self.assertEqual(list(cache_dir.glob("pwsh*.probe")), [])
+            self.assertEqual(list(cache_dir.glob("*.tmp")), [])
+
+        with tempfile.TemporaryDirectory(prefix="just-shell-pwsh-timeout-") as temp_dir:
+            root = Path(temp_dir)
+            script, cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            self._install_fake_tools(bin_dir, "pwsh")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+            env["KD4_TEST_PWSH_PROBE_MODE"] = "timeout"
+            timeout_marker = root / "probe-finished-after-sleep"
+            env["KD4_TEST_PWSH_TIMEOUT_MARKER"] = str(timeout_marker)
+
+            started = time.monotonic()
+            first = self._run_just_shell(script, env)
+            second = self._run_just_shell(script, env)
+            elapsed = time.monotonic() - started
+
+            self._assert_just_shell_success(first)
+            self._assert_just_shell_success(second)
+            self.assertLess(elapsed, 6.5)
+            time.sleep(2.25)
+            self.assertFalse(timeout_marker.exists())
+            records = self._decode_tool_records(record_path)
+            probes = [record for record in records if "-Command" in record["args"]]
+            actuals = [
+                record for record in records if "-CommandWithArgs" in record["args"]
+            ]
+            self.assertEqual(len(probes), 2, records)
+            self.assertEqual(len(actuals), 2, records)
+            self.assertEqual(list(cache_dir.glob("pwsh*.probe")), [])
+            self.assertEqual(list(cache_dir.glob("*.tmp")), [])
+
+        with tempfile.TemporaryDirectory(
+            prefix="just-shell-pwsh-concurrent-cache-"
+        ) as temp_dir:
+            root = Path(temp_dir)
+            script, cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            self._install_fake_tools(bin_dir, "pwsh")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+            command = [
+                sys.executable,
+                "-E",
+                str(script),
+                "Write-Output ready",
+                "integration-test",
+            ]
+
+            processes = [
+                subprocess.Popen(
+                    command,
+                    cwd=root,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                for _ in range(2)
+            ]
+            concurrent_results = []
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=15)
+                concurrent_results.append(
+                    subprocess.CompletedProcess(
+                        command,
+                        process.returncode,
+                        stdout,
+                        stderr,
+                    )
+                )
+
+            for result in concurrent_results:
+                self._assert_just_shell_success(result)
+            cache_entries = list(cache_dir.glob("pwsh*.probe"))
+            self.assertEqual(len(cache_entries), 1, list(cache_dir.iterdir()))
+            self.assertEqual(cache_entries[0].read_text(encoding="utf-8"), "ok")
+            self.assertEqual(list(cache_dir.glob("*.tmp")), [])
+
+            record_path.write_text("", encoding="utf-8")
+            reused = self._run_just_shell(script, env)
+
+            self._assert_just_shell_success(reused)
+            reused_records = self._decode_tool_records(record_path)
+            self.assertEqual(
+                len(
+                    [
+                        record
+                        for record in reused_records
+                        if "-CommandWithArgs" in record["args"]
+                    ]
+                ),
+                1,
+                reused_records,
+            )
+            self.assertEqual(
+                [record for record in reused_records if "-Command" in record["args"]],
+                [],
+                reused_records,
+            )
+            self.assertEqual(cache_entries[0].read_text(encoding="utf-8"), "ok")
+            self.assertEqual(list(cache_dir.glob("*.tmp")), [])
+
+        with tempfile.TemporaryDirectory(
+            prefix="just-shell-pwsh-identity-"
+        ) as temp_dir:
+            root = Path(temp_dir)
+            script, cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            tools = self._install_fake_tools(bin_dir, "pwsh")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+
+            first = self._run_just_shell(script, env)
+            second = self._run_just_shell(script, env)
+            stat = tools["pwsh"].stat()
+            os.utime(
+                tools["pwsh"],
+                ns=(stat.st_atime_ns, stat.st_mtime_ns + 10_000_000),
+            )
+            third = self._run_just_shell(script, env)
+
+            for result in (first, second, third):
+                self._assert_just_shell_success(result)
+            records = self._decode_tool_records(record_path)
+            probes = [record for record in records if "-Command" in record["args"]]
+            actuals = [
+                record for record in records if "-CommandWithArgs" in record["args"]
+            ]
+            self.assertEqual(len(probes), 2, records)
+            self.assertEqual(len(actuals), 3, records)
+            pwsh_caches = list(cache_dir.glob("pwsh*.probe"))
+            self.assertEqual(len(pwsh_caches), 2, list(cache_dir.iterdir()))
+            self.assertTrue(
+                all(path.read_text(encoding="utf-8") == "ok" for path in pwsh_caches)
+            )
+            self.assertEqual(list(cache_dir.glob("*.tmp")), [])
+
+    def test_just_shell_cli_configures_windows_lld_link(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="just-shell-linker-path-") as temp_dir:
+            root = Path(temp_dir)
+            script, _cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            tools = self._install_fake_tools(bin_dir, "pwsh", "lld-link")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+
+            result = self._run_just_shell(script, env, "cargo check")
+
+            self._assert_just_shell_success(result)
+            actual_env = self._actual_pwsh_record(
+                self._decode_tool_records(record_path)
+            )["env"]
+            self.assertEqual(
+                os.path.normcase(
+                    actual_env["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"]
+                ),
+                os.path.normcase(str(tools["lld-link"])),
+            )
+            self.assertEqual(
+                os.path.normcase(
+                    actual_env["CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"]
+                ),
+                os.path.normcase(str(tools["lld-link"])),
+            )
+
+        with tempfile.TemporaryDirectory(prefix="just-shell-linker-scoop-") as temp_dir:
+            root = Path(temp_dir)
+            script, _cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            self._install_fake_tools(bin_dir, "pwsh")
+            scoop_linker = (
+                root / "scoop" / "apps" / "llvm" / "current" / "bin" / "lld-link.exe"
+            )
+            scoop_linker.parent.mkdir(parents=True)
+            scoop_linker.write_bytes(self._compiled_fake_tool().read_bytes())
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+            env["SCOOP"] = str(root / "scoop")
+
+            result = self._run_just_shell(script, env, "cargo check")
+
+            self._assert_just_shell_success(result)
+            actual_env = self._actual_pwsh_record(
+                self._decode_tool_records(record_path)
+            )["env"]
+            self.assertEqual(
+                actual_env["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"],
+                str(scoop_linker),
+            )
+            self.assertEqual(
+                actual_env["CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"],
+                str(scoop_linker),
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix="just-shell-linker-existing-"
+        ) as temp_dir:
+            root = Path(temp_dir)
+            script, _cache_dir = self._prepare_just_shell_repo(root)
+            bin_dir = root / "bin"
+            tools = self._install_fake_tools(bin_dir, "pwsh", "lld-link")
+            record_path = root / "tool-records.tsv"
+            env = self._just_shell_env(bin_dir, record_path)
+            env["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"] = "custom-link.exe"
+
+            result = self._run_just_shell(script, env, "cargo check")
+
+            self._assert_just_shell_success(result)
+            actual_env = self._actual_pwsh_record(
+                self._decode_tool_records(record_path)
+            )["env"]
+            self.assertEqual(
+                actual_env["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"],
+                "custom-link.exe",
+            )
+            self.assertEqual(
+                os.path.normcase(
+                    actual_env["CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"]
+                ),
+                os.path.normcase(str(tools["lld-link"])),
+            )
 
     def test_rust_workspace_uses_upstream_default_members(self) -> None:
         manifest = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
@@ -765,6 +1217,15 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             local_profile["overrides"],
         )
         self.assertIn(local_app_server_override, fast_profile["overrides"])
+        completion_proof_protocol_override = {
+            "platform": "cfg(windows)",
+            "filter": "(package(codex-app-server) & binary(all) & (test(=suite::v2::turn_start::blocked_completion_proof_reaches_app_server_as_failed_turn_without_launching_runner) | test(=suite::v2::turn_start::desktop_fresh_home_missing_canonical_command_blocks_changed_repository))) | (package(codex-mcp-server) & binary(all) & test(=suite::codex_tool::blocked_completion_proof_reaches_mcp_as_error_without_launching_runner))",
+            "slow-timeout": {"period": "2m", "terminate-after": 2},
+        }
+        self.assertIn(
+            completion_proof_protocol_override,
+            nextest["profile"]["default"]["overrides"],
+        )
         self.assertIn('$env:NEXTEST_PROFILE = "fast"; cargo nextest run', justfile)
         no_sccache_recipe = justfile.split("test-fast-nosccache *args:", 1)[1].split(
             "\n\n", 1
@@ -893,6 +1354,142 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertEqual(command.cwd, REPO_ROOT / "codex-rs")
         self.assertFalse(hasattr(command, "discard_stderr"))
 
+    def test_formatter_cli_runs_pinned_nightly_rustfmt(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="formatter-rustup-") as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            record_path = temp_path / "rustup-invocations.jsonl"
+            recorder_path = temp_path / "record_rustup.py"
+            recorder_path.write_text(
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "\n"
+                'record_path = Path(os.environ["KD4_TEST_RUSTUP_RECORD"])\n'
+                'with record_path.open("a", encoding="utf-8", newline="\\n") as stream:\n'
+                '    payload = {"cwd": os.getcwd(), "args": sys.argv[1:]}\n'
+                '    stream.write(json.dumps(payload) + "\\n")\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+
+            if os.name == "nt":
+                launcher_source = temp_path / "rustup_launcher.rs"
+                launcher_path = fake_bin / "rustup.exe"
+                launcher_source.write_text(
+                    """use std::env;
+use std::process::{exit, Command};
+
+fn main() {
+    let python = env::var_os("KD4_TEST_PYTHON").expect("KD4_TEST_PYTHON");
+    let recorder =
+        env::var_os("KD4_TEST_RUSTUP_RECORDER").expect("KD4_TEST_RUSTUP_RECORDER");
+    let status = Command::new(python)
+        .arg(recorder)
+        .args(env::args_os().skip(1))
+        .status()
+        .expect("start fake rustup recorder");
+    exit(status.code().unwrap_or(1));
+}
+""",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                compile_result = subprocess.run(
+                    [
+                        "rustc",
+                        "--edition=2021",
+                        str(launcher_source),
+                        "-o",
+                        str(launcher_path),
+                    ],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                    timeout=120,
+                )
+                self.assertEqual(
+                    compile_result.returncode,
+                    0,
+                    (
+                        f"stdout:\n{compile_result.stdout}\n"
+                        f"stderr:\n{compile_result.stderr}"
+                    ),
+                )
+            else:
+                launcher_path = fake_bin / "rustup"
+                launcher_path.write_text(
+                    "#!/bin/sh\n"
+                    'exec "$KD4_TEST_PYTHON" "$KD4_TEST_RUSTUP_RECORDER" "$@"\n',
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                launcher_path.chmod(launcher_path.stat().st_mode | 0o111)
+
+            env = os.environ.copy()
+            env["KD4_TEST_PYTHON"] = str(Path(sys.executable).resolve())
+            env["KD4_TEST_RUSTUP_RECORDER"] = str(recorder_path.resolve())
+            env["KD4_TEST_RUSTUP_RECORD"] = str(record_path.resolve())
+            env["PATH"] = str(fake_bin.resolve())
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/format.py",
+                    "--check",
+                    "--only",
+                    "rust",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=30,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(result.stderr, "")
+            self.assertIn("Starting Rust formatter...", result.stdout)
+            self.assertIn("==> Rust formatter finished", result.stdout)
+            self.assertIn(
+                f"$ rustup run {tool_versions.RUSTFMT_TOOLCHAIN} "
+                "cargo fmt --check\n",
+                result.stdout,
+            )
+            self.assertTrue(record_path.is_file(), result.stdout)
+            invocations = [
+                json.loads(line)
+                for line in record_path.read_text(encoding="utf-8").splitlines()
+                if line
+            ]
+            self.assertEqual(len(invocations), 1)
+            invocation = invocations[0]
+            self.assertEqual(
+                invocation["args"],
+                [
+                    "run",
+                    tool_versions.RUSTFMT_TOOLCHAIN,
+                    "cargo",
+                    "fmt",
+                    "--check",
+                ],
+            )
+            self.assertEqual(
+                os.path.normcase(os.path.realpath(invocation["cwd"])),
+                os.path.normcase(os.path.realpath(REPO_ROOT / "codex-rs")),
+            )
+
     def test_formatter_full_path_includes_prettier_targets(self) -> None:
         format_script = load_format_module()
 
@@ -937,6 +1534,36 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         self.assertIn(
             "--fast-local excludes formatter groups selected by --only: prettier",
             stderr.getvalue(),
+        )
+
+    def test_formatter_cli_rejects_fast_local_prettier_selection(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/format.py",
+                "--check",
+                "--fast-local",
+                "--only",
+                "prettier",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=30,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            2,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertEqual(result.stdout, "")
+        self.assertIn(
+            "--fast-local excludes formatter groups selected by --only: prettier",
+            result.stderr,
         )
 
     def test_ci_formatter_jobs_install_and_use_pinned_nightly_rustfmt(self) -> None:

@@ -1,0 +1,1662 @@
+from __future__ import annotations
+
+import argparse
+import ast
+import base64
+from collections import Counter
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tarfile
+import tempfile
+import tomllib
+from typing import Any
+import uuid
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
+from scripts.completion_proof_inventory_v2 import ActiveHostApplicabilityIssuerV1
+from scripts.completion_proof_inventory_v2 import DOCTEST_RECAPTURE_PACKAGE_SPECS
+from scripts.completion_proof_inventory_v2 import DOCTEST_RECAPTURE_PARENT_TARGETS
+from scripts.completion_proof_inventory_v2 import FROZEN_V1_BASELINE_ASSOCIATIONS_SHA256
+from scripts.completion_proof_inventory_v2 import FROZEN_V1_BASELINE_IDS_SHA256
+from scripts.completion_proof_inventory_v2 import FROZEN_V1_INVENTORY_RAW_SHA256
+from scripts.completion_proof_inventory_v2 import FROZEN_V1_INVENTORY_SEMANTIC_SHA256
+from scripts.completion_proof_inventory_v2 import FROZEN_V1_LEDGER_RAW_SHA256
+from scripts.completion_proof_inventory_v2 import FROZEN_V1_WORKSPACE_FINGERPRINT
+from scripts.completion_proof_inventory_v2 import INVENTORY_V2_SCHEMA_IDS
+from scripts.completion_proof_inventory_v2 import INVENTORY_V2_SCHEMA_PATHS
+from scripts.completion_proof_inventory_v2 import INVENTORY_V2_SCHEMA_RAW_SHA256S
+from scripts.completion_proof_inventory_v2 import canonical_jcs
+from scripts.completion_proof_inventory_v2 import doctest_recovered_child_sources_v1
+from scripts.completion_proof_inventory_v2 import frozen_baseline_obligation_id_v2
+from scripts.completion_proof_inventory_v2 import inventory_declaration_id_v2
+from scripts.completion_proof_inventory_v2 import inventory_declaration_obligation_id_v2
+from scripts.completion_proof_inventory_v2 import proof_hash
+from scripts.completion_proof_inventory_v2 import validate_frozen_test_inventory_v2
+from scripts.completion_proof_inventory_v2 import validate_doctest_recapture_packet_v1
+from scripts.completion_proof_inventory_v2 import validate_inventory_ledger_predecessor_closure
+from scripts.completion_proof_inventory_v2 import validate_inventory_recovery_authority_v1
+from scripts.completion_proof_inventory_v2 import validate_test_replacement_ledger_v2
+from scripts.rust_test_runner import Manifest
+from scripts.rust_test_runner import RunnerError
+from scripts.rust_test_runner import Target
+
+
+V1_INVENTORY_PATH = ".codex/validation/frozen-test-inventory-v1.json"
+V1_LEDGER_PATH = ".codex/validation/test-replacements-v1.json"
+V2_INVENTORY_PATH = ".codex/validation/frozen-test-inventory-v2.json"
+V2_RECOVERY_PATH = ".codex/validation/frozen-test-inventory-v2-recoveries.json"
+V2_DOCTEST_RECAPTURE_PATH = (
+    ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json"
+)
+V2_LEDGER_PATH = ".codex/validation/test-replacements-v2.json"
+RUST_TEST_MANIFEST_PATH = "codex-rs/.config/kd4-rust-tests.toml"
+BASELINE_COMMIT = "60bb133fa0a4f25e83851ab16d8c462e5f42ff95"
+EXPECTED_BASELINE_COUNT = 15_544
+EXPECTED_DECLARATION_COUNT = 15_547
+EXPECTED_SOURCE_TREE_SHA256 = (
+    "654591dd1ddda7a77312172ec7c70e60e80990590c7c74a7c3b08a445279d90e"
+)
+EXPECTED_REPOSITORY_IDENTITY_SHA256 = (
+    "f386e4786f3a61829ecdd61e764fa9d65eddbd08f2902745c6480bce448573cc"
+)
+RECAPTURE_TOOLCHAIN = "1.95.0-x86_64-pc-windows-msvc"
+
+ROUTE_VALIDATION_IDS = {
+    "argument-comment-lint-native": "tools.argument-comment-lint.native",
+    "javascript-jest": "sdk.typescript.jest",
+    "python-pytest": "sdk.python.pytest",
+    "python-unittest": "maintenance.root-unittest",
+    "rust-doctest": "rust.doctest.workspace",
+    "rust-nextest": "rust.nextest.workspace",
+    "windows-sandbox-smoke-native": "windows.sandbox-smoke",
+}
+V1_TO_V2_RUNNER_KIND = {
+    "argument-comment-lint-native": "argument-comment-lint-native",
+    "javascript-jest": "javascript-jest",
+    "python-pytest": "python-pytest",
+    "python-unittest": "python-unittest",
+    "rust-doctest": "rust-doctest",
+    "rust-nextest": "rust-nextest",
+    "windows-sandbox-smoke": "windows-sandbox-smoke-native",
+}
+
+SOURCE_ONLY_SPECS = (
+    {
+        "canonical_id": (
+            "rust-nextest::codex-http-client::codex_http_client$"
+            "outbound_proxy::tests::unsupported_platform_system_proxy_falls_back_explicitly"
+        ),
+        "line": 328,
+        "native_id": (
+            "codex-http-client::codex_http_client$outbound_proxy::tests::"
+            "unsupported_platform_system_proxy_falls_back_explicitly"
+        ),
+        "required_hosts": ["linux"],
+        "source_path": "codex-rs/http-client/src/outbound_proxy_tests.rs",
+    },
+    {
+        "canonical_id": (
+            "rust-nextest::codex-core::codex_core$tools::command_output_artifact::"
+            "hardening_tests::read_rejects_uuid_named_symlink_outside_thread_directory"
+        ),
+        "line": 5985,
+        "native_id": (
+            "codex-core::codex_core$tools::command_output_artifact::hardening_tests::"
+            "read_rejects_uuid_named_symlink_outside_thread_directory"
+        ),
+        "required_hosts": ["darwin", "linux"],
+        "source_path": "codex-rs/core/src/tools/command_output_artifact.rs",
+    },
+    {
+        "canonical_id": (
+            "rust-nextest::codex-core::turn_latency_bench$turn_latency::tests::"
+            "ab_worker_tree_cleanup_process_group_survives_root_exit"
+        ),
+        "line": 6010,
+        "native_id": (
+            "codex-core::turn_latency_bench$turn_latency::tests::"
+            "ab_worker_tree_cleanup_process_group_survives_root_exit"
+        ),
+        "required_hosts": ["darwin", "linux"],
+        "source_path": "codex-rs/core/benches/turn_latency/tests.rs",
+    },
+)
+
+UNITTEST_RUNNER_SITES = [
+    {
+        "column": 18,
+        "line": 868,
+        "parent_id": "FilteringArgumentPolicyTest.test_package_and_target_overrides_are_rejected_through_cli",
+        "path": "scripts/test_rust_test_runner.py",
+    },
+    {
+        "column": 18,
+        "line": 875,
+        "parent_id": "FilteringArgumentPolicyTest.test_no_tests_override_is_rejected_through_cli",
+        "path": "scripts/test_rust_test_runner.py",
+    },
+    {
+        "column": 18,
+        "line": 913,
+        "parent_id": "GenericRecipeGuardTest.test_every_codex_core_package_spelling_is_rejected_through_cli",
+        "path": "scripts/test_rust_test_runner.py",
+    },
+    {
+        "column": 22,
+        "line": 1688,
+        "parent_id": "TargetDirectoryPropagationTest.test_relative_codex_rs_target_dir_is_rejected_before_cargo_through_cli",
+        "path": "scripts/test_rust_test_runner.py",
+    },
+    {
+        "column": 18,
+        "line": 1704,
+        "parent_id": "TargetDirectoryPropagationTest.test_effective_environment_target_dir_is_validated_before_cargo_through_cli",
+        "path": "scripts/test_rust_test_runner.py",
+    },
+]
+
+OWNED_ARTIFACT_PATTERNS = (
+    "frozen-test-inventory-v2*.json",
+    "test-replacements-v2*.json",
+)
+
+_DESCRIBE_RE = re.compile(r'^\s*describe\s*\(\s*(["\'])(.*?)\1\s*,.*?\{\s*$')
+_TEST_RE = re.compile(
+    r'^\s*(it|test)(\.[A-Za-z_][A-Za-z0-9_]*)?\s*\(\s*(["\'])(.*?)\3\s*,'
+)
+
+
+class MaterializationError(RuntimeError):
+    pass
+
+
+def _read_frozen_json(path: Path, expected_sha256: str) -> tuple[bytes, dict[str, Any]]:
+    raw = path.read_bytes()
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual != expected_sha256:
+        raise MaterializationError(
+            f"frozen input hash mismatch for {path}: expected {expected_sha256}, got {actual}"
+        )
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise MaterializationError(f"frozen input must be an object: {path}")
+    return raw, value
+
+
+def _execution_input_contract(*, owned: list[dict[str, Any]], consumed: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    projection = {
+        "consumed": sorted(consumed or [], key=canonical_jcs),
+        "owned": sorted(owned, key=canonical_jcs),
+        "schema_version": 1,
+    }
+    digest = proof_hash("kd4.execution-input-contract.v1", projection)
+    return {
+        **projection,
+        "contract_id": f"execution-input-contract-v1.{digest}",
+        "contract_sha256": digest,
+    }
+
+
+def _cargo_context(
+    *,
+    manifest_path: Path,
+    package_name: str,
+    target_kind: str,
+    target_name: str,
+    target_source_path: Path,
+    repo_root: Path,
+    features: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    projection = {
+        "cargo_profile": "test",
+        "feature_selection": {
+            "additional_features": sorted(features),
+            "kind": "default",
+        },
+        "package_manifest_path": manifest_path.relative_to(repo_root).as_posix(),
+        "package_name": package_name,
+        "schema_version": 1,
+        "target_kind": target_kind,
+        "target_name": target_name,
+        "target_source_path": target_source_path.relative_to(repo_root).as_posix(),
+        "workspace_manifest_path": "codex-rs/Cargo.toml",
+    }
+    return {
+        **projection,
+        "context_sha256": proof_hash("kd4.cargo-target-context-spec.v1", projection),
+    }
+
+
+def _manifest_index(repo_root: Path) -> dict[str, tuple[Path, dict[str, Any]]]:
+    result: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for manifest in sorted((repo_root / "codex-rs").rglob("Cargo.toml")):
+        value = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        name = value.get("package", {}).get("name")
+        if isinstance(name, str):
+            if name in result:
+                raise MaterializationError(f"duplicate Cargo package name: {name}")
+            result[name] = (manifest, value)
+    return result
+
+
+def _cargo_targets(manifest: Path, data: dict[str, Any]) -> list[tuple[str, str, Path]]:
+    base = manifest.parent
+    package_name = data["package"]["name"]
+    result: list[tuple[str, str, Path]] = []
+    lib = data.get("lib")
+    if isinstance(lib, dict) or (base / "src/lib.rs").is_file():
+        lib = lib if isinstance(lib, dict) else {}
+        result.append(
+            (
+                str(lib.get("name", package_name.replace("-", "_"))),
+                "proc-macro" if lib.get("proc-macro") else "lib",
+                base / str(lib.get("path", "src/lib.rs")),
+            )
+        )
+    for target_kind, table_name, folder in (
+        ("bin", "bin", "src/bin"),
+        ("test", "test", "tests"),
+        ("bench", "bench", "benches"),
+        ("example", "example", "examples"),
+    ):
+        for target in data.get(table_name, []):
+            result.append(
+                (
+                    str(target["name"]),
+                    target_kind,
+                    base / str(target.get("path", f"{folder}/{target['name']}.rs")),
+                )
+            )
+        auto_root = base / folder
+        if auto_root.is_dir():
+            result.extend((path.stem, target_kind, path) for path in auto_root.glob("*.rs"))
+            result.extend((path.parent.name, target_kind, path) for path in auto_root.glob("*/main.rs"))
+    if (base / "src/main.rs").is_file():
+        result.append((package_name, "bin", base / "src/main.rs"))
+    unique = {(name, kind, path.resolve()): (name, kind, path) for name, kind, path in result}
+    return list(unique.values())
+
+
+def _resolve_cargo_target(
+    package_name: str,
+    binary_name: str,
+    manifests: dict[str, tuple[Path, dict[str, Any]]],
+) -> tuple[Path, str, str, Path]:
+    try:
+        manifest, data = manifests[package_name]
+    except KeyError as exc:
+        raise MaterializationError(f"no checked-in manifest for Cargo package {package_name}") from exc
+    targets = _cargo_targets(manifest, data)
+    matches = [target for target in targets if target[0] == binary_name]
+    if not matches and binary_name.endswith("_bench"):
+        matches = [
+            target for target in targets
+            if target[0] == binary_name.removesuffix("_bench") and target[1] == "bench"
+        ]
+    if len(matches) != 1:
+        raise MaterializationError(
+            f"Cargo binary {package_name}::{binary_name} mapped to {len(matches)} targets"
+        )
+    target_name, target_kind, source = matches[0]
+    if not source.is_file():
+        raise MaterializationError(f"Cargo target source does not exist: {source}")
+    return manifest, target_kind, target_name, source
+
+
+def _resolve_manifest_target(
+    target: Target,
+    manifests: dict[str, tuple[Path, dict[str, Any]]],
+) -> tuple[Path, str, str, Path]:
+    try:
+        manifest, data = manifests[target.package]
+    except KeyError as exc:
+        raise MaterializationError(
+            f"Rust test manifest target {target.name!r} declares missing Cargo package "
+            f"{target.package!r}"
+        ) from exc
+    cargo_targets = _cargo_targets(manifest, data)
+    if target.selector_kind == "lib":
+        matches = [item for item in cargo_targets if item[1] in {"lib", "proc-macro"}]
+    else:
+        matches = [
+            item
+            for item in cargo_targets
+            if item[0] == target.selector_value and item[1] == target.selector_kind
+        ]
+    if len(matches) != 1:
+        raise MaterializationError(
+            f"Rust test manifest target {target.name!r} mapped to {len(matches)} Cargo targets"
+        )
+    target_name, target_kind, source = matches[0]
+    if not source.is_file():
+        raise MaterializationError(
+            f"Rust test manifest target {target.name!r} source does not exist: {source}"
+        )
+    return manifest, target_kind, target_name, source
+
+
+def _manifest_feature_contexts(
+    repo_root: Path,
+    manifests: dict[str, tuple[Path, dict[str, Any]]],
+) -> tuple[
+    bytes,
+    dict[tuple[str, str, str], tuple[str, ...]],
+    dict[str, tuple[str, Path, str, str, Path]],
+]:
+    manifest_path = repo_root / RUST_TEST_MANIFEST_PATH
+    try:
+        manifest = Manifest.load(manifest_path)
+    except RunnerError as exc:
+        raise MaterializationError(str(exc)) from exc
+    raw = manifest_path.read_bytes()
+    feature_contexts: dict[tuple[str, str, str], tuple[str, ...]] = {}
+    owners: dict[tuple[str, str, str], str] = {}
+    resolved_targets: dict[str, tuple[str, Path, str, str, Path]] = {}
+    for name, target in manifest.targets.items():
+        resolved = _resolve_manifest_target(target, manifests)
+        resolved_targets[name] = (target.package, *resolved)
+        _, target_kind, target_name, _ = resolved
+        identity = (target.package, target_kind, target_name)
+        features = tuple(sorted(target.features))
+        prior = feature_contexts.get(identity)
+        if prior is not None and prior != features:
+            raise MaterializationError(
+                "Rust test manifest has ambiguous feature selections for Cargo target "
+                f"{target.package}::{target_kind}/{target_name}: "
+                f"{owners[identity]!r} declares {list(prior)!r}, "
+                f"{name!r} declares {list(features)!r}"
+            )
+        feature_contexts[identity] = features
+        owners[identity] = name
+    return raw, feature_contexts, resolved_targets
+
+
+def _brace_delta(line: str) -> int:
+    delta = 0
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in {"'", '"', "`"}:
+            quote = char
+        elif char == "/" and index + 1 < len(line) and line[index + 1] == "/":
+            break
+        elif char == "{":
+            delta += 1
+        elif char == "}":
+            delta -= 1
+        index += 1
+    return delta
+
+
+def _jest_selector_index(repo_root: Path) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    ordinals: Counter[str] = Counter()
+    for path in sorted((repo_root / "sdk/typescript/tests").rglob("*.test.ts")):
+        depth = 0
+        describes: list[tuple[int, str]] = []
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            while describes and describes[-1][0] > depth:
+                describes.pop()
+            describe = _DESCRIBE_RE.match(line)
+            test = _TEST_RE.match(line)
+            if describe is not None:
+                describes.append((depth + max(1, _brace_delta(line)), describe.group(2)))
+            elif test is not None:
+                ancestors = [item[1] for item in describes]
+                full_title = " ".join([*ancestors, test.group(4)])
+                file_path = path.relative_to(repo_root).as_posix()
+                native_id = f"{file_path}::{full_title}"
+                if native_id in result:
+                    raise MaterializationError(f"ambiguous Jest selector: {native_id}")
+                result[native_id] = {
+                    "ancestor_titles": ancestors,
+                    "column": line.index(test.group(1)) + 1,
+                    "config_path": "sdk/typescript/jest.config.cjs",
+                    "file_path": file_path,
+                    "full_title": full_title,
+                    "kind": "javascript-jest",
+                    "line": line_number,
+                    "registration_ordinal": ordinals[native_id],
+                }
+                ordinals[native_id] += 1
+            depth += _brace_delta(line)
+    return result
+
+
+def _build_entry(
+    *,
+    baseline: dict[str, Any],
+    contract_sha256: str,
+    context_by_binary: dict[tuple[str, str], dict[str, Any]],
+    jest_selectors: dict[str, dict[str, Any]],
+    doctest_ordinals: Counter[tuple[str, str]],
+) -> dict[str, Any]:
+    framework = baseline["framework"]
+    runner_kind = V1_TO_V2_RUNNER_KIND[framework]
+    route_id = f"test-route.{runner_kind}.v1"
+    validation_id = ROUTE_VALIDATION_IDS[runner_kind]
+    identity = {
+        "kind": "test",
+        "route_id": route_id,
+        "test_id": baseline["baseline_id"],
+        "validation_id": validation_id,
+    }
+    native_id = baseline["native_id"]
+    context: dict[str, Any] | None = None
+    if runner_kind == "rust-nextest":
+        package_name, rest = native_id.split("::", 1)
+        binary_name, harness_name = rest.split("$", 1)
+        context = context_by_binary[(package_name, binary_name)]
+        selector = {
+            "cargo_target_context_spec_sha256": context["context_sha256"],
+            "harness_test_name": harness_name,
+            "kind": runner_kind,
+            "nextest_binary_id": f"{package_name}::{binary_name}",
+        }
+    elif runner_kind == "rust-doctest":
+        source_path = baseline["source"]
+        item_path = native_id.split(" - ", 1)[1].rsplit(" (line ", 1)[0]
+        context = context_by_binary[("doctest-source", source_path)]
+        ordinal_key = (source_path, item_path)
+        selector = {
+            "cargo_target_context_spec_sha256": context["context_sha256"],
+            "declaration_ordinal": doctest_ordinals[ordinal_key],
+            "harness_test_name": native_id,
+            "item_path": item_path,
+            "kind": runner_kind,
+            "source_path": source_path,
+        }
+        doctest_ordinals[ordinal_key] += 1
+    elif runner_kind == "python-unittest":
+        selector = {
+            "kind": runner_kind,
+            "parent_test_id": native_id,
+            "selection_unit": "parent-with-all-declared-subtests",
+            "subtest_manifest_sha256": proof_hash(
+                "kd4.python-unittest-subtest-manifest.pending-recapture.v1",
+                {"baseline_id": baseline["baseline_id"], "native_id": native_id},
+            ),
+        }
+    elif runner_kind == "python-pytest":
+        selector = {"kind": runner_kind, "node_id": native_id}
+    elif runner_kind == "javascript-jest":
+        try:
+            selector = jest_selectors[native_id]
+        except KeyError as exc:
+            raise MaterializationError(f"frozen Jest test is absent from checked-in source: {native_id}") from exc
+    elif runner_kind in {"argument-comment-lint-native", "windows-sandbox-smoke-native"}:
+        selector = {"case_id": native_id, "kind": runner_kind}
+    else:
+        raise MaterializationError(f"unsupported frozen framework: {framework}")
+    applicability = {
+        "kind": "host-set",
+        "required_hosts": sorted(baseline["platforms"]),
+    }
+    return {
+        "cargo_target_context_spec_sha256": context["context_sha256"] if context else None,
+        "executable_identity": identity,
+        "executable_identity_sha256": proof_hash("kd4.executable-identity.v1", identity),
+        "execution_input_contract_sha256": contract_sha256,
+        "platform_applicability": applicability,
+        "platform_applicability_sha256": proof_hash("kd4.platform-applicability.v1", applicability),
+        "runner_selector": selector,
+        "runner_selector_sha256": proof_hash("kd4.runner-selector.v1", selector),
+        "test_route_id": route_id,
+        "validation_id": validation_id,
+    }
+
+
+def _source_only_declaration(
+    spec: dict[str, Any],
+    contract_sha256: str,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    package_name, rest = spec["native_id"].split("::", 1)
+    binary_name, harness_name = rest.split("$", 1)
+    identity = {
+        "kind": "test",
+        "route_id": "test-route.rust-nextest.v1",
+        "test_id": spec["canonical_id"],
+        "validation_id": ROUTE_VALIDATION_IDS["rust-nextest"],
+    }
+    selector = {
+        "cargo_target_context_spec_sha256": context["context_sha256"],
+        "harness_test_name": harness_name,
+        "kind": "rust-nextest",
+        "nextest_binary_id": f"{package_name}::{binary_name}",
+    }
+    applicability = {"kind": "host-set", "required_hosts": spec["required_hosts"]}
+    entry = {
+        "cargo_target_context_spec_sha256": context["context_sha256"],
+        "executable_identity": identity,
+        "executable_identity_sha256": proof_hash("kd4.executable-identity.v1", identity),
+        "execution_input_contract_sha256": contract_sha256,
+        "platform_applicability": applicability,
+        "platform_applicability_sha256": proof_hash("kd4.platform-applicability.v1", applicability),
+        "runner_selector": selector,
+        "runner_selector_sha256": proof_hash("kd4.runner-selector.v1", selector),
+        "test_route_id": "test-route.rust-nextest.v1",
+        "validation_id": ROUTE_VALIDATION_IDS["rust-nextest"],
+    }
+    evidence = {
+        "confirmation_state": "deterministically-reconstructed-pending-off-host-compiled-confirmation",
+        "line": spec["line"],
+        "native_id": spec["native_id"],
+        "source_path": spec["source_path"],
+    }
+    provenance_projection = {
+        "evidence_paths": [spec["source_path"]],
+        "evidence_sha256": proof_hash("kd4.source-only-declaration-evidence.v1", evidence),
+        "kind": "platform-pending",
+        "schema_version": 1,
+    }
+    provenance = {
+        **provenance_projection,
+        "receipt_sha256": proof_hash("kd4.provenance-receipt.v1", provenance_projection),
+    }
+    declaration = {
+        "entry": entry,
+        "kind": "missing-baseline",
+        "source_provenance": provenance,
+    }
+    declaration["declaration_id"] = inventory_declaration_id_v2(
+        declaration["kind"], entry, provenance
+    )
+    declaration["obligation_id"] = inventory_declaration_obligation_id_v2(
+        declaration["kind"], entry, provenance
+    )
+    return declaration
+
+
+def _git_source_tree_sha256(repo_root: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "ls-tree", "-r", "--full-tree", BASELINE_COMMIT],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0 or not result.stdout:
+        raise MaterializationError(
+            f"cannot resolve frozen source tree: {result.stderr.decode(errors='replace').strip()}"
+        )
+    return hashlib.sha256(result.stdout).hexdigest()
+
+
+def _resolved_tool_identity(tool_name: str) -> tuple[Path, dict[str, Any]]:
+    result = subprocess.run(
+        ["rustup", "which", "--toolchain", RECAPTURE_TOOLCHAIN, tool_name],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise MaterializationError(
+            f"cannot resolve {tool_name} from {RECAPTURE_TOOLCHAIN}: "
+            f"{result.stderr.decode(errors='replace').strip()}"
+        )
+    try:
+        executable = Path(result.stdout.decode("utf-8").strip()).resolve(strict=True)
+    except (UnicodeDecodeError, OSError) as exc:
+        raise MaterializationError(
+            f"cannot resolve the installed {tool_name} executable"
+        ) from exc
+    version = subprocess.run(
+        [str(executable), "-Vv"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if version.returncode != 0 or not version.stdout:
+        raise MaterializationError(
+            f"cannot identify {tool_name} from {RECAPTURE_TOOLCHAIN}: "
+            f"{version.stderr.decode(errors='replace').strip()}"
+        )
+    executable_raw = executable.read_bytes()
+    return executable, {
+        "executable_path": str(executable),
+        "executable_sha256": hashlib.sha256(executable_raw).hexdigest(),
+        "version_verbose_base64": base64.b64encode(version.stdout).decode("ascii"),
+        "version_verbose_sha256": hashlib.sha256(version.stdout).hexdigest(),
+    }
+
+
+def recapture_doctests(repo_root: Path, cargo_target_dir: Path) -> dict[str, Any]:
+    """Run one complete baseline doctest-listing attempt or return no evidence."""
+
+    repo_root = repo_root.resolve()
+    if _git_source_tree_sha256(repo_root) != EXPECTED_SOURCE_TREE_SHA256:
+        raise MaterializationError("frozen baseline source-tree identity mismatch")
+    repository_identity = proof_hash(
+        "kd4.frozen-repository-identity.v1",
+        {
+            "baseline_commit": BASELINE_COMMIT,
+            "inventory_raw_sha256": FROZEN_V1_INVENTORY_RAW_SHA256,
+        },
+    )
+    if repository_identity != EXPECTED_REPOSITORY_IDENTITY_SHA256:
+        raise MaterializationError("frozen repository identity mismatch")
+
+    cargo_path, cargo_identity = _resolved_tool_identity("cargo")
+    rustc_path, rustc_identity = _resolved_tool_identity("rustc")
+    rustdoc_path, rustdoc_identity = _resolved_tool_identity("rustdoc")
+    toolchain = {
+        "cargo": cargo_identity,
+        "name": RECAPTURE_TOOLCHAIN,
+        "rustc": rustc_identity,
+        "rustdoc": rustdoc_identity,
+    }
+
+    with tempfile.TemporaryDirectory(prefix="kd4-doctest-recapture-") as temporary:
+        temporary_root = Path(temporary)
+        archive_path = temporary_root / "baseline.tar"
+        source_root = temporary_root / "source"
+        source_root.mkdir()
+        archive_argv = ["git", "archive", "--format=tar", BASELINE_COMMIT]
+        with archive_path.open("wb") as archive_file:
+            archive_result = subprocess.run(
+                archive_argv,
+                cwd=repo_root,
+                check=False,
+                stdout=archive_file,
+                stderr=subprocess.PIPE,
+            )
+        if archive_result.returncode != 0:
+            raise MaterializationError(
+                "cannot create isolated baseline archive: "
+                + archive_result.stderr.decode(errors="replace").strip()
+            )
+        archive_raw = archive_path.read_bytes()
+        if not archive_raw:
+            raise MaterializationError("isolated baseline archive is empty")
+        with tarfile.open(archive_path, mode="r:") as archive:
+            archive.extractall(source_root, filter="data")
+        isolated_cargo_root = source_root / "codex-rs"
+        if not (isolated_cargo_root / "Cargo.lock").is_file():
+            raise MaterializationError("isolated baseline archive has no Cargo.lock")
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "CARGO_NET_OFFLINE": "true",
+                "CARGO_TARGET_DIR": str(cargo_target_dir.resolve()),
+                "RUSTC": str(rustc_path),
+                "RUSTDOC": str(rustdoc_path),
+                "RUSTUP_TOOLCHAIN": RECAPTURE_TOOLCHAIN,
+            }
+        )
+        runs: list[dict[str, Any]] = []
+        parent_ordinals: Counter[str] = Counter()
+        global_ordinal = 0
+        for package_name, target_id in DOCTEST_RECAPTURE_PACKAGE_SPECS:
+            command_argv = [
+                "cargo", "test", "--locked", "--offline", "-p", package_name,
+                "--doc", "--", "--list", "--format", "terse",
+            ]
+            result = subprocess.run(
+                [str(cargo_path), *command_argv[1:]],
+                cwd=isolated_cargo_root,
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode != 0:
+                raise MaterializationError(
+                    f"doctest recapture package {package_name} returned nonzero; "
+                    "the complete attempt is discarded: "
+                    + result.stderr.decode(errors="replace").strip()
+                )
+            try:
+                listing_lines = [
+                    line for line in result.stdout.decode("utf-8").splitlines()
+                    if line.endswith(": test")
+                ]
+            except UnicodeDecodeError as exc:
+                raise MaterializationError(
+                    f"doctest recapture package {package_name} emitted non-UTF-8 output"
+                ) from exc
+            if not listing_lines:
+                raise MaterializationError(
+                    f"doctest recapture package {package_name} selected zero doctests; "
+                    "the complete attempt is discarded"
+                )
+            occurrences: list[dict[str, Any]] = []
+            for listing_line in listing_lines:
+                normalized = listing_line[:-len(": test")].replace("/", "\\")
+                parent_id = "rust-doctest::" + normalized
+                if DOCTEST_RECAPTURE_PARENT_TARGETS.get(parent_id) != target_id:
+                    raise MaterializationError(
+                        f"doctest recapture emitted an unexpected identity: {listing_line}"
+                    )
+                parent_ordinal = parent_ordinals[parent_id]
+                occurrences.append(
+                    {
+                        "global_ordinal": global_ordinal,
+                        "parent_baseline_id": parent_id,
+                        "parent_ordinal": parent_ordinal,
+                        "raw_listing_line": listing_line,
+                    }
+                )
+                parent_ordinals[parent_id] += 1
+                global_ordinal += 1
+            runs.append(
+                {
+                    "command_argv": command_argv,
+                    "exit_code": result.returncode,
+                    "package_name": package_name,
+                    "raw_occurrences": occurrences,
+                    "selected_count": len(occurrences),
+                    "stderr_base64": base64.b64encode(result.stderr).decode("ascii"),
+                    "stderr_sha256": hashlib.sha256(result.stderr).hexdigest(),
+                    "stdout_base64": base64.b64encode(result.stdout).decode("ascii"),
+                    "stdout_sha256": hashlib.sha256(result.stdout).hexdigest(),
+                    "target_id": target_id,
+                    "working_directory": "codex-rs",
+                }
+            )
+
+        packet = {
+            "attempt_id": str(uuid.uuid4()),
+            "baseline_commit": BASELINE_COMMIT,
+            "format_id": "kd4.doctest-recapture.v1",
+            "parent_counts": [
+                {"parent_baseline_id": parent, "raw_count": parent_ordinals[parent]}
+                for parent in sorted(parent_ordinals)
+            ],
+            "raw_occurrence_count": global_ordinal,
+            "repository_identity_sha256": repository_identity,
+            "runs": runs,
+            "schema_version": 1,
+            "source_isolation": {
+                "archive_command": archive_argv,
+                "archive_sha256": hashlib.sha256(archive_raw).hexdigest(),
+                "kind": "git-archive",
+            },
+            "source_tree_sha256": EXPECTED_SOURCE_TREE_SHA256,
+            "toolchain": toolchain,
+        }
+        packet["receipt_sha256"] = proof_hash(
+            "kd4.doctest-recapture-receipt.v1", packet
+        )
+        validate_doctest_recapture_packet_v1(packet)
+        return packet
+
+
+def _python_subtest_call_sites(source_path: Path) -> set[tuple[int, int, str]]:
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    sites: set[tuple[int, int, str]] = set()
+
+    class SiteVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.classes: list[str] = []
+            self.functions: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.classes.append(node.name)
+            self.generic_visit(node)
+            self.classes.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.functions.append(node.name)
+            self.generic_visit(node)
+            self.functions.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "subTest"
+                and self.classes
+                and self.functions
+            ):
+                sites.add(
+                    (
+                        node.lineno,
+                        node.col_offset + 1,
+                        f"{self.classes[-1]}.{self.functions[-1]}",
+                    )
+                )
+            self.generic_visit(node)
+
+    SiteVisitor().visit(tree)
+    return sites
+
+
+def validate_recovery_source_anchors(
+    recovery: dict[str, Any], frozen_inventory: dict[str, Any], repo_root: Path
+) -> None:
+    """Require every generated current-source anchor to resolve in this checkout."""
+
+    records = {record["kind"]: record for record in recovery["records"]}
+    unittest_sites = records["unittest"]["current_audit"]["runner_site_observations"]
+    observed_by_path: dict[str, set[tuple[int, int, str]]] = {}
+    for site in unittest_sites:
+        relative = site["path"]
+        if relative not in observed_by_path:
+            source_path = repo_root / relative
+            if not source_path.is_file():
+                raise MaterializationError(f"recovery source anchor path is missing: {relative}")
+            observed_by_path[relative] = _python_subtest_call_sites(source_path)
+        anchor = (site["line"], site["column"], site["parent_id"])
+        if anchor not in observed_by_path[relative]:
+            raise MaterializationError(
+                "recovery unittest source anchor does not resolve to a current subTest call: "
+                f"{relative}:{site['line']}:{site['column']} ({site['parent_id']})"
+            )
+
+    doctest_rows = [
+        row for row in frozen_inventory["tests"] if row["framework"] == "rust-doctest"
+    ]
+    declared_count = records["doctest"]["current_audit"]["declared_count"]
+    if declared_count != len(doctest_rows):
+        raise MaterializationError(
+            f"recovery doctest declared count {declared_count} does not match current source anchors "
+            f"{len(doctest_rows)}"
+        )
+    for row in doctest_rows:
+        relative = row["source"]
+        source_path = repo_root / relative
+        if not source_path.is_file():
+            raise MaterializationError(f"recovery doctest source anchor path is missing: {relative}")
+        source = source_path.read_text(encoding="utf-8")
+        if re.search(r"(?m)^\s*//[/!]\s*```(?:[A-Za-z_][A-Za-z0-9_-]*)?\s*$", source) is None:
+            raise MaterializationError(
+                f"recovery doctest source anchor has no current executable documentation fence: {relative}"
+            )
+        item_path = row["native_id"].split(" - ", 1)[1].rsplit(" (line ", 1)[0]
+        terminal_item = item_path.rsplit("::", 1)[-1]
+        if terminal_item != source_path.stem and re.search(
+            rf"\b(?:struct|enum|trait|type)\s+{re.escape(terminal_item)}\b", source
+        ) is None:
+            raise MaterializationError(
+                "recovery doctest source anchor does not contain its current declared item: "
+                f"{relative} ({item_path})"
+            )
+
+
+def _recovery_authority(
+    *,
+    frozen_inventory: dict[str, Any],
+    predecessor_entry_sha256s: dict[str, str],
+    doctest_contexts: list[dict[str, Any]],
+    doctest_recapture: dict[str, Any] | None,
+    repo_root: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    unittest_parents = sorted(
+        row["baseline_id"]
+        for row in frozen_inventory["tests"]
+        if row["framework"] == "python-unittest"
+    )
+    if len(unittest_parents) != 909:
+        raise MaterializationError(f"expected 909 frozen unittest parents, got {len(unittest_parents)}")
+    doctest_targets = sorted(
+        {
+            f"{context['package_name']}::{context['target_kind']}::{context['target_name']}"
+            for context in doctest_contexts
+        }
+    )
+    frozen_source_authority = {
+        "baseline_commit": BASELINE_COMMIT,
+        "repository_identity_sha256": proof_hash(
+            "kd4.frozen-repository-identity.v1",
+            {"baseline_commit": BASELINE_COMMIT, "inventory_raw_sha256": FROZEN_V1_INVENTORY_RAW_SHA256},
+        ),
+        "source_tree_sha256": _git_source_tree_sha256(repo_root),
+    }
+    records = [
+        {
+            "current_audit": {
+                "declared_count": 5,
+                "kind": "doctest",
+                "raw_count": None,
+                "unique_count": 5,
+            },
+            "gap_id": "gap.doctest-raw-versus-unique",
+            "kind": "doctest",
+            "legacy_evidence": {
+                "frozen_unique_count": 5,
+                "historical_raw_count": None,
+                "kind": "doctest",
+            },
+            "pending_requirement": {
+                "baseline_commit": BASELINE_COMMIT,
+                "kind": "doctest",
+                "reasons": ["historical-raw-count-unknown", "off-host-recapture-required"],
+                "required_package_targets": doctest_targets,
+            },
+            "recovery_id": "inventory-recovery.doctest.v1",
+            "resolution": None,
+            "state": "pending",
+            "transition_receipt_sha256": None,
+        },
+        {
+            "current_audit": {
+                "executable_ast_call_count": 62,
+                "excluded_embedded_fixture_count": 1,
+                "kind": "unittest",
+                "runner_site_observations": UNITTEST_RUNNER_SITES,
+                "text_call_count": 63,
+            },
+            "gap_id": "gap.unittest-subtest-expansion",
+            "kind": "unittest",
+            "legacy_evidence": {
+                "frozen_parent_count": 909,
+                "historical_subtest_call_count": None,
+                "kind": "unittest",
+            },
+            "pending_requirement": {
+                "baseline_commit": BASELINE_COMMIT,
+                "expected_parent_output_sha256s": [
+                    {
+                        "output_sha256": predecessor_entry_sha256s[parent],
+                        "parent_id": parent,
+                    }
+                    for parent in unittest_parents
+                ],
+                "kind": "unittest",
+                "reasons": ["historical-subtest-count-unknown", "parent-output-recapture-required"],
+                "required_parent_count": 909,
+                "required_parent_ids": unittest_parents,
+            },
+            "recovery_id": "inventory-recovery.unittest.v1",
+            "resolution": None,
+            "state": "pending",
+            "transition_receipt_sha256": None,
+        },
+    ]
+    recovery = {
+        "format_id": "kd4.inventory-recovery-authority.v1",
+        "frozen_source_authority": frozen_source_authority,
+        "records": records,
+        "schema_version": 1,
+    }
+    validate_recovery_source_anchors(recovery, frozen_inventory, repo_root)
+    recovery["semantic_sha256"] = proof_hash(
+        "kd4.inventory-recovery-authority.semantic.v1", recovery
+    )
+    recovery["self_hash"] = proof_hash(
+        "kd4.inventory-recovery-authority.self.v1", recovery
+    )
+    validate_inventory_recovery_authority_v1(recovery)
+    if doctest_recapture is None:
+        return recovery, []
+
+    validate_doctest_recapture_packet_v1(doctest_recapture)
+    authority_before_semantic_sha256 = recovery["semantic_sha256"]
+    children = doctest_recovered_child_sources_v1(doctest_recapture)
+    child_obligation_ids = sorted(
+        "inventory-v2-recovered."
+        + proof_hash("kd4.recovered-child-identity.v1", child)
+        for child in children
+    )
+    parent_container_ids = sorted(DOCTEST_RECAPTURE_PARENT_TARGETS)
+    transition = {
+        "authority_before_semantic_sha256": authority_before_semantic_sha256,
+        "child_obligation_ids": child_obligation_ids,
+        "frozen_source_authority_sha256": proof_hash(
+            "kd4.frozen-source-authority.v1", frozen_source_authority
+        ),
+        "parent_container_ids": parent_container_ids,
+        "recapture_receipt_sha256": doctest_recapture["receipt_sha256"],
+        "schema_version": 1,
+    }
+    transition["receipt_sha256"] = proof_hash(
+        "kd4.recovery-transition-receipt.v1", transition
+    )
+    records[0] = {
+        **records[0],
+        "current_audit": {
+            **records[0]["current_audit"],
+            "raw_count": doctest_recapture["raw_occurrence_count"],
+        },
+        "legacy_evidence": {
+            **records[0]["legacy_evidence"],
+            "historical_raw_count": doctest_recapture["raw_occurrence_count"],
+        },
+        "pending_requirement": None,
+        "resolution": {
+            "child_sources": children,
+            "parent_container_ids": parent_container_ids,
+            "parent_recapture_outputs": [],
+            "recapture_receipt_sha256": doctest_recapture["receipt_sha256"],
+        },
+        "state": "resolved",
+        "transition_receipt_sha256": transition["receipt_sha256"],
+    }
+    recovery = {
+        "format_id": "kd4.inventory-recovery-authority.v1",
+        "frozen_source_authority": frozen_source_authority,
+        "records": records,
+        "schema_version": 1,
+    }
+    validate_recovery_source_anchors(recovery, frozen_inventory, repo_root)
+    recovery["semantic_sha256"] = proof_hash(
+        "kd4.inventory-recovery-authority.semantic.v1", recovery
+    )
+    recovery["self_hash"] = proof_hash(
+        "kd4.inventory-recovery-authority.self.v1", recovery
+    )
+    validate_inventory_recovery_authority_v1(recovery)
+    return recovery, [transition]
+
+
+def _typed_v1_exception_provenance(
+    predecessor_row: dict[str, Any],
+    predecessor_entry: dict[str, Any],
+) -> dict[str, Any]:
+    tag = predecessor_row["provenance"]["kind"]
+    projection = {
+        "evidence_paths": [predecessor_entry["source"]],
+        "evidence_sha256": proof_hash(
+            "kd4.frozen-v1-exception-evidence.v1",
+            {"inventory_entry": predecessor_entry, "ledger_row": predecessor_row},
+        ),
+        "kind": tag,
+        "schema_version": 1,
+    }
+    return {
+        **projection,
+        "receipt_sha256": proof_hash("kd4.provenance-receipt.v1", projection),
+    }
+
+
+def build_materialized_bundle(
+    repo_root: Path, doctest_recapture_raw: bytes | None = None
+) -> dict[str, Any]:
+    repo_root = repo_root.resolve()
+    doctest_recapture: dict[str, Any] | None = None
+    if doctest_recapture_raw is not None:
+        try:
+            doctest_recapture = json.loads(doctest_recapture_raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise MaterializationError("doctest recapture artifact is invalid JSON") from exc
+        if canonical_jcs(doctest_recapture) != doctest_recapture_raw:
+            raise MaterializationError(
+                "doctest recapture artifact must be exact canonical JSON bytes"
+            )
+        validate_doctest_recapture_packet_v1(doctest_recapture)
+    _, frozen_inventory = _read_frozen_json(
+        repo_root / V1_INVENTORY_PATH, FROZEN_V1_INVENTORY_RAW_SHA256
+    )
+    _, frozen_ledger = _read_frozen_json(
+        repo_root / V1_LEDGER_PATH, FROZEN_V1_LEDGER_RAW_SHA256
+    )
+    predecessor_entries = {row["baseline_id"]: row for row in frozen_inventory["tests"]}
+    predecessor_rows = {row["baseline_id"]: row for row in frozen_ledger["rows"]}
+    baseline_ids = sorted(predecessor_entries)
+    if (
+        len(baseline_ids) != EXPECTED_BASELINE_COUNT
+        or baseline_ids != sorted(predecessor_rows)
+        or len(predecessor_rows) != EXPECTED_BASELINE_COUNT
+    ):
+        raise MaterializationError("V1 inventory and ledger do not form the exact 15,544-row baseline")
+
+    associations = [
+        {
+            "baseline_id": baseline_id,
+            "predecessor_entry_sha256": proof_hash(
+                "kd4.frozen-v1-inventory-entry.v1", predecessor_entries[baseline_id]
+            ),
+        }
+        for baseline_id in baseline_ids
+    ]
+    predecessor_entry_sha256s = {
+        association["baseline_id"]: association["predecessor_entry_sha256"]
+        for association in associations
+    }
+    reconciliation = {
+        "frozen_baseline_associations": associations,
+        "frozen_baseline_associations_sha256": FROZEN_V1_BASELINE_ASSOCIATIONS_SHA256,
+        "frozen_baseline_ids": baseline_ids,
+        "frozen_baseline_ids_sha256": FROZEN_V1_BASELINE_IDS_SHA256,
+        "frozen_inventory_raw_sha256": FROZEN_V1_INVENTORY_RAW_SHA256,
+        "frozen_inventory_semantic_sha256": FROZEN_V1_INVENTORY_SEMANTIC_SHA256,
+        "frozen_ledger_raw_sha256": FROZEN_V1_LEDGER_RAW_SHA256,
+        "schema_version": 1,
+    }
+    reconciliation["projection_sha256"] = proof_hash(
+        "kd4.predecessor-artifact-reconciliation.v1", reconciliation
+    )
+
+    source_paths = sorted(
+        {row["source"] for row in frozen_inventory["tests"]}
+        | {spec["source_path"] for spec in SOURCE_ONLY_SPECS}
+    )
+    contracts_by_source = {
+        source: _execution_input_contract(owned=[{"kind": "exact", "path": source}])
+        for source in source_paths
+    }
+    documentation_contract = _execution_input_contract(
+        owned=[{"kind": "glob", "pattern": "**/*.md", "root": "docs"}]
+    )
+    source_map_contract = _execution_input_contract(
+        owned=[{"kind": "exact", "path": "SOURCEMAP.md"}]
+    )
+    contracts = sorted(
+        [*contracts_by_source.values(), documentation_contract, source_map_contract],
+        key=canonical_jcs,
+    )
+
+    manifests = _manifest_index(repo_root)
+    rust_test_manifest_raw, manifest_features, manifest_targets = (
+        _manifest_feature_contexts(repo_root, manifests)
+    )
+    context_by_binary: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def add_context(
+        package_name: str,
+        binary_name: str,
+        resolved: tuple[Path, str, str, Path] | None = None,
+    ) -> None:
+        key = (package_name, binary_name)
+        manifest, target_kind, target_name, source = resolved or _resolve_cargo_target(
+            package_name, binary_name, manifests
+        )
+        features = manifest_features.get((package_name, target_kind, target_name), ())
+        context = _cargo_context(
+            manifest_path=manifest,
+            package_name=package_name,
+            target_kind=target_kind,
+            target_name=target_name,
+            target_source_path=source,
+            repo_root=repo_root,
+            features=features,
+        )
+        prior = context_by_binary.get(key)
+        if prior is not None and prior != context:
+            raise MaterializationError(
+                f"Cargo binary {package_name}::{binary_name} has ambiguous execution contexts"
+            )
+        context_by_binary[key] = context
+
+    for package_name, manifest, target_kind, target_name, source in manifest_targets.values():
+        add_context(
+            package_name,
+            target_name,
+            (manifest, target_kind, target_name, source),
+        )
+    for row in frozen_inventory["tests"]:
+        if row["framework"] != "rust-nextest":
+            continue
+        package_name, rest = row["native_id"].split("::", 1)
+        binary_name = rest.split("$", 1)[0]
+        key = (package_name, binary_name)
+        if key not in context_by_binary:
+            add_context(package_name, binary_name)
+    for spec in SOURCE_ONLY_SPECS:
+        package_name, rest = spec["native_id"].split("::", 1)
+        binary_name = rest.split("$", 1)[0]
+        key = (package_name, binary_name)
+        if key not in context_by_binary:
+            add_context(package_name, binary_name)
+    doctest_contexts: list[dict[str, Any]] = []
+    for row in frozen_inventory["tests"]:
+        if row["framework"] != "rust-doctest":
+            continue
+        source_path = repo_root / row["source"]
+        manifest = next(
+            (parent / "Cargo.toml" for parent in source_path.parents if (parent / "Cargo.toml").is_file()),
+            None,
+        )
+        if manifest is None or manifest.parent == repo_root:
+            raise MaterializationError(f"no Cargo manifest owns doctest source {row['source']}")
+        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        package_name = data["package"]["name"]
+        lib_targets = [target for target in _cargo_targets(manifest, data) if target[1] in {"lib", "proc-macro"}]
+        if len(lib_targets) != 1:
+            raise MaterializationError(f"doctest source does not map to one library target: {row['source']}")
+        target_name, target_kind, target_source = lib_targets[0]
+        context = _cargo_context(
+            manifest_path=manifest,
+            package_name=package_name,
+            target_kind=target_kind,
+            target_name=target_name,
+            target_source_path=target_source,
+            repo_root=repo_root,
+            features=manifest_features.get(
+                (package_name, target_kind, target_name), ()
+            ),
+        )
+        context_by_binary[("doctest-source", row["source"])] = context
+        doctest_contexts.append(context)
+
+    cargo_contexts_by_hash = {
+        context["context_sha256"]: context for context in context_by_binary.values()
+    }
+    cargo_contexts = sorted(cargo_contexts_by_hash.values(), key=lambda item: item["context_sha256"])
+    jest_selectors = _jest_selector_index(repo_root)
+    doctest_ordinals: Counter[tuple[str, str]] = Counter()
+    declarations: list[dict[str, Any]] = []
+    declarations_by_baseline: dict[str, dict[str, Any]] = {}
+    for baseline_id in baseline_ids:
+        baseline = predecessor_entries[baseline_id]
+        entry = _build_entry(
+            baseline=baseline,
+            contract_sha256=contracts_by_source[baseline["source"]]["contract_sha256"],
+            context_by_binary=context_by_binary,
+            jest_selectors=jest_selectors,
+            doctest_ordinals=doctest_ordinals,
+        )
+        declaration = {
+            "baseline_id": baseline_id,
+            "entry": entry,
+            "kind": "frozen-baseline",
+            "predecessor_entry_sha256": predecessor_entry_sha256s[baseline_id],
+        }
+        declarations.append(declaration)
+        declarations_by_baseline[baseline_id] = declaration
+    for spec in SOURCE_ONLY_SPECS:
+        package_name, rest = spec["native_id"].split("::", 1)
+        binary_name = rest.split("$", 1)[0]
+        declarations.append(
+            _source_only_declaration(
+                spec,
+                contracts_by_source[spec["source_path"]]["contract_sha256"],
+                context_by_binary[(package_name, binary_name)],
+            )
+        )
+    declarations.sort(key=canonical_jcs)
+    if len(declarations) != EXPECTED_DECLARATION_COUNT:
+        raise MaterializationError(f"expected 15,547 V2 declarations, got {len(declarations)}")
+
+    recovery, transition_receipts = _recovery_authority(
+        frozen_inventory=frozen_inventory,
+        predecessor_entry_sha256s=predecessor_entry_sha256s,
+        doctest_contexts=doctest_contexts,
+        doctest_recapture=doctest_recapture,
+        repo_root=repo_root,
+    )
+    recovery_raw = canonical_jcs(recovery)
+    schema_resources = [
+        {"path": path, "raw_sha256": raw_sha256, "schema_id": schema_id}
+        for path, raw_sha256, schema_id in zip(
+            INVENTORY_V2_SCHEMA_PATHS,
+            INVENTORY_V2_SCHEMA_RAW_SHA256S,
+            INVENTORY_V2_SCHEMA_IDS,
+        )
+    ]
+    routes = [
+        {
+            "route_id": f"test-route.{kind}.v1",
+            "runner_kind": kind,
+            "validation_id": ROUTE_VALIDATION_IDS[kind],
+        }
+        for kind in ROUTE_VALIDATION_IDS
+    ]
+    action_routes = sorted(
+        [
+            {
+                "action_id": "documentation.markdown",
+                "execution_input_contract_sha256": documentation_contract["contract_sha256"],
+                "validation_id": "documentation.markdown",
+            },
+            {
+                "action_id": "maintenance.source-map",
+                "execution_input_contract_sha256": source_map_contract["contract_sha256"],
+                "validation_id": "maintenance.source-map",
+            },
+        ],
+        key=canonical_jcs,
+    )
+    materialization_source_projection = {
+        "predecessor_inventory_raw_sha256": FROZEN_V1_INVENTORY_RAW_SHA256,
+        "predecessor_ledger_raw_sha256": FROZEN_V1_LEDGER_RAW_SHA256,
+        "rust_test_manifest": {
+            "path": RUST_TEST_MANIFEST_PATH,
+            "raw_sha256": hashlib.sha256(rust_test_manifest_raw).hexdigest(),
+        },
+        "source_only_specs": list(SOURCE_ONLY_SPECS),
+    }
+    if doctest_recapture is not None:
+        materialization_source_projection["doctest_recapture"] = {
+            "path": V2_DOCTEST_RECAPTURE_PATH,
+            "raw_sha256": hashlib.sha256(doctest_recapture_raw).hexdigest(),
+            "receipt_sha256": doctest_recapture["receipt_sha256"],
+        }
+    inventory = {
+        "action_routes": action_routes,
+        "authority": {
+            "format_id": "kd4-frozen-test-inventory-v2",
+            "raw_sha256": hashlib.sha256(canonical_jcs(materialization_source_projection)).hexdigest(),
+            "schema_sha256": INVENTORY_V2_SCHEMA_RAW_SHA256S[1],
+            "semantic_sha256": "0" * 64,
+            "self_hash": "0" * 64,
+        },
+        "cargo_target_context_specs": cargo_contexts,
+        "declaration_universe": declarations,
+        "execution_input_contracts": contracts,
+        "format_id": "kd4-frozen-test-inventory-v2",
+        "predecessor": {
+            "inventory_hash": FROZEN_V1_INVENTORY_SEMANTIC_SHA256,
+            "raw_sha256": FROZEN_V1_INVENTORY_RAW_SHA256,
+            "recorded_baseline_workspace_fingerprint": FROZEN_V1_WORKSPACE_FINGERPRINT,
+            "test_count": EXPECTED_BASELINE_COUNT,
+        },
+        "predecessor_reconciliation": reconciliation,
+        "recovery_authority": {
+            "path": V2_RECOVERY_PATH,
+            "raw_sha256": hashlib.sha256(recovery_raw).hexdigest(),
+            "semantic_sha256": recovery["semantic_sha256"],
+            "self_hash": recovery["self_hash"],
+        },
+        "routes": routes,
+        "schema_resources": schema_resources,
+        "schema_resources_sha256": proof_hash(
+            "kd4.inventory-v2-schema-resource-set.v1", schema_resources
+        ),
+        "schema_version": 2,
+    }
+    inventory_semantic_projection = {
+        key: inventory[key]
+        for key in (
+            "action_routes",
+            "cargo_target_context_specs",
+            "declaration_universe",
+            "execution_input_contracts",
+            "format_id",
+            "predecessor",
+            "predecessor_reconciliation",
+            "recovery_authority",
+            "routes",
+            "schema_resources",
+            "schema_resources_sha256",
+            "schema_version",
+        )
+    }
+    inventory["authority"]["semantic_sha256"] = proof_hash(
+        "kd4.frozen-test-inventory-v2.semantic", inventory_semantic_projection
+    )
+    inventory["authority"]["self_hash"] = proof_hash(
+        "kd4.frozen-test-inventory-v2.authority.self.v1",
+        {
+            key: inventory["authority"][key]
+            for key in ("format_id", "raw_sha256", "schema_sha256", "semantic_sha256")
+        },
+    )
+
+    ledger_rows: list[dict[str, Any]] = []
+    for baseline_id in baseline_ids:
+        predecessor_row = predecessor_rows[baseline_id]
+        declaration = declarations_by_baseline[baseline_id]
+        resolution = predecessor_row["resolution"]
+        if doctest_recapture is not None and baseline_id in DOCTEST_RECAPTURE_PARENT_TARGETS:
+            transition = transition_receipts[0]
+            child_obligation_ids = sorted(
+                child_id
+                for child_id, child in zip(
+                    transition["child_obligation_ids"],
+                    recovery["records"][0]["resolution"]["child_sources"],
+                )
+                if child["parent_baseline_id"] == baseline_id
+            )
+            disposition = {
+                "child_obligation_ids": child_obligation_ids,
+                "kind": "recovered-container",
+                "transition_receipt_sha256": transition["receipt_sha256"],
+            }
+        elif resolution == "unresolved":
+            disposition: dict[str, Any] = {"kind": "unresolved"}
+        elif resolution == "replacement":
+            predecessor_row_sha256 = proof_hash(
+                "kd4.frozen-v1-replacement-ledger-row.v1", predecessor_row
+            )
+            disposition = {
+                "contract": {
+                    "accepted": None,
+                    "candidate": None,
+                    "legacy_replacement_hint": {
+                        "predecessor_row_sha256": predecessor_row_sha256,
+                        "replacement_ids": sorted(predecessor_row["replacement_ids"]),
+                    },
+                    "state": "pending-review",
+                },
+                "edge_ids": sorted([
+                    "replacement-edge-v2."
+                    + proof_hash(
+                        "kd4.legacy-replacement-edge.v1",
+                        {
+                            "baseline_id": baseline_id,
+                            "predecessor_row_sha256": predecessor_row_sha256,
+                            "replacement_id": replacement_id,
+                        },
+                    )
+                    for replacement_id in sorted(predecessor_row["replacement_ids"])
+                ]),
+                "kind": "replacement",
+                "stage2_incorrect_behavior_ids": None,
+            }
+        elif resolution == "exception":
+            disposition = {
+                "exception": {
+                    "kind": "pending-legacy",
+                    "provenance_receipt": _typed_v1_exception_provenance(
+                        predecessor_row, predecessor_entries[baseline_id]
+                    ),
+                    "tag": predecessor_row["provenance"]["kind"],
+                },
+                "kind": "exception",
+            }
+        else:
+            raise MaterializationError(f"unknown V1 ledger resolution: {resolution}")
+        ledger_rows.append(
+            {
+                "baseline_id": baseline_id,
+                "disposition": disposition,
+                "obligation_id": frozen_baseline_obligation_id_v2(declaration),
+            }
+        )
+    for declaration in declarations:
+        if declaration["kind"] == "frozen-baseline":
+            continue
+        ledger_rows.append(
+            {
+                "baseline_id": None,
+                "disposition": {
+                    "exception": {
+                        "kind": "pending-legacy",
+                        "provenance_receipt": declaration["source_provenance"],
+                        "tag": "platform-pending",
+                    },
+                    "kind": "exception",
+                },
+                "obligation_id": declaration["obligation_id"],
+            }
+        )
+    ledger_rows.sort(key=canonical_jcs)
+    ledger = {
+        "format_id": "kd4.test-replacement-ledger.v2",
+        "inventory_authority": {
+            "path": V2_INVENTORY_PATH,
+            "raw_sha256": inventory["authority"]["raw_sha256"],
+            "semantic_sha256": inventory["authority"]["semantic_sha256"],
+            "self_hash": inventory["authority"]["self_hash"],
+        },
+        "rows": ledger_rows,
+        "schema_version": 2,
+        "trusted_defect_receipts": None,
+    }
+    ledger["semantic_sha256"] = proof_hash("kd4.test-replacement-ledger.v2.semantic", ledger)
+    ledger["self_hash"] = proof_hash("kd4.test-replacement-ledger.v2.self", ledger)
+
+    validate_frozen_test_inventory_v2(inventory)
+    validate_test_replacement_ledger_v2(ledger)
+    issuer = ActiveHostApplicabilityIssuerV1(
+        "39bc53cc-ec47-4ea4-a940-b9a874779c30",
+        hashlib.sha256(b"kd4.inventory-v2-a2.dormant-validation-only.v1").digest(),
+    )
+    validate_inventory_ledger_predecessor_closure(
+        inventory,
+        ledger,
+        recovery_raw,
+        transition_receipts,
+        issuer,
+        doctest_recapture_raw,
+    )
+
+    documents = {
+        V2_INVENTORY_PATH: inventory,
+        V2_RECOVERY_PATH: recovery,
+        V2_LEDGER_PATH: ledger,
+    }
+    raw_documents = {path: canonical_jcs(document) for path, document in documents.items()}
+    if doctest_recapture is not None:
+        documents[V2_DOCTEST_RECAPTURE_PATH] = doctest_recapture
+        raw_documents[V2_DOCTEST_RECAPTURE_PATH] = doctest_recapture_raw
+    framework_counts = Counter(
+        declaration["entry"]["runner_selector"]["kind"] for declaration in declarations
+    )
+    disposition_counts = Counter(row["disposition"]["kind"] for row in ledger_rows)
+    return {
+        "documents": documents,
+        "raw_documents": raw_documents,
+        "summary": {
+            "artifact_sha256": {
+                path: hashlib.sha256(raw).hexdigest() for path, raw in raw_documents.items()
+            },
+            "authority_hashes": {
+                "inventory_semantic_sha256": inventory["authority"]["semantic_sha256"],
+                "inventory_self_hash": inventory["authority"]["self_hash"],
+                "ledger_semantic_sha256": ledger["semantic_sha256"],
+                "ledger_self_hash": ledger["self_hash"],
+                "recovery_semantic_sha256": recovery["semantic_sha256"],
+                "recovery_self_hash": recovery["self_hash"],
+            },
+            "counts": {
+                "cargo_target_contexts": len(cargo_contexts),
+                "frozen_baseline_declarations": EXPECTED_BASELINE_COUNT,
+                "inventory_declarations": len(declarations),
+                "ledger_rows": len(ledger_rows),
+                "recovery_records": len(recovery["records"]),
+                "source_only_declarations": len(SOURCE_ONLY_SPECS),
+            },
+            "disposition_counts": dict(sorted(disposition_counts.items())),
+            "framework_counts": dict(sorted(framework_counts.items())),
+            "intended_count": EXPECTED_DECLARATION_COUNT,
+            "selected_count": len(declarations),
+            "executed_count": len(ledger_rows),
+            "mode": (
+                "doctest-recovery-materialization"
+                if doctest_recapture is not None
+                else "dormant-materialization"
+            ),
+        },
+    }
+
+
+def _write_or_check(bundle: dict[str, Any], output_root: Path, *, write: bool) -> None:
+    expected_paths = set(bundle["raw_documents"])
+    validation_root = output_root / ".codex/validation"
+    unexpected: set[str] = set()
+    if validation_root.is_dir():
+        for pattern in OWNED_ARTIFACT_PATTERNS:
+            for candidate in validation_root.glob(pattern):
+                relative = candidate.relative_to(output_root).as_posix()
+                if relative not in expected_paths and not candidate.name.endswith(".schema.json"):
+                    unexpected.add(relative)
+    if unexpected:
+        raise MaterializationError(
+            "unexpected owned V2 artifacts: " + ", ".join(sorted(unexpected))
+        )
+
+    mismatches: list[str] = []
+    for relative, raw in bundle["raw_documents"].items():
+        destination = output_root / relative
+        if write:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(raw)
+        elif not destination.is_file() or destination.read_bytes() != raw:
+            mismatches.append(relative)
+    if mismatches:
+        raise MaterializationError(
+            "materialized V2 artifacts differ from deterministic output: " + ", ".join(mismatches)
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Recapture or materialize KD4 Inventory V2 recovery artifacts"
+    )
+    parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--output-root", type=Path)
+    parser.add_argument(
+        "--doctest-recapture-packet",
+        type=Path,
+        help="use this exact canonical packet while materializing",
+    )
+    parser.add_argument(
+        "--cargo-target-dir",
+        type=Path,
+        help="serialized Cargo target directory for direct doctest recapture",
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--write", action="store_true")
+    mode.add_argument("--check", action="store_true")
+    mode.add_argument("--recapture-doctests", action="store_true")
+    args = parser.parse_args(argv)
+    output_root = (args.output_root or args.repo_root).resolve()
+    try:
+        if args.recapture_doctests:
+            if args.doctest_recapture_packet is not None:
+                raise MaterializationError(
+                    "--doctest-recapture-packet is invalid during a direct recapture"
+                )
+            cargo_target_dir = args.cargo_target_dir or (
+                args.repo_root / "codex-rs" / "target-doctest-recapture-v1"
+            )
+            packet = recapture_doctests(args.repo_root, cargo_target_dir)
+            raw = canonical_jcs(packet)
+            destination = output_root / V2_DOCTEST_RECAPTURE_PATH
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_suffix(destination.suffix + ".tmp")
+            temporary.write_bytes(raw)
+            temporary.replace(destination)
+            print(
+                json.dumps(
+                    {
+                        "artifact_sha256": hashlib.sha256(raw).hexdigest(),
+                        "attempt_id": packet["attempt_id"],
+                        "operation": "recapture-doctests",
+                        "package_run_count": len(packet["runs"]),
+                        "raw_occurrence_count": packet["raw_occurrence_count"],
+                        "selected_count": packet["raw_occurrence_count"],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            return 0
+        packet_path = args.doctest_recapture_packet or (
+            args.repo_root / V2_DOCTEST_RECAPTURE_PATH
+        )
+        recapture_raw = packet_path.read_bytes() if packet_path.is_file() else None
+        bundle = build_materialized_bundle(args.repo_root, recapture_raw)
+        _write_or_check(bundle, output_root, write=args.write)
+    except (MaterializationError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        print(f"inventory-v2 materialization failed: {exc}", file=sys.stderr)
+        return 1
+    summary = dict(bundle["summary"])
+    summary["operation"] = "write" if args.write else "check"
+    print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

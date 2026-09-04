@@ -431,6 +431,8 @@ async fn execute_local_user_shell_command(
         network_sandbox_policy: permission_profile.network_sandbox_policy(),
         windows_sandbox_filesystem_overrides: None,
         windows_sandbox_additional_read_roots: Vec::new(),
+        prepared_canonical_windows_sandbox_launch: None,
+        canonical_windows_sandbox_launch_identity: None,
         arg0: None,
         exec_server_sandbox: None,
         exec_server_enforce_managed_network: false,

@@ -1,0 +1,161 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "stage1.inventory-recovery.doctest.v1.local-recapture",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex",
+          ".codex/validation/frozen-test-inventory-v2-doctest-recapture.json"
+        ],
+        [
+          ".codex",
+          ".codex/validation/frozen-test-inventory-v2-recoveries.schema.json"
+        ],
+        [
+          ".codex",
+          ".codex/validation/frozen-test-inventory-v2-recoveries.json"
+        ],
+        [
+          ".codex",
+          ".codex/validation/frozen-test-inventory-v2.json"
+        ],
+        [
+          ".codex",
+          ".codex/validation/test-replacements-v2.json"
+        ],
+        [
+          "SOURCEMAP.md",
+          "SOURCEMAP.md"
+        ],
+        [
+          "scripts",
+          "scripts/completion_proof_inventory_v2.py"
+        ],
+        [
+          "scripts",
+          "scripts/materialize_completion_proof_inventory_v2.py"
+        ],
+        [
+          "scripts",
+          "scripts/test_completion_proof_inventory_v2.py"
+        ],
+        [
+          "scripts",
+          "scripts/test_materialize_completion_proof_inventory_v2.py"
+        ],
+        [
+          "scripts",
+          "scripts/fixtures/completion_proof_v2_cross_language_vectors.json"
+        ],
+        [
+          "codex-rs",
+          "codex-rs/validation-contracts/src/recovery.rs"
+        ],
+        [
+          "codex-rs",
+          "codex-rs/validation-contracts/src/inventory_v2.rs"
+        ],
+        [
+          "codex-rs",
+          "codex-rs/validation-contracts/tests/cross_language_vectors.rs"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "worker:just-shell-test-gap-implementation-20260903",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts",
+          "scripts/test_build_tooling.py"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "root:completion-proof-migration-20260902",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+  },
+  "contract_claims": [
+    "completion-proof-runtime-policy",
+    "canonical-completion-proof-runner",
+    "frozen-test-inventory-reconciliation",
+    "test-replacement-ledger",
+    "real-runtime-test-migration",
+    "stage2-incorrect-behavior-log"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-04T06:19:32.913090+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [
+    ".codex/validation/test-replacements-v1.json",
+    ".codex/validation/test-replacements-v2.json",
+    ".codex/validation/stage2-incorrect-behaviors-v1.txt"
+  ],
+  "manifest_fingerprint": "7c631f17bd6c8acb52acf754e55f5b6a8055d585e859f9dd4c89e32303818b4a",
+  "path_claims": [
+    {
+      "path": ".codex",
+      "recursive": true
+    },
+    {
+      "path": "SOURCEMAP.md",
+      "recursive": false
+    },
+    {
+      "path": "architecture_index.json",
+      "recursive": false
+    },
+    {
+      "path": "source_owners.toml",
+      "recursive": false
+    },
+    {
+      "path": "justfile",
+      "recursive": false
+    },
+    {
+      "path": "scripts",
+      "recursive": true
+    },
+    {
+      "path": "tools",
+      "recursive": true
+    },
+    {
+      "path": "codex-rs",
+      "recursive": true
+    },
+    {
+      "path": "codex-cli",
+      "recursive": true
+    },
+    {
+      "path": "sdk",
+      "recursive": true
+    }
+  ],
+  "recorded_at": "2026-09-04T04:19:32.913090+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "71d4a019060cc1ab023ff07634caaf1913dc8487324272b522ac8821bc8693f4"
+  },
+  "validation_commands": [
+    "just source-map-check",
+    "just completion-focused inventory.frozen-reconciliation",
+    "just completion-focused maintenance.root-unittest",
+    "just completion-focused rust.nextest.workspace",
+    "just completion-focused windows.sandbox-smoke"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

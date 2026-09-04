@@ -1,0 +1,16 @@
+{
+  "admissions": [],
+  "approval_receipts": [],
+  "format_id": "kd4.replacement-admissions.v1",
+  "predecessor_authority": {
+    "baseline_ids_sha256": "9100d0fe0dd4c270a1216b6d3ec6f6c39b7f93278cf68235f500edae17d25eb1",
+    "inventory_path": ".codex/validation/frozen-test-inventory-v1.json",
+    "inventory_raw_sha256": "df230a7683f0f31f1aae4d3f7644af39cec67b09fadf8f3f1e6c60729d18196a",
+    "inventory_semantic_sha256": "a2fb8c0b806853b6375d92cfa6daf985ea35a5c4d4ecd49cf1d6da6f23359152",
+    "ledger_path": ".codex/validation/test-replacements-v1.json",
+    "ledger_raw_sha256": "210acb8428be83b9c6acd021bde4e44905e738d557ca89db60cb1271f65da46b"
+  },
+  "schema_version": 1,
+  "self_hash": "62da3b4b3bbfafdeaee2defe6f32475134ac8ed8afd4ed79e03e9e5aa0936243",
+  "semantic_sha256": "708babfa45fe7e64c731737e5ef95fd220fb7878a42380921dc2b6af32acffce"
+}

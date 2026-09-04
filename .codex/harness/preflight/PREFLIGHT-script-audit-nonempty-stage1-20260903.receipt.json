@@ -1,0 +1,58 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts/root_maintenance.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_build_tooling_policy.py",
+          "scripts"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:script-audit-nonempty-stage1-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\script-audit-nonempty-stage1"
+  },
+  "contract_claims": [
+    "maintenance-script-audit-nonempty-discovery",
+    "maintenance-script-audit-nonempty-command-execution"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-03T21:28:56.235174+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "38c45ea834e1a382837e10823479d2a4e32727f1b02f2fb0d90ddb72ee19b2a4",
+  "path_claims": [
+    {
+      "path": "scripts/root_maintenance.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_build_tooling_policy.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T20:28:56.235174+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "797cc29a68e448afcff3a69f9bfd4cc5e91d281c28a5bc9b7ab89333cc252db3"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_build_tooling_policy.BuildToolingPolicyRuntimeTest.test_root_maintenance_audit_rejects_empty_inventory scripts.test_build_tooling_policy.BuildToolingPolicyRuntimeTest.test_root_maintenance_audit_rejects_empty_command_plan scripts.test_build_tooling_policy.BuildToolingPolicyRuntimeTest.test_root_maintenance_audit_executes_nonempty_command_plan"
+  ],
+  "validation_owner": "worker:script-audit-nonempty-stage1-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

@@ -332,6 +332,13 @@ def run_command(cmd: list[str], cwd: Path | None = None) -> None:
     subprocess.run(cmd, cwd=cwd, check=True)
 
 
+def installed_executable(name: str) -> str:
+    executable = shutil.which(name)
+    if executable is None:
+        raise RuntimeError(f"Required executable not found on PATH: {name}")
+    return executable
+
+
 def stage_codex_sdk_sources(staging_dir: Path) -> None:
     package_root = CODEX_SDK_ROOT
 
@@ -500,6 +507,7 @@ def copy_native_binaries(
 def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    npm = installed_executable("npm")
 
     with tempfile.TemporaryDirectory(prefix="codex-npm-pack-") as pack_dir_str:
         pack_dir = Path(pack_dir_str)
@@ -511,7 +519,7 @@ def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
         env["NPM_CONFIG_CACHE"] = str(npm_cache_dir)
         env["NPM_CONFIG_LOGS_DIR"] = str(npm_logs_dir)
         stdout = subprocess.check_output(
-            ["npm", "pack", "--json", "--pack-destination", str(pack_dir)],
+            [npm, "pack", "--json", "--pack-destination", str(pack_dir)],
             cwd=staging_dir,
             env=env,
             text=True,
@@ -539,11 +547,16 @@ def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
 
 
 def smoke_test_npm_tarball(tarball_path: Path) -> None:
+    npm = installed_executable("npm")
     with tempfile.TemporaryDirectory(prefix="codex-npm-smoke-") as smoke_dir_str:
         smoke_dir = Path(smoke_dir_str)
+        (smoke_dir / "package.json").write_text(
+            json.dumps({"name": "codex-npm-smoke", "private": True}) + "\n",
+            encoding="utf-8",
+        )
         subprocess.run(
             [
-                "npm",
+                npm,
                 "install",
                 "--force",
                 "--ignore-scripts",
@@ -560,10 +573,14 @@ def smoke_test_npm_tarball(tarball_path: Path) -> None:
         installed = smoke_dir / "node_modules" / "@openai" / "codex"
         package_json = installed / "package.json"
         if not package_json.is_file():
-            raise RuntimeError("npm smoke install did not produce @openai/codex/package.json")
+            raise RuntimeError(
+                "npm smoke install did not produce @openai/codex/package.json"
+            )
         launcher = installed / "bin" / "codex.js"
         if launcher.is_file():
-            subprocess.run(["node", "--check", str(launcher)], check=True)
+            subprocess.run(
+                [installed_executable("node"), "--check", str(launcher)], check=True
+            )
 
 
 if __name__ == "__main__":

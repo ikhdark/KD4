@@ -1,0 +1,59 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts/completion_proof.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_completion_proof.py",
+          "scripts"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:bounded-python-git-process-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\none",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\none"
+  },
+  "contract_claims": [
+    "completion-proof-python-git-process-budget",
+    "completion-proof-git-pre-result-classification",
+    "completion-proof-git-descendant-cleanup"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-04T00:20:25.789098+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "22166b8968f23009577e76863453b490f3b7498182fb9289bc0d54518c4578ad",
+  "path_claims": [
+    {
+      "path": "scripts/completion_proof.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_completion_proof.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T23:20:25.789098+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "6c8c0e06ee9925249ae290b77f7154b9233c3bf45f53e382da3ca7ff4c3b34c2"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_git_supervision_errors_use_five_second_budget_and_fail_closed scripts.test_completion_proof.CompletionProofCliTest.test_git_helper_hanging_fake_git_is_bounded_and_preserves_failure scripts.test_completion_proof.CompletionProofCliTest.test_test_surface_git_process_hanging_fake_git_is_bounded_and_cleans_descendant scripts.test_completion_proof.CompletionProofCliTest.test_workspace_fingerprint_hanging_fake_git_is_bounded_and_cleans_descendant"
+  ],
+  "validation_owner": "worker:bounded-python-git-process-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

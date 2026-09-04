@@ -6,6 +6,7 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use codex_windows_sandbox::CANONICAL_PROOF_USERNAME;
 use codex_windows_sandbox::SETUP_VERSION;
 use codex_windows_sandbox::SetupErrorCode;
 use codex_windows_sandbox::SetupErrorReport;
@@ -17,6 +18,7 @@ use codex_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
 use codex_windows_sandbox::ensure_allow_write_aces;
 use codex_windows_sandbox::extract_setup_failure;
 use codex_windows_sandbox::hide_newly_created_users;
+use codex_windows_sandbox::install_canonical_proof_wfp_filters;
 use codex_windows_sandbox::install_wfp_filters;
 use codex_windows_sandbox::is_command_cwd_root;
 use codex_windows_sandbox::log_note;
@@ -582,6 +584,7 @@ fn provision_and_hide_sandbox_users(
     let users = vec![
         payload.offline_username.clone(),
         payload.online_username.clone(),
+        CANONICAL_PROOF_USERNAME.to_string(),
     ];
     hide_newly_created_users(&users, sbx_dir);
     Ok(())
@@ -634,6 +637,23 @@ fn configure_offline_sandbox_network(
         ))
     })?;
     Ok(())
+}
+
+fn configure_canonical_proof_network(payload: &Payload, log: &mut dyn Write) -> Result<()> {
+    install_canonical_proof_wfp_filters(
+        &payload.codex_home,
+        CANONICAL_PROOF_USERNAME,
+        payload.otel.as_ref(),
+        |message| {
+            let _ = log_line(log, message);
+        },
+    )
+    .map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperFirewallRuleCreateOrAddFailed,
+            format!("required canonical completion-proof network isolation setup failed: {err}"),
+        ))
+    })
 }
 
 fn lock_persistent_sandbox_dirs(
@@ -730,6 +750,7 @@ fn run_provision_only(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) ->
     })?;
 
     configure_offline_sandbox_network(payload, &offline_sid_str, log)?;
+    configure_canonical_proof_network(payload, log)?;
 
     lock_sandbox_bin_dir(payload, &sandbox_group_sid, log)?;
     lock_persistent_sandbox_dirs(payload, &sandbox_group_sid, log)?;
@@ -771,6 +792,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
     let mut refresh_errors: Vec<String> = Vec::new();
     if !refresh_only {
         configure_offline_sandbox_network(payload, &offline_sid_str, log)?;
+        configure_canonical_proof_network(payload, log)?;
     }
 
     // Deny-read ACEs must be present before the sandboxed command starts. Apply

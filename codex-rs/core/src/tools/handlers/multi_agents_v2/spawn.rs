@@ -96,7 +96,7 @@ async fn handle_spawn_agent(
     let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
     let mut args: SpawnAgentArgs = parse_arguments(&arguments)?;
-    if turn.session_source.is_non_root_agent() && args.assignment.is_some() {
+    if turn.session_source.get_agent_path().is_some() && args.assignment.is_some() {
         return Err(FunctionCallError::RespondToModel(
             "spawn_agent: durable typed assignments are root-only".to_string(),
         ));
@@ -137,14 +137,21 @@ async fn handle_spawn_agent(
         }
         (None, true) => None,
     };
-    let legacy_parent_assignment_id = if turn.session_source.is_non_root_agent() {
+    let legacy_parent_assignment_id = if turn.session_source.get_agent_path().is_some() {
         let coordinator = session.services.agent_control.task_coordinator();
-        match coordinator.binding_for_source(&turn.session_source) {
+        match turn.typed_agent_task_binding() {
             Some(binding) => {
                 let parent = coordinator
                     .get_agent_task(binding.assignment_id, Some(0))
                     .await
                     .map_err(typed_task_store_error)?;
+                if parent.current_attempt.attempt_id != binding.attempt_id
+                    || parent.current_attempt.state != AttemptState::Active
+                {
+                    return Err(FunctionCallError::RespondToModel(
+                        "spawn_agent: the immutable parent attempt is no longer active".to_string(),
+                    ));
+                }
                 if !matches!(
                     parent.assignment.admission_origin,
                     AssignmentAdmissionOrigin::LegacyMessage { .. }
@@ -155,7 +162,12 @@ async fn handle_spawn_agent(
                 }
                 Some(binding.assignment_id)
             }
-            None => None,
+            None => {
+                return Err(FunctionCallError::RespondToModel(
+                    "spawn_agent: this typed child turn has no immutable parent task authority"
+                        .to_string(),
+                ));
+            }
         }
     } else {
         None
@@ -233,6 +245,18 @@ async fn handle_spawn_agent(
             "spawned agent is missing a canonical task name".to_string(),
         )
     })?;
+    // Serialize typed admission with root terminal certification. The guard covers durable task
+    // creation, registry commit, and initial submission so terminal quiescence cannot race a
+    // half-admitted child.
+    let coordination_cwd = turn
+        .environments
+        .primary()
+        .and_then(|environment| environment.cwd().to_abs_path().ok())
+        .map(|cwd| cwd.to_path_buf())
+        .unwrap_or_else(|| turn.config.cwd.to_path_buf());
+    let coordination_root = get_git_repo_root(&coordination_cwd).unwrap_or(coordination_cwd);
+    let _workspace_operation_permit =
+        crate::workspace_operation_gate::acquire_workspace_operation(&coordination_root).await;
     // Typed spawns reserve execution, registry identity, and V2 residency before any
     // worktree or durable assignment preparation. The token holds only logical RAII
     // reservations; all synchronization guards used to create it have already been released.
@@ -282,7 +306,7 @@ async fn handle_spawn_agent(
                     session.services.state_db.clone(),
                     config.sqlite_home.clone(),
                     config.model_provider_id.clone(),
-                    session.services.agent_control.session_id().to_string(),
+                    session.services.agent_control.task_lineage_id().to_string(),
                 )
                 .await
                 .map_err(typed_task_store_error)?;
@@ -875,19 +899,27 @@ async fn create_isolated_worktree(
         ))
     })?;
     let path = parent.join(leaf);
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_root)
         .args(["worktree", "add", "--detach"])
         .arg(&path)
         .arg("HEAD")
-        .output()
-        .await
-        .map_err(|error| {
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child =
+        codex_utils_pty::with_windows_child_creation(|_| command.spawn()).map_err(|error| {
             FunctionCallError::RespondToModel(format!(
                 "spawn_agent: could not launch git worktree add: {error}"
             ))
         })?;
+    let output = child.wait_with_output().await.map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "spawn_agent: could not launch git worktree add: {error}"
+        ))
+    })?;
     if !output.status.success() {
         return Err(FunctionCallError::RespondToModel(format!(
             "spawn_agent: git worktree add failed: {}",
@@ -907,19 +939,22 @@ async fn create_isolated_worktree(
             ));
         }
         if !initial_overlay.tracked_diff.is_empty() {
-            let mut child = Command::new("git")
+            let mut command = Command::new("git");
+            command
                 .arg("-C")
                 .arg(&workspace.path)
                 .args(["apply", "--binary", "--whitespace=nowarn", "-"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "spawn_agent: could not apply the shared-worktree snapshot: {error}"
-                    ))
-                })?;
+                .stderr(Stdio::piped());
+            let mut child =
+                codex_utils_pty::with_windows_child_creation(|_| command.spawn()).map_err(
+                    |error| {
+                        FunctionCallError::RespondToModel(format!(
+                            "spawn_agent: could not apply the shared-worktree snapshot: {error}"
+                        ))
+                    },
+                )?;
             let mut stdin = child.stdin.take().ok_or_else(|| {
                 FunctionCallError::RespondToModel(
                     "spawn_agent: git apply stdin was unavailable".to_string(),
@@ -980,34 +1015,50 @@ async fn create_isolated_worktree(
 async fn capture_workspace_overlay(
     repo_root: &Path,
 ) -> Result<WorkspaceOverlay, FunctionCallError> {
-    let diff = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_root)
         .args(["diff", "--binary", "--no-ext-diff", "HEAD", "--"])
-        .output()
-        .await
-        .map_err(|error| {
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child =
+        codex_utils_pty::with_windows_child_creation(|_| command.spawn()).map_err(|error| {
             FunctionCallError::RespondToModel(format!(
                 "spawn_agent: could not capture tracked workspace changes: {error}"
             ))
         })?;
+    let diff = child.wait_with_output().await.map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "spawn_agent: could not capture tracked workspace changes: {error}"
+        ))
+    })?;
     if !diff.status.success() {
         return Err(FunctionCallError::RespondToModel(format!(
             "spawn_agent: git diff failed while creating an isolated snapshot: {}",
             String::from_utf8_lossy(&diff.stderr).trim()
         )));
     }
-    let untracked = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_root)
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .output()
-        .await
-        .map_err(|error| {
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child =
+        codex_utils_pty::with_windows_child_creation(|_| command.spawn()).map_err(|error| {
             FunctionCallError::RespondToModel(format!(
                 "spawn_agent: could not enumerate untracked workspace files: {error}"
             ))
         })?;
+    let untracked = child.wait_with_output().await.map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "spawn_agent: could not enumerate untracked workspace files: {error}"
+        ))
+    })?;
     if !untracked.status.success() {
         return Err(FunctionCallError::RespondToModel(format!(
             "spawn_agent: git ls-files failed while creating an isolated snapshot: {}",
@@ -1092,13 +1143,17 @@ async fn capture_workspace_overlay(
 }
 
 async fn cleanup_isolated_worktree(workspace: &IsolatedWorkspace) -> Result<(), std::io::Error> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(&workspace.main_repo_root)
         .args(["worktree", "remove", "--force"])
         .arg(&workspace.path)
-        .output()
-        .await?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = codex_utils_pty::with_windows_child_creation(|_| command.spawn())?;
+    let output = child.wait_with_output().await?;
     if output.status.success() {
         Ok(())
     } else {

@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:mcp-error-surface-remediation-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "codex-rs/mcp-server/src/codex_tool_runner.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/mcp-server/src/message_processor.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/mcp-server/tests/suite/codex_tool.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/mcp-server/tests/common/mcp_process.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/app-server/src/bespoke_event_handling.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/app-server-protocol/src/protocol/thread_history.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/turn_start.rs",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "mcp-failed-turn-no-success-publication",
+    "mcp-terminal-request-cleanup",
+    "app-server-failed-turn-no-surfaced-result",
+    "app-server-history-failed-turn-no-surfaced-result"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:mcp-error-surface-remediation-20260903",
+  "validation_commands": [
+    "just test-fast -p codex-mcp-server --lib -E 'test(codex_tool_runner::tests)'",
+    "just test-fast -p codex-mcp-server --lib -E 'test(=message_processor::tests::cancelled_notification_unregisters_request_when_thread_lookup_fails)'",
+    "just test-fast -p codex-mcp-server --test all -E 'test(=suite::codex_tool::blocked_completion_proof_reaches_mcp_as_error_without_launching_runner)'",
+    "just test-fast -p codex-app-server --lib -E 'test(=bespoke_event_handling::tests::test_handle_turn_complete_emits_failed_with_error)'",
+    "just test-fast -p codex-app-server --test all -E 'test(=suite::v2::turn_start::blocked_completion_proof_reaches_app_server_as_failed_turn_without_launching_runner)'"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

@@ -23,6 +23,17 @@ version = 1
 [helpers.codex]
 package = "codex-cli"
 bin = "codex"
+features = ["codex-core/completion-proof-test-store"]
+
+[helpers.codex-app-server]
+package = "codex-app-server"
+bin = "codex-app-server"
+features = ["codex-core/completion-proof-test-store"]
+
+[helpers.codex-mcp-server]
+package = "codex-mcp-server"
+bin = "codex-mcp-server"
+features = ["codex-core/completion-proof-test-store"]
 
 [helpers.codex-code-mode-host]
 package = "codex-code-mode-host"
@@ -46,6 +57,10 @@ package = "codex-windows-sandbox"
 bin = "codex-command-runner"
 platform = "windows"
 
+[helpers.apply_patch]
+package = "codex-apply-patch"
+bin = "apply_patch"
+
 # ---------------------------------------------------------------------------
 # Named targets
 # ---------------------------------------------------------------------------
@@ -53,6 +68,7 @@ platform = "windows"
 [targets.core_lib]
 package = "codex-core"
 lib = true
+features = ["codex-core/completion-proof-test-store"]
 helpers = [
   "codex",
   "codex-code-mode-host",
@@ -64,21 +80,25 @@ helpers = [
 [targets.available_skills_instructions]
 package = "codex-core"
 test = "available_skills_instructions"
+features = ["codex-core/completion-proof-test-store"]
 helpers = ["codex", "codex-code-mode-host"]
 
 [targets.responses_headers]
 package = "codex-core"
 test = "responses_headers"
+features = ["codex-core/completion-proof-test-store"]
 helpers = ["codex", "codex-code-mode-host"]
 
 [targets.round_trip_batching]
 package = "codex-core"
 test = "round_trip_batching"
+features = ["codex-core/completion-proof-test-store"]
 helpers = ["codex", "codex-code-mode-host"]
 
 [targets.turn_latency_bench]
 package = "codex-core"
 test = "turn_latency_bench"
+features = ["codex-core/completion-proof-test-store"]
 helpers = ["codex", "codex-code-mode-host"]
 
 # Bounded core integration targets. Every shard carries the conservative
@@ -88,11 +108,18 @@ helpers = ["codex", "codex-code-mode-host"]
 [targets.core_cli_workspace]
 package = "codex-core"
 test = "core_cli_workspace"
-helpers = ["codex", "codex-code-mode-host"]
+features = ["codex-core/completion-proof-test-store"]
+helpers = [
+  "codex",
+  "codex-code-mode-host",
+  "codex-windows-sandbox-setup",
+  "codex-command-runner",
+]
 
 [targets.core_code_mode_mcp]
 package = "codex-core"
 test = "core_code_mode_mcp"
+features = ["codex-core/completion-proof-test-store"]
 helpers = [
   "codex",
   "codex-code-mode-host",
@@ -103,6 +130,7 @@ helpers = [
 [targets.core_exec_permissions]
 package = "codex-core"
 test = "core_exec_permissions"
+features = ["codex-core/completion-proof-test-store"]
 helpers = [
   "codex",
   "codex-code-mode-host",
@@ -113,26 +141,31 @@ helpers = [
 [targets.core_thread_state]
 package = "codex-core"
 test = "core_thread_state"
+features = ["codex-core/completion-proof-test-store"]
 helpers = ["codex", "codex-code-mode-host", "test_stdio_server"]
 
 [targets.core_transport_telemetry]
 package = "codex-core"
 test = "core_transport_telemetry"
+features = ["codex-core/completion-proof-test-store"]
 helpers = ["codex", "codex-code-mode-host"]
 
 [targets.core_agents_review]
 package = "codex-core"
 test = "core_agents_review"
+features = ["codex-core/completion-proof-test-store"]
 helpers = ["codex", "codex-code-mode-host"]
 
 [targets.core_model_prompt_runtime]
 package = "codex-core"
 test = "core_model_prompt_runtime"
+features = ["codex-core/completion-proof-test-store"]
 helpers = ["codex", "codex-code-mode-host"]
 
 [targets.core_windows]
 package = "codex-core"
 test = "core_windows"
+features = ["codex-core/completion-proof-test-store"]
 helpers = [
   "codex",
   "codex-code-mode-host",
@@ -140,11 +173,59 @@ helpers = [
   "codex-command-runner",
 ]
 
+[targets.cli_completion_proof]
+package = "codex-cli"
+test = "completion_proof"
+features = ["codex-core/completion-proof-test-store"]
+helpers = ["codex"]
+
+[targets.app_server_all]
+package = "codex-app-server"
+test = "all"
+features = ["codex-core/completion-proof-test-store"]
+helpers = ["codex-app-server", "codex-code-mode-host"]
+
+[targets.mcp_server_all]
+package = "codex-mcp-server"
+test = "all"
+features = ["codex-core/completion-proof-test-store"]
+helpers = ["codex-mcp-server", "codex"]
+
 # `codex-config` owns the raw adaptive-reasoning tables; the adaptive reasoning
 # gate pairs it with the resolved `codex-core` defaults in one ordered run.
 [targets.config_lib]
 package = "codex-config"
 lib = true
+helpers = []
+
+[targets.pty_lib]
+package = "codex-utils-pty"
+lib = true
+helpers = []
+
+[targets.windows_sandbox_lib]
+package = "codex-windows-sandbox"
+lib = true
+helpers = []
+
+[targets.windows_sandbox_command_runner]
+package = "codex-windows-sandbox"
+bin = "codex-command-runner"
+helpers = []
+
+[targets.apply_patch_all]
+package = "codex-apply-patch"
+test = "all"
+helpers = ["apply_patch"]
+
+[targets.tools_json_schema_policy]
+package = "codex-tools"
+test = "json_schema_policy_fixtures"
+helpers = []
+
+[targets.app_server_protocol_schema]
+package = "codex-app-server-protocol"
+test = "schema_fixtures"
 helpers = []
 
 # ---------------------------------------------------------------------------
@@ -191,6 +272,17 @@ filter = "test(config_schema_matches_fixture) | test(config_schema_hides_unsuppo
 tests = [
   "config::schema::tests::config_schema_hides_unsupported_inline_mcp_bearer_token",
   "config::schema::tests::config_schema_matches_fixture",
+]
+
+[gates.app-server-schema-protocol]
+description = "App-server TypeScript and JSON schema fixture parity without regeneration."
+
+[[gates.app-server-schema-protocol.steps]]
+target = "app_server_protocol_schema"
+filter = "test(typescript_schema_fixtures_match_generated) | test(json_schema_fixtures_match_generated)"
+tests = [
+  "json_schema_fixtures_match_generated",
+  "typescript_schema_fixtures_match_generated",
 ]
 
 [gates.windows-sandbox-core-exec]
@@ -247,4 +339,86 @@ tests = [
   "suite::rmcp_client::streamable_http_configured_auth_precedes_chatgpt_auth",
   "suite::rmcp_client::streamable_http_tool_call_round_trip",
   "suite::rmcp_client::streamable_http_with_oauth_round_trip",
+]
+
+[gates.windows-process-coverage]
+description = "Windows ConPTY, process-tree, cancellation, and wait-failure coverage."
+
+[[gates.windows-process-coverage.steps]]
+target = "pty_lib"
+filter = "test(terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty) | test(normal_exit_preserves_descendants_for_pipe_and_conpty) | test(conpty_delivers_input_to_foreground_children) | test(conpty_ctrl_c_interrupts_powershell_foreground_child) | test(required_process_test_prerequisites_report_unverified_coverage)"
+tests = [
+  "tests::windows_tests::conpty_ctrl_c_interrupts_powershell_foreground_child",
+  "tests::windows_tests::conpty_delivers_input_to_foreground_children",
+  "tests::windows_tests::normal_exit_preserves_descendants_for_pipe_and_conpty",
+  "tests::windows_tests::required_process_test_prerequisites_report_unverified_coverage",
+  "tests::windows_tests::terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty",
+]
+
+[[gates.windows-process-coverage.steps]]
+target = "windows_sandbox_lib"
+filter = "test(legacy_capture_cancellation_terminates_descendants_without_timeout) | test(process_wait_failure_is_not_treated_as_exit)"
+tests = [
+  "unified_exec::tests::legacy_capture_cancellation_terminates_descendants_without_timeout",
+  "windows_impl::tests::process_wait_failure_is_not_treated_as_exit",
+]
+
+[[gates.windows-process-coverage.steps]]
+target = "windows_sandbox_command_runner"
+filter = "test(invalid_process_wait_is_not_treated_as_exit) | test(controlling_ipc_eof_terminates_process_tree)"
+tests = [
+  "win::tests::controlling_ipc_eof_terminates_process_tree",
+  "win::tests::invalid_process_wait_is_not_treated_as_exit",
+]
+
+[[gates.windows-process-coverage.steps]]
+target = "core_lib"
+filter = "test(direct_exec_cancellation_terminates_windows_descendants)"
+tests = ["exec::tests::direct_exec_cancellation_terminates_windows_descendants"]
+
+[gates.apply-patch-scenarios]
+description = "Every portable apply-patch fixture through the standalone executable boundary."
+
+[[gates.apply-patch-scenarios.steps]]
+target = "apply_patch_all"
+filter = "test(/^suite::scenarios::scenario_/)"
+tests = [
+  "suite::scenarios::scenario_001_add_file",
+  "suite::scenarios::scenario_002_multiple_operations",
+  "suite::scenarios::scenario_003_multiple_chunks",
+  "suite::scenarios::scenario_004_move_to_new_directory",
+  "suite::scenarios::scenario_005_rejects_empty_patch",
+  "suite::scenarios::scenario_006_rejects_missing_context",
+  "suite::scenarios::scenario_007_rejects_missing_file_delete",
+  "suite::scenarios::scenario_008_rejects_empty_update_hunk",
+  "suite::scenarios::scenario_009_requires_existing_file_for_update",
+  "suite::scenarios::scenario_010_move_overwrites_existing_destination",
+  "suite::scenarios::scenario_011_add_overwrites_existing_file",
+  "suite::scenarios::scenario_012_delete_directory_fails",
+  "suite::scenarios::scenario_013_rejects_invalid_hunk_header",
+  "suite::scenarios::scenario_014_update_file_appends_trailing_newline",
+  "suite::scenarios::scenario_015_failure_after_partial_success_leaves_changes",
+  "suite::scenarios::scenario_016_pure_addition_update_chunk",
+  "suite::scenarios::scenario_017_whitespace_padded_hunk_header",
+  "suite::scenarios::scenario_018_whitespace_padded_patch_markers",
+  "suite::scenarios::scenario_019_unicode_simple",
+  "suite::scenarios::scenario_020_delete_file_success",
+  "suite::scenarios::scenario_020_whitespace_padded_patch_marker_lines",
+  "suite::scenarios::scenario_021_update_file_deletion_only",
+  "suite::scenarios::scenario_022_update_file_end_of_file_marker",
+]
+
+[gates.tools-json-schema-policy-fixtures]
+description = "Each external MCP schema fixture through the production Responses tool conversion boundary."
+
+[[gates.tools-json-schema-policy-fixtures.steps]]
+target = "tools_json_schema_policy"
+filter = "test(/_through_mcp_responses_boundary$/)"
+tests = [
+  "google_calendar_schema_converts_through_mcp_responses_boundary",
+  "google_drive_schema_converts_through_mcp_responses_boundary",
+  "microsoft_outlook_email_schema_converts_through_mcp_responses_boundary",
+  "notion_schema_converts_through_mcp_responses_boundary",
+  "oversized_notion_schema_compacts_through_mcp_responses_boundary",
+  "slack_schema_converts_through_mcp_responses_boundary",
 ]

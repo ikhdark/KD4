@@ -471,7 +471,7 @@ fn maybe_wrap_powershell_with_snapshot(
 
     let snapshot_path = powershell_single_quote(snapshot_path);
     let rewritten_script = format!(
-        "try {{ . '{snapshot_path}' *> $null }} catch {{ [Console]::Error.WriteLine('codex: shell snapshot replay failed: ' + $_.Exception.Message) }}\n{override_restores}\n{proxy_restore}\n& {{\n{original_script}\n}}"
+        "try {{ . '{snapshot_path}' *> $null }} catch {{ [Console]::Error.WriteLine('codex: shell snapshot replay failed: ' + $_.Exception.Message) }}\n{override_restores}\n{proxy_restore}\n& {{\n{original_script}\n$codexCommandSucceeded = $?\n$codexCommandExitCode = $LASTEXITCODE\nif ($codexCommandSucceeded) {{ exit 0 }}\nif ($null -ne $codexCommandExitCode -and $codexCommandExitCode -ne 0) {{ exit $codexCommandExitCode }}\nexit 1\n}}"
     );
 
     let rewritten = vec![
@@ -985,6 +985,41 @@ mod shell_snapshot_replay_tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             "from-snapshot|current|False"
         );
+    }
+
+    #[test]
+    fn powershell_snapshot_wrapper_preserves_native_command_failure() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let snapshot_path = AbsolutePathBuf::from_absolute_path(dir.path().join("snapshot.ps1"))
+            .expect("absolute snapshot path");
+        std::fs::write(
+            &snapshot_path,
+            format!("# Snapshot file\n{POWERSHELL_SNAPSHOT_FORMAT_HEADER}\n"),
+        )
+        .expect("write PowerShell snapshot");
+        let shell = crate::shell::get_shell(ShellType::PowerShell, /*path*/ None)
+            .expect("PowerShell is required on Windows");
+        let original = shell
+            .derive_exec_args(
+                "& $env:ComSpec /d /c 'exit 7'",
+                /*use_login_shell*/ true,
+            )
+            .expect("PowerShell args");
+        let rewritten = maybe_wrap_shell_lc_with_snapshot(
+            &original,
+            &shell,
+            Some(&snapshot_path),
+            &HashMap::new(),
+            &std::env::vars().collect(),
+            &RuntimePathPrepends,
+        );
+
+        let status = std::process::Command::new(&rewritten[0])
+            .args(&rewritten[1..])
+            .status()
+            .expect("run wrapped PowerShell command");
+
+        assert_eq!(status.code(), Some(7));
     }
 
     #[test]

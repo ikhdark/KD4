@@ -160,13 +160,13 @@ async fn handle_get_agent_task(
     }
 
     let coordinator = session.services.agent_control.task_coordinator();
-    let caller_binding = if turn.session_source.is_non_root_agent() {
-        let binding = coordinator
-            .binding_for_source(&turn.session_source)
+    let caller_binding = if turn.session_source.get_agent_path().is_some() {
+        let binding = turn
+            .typed_agent_task_binding()
             .filter(|binding| binding.assignment_id == assignment_id)
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(format!(
-                    "{GET_AGENT_TASK_TOOL}: non-root callers may only read their own current bound task"
+                    "{GET_AGENT_TASK_TOOL}: non-root callers may only read their own immutable bound task"
                 ))
             })?;
         Some(binding)
@@ -212,13 +212,11 @@ async fn handle_submit_agent_receipt(
     let arguments = function_arguments(payload)?;
     let args: SubmitAgentReceiptArgs = parse_arguments(&arguments)?;
     let coordinator = session.services.agent_control.task_coordinator();
-    let binding = coordinator
-        .binding_for_source(&turn.session_source)
-        .ok_or_else(|| {
-            FunctionCallError::RespondToModel(format!(
-                "{SUBMIT_AGENT_RECEIPT_TOOL}: the caller is not a typed agent with a bound task"
-            ))
-        })?;
+    let binding = turn.typed_agent_task_binding().ok_or_else(|| {
+        FunctionCallError::RespondToModel(format!(
+            "{SUBMIT_AGENT_RECEIPT_TOOL}: this turn has no immutable typed-task binding"
+        ))
+    })?;
     // The binding proves both assignment and attempt ownership. Never retarget a stale worker
     // binding to a newer correction attempt: the root must first refresh the binding explicitly.
     let task = coordinator
@@ -241,29 +239,16 @@ async fn handle_submit_agent_receipt(
     let _workspace_operation_permit =
         crate::workspace_operation_gate::acquire_workspace_operation(&workspace_root).await;
     let draft = args.into_receipt_draft();
-    if let Err(error) = store.finalize_pending_mutations(binding.attempt_id).await {
-        tracing::warn!(
-            %error,
-            attempt_id = %binding.attempt_id,
-            "typed mutation evidence finalization was unavailable; continuing receipt submission"
-        );
-    }
+    store
+        .finalize_pending_mutations(binding.attempt_id)
+        .await
+        .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
     // Risk derivation and cold-review evidence must cover the complete attempt, including writes
     // that another runtime path finalized before receipt submission.
-    let observed_writes = match store
+    let observed_writes = store
         .list_mutation_evidence(binding.attempt_id, Some(MAX_MUTATION_EVIDENCE_LIMIT))
         .await
-    {
-        Ok(observed_writes) => observed_writes,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                attempt_id = %binding.attempt_id,
-                "typed mutation evidence could not be read; continuing receipt submission"
-            );
-            Vec::new()
-        }
-    };
+        .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
     let review_reason = derive_review_reason(
         store.as_ref(),
         turn.config.cwd.as_path(),
@@ -752,14 +737,12 @@ async fn handle_set_agent_gate(
     let args: SetAgentGateArgs = parse_arguments(&arguments)?;
     let assignment_id = parse_assignment_id(SET_AGENT_GATE_TOOL, &args.assignment_id)?;
     let coordinator = session.services.agent_control.task_coordinator();
-    let actor = if turn.session_source.is_non_root_agent() {
-        let binding = coordinator
-            .binding_for_source(&turn.session_source)
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(format!(
-                    "{SET_AGENT_GATE_TOOL}: the caller is not a typed agent with a bound task"
-                ))
-            })?;
+    let actor = if turn.session_source.get_agent_path().is_some() {
+        let binding = turn.typed_agent_task_binding().ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "{SET_AGENT_GATE_TOOL}: this turn has no immutable typed-task binding"
+            ))
+        })?;
         TaskActor::Attempt(binding.attempt_id)
     } else {
         TaskActor::Root

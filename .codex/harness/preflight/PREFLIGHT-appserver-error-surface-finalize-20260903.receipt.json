@@ -1,0 +1,67 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/app-server/src/bespoke_event_handling.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/app-server-protocol/src/protocol/thread_history.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/app-server/tests/suite/v2/turn_start.rs",
+          "codex-rs"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:appserver-error-surface-finalize-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\scoop\\persist\\rustup\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-appserver-error-surface-finalize"
+  },
+  "contract_claims": [
+    "completion-proof-app-server-error-surface"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-03T21:23:42.463810+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "ed2669d368c24a0b110428a51f371f39503239fab797bb4efc6fa93aaafbe3cf",
+  "path_claims": [
+    {
+      "path": "codex-rs/app-server/src/bespoke_event_handling.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/app-server-protocol/src/protocol/thread_history.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/turn_start.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T20:23:42.463810+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "e4b13c553161a6918c6df2b91a645d95b00fe1186afa1ab12bfc5d6263ee30d7"
+  },
+  "validation_commands": [
+    "cargo test --target-dir C:/Users/kuh/Desktop/kd4/codex-rs/target-appserver-error-surface-finalize -p codex-app-server --test all suite::v2::turn_start::blocked_completion_proof_reaches_app_server_as_failed_turn_without_launching_runner -- --exact --nocapture",
+    "cargo test --target-dir C:/Users/kuh/Desktop/kd4/codex-rs/target-appserver-error-surface-finalize -p codex-app-server-protocol protocol::thread_history::tests::error_then_turn_complete_preserves_failed_status -- --exact --nocapture",
+    "cargo test --target-dir C:/Users/kuh/Desktop/kd4/codex-rs/target-appserver-error-surface-finalize -p codex-app-server bespoke_event_handling::tests::test_handle_turn_complete_emits_failed_with_error -- --exact --nocapture"
+  ],
+  "validation_owner": "worker:appserver-error-surface-finalize-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

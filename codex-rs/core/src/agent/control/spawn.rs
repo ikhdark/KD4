@@ -1041,7 +1041,7 @@ impl AgentControl {
             return Err(pending_cleanup.rollback(error).await);
         }
 
-        if let Some(mut binding) = options.typed_task_binding.clone() {
+        let typed_task_binding = if let Some(mut binding) = options.typed_task_binding.clone() {
             let spawned_agent_path = agent_metadata.agent_path.as_ref().map(ToString::to_string);
             if spawned_agent_path.as_deref() != Some(binding.agent_path.as_str()) {
                 return Err(pending_cleanup
@@ -1053,18 +1053,21 @@ impl AgentControl {
                     .await);
             }
             binding.thread_id = Some(new_thread.thread_id.to_string());
-            if let Err(error) = self.task_coordinator().bind_agent_task(binding).await {
-                return Err(pending_cleanup
-                    .rollback(CodexErr::Fatal(format!(
-                        "failed to bind typed task before starting spawned agent: {error}"
-                    )))
-                    .await);
+            match self.task_coordinator().bind_agent_task(binding).await {
+                Ok(binding) => Some(binding),
+                Err(error) => {
+                    return Err(pending_cleanup
+                        .rollback(CodexErr::Fatal(format!(
+                            "failed to bind typed task before starting spawned agent: {error}"
+                        )))
+                        .await);
+                }
             }
-        }
-        if options.typed_task_binding.is_some()
-            && let Some(agent_path) = agent_metadata.agent_path.clone()
-        {
-            self.start_typed_actor_heartbeat_watcher(agent_path, new_thread.thread_id);
+        } else {
+            None
+        };
+        if let Some(binding) = typed_task_binding {
+            self.start_typed_actor_heartbeat_watcher(binding, new_thread.thread_id);
         }
 
         if let Some(binding) = options.agent_job_binding.as_ref() {
@@ -1688,12 +1691,9 @@ impl AgentControl {
             };
         }
         if let Some(agent_path) = agent_metadata.agent_path.clone()
-            && self
-                .task_coordinator()
-                .binding_for_agent_path(&agent_path)
-                .is_some()
+            && let Some(binding) = self.task_coordinator().binding_for_agent_path(&agent_path)
         {
-            self.start_typed_actor_heartbeat_watcher(agent_path, resumed_thread.thread_id);
+            self.start_typed_actor_heartbeat_watcher(binding, resumed_thread.thread_id);
         }
         // Resumed threads are re-registered in-memory and need the same listener
         // attachment path as freshly spawned threads.

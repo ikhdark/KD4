@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:rust-manifest-nonempty-fix-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+  "path_claims": [
+    {
+      "path": "scripts/rust_test_runner.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_rust_test_runner.py",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "rust-test-manifest-nonempty-targets-and-gates"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:rust-manifest-nonempty-fix-20260903",
+  "validation_commands": [
+    "python -m unittest scripts.test_rust_test_runner.ManifestSchemaTest.test_empty_targets_table_is_rejected_through_cli scripts.test_rust_test_runner.ManifestSchemaTest.test_empty_gates_table_is_rejected_through_cli scripts.test_rust_test_runner.RepositoryManifestTest.test_repository_manifest_has_nonempty_targets_and_gates_through_cli"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target-rust-manifest-nonempty-fix",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

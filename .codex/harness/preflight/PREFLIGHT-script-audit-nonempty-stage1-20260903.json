@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:script-audit-nonempty-stage1-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+  "path_claims": [
+    {
+      "path": "scripts/root_maintenance.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_build_tooling_policy.py",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "maintenance-script-audit-nonempty-discovery",
+    "maintenance-script-audit-nonempty-command-execution"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:script-audit-nonempty-stage1-20260903",
+  "validation_commands": [
+    "python -m unittest scripts.test_build_tooling_policy.BuildToolingPolicyRuntimeTest.test_root_maintenance_audit_rejects_empty_inventory scripts.test_build_tooling_policy.BuildToolingPolicyRuntimeTest.test_root_maintenance_audit_rejects_empty_command_plan scripts.test_build_tooling_policy.BuildToolingPolicyRuntimeTest.test_root_maintenance_audit_executes_nonempty_command_plan"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target/script-audit-nonempty-stage1",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

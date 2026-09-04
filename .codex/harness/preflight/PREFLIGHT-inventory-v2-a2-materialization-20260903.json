@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:inventory-v2-a2-materialization-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+  "path_claims": [
+    { "path": ".codex/validation/frozen-test-inventory-v2.json", "recursive": false },
+    { "path": ".codex/validation/frozen-test-inventory-v2-recoveries.json", "recursive": false },
+    { "path": ".codex/validation/test-replacements-v2.json", "recursive": false },
+    { "path": "codex-rs/validation-contracts/src/recovery.rs", "recursive": false },
+    { "path": "codex-rs/validation-contracts/tests/cross_language_vectors.rs", "recursive": false },
+    { "path": "scripts/completion_proof_inventory_v2.py", "recursive": false },
+    { "path": "scripts/materialize_completion_proof_inventory_v2.py", "recursive": false },
+    { "path": "scripts/test_completion_proof_inventory_v2.py", "recursive": false },
+    { "path": "scripts/test_materialize_completion_proof_inventory_v2.py", "recursive": false }
+  ],
+  "contract_claims": [
+    "dormant-frozen-test-inventory-v2-a2-materialization",
+    "exact-v1-to-v2-declaration-ledger-bijection",
+    "inventory-v2-recovery-authority-materialization"
+  ],
+  "dependencies": [
+    "worker:inventory-v2-a1-recovery-20260903"
+  ],
+  "generated_outputs": [
+    ".codex/validation/frozen-test-inventory-v2.json",
+    ".codex/validation/frozen-test-inventory-v2-recoveries.json",
+    ".codex/validation/test-replacements-v2.json"
+  ],
+  "generated_output_owner": "worker:inventory-v2-a2-materialization-20260903",
+  "validation_owner": "worker:inventory-v2-a2-materialization-20260903",
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof_inventory_v2",
+    "python -m unittest scripts.test_materialize_completion_proof_inventory_v2"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target-inventory-v2-a2",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

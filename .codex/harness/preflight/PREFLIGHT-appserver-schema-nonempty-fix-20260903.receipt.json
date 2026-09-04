@@ -1,0 +1,67 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/.config/kd4-rust-tests.toml",
+          "codex-rs"
+        ],
+        [
+          "justfile",
+          "justfile"
+        ],
+        [
+          "scripts/test_rust_test_runner.py",
+          "scripts"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:appserver-schema-nonempty-fix-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\appserver-schema-nonempty-fix"
+  },
+  "contract_claims": [
+    "app-server-schema-exact-nonzero-trusted-runner-validation"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-03T21:27:06.189565+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "5128b8263353ead1f03218963f439022aca4188990e598fcc6ab0759f45de16d",
+  "path_claims": [
+    {
+      "path": "codex-rs/.config/kd4-rust-tests.toml",
+      "recursive": false
+    },
+    {
+      "path": "justfile",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_rust_test_runner.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T20:27:06.189565+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "e82319002b104b54dcc8f7a0979f0114a2748b20c57c2d49cf340e4a433158bd"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_rust_test_runner.RepositoryManifestTest.test_app_server_schema_gate_binds_exact_fixture_ids_through_cli",
+    "python -m unittest scripts.test_rust_test_runner.RepositoryManifestTest.test_app_server_schema_real_selection_rejects_zero_matches_through_cli",
+    "just app-server-schema-protocol-check"
+  ],
+  "validation_owner": "worker:appserver-schema-nonempty-fix-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

@@ -10,6 +10,7 @@ use codex_exec_server_protocol::JSONRPCMessage;
 use codex_utils_pty::ManagedRootProcess;
 use codex_utils_pty::WINDOWS_PROCESS_OPERATION_TIMEOUT;
 use codex_utils_pty::run_windows_process_operation;
+use codex_utils_pty::with_windows_child_creation;
 use futures::Sink;
 use futures::SinkExt;
 use futures::Stream;
@@ -265,16 +266,26 @@ fn kill_direct_child(child_process: &mut Child, action: &str) {
 async fn kill_windows_process_tree(pid: u32) -> bool {
     let pid = pid.to_string();
     let pid_for_task = pid.clone();
-    match run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
-        std::process::Command::new("taskkill")
+    let deadline = tokio::time::Instant::now() + WINDOWS_PROCESS_OPERATION_TIMEOUT;
+    let child = run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
+        let mut command = std::process::Command::new("taskkill");
+        command
             .args(["/PID", pid_for_task.as_str(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::null());
+        with_windows_child_creation(|_| command.spawn())
     })
-    .await
-    {
+    .await;
+    let mut child = match child {
+        Ok(child) => child,
+        Err(err) => {
+            warn!("failed to run taskkill for exec-server stdio process tree {pid}: {err}");
+            return false;
+        }
+    };
+    let wait_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+    match run_windows_process_operation(wait_timeout, move || child.wait()).await {
         Ok(status) => status.success(),
         Err(err) => {
             warn!("failed to run taskkill for exec-server stdio process tree {pid}: {err}");

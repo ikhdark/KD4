@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:docs-policy-runtime-fix-20260903",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/src/completion_proof.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/tests/suite/completion_proof_gate.rs",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "completion-proof-nested-standard-document-classification"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:docs-policy-runtime-fix-20260903",
+  "validation_commands": [
+    "python scripts/rust_test_runner.py --target-dir C:/Users/kuh/Desktop/kd4/codex-rs/target-docs-policy-runtime-fix run-target --profile fast --no-fail-fast core_cli_workspace -- -E 'test(=suite::completion_proof_gate::documentation_only_change_uses_exact_configured_validation_through_real_session_path) | test(=suite::completion_proof_gate::isolated_non_documentation_files_require_canonical_proof_through_real_session_path)'"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target-docs-policy-runtime-fix",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

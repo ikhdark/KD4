@@ -1,0 +1,51 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/core/src/session/turn.rs",
+          "codex-rs"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:mcp-work-limit-core-runtime-fix-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\workflow-mcp-work-limit-core-runtime-fix-20260903"
+  },
+  "contract_claims": [
+    "logical-generation-budget-terminal-follow-up-reports-exhaustion"
+  ],
+  "dependencies": [
+    "worker:mcp-work-limit-turn-complete-fix-20260903"
+  ],
+  "expires_at": "2026-09-04T02:14:27.503458+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "996648fa5d7de02eadcd5b1c3aa77da43cdfe589e565611b40bbccf0505c2a5b",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/src/session/turn.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T01:14:27.503458+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "db7a45d6aec8bcb2af57b8d53266056d4e63ee178923786b918935eb4f550ca1"
+  },
+  "validation_commands": [
+    "just core-test-fast mcp_server_all -E 'test(=suite::codex_tool::logical_generation_limit_reaches_mcp_as_failed_turn_complete)'"
+  ],
+  "validation_owner": "worker:mcp-work-limit-turn-complete-fix-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

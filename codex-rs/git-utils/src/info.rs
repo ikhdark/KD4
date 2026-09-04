@@ -14,6 +14,7 @@ use futures::StreamExt;
 use futures::stream;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::process::Child;
 use tokio::process::Command;
 use tokio::time::Duration as TokioDuration;
 use tokio::time::timeout;
@@ -468,7 +469,12 @@ impl crate::FsmonitorProbeRunner for LocalFsmonitorProbeRunner<'_> {
         // worktree or index, so do not reduce the requested command's timeout.
         let mut command = Command::new(self.git);
         command.args(args).current_dir(self.cwd).kill_on_drop(true);
-        match timeout(GIT_COMMAND_TIMEOUT, command.output()).await {
+        match timeout(
+            GIT_COMMAND_TIMEOUT,
+            coordinated_command_output(&mut command),
+        )
+        .await
+        {
             Ok(Ok(output)) if output.status.success() => Some(output.stdout),
             _ => None,
         }
@@ -595,12 +601,27 @@ async fn run_git_command_attempt(
         .args(args)
         .current_dir(cwd)
         .kill_on_drop(true);
-    let result = timeout(GIT_COMMAND_TIMEOUT, command.output()).await;
+    let result = timeout(
+        GIT_COMMAND_TIMEOUT,
+        coordinated_command_output(&mut command),
+    )
+    .await;
 
     match result {
         Ok(Ok(output)) => Some(output),
         _ => None, // Timeout or error
     }
+}
+
+async fn coordinated_command_output(
+    command: &mut Command,
+) -> std::io::Result<std::process::Output> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child: Child = codex_utils_pty::with_windows_child_creation(|_| command.spawn())?;
+    child.wait_with_output().await
 }
 
 async fn get_git_remotes(cwd: &Path) -> Option<Vec<String>> {

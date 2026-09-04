@@ -1,0 +1,69 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "SOURCEMAP.md",
+          "SOURCEMAP.md"
+        ],
+        [
+          "architecture_index.json",
+          "architecture_index.json"
+        ],
+        [
+          "source_owners.toml",
+          "source_owners.toml"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "root:stage1-source-map-reconciliation-20260903",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4-cargo-target-stage1-source-map-reconciliation-20260903"
+  },
+  "contract_claims": [
+    "stage1-source-map-derived-output-reconciliation"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-03T14:03:30.058536+00:00",
+  "generated_output_owner": "root:stage1-source-map-reconciliation-20260903",
+  "generated_outputs": [
+    "SOURCEMAP.md",
+    "architecture_index.json"
+  ],
+  "manifest_fingerprint": "a167e76678887816297d479a6d704ea808934d7cb5334b1b44528b4f289c5156",
+  "path_claims": [
+    {
+      "path": "SOURCEMAP.md",
+      "recursive": false
+    },
+    {
+      "path": "architecture_index.json",
+      "recursive": false
+    },
+    {
+      "path": "source_owners.toml",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-03T13:03:30.058536+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "60bb133fa0a4f25e83851ab16d8c462e5f42ff95",
+    "workspace_fingerprint": "b9159f64f5068c4b8ed441c10a891f25671b605256c4eb15f8215611ab2c0502"
+  },
+  "validation_commands": [
+    "python scripts/source_owners.py generate",
+    "just source-map-check"
+  ],
+  "validation_owner": "root:stage1-source-map-reconciliation-20260903",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

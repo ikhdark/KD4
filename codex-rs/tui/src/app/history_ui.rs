@@ -185,11 +185,16 @@ fn desktop_thread_open_error_message(err: &str) -> String {
 
 fn open_desktop_thread_url(url: &str) -> Result<(), String> {
     let script = windows_desktop_app_launch_script(url);
-    let output = std::process::Command::new("powershell.exe")
+    let mut command = std::process::Command::new("powershell.exe");
+    command
         .arg("-NoProfile")
         .arg("-Command")
         .arg(&script)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let output = codex_utils_pty::with_windows_child_creation(|_| command.spawn())
+        .and_then(|child| child.wait_with_output())
         .map_err(|err| format!("failed to launch Codex Desktop through PowerShell: {err}"))?;
 
     if output.status.success() {

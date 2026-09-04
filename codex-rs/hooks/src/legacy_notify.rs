@@ -1,5 +1,6 @@
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -8,6 +9,10 @@ use crate::HookEvent;
 use crate::HookPayload;
 use crate::HookResult;
 use crate::command_from_argv;
+use crate::engine::command_runner::run_contained_command;
+
+const LEGACY_NOTIFY_TIMEOUT: Duration = Duration::from_secs(10);
+const MUTATING_FINALIZER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Legacy notify payload appended as the final argv argument for backward compatibility.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -60,8 +65,12 @@ pub fn notify_hook(argv: Vec<String>) -> Hook {
                     .stdout(Stdio::null())
                     .stderr(Stdio::null());
 
-                match command.spawn() {
-                    Ok(_) => HookResult::Success,
+                match run_contained_command(command, Some(LEGACY_NOTIFY_TIMEOUT)).await {
+                    Ok(status) if status.success() => HookResult::Success,
+                    Ok(status) => HookResult::FailedContinue(
+                        std::io::Error::other(format!("legacy notify exited with status {status}"))
+                            .into(),
+                    ),
                     Err(err) => HookResult::FailedContinue(err.into()),
                 }
             })
@@ -70,6 +79,10 @@ pub fn notify_hook(argv: Vec<String>) -> Hook {
 }
 
 pub fn mutating_finalizer_hook(argv: Vec<String>) -> Hook {
+    mutating_finalizer_hook_with_timeout(argv, MUTATING_FINALIZER_TIMEOUT)
+}
+
+fn mutating_finalizer_hook_with_timeout(argv: Vec<String>, execution_timeout: Duration) -> Hook {
     let argv = Arc::new(argv);
     Hook {
         name: "legacy_notify".to_string(),
@@ -87,10 +100,9 @@ pub fn mutating_finalizer_hook(argv: Vec<String>) -> Hook {
                 command
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .kill_on_drop(true);
+                    .stderr(Stdio::null());
 
-                match command.status().await {
+                match run_contained_command(command, Some(execution_timeout)).await {
                     Ok(status) if status.success() => HookResult::Success,
                     Ok(status) => HookResult::FailedAbort(
                         std::io::Error::other(format!(
@@ -140,36 +152,91 @@ mod tests {
         }
     }
 
-    fn delayed_marker_command(directory: &std::path::Path) -> Vec<String> {
+    fn redirected_descendant_command(
+        directory: &std::path::Path,
+        keep_root_alive: bool,
+        descendant_delay_seconds: u64,
+    ) -> (
+        Vec<String>,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let started = directory.join("descendant-started.txt");
+        let escaped = directory.join("descendant-escaped.txt");
+        let direct_finished = directory.join("direct-finished.txt");
+
         #[cfg(windows)]
-        {
-            let script = directory.join("delayed-marker.ps1");
+        let argv = {
+            let child_script = directory.join("redirected-descendant.ps1");
+            let root_script = directory.join("legacy-hook-root.ps1");
+            let stdout = directory.join("redirected-descendant.stdout");
+            let stderr = directory.join("redirected-descendant.stderr");
+            let quote = |path: &std::path::Path| path.to_string_lossy().replace('\'', "''");
             std::fs::write(
-                &script,
-                concat!(
-                    "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'started.txt') -Value started\n",
-                    "Start-Sleep -Seconds 2\n",
-                    "Set-Content -LiteralPath (Join-Path $PSScriptRoot 'escaped.txt') -Value escaped\n",
+                &child_script,
+                format!(
+                    "Set-Content -LiteralPath '{}' -Value started\nStart-Sleep -Seconds {descendant_delay_seconds}\nSet-Content -LiteralPath '{}' -Value escaped\n",
+                    quote(&started),
+                    quote(&escaped),
                 ),
             )
-            .expect("write finalizer test script");
+            .expect("write redirected descendant script");
+            std::fs::write(
+                &root_script,
+                format!(
+                    "$null = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-File', '{}') -WindowStyle Hidden -RedirectStandardOutput '{}' -RedirectStandardError '{}'; while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 10 }}\n{}\n",
+                    quote(&child_script),
+                    quote(&stdout),
+                    quote(&stderr),
+                    quote(&started),
+                    if keep_root_alive {
+                        "Start-Sleep -Seconds 60".to_string()
+                    } else {
+                        format!(
+                            "Start-Sleep -Milliseconds 250; Set-Content -LiteralPath '{}' -Value finished",
+                            quote(&direct_finished),
+                        )
+                    },
+                ),
+            )
+            .expect("write legacy hook root script");
             vec![
                 "powershell.exe".to_string(),
                 "-NoProfile".to_string(),
                 "-File".to_string(),
-                script.to_string_lossy().into_owned(),
+                root_script.to_string_lossy().into_owned(),
             ]
-        }
+        };
         #[cfg(not(windows))]
-        {
+        let argv = {
+            let stdout = directory.join("redirected-descendant.stdout");
+            let stderr = directory.join("redirected-descendant.stderr");
+            let quote = |path: &std::path::Path| path.to_string_lossy().replace('\'', "'\\''");
             vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
-                "touch \"$1/started.txt\"; sleep 2; touch \"$1/escaped.txt\"".to_string(),
+                format!(
+                    "(printf started > '{}'; sleep {descendant_delay_seconds}; printf escaped > '{}') </dev/null > '{}' 2> '{}' & while [ ! -f '{}' ]; do sleep 0.01; done; {}",
+                    quote(&started),
+                    quote(&escaped),
+                    quote(&stdout),
+                    quote(&stderr),
+                    quote(&started),
+                    if keep_root_alive {
+                        "sleep 60".to_string()
+                    } else {
+                        format!(
+                            "sleep 0.25; printf finished > '{}'",
+                            quote(&direct_finished),
+                        )
+                    },
+                ),
                 "codex-hook-test".to_string(),
-                directory.to_string_lossy().into_owned(),
             ]
-        }
+        };
+
+        (argv, started, escaped, direct_finished)
     }
 
     fn expected_notification_json() -> Value {
@@ -235,11 +302,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_mutating_finalizer_terminates_its_subprocess() {
+    async fn legacy_notify_waits_for_root_and_terminates_redirected_descendants() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let started = temp_dir.path().join("started.txt");
-        let escaped = temp_dir.path().join("escaped.txt");
-        let hook = mutating_finalizer_hook(delayed_marker_command(temp_dir.path()));
+        let (argv, started, escaped, direct_finished) = redirected_descendant_command(
+            temp_dir.path(),
+            /*keep_root_alive*/ false,
+            /*descendant_delay_seconds*/ 2,
+        );
+        let hook = notify_hook(argv);
+        let payload = after_agent_payload(temp_dir.path());
+
+        let response = hook.execute(&payload).await;
+
+        assert!(matches!(response.result, HookResult::Success));
+        assert!(
+            direct_finished.exists(),
+            "legacy notify returned before its root process finished"
+        );
+        assert!(
+            started.exists(),
+            "the redirected descendant did not actually start"
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !escaped.exists(),
+            "a redirected descendant survived successful legacy notify completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_mutating_finalizer_terminates_redirected_descendants() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let (argv, started, escaped, _direct_finished) = redirected_descendant_command(
+            temp_dir.path(),
+            /*keep_root_alive*/ true,
+            /*descendant_delay_seconds*/ 2,
+        );
+        let hook = mutating_finalizer_hook(argv);
         let payload = after_agent_payload(temp_dir.path());
 
         let hook_task = tokio::spawn(async move { hook.execute(&payload).await });
@@ -262,7 +361,44 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(
             !escaped.exists(),
-            "mutating finalizer subprocess survived cancellation"
+            "a redirected mutating-finalizer descendant survived cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_finalizer_timeout_terminates_redirected_descendants() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let test_timeout = Duration::from_secs(8);
+        let descendant_delay = Duration::from_secs(10);
+        let (argv, started, escaped, _direct_finished) = redirected_descendant_command(
+            temp_dir.path(),
+            /*keep_root_alive*/ true,
+            descendant_delay.as_secs(),
+        );
+        let hook = mutating_finalizer_hook_with_timeout(argv, test_timeout);
+        let payload = after_agent_payload(temp_dir.path());
+
+        let response = tokio::time::timeout(
+            test_timeout + Duration::from_secs(5),
+            hook.execute(&payload),
+        )
+        .await
+        .expect("mutating finalizer should enforce its execution deadline");
+
+        match response.result {
+            HookResult::FailedAbort(error) => assert!(
+                error
+                    .to_string()
+                    .contains(&format!("hook timed out after {}s", test_timeout.as_secs())),
+                "unexpected finalizer timeout error: {error}"
+            ),
+            result => panic!("timed-out mutating finalizer should abort, got {result:?}"),
+        }
+        assert!(started.exists(), "the redirected descendant did not start");
+        tokio::time::sleep(descendant_delay + Duration::from_secs(1)).await;
+        assert!(
+            !escaped.exists(),
+            "a redirected mutating-finalizer descendant survived its execution timeout"
         );
     }
 }

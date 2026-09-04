@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -23,6 +24,8 @@ SCHEMA_VERSION = 1
 # worker threads from RUST_MIN_STACK. Keep the runner aligned with the justfile
 # and `scripts/rust_build_status.py`.
 RUST_MIN_STACK_BYTES = "8388608"
+TRUSTED_TEST_FEATURES = frozenset({"codex-core/completion-proof-test-store"})
+_QUALIFIED_FEATURE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$")
 
 
 class RunnerError(RuntimeError):
@@ -35,6 +38,7 @@ class Helper:
     package: str
     binary: str
     platform: str | None
+    features: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -44,13 +48,16 @@ class Target:
     selector_kind: str
     selector_value: str | None
     helpers: tuple[str, ...]
+    features: tuple[str, ...] = ()
 
     def selection_args(self) -> list[str]:
         args = ["-p", self.package]
         if self.selector_kind == "lib":
             args.append("--lib")
         else:
-            args.extend(["--test", self.selector_value or ""])
+            args.extend([f"--{self.selector_kind}", self.selector_value or ""])
+        if self.features:
+            args.extend(["--features", ",".join(self.features)])
         return args
 
 
@@ -66,6 +73,41 @@ class Gate:
     name: str
     description: str
     steps: tuple[GateStep, ...]
+
+
+@dataclass(frozen=True)
+class NextestTest:
+    rust_binary_id: str
+    event_binary_alias: str
+    semantic_id: str
+    ignored: bool
+
+    @property
+    def authoritative_id(self) -> str:
+        return f"{self.rust_binary_id}${self.semantic_id}"
+
+    @property
+    def event_alias(self) -> str:
+        return f"{self.event_binary_alias}${self.semantic_id}"
+
+
+@dataclass(frozen=True)
+class NextestTargetIdentity:
+    package_name: str
+    binary_name: str
+    kind: str
+
+    @property
+    def rust_binary_id(self) -> str:
+        return _nextest_rust_binary_id(
+            self.package_name,
+            self.kind,
+            self.binary_name,
+        )
+
+    @property
+    def event_binary_alias(self) -> str:
+        return f"{self.package_name}::{self.binary_name}"
 
 
 @dataclass(frozen=True)
@@ -98,6 +140,10 @@ class Manifest:
         helpers_raw = _require_table(root.get("helpers"), "manifest.helpers")
         targets_raw = _require_table(root.get("targets"), "manifest.targets")
         gates_raw = _require_table(root.get("gates"), "manifest.gates")
+        if not targets_raw:
+            raise RunnerError("manifest.targets must be a non-empty table")
+        if not gates_raw:
+            raise RunnerError("manifest.gates must be a non-empty table")
 
         helpers: dict[str, Helper] = {}
         for name, value in helpers_raw.items():
@@ -105,7 +151,7 @@ class Manifest:
             table = _require_table(value, f"helpers.{helper_name}")
             _reject_unknown(
                 table,
-                {"package", "bin", "platform"},
+                {"package", "bin", "platform", "features"},
                 f"helpers.{helper_name}",
             )
             package = _require_string(
@@ -122,7 +168,12 @@ class Manifest:
                     raise RunnerError(
                         f"helpers.{helper_name}.platform must be windows, linux, or macos"
                     )
-            helpers[helper_name] = Helper(helper_name, package, binary, platform)
+            features = _require_trusted_features(
+                table.get("features", []), f"helpers.{helper_name}.features"
+            )
+            helpers[helper_name] = Helper(
+                helper_name, package, binary, platform, features
+            )
 
         targets: dict[str, Target] = {}
         for name, value in targets_raw.items():
@@ -130,27 +181,25 @@ class Manifest:
             table = _require_table(value, f"targets.{target_name}")
             _reject_unknown(
                 table,
-                {"package", "lib", "test", "helpers"},
+                {"package", "lib", "test", "bin", "helpers", "features"},
                 f"targets.{target_name}",
             )
             package = _require_string(
                 table.get("package"), f"targets.{target_name}.package"
             )
-            has_lib = "lib" in table
-            has_test = "test" in table
-            if has_lib == has_test:
+            selectors = [key for key in ("lib", "test", "bin") if key in table]
+            if len(selectors) != 1:
                 raise RunnerError(
-                    f"targets.{target_name} must declare exactly one of lib or test"
+                    f"targets.{target_name} must declare exactly one of lib, test, or bin"
                 )
-            if has_lib:
+            selector_kind = selectors[0]
+            if selector_kind == "lib":
                 if table["lib"] is not True:
                     raise RunnerError(f"targets.{target_name}.lib must be true")
-                selector_kind = "lib"
                 selector_value = None
             else:
-                selector_kind = "test"
                 selector_value = _require_string(
-                    table["test"], f"targets.{target_name}.test"
+                    table[selector_kind], f"targets.{target_name}.{selector_kind}"
                 )
             helper_names = _require_string_list(
                 table.get("helpers"), f"targets.{target_name}.helpers"
@@ -161,12 +210,16 @@ class Manifest:
                     raise RunnerError(
                         f"targets.{target_name}.helpers references unknown helper {helper_name!r}"
                     )
+            features = _require_trusted_features(
+                table.get("features", []), f"targets.{target_name}.features"
+            )
             targets[target_name] = Target(
                 target_name,
                 package,
                 selector_kind,
                 selector_value,
                 tuple(helper_names),
+                features,
             )
 
         gates: dict[str, Gate] = {}
@@ -252,6 +305,34 @@ def _reject_duplicates(values: Sequence[str], location: str) -> None:
         raise RunnerError(f"{location} contains duplicates: {', '.join(duplicates)}")
 
 
+def _require_trusted_features(value: Any, location: str) -> tuple[str, ...]:
+    features = _require_string_list(value, location)
+    _reject_duplicates(features, location)
+    for feature in features:
+        if not _QUALIFIED_FEATURE_PATTERN.fullmatch(feature):
+            raise RunnerError(
+                f"{location} entry {feature!r} must be exactly package/feature"
+            )
+        if feature not in TRUSTED_TEST_FEATURES:
+            raise RunnerError(f"{location} contains untrusted feature {feature!r}")
+    return tuple(features)
+
+
+def _nextest_rust_binary_id(
+    package_name: str,
+    kind: str,
+    binary_name: str,
+) -> str:
+    """Derive nextest's stable RustBinaryId for the supported target kinds."""
+    if kind in {"lib", "proc-macro"}:
+        return package_name
+    if kind == "test":
+        return f"{package_name}::{binary_name}"
+    if kind == "bin":
+        return f"{package_name}::bin/{binary_name}"
+    raise RunnerError(f"unsupported nextest Rust suite kind {kind!r}")
+
+
 @dataclass(frozen=True)
 class MetadataIndex:
     target_directory: Path
@@ -287,23 +368,86 @@ class MetadataIndex:
                     f"helper {helper.name!r} declares missing binary "
                     f"{helper.package}/{helper.binary}"
                 )
+            self._validate_features(helper.features, f"helper {helper.name!r}")
         for target in manifest.targets.values():
-            package = self._package(target.package, f"target {target.name!r}")
-            if target.selector_kind == "lib":
-                if not self._has_kind(package, "lib"):
-                    raise RunnerError(
-                        f"target {target.name!r} declares --lib for package "
-                        f"{target.package!r}, which has no library target"
-                    )
-            elif not self._has_target(package, target.selector_value or "", "test"):
+            self.nextest_target_identity(target)
+            self._validate_features(target.features, f"target {target.name!r}")
+
+    def _validate_features(self, features: Sequence[str], owner: str) -> None:
+        for qualified in features:
+            package_name, feature_name = qualified.split("/", 1)
+            package = self._package(package_name, owner)
+            package_features = package.get("features")
+            if not isinstance(package_features, dict):
                 raise RunnerError(
-                    f"target {target.name!r} declares missing test target "
-                    f"{target.package}/{target.selector_value}"
+                    f"cargo metadata features for package {package_name!r} must be a table"
+                )
+            if feature_name not in package_features:
+                raise RunnerError(
+                    f"{owner} declares unknown Cargo feature {qualified!r}"
                 )
 
     def package_id(self, package_name: str) -> str:
         package = self._package(package_name, f"package {package_name!r}")
         return _require_string(package.get("id"), f"cargo package {package_name!r}.id")
+
+    def nextest_target_identity(self, target: Target) -> NextestTargetIdentity:
+        package = self._package(target.package, f"target {target.name!r}")
+        candidates: list[tuple[str, str]] = []
+        if target.selector_kind == "lib":
+            for cargo_target in self._targets(package):
+                kinds = cargo_target.get("kind")
+                if not isinstance(kinds, list):
+                    continue
+                supported = [kind for kind in ("lib", "proc-macro") if kind in kinds]
+                if len(supported) > 1:
+                    raise RunnerError(
+                        f"target {target.name!r} has ambiguous Cargo library kinds"
+                    )
+                if supported:
+                    candidates.append(
+                        (
+                            _require_string(
+                                cargo_target.get("name"),
+                                f"Cargo library target for {target.package!r}.name",
+                            ),
+                            supported[0],
+                        )
+                    )
+            if not candidates:
+                raise RunnerError(
+                    f"target {target.name!r} declares --lib for package "
+                    f"{target.package!r}, which has no library target"
+                )
+        else:
+            for cargo_target in self._targets(package):
+                kinds = cargo_target.get("kind")
+                if (
+                    cargo_target.get("name") == (target.selector_value or "")
+                    and isinstance(kinds, list)
+                    and target.selector_kind in kinds
+                ):
+                    candidates.append(
+                        (
+                            _require_string(
+                                cargo_target.get("name"),
+                                f"Cargo {target.selector_kind} target for "
+                                f"{target.package!r}.name",
+                            ),
+                            target.selector_kind,
+                        )
+                    )
+            if not candidates:
+                raise RunnerError(
+                    f"target {target.name!r} declares missing {target.selector_kind} target "
+                    f"{target.package}/{target.selector_value}"
+                )
+        if len(candidates) != 1:
+            raise RunnerError(
+                f"target {target.name!r} does not resolve to exactly one Cargo target"
+            )
+        binary_name, kind = candidates[0]
+        return NextestTargetIdentity(target.package, binary_name, kind)
 
     def _package(self, name: str, owner: str) -> Mapping[str, Any]:
         try:
@@ -425,7 +569,11 @@ class RustTestRunner:
                 "name": name,
                 "target_dir": str(self.target_dir),
                 "selection": target.selection_args(),
+                "features": list(target.features),
                 "helpers": [helper.name for helper in helpers],
+                "helper_features": {
+                    helper.name: list(helper.features) for helper in helpers
+                },
                 "list": self._list_command(target, []),
                 "builds": [self._build_command(helper) for helper in helpers],
                 "run": self._run_command(target, []),
@@ -442,6 +590,7 @@ class RustTestRunner:
                     {
                         "target": step.target,
                         "tests": list(step.tests),
+                        "features": list(target.features),
                         "list": self._list_command(target, filter_args),
                         "run": self._run_command(target, filter_args),
                     }
@@ -451,6 +600,9 @@ class RustTestRunner:
                 "name": name,
                 "target_dir": str(self.target_dir),
                 "helpers": [helper.name for helper in helpers],
+                "helper_features": {
+                    helper.name: list(helper.features) for helper in helpers
+                },
                 "builds": [self._build_command(helper) for helper in helpers],
                 "steps": steps,
             }
@@ -502,6 +654,223 @@ class RustTestRunner:
                 env=env,
                 capture_output=False,
             )
+
+    def run_gate_proof(self, name: str, execution_id: str) -> tuple[dict[str, Any], int]:
+        """Run a named gate and return fresh per-test execution evidence.
+
+        This path is reserved for the canonical completion-proof runner. It first
+        confirms every nonzero manifest selection, then runs every gate step with
+        nextest's structured libtest event stream. A confirmed test failure is
+        retained even if a later step has a runner error.
+        """
+        if not execution_id.strip():
+            raise RunnerError("proof execution ID must be nonempty")
+        gate = self.gate(name)
+        intended = [test_id for step in gate.steps for test_id in step.tests]
+        _reject_duplicates(intended, f"gate {name!r} proof test IDs")
+        if not intended:
+            raise RunnerError(f"gate {name!r} proof selected zero tests")
+
+        selected: list[str] = []
+        selected_steps: list[tuple[GateStep, dict[str, NextestTest]]] = []
+        for step in gate.steps:
+            target = self.target(step.target)
+            listed = self._list_selection(target, self._gate_filter_args(step))
+            actual = set(listed)
+            expected = set(step.tests)
+            if actual != expected:
+                missing = sorted(expected - actual)
+                unexpected = sorted(actual - expected)
+                raise RunnerError(
+                    f"gate {name!r} step {step.target!r} selected the wrong test-ID set: "
+                    f"missing={missing}, unexpected={unexpected}"
+                )
+            selected.extend(step.tests)
+            selected_steps.append((step, listed))
+
+        env = self._build_helper_environment(
+            self.active_helpers(step.target for step in gate.steps)
+        )
+        env["NEXTEST_EXPERIMENTAL_LIBTEST_JSON"] = "1"
+        executed: list[str] = []
+        outcomes: list[dict[str, str]] = []
+        diagnostics: list[str] = []
+        saw_confirmed_failure = False
+        saw_pre_result_error = False
+
+        for step, listed in selected_steps:
+            target = self.target(step.target)
+            command = [
+                *self._run_command(
+                    target,
+                    self._gate_filter_args(step),
+                    no_fail_fast=True,
+                ),
+                "--retries",
+                "0",
+                "--message-format",
+                "libtest-json-plus",
+                "--message-format-version",
+                "0.1",
+            ]
+            result = self.executor(
+                command,
+                cwd=CODEX_RS_ROOT,
+                env=env,
+                capture_output=True,
+            )
+            started, terminal, parse_errors = parse_nextest_events(
+                result.stdout or ""
+            )
+            expected_semantic = set(step.tests)
+            event_by_semantic: dict[str, str] = {}
+            authoritative_by_event: dict[str, str] = {}
+            semantic_by_authoritative: dict[str, str] = {}
+            for semantic_id in step.tests:
+                listed_test = listed[semantic_id]
+                event_alias = listed_test.event_alias
+                authoritative_id = listed_test.authoritative_id
+                previous_authoritative = authoritative_by_event.get(event_alias)
+                if (
+                    previous_authoritative is not None
+                    and previous_authoritative != authoritative_id
+                ):
+                    raise RunnerError(
+                        f"nextest event alias {event_alias!r} is ambiguous between "
+                        f"{previous_authoritative!r} and {authoritative_id!r}"
+                    )
+                previous_semantic = semantic_by_authoritative.get(authoritative_id)
+                if previous_semantic is not None and previous_semantic != semantic_id:
+                    raise RunnerError(
+                        f"nextest authoritative ID {authoritative_id!r} maps to "
+                        "more than one manifest test ID"
+                    )
+                event_by_semantic[semantic_id] = event_alias
+                authoritative_by_event[event_alias] = authoritative_id
+                semantic_by_authoritative[authoritative_id] = semantic_id
+            expected_events = set(authoritative_by_event)
+            observed_starts = started & expected_events
+            observed_terminals = {
+                event_alias
+                for event_alias, outcome in terminal.items()
+                if event_alias in expected_events
+                and outcome in {"passed", "failed"}
+            }
+            unexpected_terminal_ids = sorted(
+                event_alias
+                for event_alias, outcome in terminal.items()
+                if event_alias not in expected_events
+                and outcome in {"passed", "failed"}
+            )
+            cross_binary_lookalikes = sorted(
+                event_alias
+                for event_alias, outcome in terminal.items()
+                if event_alias not in expected_events
+                and outcome in {"passed", "failed"}
+                and _split_qualified_nextest_id(event_alias)[1]
+                in expected_semantic
+            )
+            step_outcomes: list[dict[str, str]] = []
+            for semantic_id in step.tests:
+                event_alias = event_by_semantic[semantic_id]
+                authoritative_id = authoritative_by_event[event_alias]
+                mapped_semantic = semantic_by_authoritative[authoritative_id]
+                outcome = terminal.get(event_alias)
+                if outcome in {"passed", "failed"}:
+                    executed.append(mapped_semantic)
+                    item = {"id": mapped_semantic, "outcome": outcome}
+                    outcomes.append(item)
+                    step_outcomes.append(item)
+            failed = [item for item in step_outcomes if item["outcome"] == "failed"]
+            invalid_outcomes = [
+                semantic_id
+                for semantic_id, event_alias in event_by_semantic.items()
+                if event_alias in terminal
+                and terminal[event_alias] not in {"passed", "failed"}
+            ]
+            confirmed_failure = bool(failed) and result.returncode != 0
+            step_passed = (
+                result.returncode == 0
+                and not parse_errors
+                and not invalid_outcomes
+                and observed_starts == expected_events
+                and observed_terminals == expected_events
+                and not unexpected_terminal_ids
+                and not cross_binary_lookalikes
+                and not failed
+            )
+            if confirmed_failure:
+                saw_confirmed_failure = True
+            if not step_passed and not confirmed_failure:
+                saw_pre_result_error = True
+            elif confirmed_failure and (
+                parse_errors
+                or invalid_outcomes
+                or observed_starts != expected_events
+                or observed_terminals != expected_events
+                or unexpected_terminal_ids
+                or cross_binary_lookalikes
+            ):
+                # Preserve the confirmed failure while retaining that the rest
+                # of the step was not clean evidence.
+                saw_pre_result_error = True
+            if parse_errors:
+                diagnostics.extend(parse_errors)
+            if observed_starts != expected_events:
+                diagnostics.append(
+                    f"step {step.target} start mismatch: "
+                    f"missing={sorted(expected_events - observed_starts)}"
+                )
+            if (
+                observed_terminals != expected_events
+                or unexpected_terminal_ids
+                or cross_binary_lookalikes
+            ):
+                diagnostics.append(
+                    f"step {step.target} terminal mismatch: "
+                    f"missing={sorted(expected_events - observed_terminals)}, "
+                    f"unexpected={unexpected_terminal_ids}, "
+                    f"cross_binary_lookalikes={cross_binary_lookalikes}"
+                )
+            if invalid_outcomes:
+                diagnostics.append(
+                    f"step {step.target} invalid terminal outcomes: "
+                    f"{sorted(invalid_outcomes)}"
+                )
+            if failed and result.returncode == 0:
+                diagnostics.append(
+                    f"step {step.target} emitted a failed terminal with exit 0"
+                )
+            if result.returncode != 0:
+                diagnostics.append(
+                    f"step {step.target} exited {result.returncode}: "
+                    f"{(result.stderr or '')[-2000:]}"
+                )
+
+        if saw_confirmed_failure:
+            classification = "confirmed_validation_failure"
+            exit_code = 100
+        elif saw_pre_result_error:
+            classification = "pre_result_error"
+            exit_code = 2
+        else:
+            classification = "confirmed_pass"
+            exit_code = 0
+        return (
+            {
+                "schema_version": 1,
+                "report_type": "RustNamedGateExecutionReportV1",
+                "gate": name,
+                "execution_id": execution_id,
+                "classification": classification,
+                "intended_ids": intended,
+                "selected_ids": selected,
+                "executed_ids": executed,
+                "outcomes": outcomes,
+                "diagnostic": "\n".join(diagnostics)[-8000:],
+            },
+            exit_code,
+        )
 
     def parity(self, legacy_name: str, replacement_names: Sequence[str]) -> None:
         if not replacement_names:
@@ -674,16 +1043,32 @@ class RustTestRunner:
             helper.package,
             "--bin",
             helper.binary,
+            *(
+                ["--features", ",".join(helper.features)]
+                if helper.features
+                else []
+            ),
         ]
 
     def _list_tests(
         self, target: Target, filter_args: Sequence[str]
     ) -> dict[str, bool]:
+        return {
+            test_id: test.ignored
+            for test_id, test in self._list_selection(target, filter_args).items()
+        }
+
+    def _list_selection(
+        self, target: Target, filter_args: Sequence[str]
+    ) -> dict[str, NextestTest]:
         args = _list_only_args(validate_filtering_args(filter_args))
         result = self._checked(
             self._list_command(target, args), env=self.base_env, capture_output=True
         )
-        tests = parse_nextest_list(result.stdout)
+        tests = parse_nextest_list(
+            result.stdout,
+            expected_target=self.metadata.nextest_target_identity(target),
+        )
         if not tests:
             raise RunnerError(
                 f"named target {target.name!r} selected zero tests with args {args!r}"
@@ -756,29 +1141,111 @@ class RustTestRunner:
         return result
 
 
-def parse_nextest_list(output: str) -> dict[str, bool]:
+def parse_nextest_list(
+    output: str,
+    *,
+    expected_target: NextestTargetIdentity,
+) -> dict[str, NextestTest]:
     try:
         payload = json.loads(output)
     except json.JSONDecodeError as exc:
         raise RunnerError(f"cargo nextest list returned invalid JSON: {exc}") from exc
     root = _require_table(payload, "cargo nextest list output")
+    if "test-count" not in root:
+        raise RunnerError("cargo nextest list output.test-count is required")
+    declared_count = root["test-count"]
+    if type(declared_count) is not int:
+        raise RunnerError("cargo nextest list output.test-count must be an integer")
+    if declared_count < 0:
+        raise RunnerError(
+            "cargo nextest list output.test-count must be nonnegative"
+        )
     suites = _require_table(
         root.get("rust-suites"), "cargo nextest list output.rust-suites"
     )
-    tests: dict[str, bool] = {}
+    tests: dict[str, NextestTest] = {}
     listed_ids: set[str] = set()
+    binary_alias_owners: dict[str, str] = {}
+    event_alias_owners: dict[str, str] = {}
+    found_targets: list[tuple[NextestTargetIdentity, str]] = []
+    listed_count = 0
     for suite_name, suite_value in suites.items():
-        suite = _require_table(suite_value, f"rust-suites.{suite_name}")
+        suite_name = _require_string(suite_name, "nextest rust-suite ID")
+        if "$" in suite_name:
+            raise RunnerError(
+                f"nextest rust-suite ID {suite_name!r} must not contain '$'"
+            )
+        suite_location = f"rust-suites.{suite_name}"
+        suite = _require_table(suite_value, suite_location)
+        binary_id = _require_string(
+            suite.get("binary-id"), f"{suite_location}.binary-id"
+        )
+        package_name = _require_string(
+            suite.get("package-name"), f"{suite_location}.package-name"
+        )
+        binary_name = _require_string(
+            suite.get("binary-name"), f"{suite_location}.binary-name"
+        )
+        kind = _require_string(suite.get("kind"), f"{suite_location}.kind")
+        status = _require_string(suite.get("status"), f"{suite_location}.status")
+        for label, value in (
+            ("binary-id", binary_id),
+            ("package-name", package_name),
+            ("binary-name", binary_name),
+        ):
+            if "$" in value:
+                raise RunnerError(
+                    f"{suite_location}.{label} {value!r} must not contain '$'"
+                )
+        if suite_name != binary_id:
+            raise RunnerError(
+                f"nextest rust-suite map key {suite_name!r} does not match "
+                f"binary-id {binary_id!r}"
+            )
+        if status != "listed":
+            raise RunnerError(
+                f"{suite_location}.status must be 'listed', found {status!r}"
+            )
+        derived_binary_id = _nextest_rust_binary_id(
+            package_name,
+            kind,
+            binary_name,
+        )
+        if binary_id != derived_binary_id:
+            raise RunnerError(
+                f"{suite_location}.binary-id {binary_id!r} does not match "
+                f"the stable {kind} identity {derived_binary_id!r}"
+            )
+        event_binary_alias = f"{package_name}::{binary_name}"
+        previous_owner = binary_alias_owners.get(event_binary_alias)
+        if previous_owner is not None and previous_owner != binary_id:
+            raise RunnerError(
+                f"nextest event binary alias {event_binary_alias!r} is ambiguous "
+                f"between {previous_owner!r} and {binary_id!r}"
+            )
+        binary_alias_owners[event_binary_alias] = binary_id
+        actual_target = NextestTargetIdentity(package_name, binary_name, kind)
+        found_targets.append((actual_target, binary_id))
         testcases = _require_table(
-            suite.get("testcases"), f"rust-suites.{suite_name}.testcases"
+            suite.get("testcases"), f"{suite_location}.testcases"
         )
         for test_id, testcase_value in testcases.items():
+            listed_count += 1
             test_id = _require_string(test_id, "nextest test ID")
+            if "$" in test_id:
+                raise RunnerError(
+                    f"nextest test ID {test_id!r} must not contain '$'"
+                )
+            _reject_nextest_attempt_identity(test_id, owner="nextest test ID")
             testcase = _require_table(
                 testcase_value, f"rust-suites.{suite_name}.testcases.{test_id}"
             )
-            ignored = testcase.get("ignored", False)
-            if not isinstance(ignored, bool):
+            if "ignored" not in testcase:
+                raise RunnerError(
+                    f"nextest ignored state for {test_id!r} is required"
+                )
+            ignored = testcase["ignored"]
+            if type(ignored) is not bool:
                 raise RunnerError(
                     f"nextest ignored state for {test_id!r} must be boolean"
                 )
@@ -787,25 +1254,151 @@ def parse_nextest_list(output: str) -> dict[str, bool]:
             listed_ids.add(test_id)
             if not _testcase_matches_filter(testcase):
                 continue
-            tests[test_id] = ignored
+            test = NextestTest(
+                rust_binary_id=binary_id,
+                event_binary_alias=event_binary_alias,
+                semantic_id=test_id,
+                ignored=ignored,
+            )
+            prior_authoritative = event_alias_owners.get(test.event_alias)
+            if (
+                prior_authoritative is not None
+                and prior_authoritative != test.authoritative_id
+            ):
+                raise RunnerError(
+                    f"nextest event alias {test.event_alias!r} is ambiguous between "
+                    f"{prior_authoritative!r} and {test.authoritative_id!r}"
+                )
+            event_alias_owners[test.event_alias] = test.authoritative_id
+            tests[test_id] = test
     # `test-count` covers every listed case, including the ones a filterset
     # excluded, so compare it against the full listing rather than the selection.
-    declared_count = root.get("test-count")
-    if isinstance(declared_count, int) and declared_count != len(listed_ids):
+    if declared_count != listed_count:
         raise RunnerError(
-            f"nextest test-count {declared_count} does not match parsed count {len(listed_ids)}"
+            f"nextest test-count {declared_count} does not match parsed count {listed_count}"
+        )
+    mismatched_targets = [
+        (target, binary_id)
+        for target, binary_id in found_targets
+        if target != expected_target
+    ]
+    if mismatched_targets:
+        target, binary_id = mismatched_targets[0]
+        raise RunnerError(
+            "nextest rust-suite does not match the requested Cargo target: "
+            f"expected package={expected_target.package_name!r}, "
+            f"binary={expected_target.binary_name!r}, kind={expected_target.kind!r}, "
+            f"binary-id={expected_target.rust_binary_id!r}; "
+            f"found package={target.package_name!r}, "
+            f"binary={target.binary_name!r}, kind={target.kind!r}, "
+            f"binary-id={binary_id!r}"
         )
     return tests
 
 
+def _reject_nextest_attempt_identity(value: str, *, owner: str) -> None:
+    retry_prefix, retry_separator, retry_index = value.rpartition("#")
+    if retry_separator and retry_prefix and retry_index.isdecimal():
+        raise RunnerError(f"{owner} {value!r} contains a retry-attempt suffix")
+    stress_prefix, stress_separator, stress_index = value.rpartition("@stress-")
+    if stress_separator and stress_prefix and stress_index.isdecimal():
+        raise RunnerError(f"{owner} {value!r} contains a stress-attempt suffix")
+
+
+def _split_qualified_nextest_id(value: str) -> tuple[str, str]:
+    if value.count("$") != 1:
+        raise RunnerError(
+            f"nextest test event name {value!r} must be exactly "
+            "<package-name>::<binary-name>$<semantic-test-id>"
+        )
+    event_binary_alias, semantic_id = value.split("$", 1)
+    if event_binary_alias.count("::") != 1 or not semantic_id:
+        raise RunnerError(
+            f"nextest test event name {value!r} must be exactly "
+            "<package-name>::<binary-name>$<semantic-test-id>"
+        )
+    package_name, binary_name = event_binary_alias.split("::", 1)
+    if not package_name.strip() or not binary_name.strip():
+        raise RunnerError(
+            f"nextest test event name {value!r} must be exactly "
+            "<package-name>::<binary-name>$<semantic-test-id>"
+        )
+    _reject_nextest_attempt_identity(
+        semantic_id,
+        owner="nextest test event semantic ID",
+    )
+    return event_binary_alias, semantic_id
+
+
+def parse_nextest_events(
+    output: str,
+) -> tuple[set[str], dict[str, str], list[str]]:
+    """Parse nextest's libtest-json-plus stream without inferring execution."""
+    started: set[str] = set()
+    terminal: dict[str, str] = {}
+    errors: list[str] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            errors.append(f"invalid nextest event JSON: {line[:500]}")
+            continue
+        if not isinstance(event, dict) or event.get("type") != "test":
+            continue
+        test_id = event.get("name")
+        event_name = event.get("event")
+        if not isinstance(test_id, str) or not test_id:
+            errors.append("nextest test event omitted its name")
+            continue
+        try:
+            _split_qualified_nextest_id(test_id)
+        except RunnerError as exc:
+            errors.append(str(exc))
+            continue
+        if event_name == "started":
+            if test_id in started:
+                errors.append(f"nextest emitted duplicate start for {test_id}")
+                continue
+            started.add(test_id)
+        elif event_name in {"ok", "failed", "ignored"}:
+            if test_id not in started:
+                errors.append(
+                    f"nextest emitted a terminal result before its start for {test_id}"
+                )
+                continue
+            if event_name == "ok":
+                outcome = "passed"
+            elif event_name == "failed":
+                outcome = "failed"
+            else:
+                outcome = "skipped"
+            if test_id in terminal:
+                errors.append(f"nextest emitted duplicate terminal result for {test_id}")
+                continue
+            terminal[test_id] = outcome
+        else:
+            errors.append(
+                f"nextest emitted unsupported test event {event_name!r} for {test_id}"
+            )
+    return started, terminal, errors
+
+
 def _testcase_matches_filter(testcase: Mapping[str, Any]) -> bool:
     """Nextest lists non-matching cases with a `filter-match` mismatch status."""
-    filter_match = testcase.get("filter-match")
-    if filter_match is None:
-        return True
+    if "filter-match" not in testcase:
+        raise RunnerError("nextest filter-match is required")
+    filter_match = testcase["filter-match"]
     if not isinstance(filter_match, dict):
         raise RunnerError("nextest filter-match must be a table")
-    return filter_match.get("status") == "matches"
+    status = _require_string(filter_match.get("status"), "nextest filter-match.status")
+    if status not in {"matches", "mismatch"}:
+        raise RunnerError(
+            f"nextest filter-match.status has unsupported value {status!r}"
+        )
+    return status == "matches"
 
 
 _TARGET_OVERRIDE_OPTIONS = {
@@ -967,12 +1560,32 @@ def load_metadata(executor: Executor = _default_executor) -> MetadataIndex:
     return MetadataIndex.from_json(payload)
 
 
-def _resolve_target_dir(value: str | None, metadata: MetadataIndex) -> Path:
-    configured = (
+def _configured_target_dir(value: str | None) -> str | None:
+    return (
         value
         or os.environ.get("CODEX_CARGO_LANE_TARGET_DIR")
         or os.environ.get("CARGO_TARGET_DIR")
     )
+
+
+def _validate_explicit_target_dir(value: str | None) -> None:
+    configured = _configured_target_dir(value)
+    if configured is None:
+        return
+    path = Path(configured)
+    if path.is_absolute():
+        return
+    normalized = Path(os.path.normpath(configured))
+    if normalized.parts and normalized.parts[0].casefold() == "codex-rs":
+        raise RunnerError(
+            "relative --target-dir paths are anchored under codex-rs and must not "
+            "start with codex-rs; use an absolute path or a workspace-relative "
+            "target-* path"
+        )
+
+
+def _resolve_target_dir(value: str | None, metadata: MetadataIndex) -> Path:
+    configured = _configured_target_dir(value)
     if configured is None:
         return metadata.target_directory
     path = Path(configured)
@@ -1001,6 +1614,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_target.add_argument("filter_args", nargs=argparse.REMAINDER)
     run_gate = subparsers.add_parser("run-gate", parents=[run_options])
     run_gate.add_argument("name")
+    proof_gate = subparsers.add_parser("run-gate-proof", parents=[run_options])
+    proof_gate.add_argument("name")
+    proof_gate.add_argument("--proof-report", type=Path, required=True)
+    proof_gate.add_argument("--proof-execution-id", required=True)
     parity = subparsers.add_parser("parity", parents=[run_options])
     parity.add_argument("legacy_target")
     parity.add_argument("replacement_targets", nargs="+")
@@ -1058,6 +1675,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             filter_args, owned = _split_runner_owned_options(filter_args)
             no_fail_fast = no_fail_fast or "--no-fail-fast" in owned
 
+        _validate_explicit_target_dir(args.target_dir)
         manifest = Manifest.load(args.manifest)
         metadata = load_metadata()
         runner = RustTestRunner(
@@ -1072,16 +1690,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"validated Rust test manifest version {manifest.version}: {args.manifest}"
             )
         elif args.command == "list-targets":
-            for name in manifest.targets:
-                print(f"target\t{name}")
+            for name, target in manifest.targets.items():
+                print(f"target\t{name}\tfeatures={','.join(target.features)}")
             for name in manifest.gates:
-                print(f"gate\t{name}")
+                gate_features = sorted(
+                    {
+                        feature
+                        for step in manifest.gates[name].steps
+                        for feature in manifest.targets[step.target].features
+                    }
+                )
+                print(f"gate\t{name}\tfeatures={','.join(gate_features)}")
         elif args.command == "plan":
             print(json.dumps(runner.plan(args.name), indent=2))
         elif args.command == "run-target":
             runner.run_target(args.name, filter_args)
         elif args.command == "run-gate":
             runner.run_gate(args.name)
+        elif args.command == "run-gate-proof":
+            report, exit_code = runner.run_gate_proof(
+                args.name,
+                args.proof_execution_id,
+            )
+            args.proof_report.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with args.proof_report.open("x", encoding="utf-8", newline="\n") as output:
+                    json.dump(report, output, indent=2, sort_keys=True)
+                    output.write("\n")
+            except FileExistsError as exc:
+                raise RunnerError(
+                    f"proof report already exists: {args.proof_report}"
+                ) from exc
+            return exit_code
         elif args.command == "parity":
             runner.parity(args.legacy_target, args.replacement_targets)
         else:  # pragma: no cover - argparse enforces the command set.

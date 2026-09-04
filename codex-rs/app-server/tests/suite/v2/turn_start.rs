@@ -26,6 +26,9 @@ use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
 use codex_app_server_protocol::CommandExecutionStatus;
+use codex_app_server_protocol::ConfigBatchWriteParams;
+use codex_app_server_protocol::ConfigEdit;
+use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangePatchUpdatedNotification;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
@@ -35,6 +38,7 @@ use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind;
 use codex_app_server_protocol::RequestId;
@@ -52,6 +56,8 @@ use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadTurnsListParams;
+use codex_app_server_protocol::ThreadTurnsListResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnEnvironmentParams;
 use codex_app_server_protocol::TurnItemsView;
@@ -62,6 +68,7 @@ use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_app_server_protocol::WarningNotification;
+use codex_app_server_protocol::WriteStatus;
 use codex_config::config_toml::ConfigToml;
 use codex_core::test_support::all_model_presets;
 use codex_features::FEATURES;
@@ -76,6 +83,7 @@ use codex_protocol::models::ImageDetail;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_utils_absolute_path::test_support::PathExt;
+use core_test_support::BlockedCompletionProofFixture;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use indexmap::IndexMap;
@@ -4218,6 +4226,356 @@ async fn turn_start_with_elevated_override_does_not_persist_project_trust() -> R
     let config_toml = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
     assert!(!config_toml.contains("trust_level = \"trusted\""));
     assert!(!config_toml.contains(&workspace.path().display().to_string()));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn blocked_completion_proof_reaches_app_server_as_failed_turn_without_launching_runner()
+-> Result<()> {
+    let proof_protocol_timeout = std::time::Duration::from_secs(120);
+    let fixture = BlockedCompletionProofFixture::new()?;
+    let server = create_mock_responses_server_repeating_assistant("premature success").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "never",
+        &BTreeMap::default(),
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(proof_protocol_timeout, mcp.initialize()).await??;
+    let physical_credential_before =
+        codex_core::test_support::completion_proof_physical_credential_snapshot(
+            codex_home.path(),
+            fixture.repo_path(),
+        )
+        .map_err(anyhow::Error::msg)?;
+
+    let thread_request = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            cwd: Some(fixture.repo_path().display().to_string()),
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_response: JSONRPCResponse = timeout(
+        proof_protocol_timeout,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_request)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_response)?;
+    let thread_id = thread.id;
+
+    let turn_request = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread_id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "finish without running certification".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        proof_protocol_timeout,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_request)),
+    )
+    .await??;
+
+    let (completed_notification, observed_payloads) = timeout(proof_protocol_timeout, async {
+        let mut observed_payloads = Vec::new();
+        loop {
+            let message = mcp.read_next_message().await?;
+            observed_payloads.push(serde_json::to_string(&message)?);
+            if matches!(
+                &message,
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == "turn/completed"
+            ) {
+                let JSONRPCMessage::Notification(notification) = message else {
+                    unreachable!("turn/completed match must be a notification")
+                };
+                break Ok::<_, anyhow::Error>((notification, observed_payloads));
+            }
+        }
+    })
+    .await??;
+    assert!(
+        observed_payloads
+            .iter()
+            .all(|payload| !payload.contains("premature success")),
+        "app-server published the buffered assistant success: {observed_payloads:#?}"
+    );
+    let completed: TurnCompletedNotification = serde_json::from_value(
+        completed_notification
+            .params
+            .context("turn/completed notification should include params")?,
+    )?;
+    let completed_turn_id = completed.turn.id.clone();
+    assert_eq!(completed.turn.status, TurnStatus::Failed);
+    assert_eq!(completed.turn.surfaced_result, None);
+    assert_eq!(completed.surfaced_result, None);
+    let error = completed
+        .turn
+        .error
+        .context("blocked completion must include the terminal error")?;
+    assert!(
+        error
+            .message
+            .contains("CompletionProofGate blocked terminal success"),
+        "unexpected app-server terminal error: {}",
+        error.message
+    );
+    let terminal_error_message = error.message.clone();
+    assert!(
+        !fixture.canonical_runner_launched(),
+        "app-server must not launch canonical certification"
+    );
+
+    let turns_list_request = mcp
+        .send_thread_turns_list_request(ThreadTurnsListParams {
+            thread_id,
+            cursor: None,
+            limit: None,
+            sort_direction: None,
+            items_view: None,
+        })
+        .await?;
+    let turns_list_response: JSONRPCResponse = timeout(
+        proof_protocol_timeout,
+        mcp.read_stream_until_response_message(RequestId::Integer(turns_list_request)),
+    )
+    .await??;
+    let ThreadTurnsListResponse { data, .. } =
+        to_response::<ThreadTurnsListResponse>(turns_list_response)?;
+    let indexed_turn = data
+        .iter()
+        .find(|turn| turn.id == completed_turn_id)
+        .context("thread/turns/list should include the blocked turn")?;
+    assert_eq!(indexed_turn.status, TurnStatus::Failed);
+    assert_eq!(indexed_turn.surfaced_result, None);
+    let indexed_error = indexed_turn
+        .error
+        .as_ref()
+        .context("thread/turns/list must preserve the terminal completion-proof error")?;
+    assert_eq!(indexed_error.message, terminal_error_message);
+
+    timeout(proof_protocol_timeout, mcp.hard_kill_and_wait()).await??;
+    let physical_credential_after =
+        codex_core::test_support::completion_proof_physical_credential_snapshot(
+            codex_home.path(),
+            fixture.repo_path(),
+        )
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        physical_credential_after, physical_credential_before,
+        "hard-killed app-server changed the exact physical completion-proof credential"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn desktop_fresh_home_missing_canonical_command_blocks_changed_repository() -> Result<()> {
+    let proof_protocol_timeout = std::time::Duration::from_secs(120);
+    let repository = TempDir::new().context("create generic repository")?;
+    let repository_path = repository.path();
+    std::fs::create_dir_all(repository_path.join("src"))?;
+    std::fs::write(
+        repository_path.join("src/runtime.rs"),
+        "pub const VALUE: u8 = 1;\n",
+    )?;
+    let run_git = |args: &[&str]| -> Result<()> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repository_path)
+            .output()
+            .with_context(|| format!("run git {}", args.join(" ")))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "git {} failed: {}{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    };
+    run_git(&["init", "--quiet"])?;
+    run_git(&["config", "core.autocrlf", "false"])?;
+    run_git(&["config", "user.name", "KD4 Test"])?;
+    run_git(&["config", "user.email", "kd4-test@example.invalid"])?;
+    run_git(&["add", "."])?;
+    run_git(&[
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "generic baseline",
+    ])?;
+    std::fs::write(
+        repository_path.join("src/runtime.rs"),
+        "pub const VALUE: u8 = 2;\n",
+    )?;
+    assert!(
+        !repository_path
+            .join(".codex/validation/completion-proof.toml")
+            .exists(),
+        "generic repository must not define a canonical completion-proof command"
+    );
+
+    let server = create_mock_responses_server_repeating_assistant("premature success").await;
+    let fresh_home = TempDir::new().context("create fresh CODEX_HOME")?;
+    anyhow::ensure!(
+        std::fs::read_dir(fresh_home.path())?.next().is_none(),
+        "Desktop test requires an initially empty CODEX_HOME"
+    );
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(fresh_home.path())
+        .build()
+        .await?;
+    timeout(
+        proof_protocol_timeout,
+        mcp.initialize_with_client_info(ClientInfo {
+            name: "Codex Desktop".to_string(),
+            title: Some("Codex Desktop".to_string()),
+            version: "0.1.0".to_string(),
+        }),
+    )
+    .await??;
+    let configure_request = mcp
+        .send_config_batch_write_request(ConfigBatchWriteParams {
+            edits: vec![
+                ConfigEdit {
+                    key_path: "model".to_string(),
+                    value: json!("mock-model"),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+                ConfigEdit {
+                    key_path: "approval_policy".to_string(),
+                    value: json!("never"),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+                ConfigEdit {
+                    key_path: "sandbox_mode".to_string(),
+                    value: json!("read-only"),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+                ConfigEdit {
+                    key_path: "model_provider".to_string(),
+                    value: json!("mock_provider"),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+                ConfigEdit {
+                    key_path: "model_providers.mock_provider".to_string(),
+                    value: json!({
+                        "name": "Mock provider for test",
+                        "base_url": format!("{}/v1", server.uri()),
+                        "wire_api": "responses",
+                        "request_max_retries": 0,
+                        "stream_max_retries": 0,
+                    }),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+            ],
+            file_path: None,
+            expected_version: None,
+            reload_user_config: true,
+        })
+        .await?;
+    let configure_response: JSONRPCResponse = timeout(
+        proof_protocol_timeout,
+        mcp.read_stream_until_response_message(RequestId::Integer(configure_request)),
+    )
+    .await??;
+    let configure: ConfigWriteResponse = to_response(configure_response)?;
+    assert_eq!(configure.status, WriteStatus::Ok);
+
+    let thread_request = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            cwd: Some(repository_path.display().to_string()),
+            model: Some("mock-model".to_string()),
+            experimental_raw_events: true,
+            ..Default::default()
+        })
+        .await?;
+    let thread_response: JSONRPCResponse = timeout(
+        proof_protocol_timeout,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_request)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_response)?;
+
+    let turn_request = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id,
+            input: vec![V2UserInput::Text {
+                text: "finish this changed generic repository".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        proof_protocol_timeout,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_request)),
+    )
+    .await??;
+
+    let (completed_notification, observed_payloads) = timeout(proof_protocol_timeout, async {
+        let mut observed_payloads = Vec::new();
+        loop {
+            let message = mcp.read_next_message().await?;
+            observed_payloads.push(serde_json::to_string(&message)?);
+            if matches!(
+                &message,
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == "turn/completed"
+            ) {
+                let JSONRPCMessage::Notification(notification) = message else {
+                    unreachable!("turn/completed match must be a notification")
+                };
+                break Ok::<_, anyhow::Error>((notification, observed_payloads));
+            }
+        }
+    })
+    .await??;
+    assert!(
+        observed_payloads
+            .iter()
+            .all(|payload| !payload.contains("premature success")),
+        "Desktop published the buffered assistant success: {observed_payloads:#?}"
+    );
+    let completed: TurnCompletedNotification = serde_json::from_value(
+        completed_notification
+            .params
+            .context("turn/completed notification should include params")?,
+    )?;
+    assert_eq!(completed.turn.status, TurnStatus::Failed);
+    let error = completed
+        .turn
+        .error
+        .context("missing canonical command must include the terminal error")?;
+    assert!(
+        error.message.contains(
+            "does not define a valid explicitly trusted canonical completion-proof command"
+        ),
+        "unexpected missing-command gate error: {}",
+        error.message
+    );
+    assert!(
+        error
+            .message
+            .contains("CompletionProofGate will not invent or launch one"),
+        "missing-command error did not preserve verifier-only behavior: {}",
+        error.message
+    );
 
     Ok(())
 }

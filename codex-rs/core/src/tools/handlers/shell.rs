@@ -43,6 +43,8 @@ use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::runtimes::prove_noprofile_powershell_direct_argv_async;
 use crate::tools::runtimes::shell::ShellRequest;
 use crate::tools::runtimes::shell::ShellRuntime;
+#[cfg(windows)]
+use crate::tools::runtimes::shell::canonical_completion_proof_permissions;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 
@@ -532,7 +534,7 @@ async fn run_exec_like_with_exit_code_inner(
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
         tool_name,
-        exec_params,
+        mut exec_params,
         stall_timeout_ms,
         cancellation_token,
         hook_command,
@@ -610,7 +612,41 @@ async fn run_exec_like_with_exit_code_inner(
     let attempt_key =
         attempt_key.map(|key| key.with_permission_context(&effective_permission_context));
 
+    // Approval policy guard for explicit escalation in non-OnRequest modes.
+    // Sticky turn permissions have already been approved, so they should
+    // continue through the normal exec approval flow for the command.
+    if effective_additional_permissions
+        .sandbox_permissions
+        .requests_sandbox_override()
+        && !effective_additional_permissions.permissions_preapproved
+        && !matches!(
+            turn.approval_policy.value(),
+            codex_protocol::protocol::AskForApproval::OnRequest
+        )
+    {
+        let approval_policy = turn.approval_policy.value();
+        return Err(FunctionCallError::RespondToModel(format!(
+            "approval policy is {approval_policy:?}; reject command — you should not ask for escalated permissions if the approval policy is {approval_policy:?}"
+        )));
+    }
+
+    // Recognize and reserve the exact trusted command before any generic
+    // replay, retry, or apply-patch path can answer in place of a fresh
+    // process. Reservation creates only a private launch identity; it does not
+    // snapshot the workspace or register proof state.
+    let completion_proof_reservation = if turn_environment.environment.is_remote() {
+        None
+    } else {
+        session
+            .services
+            .completion_proof
+            .reserve_canonical_attempt(&hook_command, exec_params.cwd.as_path())
+            .await
+            .map_err(FunctionCallError::RespondToModel)?
+    };
+
     let known_delta = if turn.config.features.enabled(Feature::KnownDeltaStore)
+        && completion_proof_reservation.is_none()
         && !is_validation
         && !exec_params.command.is_empty()
         && known_delta_store::is_immutable_git_show_candidate(
@@ -654,25 +690,10 @@ async fn run_exec_like_with_exit_code_inner(
         .as_ref()
         .is_some_and(known_delta_store::PreparedKnownDelta::is_hit);
 
-    // Approval policy guard for explicit escalation in non-OnRequest modes.
-    // Sticky turn permissions have already been approved, so they should
-    // continue through the normal exec approval flow for the command.
-    if effective_additional_permissions
-        .sandbox_permissions
-        .requests_sandbox_override()
-        && !effective_additional_permissions.permissions_preapproved
-        && !matches!(
-            turn.approval_policy.value(),
-            codex_protocol::protocol::AskForApproval::OnRequest
-        )
+    if completion_proof_reservation.is_none()
+        && !known_delta_hit
+        && let Some(attempt_key) = attempt_key.as_ref()
     {
-        let approval_policy = turn.approval_policy.value();
-        return Err(FunctionCallError::RespondToModel(format!(
-            "approval policy is {approval_policy:?}; reject command — you should not ask for escalated permissions if the approval policy is {approval_policy:?}"
-        )));
-    }
-
-    if !known_delta_hit && let Some(attempt_key) = attempt_key.as_ref() {
         session
             .services
             .command_execution
@@ -684,7 +705,7 @@ async fn run_exec_like_with_exit_code_inner(
     // Intercept apply_patch if present.
     let apply_patch_cwd = PathUri::from_abs_path(&exec_params.cwd);
     let intercepted = intercept_apply_patch(
-        validation_launch.is_some(),
+        validation_launch.is_some() || completion_proof_reservation.is_some(),
         &exec_params.command,
         &apply_patch_cwd,
         fs.as_ref(),
@@ -728,6 +749,100 @@ async fn run_exec_like_with_exit_code_inner(
         });
     }
 
+    let command_mutation = crate::turn_diff_tracker::command_mutation(
+        &exec_params.command,
+        Some(exec_params.cwd.as_path()),
+    );
+    let completion_repository_root = if !turn_environment.environment.is_remote()
+        && (command_mutation.may_have_mutated() || completion_proof_reservation.is_some())
+    {
+        session
+            .services
+            .completion_proof
+            .repository_root_for_cwd(exec_params.cwd.as_path())
+    } else {
+        None
+    };
+    // Arm one source observer before proof reservation. It becomes the canonical interval on
+    // platforms without trusted launch preparation, or hands off through one exact barrier after
+    // Windows ACL preparation. Ordinary commands retain it as their mutation baseline.
+    let mut prearmed_source_observation = match completion_repository_root.as_ref() {
+        Some(repository_root) => {
+            session
+                .services
+                .git_workspace
+                .begin_source_path_change_observation_after_barrier(repository_root)
+                .await
+        }
+        None => None,
+    };
+    if completion_repository_root.is_some() {
+        // Close the previous proof's long-lived interval only after the new observer is active.
+        // Their overlap is intentional; watcher-owned barrier events are tagged centrally.
+        session
+            .services
+            .completion_proof
+            .refresh_post_proof_source_observation(&session.services.git_workspace)
+            .await;
+    }
+    let mut prearmed_proof_observation = if completion_repository_root.is_some() {
+        session
+            .services
+            .completion_proof
+            .begin_post_proof_mutation_observation(exec_params.cwd.as_path())
+            .await
+    } else {
+        None
+    };
+    let mut completion_proof_workspace_observation = completion_proof_reservation
+        .is_some()
+        .then(|| prearmed_source_observation.take())
+        .flatten();
+    let mut completion_proof_prior_observation = completion_proof_reservation
+        .is_some()
+        .then(|| prearmed_proof_observation.take())
+        .flatten();
+    if let Some(reservation) = completion_proof_reservation.as_ref()
+        && completion_proof_workspace_observation.is_none()
+    {
+        if let Some(observation) = completion_proof_prior_observation.take() {
+            session
+                .services
+                .completion_proof
+                .finish_post_proof_mutation_observation(observation, None)
+                .await;
+        }
+        session
+            .services
+            .completion_proof
+            .discard_canonical_reservation(reservation)
+            .await;
+        return Err(FunctionCallError::RespondToModel(
+            "Canonical certification produced a pre-result error before process launch: the trusted workspace watcher could not start. No validation evidence was recorded; correct the watcher problem and explicitly rerun the canonical command."
+                .to_string(),
+        ));
+    }
+    let prearmed_generic_observation =
+        completion_proof_reservation.is_none() && completion_repository_root.is_some();
+    if prearmed_generic_observation {
+        session
+            .services
+            .command_execution
+            .record_post_proof_mutation_baseline(
+                &call_id,
+                &turn.sub_id,
+                crate::tools::command_execution::PostProofMutationBaseline {
+                    proof_observation: prearmed_proof_observation.take(),
+                    source_observation: prearmed_source_observation.take(),
+                },
+            )
+            .await;
+    }
+
+    let workspace_operation =
+        workspace_operation_root_if_needed(is_validation, inspection_command, repository_root)
+            .map(crate::workspace_operation_gate::WorkspaceOperationLease::new);
+
     let source = ExecCommandSource::Agent;
     let emitter = crate::tools::events::ToolEmitter::shell(
         safety_command.clone(),
@@ -737,8 +852,11 @@ async fn run_exec_like_with_exit_code_inner(
     )
     .with_model_command_text(hook_command.clone());
     let event_tracker = track_command_mutations.then_some(&tracker);
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
+    let mut event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
         .with_call_source(&tool_call_source);
+    if completion_proof_reservation.is_some() || prearmed_generic_observation {
+        event_ctx = event_ctx.without_post_proof_mutation_observation();
+    }
     emitter.begin(event_ctx).await;
 
     // This is a preliminary resolution used only for the policy compatibility check. The runtime
@@ -821,8 +939,161 @@ async fn run_exec_like_with_exit_code_inner(
         None
     };
 
-    let workspace_operation_root =
-        workspace_operation_root_if_needed(is_validation, inspection_command, repository_root);
+    let mut prepared_canonical_windows_sandbox_launch = None;
+    #[cfg(windows)]
+    if let Some(reservation) = completion_proof_reservation.as_ref() {
+        reservation.apply_platform_preparation_environment(&mut exec_params.env);
+        let preflight = match canonical_completion_proof_permissions(
+            reservation.repository_root(),
+            reservation.report_write_root(),
+        ) {
+            Ok(permissions) => {
+                let workspace_roots = turn.effective_workspace_roots().to_vec();
+                let command_cwd = exec_params.cwd.to_path_buf();
+                let env = exec_params.env.clone();
+                let codex_home = turn.config.codex_home.to_path_buf();
+                let attempt_id = reservation.attempt_id().to_string();
+                let launch_identity = reservation.exact_command().to_string();
+                tokio::task::spawn_blocking(move || {
+                    crate::windows_sandbox::prepare_canonical_completion_proof_sandbox(
+                        &attempt_id,
+                        &launch_identity,
+                        &permissions,
+                        &workspace_roots,
+                        &command_cwd,
+                        &env,
+                        &codex_home,
+                    )
+                })
+                .await
+                .map_err(|error| format!("Windows sandbox preparation task failed: {error}"))
+                .and_then(|result| result.map_err(|error| error.to_string()))
+            }
+            Err(error) => Err(error),
+        };
+        let preflight_handoff = match completion_proof_workspace_observation.take() {
+            Some(observation) => {
+                session
+                    .services
+                    .git_workspace
+                    .finish_source_path_change_observation_and_continue(&observation)
+                    .await
+            }
+            None => None,
+        };
+        let prior_observed_paths = preflight_handoff
+            .as_ref()
+            .and_then(|handoff| handoff.classifiable_exact_paths());
+        if let Some(observation) = completion_proof_prior_observation.take() {
+            session
+                .services
+                .completion_proof
+                .finish_post_proof_mutation_observation(observation, prior_observed_paths)
+                .await;
+        }
+        let Some(preflight_handoff) = preflight_handoff else {
+            session
+                .services
+                .completion_proof
+                .discard_canonical_reservation(reservation)
+                .await;
+            return Err(FunctionCallError::RespondToModel(
+                "Canonical certification produced a pre-result error before process launch: the trusted workspace watcher could not hand off from platform preparation to the measured attempt. No validation evidence was recorded; correct the watcher problem and explicitly rerun the canonical command."
+                    .to_string(),
+            ));
+        };
+        completion_proof_workspace_observation = Some(preflight_handoff.continuation);
+        prepared_canonical_windows_sandbox_launch = match preflight {
+            Ok(prepared_launch) => Some(prepared_launch),
+            Err(error) => {
+                session
+                    .services
+                    .completion_proof
+                    .discard_canonical_reservation(reservation)
+                    .await;
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "Canonical certification produced a pre-result error before process launch: network confinement setup failed: {error}. No validation evidence was recorded; correct the setup problem and explicitly rerun the canonical command."
+                )));
+            }
+        };
+        completion_proof_prior_observation = session
+            .services
+            .completion_proof
+            .begin_post_proof_mutation_observation(exec_params.cwd.as_path())
+            .await;
+    }
+    let mut completion_proof_attempt = match completion_proof_reservation.as_ref() {
+        Some(reservation) => match session
+            .services
+            .completion_proof
+            .activate_canonical_attempt(reservation)
+            .await
+        {
+            Ok(attempt) => Some(attempt),
+            Err(error) => {
+                let handoff = match completion_proof_workspace_observation.take() {
+                    Some(observation) => {
+                        session
+                            .services
+                            .git_workspace
+                            .finish_source_path_change_observation_and_continue(&observation)
+                            .await
+                    }
+                    None => None,
+                };
+                let observed_paths = handoff
+                    .as_ref()
+                    .and_then(|handoff| handoff.classifiable_exact_paths());
+                if let Some(observation) = completion_proof_prior_observation.take() {
+                    session
+                        .services
+                        .completion_proof
+                        .finish_post_proof_mutation_observation(observation, observed_paths)
+                        .await;
+                }
+                session
+                    .services
+                    .completion_proof
+                    .discard_canonical_reservation(reservation)
+                    .await;
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "Canonical certification produced a pre-result error before process launch: {error}. No validation evidence was recorded; correct the problem and explicitly rerun the canonical command."
+                )));
+            }
+        },
+        None => None,
+    };
+    if let Some(attempt) = completion_proof_attempt.as_ref() {
+        attempt.apply_private_environment(&mut exec_params.env);
+    }
+    let mut focused_validation_attempt =
+        if turn_environment.environment.is_remote() || completion_proof_attempt.is_some() {
+            None
+        } else {
+            session
+                .services
+                .completion_proof
+                .prepare_focused_attempt(&hook_command, exec_params.cwd.as_path())
+                .await
+                .map_err(FunctionCallError::RespondToModel)?
+        };
+    let mut documentation_validation_attempt = if turn_environment.environment.is_remote()
+        || completion_proof_attempt.is_some()
+        || focused_validation_attempt.is_some()
+    {
+        None
+    } else {
+        session
+            .services
+            .completion_proof
+            .prepare_documentation_validation(&hook_command, exec_params.cwd.as_path())
+            .await
+            .map_err(FunctionCallError::RespondToModel)?
+    };
+    if let Some(attempt) = focused_validation_attempt.as_ref() {
+        attempt.apply_private_environment(&mut exec_params.env);
+    }
+
     let req = ShellRequest {
         command: exec_params.command.clone(),
         command_for_approval: safety_command,
@@ -844,7 +1115,14 @@ async fn run_exec_like_with_exit_code_inner(
         exec_approval_requirement,
         known_delta: known_delta.clone(),
         validation_launch,
-        workspace_operation_root,
+        workspace_operation,
+        canonical_proof_repository_root: completion_proof_attempt
+            .as_ref()
+            .map(|attempt| attempt.repository_root().to_path_buf()),
+        canonical_proof_report_write_root: completion_proof_attempt
+            .as_ref()
+            .map(|attempt| attempt.report_write_root().to_path_buf()),
+        prepared_canonical_windows_sandbox_launch,
     };
     let mut orchestrator = ToolOrchestrator::new();
     let mut runtime = ShellRuntime::for_shell_command();
@@ -873,6 +1151,48 @@ async fn run_exec_like_with_exit_code_inner(
             || runtime_validation_attempt_started
             || shell_validation_execution_output(&out, None).is_some());
     if let Some(skipped) = unexecuted_validation_skip(&out, validation_attempt_started) {
+        let observed_paths = if completion_proof_attempt.is_some() {
+            match completion_proof_workspace_observation.as_ref() {
+                Some(observation) => {
+                    session
+                        .services
+                        .git_workspace
+                        .finish_source_path_change_observation(observation)
+                        .await
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Some(observation) = completion_proof_prior_observation.take() {
+            session
+                .services
+                .completion_proof
+                .finish_post_proof_mutation_observation(observation, observed_paths.clone())
+                .await;
+        }
+        if let Some(attempt) = completion_proof_attempt.take() {
+            let _outcome = session
+                .services
+                .completion_proof
+                .finish_canonical_attempt(attempt, None, observed_paths)
+                .await;
+        }
+        if let Some(attempt) = focused_validation_attempt.take() {
+            let _outcome = session
+                .services
+                .completion_proof
+                .finish_focused_attempt(attempt, None)
+                .await;
+        }
+        if let Some(attempt) = documentation_validation_attempt.take() {
+            let _outcome = session
+                .services
+                .completion_proof
+                .finish_documentation_validation(attempt, None)
+                .await;
+        }
         return finish_validation_skip_after_begin(
             &emitter,
             &session,
@@ -991,7 +1311,114 @@ async fn run_exec_like_with_exit_code_inner(
         .command_execution
         .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
         .await;
-    let mut content = recover_output_bearing_shell_content(finish_result, output_bearing_result)?;
+    let content_result = recover_output_bearing_shell_content(finish_result, output_bearing_result);
+    // Mutation observation must finish before a failed validation is poisoned.
+    // Otherwise a mutation performed by that same command could immediately
+    // clear the newly recorded failure epoch.
+    let proof_process_exit_code = content_result.as_ref().ok().and(exit_code);
+    let (observed_completion_proof_workspace_changes, completion_proof_workspace_continuation) =
+        if completion_proof_attempt.is_some() {
+            match completion_proof_workspace_observation.as_ref() {
+                Some(observation) => match session
+                    .services
+                    .git_workspace
+                    .finish_source_path_change_observation_and_continue(observation)
+                    .await
+                {
+                    Some(handoff) => {
+                        let observed_paths = handoff.classifiable_exact_paths();
+                        (observed_paths, Some(handoff.continuation))
+                    }
+                    None => (None, None),
+                },
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+    if let Some(prior_observation) = completion_proof_prior_observation {
+        session
+            .services
+            .completion_proof
+            .finish_post_proof_mutation_observation(
+                prior_observation,
+                observed_completion_proof_workspace_changes.clone(),
+            )
+            .await;
+    }
+    let completion_proof_outcome = match completion_proof_attempt {
+        Some(attempt) => Some(
+            session
+                .services
+                .completion_proof
+                .finish_canonical_attempt(
+                    attempt,
+                    proof_process_exit_code,
+                    observed_completion_proof_workspace_changes,
+                )
+                .await,
+        ),
+        None => None,
+    };
+    if matches!(
+        completion_proof_outcome,
+        Some(crate::completion_proof::CompletionProofAttemptOutcome::ConfirmedPass)
+    ) && let Some(source_observation) = completion_proof_workspace_continuation
+    {
+        session
+            .services
+            .completion_proof
+            .bind_current_proof_source_observation(
+                source_observation,
+                Arc::clone(&session.services.git_workspace),
+            )
+            .await;
+    }
+    let focused_validation_outcome = match focused_validation_attempt {
+        Some(attempt) => Some(
+            session
+                .services
+                .completion_proof
+                .finish_focused_attempt(attempt, proof_process_exit_code)
+                .await,
+        ),
+        None => None,
+    };
+    let documentation_validation_outcome = match documentation_validation_attempt {
+        Some(attempt) => Some(
+            session
+                .services
+                .completion_proof
+                .finish_documentation_validation(attempt, proof_process_exit_code)
+                .await,
+        ),
+        None => None,
+    };
+    let completion_proof_accepted =
+        completion_proof_outcome.as_ref().is_none_or(|outcome| {
+            matches!(
+                outcome,
+                crate::completion_proof::CompletionProofAttemptOutcome::ConfirmedPass
+            )
+        }) && focused_validation_outcome.as_ref().is_none_or(|outcome| {
+            matches!(
+                outcome,
+                crate::completion_proof::FocusedValidationOutcome::ConfirmedPass { .. }
+            )
+        }) && documentation_validation_outcome
+            .as_ref()
+            .is_none_or(|outcome| {
+                matches!(
+                    outcome,
+                    crate::completion_proof::DocumentationValidationOutcome::ConfirmedPass
+                )
+            });
+    let effective_exit_code = if completion_proof_accepted {
+        exit_code
+    } else {
+        Some(exit_code.filter(|code| *code != 0).unwrap_or(-1))
+    };
+    let mut content = content_result?;
     if let Some(advisory) = advisory {
         content.push_str("\n\n");
         content.push_str(advisory);
@@ -999,6 +1426,18 @@ async fn run_exec_like_with_exit_code_inner(
     if let Some(repair_notice) = repair_notice {
         content.push_str("\n\n");
         content.push_str(&repair_notice);
+    }
+    if let Some(completion_proof_outcome) = completion_proof_outcome.as_ref() {
+        content.push_str("\n\n");
+        content.push_str(&completion_proof_outcome.render_for_model());
+    }
+    if let Some(focused_validation_outcome) = focused_validation_outcome.as_ref() {
+        content.push_str("\n\n");
+        content.push_str(&focused_validation_outcome.render_for_model());
+    }
+    if let Some(documentation_validation_outcome) = documentation_validation_outcome.as_ref() {
+        content.push_str("\n\n");
+        content.push_str(&documentation_validation_outcome.render_for_model());
     }
     if let Some(raw_output_artifact) = raw_output_artifact {
         insert_metadata_before_output(
@@ -1017,7 +1456,7 @@ async fn run_exec_like_with_exit_code_inner(
             "\n\n[output capture truncated at execution retained-byte limit; omitted bytes are unavailable]",
         );
     }
-    let validation_execution_outcome = match exit_code {
+    let validation_execution_outcome = match effective_exit_code {
         Some(0) => ValidationExecutionOutcome::ExecutedSuccess,
         Some(_) | None => ValidationExecutionOutcome::ExecutedFailure,
     };
@@ -1026,13 +1465,19 @@ async fn run_exec_like_with_exit_code_inner(
             codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },
         ],
         canonical_body: None,
-        success: Some(tool_outcome == codex_tools::ToolOutputOutcome::Success),
-        outcome: Some(tool_outcome),
+        success: Some(
+            completion_proof_accepted && tool_outcome == codex_tools::ToolOutputOutcome::Success,
+        ),
+        outcome: Some(if completion_proof_accepted {
+            tool_outcome
+        } else {
+            codex_tools::ToolOutputOutcome::Failure
+        }),
         post_tool_use_response,
         sampling_request_signal: shell_sampling_signal(
             attempt_key.as_ref(),
             req.hook_command.as_str(),
-            exit_code,
+            effective_exit_code,
             canonical_output.as_deref(),
         ),
         deterministic_continuation_receipts: Vec::new(),
@@ -1041,7 +1486,7 @@ async fn run_exec_like_with_exit_code_inner(
     };
     Ok(RunExecLikeResult {
         output,
-        exit_code,
+        exit_code: effective_exit_code,
         validation_execution_outcome,
         canonical_output,
     })

@@ -59,6 +59,13 @@ pub fn token_mode_for_permission_profile(
 }
 
 impl ResolvedWindowsSandboxPermissions {
+    pub(crate) fn is_semantically_equivalent_to(&self, other: &Self, cwd: &Path) -> bool {
+        self.network == other.network
+            && self
+                .file_system
+                .is_semantically_equivalent_to(&other.file_system, cwd)
+    }
+
     pub fn try_from_permission_profile(permission_profile: &PermissionProfile) -> Result<Self> {
         if !matches!(permission_profile, PermissionProfile::Managed { .. }) {
             anyhow::bail!(

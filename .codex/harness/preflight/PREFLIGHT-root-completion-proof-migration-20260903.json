@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "assignment_id": "root:completion-proof-migration-20260902",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    { "path": ".codex", "recursive": true },
+    { "path": "SOURCEMAP.md", "recursive": false },
+    { "path": "architecture_index.json", "recursive": false },
+    { "path": "source_owners.toml", "recursive": false },
+    { "path": "justfile", "recursive": false },
+    { "path": "scripts", "recursive": true },
+    { "path": "tools", "recursive": true },
+    { "path": "codex-rs", "recursive": true },
+    { "path": "codex-cli", "recursive": true },
+    { "path": "sdk", "recursive": true }
+  ],
+  "contract_claims": [
+    "completion-proof-runtime-policy",
+    "canonical-completion-proof-runner",
+    "frozen-test-inventory-reconciliation",
+    "test-replacement-ledger",
+    "real-runtime-test-migration",
+    "stage2-incorrect-behavior-log"
+  ],
+  "dependencies": [],
+  "generated_outputs": [
+    ".codex/validation/test-replacements-v1.json",
+    ".codex/validation/test-replacements-v2.json",
+    ".codex/validation/stage2-incorrect-behaviors-v1.txt"
+  ],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "just source-map-check",
+    "just completion-focused inventory.frozen-reconciliation",
+    "just completion-focused maintenance.root-unittest",
+    "just completion-focused rust.nextest.workspace",
+    "just completion-focused windows.sandbox-smoke"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

@@ -36,6 +36,7 @@ use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
+use crate::tools::runtimes::shell::canonical_completion_proof_permissions;
 use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
@@ -61,6 +62,7 @@ use serde::Deserialize;
 
 use super::super::shell::validation_environment_hash;
 use super::super::shell::validation_structured_output;
+use super::super::shell::workspace_operation_root_if_needed;
 use super::super::shell_spec::CommandToolOptions;
 use super::super::shell_spec::create_exec_command_tool_for_policy;
 use super::ExecCommandArgs;
@@ -206,6 +208,57 @@ pub(super) async fn finalize_sandbox_denial_artifact(
         Some(artifact) => artifact,
         None => replace_raw_output_artifact(pending_artifact, fallback_output).await,
     }
+}
+
+async fn finish_completion_proof_for_terminal(
+    completion_proof: Option<&crate::completion_proof::UnifiedExecCompletionProof>,
+    process_exit_code: Option<i32>,
+) -> Option<crate::completion_proof::UnifiedExecCompletionProofOutcome> {
+    let completion_proof = completion_proof?;
+    match completion_proof
+        .finish_if_caller_owned(process_exit_code)
+        .await
+    {
+        Some(outcome) => Some(outcome),
+        None => Some(completion_proof.await_outcome().await),
+    }
+}
+
+fn append_completion_proof_to_error(
+    error: FunctionCallError,
+    outcome: &crate::completion_proof::UnifiedExecCompletionProofOutcome,
+) -> FunctionCallError {
+    let append = |message: String| format!("{message}\n{}", outcome.render_for_model());
+    match error {
+        FunctionCallError::RespondToModel(message) => {
+            FunctionCallError::RespondToModel(append(message))
+        }
+        FunctionCallError::DeniedToModel(message) => {
+            FunctionCallError::DeniedToModel(append(message))
+        }
+        FunctionCallError::Fatal(message) => FunctionCallError::Fatal(append(message)),
+    }
+}
+
+fn apply_completion_proof_to_validation_skip(
+    mut value: serde_json::Value,
+    outcome: &crate::completion_proof::UnifiedExecCompletionProofOutcome,
+) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        let text = object
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Validation did not execute.");
+        object.insert(
+            "text".to_string(),
+            serde_json::Value::String(format!("{text}\n{}", outcome.render_for_model())),
+        );
+        object.insert(
+            "execution_outcome".to_string(),
+            serde_json::Value::String("not_executed".to_string()),
+        );
+    }
+    value
 }
 
 impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
@@ -567,7 +620,12 @@ impl ExecCommandHandler {
             context.turn.network,
         );
         let input_context = format!("prefix={prefix_rule:?}");
-        let effective_environment = manager.effective_environment(&context);
+        let mut effective_environment = manager.effective_environment(&context);
+        effective_environment.retain(|name, _| {
+            !name
+                .to_ascii_uppercase()
+                .starts_with("CODEX_COMPLETION_PROOF_")
+        });
         let environment_hash = validation_environment_hash(&effective_environment);
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         let repository_epoch = session
@@ -608,7 +666,53 @@ impl ExecCommandHandler {
         } else {
             attempt_key
         };
-        if validation_launch.is_none() {
+        // Reserve the exact canonical command before replay/freshness logic can
+        // answer in place of a fresh process. Focused and documentation
+        // commands are also prepared here so every recognized proof-related
+        // launch bypasses generic replay accounting.
+        let completion_proof_reservation = if environment_is_remote {
+            None
+        } else {
+            session
+                .services
+                .completion_proof
+                .reserve_canonical_attempt(&hook_command, permission_cwd)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?
+        };
+        let mut completion_proof =
+            if environment_is_remote || completion_proof_reservation.is_some() {
+                None
+            } else if let Some(attempt) = session
+                .services
+                .completion_proof
+                .prepare_focused_attempt(&hook_command, permission_cwd)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?
+            {
+                Some(
+                    crate::completion_proof::UnifiedExecCompletionProof::focused(
+                        Arc::clone(&session),
+                        attempt,
+                    ),
+                )
+            } else {
+                session
+                    .services
+                    .completion_proof
+                    .prepare_documentation_validation(&hook_command, permission_cwd)
+                    .await
+                    .map_err(FunctionCallError::RespondToModel)?
+                    .map(|attempt| {
+                        crate::completion_proof::UnifiedExecCompletionProof::documentation(
+                            Arc::clone(&session),
+                            attempt,
+                        )
+                    })
+            };
+        let completion_proof_launch =
+            completion_proof_reservation.is_some() || completion_proof.is_some();
+        if validation_launch.is_none() && !completion_proof_launch {
             session
                 .services
                 .command_execution
@@ -620,6 +724,7 @@ impl ExecCommandHandler {
             && !environment_is_remote
             && !tty
             && validation_launch.is_none()
+            && !completion_proof_launch
             && let Some(native_cwd) = native_cwd.as_ref()
             && let CommandInvocation::Argv { program, args } = &command_invocation
             && known_delta_store::is_immutable_git_show_candidate(program, args)
@@ -656,7 +761,7 @@ impl ExecCommandHandler {
         let known_delta_hit = known_delta
             .as_ref()
             .is_some_and(crate::tools::known_delta_store::PreparedKnownDelta::is_hit);
-        let validation_attempt = validation_launch.is_some();
+        let validation_attempt = validation_launch.is_some() || completion_proof_launch;
         if !known_delta_hit && !validation_attempt {
             session
                 .services
@@ -688,6 +793,13 @@ impl ExecCommandHandler {
             .await;
         match intercepted {
             Ok(Some(output)) => {
+                if let Some(reservation) = completion_proof_reservation.as_ref() {
+                    session
+                        .services
+                        .completion_proof
+                        .discard_canonical_reservation(reservation)
+                        .await;
+                }
                 let raw_output = output.into_text().into_bytes();
                 let raw_output_artifact = create_raw_output_artifact(
                     turn.config.codex_home.as_path(),
@@ -702,7 +814,7 @@ impl ExecCommandHandler {
                         .record_exit(&attempt_key, 0)
                         .await;
                 }
-                return Ok(boxed_tool_output(ExecCommandToolOutput {
+                let mut response = ExecCommandToolOutput {
                     event_call_id: String::new(),
                     chunk_id: String::new(),
                     wall_time: interception_wall_time,
@@ -716,17 +828,234 @@ impl ExecCommandHandler {
                     hook_command: Some(hook_command),
                     raw_output_artifact: Some(raw_output_artifact),
                     repair_notice,
-                }));
+                };
+                if let Some(outcome) =
+                    finish_completion_proof_for_terminal(completion_proof.as_ref(), None).await
+                {
+                    outcome.apply_to_exec_command_output(&mut response);
+                }
+                return Ok(boxed_tool_output(response));
             }
             Ok(None) => {}
             Err(err) => {
+                if let Some(reservation) = completion_proof_reservation.as_ref() {
+                    session
+                        .services
+                        .completion_proof
+                        .discard_canonical_reservation(reservation)
+                        .await;
+                }
                 if !known_delta_hit && !validation_attempt {
                     err.record_attempt_failure(&session.services.command_execution, &attempt_key)
                         .await;
                 }
-                return Err(err.into_error());
+                let mut error = err.into_error();
+                if let Some(outcome) =
+                    finish_completion_proof_for_terminal(completion_proof.as_ref(), None).await
+                {
+                    error = append_completion_proof_to_error(error, &outcome);
+                }
+                return Err(error);
             }
         }
+
+        let mut completion_proof_source_observation = if let Some(reservation) =
+            completion_proof_reservation.as_ref()
+        {
+            let observation = session
+                .services
+                .git_workspace
+                .begin_source_path_change_observation_after_barrier(reservation.repository_root())
+                .await;
+            session
+                .services
+                .completion_proof
+                .refresh_post_proof_source_observation(&session.services.git_workspace)
+                .await;
+            observation
+        } else {
+            None
+        };
+        let mut completion_proof_prior_observation = if completion_proof_reservation.is_some() {
+            session
+                .services
+                .completion_proof
+                .begin_post_proof_mutation_observation(permission_cwd)
+                .await
+        } else {
+            None
+        };
+        if let Some(reservation) = completion_proof_reservation.as_ref()
+            && completion_proof_source_observation.is_none()
+        {
+            if let Some(observation) = completion_proof_prior_observation.take() {
+                session
+                    .services
+                    .completion_proof
+                    .finish_post_proof_mutation_observation(observation, None)
+                    .await;
+            }
+            session
+                .services
+                .completion_proof
+                .discard_canonical_reservation(reservation)
+                .await;
+            return Err(FunctionCallError::RespondToModel(
+                "Canonical certification produced a pre-result error before process launch: the trusted workspace watcher could not start. No validation evidence was recorded; correct the watcher problem and explicitly rerun the canonical command."
+                    .to_string(),
+            ));
+        }
+
+        let mut prepared_canonical_windows_sandbox_launch = None;
+        #[cfg(windows)]
+        if let Some(reservation) = completion_proof_reservation.as_ref() {
+            let mut preparation_environment = effective_environment.clone();
+            reservation.apply_platform_preparation_environment(&mut preparation_environment);
+            let preflight = match canonical_completion_proof_permissions(
+                reservation.repository_root(),
+                reservation.report_write_root(),
+            ) {
+                Ok(permissions) => {
+                    let workspace_roots = turn.effective_workspace_roots().to_vec();
+                    let command_cwd = permission_cwd.to_path_buf();
+                    let codex_home = turn.config.codex_home.to_path_buf();
+                    let attempt_id = reservation.attempt_id().to_string();
+                    let launch_identity = reservation.exact_command().to_string();
+                    tokio::task::spawn_blocking(move || {
+                        crate::windows_sandbox::prepare_canonical_completion_proof_sandbox(
+                            &attempt_id,
+                            &launch_identity,
+                            &permissions,
+                            &workspace_roots,
+                            &command_cwd,
+                            &preparation_environment,
+                            &codex_home,
+                        )
+                    })
+                    .await
+                    .map_err(|error| format!("Windows sandbox preparation task failed: {error}"))
+                    .and_then(|result| result.map_err(|error| error.to_string()))
+                }
+                Err(error) => Err(error),
+            };
+            let preflight_handoff = match completion_proof_source_observation.take() {
+                Some(observation) => {
+                    session
+                        .services
+                        .git_workspace
+                        .finish_source_path_change_observation_and_continue(&observation)
+                        .await
+                }
+                None => None,
+            };
+            let observed_paths = preflight_handoff
+                .as_ref()
+                .and_then(|handoff| handoff.classifiable_exact_paths());
+            if let Some(observation) = completion_proof_prior_observation.take() {
+                session
+                    .services
+                    .completion_proof
+                    .finish_post_proof_mutation_observation(observation, observed_paths)
+                    .await;
+            }
+            let Some(preflight_handoff) = preflight_handoff else {
+                session
+                    .services
+                    .completion_proof
+                    .discard_canonical_reservation(reservation)
+                    .await;
+                return Err(FunctionCallError::RespondToModel(
+                    "Canonical certification produced a pre-result error before process launch: the trusted workspace watcher could not hand off from platform preparation to the measured attempt. No validation evidence was recorded; correct the watcher problem and explicitly rerun the canonical command."
+                        .to_string(),
+                ));
+            };
+            completion_proof_source_observation = Some(preflight_handoff.continuation);
+            prepared_canonical_windows_sandbox_launch = match preflight {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    session
+                        .services
+                        .completion_proof
+                        .discard_canonical_reservation(reservation)
+                        .await;
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "Canonical certification produced a pre-result error before process launch: network confinement setup failed: {error}. No validation evidence was recorded; correct the setup problem and explicitly rerun the canonical command."
+                    )));
+                }
+            };
+            completion_proof_prior_observation = session
+                .services
+                .completion_proof
+                .begin_post_proof_mutation_observation(permission_cwd)
+                .await;
+        }
+
+        let canonical_proof_repository_root = completion_proof_reservation
+            .as_ref()
+            .map(|reservation| reservation.repository_root().to_path_buf());
+        let canonical_proof_report_write_root = completion_proof_reservation
+            .as_ref()
+            .map(|reservation| reservation.report_write_root().to_path_buf());
+        if let Some(reservation) = completion_proof_reservation.as_ref() {
+            let attempt = match session
+                .services
+                .completion_proof
+                .activate_canonical_attempt(reservation)
+                .await
+            {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    let handoff = match completion_proof_source_observation.take() {
+                        Some(observation) => {
+                            session
+                                .services
+                                .git_workspace
+                                .finish_source_path_change_observation_and_continue(&observation)
+                                .await
+                        }
+                        None => None,
+                    };
+                    let observed_paths = handoff
+                        .as_ref()
+                        .and_then(|handoff| handoff.classifiable_exact_paths());
+                    if let Some(observation) = completion_proof_prior_observation.take() {
+                        session
+                            .services
+                            .completion_proof
+                            .finish_post_proof_mutation_observation(observation, observed_paths)
+                            .await;
+                    }
+                    session
+                        .services
+                        .completion_proof
+                        .discard_canonical_reservation(reservation)
+                        .await;
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "Canonical certification produced a pre-result error before process launch: {error}. No validation evidence was recorded; correct the problem and explicitly rerun the canonical command."
+                    )));
+                }
+            };
+            let source_observation = completion_proof_source_observation
+                .take()
+                .expect("canonical source observation was checked before activation");
+            completion_proof = Some(
+                crate::completion_proof::UnifiedExecCompletionProof::canonical(
+                    Arc::clone(&session),
+                    attempt,
+                    source_observation,
+                    completion_proof_prior_observation.take(),
+                ),
+            );
+        }
+
+        let workspace_operation = native_cwd.as_ref().and_then(|native_cwd| {
+            workspace_operation_root_if_needed(
+                validation_attempt,
+                is_known_safe_command(&safety_command),
+                resolve_repository_root(native_cwd.as_path()),
+            )
+            .map(crate::workspace_operation_gate::WorkspaceOperationLease::new)
+        });
 
         // Carry only an in-memory target through launch. The output task
         // materializes durable storage only after output exceeds the inline
@@ -773,6 +1102,11 @@ impl ExecCommandHandler {
                     prefix_rule,
                     validation_launch,
                     known_delta,
+                    workspace_operation,
+                    completion_proof: completion_proof.clone(),
+                    canonical_proof_repository_root,
+                    canonical_proof_report_write_root,
+                    prepared_canonical_windows_sandbox_launch,
                 },
                 process_id_reservation,
                 &context,
@@ -849,6 +1183,15 @@ impl ExecCommandHandler {
                         }
                     }
                 }
+                if response.process_id.is_none()
+                    && let Some(outcome) = finish_completion_proof_for_terminal(
+                        completion_proof.as_ref(),
+                        response.exit_code,
+                    )
+                    .await
+                {
+                    outcome.apply_to_exec_command_output(&mut response);
+                }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
                 Ok(boxed_tool_output(response))
             }
@@ -910,15 +1253,28 @@ impl ExecCommandHandler {
                     raw_output_artifact: Some(finalized_artifact),
                     repair_notice,
                 };
+                if let Some(outcome) = finish_completion_proof_for_terminal(
+                    completion_proof.as_ref(),
+                    Some(output.exit_code),
+                )
+                .await
+                {
+                    outcome.apply_to_exec_command_output(&mut response);
+                }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
                 Ok(boxed_tool_output(response))
             }
             Err(UnifiedExecError::ValidationSkipped(skipped)) => {
                 record_late_validation_skip(&turn, &skipped);
                 let skip_disposition = skipped.skip_disposition;
+                let mut value = serde_json::to_value(skipped).unwrap_or_default();
+                if let Some(outcome) =
+                    finish_completion_proof_for_terminal(completion_proof.as_ref(), None).await
+                {
+                    value = apply_completion_proof_to_validation_skip(value, &outcome);
+                }
                 Ok(boxed_tool_output(
-                    validation_structured_output(serde_json::to_value(skipped).unwrap_or_default())
-                        .with_skip_disposition(skip_disposition),
+                    validation_structured_output(value).with_skip_disposition(skip_disposition),
                 ))
             }
             Err(err) => {
@@ -962,7 +1318,13 @@ impl ExecCommandHandler {
                 let repair = repair_notice
                     .as_deref()
                     .map_or(String::new(), |notice| format!("\n{notice}"));
-                exec_command_error_output(&command_for_display, &err, &repair)
+                let result = exec_command_error_output(&command_for_display, &err, &repair);
+                match finish_completion_proof_for_terminal(completion_proof.as_ref(), None).await {
+                    Some(outcome) => {
+                        result.map_err(|error| append_completion_proof_to_error(error, &outcome))
+                    }
+                    None => result,
+                }
             }
         };
         let running_process_after_cleanup = session

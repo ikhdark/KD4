@@ -193,6 +193,21 @@ def _trace(
 
 
 class Kd4LiveAgentBenchmarkTest(unittest.TestCase):
+    def test_cli_self_test_runs_offline(self) -> None:
+        script = Path(benchmark.__file__).resolve()
+        result = subprocess.run(
+            [sys.executable, str(script), "--self-test"],
+            cwd=script.parents[1],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+        self.assertEqual(result.stdout, "self-test passed\n")
+        self.assertEqual(result.stderr, "")
+
     def test_turn_measurements_use_union_wait_and_continuation_flags(self) -> None:
         event = {
             "type": "turn.completed",

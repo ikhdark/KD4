@@ -76,6 +76,7 @@ async fn guardian_review_request_includes_patch_context() {
         },
         additional_permissions: None,
         permissions_preapproved: false,
+        workspace_operation: None,
     };
 
     let guardian_request = ApplyPatchRuntime::build_guardian_review_request(&request, "call-1")
@@ -109,6 +110,7 @@ async fn guardian_review_request_preserves_foreign_paths() {
         },
         additional_permissions: None,
         permissions_preapproved: false,
+        workspace_operation: None,
     };
 
     let guardian_request =
@@ -175,6 +177,7 @@ async fn permission_request_payload_uses_apply_patch_hook_name_and_aliases() {
         },
         additional_permissions: None,
         permissions_preapproved: false,
+        workspace_operation: None,
     };
 
     let payload = runtime
@@ -210,6 +213,7 @@ async fn approval_keys_include_environment_id_and_approval_scope() {
         },
         additional_permissions: None,
         permissions_preapproved: false,
+        workspace_operation: None,
     };
 
     let keys = runtime.approval_keys(&req);
@@ -255,6 +259,7 @@ async fn sandbox_retry_session_approval_is_cached_separately() {
                 },
                 additional_permissions: None,
                 permissions_preapproved: false,
+                workspace_operation: None,
             };
             let mut runtime = ApplyPatchRuntime::new();
             let retry_one_id = "retry-1".to_string();
@@ -362,6 +367,7 @@ async fn sandbox_cwd_uses_patch_action_cwd() {
         },
         additional_permissions: None,
         permissions_preapproved: false,
+        workspace_operation: None,
     };
 
     assert_eq!(runtime.sandbox_cwd(&req), Some(&req.action.cwd));
@@ -393,6 +399,7 @@ async fn file_system_sandbox_context_uses_active_attempt() {
         },
         additional_permissions: Some(additional_permissions.clone()),
         permissions_preapproved: false,
+        workspace_operation: None,
     };
     let file_system_policy = FileSystemSandboxPolicy::default();
     let permissions = PermissionProfile::from_runtime_permissions(
@@ -462,6 +469,7 @@ async fn no_sandbox_attempt_has_no_file_system_context() {
         },
         additional_permissions: None,
         permissions_preapproved: false,
+        workspace_operation: None,
     };
     let permissions = PermissionProfile::Disabled;
     let sandbox_policy_cwd = PathUri::from_abs_path(&path);

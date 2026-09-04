@@ -1,0 +1,339 @@
+schema_version = 2
+policy_id = "kd4"
+frozen_inventory_hash = "a2fb8c0b806853b6375d92cfa6daf985ea35a5c4d4ecd49cf1d6da6f23359152"
+canonical_command = "just completion-proof"
+focused_command = "just completion-focused {validation_id}"
+documentation_command = "just source-map-check"
+repository_root = "../.."
+frozen_inventory = ".codex/validation/frozen-test-inventory-v1.json"
+replacement_ledger = ".codex/validation/test-replacements-v1.json"
+host_platform = "windows"
+
+# These tests require an independently installed Codex app-server and are
+# deliberately quarantined from the offline canonical certification.
+[[baseline_exception]]
+id_prefix = "python-pytest::tests/test_real_app_server_integration.py::"
+kind = "live-service"
+source = "locked KD4 completion-proof plan"
+text = "Optional real-app tests remain quarantined; canonical proof uses local processes and loopback fakes only."
+
+# Protected upstream mirrors are inventoried but are not migration edit targets.
+[[baseline_exception]]
+id_prefix = "rust-nextest::codex-backend-client::"
+kind = "protected"
+source = "locked KD4 completion-proof plan"
+text = "backend-client is a protected mirror and is validated through its editable consumers."
+
+[[baseline_exception]]
+id_prefix = "rust-nextest::codex-login::"
+kind = "protected"
+source = "locked KD4 completion-proof plan"
+text = "login is a protected mirror and is validated through its editable consumers."
+
+[[validation]]
+id = "inventory.frozen-reconciliation"
+runner = "inventory-reconciliation"
+owned_paths = [".codex/validation/**", "scripts/completion_proof*.py"]
+consumed_paths = [
+  "justfile",
+  "**/Cargo.toml",
+  "codex-rs/**/*.rs",
+  "tools/argument-comment-lint/**",
+  "codex-rs/windows-sandbox-rs/sandbox_smoketests.py",
+  "**/test_*.py",
+  "**/*_test.py",
+  "**/package.json",
+  "**/pyproject.toml",
+  "**/pytest.ini",
+  "**/setup.cfg",
+  "**/tox.ini",
+  "**/jest.config.cjs",
+  "**/jest.config.cts",
+  "**/jest.config.js",
+  "**/jest.config.mjs",
+  "**/jest.config.mts",
+  "**/jest.config.ts",
+  "**/playwright.config.cjs",
+  "**/playwright.config.cts",
+  "**/playwright.config.js",
+  "**/playwright.config.mjs",
+  "**/playwright.config.mts",
+  "**/playwright.config.ts",
+  "**/vitest.config.cjs",
+  "**/vitest.config.cts",
+  "**/vitest.config.js",
+  "**/vitest.config.mjs",
+  "**/vitest.config.mts",
+  "**/vitest.config.ts",
+  "**/*.test.cjs",
+  "**/*.test.cts",
+  "**/*.test.js",
+  "**/*.test.jsx",
+  "**/*.test.mjs",
+  "**/*.test.mts",
+  "**/*.test.ts",
+  "**/*.test.tsx",
+  "**/*.spec.cjs",
+  "**/*.spec.cts",
+  "**/*.spec.js",
+  "**/*.spec.jsx",
+  "**/*.spec.mjs",
+  "**/*.spec.mts",
+  "**/*.spec.ts",
+  "**/*.spec.tsx",
+  "**/*_test.go",
+  "**/*.bats",
+]
+timeout_seconds = 3600
+
+[[validation]]
+id = "rust.nextest.workspace"
+runner = "rust-nextest"
+owned_paths = ["codex-rs/**"]
+consumed_paths = ["codex-rs/**", "docs/schemas/investigation-evidence-v1.schema.json", "justfile", "scripts/rust_test_runner.py"]
+timeout_seconds = 21600
+
+[[validation]]
+id = "rust.doctest.workspace"
+runner = "rust-doctest"
+owned_paths = ["codex-rs/**/*.rs"]
+consumed_paths = ["codex-rs/**", "justfile"]
+timeout_seconds = 7200
+
+[[validation]]
+id = "maintenance.root-unittest"
+runner = "python-unittest"
+owned_paths = ["scripts/**", "tools/**", "codex-cli/**"]
+consumed_paths = ["scripts/**", "tools/**", "codex-cli/**", "justfile", "scripts/pyproject.toml", "scripts/uv.lock"]
+timeout_seconds = 3600
+
+[[validation]]
+id = "sdk.python.pytest"
+runner = "python-pytest"
+owned_paths = ["sdk/python/**"]
+consumed_paths = ["sdk/python/**", "scripts/completion_proof_pytest.py", "sdk/python/pyproject.toml", "sdk/python/uv.lock"]
+timeout_seconds = 3600
+
+[[validation]]
+id = "sdk.typescript.jest"
+runner = "javascript-jest"
+owned_paths = ["sdk/typescript/**"]
+consumed_paths = ["sdk/typescript/**", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"]
+timeout_seconds = 1800
+
+[[validation]]
+id = "tools.argument-comment-lint.native"
+runner = "argument-comment-lint-native"
+owned_paths = ["tools/argument-comment-lint/**"]
+consumed_paths = ["tools/argument-comment-lint/**"]
+timeout_seconds = 3600
+
+[[validation]]
+id = "windows.sandbox-smoke"
+runner = "windows-sandbox-smoke"
+owned_paths = ["codex-rs/windows-sandbox-rs/**"]
+consumed_paths = ["codex-rs/windows-sandbox-rs/**", "codex-rs/cli/**", "codex-rs/core/**"]
+timeout_seconds = 7200
+
+[[validation]]
+id = "rust.named-gate.adaptive-reasoning-contract"
+runner = "rust-gate"
+gate = "adaptive-reasoning-contract"
+owned_paths = ["codex-rs/config/**", "codex-rs/core/**"]
+consumed_paths = ["codex-rs/config/**", "codex-rs/core/**", "codex-rs/.config/kd4-rust-tests.toml", "codex-rs/.config/nextest.toml", "codex-rs/scripts/nextest_windows_stack.py", "scripts/rust_test_runner.py", "justfile"]
+timeout_seconds = 3600
+
+[[validation]]
+id = "rust.named-gate.config-schema-protocol"
+runner = "rust-gate"
+gate = "config-schema-protocol"
+owned_paths = ["codex-rs/config/**", "codex-rs/core/**"]
+consumed_paths = ["codex-rs/config/**", "codex-rs/core/**", "codex-rs/.config/kd4-rust-tests.toml", "codex-rs/.config/nextest.toml", "codex-rs/scripts/nextest_windows_stack.py", "scripts/rust_test_runner.py", "justfile"]
+timeout_seconds = 3600
+
+[[validation]]
+id = "rust.named-gate.app-server-schema-protocol"
+runner = "rust-gate"
+gate = "app-server-schema-protocol"
+owned_paths = ["codex-rs/app-server-protocol/**"]
+consumed_paths = ["codex-rs/app-server-protocol/**", "codex-rs/protocol/**", "codex-rs/.config/kd4-rust-tests.toml", "codex-rs/.config/nextest.toml", "codex-rs/scripts/nextest_windows_stack.py", "scripts/rust_test_runner.py", "justfile"]
+timeout_seconds = 3600
+
+[[validation]]
+id = "rust.named-gate.windows-sandbox-core-exec"
+runner = "rust-gate"
+gate = "windows-sandbox-core-exec"
+owned_paths = ["codex-rs/core/**", "codex-rs/windows-sandbox-rs/**"]
+consumed_paths = ["codex-rs/core/**", "codex-rs/windows-sandbox-rs/**", "codex-rs/.config/kd4-rust-tests.toml", "codex-rs/.config/nextest.toml", "codex-rs/scripts/nextest_windows_stack.py", "scripts/rust_test_runner.py", "justfile"]
+timeout_seconds = 3600
+
+[[validation]]
+id = "rust.named-gate.core-helper-resolution"
+runner = "rust-gate"
+gate = "core-helper-resolution"
+owned_paths = ["codex-rs/core/**", "codex-rs/utils/cargo-bin/**"]
+consumed_paths = ["codex-rs/core/**", "codex-rs/utils/cargo-bin/**", "codex-rs/.config/kd4-rust-tests.toml", "codex-rs/.config/nextest.toml", "codex-rs/scripts/nextest_windows_stack.py", "scripts/rust_test_runner.py", "justfile"]
+timeout_seconds = 3600
+
+[[validation]]
+id = "rust.named-gate.core-stdio-helper-regressions"
+runner = "rust-gate"
+gate = "core-stdio-helper-regressions"
+owned_paths = ["codex-rs/core/**", "codex-rs/rmcp-client/**"]
+consumed_paths = ["codex-rs/core/**", "codex-rs/rmcp-client/**", "codex-rs/.config/kd4-rust-tests.toml", "codex-rs/.config/nextest.toml", "codex-rs/scripts/nextest_windows_stack.py", "scripts/rust_test_runner.py", "justfile"]
+timeout_seconds = 3600
+
+[[validation]]
+id = "rust.named-gate.rmcp-streamable-http"
+runner = "rust-gate"
+gate = "rmcp-streamable-http"
+owned_paths = ["codex-rs/rmcp-client/**"]
+consumed_paths = ["codex-rs/rmcp-client/**", "codex-rs/.config/kd4-rust-tests.toml", "codex-rs/.config/nextest.toml", "codex-rs/scripts/nextest_windows_stack.py", "scripts/rust_test_runner.py", "justfile"]
+timeout_seconds = 3600
+
+[[validation]]
+id = "rust.named-gate.apply-patch-scenarios"
+runner = "rust-gate"
+gate = "apply-patch-scenarios"
+owned_paths = ["codex-rs/apply-patch/**"]
+consumed_paths = ["codex-rs/apply-patch/**", "codex-rs/.config/kd4-rust-tests.toml", "codex-rs/.config/nextest.toml", "codex-rs/scripts/nextest_windows_stack.py", "scripts/rust_test_runner.py", "justfile"]
+timeout_seconds = 3600
+
+[[validation]]
+id = "rust.named-gate.tools-json-schema-policy-fixtures"
+runner = "rust-gate"
+gate = "tools-json-schema-policy-fixtures"
+owned_paths = ["codex-rs/tools/**"]
+consumed_paths = ["codex-rs/tools/**", "codex-rs/.config/kd4-rust-tests.toml", "codex-rs/.config/nextest.toml", "codex-rs/scripts/nextest_windows_stack.py", "scripts/rust_test_runner.py", "justfile"]
+timeout_seconds = 3600
+
+[[validation]]
+id = "windows.process-coverage"
+runner = "rust-gate"
+gate = "windows-process-coverage"
+owned_paths = ["codex-rs/utils/pty/**", "codex-rs/windows-sandbox-rs/**", "codex-rs/core/**"]
+consumed_paths = ["codex-rs/utils/pty/**", "codex-rs/windows-sandbox-rs/**", "codex-rs/core/**", "codex-rs/.config/kd4-rust-tests.toml", "codex-rs/.config/nextest.toml", "codex-rs/scripts/nextest_windows_stack.py", "scripts/rust_test_runner.py", "justfile"]
+timeout_seconds = 7200
+
+[[validation]]
+id = "sdk.typescript.typecheck"
+runner = "typed-validation"
+validation_type = "typescript-typecheck"
+owned_paths = ["sdk/typescript/**"]
+consumed_paths = ["sdk/typescript/**", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"]
+timeout_seconds = 1800
+
+[[validation]]
+id = "sdk.python.ruff"
+runner = "typed-validation"
+validation_type = "python-ruff"
+owned_paths = ["sdk/python/**"]
+consumed_paths = ["sdk/python/**", "sdk/python/pyproject.toml", "sdk/python/uv.lock"]
+timeout_seconds = 900
+
+[[validation]]
+id = "maintenance.script-audit"
+runner = "typed-validation"
+validation_type = "script-audit"
+owned_paths = ["scripts/**", "tools/**", "justfile"]
+consumed_paths = ["scripts/**", "tools/**", "justfile", "scripts/pyproject.toml", "scripts/uv.lock"]
+timeout_seconds = 1800
+
+[[validation]]
+id = "maintenance.source-map"
+runner = "typed-validation"
+validation_type = "source-map-consistency"
+owned_paths = ["SOURCEMAP.md", "architecture_index.json", "source_owners.toml"]
+consumed_paths = ["scripts/source_map_check.py", "scripts/source_owners.py", "scripts/asciicheck.py", "scripts/readme_toc.py", "justfile"]
+path_set_paths = ["**"]
+evidence_path_manifests = ["source_owners.toml"]
+timeout_seconds = 1800
+
+[[validation]]
+id = "maintenance.rust-test-manifest"
+runner = "typed-validation"
+validation_type = "rust-test-manifest"
+owned_paths = ["codex-rs/.config/kd4-rust-tests.toml"]
+consumed_paths = ["codex-rs/**/Cargo.toml", "codex-rs/.config/kd4-rust-tests.toml", "scripts/rust_test_runner.py"]
+timeout_seconds = 900
+
+[[validation]]
+id = "generated.config-schema"
+runner = "typed-validation"
+validation_type = "generated-config-schema"
+owned_paths = ["codex-rs/core/config.schema.json"]
+consumed_paths = [
+  "codex-rs/config/**",
+  "codex-rs/core/**",
+  "codex-rs/features/**",
+  "codex-rs/protocol/**",
+  "scripts/config_schema_check.py",
+  "scripts/generated_output_lock.py",
+  "codex-rs/.config/kd4-rust-tests.toml",
+  "scripts/rust_test_runner.py",
+  "codex-rs/.config/nextest.toml",
+  "codex-rs/scripts/nextest_windows_stack.py",
+  "justfile",
+]
+timeout_seconds = 1800
+
+[[validation]]
+id = "generated.app-server-schema"
+runner = "typed-validation"
+validation_type = "generated-app-server-schema"
+owned_paths = ["codex-rs/app-server-protocol/schema/**"]
+consumed_paths = [
+  "codex-rs/app-server-protocol/**",
+  "codex-rs/protocol/**",
+  "sdk/python/**",
+  "scripts/app_server_schema_runtime_check.py",
+  "scripts/generated_output_lock.py",
+  "codex-rs/.config/kd4-rust-tests.toml",
+  "scripts/rust_test_runner.py",
+  "codex-rs/.config/nextest.toml",
+  "codex-rs/scripts/nextest_windows_stack.py",
+  "justfile",
+]
+timeout_seconds = 1800
+
+[[validation]]
+id = "generated.config-proto"
+runner = "typed-validation"
+validation_type = "generated-config-proto"
+owned_paths = ["codex-rs/config/src/thread_config/proto/codex.thread_config.v1.rs"]
+consumed_paths = [
+  ".gitattributes",
+  "codex-rs/Cargo.lock",
+  "codex-rs/Cargo.toml",
+  "codex-rs/config/Cargo.toml",
+  "codex-rs/config/examples/generate-proto.rs",
+  "codex-rs/config/scripts/generate-proto.ps1",
+  "codex-rs/config/src/thread_config/proto/codex.thread_config.v1.proto",
+  "codex-rs/rustfmt.toml",
+  "scripts/cargo-lane.ps1",
+]
+timeout_seconds = 1800
+
+[[validation]]
+id = "generated.exec-server-relay-proto"
+runner = "typed-validation"
+validation_type = "generated-exec-server-relay-proto"
+owned_paths = ["codex-rs/exec-server/src/**"]
+consumed_paths = ["codex-rs/exec-server/**", "codex-rs/Cargo.lock", "codex-rs/Cargo.toml"]
+timeout_seconds = 1800
+
+[[validation]]
+id = "wrapper.codex-cli"
+runner = "typed-validation"
+validation_type = "codex-cli-wrapper"
+owned_paths = ["codex-cli/**", "codex-rs/responses-api-proxy/npm/**"]
+consumed_paths = [
+  "codex-cli/**",
+  "codex-rs/responses-api-proxy/npm/**",
+  "scripts/test_stage_npm_packages.py",
+  "scripts/stage_npm_packages.py",
+  "scripts/stage_npm_archives.py",
+  "scripts/codex_package/targets.py",
+  "justfile",
+]
+timeout_seconds = 600
