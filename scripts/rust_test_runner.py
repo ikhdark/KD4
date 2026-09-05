@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import tomllib
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -108,6 +109,58 @@ class NextestTargetIdentity:
     @property
     def event_binary_alias(self) -> str:
         return f"{self.package_name}::{self.binary_name}"
+
+
+@dataclass(frozen=True)
+class NextestWorkspaceListing:
+    tests: Mapping[str, NextestTest]
+    targets: Mapping[str, NextestTargetIdentity]
+
+
+@dataclass(frozen=True)
+class LiveCargoTargetContext:
+    workspace_manifest_path: Path
+    package_manifest_path: Path
+    package_name: str
+    target_name: str
+    target_kind: str
+    target_source_path: Path
+
+    @property
+    def rust_binary_id(self) -> str:
+        return _nextest_rust_binary_id(
+            self.package_name,
+            self.target_kind,
+            self.target_name,
+        )
+
+
+@dataclass(frozen=True)
+class LiveCargoMetadata:
+    workspace_root: Path
+    targets: Mapping[str, LiveCargoTargetContext]
+
+    def target_context_for(
+        self,
+        identity: NextestTargetIdentity,
+    ) -> LiveCargoTargetContext:
+        context = self.targets.get(identity.rust_binary_id)
+        if context is None:
+            raise RunnerError(
+                "live Cargo metadata has no target matching nextest suite "
+                f"package={identity.package_name!r}, binary={identity.binary_name!r}, "
+                f"kind={identity.kind!r}, binary-id={identity.rust_binary_id!r}"
+            )
+        if (
+            context.package_name != identity.package_name
+            or context.target_name != identity.binary_name
+            or context.target_kind != identity.kind
+        ):
+            raise RunnerError(
+                "live Cargo metadata target identity collision for nextest suite "
+                f"{identity.rust_binary_id!r}"
+            )
+        return context
 
 
 @dataclass(frozen=True)
@@ -269,6 +322,21 @@ def _require_string(value: Any, location: str) -> str:
     return value
 
 
+def _require_identity_string(value: Any, location: str) -> str:
+    identity = _require_string(value, location)
+    if identity != identity.strip():
+        raise RunnerError(f"{location} must not have surrounding whitespace")
+    if unicodedata.normalize("NFC", identity) != identity:
+        raise RunnerError(f"{location} must use NFC Unicode normalization")
+    return identity
+
+
+def _require_array(value: Any, location: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise RunnerError(f"{location} must be an array")
+    return value
+
+
 def _require_int(value: Any, location: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise RunnerError(f"{location} must be an integer")
@@ -330,7 +398,195 @@ def _nextest_rust_binary_id(
         return f"{package_name}::{binary_name}"
     if kind == "bin":
         return f"{package_name}::bin/{binary_name}"
+    if kind == "example":
+        return f"{package_name}::example/{binary_name}"
+    if kind == "bench":
+        return f"{package_name}::bench/{binary_name}"
     raise RunnerError(f"unsupported nextest Rust suite kind {kind!r}")
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise RunnerError(f"JSON object contains duplicate key {key!r}")
+        value[key] = item
+    return value
+
+
+def _load_json(output: str, *, owner: str, reject_duplicate_keys: bool) -> Any:
+    try:
+        if reject_duplicate_keys:
+            return json.loads(output, object_pairs_hook=_strict_json_object)
+        return json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RunnerError(f"{owner} returned invalid JSON: {exc}") from exc
+
+
+def _resolve_live_path(
+    value: Any,
+    *,
+    location: str,
+    repository_root: Path,
+    expect_directory: bool,
+) -> Path:
+    raw_path = Path(_require_identity_string(value, location))
+    if not raw_path.is_absolute():
+        raise RunnerError(f"{location} must be an absolute path")
+    try:
+        resolved = raw_path.resolve(strict=True)
+    except OSError as exc:
+        raise RunnerError(
+            f"{location} does not resolve to a live path: {raw_path}"
+        ) from exc
+    if not resolved.is_relative_to(repository_root):
+        raise RunnerError(
+            f"{location} resolves outside the repository root: {resolved}"
+        )
+    if expect_directory and not resolved.is_dir():
+        raise RunnerError(f"{location} must resolve to a directory: {resolved}")
+    if not expect_directory and not resolved.is_file():
+        raise RunnerError(f"{location} must resolve to a file: {resolved}")
+    return resolved
+
+
+def parse_live_cargo_metadata(
+    output: str,
+    *,
+    repository_root: Path,
+    expected_workspace_root: Path,
+) -> LiveCargoMetadata:
+    """Parse the live Cargo metadata needed to bind nextest suites to source."""
+    try:
+        repository_root = repository_root.resolve(strict=True)
+        expected_workspace_root = expected_workspace_root.resolve(strict=True)
+    except OSError as exc:
+        raise RunnerError(
+            f"live Cargo metadata boundary path does not exist: {exc}"
+        ) from exc
+    if not repository_root.is_dir():
+        raise RunnerError(f"repository root must be a directory: {repository_root}")
+    if not expected_workspace_root.is_relative_to(repository_root):
+        raise RunnerError(
+            "expected Cargo workspace root must be contained by the repository root"
+        )
+
+    root = _require_table(
+        _load_json(
+            output,
+            owner="cargo metadata",
+            reject_duplicate_keys=True,
+        ),
+        "cargo metadata output",
+    )
+    workspace_root = _resolve_live_path(
+        root.get("workspace_root"),
+        location="cargo metadata output.workspace_root",
+        repository_root=repository_root,
+        expect_directory=True,
+    )
+    if workspace_root != expected_workspace_root:
+        raise RunnerError(
+            "cargo metadata output.workspace_root does not match the expected "
+            "workspace root: "
+            f"expected {expected_workspace_root}, found {workspace_root}"
+        )
+    workspace_manifest_path = _resolve_live_path(
+        str(workspace_root / "Cargo.toml"),
+        location="live Cargo workspace manifest",
+        repository_root=repository_root,
+        expect_directory=False,
+    )
+
+    packages = _require_array(root.get("packages"), "cargo metadata output.packages")
+    if not packages:
+        raise RunnerError("cargo metadata output.packages must not be empty")
+    package_names: set[str] = set()
+    targets: dict[str, LiveCargoTargetContext] = {}
+    for package_index, package_value in enumerate(packages):
+        package_location = f"cargo metadata output.packages[{package_index}]"
+        package = _require_table(package_value, package_location)
+        package_name = _require_identity_string(
+            package.get("name"), f"{package_location}.name"
+        )
+        if "$" in package_name:
+            raise RunnerError(f"{package_location}.name must not contain '$'")
+        if package_name in package_names:
+            raise RunnerError(
+                f"cargo metadata contains duplicate package name {package_name!r}"
+            )
+        package_names.add(package_name)
+        package_manifest_path = _resolve_live_path(
+            package.get("manifest_path"),
+            location=f"{package_location}.manifest_path",
+            repository_root=repository_root,
+            expect_directory=False,
+        )
+        package_targets = _require_array(
+            package.get("targets"), f"{package_location}.targets"
+        )
+        for target_index, target_value in enumerate(package_targets):
+            target_location = f"{package_location}.targets[{target_index}]"
+            target = _require_table(target_value, target_location)
+            target_name = _require_identity_string(
+                target.get("name"), f"{target_location}.name"
+            )
+            if "$" in target_name:
+                raise RunnerError(f"{target_location}.name must not contain '$'")
+            kinds = [
+                _require_identity_string(kind, f"{target_location}.kind[{index}]")
+                for index, kind in enumerate(
+                    _require_array(target.get("kind"), f"{target_location}.kind")
+                )
+            ]
+            _reject_duplicates(kinds, f"{target_location}.kind")
+            supported_kinds = [
+                kind
+                for kind in kinds
+                if kind
+                in {"lib", "proc-macro", "test", "bin", "example", "bench"}
+            ]
+            unsupported_kinds = [
+                kind
+                for kind in kinds
+                if kind != "custom-build" and kind not in supported_kinds
+            ]
+            if unsupported_kinds:
+                raise RunnerError(
+                    f"{target_location}.kind contains unsupported Cargo target kinds: "
+                    f"{', '.join(unsupported_kinds)}"
+                )
+            if len(supported_kinds) > 1:
+                raise RunnerError(
+                    f"{target_location}.kind has ambiguous nextest target kinds: "
+                    f"{', '.join(supported_kinds)}"
+                )
+            if not supported_kinds:
+                continue
+            target_source_path = _resolve_live_path(
+                target.get("src_path"),
+                location=f"{target_location}.src_path",
+                repository_root=repository_root,
+                expect_directory=False,
+            )
+            context = LiveCargoTargetContext(
+                workspace_manifest_path=workspace_manifest_path,
+                package_manifest_path=package_manifest_path,
+                package_name=package_name,
+                target_name=target_name,
+                target_kind=supported_kinds[0],
+                target_source_path=target_source_path,
+            )
+            prior = targets.get(context.rust_binary_id)
+            if prior is not None:
+                raise RunnerError(
+                    "cargo metadata has ambiguous nextest Rust binary ID "
+                    f"{context.rust_binary_id!r}"
+                )
+            targets[context.rust_binary_id] = context
+    if not targets:
+        raise RunnerError("cargo metadata contains no supported nextest targets")
+    return LiveCargoMetadata(workspace_root=workspace_root, targets=targets)
 
 
 @dataclass(frozen=True)
@@ -1141,15 +1397,22 @@ class RustTestRunner:
         return result
 
 
-def parse_nextest_list(
+@dataclass(frozen=True)
+class _ParsedNextestListing:
+    tests: Mapping[str, NextestTest]
+    targets: Mapping[str, NextestTargetIdentity]
+
+
+def _parse_nextest_list_output(
     output: str,
     *,
-    expected_target: NextestTargetIdentity,
-) -> dict[str, NextestTest]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError as exc:
-        raise RunnerError(f"cargo nextest list returned invalid JSON: {exc}") from exc
+    strict_workspace: bool,
+) -> _ParsedNextestListing:
+    payload = _load_json(
+        output,
+        owner="cargo nextest list",
+        reject_duplicate_keys=strict_workspace,
+    )
     root = _require_table(payload, "cargo nextest list output")
     if "test-count" not in root:
         raise RunnerError("cargo nextest list output.test-count is required")
@@ -1167,27 +1430,30 @@ def parse_nextest_list(
     listed_ids: set[str] = set()
     binary_alias_owners: dict[str, str] = {}
     event_alias_owners: dict[str, str] = {}
-    found_targets: list[tuple[NextestTargetIdentity, str]] = []
+    found_targets: dict[str, NextestTargetIdentity] = {}
     listed_count = 0
     for suite_name, suite_value in suites.items():
-        suite_name = _require_string(suite_name, "nextest rust-suite ID")
+        require_string = (
+            _require_identity_string if strict_workspace else _require_string
+        )
+        suite_name = require_string(suite_name, "nextest rust-suite ID")
         if "$" in suite_name:
             raise RunnerError(
                 f"nextest rust-suite ID {suite_name!r} must not contain '$'"
             )
         suite_location = f"rust-suites.{suite_name}"
         suite = _require_table(suite_value, suite_location)
-        binary_id = _require_string(
+        binary_id = require_string(
             suite.get("binary-id"), f"{suite_location}.binary-id"
         )
-        package_name = _require_string(
+        package_name = require_string(
             suite.get("package-name"), f"{suite_location}.package-name"
         )
-        binary_name = _require_string(
+        binary_name = require_string(
             suite.get("binary-name"), f"{suite_location}.binary-name"
         )
-        kind = _require_string(suite.get("kind"), f"{suite_location}.kind")
-        status = _require_string(suite.get("status"), f"{suite_location}.status")
+        kind = require_string(suite.get("kind"), f"{suite_location}.kind")
+        status = require_string(suite.get("status"), f"{suite_location}.status")
         for label, value in (
             ("binary-id", binary_id),
             ("package-name", package_name),
@@ -1225,13 +1491,13 @@ def parse_nextest_list(
             )
         binary_alias_owners[event_binary_alias] = binary_id
         actual_target = NextestTargetIdentity(package_name, binary_name, kind)
-        found_targets.append((actual_target, binary_id))
+        found_targets[binary_id] = actual_target
         testcases = _require_table(
             suite.get("testcases"), f"{suite_location}.testcases"
         )
         for test_id, testcase_value in testcases.items():
             listed_count += 1
-            test_id = _require_string(test_id, "nextest test ID")
+            test_id = require_string(test_id, "nextest test ID")
             if "$" in test_id:
                 raise RunnerError(
                     f"nextest test ID {test_id!r} must not contain '$'"
@@ -1240,6 +1506,16 @@ def parse_nextest_list(
             testcase = _require_table(
                 testcase_value, f"rust-suites.{suite_name}.testcases.{test_id}"
             )
+            if strict_workspace:
+                testcase_kind = _require_identity_string(
+                    testcase.get("kind"),
+                    f"rust-suites.{suite_name}.testcases.{test_id}.kind",
+                )
+                if testcase_kind != "test":
+                    raise RunnerError(
+                        f"nextest testcase {test_id!r} kind must be 'test', "
+                        f"found {testcase_kind!r}"
+                    )
             if "ignored" not in testcase:
                 raise RunnerError(
                     f"nextest ignored state for {test_id!r} is required"
@@ -1249,10 +1525,16 @@ def parse_nextest_list(
                 raise RunnerError(
                     f"nextest ignored state for {test_id!r} must be boolean"
                 )
-            if test_id in listed_ids:
+            if not strict_workspace and test_id in listed_ids:
                 raise RunnerError(f"nextest listed duplicate test ID {test_id!r}")
             listed_ids.add(test_id)
-            if not _testcase_matches_filter(testcase):
+            matches_filter = _testcase_matches_filter(testcase)
+            if strict_workspace and not matches_filter:
+                raise RunnerError(
+                    f"workspace nextest listing testcase {test_id!r} did not match "
+                    "the unfiltered workspace selection"
+                )
+            if not matches_filter:
                 continue
             test = NextestTest(
                 rust_binary_id=binary_id,
@@ -1270,16 +1552,39 @@ def parse_nextest_list(
                     f"{prior_authoritative!r} and {test.authoritative_id!r}"
                 )
             event_alias_owners[test.event_alias] = test.authoritative_id
-            tests[test_id] = test
+            if test.authoritative_id in tests:
+                raise RunnerError(
+                    f"nextest listed duplicate authoritative test ID "
+                    f"{test.authoritative_id!r}"
+                )
+            tests[test.authoritative_id] = test
     # `test-count` covers every listed case, including the ones a filterset
     # excluded, so compare it against the full listing rather than the selection.
     if declared_count != listed_count:
         raise RunnerError(
             f"nextest test-count {declared_count} does not match parsed count {listed_count}"
         )
+    return _ParsedNextestListing(tests=tests, targets=found_targets)
+
+
+def parse_nextest_workspace_list(output: str) -> NextestWorkspaceListing:
+    """Parse one unfiltered, all-target nextest workspace inventory."""
+    parsed = _parse_nextest_list_output(output, strict_workspace=True)
+    if not parsed.tests:
+        raise RunnerError("workspace nextest listing selected zero tests")
+    return NextestWorkspaceListing(tests=parsed.tests, targets=parsed.targets)
+
+
+def parse_nextest_list(
+    output: str,
+    *,
+    expected_target: NextestTargetIdentity,
+) -> dict[str, NextestTest]:
+    """Compatibility parser for one manifest-selected target."""
+    parsed = _parse_nextest_list_output(output, strict_workspace=False)
     mismatched_targets = [
         (target, binary_id)
-        for target, binary_id in found_targets
+        for binary_id, target in parsed.targets.items()
         if target != expected_target
     ]
     if mismatched_targets:
@@ -1293,7 +1598,7 @@ def parse_nextest_list(
             f"binary={target.binary_name!r}, kind={target.kind!r}, "
             f"binary-id={binary_id!r}"
         )
-    return tests
+    return {test.semantic_id: test for test in parsed.tests.values()}
 
 
 def _reject_nextest_attempt_identity(value: str, *, owner: str) -> None:
@@ -1592,6 +1897,58 @@ def _resolve_target_dir(value: str | None, metadata: MetadataIndex) -> Path:
     return path if path.is_absolute() else CODEX_RS_ROOT / path
 
 
+def _read_parser_input(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise RunnerError(f"cannot read parser input {path}: {exc}") from exc
+
+
+def _workspace_listing_json(listing: NextestWorkspaceListing) -> dict[str, Any]:
+    return {
+        "targets": [
+            {
+                "rust_binary_id": binary_id,
+                "package_name": identity.package_name,
+                "binary_name": identity.binary_name,
+                "kind": identity.kind,
+                "event_binary_alias": identity.event_binary_alias,
+            }
+            for binary_id, identity in sorted(listing.targets.items())
+        ],
+        "tests": [
+            {
+                "authoritative_id": test.authoritative_id,
+                "event_alias": test.event_alias,
+                "rust_binary_id": test.rust_binary_id,
+                "semantic_id": test.semantic_id,
+                "ignored": test.ignored,
+            }
+            for test in sorted(
+                listing.tests.values(), key=lambda item: item.authoritative_id
+            )
+        ],
+    }
+
+
+def _live_cargo_metadata_json(metadata: LiveCargoMetadata) -> dict[str, Any]:
+    return {
+        "workspace_root": str(metadata.workspace_root),
+        "targets": [
+            {
+                "rust_binary_id": rust_binary_id,
+                "workspace_manifest_path": str(context.workspace_manifest_path),
+                "package_manifest_path": str(context.package_manifest_path),
+                "package_name": context.package_name,
+                "target_name": context.target_name,
+                "target_kind": context.target_kind,
+                "target_source_path": str(context.target_source_path),
+            }
+            for rust_binary_id, context in sorted(metadata.targets.items())
+        ],
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
@@ -1626,6 +1983,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     guard.add_argument("--recipe")
     guard.add_argument("guarded_args", nargs=argparse.REMAINDER)
+    workspace_list = subparsers.add_parser(
+        "_parse-nextest-workspace-list", help=argparse.SUPPRESS
+    )
+    workspace_list.add_argument("input", type=Path)
+    live_metadata = subparsers.add_parser(
+        "_parse-live-cargo-metadata", help=argparse.SUPPRESS
+    )
+    live_metadata.add_argument("input", type=Path)
+    live_metadata.add_argument("--repository-root", type=Path, required=True)
+    live_metadata.add_argument("--expected-workspace-root", type=Path, required=True)
     return parser
 
 
@@ -1657,6 +2024,18 @@ def _split_runner_owned_options(
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "_parse-nextest-workspace-list":
+            listing = parse_nextest_workspace_list(_read_parser_input(args.input))
+            print(json.dumps(_workspace_listing_json(listing), sort_keys=True))
+            return 0
+        if args.command == "_parse-live-cargo-metadata":
+            metadata = parse_live_cargo_metadata(
+                _read_parser_input(args.input),
+                repository_root=args.repository_root,
+                expected_workspace_root=args.expected_workspace_root,
+            )
+            print(json.dumps(_live_cargo_metadata_json(metadata), sort_keys=True))
+            return 0
         if args.command in {"_guard-generic", "guard-args"}:
             # This runs on every generic recipe invocation: never read the
             # manifest or shell out to Cargo here.

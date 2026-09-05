@@ -1,0 +1,37 @@
+{
+  "advisories": [],
+  "assignment_id": "gate9:feature-metadata-reconciliation-20260905",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\.codex\\harness\\runs\\2026-09-02-completion-proof-migration\\gate9-execution\\no-cargo-feature-metadata"
+  },
+  "contract_claims": [
+    "gate9-actual-manifest-seven-stale-references"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-05T04:17:16.731790+00:00",
+  "generated_output_owner": "gate9:feature-metadata-reconciliation-20260905",
+  "generated_outputs": [],
+  "manifest_fingerprint": "c50c265a41a730e61d0d53528ef80366142124c08e36e215812f5e0b39cc069d",
+  "path_claims": [
+    {
+      "path": "kd4_features.toml",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-05T03:17:16.731790+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "90b02f662bfebe689c10207cf712275c4e9b3d42df090989c230c291345ab59f"
+  },
+  "validation_commands": [
+    "python -c \"from pathlib import Path; from scripts.check_kd4_features import validate_manifest; result = validate_manifest(Path('kd4_features.toml'), repo_root=Path.cwd(), strict=False); print(result.to_json()); raise SystemExit(not result.ok)\""
+  ],
+  "validation_owner": "gate9:feature-metadata-reconciliation-20260905",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

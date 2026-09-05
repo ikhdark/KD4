@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:canonical-failure-timeout-override-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "codex-rs/.config/nextest.toml",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-canonical-failure-timeout-override-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-canonical-failure-timeout-override-20260904.receipt.json",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "canonical-failure-real-path-windows-nextest-timeout"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:canonical-failure-timeout-override-20260904",
+  "validation_commands": [
+    "python -c \"import pathlib, tomllib; tomllib.loads(pathlib.Path('codex-rs/.config/nextest.toml').read_text(encoding='utf-8'))\"",
+    "git diff --check -- codex-rs/.config/nextest.toml .codex/harness/preflight/PREFLIGHT-canonical-failure-timeout-override-20260904.json .codex/harness/preflight/PREFLIGHT-canonical-failure-timeout-override-20260904.receipt.json"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-canonical-failure-timeout-override-unused",
+    "cargo_home": "C:\\Users\\kuh\\.cargo"
+  },
+  "workspace_strategy": "shared"
+}

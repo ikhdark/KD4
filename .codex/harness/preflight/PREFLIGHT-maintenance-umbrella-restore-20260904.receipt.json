@@ -1,0 +1,66 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts/test_build_tooling_policy.py",
+          "scripts"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-maintenance-umbrella-restore-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-maintenance-umbrella-restore-20260904.receipt.json",
+          ".codex"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "root:maintenance-umbrella-restore-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-maintenance-umbrella-restore"
+  },
+  "contract_claims": [
+    "root-maintenance-umbrella-successor-identity"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-04T11:22:38.697034+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "9ae162163f5c76332df6f627bc6b5395bb2c541a91352d0324bcfb6d23ad9294",
+  "path_claims": [
+    {
+      "path": "scripts/test_build_tooling_policy.py",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-maintenance-umbrella-restore-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-maintenance-umbrella-restore-20260904.receipt.json",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T10:22:38.697034+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "029b40447c26d7497469b6d1ad10f1bca593c14c9b837640eac6a2273d0d0992"
+  },
+  "validation_commands": [
+    "python scripts/root_maintenance.py test-python --module scripts.test_build_tooling_policy.BuildToolingPolicyRuntimeTest.test_maintenance_policy_through_root_maintenance_cli",
+    "python -c \"import unittest; from scripts.test_build_tooling_policy import BuildToolingPolicyRuntimeTest as C; ids=[case.id() for case in unittest.defaultTestLoader.loadTestsFromTestCase(C)]; target='scripts.test_build_tooling_policy.BuildToolingPolicyRuntimeTest.test_maintenance_policy_through_root_maintenance_cli'; old={f'scripts.test_build_tooling_policy.BuildToolingPolicyRuntimeTest.{name}' for name in ('test_maintenance_audit_contracts_through_subprocess_cli','test_maintenance_changed_routes_through_subprocess_cli','test_maintenance_command_contracts_through_subprocess_cli','test_maintenance_parser_contract_through_subprocess_cli')}; assert ids.count(target) == 1, ids; assert old.isdisjoint(ids), sorted(old.intersection(ids)); print('umbrella=1 former_public=0')\""
+  ],
+  "validation_owner": "root:maintenance-umbrella-restore-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

@@ -220,6 +220,70 @@
         "receipt_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
+    "focusedReplacementApprovalReceiptRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format_id", "schema_version", "attempt_id", "focused_validation_id",
+        "receipt_sha256"
+      ],
+      "properties": {
+        "format_id": { "const": "kd4.focused-replacement-approval-receipt.v1" },
+        "schema_version": { "const": 1 },
+        "attempt_id": { "$ref": "#/$defs/nonemptyString" },
+        "focused_validation_id": { "const": "inventory.frozen-reconciliation" },
+        "receipt_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "historicalScopeReview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "review_scope_id", "review_scope_sha256", "disposition"
+      ],
+      "properties": {
+        "review_scope_id": {
+          "type": "string",
+          "pattern": "^historical-replacement-review-v1\\.[0-9a-f]{64}$"
+        },
+        "review_scope_sha256": { "$ref": "#/$defs/sha256" },
+        "disposition": { "const": "reviewed-no-incorrect-behavior" }
+      }
+    },
+    "historicalAcceptanceProposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format_id", "schema_version", "frozen_graph_sha256",
+        "review_plan_sha256", "baseline_count", "edge_count",
+        "successor_count", "review_scope_count",
+        "focused_replacement_approval_receipt_ref", "scope_reviews",
+        "scope_review_set_sha256", "activation_authority", "proposal_sha256"
+      ],
+      "properties": {
+        "format_id": { "const": "kd4.historical-replacement-acceptance-proposal.v1" },
+        "schema_version": { "const": 1 },
+        "frozen_graph_sha256": { "$ref": "#/$defs/sha256" },
+        "review_plan_sha256": { "$ref": "#/$defs/sha256" },
+        "baseline_count": { "const": 644 },
+        "edge_count": { "const": 685 },
+        "successor_count": { "const": 572 },
+        "review_scope_count": { "const": 531 },
+        "focused_replacement_approval_receipt_ref": {
+          "$ref": "#/$defs/focusedReplacementApprovalReceiptRef"
+        },
+        "scope_reviews": {
+          "type": "array",
+          "minItems": 531,
+          "maxItems": 531,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/historicalScopeReview" }
+        },
+        "scope_review_set_sha256": { "$ref": "#/$defs/sha256" },
+        "activation_authority": { "type": "null" },
+        "proposal_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
     "stage2Disposition": {
       "type": "object",
       "additionalProperties": false,

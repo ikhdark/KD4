@@ -1,0 +1,51 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/core/tests/suite/completion_proof_gate.rs",
+          "codex-rs"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:focused-approval-runtime-session-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\default",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\root-owned-serialized"
+  },
+  "contract_claims": [
+    "focused-replacement-approval-real-session-proof"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-05T01:41:01.547987+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "060fed59cca4f8481902af22cc938c888feb613fe2f5b63aae78551f849882d1",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/tests/suite/completion_proof_gate.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-05T00:41:01.547987+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "b69b6777e4e9b7e814237bcf0346e4cbe1c595a030e64ea0ace537036eea6023"
+  },
+  "validation_commands": [
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::focused_replacement_approval_requires_current_catalog_and_real_reconciliation)'"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

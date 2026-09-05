@@ -1064,10 +1064,10 @@ class NextestListParsingTest(CliRunnerTestCase):
         )
 
     def test_unknown_suite_kind_is_rejected_through_cli(self) -> None:
-        payload = nextest_list_payload({"a::b": False}, kind="bench")
+        payload = nextest_list_payload({"a::b": False}, kind="future-target")
         self.assert_error(
             ["run-target", "core_all"],
-            "unsupported nextest Rust suite kind 'bench'",
+            "unsupported nextest Rust suite kind 'future-target'",
             state={"list_payloads": {"all": payload}},
         )
 
@@ -1748,6 +1748,551 @@ class TargetDirectoryPropagationTest(CliRunnerTestCase):
                 call["args"][target_index + 1],
                 str((codex_rs / "target-relative").resolve()),
             )
+
+
+class NextestWorkspaceListParsingTest(CliRunnerTestCase):
+    def invoke_workspace_parser(self, payload: str) -> subprocess.CompletedProcess[str]:
+        path = self.temp_dir / "nextest-workspace.json"
+        path.write_text(payload, encoding="utf-8", newline="\n")
+        return self.invoke(["_parse-nextest-workspace-list", str(path)])
+
+    def test_workspace_parser_preserves_authoritative_multi_suite_rows_through_cli(
+        self,
+    ) -> None:
+        testcase = {
+            "kind": "test",
+            "ignored": False,
+            "filter-match": {"status": "matches"},
+        }
+        ignored_testcase = copy.deepcopy(testcase)
+        ignored_testcase["ignored"] = True
+        payload = {
+            "test-count": 4,
+            "rust-suites": {
+                "codex-core": {
+                    "binary-id": "codex-core",
+                    "package-name": "codex-core",
+                    "binary-name": "codex_core",
+                    "kind": "lib",
+                    "status": "listed",
+                    "testcases": {"same::test": testcase},
+                },
+                "codex-core::all": {
+                    "binary-id": "codex-core::all",
+                    "package-name": "codex-core",
+                    "binary-name": "all",
+                    "kind": "test",
+                    "status": "listed",
+                    "testcases": {"same::test": ignored_testcase},
+                },
+                "codex-core::example/demo-example": {
+                    "binary-id": "codex-core::example/demo-example",
+                    "package-name": "codex-core",
+                    "binary-name": "demo-example",
+                    "kind": "example",
+                    "status": "listed",
+                    "testcases": {"same::test": testcase},
+                },
+                "codex-core::bench/demo-bench": {
+                    "binary-id": "codex-core::bench/demo-bench",
+                    "package-name": "codex-core",
+                    "binary-name": "demo-bench",
+                    "kind": "bench",
+                    "status": "listed",
+                    "testcases": {"same::test": testcase},
+                },
+            },
+        }
+        result = self.invoke_workspace_parser(json.dumps(payload))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = json.loads(result.stdout)
+        self.assertEqual(
+            {row["authoritative_id"]: row["ignored"] for row in parsed["tests"]},
+            {
+                "codex-core$same::test": False,
+                "codex-core::all$same::test": True,
+                "codex-core::example/demo-example$same::test": False,
+                "codex-core::bench/demo-bench$same::test": False,
+            },
+        )
+        self.assertEqual(
+            {row["rust_binary_id"] for row in parsed["targets"]},
+            {
+                "codex-core",
+                "codex-core::all",
+                "codex-core::example/demo-example",
+                "codex-core::bench/demo-bench",
+            },
+        )
+        self.assertEqual(self.last_calls, [])
+
+    def test_workspace_parser_rejects_duplicate_json_and_non_nfc_ids_through_cli(
+        self,
+    ) -> None:
+        duplicate = self.invoke_workspace_parser(
+            '{"test-count":0,"test-count":0,"rust-suites":{}}'
+        )
+        self.assertEqual(duplicate.returncode, 2)
+        self.assertIn("duplicate key 'test-count'", duplicate.stderr)
+
+        package_name = "cafe\u0301"
+        payload = nextest_list_payload(
+            {"a::b": False},
+            binary_id=f"{package_name}::all",
+            package_name=package_name,
+        )
+        non_nfc = self.invoke_workspace_parser(payload)
+        self.assertEqual(non_nfc.returncode, 2)
+        self.assertIn("must use NFC Unicode normalization", non_nfc.stderr)
+
+    def test_workspace_parser_requires_test_kind_and_unfiltered_match_through_cli(
+        self,
+    ) -> None:
+        missing_kind = json.loads(nextest_list_payload({"a::b": False}))
+        testcase = missing_kind["rust-suites"]["codex-core::all"]["testcases"][
+            "a::b"
+        ]
+        del testcase["kind"]
+        missing_result = self.invoke_workspace_parser(json.dumps(missing_kind))
+        self.assertEqual(missing_result.returncode, 2)
+        self.assertIn(
+            "testcases.a::b.kind must be a non-empty string",
+            missing_result.stderr,
+        )
+
+        mismatch = json.loads(nextest_list_payload({"a::b": False}))
+        testcase = mismatch["rust-suites"]["codex-core::all"]["testcases"]["a::b"]
+        testcase["filter-match"] = {"status": "mismatch", "reason": "string"}
+        mismatch_result = self.invoke_workspace_parser(json.dumps(mismatch))
+        self.assertEqual(mismatch_result.returncode, 2)
+        self.assertIn(
+            "did not match the unfiltered workspace selection",
+            mismatch_result.stderr,
+        )
+
+    def test_workspace_parser_rejects_zero_tests_through_cli(self) -> None:
+        result = self.invoke_workspace_parser(
+            json.dumps({"test-count": 0, "rust-suites": {}})
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("workspace nextest listing selected zero tests", result.stderr)
+        self.assertEqual(self.last_calls, [])
+
+
+class LiveCargoMetadataParsingTest(CliRunnerTestCase):
+    def live_metadata_fixture(
+        self, fixture_name: str = "repository"
+    ) -> tuple[Path, Path, dict[str, Any]]:
+        repository_root = self.temp_dir / fixture_name
+        workspace_root = repository_root / "codex-rs"
+        package_root = workspace_root / "demo"
+        source_root = package_root / "src"
+        source_root.mkdir(parents=True)
+        (workspace_root / "Cargo.toml").write_text(
+            "[workspace]\nmembers = [\"demo\"]\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        package_manifest = package_root / "Cargo.toml"
+        package_manifest.write_text(
+            "[package]\nname = \"demo\"\nversion = \"0.0.0\"\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        lib_source = source_root / "lib.rs"
+        test_source = package_root / "tests" / "suite.rs"
+        test_source.parent.mkdir()
+        example_source = package_root / "examples" / "demo-example.rs"
+        example_source.parent.mkdir()
+        bench_source = package_root / "benches" / "demo-bench.rs"
+        bench_source.parent.mkdir()
+        lib_source.write_text("", encoding="utf-8")
+        test_source.write_text("", encoding="utf-8")
+        example_source.write_text("", encoding="utf-8")
+        bench_source.write_text("", encoding="utf-8")
+        payload = {
+            "workspace_root": str(workspace_root),
+            "packages": [
+                {
+                    "name": "demo",
+                    "manifest_path": str(package_manifest),
+                    "targets": [
+                        {
+                            "name": "demo",
+                            "kind": ["lib"],
+                            "src_path": str(lib_source),
+                        },
+                        {
+                            "name": "suite",
+                            "kind": ["test"],
+                            "src_path": str(test_source),
+                        },
+                        {
+                            "name": "demo-example",
+                            "kind": ["example"],
+                            "src_path": str(example_source),
+                        },
+                        {
+                            "name": "demo-bench",
+                            "kind": ["bench"],
+                            "src_path": str(bench_source),
+                        },
+                        {"name": "build-script-build", "kind": ["custom-build"]},
+                    ],
+                }
+            ],
+        }
+        return repository_root, workspace_root, payload
+
+    def invoke_metadata_parser(
+        self,
+        repository_root: Path,
+        workspace_root: Path,
+        payload: str | dict[str, Any],
+    ) -> subprocess.CompletedProcess[str]:
+        path = self.temp_dir / "live-cargo-metadata.json"
+        path.write_text(
+            payload if isinstance(payload, str) else json.dumps(payload),
+            encoding="utf-8",
+            newline="\n",
+        )
+        return self.invoke(
+            [
+                "_parse-live-cargo-metadata",
+                str(path),
+                "--repository-root",
+                str(repository_root),
+                "--expected-workspace-root",
+                str(workspace_root),
+            ]
+        )
+
+    def test_live_metadata_parser_emits_exact_target_context_inputs_through_cli(
+        self,
+    ) -> None:
+        repository_root, workspace_root, payload = self.live_metadata_fixture()
+        result = self.invoke_metadata_parser(repository_root, workspace_root, payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = json.loads(result.stdout)
+        self.assertEqual(parsed["workspace_root"], str(workspace_root.resolve()))
+        self.assertEqual(
+            {row["rust_binary_id"] for row in parsed["targets"]},
+            {
+                "demo",
+                "demo::suite",
+                "demo::example/demo-example",
+                "demo::bench/demo-bench",
+            },
+        )
+        suite = next(
+            row for row in parsed["targets"] if row["rust_binary_id"] == "demo::suite"
+        )
+        self.assertEqual(
+            set(suite),
+            {
+                "rust_binary_id",
+                "workspace_manifest_path",
+                "package_manifest_path",
+                "package_name",
+                "target_name",
+                "target_kind",
+                "target_source_path",
+            },
+        )
+        self.assertEqual(
+            suite["workspace_manifest_path"], str(workspace_root / "Cargo.toml")
+        )
+        self.assertEqual(
+            suite["package_manifest_path"],
+            str((workspace_root / "demo" / "Cargo.toml").resolve()),
+        )
+        self.assertEqual(
+            suite["target_source_path"],
+            str((workspace_root / "demo" / "tests" / "suite.rs").resolve()),
+        )
+        self.assertEqual(suite["package_name"], "demo")
+        self.assertEqual(suite["target_name"], "suite")
+        self.assertEqual(suite["target_kind"], "test")
+        specialized_targets = {
+            row["rust_binary_id"]: (row["target_kind"], row["target_source_path"])
+            for row in parsed["targets"]
+            if row["target_kind"] in {"example", "bench"}
+        }
+        self.assertEqual(
+            specialized_targets,
+            {
+                "demo::example/demo-example": (
+                    "example",
+                    str(
+                        (
+                            workspace_root
+                            / "demo"
+                            / "examples"
+                            / "demo-example.rs"
+                        ).resolve()
+                    ),
+                ),
+                "demo::bench/demo-bench": (
+                    "bench",
+                    str(
+                        (
+                            workspace_root / "demo" / "benches" / "demo-bench.rs"
+                        ).resolve()
+                    ),
+                ),
+            },
+        )
+        self.assertEqual(self.last_calls, [])
+
+    def test_live_metadata_parser_rejects_malformed_values_through_cli(self) -> None:
+        cases = (
+            ("root-array", (), [], "cargo metadata output must be a table"),
+            (
+                "packages-bool",
+                ("packages",),
+                True,
+                "cargo metadata output.packages must be an array",
+            ),
+            (
+                "package-array",
+                ("packages", 0),
+                [],
+                "cargo metadata output.packages[0] must be a table",
+            ),
+            (
+                "targets-bool",
+                ("packages", 0, "targets"),
+                True,
+                "packages[0].targets must be an array",
+            ),
+            (
+                "target-array",
+                ("packages", 0, "targets", 0),
+                [],
+                "packages[0].targets[0] must be a table",
+            ),
+            (
+                "bool-package-name",
+                ("packages", 0, "name"),
+                True,
+                "packages[0].name must be a non-empty string",
+            ),
+            (
+                "padded-package-name",
+                ("packages", 0, "name"),
+                " demo ",
+                "packages[0].name must not have surrounding whitespace",
+            ),
+            (
+                "non-nfc-target-name",
+                ("packages", 0, "targets", 0, "name"),
+                "cafe\u0301",
+                "targets[0].name must use NFC Unicode normalization",
+            ),
+            (
+                "bool-kind",
+                ("packages", 0, "targets", 0, "kind", 0),
+                True,
+                "kind[0] must be a non-empty string",
+            ),
+            (
+                "padded-kind",
+                ("packages", 0, "targets", 0, "kind", 0),
+                " lib ",
+                "kind[0] must not have surrounding whitespace",
+            ),
+            (
+                "non-nfc-kind",
+                ("packages", 0, "targets", 0, "kind", 0),
+                "te\u0301st",
+                "kind[0] must use NFC Unicode normalization",
+            ),
+            (
+                "bool-path",
+                ("packages", 0, "manifest_path"),
+                True,
+                "manifest_path must be a non-empty string",
+            ),
+        )
+        for fixture_name, path, replacement, expected_error in cases:
+            with self.subTest(case=fixture_name):
+                repository_root, workspace_root, payload = self.live_metadata_fixture(
+                    fixture_name
+                )
+                candidate: Any = payload
+                if path:
+                    owner: Any = candidate
+                    for key in path[:-1]:
+                        owner = owner[key]
+                    owner[path[-1]] = replacement
+                else:
+                    candidate = replacement
+                result = self.invoke_metadata_parser(
+                    repository_root, workspace_root, candidate
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(expected_error, result.stderr)
+                self.assertEqual(self.last_calls, [])
+
+    def test_live_metadata_parser_rejects_invalid_kind_sets_through_cli(self) -> None:
+        cases = (
+            ("empty", [], "contains no supported nextest targets"),
+            ("duplicate", ["lib", "lib"], "kind contains duplicates: lib"),
+            (
+                "ambiguous",
+                ["lib", "test"],
+                "kind has ambiguous nextest target kinds: lib, test",
+            ),
+            (
+                "unknown",
+                ["future-target"],
+                "kind contains unsupported Cargo target kinds: future-target",
+            ),
+        )
+        for fixture_name, kinds, expected_error in cases:
+            with self.subTest(case=fixture_name):
+                repository_root, workspace_root, payload = self.live_metadata_fixture(
+                    f"kind-{fixture_name}"
+                )
+                payload["packages"][0]["targets"] = [
+                    {
+                        **payload["packages"][0]["targets"][0],
+                        "kind": kinds,
+                    }
+                ]
+                result = self.invoke_metadata_parser(
+                    repository_root, workspace_root, payload
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(expected_error, result.stderr)
+                self.assertEqual(self.last_calls, [])
+
+    def test_live_metadata_parser_rejects_invalid_live_paths_through_cli(self) -> None:
+        path_cases = (
+            (
+                "relative",
+                ("packages", 0, "manifest_path"),
+                "demo/Cargo.toml",
+                "manifest_path must be an absolute path",
+            ),
+            (
+                "padded",
+                ("packages", 0, "manifest_path"),
+                "padded",
+                "manifest_path must not have surrounding whitespace",
+            ),
+            (
+                "non-nfc",
+                ("packages", 0, "manifest_path"),
+                "non-nfc",
+                "manifest_path must use NFC Unicode normalization",
+            ),
+            (
+                "nonexistent",
+                ("packages", 0, "targets", 0, "src_path"),
+                "missing.rs",
+                "src_path does not resolve to a live path",
+            ),
+            (
+                "wrong-kind",
+                ("packages", 0, "targets", 0, "src_path"),
+                "directory",
+                "src_path must resolve to a file",
+            ),
+        )
+        for fixture_name, path, replacement_kind, expected_error in path_cases:
+            with self.subTest(case=fixture_name):
+                repository_root, workspace_root, payload = self.live_metadata_fixture(
+                    f"path-{fixture_name}"
+                )
+                if replacement_kind == "missing.rs":
+                    replacement = str(workspace_root / "demo" / replacement_kind)
+                elif replacement_kind == "directory":
+                    replacement = str(workspace_root / "demo" / "src")
+                elif replacement_kind == "padded":
+                    replacement = f" {payload['packages'][0]['manifest_path']} "
+                elif replacement_kind == "non-nfc":
+                    replacement = (
+                        f"{payload['packages'][0]['manifest_path']}-cafe\u0301"
+                    )
+                else:
+                    replacement = replacement_kind
+                owner: Any = payload
+                for key in path[:-1]:
+                    owner = owner[key]
+                owner[path[-1]] = replacement
+                result = self.invoke_metadata_parser(
+                    repository_root, workspace_root, payload
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(expected_error, result.stderr)
+                self.assertEqual(self.last_calls, [])
+
+        repository_root, workspace_root, payload = self.live_metadata_fixture(
+            "path-escaped"
+        )
+        outside_manifest = self.temp_dir / "outside-Cargo.toml"
+        outside_manifest.write_text("[package]\n", encoding="utf-8")
+        payload["packages"][0]["manifest_path"] = str(outside_manifest)
+        escaped = self.invoke_metadata_parser(repository_root, workspace_root, payload)
+        self.assertEqual(escaped.returncode, 2)
+        self.assertIn("resolves outside the repository root", escaped.stderr)
+
+        repository_root, workspace_root, payload = self.live_metadata_fixture(
+            "path-missing-workspace-manifest"
+        )
+        (workspace_root / "Cargo.toml").unlink()
+        missing_manifest = self.invoke_metadata_parser(
+            repository_root, workspace_root, payload
+        )
+        self.assertEqual(missing_manifest.returncode, 2)
+        self.assertIn("live Cargo workspace manifest does not resolve", missing_manifest.stderr)
+        self.assertEqual(self.last_calls, [])
+
+    def test_live_metadata_parser_rejects_wrong_workspace_and_escaped_paths_through_cli(
+        self,
+    ) -> None:
+        repository_root, workspace_root, payload = self.live_metadata_fixture()
+        other_workspace = repository_root / "other"
+        other_workspace.mkdir()
+        (other_workspace / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+        wrong_workspace = copy.deepcopy(payload)
+        wrong_workspace["workspace_root"] = str(other_workspace)
+        wrong_result = self.invoke_metadata_parser(
+            repository_root, workspace_root, wrong_workspace
+        )
+        self.assertEqual(wrong_result.returncode, 2)
+        self.assertIn("does not match the expected workspace root", wrong_result.stderr)
+
+        outside_manifest = self.temp_dir / "outside-Cargo.toml"
+        outside_manifest.write_text("[package]\n", encoding="utf-8")
+        escaped = copy.deepcopy(payload)
+        escaped["packages"][0]["manifest_path"] = str(outside_manifest)
+        escaped_result = self.invoke_metadata_parser(
+            repository_root, workspace_root, escaped
+        )
+        self.assertEqual(escaped_result.returncode, 2)
+        self.assertIn("resolves outside the repository root", escaped_result.stderr)
+
+    def test_live_metadata_parser_rejects_ambiguous_binary_ids_through_cli(
+        self,
+    ) -> None:
+        repository_root, workspace_root, payload = self.live_metadata_fixture()
+        payload["packages"][0]["targets"][1]["kind"] = ["lib"]
+        result = self.invoke_metadata_parser(repository_root, workspace_root, payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ambiguous nextest Rust binary ID 'demo'", result.stderr)
+
+    def test_live_metadata_parser_rejects_duplicate_json_keys_through_cli(self) -> None:
+        repository_root, workspace_root, _ = self.live_metadata_fixture()
+        result = self.invoke_metadata_parser(
+            repository_root,
+            workspace_root,
+            '{"workspace_root":"x","workspace_root":"y","packages":[]}',
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("duplicate key 'workspace_root'", result.stderr)
 
 
 class RunTargetTest(CliRunnerTestCase):

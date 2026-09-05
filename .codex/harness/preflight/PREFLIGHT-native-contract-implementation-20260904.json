@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:native-contract-implementation-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    { "path": ".codex/harness/preflight/PREFLIGHT-native-contract-implementation-20260904.json", "recursive": false },
+    { "path": ".codex/harness/preflight/PREFLIGHT-native-contract-implementation-20260904.receipt.json", "recursive": false },
+    { "path": ".codex/validation/frozen-test-inventory-v2.json", "recursive": false },
+    { "path": ".codex/validation/test-replacements-v2.json", "recursive": false },
+    { "path": "scripts/materialize_completion_proof_inventory_v2.py", "recursive": false },
+    { "path": "scripts/test_materialize_completion_proof_inventory_v2.py", "recursive": false }
+  ],
+  "contract_claims": [
+    "argument-comment-lint-native-consumed-stderr-mapping"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [
+    ".codex/validation/frozen-test-inventory-v2.json",
+    ".codex/validation/test-replacements-v2.json"
+  ],
+  "generated_output_owner": "worker:native-contract-implementation-20260904",
+  "validation_owner": "worker:native-contract-implementation-20260904",
+  "validation_commands": [
+    "python -m unittest scripts.test_materialize_completion_proof_inventory_v2",
+    "python scripts/materialize_completion_proof_inventory_v2.py --check"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target-native-contract-implementation-unused",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

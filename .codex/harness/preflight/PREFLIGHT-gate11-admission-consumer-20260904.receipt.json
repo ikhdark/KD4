@@ -1,0 +1,119 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "gate10:ignored-listing-budget-20260904",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "SOURCEMAP.md",
+          "SOURCEMAP.md"
+        ],
+        [
+          "architecture_index.json",
+          "architecture_index.json"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "gate12:materializer-staging-20260904",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/core/src/completion_proof.rs",
+          "codex-rs/core/src/completion_proof.rs"
+        ],
+        [
+          "codex-rs/core/tests/suite/completion_proof_gate.rs",
+          "codex-rs/core/tests/suite/completion_proof_gate.rs"
+        ],
+        [
+          "SOURCEMAP.md",
+          "SOURCEMAP.md"
+        ],
+        [
+          "architecture_index.json",
+          "architecture_index.json"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "gate11:admission-consumer-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\none",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\none"
+  },
+  "contract_claims": [
+    "gate11:admission-consumer-20260904"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-05T04:04:09.849361+00:00",
+  "generated_output_owner": "gate11:admission-consumer-20260904",
+  "generated_outputs": [
+    "SOURCEMAP.md",
+    "architecture_index.json"
+  ],
+  "manifest_fingerprint": "ba83a4a054b96b47bd6370fd76c3dff3e1100a8c9144e616f0284a76354cdad1",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/src/completion_proof.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/src/tools/handlers/multi_agents_v2/task.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/src/agent/control.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/src/agent/control/spawn.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/tests/suite/completion_proof_gate.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/agent-task-store/src/local.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/agent-task-store/src/tests.rs",
+      "recursive": false
+    },
+    {
+      "path": "source_owners.toml",
+      "recursive": false
+    },
+    {
+      "path": "SOURCEMAP.md",
+      "recursive": false
+    },
+    {
+      "path": "architecture_index.json",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-05T03:04:09.849361+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "29684bd594630e41e28eb54a46b05450e715544d6a762e9fd8fc7936455aa6dc"
+  },
+  "validation_commands": [
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::historical_acceptance_requires_live_reviewer_and_current_approval)'"
+  ],
+  "validation_owner": "gate11:admission-consumer-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

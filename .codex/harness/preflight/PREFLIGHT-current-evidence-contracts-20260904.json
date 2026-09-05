@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:current-evidence-contracts-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-current-evidence-contracts-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-current-evidence-contracts-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/validation/focused-live-successor-catalog-v1.schema.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/focused_live_successor_catalog.py",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/src/focused_live_successor.rs",
+      "recursive": false
+    },
+    {
+      "path": "scripts/fixtures/focused_live_successor_catalog_v1_vectors.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_focused_live_successor_catalog.py",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/tests/focused_evidence_frame.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/tests/focused_live_successor_catalog.rs",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "focused-current-evidence-catalog-identity-parity"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "python -m unittest scripts.test_focused_live_successor_catalog",
+    "git diff --check"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

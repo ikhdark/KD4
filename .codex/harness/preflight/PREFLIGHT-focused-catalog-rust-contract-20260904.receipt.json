@@ -1,0 +1,68 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/validation-contracts/src/focused_live_successor.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/validation-contracts/src/lib.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/validation-contracts/tests/focused_live_successor_catalog.rs",
+          "codex-rs"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:focused-catalog-rust-contract-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\focused-catalog-rust-contract"
+  },
+  "contract_claims": [
+    "focused-live-successor-catalog-rust-contract"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902",
+    "worker:focused-catalog-schema-vectors-20260904"
+  ],
+  "expires_at": "2026-09-04T12:35:23.170453+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "79f458512ee546459c21ef3b0ed01826097ec9135b5ca84471f49326189d20db",
+  "path_claims": [
+    {
+      "path": "codex-rs/validation-contracts/src/focused_live_successor.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/src/lib.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/tests/focused_live_successor_catalog.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T11:35:23.170453+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "bdf7d1216a866f8b6de9ae6eb6ddbf1f3937b8cc21345811d649941a838b2e07"
+  },
+  "validation_commands": [
+    "just test-lane-package codex-validation-contracts --test focused_live_successor_catalog"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

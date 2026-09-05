@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:typed-validation-broker-fix-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "scripts/child_validation_report.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/completion_proof.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_completion_proof.py",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "typed-validation-broker-fail-closed-fix"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:typed-validation-broker-fix-20260904",
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof.ChildValidationJournalFoundationTest.test_real_broker_does_not_forward_private_or_completion_proof_environment",
+    "python -m unittest scripts.test_completion_proof.ChildValidationJournalFoundationTest.test_real_broker_preserves_confirmed_failure_before_later_infrastructure_error",
+    "python -m unittest scripts.test_completion_proof.ChildValidationJournalFoundationTest"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\typed-validation-broker-fix",
+    "cargo_home": "C:\\Users\\kuh\\.cargo"
+  },
+  "workspace_strategy": "shared"
+}

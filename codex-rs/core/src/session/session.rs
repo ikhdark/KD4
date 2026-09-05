@@ -942,8 +942,9 @@ impl Session {
             InitialHistory::Resumed(resumed_history) => resumed_history.conversation_id,
         };
         // Session metadata is serialized input, so it never grants completion authority here.
-        // The manager-issued non-Serde capability either retains an already live root lineage or
-        // binds a fresh one. Contributors inherit only their private AgentControl task lineage.
+        // The manager-issued non-Serde capability either retains an exact process-private rollout
+        // admission or binds a fresh lineage. Contributors inherit only their private AgentControl
+        // task lineage unless that exact rollout was registered earlier by this manager.
         let fallback_completion_proof_lineage_id = if completion_proof_authority.is_terminal_owner()
             || agent_control.task_lineage_id().is_empty()
         {
@@ -1206,10 +1207,10 @@ impl Session {
             };
             if let Some(rollout_path) = rollout_path.as_deref() {
                 completion_proof_authority
-                    .register_root_rollout(
+                    .register_rollout_authority(
                         rollout_path,
                         completion_proof_session_lineage_id.as_str(),
-                        terminal_quiescence_root_thread_id.unwrap_or(thread_id),
+                        terminal_quiescence_root_thread_id,
                     )
                     .await;
             }

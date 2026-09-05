@@ -29,6 +29,7 @@ use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
+use crate::tools::handlers::TestQualityHandler;
 use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
@@ -1011,6 +1012,11 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
         planned_tools.add_with_authorization_class(PlanHandler, TypedToolClass::OwnTask);
+        if !crate::agent::task_capabilities::is_independent_review_source(
+            &turn_context.session_source,
+        ) {
+            planned_tools.add_with_authorization_class(TestQualityHandler, TypedToolClass::OwnTask);
+        }
     }
 
     if features.enabled(Feature::DeferredExecutor)

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Private append-only evidence for one child validation invocation.
+"""Private append-only evidence and one-shot typed-validation broker.
 
-This module is intentionally dormant: production completion-proof routes do not
-consume it yet.  Later wrappers can use :class:`ChildValidationJournalWriter`
-to record freshly observed action results without asking the parent runner to
-infer execution from an outer process exit code.
+The completion-proof parent owns every launch choice.  The broker receives one
+precommitted launch over authenticated IPC, executes it once, and reports the
+same observation both over IPC and through the append-only journal.
 """
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -20,11 +20,35 @@ import sys
 import time
 import uuid
 from collections.abc import Mapping, Sequence
+from multiprocessing.connection import Client
 from typing import Final, Literal
+
+
+_BOUNDED_PROCESS_MODULE_NAME = "_kd4_child_validation_bounded_process"
+_BOUNDED_PROCESS_PATH = pathlib.Path(__file__).resolve().with_name(
+    "bounded_process.py"
+)
+_bounded_process_module = sys.modules.get(_BOUNDED_PROCESS_MODULE_NAME)
+if _bounded_process_module is None:
+    _bounded_process_spec = importlib.util.spec_from_file_location(
+        _BOUNDED_PROCESS_MODULE_NAME,
+        _BOUNDED_PROCESS_PATH,
+    )
+    if _bounded_process_spec is None or _bounded_process_spec.loader is None:
+        raise RuntimeError(
+            f"cannot load trusted process supervisor {_BOUNDED_PROCESS_PATH}"
+        )
+    _bounded_process_module = importlib.util.module_from_spec(_bounded_process_spec)
+    sys.modules[_BOUNDED_PROCESS_MODULE_NAME] = _bounded_process_module
+    _bounded_process_spec.loader.exec_module(_bounded_process_module)
+run_bounded_process = _bounded_process_module.run_bounded_process
 
 
 REPORT_TYPE: Final = "CompletionProofChildValidationJournalV1"
 SCHEMA_VERSION: Final = 1
+BROKER_PROTOCOL: Final = "CompletionProofTypedValidationBrokerV1"
+BROKER_AUTHKEY_ENV: Final = "KD4_TYPED_VALIDATION_BROKER_AUTHKEY"
+BROKER_MAX_REQUEST_BYTES: Final = 64 * 1024 * 1024
 CLASSIFICATIONS: Final = frozenset(
     {"confirmed_pass", "confirmed_validation_failure", "pre_result_error"}
 )
@@ -277,6 +301,153 @@ class ProcessIdentity:
             argv_sha256=str(raw["argv_sha256"]),
             started_at_unix_ns=_positive_int(
                 raw["started_at_unix_ns"], "process started_at_unix_ns"
+            ),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class ActionProcessObservation:
+    """The parent's independent in-memory view of one inner action."""
+
+    action_id: str
+    action_execution_id: str
+    subjects: tuple[str, ...]
+    process: ProcessIdentity
+    classification: Literal[
+        "confirmed_pass", "confirmed_validation_failure", "pre_result_error"
+    ]
+    actually_executed: bool
+    result_code: Literal["passed", "failed", "error"]
+    exit_code: int | None
+    diagnostic: str
+    ended_at_unix_ns: int
+    process_executable_sha256_after: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.action_id, "action observation ID")
+        _canonical_uuid(self.action_execution_id, "action observation execution ID")
+        _nonempty_string_list(list(self.subjects), "action observation subjects")
+        if not isinstance(self.process, ProcessIdentity):
+            raise JournalContractError("action observation process is invalid")
+        if self.classification not in CLASSIFICATIONS:
+            raise JournalContractError("action observation classification is invalid")
+        if not isinstance(self.actually_executed, bool):
+            raise JournalContractError("action observation executed state is invalid")
+        if self.classification != "pre_result_error" and not self.actually_executed:
+            raise JournalContractError("confirmed action observation did not execute")
+        expected_result = {
+            "confirmed_pass": "passed",
+            "confirmed_validation_failure": "failed",
+            "pre_result_error": "error",
+        }[self.classification]
+        if self.result_code != expected_result:
+            raise JournalContractError(
+                "action observation result contradicts classification"
+            )
+        if self.exit_code is not None and (
+            isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
+        ):
+            raise JournalContractError("action observation exit code is invalid")
+        if not isinstance(self.diagnostic, str):
+            raise JournalContractError("action observation diagnostic is invalid")
+        _positive_int(self.ended_at_unix_ns, "action observation ended_at_unix_ns")
+        if self.ended_at_unix_ns < self.process.started_at_unix_ns:
+            raise JournalContractError("action observation ended before it started")
+        _hex_digest(
+            self.process_executable_sha256_after,
+            "action observation process_executable_sha256_after",
+        )
+
+    def started_record_fields(self) -> dict[str, object]:
+        return {
+            "action_id": self.action_id,
+            "action_execution_id": self.action_execution_id,
+            "subject_count": len(self.subjects),
+            "subjects_sha256": hash_subjects(self.subjects),
+            "process": self.process.as_record_fields(),
+        }
+
+    def result_record_fields(self) -> dict[str, object]:
+        return {
+            "action_id": self.action_id,
+            "action_execution_id": self.action_execution_id,
+            "subject_count": len(self.subjects),
+            "subjects_sha256": hash_subjects(self.subjects),
+            "classification": self.classification,
+            "actually_executed": self.actually_executed,
+            "result_code": self.result_code,
+            "exit_code": self.exit_code,
+            "diagnostic": self.diagnostic,
+            "ended_at_unix_ns": self.ended_at_unix_ns,
+            "process_executable_sha256_after": (
+                self.process_executable_sha256_after
+            ),
+        }
+
+    def as_ipc_fields(self) -> dict[str, object]:
+        return {
+            "action_id": self.action_id,
+            "action_execution_id": self.action_execution_id,
+            "subjects": list(self.subjects),
+            "process": self.process.as_record_fields(),
+            "classification": self.classification,
+            "actually_executed": self.actually_executed,
+            "result_code": self.result_code,
+            "exit_code": self.exit_code,
+            "diagnostic": self.diagnostic,
+            "ended_at_unix_ns": self.ended_at_unix_ns,
+            "process_executable_sha256_after": (
+                self.process_executable_sha256_after
+            ),
+        }
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, object]) -> ActionProcessObservation:
+        expected = {
+            "action_id",
+            "action_execution_id",
+            "subjects",
+            "process",
+            "classification",
+            "actually_executed",
+            "result_code",
+            "exit_code",
+            "diagnostic",
+            "ended_at_unix_ns",
+            "process_executable_sha256_after",
+        }
+        if set(raw) != expected:
+            raise JournalContractError("action observation fields do not match")
+        process = raw["process"]
+        if not isinstance(process, dict):
+            raise JournalContractError("action observation process is not an object")
+        subjects = _nonempty_string_list(
+            raw["subjects"], "action observation subjects"
+        )
+        classification = raw["classification"]
+        result_code = raw["result_code"]
+        if not isinstance(classification, str) or not isinstance(result_code, str):
+            raise JournalContractError("action observation result fields are invalid")
+        exit_code = raw["exit_code"]
+        if exit_code is not None and (
+            isinstance(exit_code, bool) or not isinstance(exit_code, int)
+        ):
+            raise JournalContractError("action observation exit code is invalid")
+        return cls(
+            action_id=str(raw["action_id"]),
+            action_execution_id=str(raw["action_execution_id"]),
+            subjects=tuple(subjects),
+            process=ProcessIdentity.from_mapping(process),
+            classification=classification,  # type: ignore[arg-type]
+            actually_executed=raw["actually_executed"],  # type: ignore[arg-type]
+            result_code=result_code,  # type: ignore[arg-type]
+            exit_code=exit_code,
+            diagnostic=raw["diagnostic"],  # type: ignore[arg-type]
+            ended_at_unix_ns=_positive_int(
+                raw["ended_at_unix_ns"], "action observation ended_at_unix_ns"
+            ),
+            process_executable_sha256_after=str(
+                raw["process_executable_sha256_after"]
             ),
         )
 
@@ -632,6 +803,7 @@ def _validate_started(
     execution_ids: set[str],
     producer: ProcessIdentity,
     expected_processes: Mapping[str, ProcessIdentity],
+    expected_observations: Mapping[str, ActionProcessObservation] | None,
     outer_ended_at_unix_ns: int,
 ) -> tuple[str, _StartedAction]:
     action_id = _identifier(raw.get("action_id"), "action_id")
@@ -652,6 +824,13 @@ def _validate_started(
     process = ProcessIdentity.from_mapping(process_raw)
     if process != expected_processes[action_id]:
         raise JournalContractError("action process identity mismatch")
+    if expected_observations is not None:
+        expected_fields = expected_observations[action_id].started_record_fields()
+        for key, expected in expected_fields.items():
+            if raw.get(key) != expected:
+                raise JournalContractError(
+                    f"action start {key} does not match the parent observation"
+                )
     if (
         process.started_at_unix_ns < producer.started_at_unix_ns
         or process.started_at_unix_ns > outer_ended_at_unix_ns
@@ -670,6 +849,7 @@ def _validate_result(
     *,
     started: Mapping[str, _StartedAction],
     terminal: Mapping[str, _TerminalAction],
+    expected_observations: Mapping[str, ActionProcessObservation] | None,
     outer_ended_at_unix_ns: int,
 ) -> tuple[str, _TerminalAction]:
     action_id = _identifier(raw.get("action_id"), "action_id")
@@ -719,6 +899,13 @@ def _validate_result(
     )
     if executable_after != start.process.executable_sha256:
         raise JournalContractError("action executable changed during execution")
+    if expected_observations is not None:
+        expected_fields = expected_observations[action_id].result_record_fields()
+        for key, expected in expected_fields.items():
+            if raw.get(key) != expected:
+                raise JournalContractError(
+                    f"action result {key} does not match the parent observation"
+                )
     return action_id, _TerminalAction(
         action_execution_id=execution_id,
         classification=str(classification),
@@ -801,6 +988,9 @@ def parse_child_validation_journal(
     outer_ended_at_unix_ns: int,
     outer_executable_sha256_after: str,
     outer_exit_code: int | None,
+    expected_action_observations: Mapping[
+        str, ActionProcessObservation
+    ] | None = None,
 ) -> JournalVerdict:
     """Parse a strict valid prefix and classify only authenticated evidence."""
 
@@ -828,6 +1018,33 @@ def parse_child_validation_journal(
         raise JournalContractError(
             "expected action process IDs do not match external selected_ids"
         )
+    normalized_observations: dict[str, ActionProcessObservation] | None = None
+    if expected_action_observations is not None:
+        if not isinstance(expected_action_observations, Mapping):
+            raise JournalContractError("expected_action_observations is not a mapping")
+        normalized_observations = {}
+        for raw_action_id, observation in expected_action_observations.items():
+            action_id = _identifier(raw_action_id, "expected action observation ID")
+            if not isinstance(observation, ActionProcessObservation):
+                raise JournalContractError(
+                    f"expected action observation {action_id} is invalid"
+                )
+            if observation.action_id != action_id:
+                raise JournalContractError(
+                    "expected action observation ID does not match its mapping key"
+                )
+            normalized_observations[action_id] = observation
+        if set(normalized_observations) != set(selected_binding):
+            raise JournalContractError(
+                "expected action observation IDs do not match external selected_ids"
+            )
+        if any(
+            normalized_processes[action_id] != observation.process
+            for action_id, observation in normalized_observations.items()
+        ):
+            raise JournalContractError(
+                "expected action processes do not match parent observations"
+            )
     try:
         actual_journal_path = path.resolve(strict=False)
         bound_journal_path = expected_journal_path.resolve(strict=False)
@@ -921,6 +1138,7 @@ def parse_child_validation_journal(
                     execution_ids=execution_ids,
                     producer=expected_producer,
                     expected_processes=normalized_processes,
+                    expected_observations=normalized_observations,
                     outer_ended_at_unix_ns=outer_ended_at_unix_ns,
                 )
                 started[action_id] = action
@@ -930,6 +1148,7 @@ def parse_child_validation_journal(
                     raw,
                     started=started,
                     terminal=terminal,
+                    expected_observations=normalized_observations,
                     outer_ended_at_unix_ns=outer_ended_at_unix_ns,
                 )
                 terminal[action_id] = result
@@ -1017,6 +1236,357 @@ def parse_child_validation_journal(
     )
 
 
+def _canonical_ipc_object(payload: bytes, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise JournalContractError(f"{label} is not valid UTF-8 JSON") from error
+    if not isinstance(value, dict) or canonical_json(value) != payload:
+        raise JournalContractError(f"{label} is not a canonical JSON object")
+    return value
+
+
+def _portable_exit_code(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if 0x80000000 <= value <= 0xFFFFFFFF:
+        return value - 0x100000000
+    if -(2**31) <= value <= 2**31 - 1:
+        return value
+    return None
+
+
+def _validated_broker_request(raw: Mapping[str, object]) -> dict[str, object]:
+    expected = {
+        "protocol",
+        "binding",
+        "action_id",
+        "action_execution_id",
+        "subjects",
+        "command",
+        "cwd",
+        "env",
+        "timeout_seconds",
+        "stdout_limit_bytes",
+        "stderr_limit_bytes",
+        "validation_failure_exit_codes",
+        "journal_path",
+        "launch_target_identity",
+    }
+    if set(raw) != expected or raw.get("protocol") != BROKER_PROTOCOL:
+        raise JournalContractError("broker request fields do not match")
+    binding_raw = raw["binding"]
+    if not isinstance(binding_raw, dict):
+        raise JournalContractError("broker binding is not an object")
+    binding = JournalInvocationBinding.from_mapping(binding_raw)
+    action_id = _identifier(raw["action_id"], "broker action_id")
+    if action_id != binding.validation_id:
+        raise JournalContractError("broker action_id does not match its binding")
+    action_execution_id = _canonical_uuid(
+        str(raw["action_execution_id"]), "broker action_execution_id"
+    )
+    subjects = _nonempty_string_list(raw["subjects"], "broker subjects")
+
+    command = raw["command"]
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(item, str) and item for item in command)
+    ):
+        raise JournalContractError("broker command is invalid")
+    executable = pathlib.Path(command[0])
+    if not executable.is_absolute():
+        raise JournalContractError("broker command executable is not absolute")
+    cwd = raw["cwd"]
+    journal_path = raw["journal_path"]
+    if not isinstance(cwd, str) or not pathlib.Path(cwd).is_absolute():
+        raise JournalContractError("broker cwd is not absolute")
+    if not isinstance(journal_path, str) or not pathlib.Path(journal_path).is_absolute():
+        raise JournalContractError("broker journal path is not absolute")
+    env = raw["env"]
+    if not isinstance(env, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in env.items()
+    ):
+        raise JournalContractError("broker environment is invalid")
+    timeout_seconds = _positive_int(raw["timeout_seconds"], "broker timeout_seconds")
+    stdout_limit = _positive_int(
+        raw["stdout_limit_bytes"],
+        "broker stdout_limit_bytes",
+        allow_zero=True,
+    )
+    stderr_limit = _positive_int(
+        raw["stderr_limit_bytes"],
+        "broker stderr_limit_bytes",
+        allow_zero=True,
+    )
+    failure_codes = raw["validation_failure_exit_codes"]
+    if not isinstance(failure_codes, list) or not all(
+        not isinstance(value, bool) and isinstance(value, int)
+        for value in failure_codes
+    ):
+        raise JournalContractError("broker failure exit codes are invalid")
+    if failure_codes != sorted(set(failure_codes)) or 0 in failure_codes:
+        raise JournalContractError("broker failure exit codes are not canonical")
+    launch_raw = raw["launch_target_identity"]
+    if not isinstance(launch_raw, dict) or set(launch_raw) != {
+        "requested",
+        "resolved_path",
+        "sha256_before",
+    }:
+        raise JournalContractError("broker launch identity fields do not match")
+    if (
+        not isinstance(launch_raw["requested"], str)
+        or not isinstance(launch_raw["resolved_path"], str)
+        or pathlib.Path(launch_raw["resolved_path"]).resolve(strict=False)
+        != executable.resolve(strict=False)
+        or command[0] != launch_raw["resolved_path"]
+    ):
+        raise JournalContractError("broker command contradicts its launch identity")
+    expected_executable_hash = _hex_digest(
+        launch_raw["sha256_before"], "broker launch executable hash"
+    )
+    if hash_file(executable.resolve(strict=True)) != expected_executable_hash:
+        raise JournalContractError("broker launch executable changed before execution")
+    return {
+        "binding": binding,
+        "action_id": action_id,
+        "action_execution_id": action_execution_id,
+        "subjects": tuple(subjects),
+        "command": command,
+        "cwd": pathlib.Path(cwd),
+        "env": env,
+        "timeout_seconds": timeout_seconds,
+        "stdout_limit_bytes": stdout_limit,
+        "stderr_limit_bytes": stderr_limit,
+        "validation_failure_exit_codes": frozenset(failure_codes),
+        "journal_path": pathlib.Path(journal_path),
+        "expected_executable_hash": expected_executable_hash,
+    }
+
+
+def _run_broker_request(
+    request_payload: bytes,
+    *,
+    producer: ProcessIdentity,
+) -> tuple[dict[str, object], dict[str, object] | None, int]:
+    request_sha256 = sha256_bytes(request_payload)
+    request = _validated_broker_request(
+        _canonical_ipc_object(request_payload, "broker request")
+    )
+    binding = request["binding"]
+    assert isinstance(binding, JournalInvocationBinding)
+    journal_path = request["journal_path"]
+    assert isinstance(journal_path, pathlib.Path)
+    action_id = str(request["action_id"])
+    action_execution_id = str(request["action_execution_id"])
+    subjects = request["subjects"]
+    assert isinstance(subjects, tuple)
+    command = request["command"]
+    cwd = request["cwd"]
+    env = request["env"]
+    assert isinstance(command, list)
+    assert isinstance(cwd, pathlib.Path)
+    assert isinstance(env, dict)
+    failure_codes = request["validation_failure_exit_codes"]
+    assert isinstance(failure_codes, frozenset)
+
+    with ChildValidationJournalWriter(
+        journal_path,
+        binding=binding,
+        producer=producer,
+        intended_ids=[action_id],
+        selected_ids=[action_id],
+    ) as writer:
+        started_at = time.time_ns()
+        bounded = run_bounded_process(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=int(request["timeout_seconds"]),
+            stdout_limit_bytes=int(request["stdout_limit_bytes"]),
+            stderr_limit_bytes=int(request["stderr_limit_bytes"]),
+        )
+        sys.stdout.buffer.write(bounded.stdout)
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.write(bounded.stderr)
+        sys.stderr.buffer.flush()
+        returncode = _portable_exit_code(bounded.returncode)
+        supervision_error = bounded.supervision_error
+        if bounded.returncode is not None and returncode is None:
+            supervision_error = (
+                f"{supervision_error}; inner validation returned an exit code outside "
+                "the signed 32-bit report contract"
+                if supervision_error
+                else "inner validation returned an exit code outside the signed "
+                "32-bit report contract"
+            )
+        if bounded.pid <= 0:
+            writer.infrastructure_error(
+                phase="inner-launch",
+                diagnostic=supervision_error or "inner validation did not launch",
+            )
+            producer_ended = time.time_ns()
+            producer_after = hash_file(pathlib.Path(sys.executable).resolve())
+            writer.seal(
+                producer_ended_at_unix_ns=producer_ended,
+                producer_executable_sha256_after=producer_after,
+            )
+            return (
+                {
+                    "protocol": BROKER_PROTOCOL,
+                    "request_sha256": request_sha256,
+                    "status": "infrastructure_error",
+                    "producer": producer.as_record_fields(),
+                    "producer_ended_at_unix_ns": producer_ended,
+                    "producer_executable_sha256_after": producer_after,
+                    "diagnostic": supervision_error
+                    or "inner validation did not launch",
+                },
+                None,
+                2,
+            )
+
+        executable = pathlib.Path(command[0]).resolve(strict=True)
+        executable_after = hash_file(executable)
+        process = ProcessIdentity(
+            pid=bounded.pid,
+            executable_path=str(executable),
+            executable_sha256=str(request["expected_executable_hash"]),
+            argv_sha256=hash_arguments(command),
+            started_at_unix_ns=started_at,
+        )
+        if supervision_error or executable_after != process.executable_sha256:
+            classification = "pre_result_error"
+        elif returncode == 0:
+            classification = "confirmed_pass"
+        elif returncode in failure_codes:
+            classification = "confirmed_validation_failure"
+        else:
+            classification = "pre_result_error"
+        result_code = {
+            "confirmed_pass": "passed",
+            "confirmed_validation_failure": "failed",
+            "pre_result_error": "error",
+        }[classification]
+        diagnostic = supervision_error or bounded.stderr.decode(
+            "utf-8", errors="replace"
+        )
+        if executable_after != process.executable_sha256:
+            diagnostic = "; ".join(
+                part
+                for part in (
+                    diagnostic,
+                    "inner validation executable changed during execution",
+                )
+                if part
+            )
+        ended_at = time.time_ns()
+        observation = ActionProcessObservation(
+            action_id=action_id,
+            action_execution_id=action_execution_id,
+            subjects=subjects,
+            process=process,
+            classification=classification,  # type: ignore[arg-type]
+            actually_executed=classification
+            in {"confirmed_pass", "confirmed_validation_failure"},
+            result_code=result_code,  # type: ignore[arg-type]
+            exit_code=returncode,
+            diagnostic=diagnostic,
+            ended_at_unix_ns=ended_at,
+            process_executable_sha256_after=executable_after,
+        )
+        writer.start_action(
+            action_id,
+            subjects=subjects,
+            process=process,
+            action_execution_id=action_execution_id,
+        )
+        writer.finish_action(
+            action_id,
+            action_execution_id=action_execution_id,
+            classification=classification,
+            actually_executed=observation.actually_executed,
+            result_code=result_code,
+            exit_code=returncode,
+            diagnostic=diagnostic,
+            ended_at_unix_ns=ended_at,
+            process_executable_sha256_after=executable_after,
+        )
+        if supervision_error:
+            writer.infrastructure_error(
+                phase="inner-supervision", diagnostic=supervision_error
+            )
+        producer_ended = time.time_ns()
+        producer_after = hash_file(pathlib.Path(sys.executable).resolve())
+        writer.seal(
+            producer_ended_at_unix_ns=producer_ended,
+            producer_executable_sha256_after=producer_after,
+        )
+    response = {
+        "protocol": BROKER_PROTOCOL,
+        "request_sha256": request_sha256,
+        "status": "observed",
+        "producer": producer.as_record_fields(),
+        "observation": observation.as_ipc_fields(),
+    }
+    completion = {
+        "protocol": BROKER_PROTOCOL,
+        "request_sha256": request_sha256,
+        "status": "completed",
+        "producer_ended_at_unix_ns": producer_ended,
+        "producer_executable_sha256_after": producer_after,
+    }
+    return response, completion, returncode if returncode is not None else 2
+
+
+def _broker_main(*, host: str, port: int) -> int:
+    started_at = time.time_ns()
+    launch_arguments = globals().get("_BROKER_LAUNCH_ARGUMENTS")
+    if not (
+        isinstance(launch_arguments, list)
+        and launch_arguments
+        and all(isinstance(item, str) for item in launch_arguments)
+    ):
+        launch_arguments = [str(pathlib.Path(sys.executable).resolve()), *sys.argv]
+    producer = ProcessIdentity.current(
+        started_at_unix_ns=started_at,
+        arguments=launch_arguments,
+    )
+    authkey_value = os.environ.pop(BROKER_AUTHKEY_ENV, "")
+    try:
+        authkey = bytes.fromhex(authkey_value)
+    except ValueError as error:
+        raise JournalContractError("broker auth key is not hexadecimal") from error
+    if len(authkey) != 32:
+        raise JournalContractError("broker auth key has invalid length")
+    with Client((host, port), family="AF_INET", authkey=authkey) as connection:
+        request_payload = connection.recv_bytes(BROKER_MAX_REQUEST_BYTES)
+        try:
+            response, completion, returncode = _run_broker_request(
+                request_payload,
+                producer=producer,
+            )
+        except Exception as error:  # noqa: BLE001 - private broker fails closed
+            response = {
+                "protocol": BROKER_PROTOCOL,
+                "request_sha256": sha256_bytes(request_payload),
+                "status": "infrastructure_error",
+                "producer": producer.as_record_fields(),
+                "producer_ended_at_unix_ns": time.time_ns(),
+                "producer_executable_sha256_after": hash_file(
+                    pathlib.Path(sys.executable).resolve()
+                ),
+                "diagnostic": f"{type(error).__name__}: {error}",
+            }
+            completion = None
+            returncode = 2
+        connection.send_bytes(canonical_json(response))
+        if completion is not None:
+            connection.send_bytes(canonical_json(completion))
+    return returncode
+
+
 def _load_json_object(path: pathlib.Path, label: str) -> dict[str, object]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -1059,6 +1629,11 @@ def _parse_exit_code(value: str) -> int | None:
 def _main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    broker = subparsers.add_parser(
+        "typed-validation-broker", help=argparse.SUPPRESS
+    )
+    broker.add_argument("--host", required=True)
+    broker.add_argument("--port", required=True, type=int)
     validate = subparsers.add_parser("validate", help="validate one completed journal")
     validate.add_argument("--journal", required=True, type=pathlib.Path)
     validate.add_argument("--expected-journal", required=True, type=pathlib.Path)
@@ -1071,6 +1646,8 @@ def _main(argv: Sequence[str] | None = None) -> int:
     validate.add_argument("--outer-exit-code", required=True, type=_parse_exit_code)
     args = parser.parse_args(argv)
     try:
+        if args.command == "typed-validation-broker":
+            return _broker_main(host=args.host, port=args.port)
         binding = JournalInvocationBinding.from_mapping(
             _load_json_object(args.binding, "binding")
         )
@@ -1091,7 +1668,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             outer_executable_sha256_after=args.outer_executable_sha256_after,
             outer_exit_code=args.outer_exit_code,
         )
-    except JournalContractError as error:
+    except (JournalContractError, OSError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return 2
     print(canonical_json(verdict.to_dict()).decode("utf-8"))

@@ -1,0 +1,37 @@
+{
+  "advisories": [],
+  "assignment_id": "gate9:benchmark-replacement-20260905",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\.codex\\harness\\runs\\2026-09-02-completion-proof-migration\\gate9-execution\\no-cargo-benchmark-replacement"
+  },
+  "contract_claims": [
+    "gate9-approved-29-benchmark-replacement"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-05T04:02:32.032408+00:00",
+  "generated_output_owner": "gate9:benchmark-replacement-20260905",
+  "generated_outputs": [],
+  "manifest_fingerprint": "1f413f47c3400c293833c841b06c8b090c6a8fc2f794d91e7e0aff2f977ce68f",
+  "path_claims": [
+    {
+      "path": "scripts/test_kd4_live_agent_benchmark.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-05T03:02:32.032408+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "ed2d16b9e0a9db82b912b1e3b5237e2ea30266d6d5c188650caa00d2dd6a0aef"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_kd4_live_agent_benchmark"
+  ],
+  "validation_owner": "gate9:benchmark-replacement-20260905",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

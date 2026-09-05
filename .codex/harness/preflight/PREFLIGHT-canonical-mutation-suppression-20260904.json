@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:canonical-mutation-suppression-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/src/tools/events.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/src/tools/handlers/shell.rs",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-canonical-mutation-suppression-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-canonical-mutation-suppression-20260904.receipt.json",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "canonical-runner-mutation-accounting-suppression"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902",
+    "worker:cli-app-server-direct-argv-proof-20260904",
+    "worker:direct-argv-shell-ownership-20260904"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "worker:canonical-mutation-suppression-20260904",
+  "validation_commands": [
+    "just core-test-fast cli_completion_proof -E 'test(=real_cli_app_server_accepts_canonical_completion_proof_via_direct_argv)'",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::mutate_and_restore_invalidates_canonical_attempt_through_real_shell_path)'",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::transient_mutation_cannot_race_terminal_release_before_unified_exec_end)'",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::focused_pre_result_workspace_drift_does_not_poison_unchanged_retry)'"
+  ],
+  "cargo_lane": {
+    "target_dir": "codex-rs/target",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

@@ -147,7 +147,14 @@ slow-timeout = { period = "1m", terminate-after = 2 }
 # forced-terminal budget or a cold Windows resume. Let the real runtime path
 # return its own result instead of terminating it at the module-wide ceiling.
 platform = 'cfg(windows)'
-filter = 'package(codex-core) & binary(core_cli_workspace) & (test(=suite::completion_proof_gate::canonical_proof_survives_same_process_compact_resume_and_authorized_root_fork) | test(=suite::completion_proof_gate::differently_cased_windows_paths_preserve_repository_and_rollout_identity) | test(=suite::completion_proof_gate::explicit_admission_not_session_source_selects_terminal_authority))'
+filter = 'package(codex-core) & binary(core_cli_workspace) & (test(=suite::completion_proof_gate::canonical_proof_survives_same_process_compact_resume_and_authorized_root_fork) | test(=suite::completion_proof_gate::differently_cased_windows_paths_preserve_repository_and_rollout_identity) | test(=suite::completion_proof_gate::explicit_admission_not_session_source_selects_terminal_authority) | test(=suite::completion_proof_gate::current_evidence_real_session_executes_both_and_rejects_nonterminal_misuse))'
+slow-timeout = { period = "2m", terminate-after = 2 }
+
+[[profile.default.overrides]]
+# This exact canonical-failure session exceeded the module-wide Windows ceiling
+# before the real-path validation returned a result.
+platform = 'cfg(windows)'
+filter = 'package(codex-core) & binary(core_cli_workspace) & test(=suite::completion_proof_gate::changed_trusted_helper_is_rejected_before_canonical_failure_can_poison)'
 slow-timeout = { period = "2m", terminate-after = 2 }
 
 [[profile.default.overrides]]
@@ -171,6 +178,13 @@ slow-timeout = { period = "2m", terminate-after = 2 }
 # restarts the server. Let its bounded protocol path return its own result.
 platform = 'cfg(windows)'
 filter = 'package(codex-app-server) & binary(all) & test(=suite::v2::client_metadata::same_process_resume_reuses_completion_proof_but_restart_does_not_v2)'
+slow-timeout = { period = "2m", terminate-after = 2 }
+
+[[profile.default.overrides]]
+# This exact CLI integration starts the real app-server and runs canonical
+# certification through the Windows restricted-token sandbox.
+platform = 'cfg(windows)'
+filter = 'package(codex-cli) & binary(completion_proof) & test(=real_cli_app_server_accepts_canonical_completion_proof_via_direct_argv)'
 slow-timeout = { period = "2m", terminate-after = 2 }
 
 [[profile.default.overrides]]

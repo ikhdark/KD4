@@ -1,0 +1,98 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-focused-evidence-frame-contract-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-focused-evidence-frame-contract-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          "codex-rs/validation-contracts/src/focused_evidence_frame.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/validation-contracts/src/lib.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/validation-contracts/src/focused_live_successor.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/validation-contracts/tests/focused_evidence_frame.rs",
+          "codex-rs"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "worker:cli-app-server-direct-argv-proof-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\root-owned-serialized"
+    }
+  ],
+  "assignment_id": "worker:focused-evidence-frame-contract-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\default",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\root-owned-serialized"
+  },
+  "contract_claims": [
+    "focused-evidence-frame-v1-binary-contract",
+    "focused-evidence-ack-v1-binary-contract",
+    "focused-process-set-canonical-parser"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T20:06:17.915409+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "25788dff9edf8154b614fd3c72b1d37cc28c6ddb51b635c8af927f1f231ee755",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-focused-evidence-frame-contract-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-focused-evidence-frame-contract-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/src/focused_evidence_frame.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/src/lib.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/src/focused_live_successor.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/tests/focused_evidence_frame.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T19:06:17.915409+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "8eec5169bedbd8b1e88924f9f2758471173384a038f32dd857de978c6d65c2f6"
+  },
+  "validation_commands": [
+    "cargo test --manifest-path codex-rs/Cargo.toml -p codex-validation-contracts --test focused_evidence_frame"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

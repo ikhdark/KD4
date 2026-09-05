@@ -400,7 +400,15 @@ evidence = [{ path = "source.rs", symbol = "live_symbol" }]
         self,
     ) -> None:
         with temporary_repository() as root:
-            source = write_fixture(root, "source.rs", "fn live_symbol() {}\n")
+            supporting_sources = {
+                "source.rs": "fn live_symbol() {}\n",
+                "relationship.rs": "fn relationship_evidence() {}\n",
+                "invariant.rs": "fn invariant_evidence() {}\n",
+                "owner_test.rs": "def test_owner(): pass\n",
+                "invariant_test.rs": "def test_invariant(): pass\n",
+            }
+            for path, contents in supporting_sources.items():
+                write_fixture(root, path, contents)
             write_fixture(
                 root,
                 "source_owners.toml",
@@ -410,33 +418,47 @@ evidence = [{ path = "source.rs", symbol = "live_symbol" }]
 id = "alpha"
 roots = ["source.rs"]
 primary_entries = [{ path = "source.rs", symbol = "live_symbol" }]
+tests = ["owner_test.rs"]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:relationship.rs"
+confidence = "declared"
+evidence = [{ path = "relationship.rs" }]
+
+[[owners.invariants]]
+id = "alpha-contract"
+kind = "semantic"
+statement = "supporting inputs remain current"
+evidence = [{ path = "invariant.rs" }]
+tests = ["invariant_test.rs"]
 """
                 ),
             )
 
-            first = self.output_json(
+            previous = self.output_json(
                 run_source_owners_cli(
                     root,
                     "query",
                     extra=("--owner", "alpha"),
                 )
             )
-            source.write_text(
-                'fn live_symbol() { println!("changed"); }\n',
-                encoding="utf-8",
-            )
-            second = self.output_json(
-                run_source_owners_cli(
-                    root,
-                    "query",
-                    extra=("--owner", "alpha"),
+            for index, (path, contents) in enumerate(supporting_sources.items()):
+                write_fixture(root, path, f"{contents.rstrip()} # changed-{index}\n")
+                current = self.output_json(
+                    run_source_owners_cli(
+                        root,
+                        "query",
+                        extra=("--owner", "alpha"),
+                    )
                 )
-            )
-
-            self.assertNotEqual(
-                first["repository_revision"],
-                second["repository_revision"],
-            )
+                self.assertNotEqual(
+                    previous["repository_revision"],
+                    current["repository_revision"],
+                    path,
+                )
+                previous = current
 
     def test_alias_collision_requires_explicit_ambiguity_through_cli(self) -> None:
         with temporary_repository() as root:
@@ -1446,16 +1468,37 @@ primary_entries = [{ path = "source.rs", symbol = "locate" }]
                 ),
             ),
             (
+                ("completion-proof-focused-contracts",),
+                "focused evidence frame canonical process set and acknowledgement contract",
+                (
+                    (
+                        "control_and_data_flow",
+                        "validation-contracts/src/canonical.rs",
+                    ),
+                    ("registration_and_entrypoints", "focused_evidence_frame.rs"),
+                    ("registration_and_entrypoints", "validation-contracts/src/lib.rs"),
+                    ("tests_and_contracts", "tests/focused_evidence_frame.rs"),
+                    ("invariants", "focused-evidence-frame-v1-binary-contract"),
+                    ("invariants", "focused-evidence-ack-v1-binary-contract"),
+                    ("invariants", "focused-process-set-canonical-parser"),
+                ),
+            ),
+            (
                 ("replacement-admission-certification",),
                 "dormant replacement admission caller supplied successor boundary",
                 (
                     ("control_and_data_flow", "scripts/replacement_admission.py"),
                     ("callers_and_consumers", "test_replacement_admission.py"),
                     ("configuration_and_gates", "replacement-admissions-v1.json"),
+                    ("configuration_and_gates", "test-replacements-v2.json"),
                     ("registration_and_entrypoints", "scripts/replacement_admission.py"),
                     ("tests_and_contracts", "test_replacement_admission.py"),
                     ("invariants", "replacement-admission-dormant-projection"),
                     ("invariants", "replacement-successor-catalog-boundary"),
+                    (
+                        "invariants",
+                        "replacement-trusted-defect-receipt-provenance-boundary",
+                    ),
                 ),
             ),
             (

@@ -1,0 +1,100 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "worker:windows-cap-sid-refresh-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/core/src/tools/events.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/core/src/tools/handlers/shell.rs",
+          "codex-rs"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-canonical-mutation-suppression-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-canonical-mutation-suppression-20260904.receipt.json",
+          ".codex"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "worker:poison-pre-result-ordering-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "worker:direct-argv-shell-ownership-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    }
+  ],
+  "assignment_id": "worker:canonical-mutation-suppression-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+  },
+  "contract_claims": [
+    "canonical-runner-mutation-accounting-suppression"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902",
+    "worker:cli-app-server-direct-argv-proof-20260904",
+    "worker:direct-argv-shell-ownership-20260904"
+  ],
+  "expires_at": "2026-09-04T22:10:30.094523+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "f117ddfdd99f56b9103066983a7caff8fa4a0a63af684c38afdd4a6739fe2934",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/src/tools/events.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/src/tools/handlers/shell.rs",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-canonical-mutation-suppression-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-canonical-mutation-suppression-20260904.receipt.json",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T21:10:30.094523+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "2aebd618c35808744a4a2ce8b6d44df6add3c36fa058de8feb01020116afe889"
+  },
+  "validation_commands": [
+    "just core-test-fast cli_completion_proof -E 'test(=real_cli_app_server_accepts_canonical_completion_proof_via_direct_argv)'",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::mutate_and_restore_invalidates_canonical_attempt_through_real_shell_path)'",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::transient_mutation_cannot_race_terminal_release_before_unified_exec_end)'",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::focused_pre_result_workspace_drift_does_not_poison_unchanged_retry)'"
+  ],
+  "validation_owner": "worker:canonical-mutation-suppression-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

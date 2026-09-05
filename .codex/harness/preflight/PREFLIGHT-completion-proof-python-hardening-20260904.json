@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:completion-proof-python-hardening-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    { "path": ".codex/harness/preflight/PREFLIGHT-completion-proof-python-hardening-20260904.json", "recursive": false },
+    { "path": ".codex/harness/preflight/PREFLIGHT-completion-proof-python-hardening-20260904.receipt.json", "recursive": false },
+    { "path": "scripts/completion_proof.py", "recursive": false },
+    { "path": "scripts/test_completion_proof.py", "recursive": false }
+  ],
+  "contract_claims": [
+    "canonical-final-validation-id-closure",
+    "rust-doctest-structured-execution-evidence",
+    "confirmed-failure-late-supervision-exit-binding"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "worker:completion-proof-python-hardening-20260904",
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_canonical_doctest_accepts_fresh_libtest_json_lifecycle scripts.test_completion_proof.CompletionProofCliTest.test_canonical_doctest_rejects_pretty_stdout_pass_spoof scripts.test_completion_proof.CompletionProofCliTest.test_canonical_doctest_rejects_zero_structured_selection scripts.test_completion_proof.CompletionProofCliTest.test_canonical_doctest_rejects_duplicate_structured_lifecycle scripts.test_completion_proof.CompletionProofCliTest.test_canonical_doctest_preserves_failure_before_supervision_error",
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_focused_rust_gate_preserves_failure_before_supervision_error scripts.test_completion_proof.CompletionProofCliTest.test_focused_rust_gate_never_accepts_pass_with_supervision_error",
+    "python -m py_compile scripts/completion_proof.py scripts/test_completion_proof.py",
+    "git diff --check"
+  ],
+  "cargo_lane": {
+    "target_dir": "none",
+    "cargo_home": "none"
+  },
+  "workspace_strategy": "shared"
+}

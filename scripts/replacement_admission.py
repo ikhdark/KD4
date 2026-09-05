@@ -2,8 +2,9 @@
 """Validate and project repository-owned replacement admissions.
 
 This module is intentionally dormant: it does not modify the V2 inventory or
-ledger.  A later activation can consume the deterministic projection only after
-the trusted inventory runner supplies a current successor catalog.
+ledger. Nonempty manifests can be structurally checked, but materialization
+fails closed until trusted in-process authority is supplied by a later
+activation.
 """
 
 from __future__ import annotations
@@ -17,14 +18,61 @@ import tempfile
 import unicodedata
 from typing import Any, NoReturn
 
+if __package__:
+    from scripts.completion_proof_inventory_v2 import (
+        FROZEN_V1_HISTORICAL_REPLACEMENT_BASELINE_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_COMPONENT_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_EDGE_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_GRAPH_SHA256,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_SUCCESSOR_COUNT,
+        InventoryV2ContractError,
+        derive_frozen_v1_historical_replacement_graph_v1,
+        proof_hash,
+        validate_test_replacement_ledger_v2,
+        validate_trusted_defect_receipt_v1,
+        validate_v2_historical_replacement_graph_closure_v1,
+    )
+    from scripts.focused_replacement_approval_receipt import (
+        FORMAT_ID as FOCUSED_REPLACEMENT_APPROVAL_RECEIPT_FORMAT_ID,
+        FOCUSED_VALIDATION_ID as FOCUSED_REPLACEMENT_APPROVAL_VALIDATION_ID,
+        FocusedReplacementApprovalReceiptError,
+        validate_focused_replacement_approval_receipt_v1,
+    )
+else:
+    from completion_proof_inventory_v2 import (  # type: ignore[no-redef]
+        FROZEN_V1_HISTORICAL_REPLACEMENT_BASELINE_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_COMPONENT_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_EDGE_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_GRAPH_SHA256,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_SUCCESSOR_COUNT,
+        InventoryV2ContractError,
+        derive_frozen_v1_historical_replacement_graph_v1,
+        proof_hash,
+        validate_test_replacement_ledger_v2,
+        validate_trusted_defect_receipt_v1,
+        validate_v2_historical_replacement_graph_closure_v1,
+    )
+    from focused_replacement_approval_receipt import (  # type: ignore[no-redef]
+        FORMAT_ID as FOCUSED_REPLACEMENT_APPROVAL_RECEIPT_FORMAT_ID,
+        FOCUSED_VALIDATION_ID as FOCUSED_REPLACEMENT_APPROVAL_VALIDATION_ID,
+        FocusedReplacementApprovalReceiptError,
+        validate_focused_replacement_approval_receipt_v1,
+    )
+
 
 FORMAT_ID = "kd4.replacement-admissions.v1"
 SUCCESSOR_CATALOG_FORMAT_ID = "kd4.replacement-successor-catalog.v1"
 PROJECTION_FORMAT_ID = "kd4.replacement-admission-projection.v1"
+HISTORICAL_REVIEW_PLAN_FORMAT_ID = "kd4.historical-replacement-review-plan.v1"
+HISTORICAL_ACCEPTANCE_PROPOSAL_FORMAT_ID = (
+    "kd4.historical-replacement-acceptance-proposal.v1"
+)
+HISTORICAL_SCOPE_REVIEW_DISPOSITION = "reviewed-no-incorrect-behavior"
 SCHEMA_VERSION = 1
 
 INVENTORY_PATH = ".codex/validation/frozen-test-inventory-v1.json"
 LEDGER_PATH = ".codex/validation/test-replacements-v1.json"
+V2_LEDGER_PATH = ".codex/validation/test-replacements-v2.json"
 STAGE2_PATH = ".codex/validation/stage2-incorrect-behaviors-v1.txt"
 
 FROZEN_INVENTORY_RAW_SHA256 = (
@@ -225,6 +273,23 @@ def _baseline_maps(inventory: dict[str, Any], ledger: dict[str, Any]) -> tuple[d
     return inventory_map, ledger_map
 
 
+def _load_current_v2_rows(repository_root: Path) -> dict[str, dict[str, Any]]:
+    ledger = load_json(repository_root / V2_LEDGER_PATH)
+    try:
+        validate_test_replacement_ledger_v2(ledger)
+    except InventoryV2ContractError as exc:
+        _fail(f"current V2 replacement ledger is invalid: {exc}")
+    rows: dict[str, dict[str, Any]] = {}
+    for row in ledger["rows"]:
+        baseline_id = row["baseline_id"]
+        if baseline_id is None:
+            continue
+        if baseline_id in rows:
+            _fail(f"current V2 replacement ledger has duplicate baseline_id: {baseline_id}")
+        rows[baseline_id] = row
+    return rows
+
+
 IDENTITY_FIELDS = {
     "test_id",
     "framework",
@@ -340,7 +405,7 @@ def _validate_approval(value: Any, index: int) -> dict[str, Any]:
     return approval
 
 
-def _parse_stage2_register(repository_root: Path) -> tuple[str, set[str]]:
+def _parse_stage2_register(repository_root: Path) -> tuple[str, dict[str, str]]:
     path = repository_root / STAGE2_PATH
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -351,16 +416,40 @@ def _parse_stage2_register(repository_root: Path) -> tuple[str, set[str]]:
     entries = lines[1:]
     sentinel = "NO_QUALIFYING_STAGE2_PRODUCT_BEHAVIOR_FIXES_PROVEN_YET"
     if entries == [sentinel]:
-        return file_sha256(path), set()
+        return file_sha256(path), {}
     if sentinel in entries or entries != sorted(set(entries)):
         _fail("Stage2 incorrect-behavior entries must be sorted, unique, and exclude the empty sentinel")
-    ids: set[str] = set()
+    descriptions_by_id: dict[str, str] = {}
     for line in entries:
         parts = line.split("\t", 1)
         if len(parts) != 2 or not parts[0].startswith("stage2-incorrect-behavior-v1.") or not parts[1]:
             _fail("invalid Stage2 incorrect-behavior entry")
-        ids.add(parts[0])
-    return file_sha256(path), ids
+        behavior_id, description = parts
+        if behavior_id in descriptions_by_id:
+            _fail(f"duplicate Stage2 incorrect-behavior ID: {behavior_id}")
+        descriptions_by_id[behavior_id] = description
+    return file_sha256(path), descriptions_by_id
+
+
+def _load_trusted_defect_receipts(path: Path | None) -> dict[str, dict[str, Any]]:
+    if path is None:
+        return {}
+    receipts_by_hash: dict[str, dict[str, Any]] = {}
+    receipt_hash_by_behavior_id: dict[str, str] = {}
+    for index, raw in enumerate(_array(load_json(path), "trusted_defect_receipts")):
+        try:
+            validate_trusted_defect_receipt_v1(raw)
+        except InventoryV2ContractError as exc:
+            _fail(f"trusted_defect_receipts[{index}] is invalid: {exc}")
+        receipt_hash = raw["receipt_sha256"]
+        behavior_id = raw["defect_id"]
+        if receipt_hash in receipts_by_hash:
+            _fail(f"duplicate trusted defect receipt hash: {receipt_hash}")
+        if behavior_id in receipt_hash_by_behavior_id:
+            _fail(f"duplicate trusted defect receipt behavior ID: {behavior_id}")
+        receipts_by_hash[receipt_hash] = raw
+        receipt_hash_by_behavior_id[behavior_id] = receipt_hash
+    return receipts_by_hash
 
 
 def _validate_focused_receipt(value: Any, location: str, admission_id: str, replacement_id: str, seen: set[tuple[str, str, str]]) -> dict[str, Any]:
@@ -421,7 +510,12 @@ def _validate_focused_receipt(value: Any, location: str, admission_id: str, repl
     return receipt
 
 
-def validate_manifest(repository_root: Path, manifest_path: Path, successor_catalog_path: Path | None = None) -> dict[str, Any]:
+def validate_manifest(
+    repository_root: Path,
+    manifest_path: Path,
+    successor_catalog_path: Path | None = None,
+    trusted_defect_receipts_path: Path | None = None,
+) -> dict[str, Any]:
     repository_root = repository_root.resolve()
     manifest = _object(
         load_json(manifest_path),
@@ -432,7 +526,11 @@ def validate_manifest(repository_root: Path, manifest_path: Path, successor_cata
         _fail("replacement admission manifest format or schema version mismatch")
     inventory, ledger = _load_predecessor_authority(repository_root, manifest)
     inventory_map, ledger_map = _baseline_maps(inventory, ledger)
+    current_v2_rows = _load_current_v2_rows(repository_root)
     catalog = _load_successor_catalog(successor_catalog_path)
+    trusted_defect_receipts = _load_trusted_defect_receipts(
+        trusted_defect_receipts_path
+    )
 
     approvals: dict[str, dict[str, Any]] = {}
     approval_scope_owners: dict[str, str] = {}
@@ -454,7 +552,11 @@ def validate_manifest(repository_root: Path, manifest_path: Path, successor_cata
     seen_baselines: set[str] = set()
     seen_successors: set[str] = set()
     seen_focused: set[tuple[str, str, str]] = set()
-    stage2_register_hash, stage2_ids = _parse_stage2_register(repository_root)
+    seen_stage2_behavior_ids: set[str] = set()
+    seen_stage2_receipt_hashes: set[str] = set()
+    stage2_register_hash, stage2_descriptions = _parse_stage2_register(
+        repository_root
+    )
 
     for admission_index, raw in enumerate(admissions):
         location = f"admissions[{admission_index}]"
@@ -486,7 +588,22 @@ def validate_manifest(repository_root: Path, manifest_path: Path, successor_cata
             baseline_ids.append(baseline_id)
             _require_digest(_hash(binding["inventory_entry_sha256"], f"{location}.baseline_bindings[{index}].inventory_entry_sha256"), "kd4.replacement-admission.baseline-inventory-entry.v1", inventory_map[baseline_id], f"{location}.baseline_bindings[{index}].inventory_entry_sha256")
             _require_digest(_hash(binding["ledger_row_sha256"], f"{location}.baseline_bindings[{index}].ledger_row_sha256"), "kd4.replacement-admission.baseline-ledger-row.v1", ledger_map[baseline_id], f"{location}.baseline_bindings[{index}].ledger_row_sha256")
-            _string(binding["obligation_id"], f"{location}.baseline_bindings[{index}].obligation_id")
+            obligation_id = _string(binding["obligation_id"], f"{location}.baseline_bindings[{index}].obligation_id")
+            current_row = current_v2_rows.get(baseline_id)
+            if current_row is None:
+                _fail(f"{location}.baseline_bindings[{index}] baseline {baseline_id} is missing from the current V2 ledger")
+            disposition_kind = current_row["disposition"]["kind"]
+            if disposition_kind != "unresolved":
+                _fail(
+                    f"{location}.baseline_bindings[{index}] baseline {baseline_id} "
+                    f"has current V2 disposition {disposition_kind}; only unresolved "
+                    "baselines are admissible"
+                )
+            if obligation_id != current_row["obligation_id"]:
+                _fail(
+                    f"{location}.baseline_bindings[{index}].obligation_id does not "
+                    f"match current V2 ledger row for {baseline_id}"
+                )
             baselines.append(binding)
         if baseline_ids != sorted(set(baseline_ids)):
             _fail(f"{location}.baseline_bindings must be sorted by unique baseline_id")
@@ -583,8 +700,59 @@ def validate_manifest(repository_root: Path, manifest_path: Path, successor_cata
             if behavior_ids or defect_hashes:
                 _fail(f"{location}.acceptance no-defect disposition must have empty evidence")
         elif stage2["disposition"] == "incorrect-behavior-fixed":
-            if not behavior_ids or not defect_hashes or not set(behavior_ids) <= stage2_ids:
+            if not behavior_ids or not defect_hashes:
                 _fail(f"{location}.acceptance defect disposition lacks registered evidence")
+            receipts: list[dict[str, Any]] = []
+            for digest in defect_hashes:
+                receipt = trusted_defect_receipts.get(digest)
+                if receipt is None:
+                    _fail(
+                        f"{location}.acceptance trusted defect receipt {digest} "
+                        "is missing from --trusted-defect-receipts"
+                    )
+                if digest in seen_stage2_receipt_hashes:
+                    _fail(f"trusted defect receipt appears in multiple admissions: {digest}")
+                receipts.append(receipt)
+            receipt_behavior_ids = sorted(receipt["defect_id"] for receipt in receipts)
+            if behavior_ids != receipt_behavior_ids:
+                _fail(
+                    f"{location}.acceptance behavior IDs do not exactly match "
+                    "the bound trusted defect receipts"
+                )
+            expected_baseline_ids = sorted(baseline_ids)
+            expected_obligation_ids = sorted(
+                binding["obligation_id"] for binding in baselines
+            )
+            for receipt in receipts:
+                behavior_id = receipt["defect_id"]
+                if behavior_id in seen_stage2_behavior_ids:
+                    _fail(
+                        f"Stage2 incorrect-behavior ID appears in multiple admissions: "
+                        f"{behavior_id}"
+                    )
+                description = stage2_descriptions.get(behavior_id)
+                if description is None:
+                    _fail(
+                        f"{location}.acceptance behavior ID is not registered: "
+                        f"{behavior_id}"
+                    )
+                if description != receipt["incorrect_behavior"]:
+                    _fail(
+                        f"Stage2 incorrect-behavior description does not exactly "
+                        f"match trusted receipt {behavior_id}"
+                    )
+                if receipt["baseline_ids"] != expected_baseline_ids:
+                    _fail(
+                        f"trusted defect receipt {behavior_id} does not exactly bind "
+                        f"the admission baseline IDs"
+                    )
+                if receipt["baseline_obligation_ids"] != expected_obligation_ids:
+                    _fail(
+                        f"trusted defect receipt {behavior_id} does not exactly bind "
+                        f"the admission obligation IDs"
+                    )
+                seen_stage2_behavior_ids.add(behavior_id)
+                seen_stage2_receipt_hashes.add(receipt["receipt_sha256"])
         else:
             _fail(f"{location}.acceptance Stage2 disposition is invalid")
         accepted_payload = {"admission_id": admission_id, "candidate_receipt_sha256": admission["candidate_receipt_sha256"], "focused_validation_receipts": focused, "stage2": stage2}
@@ -596,6 +764,21 @@ def validate_manifest(repository_root: Path, manifest_path: Path, successor_cata
         _fail(f"approval scope does not close over admissions (missing={sorted(missing)}, extra={sorted(extra)})")
     if set(approvals) != set(approval_scope_owners.values()):
         _fail("unused approval receipt is forbidden")
+    if set(stage2_descriptions) != seen_stage2_behavior_ids:
+        missing = sorted(set(stage2_descriptions) - seen_stage2_behavior_ids)
+        extra = sorted(seen_stage2_behavior_ids - set(stage2_descriptions))
+        _fail(
+            "Stage2 incorrect-behavior register does not close over accepted "
+            f"unresolved-baseline admissions (missing={missing}, extra={extra})"
+        )
+    trusted_receipt_hashes = set(trusted_defect_receipts)
+    if trusted_receipt_hashes != seen_stage2_receipt_hashes:
+        missing = sorted(seen_stage2_receipt_hashes - trusted_receipt_hashes)
+        extra = sorted(trusted_receipt_hashes - seen_stage2_receipt_hashes)
+        _fail(
+            "trusted defect receipt collection does not close over accepted "
+            f"Stage2 incorrect behaviors (missing={missing}, extra={extra})"
+        )
 
     semantic_payload = {key: manifest[key] for key in manifest if key not in {"semantic_sha256", "self_hash"}}
     semantic_hash = _hash(manifest["semantic_sha256"], "semantic_sha256")
@@ -606,6 +789,12 @@ def validate_manifest(repository_root: Path, manifest_path: Path, successor_cata
 
 
 def materialize_projection(manifest: dict[str, Any]) -> dict[str, Any]:
+    if manifest["admissions"]:
+        _fail(
+            "nonempty replacement admission materialization requires trusted "
+            "in-process authority derived from the current user or a "
+            "session-admitted repository instruction"
+        )
     mappings: list[dict[str, Any]] = []
     for admission in manifest["admissions"]:
         by_baseline: dict[str, list[dict[str, str]]] = {
@@ -647,6 +836,472 @@ def materialize_projection(manifest: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _historical_replacement_review_plan_v1(graph: dict[str, Any]) -> dict[str, Any]:
+    actual_counts = (
+        len(graph["baseline_ids"]),
+        len(graph["edges"]),
+        len(graph["successor_ids"]),
+        len(graph["components"]),
+    )
+    expected_counts = (
+        FROZEN_V1_HISTORICAL_REPLACEMENT_BASELINE_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_EDGE_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_SUCCESSOR_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_COMPONENT_COUNT,
+    )
+    if actual_counts != expected_counts:
+        _fail(
+            "historical replacement graph counts do not match the exact "
+            "frozen V1 authority"
+        )
+    review_scopes = []
+    for component in graph["components"]:
+        review_scope_sha256 = proof_hash(
+            "kd4.historical-replacement-review-scope.v1", component
+        )
+        review_scopes.append(
+            {
+                **component,
+                "review_scope_id": f"historical-replacement-review-v1.{review_scope_sha256}",
+                "review_scope_sha256": review_scope_sha256,
+            }
+        )
+    payload = {
+        "format_id": HISTORICAL_REVIEW_PLAN_FORMAT_ID,
+        "schema_version": SCHEMA_VERSION,
+        "frozen_graph_sha256": FROZEN_V1_HISTORICAL_REPLACEMENT_GRAPH_SHA256,
+        "baseline_count": FROZEN_V1_HISTORICAL_REPLACEMENT_BASELINE_COUNT,
+        "edge_count": FROZEN_V1_HISTORICAL_REPLACEMENT_EDGE_COUNT,
+        "successor_count": FROZEN_V1_HISTORICAL_REPLACEMENT_SUCCESSOR_COUNT,
+        "review_scope_count": FROZEN_V1_HISTORICAL_REPLACEMENT_COMPONENT_COUNT,
+        "review_scopes": review_scopes,
+    }
+    payload["review_plan_sha256"] = proof_hash(
+        "kd4.historical-replacement-review-plan.v1", payload
+    )
+    return payload
+
+
+def validate_historical_replacement_review_plan_intrinsic_v1(
+    plan: Any,
+) -> dict[str, Any]:
+    plan = _object(
+        plan,
+        "historical_review_plan",
+        {
+            "format_id",
+            "schema_version",
+            "frozen_graph_sha256",
+            "baseline_count",
+            "edge_count",
+            "successor_count",
+            "review_scope_count",
+            "review_scopes",
+            "review_plan_sha256",
+        },
+    )
+    if plan["format_id"] != HISTORICAL_REVIEW_PLAN_FORMAT_ID:
+        _fail("historical review plan format or schema version mismatch")
+    if (
+        not isinstance(plan["schema_version"], int)
+        or isinstance(plan["schema_version"], bool)
+        or plan["schema_version"] != SCHEMA_VERSION
+    ):
+        _fail("historical review plan format or schema version mismatch")
+    if (
+        _hash(plan["frozen_graph_sha256"], "historical_review_plan.frozen_graph_sha256")
+        != FROZEN_V1_HISTORICAL_REPLACEMENT_GRAPH_SHA256
+    ):
+        _fail("historical review plan frozen graph hash mismatch")
+
+    components: list[dict[str, Any]] = []
+    all_baseline_ids: list[str] = []
+    all_edges: list[dict[str, str]] = []
+    all_successor_ids: list[str] = []
+    scopes = _array(
+        plan["review_scopes"], "historical_review_plan.review_scopes", nonempty=True
+    )
+    for index, raw in enumerate(scopes):
+        location = f"historical_review_plan.review_scopes[{index}]"
+        scope = _object(
+            raw,
+            location,
+            {
+                "baseline_ids",
+                "edges",
+                "successor_ids",
+                "review_scope_id",
+                "review_scope_sha256",
+            },
+        )
+        baseline_ids = _sorted_unique_strings(
+            scope["baseline_ids"], f"{location}.baseline_ids", nonempty=True
+        )
+        successor_ids = _sorted_unique_strings(
+            scope["successor_ids"], f"{location}.successor_ids", nonempty=True
+        )
+        edges: list[dict[str, str]] = []
+        edge_pairs: list[tuple[str, str]] = []
+        for edge_index, raw_edge in enumerate(
+            _array(scope["edges"], f"{location}.edges", nonempty=True)
+        ):
+            edge_location = f"{location}.edges[{edge_index}]"
+            edge = _object(
+                raw_edge, edge_location, {"baseline_id", "replacement_id"}
+            )
+            baseline_id = _string(
+                edge["baseline_id"], f"{edge_location}.baseline_id"
+            )
+            replacement_id = _string(
+                edge["replacement_id"], f"{edge_location}.replacement_id"
+            )
+            if baseline_id not in baseline_ids or replacement_id not in successor_ids:
+                _fail(f"{edge_location} references an unbound scope endpoint")
+            edge_pairs.append((baseline_id, replacement_id))
+            edges.append(
+                {
+                    "baseline_id": baseline_id,
+                    "replacement_id": replacement_id,
+                }
+            )
+        if edge_pairs != sorted(set(edge_pairs)):
+            _fail(f"{location}.edges must be sorted and unique")
+        if (
+            {edge["baseline_id"] for edge in edges} != set(baseline_ids)
+            or {edge["replacement_id"] for edge in edges} != set(successor_ids)
+        ):
+            _fail(f"{location}.edges do not connect every scope endpoint")
+        component = {
+            "baseline_ids": baseline_ids,
+            "edges": edges,
+            "successor_ids": successor_ids,
+        }
+        scope_hash = proof_hash(
+            "kd4.historical-replacement-review-scope.v1", component
+        )
+        declared_scope_hash = _hash(
+            scope["review_scope_sha256"], f"{location}.review_scope_sha256"
+        )
+        declared_scope_id = _string(
+            scope["review_scope_id"], f"{location}.review_scope_id"
+        )
+        if declared_scope_hash != scope_hash:
+            _fail(f"{location}.review_scope_sha256 mismatch")
+        if declared_scope_id != f"historical-replacement-review-v1.{scope_hash}":
+            _fail(f"{location}.review_scope_id mismatch")
+        components.append(component)
+        all_baseline_ids.extend(baseline_ids)
+        all_edges.extend(edges)
+        all_successor_ids.extend(successor_ids)
+
+    if [component["baseline_ids"] for component in components] != sorted(
+        component["baseline_ids"] for component in components
+    ):
+        _fail("historical review plan scopes must be sorted by baseline IDs")
+    if (
+        len(all_baseline_ids) != len(set(all_baseline_ids))
+        or len(all_successor_ids) != len(set(all_successor_ids))
+    ):
+        _fail("historical review plan scopes must be endpoint-disjoint")
+    baseline_ids = sorted(all_baseline_ids)
+    successor_ids = sorted(all_successor_ids)
+    edges = sorted(
+        all_edges, key=lambda edge: (edge["baseline_id"], edge["replacement_id"])
+    )
+    if len(edges) != len(
+        {(edge["baseline_id"], edge["replacement_id"]) for edge in edges}
+    ):
+        _fail("historical review plan scopes must contain globally unique edges")
+
+    actual_counts = (
+        len(all_baseline_ids),
+        len(edges),
+        len(all_successor_ids),
+        len(components),
+    )
+    expected_counts = (
+        FROZEN_V1_HISTORICAL_REPLACEMENT_BASELINE_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_EDGE_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_SUCCESSOR_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_COMPONENT_COUNT,
+    )
+    declared_counts = (
+        plan["baseline_count"],
+        plan["edge_count"],
+        plan["successor_count"],
+        plan["review_scope_count"],
+    )
+    if actual_counts != expected_counts or declared_counts != expected_counts:
+        _fail("historical review plan counts do not close over its exact scopes")
+    graph_projection = {
+        "baseline_ids": baseline_ids,
+        "components": components,
+        "edges": edges,
+        "successor_ids": successor_ids,
+    }
+    if (
+        proof_hash(
+            "kd4.frozen-v1-historical-replacement-graph.v1", graph_projection
+        )
+        != FROZEN_V1_HISTORICAL_REPLACEMENT_GRAPH_SHA256
+    ):
+        _fail("historical review plan scopes do not match the exact frozen V1 graph")
+    plan_projection = {
+        key: plan[key] for key in plan if key != "review_plan_sha256"
+    }
+    declared_plan_hash = _hash(
+        plan["review_plan_sha256"], "historical_review_plan.review_plan_sha256"
+    )
+    if declared_plan_hash != proof_hash(
+        "kd4.historical-replacement-review-plan.v1", plan_projection
+    ):
+        _fail("historical review plan self-hash mismatch")
+    return plan
+
+
+def validate_historical_replacement_review_plan_v1(
+    plan: Any,
+    predecessor_ledger: Any,
+    current_v2_ledger: Any,
+) -> dict[str, Any]:
+    validate_historical_replacement_review_plan_intrinsic_v1(plan)
+    try:
+        validate_test_replacement_ledger_v2(current_v2_ledger)
+        validate_v2_historical_replacement_graph_closure_v1(
+            current_v2_ledger, predecessor_ledger
+        )
+        graph = derive_frozen_v1_historical_replacement_graph_v1(
+            predecessor_ledger
+        )
+    except InventoryV2ContractError as exc:
+        _fail(f"historical replacement authority is invalid: {exc}")
+    expected = _historical_replacement_review_plan_v1(graph)
+    if plan != expected:
+        _fail(
+            "historical replacement review plan does not exactly close over "
+            "the frozen V1 connected components"
+        )
+    return expected
+
+
+def compile_historical_replacement_review_plan(
+    repository_root: Path,
+) -> dict[str, Any]:
+    predecessor_path = repository_root / LEDGER_PATH
+    if file_sha256(predecessor_path) != FROZEN_LEDGER_RAW_SHA256:
+        _fail("frozen V1 ledger raw hash mismatch")
+    predecessor_ledger = load_json(predecessor_path)
+    current_v2_ledger = load_json(repository_root / V2_LEDGER_PATH)
+    try:
+        graph = derive_frozen_v1_historical_replacement_graph_v1(
+            predecessor_ledger
+        )
+    except InventoryV2ContractError as exc:
+        _fail(f"historical replacement authority is invalid: {exc}")
+    plan = _historical_replacement_review_plan_v1(graph)
+    return validate_historical_replacement_review_plan_v1(
+        plan, predecessor_ledger, current_v2_ledger
+    )
+
+
+def _focused_replacement_approval_receipt_ref_v1(
+    receipt: Any,
+) -> dict[str, Any]:
+    try:
+        validate_focused_replacement_approval_receipt_v1(receipt)
+    except FocusedReplacementApprovalReceiptError as exc:
+        _fail(f"focused replacement approval receipt is invalid: {exc}")
+    return {
+        "format_id": FOCUSED_REPLACEMENT_APPROVAL_RECEIPT_FORMAT_ID,
+        "schema_version": SCHEMA_VERSION,
+        "attempt_id": receipt["attempt_id"],
+        "focused_validation_id": FOCUSED_REPLACEMENT_APPROVAL_VALIDATION_ID,
+        "receipt_sha256": receipt["receipt_sha256"],
+    }
+
+
+def _validate_historical_scope_reviews_v1(
+    review_plan: dict[str, Any], scope_reviews: Any
+) -> list[dict[str, str]]:
+    expected_by_id = {
+        scope["review_scope_id"]: {
+            "review_scope_id": scope["review_scope_id"],
+            "review_scope_sha256": scope["review_scope_sha256"],
+            "disposition": HISTORICAL_SCOPE_REVIEW_DISPOSITION,
+        }
+        for scope in review_plan["review_scopes"]
+    }
+    reviews: list[dict[str, str]] = []
+    for index, raw in enumerate(
+        _array(scope_reviews, "scope_reviews", nonempty=True)
+    ):
+        location = f"scope_reviews[{index}]"
+        review = _object(
+            raw,
+            location,
+            {"review_scope_id", "review_scope_sha256", "disposition"},
+        )
+        scope_id = _string(review["review_scope_id"], f"{location}.review_scope_id")
+        scope_hash = _hash(
+            review["review_scope_sha256"], f"{location}.review_scope_sha256"
+        )
+        if scope_id != f"historical-replacement-review-v1.{scope_hash}":
+            _fail(f"{location} ID does not match its scope hash")
+        if review["disposition"] != HISTORICAL_SCOPE_REVIEW_DISPOSITION:
+            _fail(
+                f"{location}.disposition must be "
+                f"{HISTORICAL_SCOPE_REVIEW_DISPOSITION} during Stage 1"
+            )
+        reviews.append(
+            {
+                "review_scope_id": scope_id,
+                "review_scope_sha256": scope_hash,
+                "disposition": HISTORICAL_SCOPE_REVIEW_DISPOSITION,
+            }
+        )
+    review_ids = [review["review_scope_id"] for review in reviews]
+    if review_ids != sorted(set(review_ids)):
+        _fail("scope_reviews must be sorted by unique review_scope_id")
+    actual_by_id = {review["review_scope_id"]: review for review in reviews}
+    if actual_by_id != expected_by_id:
+        missing = sorted(set(expected_by_id) - set(actual_by_id))
+        extra = sorted(set(actual_by_id) - set(expected_by_id))
+        rewired = sorted(
+            scope_id
+            for scope_id in set(expected_by_id) & set(actual_by_id)
+            if expected_by_id[scope_id] != actual_by_id[scope_id]
+        )
+        _fail(
+            "scope_reviews do not exactly close over the historical review plan "
+            f"(missing={missing}, extra={extra}, rewired={rewired})"
+        )
+    return reviews
+
+
+def build_historical_replacement_acceptance_proposal_v1(
+    review_plan: dict[str, Any],
+    focused_replacement_approval_receipt: Any,
+    scope_reviews: Any,
+) -> dict[str, Any]:
+    review_plan = validate_historical_replacement_review_plan_intrinsic_v1(
+        review_plan
+    )
+    expected_counts = (
+        FROZEN_V1_HISTORICAL_REPLACEMENT_BASELINE_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_EDGE_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_SUCCESSOR_COUNT,
+        FROZEN_V1_HISTORICAL_REPLACEMENT_COMPONENT_COUNT,
+    )
+    actual_counts = (
+        review_plan.get("baseline_count"),
+        review_plan.get("edge_count"),
+        review_plan.get("successor_count"),
+        review_plan.get("review_scope_count"),
+    )
+    if actual_counts != expected_counts:
+        _fail("historical acceptance proposal review-plan counts are not exact")
+    review_plan_hash = _hash(
+        review_plan.get("review_plan_sha256"), "review_plan.review_plan_sha256"
+    )
+    receipt_ref = _focused_replacement_approval_receipt_ref_v1(
+        focused_replacement_approval_receipt
+    )
+    reviews = _validate_historical_scope_reviews_v1(review_plan, scope_reviews)
+    payload = {
+        "format_id": HISTORICAL_ACCEPTANCE_PROPOSAL_FORMAT_ID,
+        "schema_version": SCHEMA_VERSION,
+        "frozen_graph_sha256": FROZEN_V1_HISTORICAL_REPLACEMENT_GRAPH_SHA256,
+        "review_plan_sha256": review_plan_hash,
+        "baseline_count": expected_counts[0],
+        "edge_count": expected_counts[1],
+        "successor_count": expected_counts[2],
+        "review_scope_count": expected_counts[3],
+        "focused_replacement_approval_receipt_ref": receipt_ref,
+        "scope_reviews": reviews,
+        "scope_review_set_sha256": proof_hash(
+            "kd4.historical-replacement-scope-review-set.v1", reviews
+        ),
+        # A caller-authored proposal and a receipt self-hash are never activation
+        # authority. Core must supply and persist that authority in-process later.
+        "activation_authority": None,
+    }
+    payload["proposal_sha256"] = proof_hash(
+        HISTORICAL_ACCEPTANCE_PROPOSAL_FORMAT_ID, payload
+    )
+    return payload
+
+
+def validate_historical_replacement_acceptance_proposal_v1(
+    proposal: Any,
+    repository_root: Path,
+    focused_replacement_approval_receipt: Any,
+) -> dict[str, Any]:
+    proposal = _object(
+        proposal,
+        "historical_acceptance_proposal",
+        {
+            "format_id",
+            "schema_version",
+            "frozen_graph_sha256",
+            "review_plan_sha256",
+            "baseline_count",
+            "edge_count",
+            "successor_count",
+            "review_scope_count",
+            "focused_replacement_approval_receipt_ref",
+            "scope_reviews",
+            "scope_review_set_sha256",
+            "activation_authority",
+            "proposal_sha256",
+        },
+    )
+    exact_plan = compile_historical_replacement_review_plan(repository_root)
+    expected = build_historical_replacement_acceptance_proposal_v1(
+        exact_plan,
+        focused_replacement_approval_receipt,
+        proposal["scope_reviews"],
+    )
+    if proposal != expected:
+        _fail(
+            "historical acceptance proposal does not exactly bind its review "
+            "plan, focused approval receipt, and scope-review set"
+        )
+    return expected
+
+
+def compile_historical_replacement_acceptance_proposal(
+    repository_root: Path,
+    review_plan_path: Path,
+    focused_replacement_approval_receipt_path: Path,
+    scope_reviews_path: Path,
+) -> dict[str, Any]:
+    exact_plan = compile_historical_replacement_review_plan(repository_root)
+    supplied_plan = load_json(review_plan_path)
+    if supplied_plan != exact_plan:
+        _fail(
+            "historical acceptance review plan or review-plan hash does not "
+            "match the exact current historical review plan"
+        )
+    focused_receipt = load_json(focused_replacement_approval_receipt_path)
+    scope_reviews = load_json(scope_reviews_path)
+    proposal = build_historical_replacement_acceptance_proposal_v1(
+        exact_plan, focused_receipt, scope_reviews
+    )
+    return validate_historical_replacement_acceptance_proposal_v1(
+        proposal, repository_root, focused_receipt
+    )
+
+
+def materialize_historical_replacement_acceptance_proposal(
+    proposal: dict[str, Any],
+) -> NoReturn:
+    del proposal
+    _fail(
+        "historical replacement acceptance materialization requires a trusted "
+        "in-process Core capability"
+    )
+
+
 def _write_atomic(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
@@ -672,15 +1327,67 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--repository-root", type=Path, required=True)
         child.add_argument("--manifest", type=Path, required=True)
         child.add_argument("--successor-inventory", type=Path)
+        child.add_argument("--trusted-defect-receipts", type=Path)
         if name == "materialize":
             child.add_argument("--output", type=Path, required=True)
+    review = subparsers.add_parser("review-historical")
+    review.add_argument("--repository-root", type=Path, required=True)
+    review.add_argument("--output", type=Path, required=True)
+    for name in (
+        "check-historical-acceptance",
+        "materialize-historical-acceptance",
+    ):
+        historical = subparsers.add_parser(name)
+        historical.add_argument("--repository-root", type=Path, required=True)
+        historical.add_argument("--review-plan", type=Path, required=True)
+        historical.add_argument(
+            "--focused-approval-receipt", type=Path, required=True
+        )
+        historical.add_argument("--scope-reviews", type=Path, required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        manifest = validate_manifest(args.repository_root, args.manifest, args.successor_inventory)
+        if args.command == "review-historical":
+            plan = compile_historical_replacement_review_plan(
+                args.repository_root
+            )
+            _write_atomic(args.output, plan)
+            print(
+                "replacement-admissions: ok historical-review-scopes="
+                f"{plan['review_scope_count']}"
+            )
+            return 0
+        if args.command in {
+            "check-historical-acceptance",
+            "materialize-historical-acceptance",
+        }:
+            proposal = compile_historical_replacement_acceptance_proposal(
+                args.repository_root,
+                args.review_plan,
+                args.focused_approval_receipt,
+                args.scope_reviews,
+            )
+            if args.command == "materialize-historical-acceptance":
+                materialize_historical_replacement_acceptance_proposal(proposal)
+            print(
+                "replacement-admissions: ok historical-acceptance-proposal "
+                f"baselines={proposal['baseline_count']} "
+                f"edges={proposal['edge_count']} "
+                f"successors={proposal['successor_count']} "
+                f"scopes={proposal['review_scope_count']} "
+                f"proposal={proposal['proposal_sha256']} "
+                "authority=structural-only"
+            )
+            return 0
+        manifest = validate_manifest(
+            args.repository_root,
+            args.manifest,
+            args.successor_inventory,
+            args.trusted_defect_receipts,
+        )
         if args.command == "materialize":
             _write_atomic(args.output, materialize_projection(manifest))
         print(f"replacement-admissions: ok admissions={len(manifest['admissions'])}")

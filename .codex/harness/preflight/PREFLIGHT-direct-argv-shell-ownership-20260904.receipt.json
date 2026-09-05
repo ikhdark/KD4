@@ -1,0 +1,87 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/core/src/unified_exec/process_manager.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/core/src/tools/runtimes/unified_exec.rs",
+          "codex-rs"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-direct-argv-shell-ownership-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-direct-argv-shell-ownership-20260904.receipt.json",
+          ".codex"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "worker:contributor-resume-authority-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    }
+  ],
+  "assignment_id": "worker:direct-argv-shell-ownership-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+  },
+  "contract_claims": [
+    "unified-exec-direct-argv-shell-ownership"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902",
+    "worker:cli-app-server-direct-argv-proof-20260904"
+  ],
+  "expires_at": "2026-09-04T22:36:25.437531+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "9543ccc32e416d7281a0b470371b995dd9b259b5e196873215e3c80ff2a4dc8e",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/src/unified_exec/process_manager.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/src/tools/runtimes/unified_exec.rs",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-direct-argv-shell-ownership-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-direct-argv-shell-ownership-20260904.receipt.json",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T21:36:25.437531+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "879008fed3004dacabc7781bec1d36de009b3af7a0cd8392bf3e629b67e01f37"
+  },
+  "validation_commands": [
+    "just core-test-fast cli_completion_proof -E 'test(=real_cli_app_server_accepts_canonical_completion_proof_via_direct_argv)'",
+    "just core-test-fast core_lib -E 'test(=tools::runtimes::unified_exec::tests::sandbox_shell_type_tracks_owned_shell_wrapper)'"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

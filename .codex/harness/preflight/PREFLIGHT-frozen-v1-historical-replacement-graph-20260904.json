@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:frozen-v1-historical-replacement-graph-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    { "path": ".codex/harness/preflight/PREFLIGHT-frozen-v1-historical-replacement-graph-20260904.json", "recursive": false },
+    { "path": ".codex/harness/preflight/PREFLIGHT-frozen-v1-historical-replacement-graph-20260904.receipt.json", "recursive": false },
+    { "path": "scripts/completion_proof_inventory_v2.py", "recursive": false },
+    { "path": "scripts/materialize_completion_proof_inventory_v2.py", "recursive": false },
+    { "path": "scripts/test_completion_proof_inventory_v2.py", "recursive": false },
+    { "path": "scripts/test_materialize_completion_proof_inventory_v2.py", "recursive": false },
+    { "path": "codex-rs/validation-contracts/src/inventory_v2.rs", "recursive": false },
+    { "path": "codex-rs/validation-contracts/tests/cross_language_vectors.rs", "recursive": false }
+  ],
+  "contract_claims": [
+    "frozen-v1-historical-replacement-graph-closure",
+    "cross-language-predecessor-replacement-binding"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "worker:frozen-v1-historical-replacement-graph-20260904",
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof_inventory_v2.InventoryV2SharedContractTests.test_non_unittest_legacy_replacement_edge_is_bound_to_frozen_v1",
+    "python -m unittest scripts.test_materialize_completion_proof_inventory_v2.InventoryV2MaterializationTests.test_real_cli_materializes_exact_full_repository_bundle",
+    "cargo test --manifest-path codex-rs/Cargo.toml -p codex-validation-contracts --test cross_language_vectors full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity -- --exact",
+    "git diff --check"
+  ],
+  "cargo_lane": {
+    "target_dir": "shared-root-queue",
+    "cargo_home": "shared-read-mostly"
+  },
+  "workspace_strategy": "shared"
+}

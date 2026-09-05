@@ -1300,8 +1300,11 @@ async fn run_exec_like_with_exit_code_inner(
     let canonical_output = canonical_exec_output_bytes(&out);
     let output_bearing_result = shell_result_has_execution_output(&out);
     let tool_outcome = shell_tool_outcome(&out);
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
+    let mut event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
         .with_call_source(&tool_call_source);
+    if completion_proof_attempt.is_some() {
+        event_ctx = event_ctx.without_post_proof_mutation_observation();
+    }
     let finish_result = emitter
         .finish(event_ctx, out, /*applied_patch_delta*/ None)
         .await;
@@ -1394,18 +1397,15 @@ async fn run_exec_like_with_exit_code_inner(
         ),
         None => None,
     };
-    let completion_proof_accepted =
-        completion_proof_outcome.as_ref().is_none_or(|outcome| {
-            matches!(
-                outcome,
-                crate::completion_proof::CompletionProofAttemptOutcome::ConfirmedPass
-            )
-        }) && focused_validation_outcome.as_ref().is_none_or(|outcome| {
-            matches!(
-                outcome,
-                crate::completion_proof::FocusedValidationOutcome::ConfirmedPass { .. }
-            )
-        }) && documentation_validation_outcome
+    let completion_proof_accepted = completion_proof_outcome.as_ref().is_none_or(|outcome| {
+        matches!(
+            outcome,
+            crate::completion_proof::CompletionProofAttemptOutcome::ConfirmedPass
+        )
+    }) && focused_validation_outcome
+        .as_ref()
+        .is_none_or(|outcome| outcome.accepted())
+        && documentation_validation_outcome
             .as_ref()
             .is_none_or(|outcome| {
                 matches!(

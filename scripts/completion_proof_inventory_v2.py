@@ -12,16 +12,45 @@ import binascii
 import hashlib
 import hmac
 import json
+import math
 import re
 import sys
+import struct
 import unicodedata
 import uuid
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 
 class InventoryV2ContractError(ValueError):
     """Raised when a value is outside the closed Inventory V2 contract."""
+
+
+_CANONICAL_MODULE_NAME = "_kd4_completion_proof_inventory_v2_canonical"
+_CANONICAL_MODULE_PATH = Path(__file__).resolve().with_name(
+    "completion_proof_canonical.py"
+)
+_canonical_module = ModuleType(_CANONICAL_MODULE_NAME)
+_canonical_module.__file__ = str(_CANONICAL_MODULE_PATH)
+_canonical_module.__package__ = ""
+_previous_canonical_module = sys.modules.get(_CANONICAL_MODULE_NAME)
+sys.modules[_CANONICAL_MODULE_NAME] = _canonical_module
+try:
+    _canonical_source = _CANONICAL_MODULE_PATH.read_bytes()
+    _canonical_code = compile(
+        _canonical_source,
+        str(_CANONICAL_MODULE_PATH),
+        "exec",
+        dont_inherit=True,
+    )
+    exec(_canonical_code, _canonical_module.__dict__)
+finally:
+    if sys.modules.get(_CANONICAL_MODULE_NAME) is _canonical_module:
+        if _previous_canonical_module is None:
+            sys.modules.pop(_CANONICAL_MODULE_NAME, None)
+        else:
+            sys.modules[_CANONICAL_MODULE_NAME] = _previous_canonical_module
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -41,6 +70,13 @@ FROZEN_V1_LEDGER_RAW_SHA256 = "210acb8428be83b9c6acd021bde4e44905e738d557ca89db6
 FROZEN_V1_BASELINE_IDS_SHA256 = "9100d0fe0dd4c270a1216b6d3ec6f6c39b7f93278cf68235f500edae17d25eb1"
 FROZEN_V1_BASELINE_ASSOCIATIONS_SHA256 = "fe4ee73177d7192ad505e30d20dd851243d981ccf2ab42de49d7d83899624908"
 FROZEN_V1_WORKSPACE_FINGERPRINT = "7d5c019e4af3720e1188704b05a098e95fdb200b901cbccf5cf13363643f34ca"
+FROZEN_V1_HISTORICAL_REPLACEMENT_BASELINE_COUNT = 644
+FROZEN_V1_HISTORICAL_REPLACEMENT_EDGE_COUNT = 685
+FROZEN_V1_HISTORICAL_REPLACEMENT_SUCCESSOR_COUNT = 572
+FROZEN_V1_HISTORICAL_REPLACEMENT_COMPONENT_COUNT = 531
+FROZEN_V1_HISTORICAL_REPLACEMENT_GRAPH_SHA256 = (
+    "137ab36ace74657f218d2cc66918ac8261decae44376073299a570cbbc0b0882"
+)
 INVENTORY_V2_SCHEMA_PATHS = (
     ".codex/validation/frozen-test-inventory-v2-recoveries.schema.json",
     ".codex/validation/frozen-test-inventory-v2.schema.json",
@@ -56,7 +92,7 @@ INVENTORY_V2_SCHEMA_IDS = (
     "kd4://validation/test-replacements-v2.schema.json",
 )
 INVENTORY_V2_SCHEMA_RAW_SHA256S = (
-    "8412a18a13ae6f93b8efd18552e0be1422e957ebde5bde24512e8ce87d8bc09f",
+    "a3ef6ec3486368c3e3c1bc468ba2a16255d75dbe250aa4681cbef696d923a6f4",
     "06d7134aa77d6fa63fea9e7a0094fa76f4c2cca74c6ddad4a55078a09909732a",
     "1753d9bbca80f85ace51f9622e4cf228e91e0dfae94f82691a9a4935b2482c19",
     "b83d9fd5a535d358d3da6a9b06652dfc9390877813b5b5f85e01fd56b90e9c78",
@@ -107,6 +143,9 @@ UNITTEST_RECAPTURE_PARENT_RECORDS_SHA256 = (
 # or from a self-asserted site manifest.  This authority is populated only from
 # independently recovered freeze provenance.
 UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256: str | None = None
+# Amendment 1 authenticates only the exception, never the missing source bodies.
+UNITTEST_SOURCE_EXCEPTIONS_SHA256 = "63fd50f8f5838408cf19b9b18abdc5353cc52412dbf36a275eb77f31c8a452f9"
+UNITTEST_APPROVED_SOURCE_SITE_MANIFEST_SHA256 = "ea2d3175afe632a4347d182d2dd045d28b11d58afda62d1848d0729356aba2c2"
 UNITTEST_V1_HIDDEN_PARENT_IDS_SHA256 = (
     "936330f9e9a23c8d628f651a1ed31b3f4ea836a06cf152a6acf09cff898ebc40"
 )
@@ -157,58 +196,13 @@ def require_strict_repository_path(value: str) -> str:
     return value
 
 
-def _validate_jcs_value(value: Any) -> None:
-    if value is None or isinstance(value, bool):
-        return
-    if isinstance(value, int):
-        if not (-(2**53) + 1 <= value <= 2**53 - 1):
-            raise InventoryV2ContractError("integer is outside the exact I-JSON range")
-        return
-    if isinstance(value, float):
-        raise InventoryV2ContractError("canonical JSON does not permit floats")
-    if isinstance(value, str):
-        require_nfc(value)
-        return
-    if isinstance(value, list):
-        for item in value:
-            _validate_jcs_value(item)
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise InventoryV2ContractError("JSON object key is not a string")
-            require_nfc(key)
-            _validate_jcs_value(item)
-        return
-    raise InventoryV2ContractError(f"unsupported canonical JSON value: {type(value)!r}")
-
-
 def canonical_jcs(value: Any) -> bytes:
     """Encode the shared no-float RFC 8785/JCS subset."""
 
-    _validate_jcs_value(value)
-    return _encode_jcs(value).encode("utf-8")
-
-
-def _encode_jcs(value: Any) -> str:
-    if value is None:
-        return "null"
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    if isinstance(value, list):
-        return "[" + ",".join(_encode_jcs(item) for item in value) + "]"
-    if isinstance(value, dict):
-        keys = sorted(value, key=lambda key: key.encode("utf-16-be"))
-        return "{" + ",".join(
-            f"{_encode_jcs(key)}:{_encode_jcs(value[key])}" for key in keys
-        ) + "}"
-    raise AssertionError("value was validated before encoding")
+    try:
+        return _canonical_module.canonical_jcs(value)
+    except _canonical_module.CanonicalJcsError as error:
+        raise InventoryV2ContractError(str(error)) from error
 
 
 def parse_canonical_jcs(raw: bytes) -> Any:
@@ -224,11 +218,10 @@ def parse_canonical_jcs(raw: bytes) -> Any:
 
 
 def proof_hash(domain: str, value: Any) -> str:
-    if not domain or not domain.isascii() or "\x00" in domain:
-        raise InventoryV2ContractError(
-            "hash domain must be nonempty ASCII without NUL"
-        )
-    return hashlib.sha256(domain.encode("ascii") + b"\x00" + canonical_jcs(value)).hexdigest()
+    try:
+        return _canonical_module.proof_hash(domain, value)
+    except _canonical_module.CanonicalJcsError as error:
+        raise InventoryV2ContractError(str(error)) from error
 
 
 def raw_jcs_sha256(value: Any) -> str:
@@ -2081,6 +2074,169 @@ class ActiveHostApplicabilityIssuerV1:
             )
 
 
+def derive_frozen_v1_historical_replacement_graph_v1(
+    predecessor_ledger: Any,
+) -> dict[str, Any]:
+    if not isinstance(predecessor_ledger, dict) or not isinstance(
+        predecessor_ledger.get("rows"), list
+    ):
+        raise InventoryV2ContractError("predecessor ledger has no canonical row array")
+    replacement_ids_by_baseline: dict[str, list[str]] = {}
+    for row in predecessor_ledger["rows"]:
+        if not isinstance(row, dict) or row.get("resolution") != "replacement":
+            continue
+        baseline_id = row.get("baseline_id")
+        replacement_ids = row.get("replacement_ids")
+        if not isinstance(baseline_id, str) or not baseline_id:
+            raise InventoryV2ContractError(
+                "historical replacement row requires a nonempty baseline ID"
+            )
+        require_nfc(baseline_id)
+        if (
+            not isinstance(replacement_ids, list)
+            or not replacement_ids
+            or any(
+                not isinstance(replacement_id, str) or not replacement_id
+                for replacement_id in replacement_ids
+            )
+            or len(set(replacement_ids)) != len(replacement_ids)
+        ):
+            raise InventoryV2ContractError(
+                "historical replacement IDs must be nonempty and unique"
+            )
+        for replacement_id in replacement_ids:
+            require_nfc(replacement_id)
+        if baseline_id in replacement_ids_by_baseline:
+            raise InventoryV2ContractError(
+                "predecessor ledger repeats a historical replacement baseline"
+            )
+        replacement_ids_by_baseline[baseline_id] = sorted(replacement_ids)
+
+    baseline_ids = sorted(replacement_ids_by_baseline)
+    edges = [
+        {"baseline_id": baseline_id, "replacement_id": replacement_id}
+        for baseline_id in baseline_ids
+        for replacement_id in replacement_ids_by_baseline[baseline_id]
+    ]
+    successor_ids = sorted({edge["replacement_id"] for edge in edges})
+    successor_owners: dict[str, set[str]] = {successor_id: set() for successor_id in successor_ids}
+    for edge in edges:
+        successor_owners[edge["replacement_id"]].add(edge["baseline_id"])
+
+    components: list[dict[str, Any]] = []
+    visited_baselines: set[str] = set()
+    for initial_baseline in baseline_ids:
+        if initial_baseline in visited_baselines:
+            continue
+        pending_baselines = [initial_baseline]
+        component_baselines: set[str] = set()
+        component_successors: set[str] = set()
+        while pending_baselines:
+            baseline_id = pending_baselines.pop()
+            if baseline_id in component_baselines:
+                continue
+            component_baselines.add(baseline_id)
+            visited_baselines.add(baseline_id)
+            for successor_id in replacement_ids_by_baseline[baseline_id]:
+                if successor_id in component_successors:
+                    continue
+                component_successors.add(successor_id)
+                pending_baselines.extend(successor_owners[successor_id])
+        sorted_baselines = sorted(component_baselines)
+        sorted_successors = sorted(component_successors)
+        component_edges = [
+            {"baseline_id": edge["baseline_id"], "replacement_id": edge["replacement_id"]}
+            for edge in edges
+            if edge["baseline_id"] in component_baselines
+        ]
+        components.append(
+            {
+                "baseline_ids": sorted_baselines,
+                "edges": component_edges,
+                "successor_ids": sorted_successors,
+            }
+        )
+    components.sort(key=lambda component: component["baseline_ids"])
+    projection = {
+        "baseline_ids": baseline_ids,
+        "components": components,
+        "edges": edges,
+        "successor_ids": successor_ids,
+    }
+    if (
+        len(baseline_ids) != FROZEN_V1_HISTORICAL_REPLACEMENT_BASELINE_COUNT
+        or len(edges) != FROZEN_V1_HISTORICAL_REPLACEMENT_EDGE_COUNT
+        or len(successor_ids) != FROZEN_V1_HISTORICAL_REPLACEMENT_SUCCESSOR_COUNT
+        or len(components) != FROZEN_V1_HISTORICAL_REPLACEMENT_COMPONENT_COUNT
+        or proof_hash("kd4.frozen-v1-historical-replacement-graph.v1", projection)
+        != FROZEN_V1_HISTORICAL_REPLACEMENT_GRAPH_SHA256
+    ):
+        raise InventoryV2ContractError(
+            "historical replacement graph does not match the exact frozen V1 graph"
+        )
+    return projection
+
+
+def validate_v2_historical_replacement_graph_closure_v1(
+    ledger: Any,
+    predecessor_ledger: Any,
+) -> None:
+    graph = derive_frozen_v1_historical_replacement_graph_v1(predecessor_ledger)
+    predecessor_rows = {
+        row["baseline_id"]: row
+        for row in predecessor_ledger["rows"]
+        if isinstance(row, dict) and row.get("resolution") == "replacement"
+    }
+    rows_by_baseline: dict[str, Any] = {}
+    for row in ledger["rows"]:
+        baseline_id = row["baseline_id"]
+        if baseline_id is None:
+            continue
+        if baseline_id in rows_by_baseline:
+            raise InventoryV2ContractError(
+                "replacement ledger repeats a baseline ID"
+            )
+        rows_by_baseline[baseline_id] = row
+    replacement_ids_by_baseline: dict[str, list[str]] = {
+        baseline_id: [] for baseline_id in graph["baseline_ids"]
+    }
+    for edge in graph["edges"]:
+        replacement_ids_by_baseline[edge["baseline_id"]].append(
+            edge["replacement_id"]
+        )
+    for baseline_id in graph["baseline_ids"]:
+        predecessor_row = predecessor_rows[baseline_id]
+        predecessor_row_sha256 = proof_hash(
+            "kd4.frozen-v1-replacement-ledger-row.v1", predecessor_row
+        )
+        replacement_ids = replacement_ids_by_baseline[baseline_id]
+        expected_edge_ids = sorted(
+            "replacement-edge-v2."
+            + proof_hash(
+                "kd4.legacy-replacement-edge.v1",
+                {
+                    "baseline_id": baseline_id,
+                    "predecessor_row_sha256": predecessor_row_sha256,
+                    "replacement_id": replacement_id,
+                },
+            )
+            for replacement_id in replacement_ids
+        )
+        current = rows_by_baseline.get(baseline_id, {}).get("disposition", {})
+        if (
+            current.get("kind") != "replacement"
+            or current.get("contract", {}).get("legacy_replacement_hint")
+            != {
+                "predecessor_row_sha256": predecessor_row_sha256,
+                "replacement_ids": replacement_ids,
+            }
+            or current.get("edge_ids") != expected_edge_ids
+        ):
+            raise InventoryV2ContractError(
+                "historical replacement mapping changed from the exact frozen V1 graph"
+            )
+
+
 def validate_inventory_ledger_predecessor_closure(
     inventory: Any,
     ledger: Any,
@@ -2165,6 +2321,15 @@ def validate_inventory_ledger_predecessor_closure(
             raise InventoryV2ContractError(
                 "ledger baseline identity does not match its exact inventory declaration"
             )
+        if (
+            declaration["kind"] == "post-baseline-current"
+            and row["disposition"]["kind"] == "current"
+            and row["disposition"]["inventory_entry_semantic_sha256"]
+            != proof_hash("kd4.executable-inventory-entry.v2", declaration["entry"])
+        ):
+            raise InventoryV2ContractError(
+                "current disposition does not bind its exact inventory declaration entry"
+            )
 
     if not isinstance(transition_receipts, list):
         raise InventoryV2ContractError("transition receipts must be an array")
@@ -2222,6 +2387,9 @@ def validate_inventory_ledger_predecessor_closure(
             predecessor_ledger = json.loads(predecessor_ledger_raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise InventoryV2ContractError("predecessor ledger is invalid JSON") from exc
+        validate_v2_historical_replacement_graph_closure_v1(
+            ledger, predecessor_ledger
+        )
     authority_state_records = json.loads(json.dumps(recovery["records"]))
     for index, record in enumerate(authority_state_records):
         if record["state"] != "resolved":
@@ -2324,14 +2492,14 @@ def validate_inventory_ledger_predecessor_closure(
                     "output_sha256": parent["predecessor_entry_sha256"],
                     "parent_id": parent["baseline_id"],
                 }
-                for parent in unittest_recapture["parent_records"]
+                for parent in unittest_executable_parent_records_v1(unittest_recapture)
             ]
             if (
                 resolution["recapture_receipt_sha256"]
                 != unittest_recapture["receipt_sha256"]
                 or resolution["child_sources"] != expected_children
                 or resolution["parent_container_ids"]
-                != [record["baseline_id"] for record in unittest_recapture["parent_records"]]
+                != [record["baseline_id"] for record in unittest_executable_parent_records_v1(unittest_recapture)]
                 or resolution["parent_recapture_outputs"] != expected_outputs
                 or record["legacy_evidence"]["historical_subtest_call_count"]
                 != unittest_recapture["total_counts"]["subtest_occurrence_count"]
@@ -2623,7 +2791,7 @@ def unittest_subtest_manifests_v1(value: Any) -> list[dict[str, Any]]:
 
     validate_unittest_recapture_packet_v1(value)
     occurrences_by_parent: dict[str, list[Any]] = {
-        record["baseline_id"]: [] for record in value["parent_records"]
+        record["baseline_id"]: [] for record in unittest_executable_parent_records_v1(value)
     }
     for occurrence in value["subtest_occurrences"]:
         occurrences_by_parent[occurrence["parent_baseline_id"]].append(occurrence)
@@ -2647,7 +2815,7 @@ def unittest_recovered_child_sources_v1(value: Any) -> list[dict[str, Any]]:
 
     validate_unittest_recapture_packet_v1(value)
     children: list[dict[str, Any]] = []
-    for record in value["parent_records"]:
+    for record in unittest_executable_parent_records_v1(value):
         parent = record["baseline_id"]
         children.append(
             {
@@ -2688,6 +2856,23 @@ def unittest_recovered_child_sources_v1(value: Any) -> list[dict[str, Any]]:
     return sorted(children, key=_validate_recovered_child_source_v1)
 
 
+def validate_unittest_source_provenance_exception_v1(exception: Any) -> None:
+    if exception is None:
+        raise InventoryV2ContractError(
+            "unittest recapture freeze-overlay source authority is unavailable"
+        )
+    if hashlib.sha256(canonical_jcs(exception)).hexdigest() != UNITTEST_SOURCE_EXCEPTIONS_SHA256:
+        raise InventoryV2ContractError("unittest source exception is not the exact approved five-source and 29-parent amendments")
+
+
+def unittest_executable_parent_records_v1(value: Any) -> list[dict[str, Any]]:
+    """Select authenticated bodies after validating the exact approved exception."""
+    exception = value.get("source_provenance_exception")
+    validate_unittest_source_provenance_exception_v1(exception)
+    excepted = set(exception["baseline_ids"]) | set(exception["historical_execution_extension"]["baseline_ids"])
+    return [row for row in value["parent_records"] if row["baseline_id"] not in excepted]
+
+
 def validate_unittest_recapture_packet_v1(value: Any) -> None:
     """Validate a complete baseline unittest recapture without rewriting parents."""
 
@@ -2699,6 +2884,8 @@ def validate_unittest_recapture_packet_v1(value: Any) -> None:
         "source_isolation", "source_site_manifest", "source_tree_sha256", "subtest_occurrences",
         "total_counts", "worker_identity",
     }
+    if isinstance(value, dict) and "source_provenance_exception" in value:
+        fields.add("source_provenance_exception")
     _require_object(value, fields, "UnittestRecapturePacketV1")
     canonical_jcs(value)
     _require_schema_version(value["schema_version"], 1, "UnittestRecapturePacketV1")
@@ -2713,10 +2900,8 @@ def validate_unittest_recapture_packet_v1(value: Any) -> None:
     }
     if any(value[key] != expected for key, expected in expected_authorities.items()):
         raise InventoryV2ContractError("unittest recapture frozen authority mismatch")
-    if UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256 is None:
-        raise InventoryV2ContractError(
-            "unittest recapture freeze-overlay source authority is unavailable"
-        )
+    executable_parents = unittest_executable_parent_records_v1(value)
+    source_site_sha256 = UNITTEST_APPROVED_SOURCE_SITE_MANIFEST_SHA256
 
     isolation = _require_object(
         value["source_isolation"],
@@ -2829,11 +3014,11 @@ def validate_unittest_recapture_packet_v1(value: Any) -> None:
         or network["sandbox_available"] is not True
         or network["fail_closed"] is not True
         or not isinstance(command, list)
-        or len(command) < 8
-        or command[:5] != [codex_path, "sandbox", "-P", ":workspace", "-C"]
-        or command[5] != isolated_checkout_path
-        or command[6] != "--"
-        or command[7:] != worker["command_argv"]
+        or len(command) < 10
+        or command[:7] != [codex_path, "-c", 'windows.sandbox="elevated"', "sandbox", "-P", ":workspace", "-C"]
+        or command[7] != isolated_checkout_path
+        or command[8] != "--"
+        or command[9:] != worker["command_argv"]
         or worker["command_argv"][0] != python_identity["executable_path"]
     ):
         raise InventoryV2ContractError(
@@ -2880,6 +3065,9 @@ def validate_unittest_recapture_packet_v1(value: Any) -> None:
         raise InventoryV2ContractError(
             "unittest parent record set is not the frozen 893-parent executable set"
         )
+    parent_ids = [row["baseline_id"] for row in executable_parents]
+    if len(parent_ids) != 859:
+        raise InventoryV2ContractError("unittest approved source exception must leave 859 executable parents")
     parent_set = set(parent_ids)
 
     sites = value["source_site_manifest"]
@@ -2907,7 +3095,7 @@ def validate_unittest_recapture_packet_v1(value: Any) -> None:
     source_audit = _require_object(
         value["source_audit"],
         {
-            "embedded_non_ast_marker_count", "executable_ast_site_count",
+            "embedded_non_ast_marker_count", "executable_ast_site_count", "excepted_ast_site_count",
             "source_file_count", "source_site_manifest_sha256", "textual_marker_count",
         },
         "UnittestSourceAuditV1",
@@ -2917,11 +3105,12 @@ def validate_unittest_recapture_packet_v1(value: Any) -> None:
     )
     if source_audit != {
         "embedded_non_ast_marker_count": 1,
-        "executable_ast_site_count": 68,
-        "source_file_count": 22,
-        "source_site_manifest_sha256": UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256,
+        "executable_ast_site_count": 59,
+        "excepted_ast_site_count": 9,
+        "source_file_count": 21,
+        "source_site_manifest_sha256": source_site_sha256,
         "textual_marker_count": 69,
-    } or expected_manifest_sha256 != UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256 or len(sites) != 68 or len({site["path"] for site in sites}) != 22:
+    } or expected_manifest_sha256 != source_site_sha256 or len(sites) != 59 or len({site["path"] for site in sites}) != 21:
         raise InventoryV2ContractError("unittest recapture source audit mismatch")
 
     occurrences = value["subtest_occurrences"]
@@ -2992,7 +3181,7 @@ def validate_unittest_recapture_packet_v1(value: Any) -> None:
         "baseline_commit": UNITTEST_RECAPTURE_BASELINE_COMMIT,
         "format_id": "kd4.unittest-parent-manifest.v1",
         "frozen_inventory_raw_sha256": FROZEN_V1_INVENTORY_RAW_SHA256,
-        "parent_records": parents,
+        "parent_records": executable_parents,
         "schema_version": 1,
         "source_tree_sha256": UNITTEST_RECAPTURE_SOURCE_TREE_SHA256,
     }:
@@ -3004,11 +3193,11 @@ def validate_unittest_recapture_packet_v1(value: Any) -> None:
     if (
         not isinstance(results, list)
         or not isinstance(bindings, list)
-        or len(results) != 893
-        or len(bindings) != 893
+        or len(results) != 859
+        or len(bindings) != 859
     ):
         raise InventoryV2ContractError(
-            "unittest results/output bindings must cover 893 executable parents"
+            "unittest results/output bindings must cover 859 authenticated parents"
         )
     binding_by_parent: dict[str, Any] = {}
     for binding in bindings:
@@ -3051,8 +3240,8 @@ def validate_unittest_recapture_packet_v1(value: Any) -> None:
             "unittest report artifact must be canonical JSON"
         ) from exc
     report_counts = {
-        "selected_parent_count": 893,
-        "started_parent_count": 893,
+        "selected_parent_count": 859,
+        "started_parent_count": 859,
         "subtest_occurrence_count": len(occurrences),
         "terminal_parent_count": terminal_count,
     }
@@ -3070,16 +3259,16 @@ def validate_unittest_recapture_packet_v1(value: Any) -> None:
         "parent_results": results,
         "schema_version": 1,
         "selection": {
-            "intended_count": 893,
-            "intended_native_ids": [record["native_id"] for record in parents],
-            "selected_count": 893,
-            "selected_native_ids": [record["native_id"] for record in parents],
+            "intended_count": 859,
+            "intended_native_ids": [record["native_id"] for record in executable_parents],
+            "selected_count": 859,
+            "selected_native_ids": [record["native_id"] for record in executable_parents],
         },
-        "socket_policy": "loopback-only",
         "source_site_manifest": sites,
         "subtest_occurrences": occurrences,
         "total_counts": report_counts,
         "untrusted_observations": {
+            "socket_policy": "loopback-only",
             "checkout": {
                 "clean_after": isolation["clean_after"],
                 "clean_before": isolation["clean_before"],
@@ -3118,11 +3307,11 @@ def validate_unittest_recapture_packet_v1(value: Any) -> None:
         "UnittestTotalCountsV1",
     )
     expected_counts = {
-        "method_body_child_count": 893,
+        "method_body_child_count": 859,
         "parent_record_count": 893,
-        "recovered_child_count": 893 + len(occurrences),
-        "selected_parent_count": 893,
-        "started_parent_count": 893,
+        "recovered_child_count": 859 + len(occurrences),
+        "selected_parent_count": 859,
+        "started_parent_count": 859,
         "subtest_occurrence_count": len(occurrences),
         "terminal_parent_count": terminal_count,
     }
@@ -3355,6 +3544,13 @@ def validate_canonical_parameter_projection_v1(value: Any) -> None:
         _require_integer(value["value"], -(1 << 53) + 1, "integer parameter value")
         if value["value"] > (1 << 53) - 1:
             raise InventoryV2ContractError("integer parameter exceeds exact I-JSON range")
+    elif kind == "float64":
+        _require_object(value, {"kind", "bits"}, "float64 parameter")
+        bits = value["bits"]
+        if not isinstance(bits, str) or re.fullmatch(r"[0-9a-f]{16}", bits) is None:
+            raise InventoryV2ContractError("float64 parameter must use 16 lowercase hexadecimal digits")
+        if not math.isfinite(struct.unpack(">d", bytes.fromhex(bits))[0]):
+            raise InventoryV2ContractError("non-finite float64 parameter is unsupported")
     elif kind == "string":
         _require_object(value, {"kind", "value"}, "string parameter")
         if not isinstance(value["value"], str) or not unicodedata.is_normalized("NFC", value["value"]):
@@ -3595,9 +3791,9 @@ def _validate_recovery_record_v1(value: Any) -> None:
         if output_ids and any(a >= b for a, b in zip(output_ids, output_ids[1:])):
             raise InventoryV2ContractError("parent_recapture_outputs must be sorted and unique")
         if kind == "unittest":
-            if len(outputs) != 893 or output_ids != parents:
+            if len(outputs) != 859 or output_ids != parents:
                 raise InventoryV2ContractError(
-                    "resolved unittest recovery must cover all 893 executable parent containers"
+                    "resolved unittest recovery must cover all 859 authenticated parent containers"
                 )
             if any(
                 child["child_kind"] not in {"unittest-method-body", "unittest-subtest"}

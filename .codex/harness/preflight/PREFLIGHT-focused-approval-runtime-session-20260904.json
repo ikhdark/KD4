@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:focused-approval-runtime-session-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    { "path": "codex-rs/core/tests/suite/completion_proof_gate.rs", "recursive": false }
+  ],
+  "contract_claims": ["focused-replacement-approval-real-session-proof"],
+  "dependencies": ["root:completion-proof-migration-20260902"],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::focused_replacement_approval_requires_current_catalog_and_real_reconciliation)'"
+  ],
+  "cargo_lane": { "target_dir": "root-owned-serialized", "cargo_home": "default" },
+  "workspace_strategy": "shared"
+}

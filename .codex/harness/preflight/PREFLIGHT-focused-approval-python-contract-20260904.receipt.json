@@ -1,0 +1,61 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts/focused_replacement_approval_receipt.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_focused_replacement_approval_receipt.py",
+          "scripts"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:focused-approval-python-contract-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\focused-approval-python-contract"
+  },
+  "contract_claims": [
+    "focused-replacement-approval-receipt-python-contract"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902",
+    "worker:focused-approval-schema-vectors-20260904"
+  ],
+  "expires_at": "2026-09-04T12:41:27.108944+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "cfa0e19494439dd027793f66a435654fb1457e3bd15955b82f65701d851267df",
+  "path_claims": [
+    {
+      "path": "scripts/focused_replacement_approval_receipt.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_focused_replacement_approval_receipt.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T11:41:27.108944+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "cfb6f5c2ec355347611799fd5863da9ba2b73b6ee40dd81692c4367e1383864d"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_focused_replacement_approval_receipt",
+    "python -m py_compile scripts/focused_replacement_approval_receipt.py scripts/test_focused_replacement_approval_receipt.py"
+  ],
+  "validation_owner": "worker:focused-approval-python-contract-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

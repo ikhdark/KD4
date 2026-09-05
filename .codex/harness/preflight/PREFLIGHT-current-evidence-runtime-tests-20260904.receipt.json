@@ -1,0 +1,88 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "worker:current-evidence-python-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-current-evidence-runtime-tests-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-current-evidence-runtime-tests-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          "codex-rs/core/tests/suite/completion_proof_gate.rs",
+          "codex-rs"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "worker:current-evidence-core-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "worker:current-evidence-python-tests-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    }
+  ],
+  "assignment_id": "worker:current-evidence-runtime-tests-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+  },
+  "contract_claims": [
+    "explicit-current-evidence-real-session-noncertification"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T23:59:25.422085+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "e12ba00c60a9d08b9d726fefb1042d3b0fedfeb72a717c16dec03da9dd9cf59a",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-current-evidence-runtime-tests-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-current-evidence-runtime-tests-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/tests/suite/completion_proof_gate.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T22:59:25.422085+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "907f1a67224f7dcd63c8e520f48c9d36cb0f9e05c94c9134458955723f56ace0"
+  },
+  "validation_commands": [
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::current_evidence_real_session_executes_both_and_rejects_nonterminal_misuse)'",
+    "git diff --check"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

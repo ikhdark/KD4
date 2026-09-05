@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:focused-evidence-frame-source-map-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+  "path_claims": [
+    {
+      "path": "source_owners.toml",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_source_owners.py",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-focused-evidence-frame-source-map-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-focused-evidence-frame-source-map-20260904.receipt.json",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "focused-evidence-frame-source-map-registration"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902",
+    "worker:focused-evidence-frame-contract-20260904"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "worker:focused-evidence-frame-source-map-20260904",
+  "validation_commands": [
+    "python -m unittest scripts.test_source_owners.SourceOwnersCliTest.test_repository_slices_retain_representative_relationships_through_cli"
+  ],
+  "cargo_lane": {
+    "target_dir": "none",
+    "cargo_home": "none"
+  },
+  "workspace_strategy": "shared"
+}

@@ -41,6 +41,7 @@ use crate::AgentTaskBinding;
 use crate::AgentTaskBindingDraft;
 use crate::ArchitectureContractV1;
 use crate::Assignment;
+use crate::AssignmentAdmissionOrigin;
 use crate::AssignmentDraft;
 use crate::AssignmentId;
 use crate::Attempt;
@@ -49,6 +50,7 @@ use crate::AttemptId;
 use crate::AttemptState;
 use crate::AttributionConfidence;
 use crate::CONCURRENT_DRIFT_REASON;
+use crate::CapabilityProfile;
 use crate::CriterionStatus;
 use crate::DEFAULT_MUTATION_EVIDENCE_LIMIT;
 use crate::DEFAULT_SNAPSHOT_CHUNK_BYTES;
@@ -224,6 +226,12 @@ pub(crate) async fn with_test_snapshot_capture_pause<T>(
 enum ReceiptHandoffAction {
     Publish(IsolationHandoff),
     Integrate(Vec<AssignmentId>),
+}
+
+struct ReviewTargetReceiptGuard {
+    expected_reviewer_assignment: Assignment,
+    target_assignment_id: AssignmentId,
+    target_attempt_id: AttemptId,
 }
 
 #[derive(Clone)]
@@ -1595,6 +1603,7 @@ LIMIT 1
         attempt_id: AttemptId,
         mut draft: ReceiptDraft,
         review_reason: Option<String>,
+        review_target_guard: Option<ReviewTargetReceiptGuard>,
     ) -> StoreResult<AgentReceipt> {
         if draft.summary.trim().is_empty() {
             return Err(StoreError::InvalidAssignment(
@@ -1624,7 +1633,19 @@ LIMIT 1
         {
             return Err(StoreError::ReceiptAlreadySealed(attempt_id));
         }
-        let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+        let mut assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+        if let Some(guard) = review_target_guard.as_ref() {
+            // Task capsules are stored separately from immutable assignment rows. Compare the
+            // complete live assignment to the private admission snapshot before sealing.
+            hydrate_task_capsule(&self.coordination_root, &mut assignment)?;
+            validate_review_target_receipt_guard_tx(
+                &mut transaction,
+                attempt_id,
+                &assignment,
+                guard,
+            )
+            .await?;
+        }
         validate_criterion_results(&assignment, attempt.amendment.as_ref(), &draft)?;
         let mut invalid_calls = Vec::new();
         let mut invalid_statuses = Vec::new();
@@ -3749,7 +3770,7 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
             let result = self
-                .submit_agent_receipt_impl(attempt_id, receipt, None)
+                .submit_agent_receipt_impl(attempt_id, receipt, None, None)
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -3766,7 +3787,38 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, AgentReceipt> {
         Box::pin(async move {
             let result = self
-                .submit_agent_receipt_impl(attempt_id, receipt, Some(review_reason))
+                .submit_agent_receipt_impl(attempt_id, receipt, Some(review_reason), None)
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
+        })
+    }
+
+    /// Seals a review receipt only while its private fresh-spawn assignment snapshot and the
+    /// successful target attempt remain current in the same transaction.
+    pub fn submit_agent_receipt_for_review_target(
+        &self,
+        attempt_id: AttemptId,
+        receipt: ReceiptDraft,
+        review_reason: Option<String>,
+        expected_reviewer_assignment: Assignment,
+        target_assignment_id: AssignmentId,
+        target_attempt_id: AttemptId,
+    ) -> TaskStoreFuture<'_, AgentReceipt> {
+        Box::pin(async move {
+            let result = self
+                .submit_agent_receipt_impl(
+                    attempt_id,
+                    receipt,
+                    review_reason,
+                    Some(ReviewTargetReceiptGuard {
+                        expected_reviewer_assignment,
+                        target_assignment_id,
+                        target_attempt_id,
+                    }),
+                )
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -4649,6 +4701,102 @@ async fn load_current_attempt_tx(
         .ok_or(StoreError::AssignmentNotFound(assignment_id))?;
     let attempt_id = AttemptId::parse(row.get::<String, _>("attempt_id").as_str())?;
     attempt_from_row(attempt_id, &row)
+}
+
+async fn validate_review_target_receipt_guard_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    reviewer_attempt_id: AttemptId,
+    reviewer: &Assignment,
+    guard: &ReviewTargetReceiptGuard,
+) -> StoreResult<()> {
+    if reviewer != &guard.expected_reviewer_assignment {
+        return Err(StoreError::InvalidAssignment(
+            "persisted reviewer assignment does not match its fresh-spawn snapshot".to_string(),
+        ));
+    }
+    let relation_matches = reviewer.relation.as_ref().is_some_and(|relation| {
+        relation.kind == RelationKind::Review
+            && relation.target_assignment_ids.as_slice() == [guard.target_assignment_id]
+    });
+    if reviewer.admission_origin != AssignmentAdmissionOrigin::Typed
+        || reviewer.role != AgentRole::Reviewer
+        || reviewer.capability_profile != CapabilityProfile::ReadSearchDiff
+        || !reviewer.write_scope.is_empty()
+        || reviewer.dependencies.as_slice() != [guard.target_assignment_id]
+        || !relation_matches
+    {
+        return Err(StoreError::InvalidAssignment(
+            "review-target receipt requires the exact typed read-only Reviewer relation and dependency"
+                .to_string(),
+        ));
+    }
+    let reviewer_attempt = load_attempt_tx(transaction, reviewer_attempt_id).await?;
+    if reviewer_attempt.assignment_id != reviewer.assignment_id
+        || reviewer_attempt.amendment.is_some()
+    {
+        return Err(StoreError::CorruptData(format!(
+            "reviewer attempt {reviewer_attempt_id} does not belong to assignment {}",
+            reviewer.assignment_id
+        )));
+    }
+
+    lock_assignment_tx(transaction, guard.target_assignment_id).await?;
+    let target = load_assignment_tx(transaction, guard.target_assignment_id).await?;
+    if target.root_session_id != reviewer.root_session_id
+        || target.repository_id != reviewer.repository_id
+        || target.workspace_id != reviewer.workspace_id
+        || target.assignment_id == reviewer.assignment_id
+    {
+        return Err(StoreError::InvalidAssignment(
+            "reviewer and review target must share root-session and repository identity"
+                .to_string(),
+        ));
+    }
+    let current_target = load_current_attempt_tx(transaction, guard.target_assignment_id).await?;
+    if current_target.attempt_id != guard.target_attempt_id {
+        return Err(StoreError::AttemptNotActive(guard.target_attempt_id));
+    }
+    if current_target.state != AttemptState::Completed || current_target.sealed_at.is_none() {
+        return Err(StoreError::InvalidAssignment(format!(
+            "review target attempt {} is not completed and sealed",
+            guard.target_attempt_id
+        )));
+    }
+    let receipt_row = sqlx::query(
+        "SELECT assignment_id, status, body_json, sealed_at
+         FROM receipts
+         WHERE assignment_id = ? AND attempt_id = ?",
+    )
+    .bind(guard.target_assignment_id.to_string())
+    .bind(guard.target_attempt_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| {
+        StoreError::InvalidAssignment(format!(
+            "review target attempt {} has no sealed receipt",
+            guard.target_attempt_id
+        ))
+    })?;
+    let stored_assignment_id =
+        AssignmentId::parse(receipt_row.get::<String, _>("assignment_id").as_str())?;
+    let stored_status: AgentStatusClaim = decode(receipt_row.get::<String, _>("status").as_str())?;
+    let stored_sealed_at: chrono::DateTime<Utc> =
+        decode(receipt_row.get::<String, _>("sealed_at").as_str())?;
+    let receipt: AgentReceipt = decode(receipt_row.get::<String, _>("body_json").as_str())?;
+    if stored_assignment_id != guard.target_assignment_id
+        || receipt.assignment_id != guard.target_assignment_id
+        || receipt.attempt_id != guard.target_attempt_id
+        || !stored_status.is_success()
+        || receipt.status != stored_status
+        || receipt.sealed_at != stored_sealed_at
+        || current_target.sealed_at != Some(stored_sealed_at)
+    {
+        return Err(StoreError::CorruptData(format!(
+            "review target receipt identity, status, or seal does not match attempt {}",
+            guard.target_attempt_id
+        )));
+    }
+    Ok(())
 }
 
 async fn require_active_current_attempt_tx(

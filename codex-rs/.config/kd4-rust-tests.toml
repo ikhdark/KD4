@@ -177,7 +177,11 @@ helpers = [
 package = "codex-cli"
 test = "completion_proof"
 features = ["codex-core/completion-proof-test-store"]
-helpers = ["codex"]
+helpers = [
+  "codex",
+  "codex-windows-sandbox-setup",
+  "codex-command-runner",
+]
 
 [targets.app_server_all]
 package = "codex-app-server"

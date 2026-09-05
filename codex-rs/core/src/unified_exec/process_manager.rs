@@ -1014,13 +1014,20 @@ impl UnifiedExecProcessManager {
         }
 
         let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
-        let event_ctx = ToolEventCtx::new(
+        let suppress_post_proof_mutation_observation = request
+            .completion_proof
+            .as_ref()
+            .is_some_and(crate::completion_proof::UnifiedExecCompletionProof::is_canonical);
+        let mut event_ctx = ToolEventCtx::new(
             context.session.as_ref(),
             context.turn.as_ref(),
             &context.call_id,
             context.tracker.as_ref(),
         )
         .with_call_source(&context.source);
+        if suppress_post_proof_mutation_observation {
+            event_ctx = event_ctx.without_post_proof_mutation_observation();
+        }
         let emitter = ToolEmitter::unified_exec(
             &request.command_for_safety,
             cwd.clone(),
@@ -1249,10 +1256,7 @@ impl UnifiedExecProcessManager {
                 wall_time,
                 context.source.clone(),
                 context.tracker.clone(),
-                request
-                    .completion_proof
-                    .as_ref()
-                    .is_some_and(crate::completion_proof::UnifiedExecCompletionProof::is_canonical),
+                suppress_post_proof_mutation_observation,
             )
             .await;
 
@@ -2170,6 +2174,7 @@ impl UnifiedExecProcessManager {
             approved_powershell_direct_argv,
             raw_output_artifact: request.raw_output_artifact.clone(),
             shell_type: request.shell_type,
+            shell_wrapper_is_owned: request.shell_wrapper_is_owned,
             hook_command: request.hook_command.clone(),
             process_id: request.process_id,
             cwd,

@@ -130,7 +130,7 @@ fn fresh_root_completion_proof_authority(
     CompletionProofSessionAuthority::root_terminal_owner(registry, cwd)
 }
 
-async fn registered_rollout_root_authority(
+async fn registered_rollout_authority(
     registry: Arc<CompletionProofRuntimeRegistry>,
     cwd: &Path,
     initial_history: &InitialHistory,
@@ -139,17 +139,9 @@ async fn registered_rollout_root_authority(
         InitialHistory::Resumed(resumed) => resumed.rollout_path.as_deref(),
         InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
     }?;
-    let (lineage_id, terminal_quiescence_root_thread_id) = registry
-        .registered_root_lineage_for_rollout(cwd, rollout_path)
-        .await?;
-    Some(
-        CompletionProofSessionAuthority::root_terminal_owner_for_existing_lineage(
-            registry,
-            cwd,
-            Some(lineage_id),
-            terminal_quiescence_root_thread_id,
-        ),
-    )
+    registry
+        .registered_authority_for_rollout(cwd, rollout_path)
+        .await
 }
 
 struct TempCodexHomeGuard {
@@ -1257,7 +1249,7 @@ impl ThreadManager {
         supports_openai_form_elicitation: bool,
     ) -> CodexResult<NewThread> {
         let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
-        let completion_proof_authority = registered_rollout_root_authority(
+        let completion_proof_authority = registered_rollout_authority(
             Arc::clone(&self.state.completion_proof_registry),
             config.cwd.as_path(),
             &initial_history,
@@ -1352,7 +1344,7 @@ impl ThreadManager {
         supports_openai_form_elicitation: bool,
         reconstruction: ThreadSettingsReconstruction,
     ) -> CodexResult<NewThread> {
-        let completion_proof_authority = registered_rollout_root_authority(
+        let completion_proof_authority = registered_rollout_authority(
             Arc::clone(&self.state.completion_proof_registry),
             config.cwd.as_path(),
             &initial_history,
@@ -1511,7 +1503,7 @@ impl ThreadManager {
         let (session_source, thread_source) = initial_history
             .get_resumed_session_sources()
             .unwrap_or_else(|| (self.state.session_source.clone(), None));
-        let completion_proof_authority = registered_rollout_root_authority(
+        let completion_proof_authority = registered_rollout_authority(
             Arc::clone(&self.state.completion_proof_registry),
             config.cwd.as_path(),
             &initial_history,
@@ -1821,30 +1813,31 @@ impl ThreadManager {
             Arc::clone(&self.state.completion_proof_registry),
             config.cwd.as_path(),
         );
-        if source_thread_id.is_some()
+        if let Some(registered_source_thread_id) = source_thread_id
             && let Some(source_rollout_path) = source_rollout_path.as_deref()
-            && let Some((lineage_id, terminal_quiescence_root_thread_id)) = self
+            && let Some(registered_authority) = self
                 .state
                 .completion_proof_registry
-                .registered_root_lineage_for_rollout(config.cwd.as_path(), source_rollout_path)
-                .await
-            && is_final(
-                &agent_control
-                    .get_status(terminal_quiescence_root_thread_id)
-                    .await,
-            )
-            && let Ok(closing_guard) = agent_control
-                .begin_terminal_publication(terminal_quiescence_root_thread_id)
+                .registered_authority_for_rollout(config.cwd.as_path(), source_rollout_path)
                 .await
         {
-            completion_proof_authority =
-                CompletionProofSessionAuthority::root_terminal_owner_for_existing_lineage(
-                    Arc::clone(&self.state.completion_proof_registry),
-                    config.cwd.as_path(),
-                    Some(lineage_id),
-                    terminal_quiescence_root_thread_id,
-                );
-            source_tree_closing = Some(closing_guard);
+            if let Some(terminal_quiescence_root_thread_id) =
+                registered_authority.terminal_quiescence_root_thread_id(registered_source_thread_id)
+            {
+                if is_final(
+                    &agent_control
+                        .get_status(terminal_quiescence_root_thread_id)
+                        .await,
+                ) && let Ok(closing_guard) = agent_control
+                    .begin_terminal_publication(terminal_quiescence_root_thread_id)
+                    .await
+                {
+                    completion_proof_authority = registered_authority;
+                    source_tree_closing = Some(closing_guard);
+                }
+            } else {
+                completion_proof_authority = registered_authority;
+            }
         }
         let new_thread = Box::pin(self.state.spawn_thread(
             config,

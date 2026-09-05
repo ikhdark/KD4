@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:contributor-resume-regression-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    { "path": ".codex/harness/preflight/PREFLIGHT-contributor-resume-regression-20260904.json", "recursive": false },
+    { "path": ".codex/harness/preflight/PREFLIGHT-contributor-resume-regression-20260904.receipt.json", "recursive": false },
+    { "path": "codex-rs/core/tests/suite/completion_proof_gate.rs", "recursive": false }
+  ],
+  "contract_claims": ["real-session-contributor-public-resume-and-fork-regression"],
+  "dependencies": ["root:completion-proof-migration-20260902", "worker:contributor-resume-authority-20260904"],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::explicit_admission_not_session_source_selects_terminal_authority)'",
+    "rustfmt --edition 2024 --check codex-rs/core/tests/suite/completion_proof_gate.rs",
+    "git diff --check"
+  ],
+  "cargo_lane": { "target_dir": "codex-rs/target", "cargo_home": "C:/Users/kuh/.cargo" },
+  "workspace_strategy": "shared"
+}

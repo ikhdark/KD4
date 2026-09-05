@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:current-evidence-runtime-tests-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-current-evidence-runtime-tests-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-current-evidence-runtime-tests-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/tests/suite/completion_proof_gate.rs",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "explicit-current-evidence-real-session-noncertification"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::current_evidence_real_session_executes_both_and_rejects_nonterminal_misuse)'",
+    "git diff --check"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

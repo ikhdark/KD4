@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:historical-replacement-review-components-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    { "path": ".codex/harness/preflight/PREFLIGHT-historical-replacement-review-components-20260904.json", "recursive": false },
+    { "path": ".codex/harness/preflight/PREFLIGHT-historical-replacement-review-components-20260904.receipt.json", "recursive": false },
+    { "path": "scripts/completion_proof_inventory_v2.py", "recursive": false },
+    { "path": "scripts/replacement_admission.py", "recursive": false },
+    { "path": "scripts/test_replacement_admission.py", "recursive": false }
+  ],
+  "contract_claims": [
+    "frozen-v1-historical-replacement-component-review-plan"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "worker:historical-replacement-review-components-20260904",
+  "validation_commands": [
+    "python -m unittest scripts.test_replacement_admission.ReplacementAdmissionCliTests.test_historical_replacement_review_plan_closes_exact_frozen_components",
+    "python -m py_compile scripts/completion_proof_inventory_v2.py scripts/replacement_admission.py scripts/test_replacement_admission.py",
+    "git diff --check"
+  ],
+  "cargo_lane": {
+    "target_dir": "none",
+    "cargo_home": "none"
+  },
+  "workspace_strategy": "shared"
+}

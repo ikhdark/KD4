@@ -885,8 +885,8 @@ fn frozen_unittest_ledger_partitions_hidden_rows_from_executable_recapture() {
     );
 }
 
-#[test]
-fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
+fn full_scale_python_bundle_with_hash_parity() -> Value {
+    let started = std::time::Instant::now();
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -907,6 +907,10 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
     );
     let bundle: Value =
         serde_json::from_slice(&output.stdout).expect("full-scale bundle parses as JSON");
+    eprintln!(
+        "full inventory: Python fixture ready after {:?}",
+        started.elapsed()
+    );
     assert_eq!(
         bundle["counts"],
         json!({
@@ -916,8 +920,8 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
         })
     );
     let expected_artifact_hashes = json!({
-        "inventory": "e0ddc09c36fe346e511256a6fd1011f3892606e3150e2c045ccae14cdfb6807a",
-        "ledger": "651f98d60ca3e0c6755dfecf87c46e251494ad6f05397aa502ca1a4c4a000eb6",
+        "inventory": "ec3edb113e3c5957d52347426075278c7ff9de2e0524b839ce76406b4b400a96",
+        "ledger": "742d77d2043129bcbaf59635563d2b7210c2902082b7a82085fe9b0ef4b92b9d",
         "recovery": "2d6e7ee1aa26ce1094f93f38152f63fc54e6db7c569a8e7acf51a709896a1712",
     });
     assert_eq!(bundle["artifact_sha256"], expected_artifact_hashes);
@@ -930,17 +934,196 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
     }
     assert_eq!(
         bundle["inventory"]["authority"]["semantic_sha256"],
-        "46b2bde1834a893f7d9851a92cb10e3ac2b2348555288a873f14941040d79288"
+        "a04a903b720b3968a62fa5978eeefd08bfc8142214c267c9a270902ae4dcb55f"
     );
     assert_eq!(
         bundle["ledger"]["semantic_sha256"],
-        "134ed74a5ac1ca9c4d3c5080ec441439b1081895f31f180214f2432dee490db8"
+        "5b0d96b4dcddea34d1fb6f2942d91accdc2c63585723774b0b22399f25016370"
     );
     assert_eq!(
         bundle["recovery"]["semantic_sha256"],
         "34b80e4f41d380d6e9c83e3182a80f7d35250b3284973dee75dcb67802a6dde0"
     );
 
+    bundle
+}
+
+#[test]
+fn full_scale_python_artifact_hashes_match_rust() {
+    full_scale_python_bundle_with_hash_parity();
+}
+
+fn assert_materialized_recovery_bundle_and_frozen_mapping_parity() {
+    let started = std::time::Instant::now();
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("validation-contracts is nested under codex-rs");
+    let issuer = ActiveHostApplicabilityIssuerV1::new(
+        "12345678-1234-1234-1234-123456789abc".to_owned(),
+        [b'K'; 32],
+        Vec::new(),
+    )
+    .expect("trusted issuer constructs");
+    let validation_root = repo_root.join(".codex/validation");
+    eprintln!(
+        "full inventory: repository inputs loading after {:?}",
+        started.elapsed()
+    );
+    let checked_inventory_raw =
+        std::fs::read(validation_root.join("frozen-test-inventory-v2.json"))
+            .expect("checked-in Inventory V2 reads");
+    let checked_ledger_raw = std::fs::read(validation_root.join("test-replacements-v2.json"))
+        .expect("checked-in replacement ledger reads");
+    let checked_recovery_raw =
+        std::fs::read(validation_root.join("frozen-test-inventory-v2-recoveries.json"))
+            .expect("checked-in recovery authority reads");
+    let checked_transition_receipts_raw = std::fs::read(
+        validation_root.join("frozen-test-inventory-v2-recovery-transition-receipts.json"),
+    )
+    .expect("checked-in transition receipts read");
+    let checked_doctest_recapture_raw =
+        std::fs::read(validation_root.join("frozen-test-inventory-v2-doctest-recapture.json"))
+            .expect("checked-in doctest recapture reads");
+    let checked_unittest_recapture_raw =
+        std::fs::read(validation_root.join("frozen-test-inventory-v2-unittest-recapture.json"))
+            .expect("checked-in unittest recapture reads");
+    let predecessor_ledger_raw = std::fs::read(validation_root.join("test-replacements-v1.json"))
+        .expect("frozen predecessor ledger reads");
+    let checked_inventory: FrozenTestInventoryV2 =
+        serde_json::from_slice(&checked_inventory_raw).expect("checked-in Inventory V2 parses");
+    let checked_ledger: TestReplacementLedgerV2 =
+        serde_json::from_slice(&checked_ledger_raw).expect("checked-in replacement ledger parses");
+    let checked_transition_receipts: Vec<RecoveryTransitionReceiptV1> =
+        serde_json::from_slice(&checked_transition_receipts_raw)
+            .expect("checked-in transition receipts parse");
+    validate_inventory_ledger_predecessor_closure_with_recaptures(
+        &checked_inventory,
+        &checked_ledger,
+        &checked_recovery_raw,
+        &checked_transition_receipts,
+        &issuer,
+        Some(&checked_doctest_recapture_raw),
+        Some(&checked_unittest_recapture_raw),
+        Some(&predecessor_ledger_raw),
+    )
+    .expect("Rust preserves the exact checked-in frozen V1 historical replacement graph");
+    eprintln!(
+        "full inventory: repository closure checked after {:?}",
+        started.elapsed()
+    );
+
+    assert!(
+        validate_inventory_ledger_predecessor_closure_with_recaptures(
+            &checked_inventory,
+            &checked_ledger,
+            &checked_recovery_raw,
+            &checked_transition_receipts,
+            &issuer,
+            Some(&checked_doctest_recapture_raw),
+            None,
+            Some(&predecessor_ledger_raw),
+        )
+        .is_err(),
+        "resolved unittest closure requires the actual typed packet"
+    );
+
+    let predecessor_value: Value =
+        serde_json::from_slice(&predecessor_ledger_raw).expect("predecessor ledger parses");
+    let predecessor_rows = predecessor_value["rows"]
+        .as_array()
+        .expect("predecessor rows are an array");
+    let predecessor_row = predecessor_rows
+        .iter()
+        .find(|row| {
+            row["resolution"] == "replacement"
+                && !row["baseline_id"]
+                    .as_str()
+                    .expect("baseline ID is a string")
+                    .starts_with("python-unittest::")
+                && row["replacement_ids"]
+                    .as_array()
+                    .is_some_and(|replacement_ids| replacement_ids.len() == 1)
+        })
+        .expect("predecessor has a non-unittest one-to-one replacement");
+    let baseline_id = predecessor_row["baseline_id"]
+        .as_str()
+        .expect("baseline ID is a string");
+    let original_replacement_id = predecessor_row["replacement_ids"][0]
+        .as_str()
+        .expect("replacement ID is a string");
+    let substituted_replacement_id = predecessor_rows
+        .iter()
+        .filter(|row| row["resolution"] == "replacement")
+        .flat_map(|row| row["replacement_ids"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .find(|replacement_id| *replacement_id != original_replacement_id)
+        .expect("predecessor has a distinct replacement successor");
+    let predecessor_row_sha256 =
+        proof_hash("kd4.frozen-v1-replacement-ledger-row.v1", predecessor_row)
+            .expect("predecessor row hashes");
+    let substituted_edge_id = format!(
+        "replacement-edge-v2.{}",
+        proof_hash(
+            "kd4.legacy-replacement-edge.v1",
+            &json!({
+                "baseline_id": baseline_id,
+                "predecessor_row_sha256": predecessor_row_sha256,
+                "replacement_id": substituted_replacement_id,
+            }),
+        )
+        .expect("substituted edge hashes")
+    );
+    let mut substituted_historical_value: Value =
+        serde_json::from_slice(&checked_ledger_raw).expect("checked-in ledger parses as JSON");
+    let substituted_historical_row = substituted_historical_value["rows"]
+        .as_array_mut()
+        .expect("ledger rows are an array")
+        .iter_mut()
+        .find(|row| row["baseline_id"] == baseline_id)
+        .expect("checked-in ledger contains historical replacement baseline");
+    substituted_historical_row["disposition"]["contract"]["legacy_replacement_hint"]["replacement_ids"] =
+        json!([substituted_replacement_id]);
+    substituted_historical_row["disposition"]["edge_ids"] = json!([substituted_edge_id]);
+    refresh_ledger_hashes(&mut substituted_historical_value);
+    let substituted_historical: TestReplacementLedgerV2 =
+        serde_json::from_value(substituted_historical_value)
+            .expect("substituted historical ledger parses");
+    substituted_historical
+        .validate()
+        .expect("substituted historical ledger remains internally valid");
+    let error = validate_inventory_ledger_predecessor_closure_with_recaptures(
+        &checked_inventory,
+        &substituted_historical,
+        &checked_recovery_raw,
+        &checked_transition_receipts,
+        &issuer,
+        Some(&checked_doctest_recapture_raw),
+        Some(&checked_unittest_recapture_raw),
+        Some(&predecessor_ledger_raw),
+    )
+    .expect_err("Rust rejects a rehashed non-unittest historical edge substitution");
+    eprintln!(
+        "full inventory: historical edge tampering checked after {:?}",
+        started.elapsed()
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("historical replacement mapping changed from the exact frozen V1 graph"),
+        "historical edge substitution must fail with the Python parity diagnostic: {error}"
+    );
+}
+
+#[test]
+fn materialized_recovery_bundle_preserves_frozen_mapping_parity() {
+    assert_materialized_recovery_bundle_and_frozen_mapping_parity();
+}
+
+#[test]
+fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
+    let started = std::time::Instant::now();
+    let bundle = full_scale_python_bundle_with_hash_parity();
     let inventory: FrozenTestInventoryV2 =
         serde_json::from_value(bundle["inventory"].clone()).expect("inventory parses");
     let ledger: TestReplacementLedgerV2 =
@@ -1047,6 +1230,69 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
         Some(&doctest_recapture_raw),
     )
     .expect("full-scale predecessor closure validates in Rust");
+    let current_declaration = bundle["inventory"]["declaration_universe"]
+        .as_array()
+        .expect("declaration universe is an array")
+        .iter()
+        .find(|declaration| declaration["kind"] == "post-baseline-current")
+        .expect("fixture has a post-baseline-current declaration");
+    let current_row = bundle["ledger"]["rows"]
+        .as_array()
+        .expect("ledger rows are an array")
+        .iter()
+        .find(|row| row["obligation_id"] == current_declaration["obligation_id"])
+        .expect("fixture has the post-baseline-current ledger row");
+    let expected_current_entry_sha256 = proof_hash(
+        ExecutableInventoryEntryV2::SEMANTIC_HASH_DOMAIN,
+        &current_declaration["entry"],
+    )
+    .expect("current declaration entry hashes");
+    assert_eq!(
+        current_row["disposition"]["inventory_entry_semantic_sha256"],
+        expected_current_entry_sha256.as_str(),
+    );
+    let substituted_entry = bundle["inventory"]["declaration_universe"]
+        .as_array()
+        .expect("declaration universe is an array")
+        .iter()
+        .find(|declaration| declaration["obligation_id"] != current_declaration["obligation_id"])
+        .expect("fixture has an unrelated declaration");
+    let substituted_entry_sha256 = proof_hash(
+        ExecutableInventoryEntryV2::SEMANTIC_HASH_DOMAIN,
+        &substituted_entry["entry"],
+    )
+    .expect("substituted declaration entry hashes");
+    let mut substituted_current_value = bundle["ledger"].clone();
+    let substituted_current_row = substituted_current_value["rows"]
+        .as_array_mut()
+        .expect("ledger rows are an array")
+        .iter_mut()
+        .find(|row| row["obligation_id"] == current_declaration["obligation_id"])
+        .expect("fixture has the post-baseline-current ledger row");
+    substituted_current_row["disposition"]["inventory_entry_semantic_sha256"] =
+        json!(substituted_entry_sha256);
+    refresh_ledger_hashes(&mut substituted_current_value);
+    let substituted_current: TestReplacementLedgerV2 =
+        serde_json::from_value(substituted_current_value)
+            .expect("entry-substituted current ledger parses");
+    substituted_current
+        .validate()
+        .expect("entry-substituted current ledger has internally consistent hashes");
+    let error = validate_inventory_ledger_predecessor_closure_with_recapture(
+        &inventory,
+        &substituted_current,
+        &recovery_raw,
+        &transition_receipts,
+        &issuer,
+        Some(&doctest_recapture_raw),
+    )
+    .expect_err("closure rejects current disposition entry substitution after rehashing");
+    assert!(
+        error
+            .to_string()
+            .contains("current disposition does not bind its exact inventory declaration entry"),
+        "current entry substitution must fail with the Python parity diagnostic: {error}"
+    );
     validate_inventory_ledger_predecessor_closure_with_recaptures(
         &inventory,
         &ledger,
@@ -1072,6 +1318,12 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
         .is_err(),
         "strongest closure rejects a foreign typed packet in the unittest slot"
     );
+
+    eprintln!(
+        "full inventory: fixture closure checked after {:?}",
+        started.elapsed()
+    );
+    assert_materialized_recovery_bundle_and_frozen_mapping_parity();
 
     let mut authority_tampered_receipts_value = bundle["transition_receipts"].clone();
     let authority_tampered_receipt = authority_tampered_receipts_value
@@ -1255,10 +1507,10 @@ fn full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity() {
         .as_array()
         .expect("ledger rows are an array")
         .iter()
-        .filter(|row| row["baseline_id"].is_null())
+        .filter(|row| row["disposition"]["kind"] == "exception")
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(source_rows.len(), 3);
+    assert_eq!(source_rows.len(), 2);
 
     {
         let mut omitted_value = bundle["ledger"].clone();

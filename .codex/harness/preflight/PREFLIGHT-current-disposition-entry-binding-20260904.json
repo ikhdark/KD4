@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:current-disposition-entry-binding-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    { "path": ".codex/harness/preflight/PREFLIGHT-current-disposition-entry-binding-20260904.json", "recursive": false },
+    { "path": ".codex/harness/preflight/PREFLIGHT-current-disposition-entry-binding-20260904.receipt.json", "recursive": false },
+    { "path": "scripts/completion_proof_inventory_v2.py", "recursive": false },
+    { "path": "scripts/test_completion_proof_inventory_v2.py", "recursive": false },
+    { "path": "codex-rs/validation-contracts/src/inventory_v2.rs", "recursive": false },
+    { "path": "codex-rs/validation-contracts/tests/cross_language_vectors.rs", "recursive": false }
+  ],
+  "contract_claims": [
+    "post-baseline-current-disposition-entry-binding"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof_inventory_v2.InventoryV2SharedContractTests.test_full_scale_fixture_validates_with_cross_language_hash_anchors",
+    "cargo test --manifest-path codex-rs/Cargo.toml -p codex-validation-contracts --test cross_language_vectors full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity -- --exact",
+    "git diff --check"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:/Users/kuh/Desktop/kd4/codex-rs/target/lanes/codex-validation-contracts",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

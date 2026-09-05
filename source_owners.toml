@@ -152,6 +152,26 @@ statement = "Model tool calls are dispatched through the registry/router contrac
 evidence = [{ path = "codex-rs/core/src/tools/registry.rs", symbol = "ToolRegistry" }, { path = "codex-rs/core/src/tools/router.rs", symbol = "ToolRouter" }]
 tests = ["codex-rs/core/src/tools/router_tests.rs", "codex-rs/core/src/tools/registry_tests.rs"]
 
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/core/src/tools/handlers/test_quality.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/tools/spec_plan.rs", symbol = "TestQualityHandler" }, { path = "codex-rs/core/src/tools/handlers/test_quality.rs", symbol = "review_test_quality" }]
+
+[[owners.invariants]]
+id = "ordinary-focused-test-quality"
+kind = "semantic"
+statement = "Ordinary completion verifies current focused coverage and private defect-sensitive independent review for changed tests; reviewed dependency inputs scope reuse. Only explicitly requested completion-proof establishes fresh whole-repository certification, and the gate never launches tests."
+evidence = [{ path = "codex-rs/core/src/completion_proof.rs", symbol = "check_gate" }, { path = "codex-rs/core/src/completion_proof/focused_completion.rs", symbol = "FocusedCompletionState" }, { path = "codex-rs/core/src/completion_proof/test_quality.rs", symbol = "review_test_quality" }, { path = "codex-rs/core/src/completion_proof/test_declarations.rs", symbol = "test_declarations" }]
+tests = ["codex-rs/core/tests/suite/completion_proof_gate.rs", "scripts/test_completion_proof.py"]
+
+[[owners.validation]]
+id = "core-focused-test-quality"
+cwd = "."
+argv = ["just", "core-test-lane", "core_cli_workspace", "-E", "test(suite::completion_proof_gate::test_quality_) | test(suite::completion_proof_gate::focused_completion_)"]
+role = "focused_tests"
+
 [[owners.validation]]
 id = "core-focused"
 cwd = "."
@@ -892,6 +912,7 @@ evidence = [
     { path = "justfile", symbol = "export JUST_SHELL :=" },
     { path = "justfile", symbol = "set shell :=" },
     { path = "scripts/build_tooling_test_support.py", symbol = "load_just_shell_module" },
+    { path = "scripts/root_maintenance.py", symbol = "SCRIPT_TEST_MODULES" },
     { path = "justfile", symbol = "audit-scripts *args:" },
     { path = "justfile", symbol = "source-map-check:" },
     { path = "scripts/readme_toc.py", symbol = "main" },
@@ -916,6 +937,12 @@ role = "focused_tests"
 id = "readme-toc-owner-closure-focused"
 cwd = "."
 argv = ["python", "-m", "unittest", "scripts.test_source_owners.SourceOwnersCliTest.test_repository_maintenance_slice_resolves_readme_toc_cli_and_test"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "completion-proof-maintenance-routing-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_build_tooling_policy.BuildToolingPolicyTest.test_root_maintenance_routes_completion_proof_contract_tests"]
 role = "focused_tests"
 
 [[owners]]
@@ -1041,7 +1068,23 @@ feature_ids = ["completion-proof"]
 concern_ids = ["terminal-certification", "frozen-test-inventory", "validation-contracts"]
 aliases = ["completion proof", "frozen test inventory"]
 phrases = ["canonical completion certification and inventory reconciliation"]
-roots = ["scripts/completion_proof.py", "scripts/completion_proof_inventory_v2.py", "scripts/materialize_completion_proof_inventory_v2.py", "codex-rs/validation-contracts", ".codex/validation"]
+roots = [
+    "scripts/completion_proof.py",
+    "scripts/completion_proof_canonical.py",
+    "scripts/completion_proof_inventory_v2.py",
+    "scripts/materialize_completion_proof_inventory_v2.py",
+    ".codex/validation/child-validation-journal-v1.schema.json",
+    "codex-rs/validation-contracts/Cargo.toml",
+    "codex-rs/validation-contracts/src/applicability.rs",
+    "codex-rs/validation-contracts/src/canonical.rs",
+    "codex-rs/validation-contracts/src/inventory_v2.rs",
+    "codex-rs/validation-contracts/src/lib.rs",
+    "codex-rs/validation-contracts/src/path.rs",
+    "codex-rs/validation-contracts/src/receipts.rs",
+    "codex-rs/validation-contracts/src/recovery.rs",
+    "codex-rs/validation-contracts/src/runner.rs",
+    "codex-rs/validation-contracts/src/selection.rs",
+]
 primary_entries = [
     { path = "scripts/completion_proof.py", symbol = "main", ambiguous = true },
     { path = "scripts/completion_proof_inventory_v2.py", symbol = "validate_frozen_test_inventory_v2" },
@@ -1049,7 +1092,10 @@ primary_entries = [
     { path = "codex-rs/validation-contracts/src/inventory_v2.rs", symbol = "FrozenTestInventoryV2" },
 ]
 instructions = ["AGENTS.md"]
-consumers = ["codex-rs/core/src/completion_proof.rs"]
+consumers = [
+    "codex-rs/core/src/completion_proof.rs",
+    "scripts/replacement_admission.py",
+]
 contracts = [
     ".codex/validation/completion-proof.toml",
     ".codex/validation/frozen-test-inventory-v2-recoveries.schema.json",
@@ -1074,7 +1120,6 @@ tests = [
     "scripts/test_materialize_completion_proof_inventory_v2.py",
     "codex-rs/validation-contracts/tests/cross_language_vectors.rs",
     "codex-rs/core/tests/suite/completion_proof_gate.rs",
-    "scripts/test_source_owners.py",
 ]
 
 [[owners.relationships]]
@@ -1083,6 +1128,16 @@ kind = "calls"
 target = "path:scripts/completion_proof.py"
 confidence = "declared"
 evidence = [{ path = "justfile", symbol = "completion-proof:" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:scripts/completion_proof_canonical.py"
+confidence = "declared"
+evidence = [
+    { path = "scripts/completion_proof_inventory_v2.py", symbol = "canonical_jcs" },
+    { path = "scripts/completion_proof_inventory_v2.py", symbol = "proof_hash" },
+]
 
 [[owners.relationships]]
 category = "callers_consumers"
@@ -1174,9 +1229,26 @@ tests = ["scripts/test_completion_proof_inventory_v2.py", "codex-rs/validation-c
 [[owners.invariants]]
 id = "cross-language-validation-contract-parity"
 kind = "compatibility"
-statement = "Python inventory validation and the production-dormant Rust contract crate accept the same canonical vectors and bind the same schema resources."
-evidence = [{ path = "scripts/fixtures/completion_proof_v2_cross_language_vectors.json" }]
-tests = ["scripts/test_completion_proof_inventory_v2.py", "codex-rs/validation-contracts/tests/cross_language_vectors.rs"]
+statement = "Python inventory validation and the focused live-successor and approval contracts remain compatible with the production-dormant Rust contract crate through shared canonical vectors, schema resources, and trusted-current-context behavior."
+evidence = [
+    { path = "scripts/completion_proof_canonical.py", symbol = "canonical_jcs" },
+    { path = "scripts/completion_proof_canonical.py", symbol = "proof_hash" },
+    { path = "scripts/fixtures/completion_proof_v2_cross_language_vectors.json" },
+    { path = "scripts/focused_live_successor_catalog.py", symbol = "validate_focused_live_successor_catalog_semantics_v1" },
+    { path = "scripts/focused_replacement_approval_receipt.py", symbol = "validate_against_trusted_current_context_v1" },
+    { path = ".codex/validation/focused-live-successor-catalog-v1.schema.json" },
+    { path = ".codex/validation/focused-replacement-approval-receipt-v1.schema.json" },
+    { path = "scripts/fixtures/focused_live_successor_catalog_v1_vectors.json" },
+    { path = "scripts/fixtures/focused_replacement_approval_receipt_v1_vectors.json" },
+]
+tests = [
+    "scripts/test_completion_proof_inventory_v2.py",
+    "scripts/test_focused_live_successor_catalog.py",
+    "scripts/test_focused_replacement_approval_receipt.py",
+    "codex-rs/validation-contracts/tests/cross_language_vectors.rs",
+    "codex-rs/validation-contracts/tests/focused_live_successor_catalog.rs",
+    "codex-rs/validation-contracts/tests/focused_replacement_approval_receipt.rs",
+]
 
 [[owners.validation]]
 id = "completion-proof-source-owner-focused"
@@ -1203,11 +1275,215 @@ argv = ["cargo", "test", "-p", "codex-validation-contracts"]
 role = "focused_tests"
 
 [[owners]]
+id = "completion-proof-focused-contracts"
+feature_ids = ["completion-proof"]
+concern_ids = [
+    "typed-canonical-journal",
+    "focused-live-successor-catalog",
+    "focused-replacement-approval-receipt",
+    "historical-replacement-review-authority",
+    "focused-evidence-frame-v1-binary-contract",
+    "focused-evidence-ack-v1-binary-contract",
+    "focused-process-set-canonical-parser",
+]
+aliases = ["completion proof focused contracts", "focused successor approval contracts", "focused evidence frame"]
+phrases = [
+    "typed canonical completion journal and focused successor catalog approval contract parity",
+    "focused evidence frame and acknowledgement binary transport",
+]
+roots = [
+    "scripts/focused_live_successor_catalog.py",
+    "scripts/current_evidence_successor_projection.py",
+    "scripts/focused_replacement_approval_receipt.py",
+    "codex-rs/validation-contracts/src/focused_evidence_frame.rs",
+    "codex-rs/validation-contracts/src/focused_live_successor.rs",
+    "codex-rs/validation-contracts/src/focused_replacement_approval.rs",
+    "codex-rs/validation-contracts/src/historical_replacement_acceptance.rs",
+]
+primary_entries = [
+    { path = "scripts/focused_live_successor_catalog.py", symbol = "validate_focused_live_successor_catalog_semantics_v1" },
+    { path = "scripts/current_evidence_successor_projection.py", symbol = "build_current_successor_projection_v1" },
+    { path = "scripts/focused_replacement_approval_receipt.py", symbol = "validate_against_trusted_current_context_v1" },
+    { path = "codex-rs/validation-contracts/src/focused_evidence_frame.rs", symbol = "FocusedEvidenceFrameV1" },
+    { path = "codex-rs/validation-contracts/src/focused_live_successor.rs", symbol = "FocusedLiveSuccessorCatalogV1" },
+    { path = "codex-rs/validation-contracts/src/focused_live_successor.rs", symbol = "parse_inventory_discovery_process_set_canonical_v1" },
+    { path = "codex-rs/validation-contracts/src/focused_replacement_approval.rs", symbol = "FocusedReplacementApprovalReceiptV1" },
+    { path = "codex-rs/validation-contracts/src/historical_replacement_acceptance.rs", symbol = "HistoricalReplacementAcceptanceProposalV1" },
+]
+instructions = ["AGENTS.md"]
+consumers = [
+    "scripts/completion_proof.py",
+    "codex-rs/core/src/completion_proof.rs",
+]
+contracts = [
+    ".codex/validation/focused-live-successor-catalog-v1.schema.json",
+    ".codex/validation/focused-replacement-approval-receipt-v1.schema.json",
+    "scripts/fixtures/focused_live_successor_catalog_v1_vectors.json",
+    "scripts/fixtures/focused_replacement_approval_receipt_v1_vectors.json",
+]
+generated_mirrors = []
+tests = [
+    "scripts/test_completion_proof_typed_canonical.py",
+    "scripts/test_completion_proof_current_evidence.py",
+    "scripts/test_focused_live_successor_catalog.py",
+    "scripts/test_focused_replacement_approval_receipt.py",
+    "codex-rs/core/tests/suite/completion_proof_gate.rs",
+    "codex-rs/validation-contracts/tests/focused_evidence_frame.rs",
+    "codex-rs/validation-contracts/tests/focused_live_successor_catalog.rs",
+    "codex-rs/validation-contracts/tests/focused_replacement_approval_receipt.rs",
+    "codex-rs/validation-contracts/tests/historical_replacement_acceptance.rs",
+]
+
+[owners.facet_exclusions]
+configuration_and_gates = "Schemas and vectors are validation contracts rather than runtime configuration gates."
+generated_artifacts = "These validators consume checked-in schemas and vectors and generate no repository artifact."
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:scripts/completion_proof.py"
+confidence = "declared"
+evidence = [{ path = "scripts/completion_proof.py", symbol = "_run_current_evidence_attempt" }]
+
+[[owners.relationships]]
+category = "callers_consumers"
+kind = "consumed_by"
+target = "path:codex-rs/core/src/completion_proof.rs"
+confidence = "declared"
+evidence = [{ path = "codex-rs/core/src/completion_proof.rs", symbol = "validate_current_evidence_frame" }, { path = "codex-rs/core/src/completion_proof.rs", symbol = "finish_focused_replacement_approval" }, { path = "codex-rs/core/src/completion_proof.rs", symbol = "prepare_historical_acceptance_review" }, { path = "codex-rs/core/src/completion_proof.rs", symbol = "finish_historical_acceptance_review" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/agent-task-store/src/local.rs"
+confidence = "compiler_resolved"
+evidence = [{ path = "codex-rs/core/src/tools/handlers/multi_agents_v2/task.rs", symbol = "submit_agent_receipt_for_review_target" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:scripts/completion_proof_canonical.py"
+confidence = "declared"
+evidence = [
+    { path = "scripts/focused_live_successor_catalog.py", symbol = "canonical_jcs" },
+    { path = "scripts/focused_live_successor_catalog.py", symbol = "proof_hash" },
+    { path = "scripts/focused_replacement_approval_receipt.py", symbol = "canonical_jcs" },
+    { path = "scripts/focused_replacement_approval_receipt.py", symbol = "proof_hash" },
+]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:scripts/completion_proof_inventory_v2.py"
+confidence = "declared"
+evidence = [{ path = "scripts/focused_live_successor_catalog.py", symbol = "validate_execution_input_contract_v1" }]
+
+[[owners.relationships]]
+category = "control_flow"
+kind = "calls"
+target = "path:codex-rs/validation-contracts/src/canonical.rs"
+confidence = "compiler_resolved"
+evidence = [
+    { path = "codex-rs/validation-contracts/src/focused_evidence_frame.rs", symbol = "parse_canonical_jcs(manifest_bytes)" },
+    { path = "codex-rs/validation-contracts/src/focused_live_successor.rs", symbol = "parse_canonical_jcs(bytes)" },
+]
+
+[[owners.relationships]]
+category = "runtime_registration"
+kind = "registers"
+target = "path:codex-rs/validation-contracts/src/lib.rs"
+confidence = "compiler_resolved"
+evidence = [
+    { path = "codex-rs/validation-contracts/src/lib.rs", symbol = "pub mod focused_evidence_frame" },
+    { path = "codex-rs/validation-contracts/src/lib.rs", symbol = "pub mod focused_live_successor" },
+    { path = "codex-rs/validation-contracts/src/lib.rs", symbol = "pub mod focused_replacement_approval" },
+    { path = "codex-rs/validation-contracts/src/lib.rs", symbol = "pub mod historical_replacement_acceptance" },
+]
+
+[[owners.invariants]]
+id = "historical-replacement-review-authority"
+kind = "compatibility"
+statement = "Historical review authority requires a single-use process-private fresh reviewer admission bound to the exact immutable review-plan contract, live binding, and current authenticated reconciliation receipt; reviewer contract and target sealing are checked in the same task-store transaction."
+evidence = [
+    { path = "codex-rs/core/src/agent/control.rs", symbol = "take_fresh_historical_review_admission" },
+    { path = "codex-rs/core/src/agent/control/spawn.rs", symbol = "capture_fresh_assignment" },
+    { path = "codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs", symbol = "capture_fresh_assignment" },
+    { path = "codex-rs/agent-task-store/src/local.rs", symbol = "validate_review_target_receipt_guard_tx" },
+]
+tests = ["codex-rs/core/tests/suite/completion_proof_gate.rs", "codex-rs/agent-task-store/src/tests.rs", "codex-rs/validation-contracts/tests/historical_replacement_acceptance.rs"]
+
+[[owners.invariants]]
+id = "focused-evidence-frame-v1-binary-contract"
+kind = "compatibility"
+statement = "Focused evidence accepts only the exact bounded KD4EVID1 header, canonical ordered manifest, contiguous positive-length members, and digest-matching payload defined by the version-one binary contract."
+evidence = [
+    { path = "codex-rs/validation-contracts/src/focused_evidence_frame.rs", symbol = "FocusedEvidenceHeaderV1" },
+    { path = "codex-rs/validation-contracts/src/focused_evidence_frame.rs", symbol = "FocusedEvidenceFrameV1" },
+]
+tests = ["codex-rs/validation-contracts/tests/focused_evidence_frame.rs"]
+
+[[owners.invariants]]
+id = "focused-evidence-ack-v1-binary-contract"
+kind = "compatibility"
+statement = "Focused evidence acknowledgements are exact 48-byte KD4EVACK records bound to the raw frame digest and permit only accepted or complete-frame-rejected reasons."
+evidence = [{ path = "codex-rs/validation-contracts/src/focused_evidence_frame.rs", symbol = "FocusedEvidenceAckV1" }]
+tests = ["codex-rs/validation-contracts/tests/focused_evidence_frame.rs"]
+
+[[owners.invariants]]
+id = "focused-process-set-canonical-parser"
+kind = "compatibility"
+statement = "The focused process-set parser accepts only canonical JSON for the exact typed six-process inventory-discovery set and rejects unknown fields or invalid process authority."
+evidence = [{ path = "codex-rs/validation-contracts/src/focused_live_successor.rs", symbol = "parse_inventory_discovery_process_set_canonical_v1" }]
+tests = ["codex-rs/validation-contracts/tests/focused_evidence_frame.rs"]
+
+[[owners.validation]]
+id = "completion-proof-typed-canonical-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_completion_proof_typed_canonical"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "focused-live-successor-python-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_focused_live_successor_catalog"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "completion-proof-current-evidence-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_completion_proof_current_evidence"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "focused-live-successor-rust-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-validation-contracts", "--test", "focused_live_successor_catalog"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "focused-evidence-frame-rust-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-validation-contracts", "--test", "focused_evidence_frame"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "focused-replacement-approval-python-focused"
+cwd = "."
+argv = ["python", "-m", "unittest", "scripts.test_focused_replacement_approval_receipt"]
+role = "focused_tests"
+
+[[owners.validation]]
+id = "focused-replacement-approval-rust-focused"
+cwd = "codex-rs"
+argv = ["cargo", "test", "-p", "codex-validation-contracts", "--test", "focused_replacement_approval_receipt"]
+role = "focused_tests"
+
+[[owners]]
 id = "replacement-admission-certification"
 feature_ids = ["completion-proof"]
-concern_ids = ["replacement-admission", "replacement-successor-catalog", "baseline-replacement-mapping"]
+concern_ids = ["replacement-admission", "replacement-successor-catalog", "baseline-replacement-mapping", "trusted-defect-receipt-provenance"]
 aliases = ["replacement admission", "successor catalog"]
-phrases = ["dormant replacement mapping admission and caller-supplied successor boundary"]
+phrases = ["dormant replacement mapping admission, caller-supplied successor boundary, and untrusted defect-receipt provenance boundary"]
 roots = [
     "scripts/replacement_admission.py",
     ".codex/validation/replacement-admissions-v1.schema.json",
@@ -1223,6 +1499,7 @@ contracts = [
     ".codex/validation/replacement-admissions-v1.json",
     ".codex/validation/frozen-test-inventory-v1.json",
     ".codex/validation/test-replacements-v1.json",
+    ".codex/validation/test-replacements-v2.json",
     ".codex/validation/stage2-incorrect-behaviors-v1.txt",
 ]
 generated_mirrors = []
@@ -1232,7 +1509,7 @@ tests = [
 ]
 
 [owners.facet_exclusions]
-generated_artifacts = "The dormant admission layer owns no checked-in generated mirror; its projection is written only to a caller-selected path."
+generated_artifacts = "The dormant admission layer owns no checked-in generated mirror and issues no trusted defect receipt; its projection is written only to a caller-selected path, with nonempty materialization fail-closed."
 
 [[owners.relationships]]
 category = "control_flow"
@@ -1247,6 +1524,13 @@ kind = "reads_config"
 target = "config:.codex/validation/replacement-admissions-v1.json"
 confidence = "compiler_resolved"
 evidence = [{ path = "scripts/replacement_admission.py", symbol = "validate_manifest", ambiguous = true }]
+
+[[owners.relationships]]
+category = "configuration"
+kind = "reads_config"
+target = "config:.codex/validation/test-replacements-v2.json"
+confidence = "compiler_resolved"
+evidence = [{ path = "scripts/replacement_admission.py", symbol = "_load_current_v2_rows" }]
 
 [[owners.relationships]]
 category = "callers_consumers"
@@ -1267,6 +1551,16 @@ id = "replacement-successor-catalog-boundary"
 kind = "compatibility"
 statement = "Nonempty admissions require an exact caller-supplied successor catalog; the dormant validator does not authenticate currentness or infer, normalize, or manufacture successor identities from predecessor hints."
 evidence = [{ path = "scripts/replacement_admission.py", symbol = "_load_successor_catalog" }]
+tests = ["scripts/test_replacement_admission.py"]
+
+[[owners.invariants]]
+id = "replacement-trusted-defect-receipt-provenance-boundary"
+kind = "semantic"
+statement = "Caller-supplied `--trusted-defect-receipts` data is structural evidence only: this dormant layer validates receipt shape, self-hash, closure, and admission bindings but does not issue or authenticate receipt provenance, and that input cannot authorize nonempty projection materialization or atomic V2 activation."
+evidence = [
+    { path = "scripts/replacement_admission.py", symbol = "_load_trusted_defect_receipts" },
+    { path = "scripts/replacement_admission.py", symbol = "materialize_projection" },
+]
 tests = ["scripts/test_replacement_admission.py"]
 
 [[owners.validation]]

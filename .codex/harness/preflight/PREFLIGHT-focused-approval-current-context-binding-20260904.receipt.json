@@ -1,0 +1,108 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "worker:canonical-typed-v2-current-registration-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\none"
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-focused-approval-current-context-binding-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-focused-approval-current-context-binding-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          "scripts/focused_replacement_approval_receipt.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_focused_replacement_approval_receipt.py",
+          "scripts"
+        ],
+        [
+          "scripts/fixtures/focused_replacement_approval_receipt_v1_vectors.json",
+          "scripts"
+        ],
+        [
+          "codex-rs/validation-contracts/tests/focused_replacement_approval_receipt.rs",
+          "codex-rs"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "worker:completion-proof-python-hardening-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\none"
+    },
+    {
+      "assignment_id": "worker:completion-proof-maintenance-registration-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\none"
+    }
+  ],
+  "assignment_id": "worker:focused-approval-current-context-binding-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\none",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\none"
+  },
+  "contract_claims": [
+    "focused-approval-exact-trusted-current-context-binding"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T13:57:54.839064+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "9abd6d46c4098b27015b0bb58aa6613e80106168d4312ef39ea8cbd7e1bf1a75",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-focused-approval-current-context-binding-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-focused-approval-current-context-binding-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/focused_replacement_approval_receipt.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_focused_replacement_approval_receipt.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/fixtures/focused_replacement_approval_receipt_v1_vectors.json",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/tests/focused_replacement_approval_receipt.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T12:57:54.839064+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "46a5a33676262980d4905522f03b291de82ab0e486573abdccbe7ba2eeecd14a"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_focused_replacement_approval_receipt",
+    "python -m py_compile scripts/focused_replacement_approval_receipt.py scripts/test_focused_replacement_approval_receipt.py",
+    "git diff --check"
+  ],
+  "validation_owner": "worker:focused-approval-current-context-binding-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

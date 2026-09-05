@@ -99,7 +99,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
         payloads = [json.loads(line) for line in output.splitlines() if line.strip()]
         return result, payloads
 
-    def test_completion_proof_test_store_is_private_default_off_and_release_safe(self) -> None:
+    def test_completion_proof_test_store_is_private_default_off_and_release_safe(
+        self,
+    ) -> None:
         feature = "completion-proof-test-store"
         core_manifest = load_toml(REPO_ROOT / "codex-rs" / "core" / "Cargo.toml")
         self.assertEqual(core_manifest.get("features", {}).get("default"), [])
@@ -138,18 +140,17 @@ class BuildToolingPolicyTest(unittest.TestCase):
             source,
         )
         release_branch = source.split(
-            '#[cfg(not(all(feature = "completion-proof-test-store", debug_assertions)))]',
+            '#[cfg(not(all(feature = "completion-proof-test-store", debug_assertions)))]\n'
+            "fn completion_proof_runtime_trust_store() -> Arc<dyn KeyringStore> {",
             1,
-        )[1].split("impl CompletionProofRuntimeRegistry", 1)[0]
+        )[1].split("\n}", 1)[0]
         self.assertIn("Arc::new(DefaultKeyringStore)", release_branch)
         self.assertNotIn("MockKeyringStore", release_branch)
 
         runner = (REPO_ROOT / "scripts" / "rust_test_runner.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn(
-            'frozenset({"codex-core/completion-proof-test-store"})', runner
-        )
+        self.assertIn('frozenset({"codex-core/completion-proof-test-store"})', runner)
 
     def test_build_metadata_is_owned_by_the_compiling_utility_crate(self) -> None:
         rust_root = REPO_ROOT / "codex-rs"
@@ -793,6 +794,38 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 "scripts.test_kd4_perf_snapshot",
             ],
         )
+
+    def test_root_maintenance_routes_completion_proof_contract_tests(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+
+        expected_routes = {
+            "scripts/completion_proof.py": (
+                "scripts.test_completion_proof",
+                "scripts.test_completion_proof_typed_canonical",
+                "scripts.test_completion_proof_current_evidence",
+            ),
+            "scripts/completion_proof_canonical.py": (
+                "scripts.test_completion_proof_inventory_v2",
+                "scripts.test_focused_live_successor_catalog",
+                "scripts.test_focused_replacement_approval_receipt",
+            ),
+            "scripts/focused_live_successor_catalog.py": (
+                "scripts.test_focused_live_successor_catalog",
+            ),
+            "scripts/current_evidence_successor_projection.py": (
+                "scripts.test_completion_proof_current_evidence",
+            ),
+            "scripts/focused_replacement_approval_receipt.py": (
+                "scripts.test_focused_replacement_approval_receipt",
+            ),
+        }
+
+        for changed_path, expected_modules in expected_routes.items():
+            with self.subTest(changed_path=changed_path):
+                self.assertEqual(
+                    root_maintenance.test_modules_for_changed_path(changed_path),
+                    expected_modules,
+                )
 
     def test_python_sdk_gate_and_publish_routing_match_source_map(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -2353,20 +2386,17 @@ class BuildToolingPolicyRuntimeTest(unittest.TestCase):
             ),
             "codex-cli/scripts/build_npm_package.py": "BUILD_PROBE = True\n",
             (
-                "codex-rs/app-server-test-client/scripts/"
-                "live_elicitation_hold.ps1"
+                "codex-rs/app-server-test-client/scripts/live_elicitation_hold.ps1"
             ): "Write-Output 'elicitation-probe'\n",
             "codex-rs/config/scripts/generate-proto.ps1": (
                 "Write-Output 'proto-probe'\n"
             ),
             (
-                "codex-rs/responses-api-proxy/npm/bin/"
-                "codex-responses-api-proxy.js"
+                "codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js"
             ): "#!/usr/bin/env node\nconsole.log('responses-probe');\n",
             "codex-rs/scripts/nextest_windows_stack.py": "NEXTEST_PROBE = True\n",
             (
-                "codex-rs/skills/src/assets/samples/imagegen/scripts/"
-                "image_gen.py"
+                "codex-rs/skills/src/assets/samples/imagegen/scripts/image_gen.py"
             ): "IMAGE_GEN_PROBE = True\n",
             "sdk/python/scripts/update_sdk_artifacts.py": "SDK_PROBE = True\n",
             "tools/argument-comment-lint/run.py": "LINT_PROBE = True\n",
@@ -2601,9 +2631,7 @@ elif tool == "just" and args == ["--summary"]:
             ) as run,
             contextlib.redirect_stdout(stdout),
         ):
-            returncode = root_maintenance.main(
-                ["audit-scripts", "--quick", "--strict"]
-            )
+            returncode = root_maintenance.main(["audit-scripts", "--quick", "--strict"])
 
         self.assertEqual(returncode, 2)
         self.assertEqual(run.call_count, 1)
@@ -2634,9 +2662,7 @@ elif tool == "just" and args == ["--summary"]:
             ) as run,
             contextlib.redirect_stdout(stdout),
         ):
-            returncode = root_maintenance.main(
-                ["audit-scripts", "--quick", "--strict"]
-            )
+            returncode = root_maintenance.main(["audit-scripts", "--quick", "--strict"])
 
         self.assertEqual(returncode, 2)
         self.assertEqual(run.call_count, 1)
@@ -2661,11 +2687,7 @@ elif tool == "just" and args == ["--summary"]:
                 tracked = subprocess.CompletedProcess(
                     ["git", "ls-files", "--stage", "-z"],
                     0,
-                    stdout=(
-                        b"100755 "
-                        + (b"a" * 40)
-                        + b" 0\ttracked-entrypoint\0"
-                    ),
+                    stdout=(b"100755 " + (b"a" * 40) + b" 0\ttracked-entrypoint\0"),
                     stderr=b"",
                 )
                 stdout = io.StringIO()
@@ -2714,9 +2736,7 @@ elif tool == "just" and args == ["--summary"]:
             ) as context_issues,
             contextlib.redirect_stdout(stdout),
         ):
-            returncode = root_maintenance.main(
-                ["audit-scripts", "--quick", "--strict"]
-            )
+            returncode = root_maintenance.main(["audit-scripts", "--quick", "--strict"])
 
         self.assertEqual(returncode, 2)
         context_issues.assert_not_called()
@@ -2762,9 +2782,7 @@ elif tool == "just" and args == ["--summary"]:
             mock.patch.object(root_maintenance, "run_script_audit_command") as run,
             contextlib.redirect_stdout(stdout),
         ):
-            returncode = root_maintenance.main(
-                ["audit-scripts", "--quick", "--strict"]
-            )
+            returncode = root_maintenance.main(["audit-scripts", "--quick", "--strict"])
 
         self.assertEqual(returncode, 2)
         run.assert_not_called()
@@ -2813,9 +2831,7 @@ elif tool == "just" and args == ["--summary"]:
             ) as run,
             contextlib.redirect_stdout(stdout),
         ):
-            returncode = root_maintenance.main(
-                ["audit-scripts", "--quick", "--strict"]
-            )
+            returncode = root_maintenance.main(["audit-scripts", "--quick", "--strict"])
 
         self.assertEqual(returncode, 0)
         run.assert_called_once_with(command)
@@ -2870,9 +2886,7 @@ elif tool == "just" and args == ["--summary"]:
             ) as run,
             contextlib.redirect_stdout(stdout),
         ):
-            returncode = root_maintenance.main(
-                ["audit-scripts", "--quick", "--strict"]
-            )
+            returncode = root_maintenance.main(["audit-scripts", "--quick", "--strict"])
 
         self.assertEqual(returncode, 2)
         run.assert_called_once_with(command)
@@ -2928,9 +2942,7 @@ elif tool == "just" and args == ["--summary"]:
             ) as run,
             contextlib.redirect_stdout(stdout),
         ):
-            returncode = root_maintenance.main(
-                ["audit-scripts", "--quick", "--strict"]
-            )
+            returncode = root_maintenance.main(["audit-scripts", "--quick", "--strict"])
 
         self.assertEqual(returncode, 1)
         run.assert_called_once_with(command)
@@ -2981,9 +2993,7 @@ elif tool == "just" and args == ["--summary"]:
             ) as run,
             contextlib.redirect_stdout(stdout),
         ):
-            returncode = root_maintenance.main(
-                ["audit-scripts", "--quick", "--strict"]
-            )
+            returncode = root_maintenance.main(["audit-scripts", "--quick", "--strict"])
 
         self.assertEqual(returncode, 1)
         run.assert_called_once_with(("injected-tool",))
@@ -3195,10 +3205,13 @@ elif tool == "just" and args == ["--summary"]:
                 "config-schema-regenerate <owner>"
             ),
         }.items():
+            source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
             self.assertIn(
                 command,
-                (REPO_ROOT / relative_path).read_text(encoding="utf-8"),
+                source,
             )
+            self.assertNotIn("just write-config-schema", source)
+            self.assertNotIn("just write-app-server-schema", source)
 
     def _assert_current_sdk_routing_contract(self) -> None:
         recipe = self.run_supported_command(["just", "--show", "sdk-python-check"])
@@ -3397,18 +3410,15 @@ elif tool == "just" and args == ["--summary"]:
                 "codex-cli/bin/codex.js": "javascript",
                 "codex-cli/scripts/build_npm_package.py": "python",
                 (
-                    "codex-rs/app-server-test-client/scripts/"
-                    "live_elicitation_hold.ps1"
+                    "codex-rs/app-server-test-client/scripts/live_elicitation_hold.ps1"
                 ): "powershell",
                 "codex-rs/config/scripts/generate-proto.ps1": "powershell",
                 (
-                    "codex-rs/responses-api-proxy/npm/bin/"
-                    "codex-responses-api-proxy.js"
+                    "codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js"
                 ): "javascript",
                 "codex-rs/scripts/nextest_windows_stack.py": "python",
                 (
-                    "codex-rs/skills/src/assets/samples/imagegen/scripts/"
-                    "image_gen.py"
+                    "codex-rs/skills/src/assets/samples/imagegen/scripts/image_gen.py"
                 ): "python",
                 "sdk/python/scripts/update_sdk_artifacts.py": "python",
                 "tools/argument-comment-lint/run.py": "python",
@@ -3921,7 +3931,15 @@ elif tool == "just" and args == ["--summary"]:
 
     def test_just_routes_through_just_cli(self) -> None:
         summary = self.run_supported_command(["just", "--summary"])
-        self.assertIn("completion-proof", summary.stdout.split())
+        recipes = summary.stdout.split()
+        self.assertIn("completion-proof", recipes)
+        self.assertNotIn("dead-code", recipes)
+        self.assertNotIn("test-full", recipes)
+        for retired_path in (
+            "scripts/run-powershell-script.ps1",
+            "scripts/test_run_powershell_script.py",
+        ):
+            self.assertFalse((REPO_ROOT / retired_path).exists())
         self.assert_migrated_contracts("just_routes")
 
     def test_workspace_analyzer_through_powershell_runtime(self) -> None:

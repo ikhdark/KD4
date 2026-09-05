@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:gate11-historical-proposal-contract-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "codex-rs/validation-contracts/src/historical_replacement_acceptance.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/src/inventory_v2.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/src/lib.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/tests/historical_replacement_acceptance.rs",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "worker:gate11-historical-proposal-contract-20260904"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "just test-fast -p codex-validation-contracts --test historical_replacement_acceptance"
+  ],
+  "cargo_lane": {
+    "target_dir": "none",
+    "cargo_home": "none"
+  },
+  "workspace_strategy": "shared"
+}

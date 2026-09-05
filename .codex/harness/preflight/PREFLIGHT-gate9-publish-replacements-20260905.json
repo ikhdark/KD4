@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "assignment_id": "gate9:publish-replacements-20260905",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "scripts/test_publish_local_codex.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_publish_local_codex_dry_run.py",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "gate9-approved-29-publish-replacements"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "gate9:publish-replacements-20260905",
+  "validation_owner": "gate9:publish-replacements-20260905",
+  "validation_commands": [
+    "python -m unittest scripts.test_publish_local_codex scripts.test_publish_local_codex_dry_run"
+  ],
+  "cargo_lane": {
+    "target_dir": ".codex/harness/runs/2026-09-02-completion-proof-migration/gate9-execution/no-cargo-publish-replacements",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

@@ -1,0 +1,60 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "source_owners.toml",
+          "source_owners.toml"
+        ],
+        [
+          "scripts/test_source_owners.py",
+          "scripts"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:replacement-source-owner-v2-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\replacement-source-owner-v2"
+  },
+  "contract_claims": [
+    "replacement-admission-v2-owner-and-untrusted-receipt-provenance"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T12:14:18.151621+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "7ecefa5aed7e2232ed9a2fb2cc6a000f746600bfbe8fcc29bc153898e1c87e9c",
+  "path_claims": [
+    {
+      "path": "source_owners.toml",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_source_owners.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T11:14:18.151621+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "e92912dc225d946b64adc32c2e11ddb39045a02d8d744b6d7201dd32de810ad8"
+  },
+  "validation_commands": [
+    "python scripts/source_owners.py validate",
+    "python -m unittest -q scripts.test_source_owners"
+  ],
+  "validation_owner": "worker:replacement-source-owner-v2-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

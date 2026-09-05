@@ -1016,25 +1016,27 @@ async fn emit_exec_end(
         observed_workspace_identity
     };
     if possible_mutation && exec_result.status != ExecCommandStatus::Declined {
-        if let Some(paths) = mutation_paths {
-            let paths = paths
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            ctx.session
-                .services
-                .git_workspace
-                .note_host_workspace_mutation_paths(
-                    native_cwd
-                        .as_ref()
-                        .map_or_else(|| std::path::Path::new("."), AbsolutePathBuf::as_path),
-                    &paths,
-                );
-        } else {
-            ctx.session
-                .services
-                .git_workspace
-                .note_host_workspace_mutation();
+        if !ctx.suppress_post_proof_mutation_observation {
+            if let Some(paths) = mutation_paths {
+                let paths = paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                ctx.session
+                    .services
+                    .git_workspace
+                    .note_host_workspace_mutation_paths(
+                        native_cwd
+                            .as_ref()
+                            .map_or_else(|| std::path::Path::new("."), AbsolutePathBuf::as_path),
+                        &paths,
+                    );
+            } else {
+                ctx.session
+                    .services
+                    .git_workspace
+                    .note_host_workspace_mutation();
+            }
         }
         if !defer_workspace_identity {
             ctx.session
@@ -1045,18 +1047,21 @@ async fn emit_exec_end(
                 )
                 .await;
         }
-        ctx.session
-            .services
-            .completion_proof
-            .note_mutation_paths(
-                native_cwd
-                    .as_ref()
-                    .map_or_else(|| ctx.turn.config.cwd.as_path(), AbsolutePathBuf::as_path),
-                mutation_paths,
-            )
-            .await;
+        if !ctx.suppress_post_proof_mutation_observation {
+            ctx.session
+                .services
+                .completion_proof
+                .note_mutation_paths(
+                    native_cwd
+                        .as_ref()
+                        .map_or_else(|| ctx.turn.config.cwd.as_path(), AbsolutePathBuf::as_path),
+                    mutation_paths,
+                )
+                .await;
+        }
     }
-    if exec_result.status != ExecCommandStatus::Declined
+    if !ctx.suppress_post_proof_mutation_observation
+        && exec_result.status != ExecCommandStatus::Declined
         && let Some(baseline) = post_proof_mutation_baseline
     {
         let proof_observation = match baseline.proof_observation {

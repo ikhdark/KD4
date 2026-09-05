@@ -9,6 +9,11 @@ frozen_inventory = ".codex/validation/frozen-test-inventory-v1.json"
 replacement_ledger = ".codex/validation/test-replacements-v1.json"
 host_platform = "windows"
 
+# Explicit preparatory evidence only; these existing validations still run
+# again during canonical certification. This is not a required-validation bypass.
+[focused_inventory_evidence]
+validation_ids = ["maintenance.root-unittest", "sdk.python.pytest"]
+
 # These tests require an independently installed Codex app-server and are
 # deliberately quarantined from the offline canonical certification.
 [[baseline_exception]]
@@ -244,7 +249,7 @@ id = "maintenance.source-map"
 runner = "typed-validation"
 validation_type = "source-map-consistency"
 owned_paths = ["SOURCEMAP.md", "architecture_index.json", "source_owners.toml"]
-consumed_paths = ["scripts/source_map_check.py", "scripts/source_owners.py", "scripts/asciicheck.py", "scripts/readme_toc.py", "justfile"]
+consumed_paths = ["scripts/source_map_check.py", "scripts/source_owners.py", "scripts/generated_output_lock.py", "scripts/asciicheck.py", "scripts/readme_toc.py", "justfile"]
 path_set_paths = ["**"]
 evidence_path_manifests = ["source_owners.toml"]
 timeout_seconds = 1800

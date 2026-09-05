@@ -1,0 +1,111 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-frozen-v1-historical-replacement-graph-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-frozen-v1-historical-replacement-graph-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          "scripts/completion_proof_inventory_v2.py",
+          "scripts"
+        ],
+        [
+          "scripts/materialize_completion_proof_inventory_v2.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_completion_proof_inventory_v2.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_materialize_completion_proof_inventory_v2.py",
+          "scripts"
+        ],
+        [
+          "codex-rs/validation-contracts/src/inventory_v2.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/validation-contracts/tests/cross_language_vectors.rs",
+          "codex-rs"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:frozen-v1-historical-replacement-graph-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\shared-read-mostly",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\shared-root-queue"
+  },
+  "contract_claims": [
+    "frozen-v1-historical-replacement-graph-closure",
+    "cross-language-predecessor-replacement-binding"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T18:49:57.870770+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "8913b4ad0ff6c7cce74956aa06ddd5d0f9bb8edffb6b44c9838d99970ff76b0f",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-frozen-v1-historical-replacement-graph-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-frozen-v1-historical-replacement-graph-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/completion_proof_inventory_v2.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/materialize_completion_proof_inventory_v2.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_completion_proof_inventory_v2.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_materialize_completion_proof_inventory_v2.py",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/src/inventory_v2.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/tests/cross_language_vectors.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T17:49:57.870770+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "7814c7480aa703730bf46b73a2e51fb6319f2ce56a725103a5def32c1cfdb476"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof_inventory_v2.InventoryV2SharedContractTests.test_non_unittest_legacy_replacement_edge_is_bound_to_frozen_v1",
+    "python -m unittest scripts.test_materialize_completion_proof_inventory_v2.InventoryV2MaterializationTests.test_real_cli_materializes_exact_full_repository_bundle",
+    "cargo test --manifest-path codex-rs/Cargo.toml -p codex-validation-contracts --test cross_language_vectors full_scale_python_artifact_bundle_validates_in_rust_with_hash_parity -- --exact",
+    "git diff --check"
+  ],
+  "validation_owner": "worker:frozen-v1-historical-replacement-graph-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

@@ -1,5 +1,109 @@
 {
-  "advisories": [],
+  "advisories": [
+    {
+      "assignment_id": "worker:gate11-historical-proposal-contract-20260904",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs",
+          "codex-rs/validation-contracts/src/historical_replacement_acceptance.rs"
+        ],
+        [
+          "codex-rs",
+          "codex-rs/validation-contracts/src/inventory_v2.rs"
+        ],
+        [
+          "codex-rs",
+          "codex-rs/validation-contracts/src/lib.rs"
+        ],
+        [
+          "codex-rs",
+          "codex-rs/validation-contracts/tests/historical_replacement_acceptance.rs"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "worker:gate10-ignored-listing-runtime-tests-20260904",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts",
+          "scripts/test_completion_proof.py"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "worker:gate10-ignored-listing-runtime-tests-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "gate10:ignored-listing-budget-20260904",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts",
+          "scripts/completion_proof.py"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "gate10:ignored-listing-budget-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "worker:gate12-materializer-staging-tests-20260904",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts",
+          "scripts/test_materialize_completion_proof_inventory_v2.py"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "gate11:admission-consumer-20260904",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs",
+          "codex-rs/core/src/completion_proof.rs"
+        ],
+        [
+          "codex-rs",
+          "codex-rs/core/src/tools/handlers/multi_agents_v2/task.rs"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "worker:gate11-session-fixture-20260904",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs",
+          "codex-rs/core/tests/suite/completion_proof_gate.rs"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "gate12:materializer-staging-20260904",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts",
+          "scripts/materialize_completion_proof_inventory_v2.py"
+        ]
+      ]
+    }
+  ],
   "assignment_id": "root:completion-proof-migration-20260902",
   "cargo_lane": {
     "cargo_home": "C:\\Users\\kuh\\.cargo",
@@ -14,17 +118,21 @@
     "stage2-incorrect-behavior-log"
   ],
   "dependencies": [],
-  "expires_at": "2026-09-04T08:20:32.804072+00:00",
+  "expires_at": "2026-09-05T02:47:05.499452+00:00",
   "generated_output_owner": "root:completion-proof-migration-20260902",
   "generated_outputs": [
     ".codex/validation/test-replacements-v1.json",
     ".codex/validation/test-replacements-v2.json",
     ".codex/validation/stage2-incorrect-behaviors-v1.txt"
   ],
-  "manifest_fingerprint": "3eabf66cef60c8c777922747ac7b0976f3c1b7d654bf7252c84231a5c24e3b42",
+  "manifest_fingerprint": "0e0ccf170d4ab82e234e88e7e5912a4058a9cff896dd8da0cfe0ff34440225ca",
   "path_claims": [
     {
       "path": ".codex",
+      "recursive": true
+    },
+    {
+      "path": ".fixture-state/current-evidence-materializer-probe-b055c8d553af40949c8c6faa037f4706",
       "recursive": true
     },
     {
@@ -64,17 +172,27 @@
       "recursive": true
     }
   ],
-  "recorded_at": "2026-09-04T07:20:32.804072+00:00",
+  "recorded_at": "2026-09-05T01:47:05.499452+00:00",
   "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
   "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
   "root_task_id": "completion-proof-migration-20260902",
   "schema_version": 1,
   "starting_revision": {
-    "commit": "586b9eb5fb44fdedb9917b172207cb001268695b",
-    "workspace_fingerprint": "224f76fe81fec0f163a9ba0f6f16d3d414361a715eac48b3ad3e4bcb472aa9d7"
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "b4557fdcc96ee3c2609dc649ae2a12fbffdf2a3af542c21a4bd1be37338ea70a"
   },
   "validation_commands": [
     "just source-map-check",
+    "just test-fast -p codex-validation-contracts --test historical_replacement_acceptance",
+    "cargo build -p codex-cli --bin codex",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::successful_focused_validation_does_not_satisfy_terminal_gate)'",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::focused_replacement_approval_requires_current_catalog_and_real_reconciliation)'",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::current_evidence_real_session_executes_both_and_rejects_nonterminal_misuse)'",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::yielded_missing_runner_attestation_is_rejected_through_write_stdin)'",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::missing_runner_attestation_is_pre_result_through_real_shell_path)'",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::rejected_terminal_candidate_is_not_published_by_later_required_tool_failure)'",
+    "just completion-focused inventory.current-evidence",
+    "python -m unittest scripts.test_completion_proof_current_evidence",
     "just completion-focused inventory.frozen-reconciliation",
     "just completion-focused maintenance.root-unittest",
     "just completion-focused rust.nextest.workspace",

@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "assignment_id": "gate12:materializer-staging-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "scripts/materialize_completion_proof_inventory_v2.py",
+      "recursive": false
+    },
+    {
+      "path": "SOURCEMAP.md",
+      "recursive": false
+    },
+    {
+      "path": "architecture_index.json",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/src/completion_proof.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/tests/suite/completion_proof_gate.rs",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "gate12-materializer-preparation-before-replacement",
+    "gate12-configured-inventory-bundle-consumption"
+  ],
+  "dependencies": [],
+  "generated_outputs": ["SOURCEMAP.md", "architecture_index.json"],
+  "generated_output_owner": "gate12:materializer-staging-20260904",
+  "validation_owner": "gate12:materializer-staging-20260904",
+  "validation_commands": [
+    "python -m unittest scripts.test_materialize_completion_proof_inventory_v2.InventoryV2MaterializationTests.test_real_cli_materializes_exact_full_repository_bundle",
+    "python -m unittest scripts.test_materialize_completion_proof_inventory_v2.InventoryV2MaterializationTests.test_real_cli_materializes_dormant_bundle_without_recovery_packet",
+    "python -",
+    "just source-map-check",
+    "python scripts/source_owners.py generate",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::configured_inventory_bundle_paths_control_real_session_proof)'"
+  ],
+  "cargo_lane": {
+    "target_dir": "codex-rs/target",
+    "cargo_home": "C:/Users/kuh/scoop/persist/rustup/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

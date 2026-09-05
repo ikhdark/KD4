@@ -1,0 +1,85 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-contributor-resume-regression-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-contributor-resume-regression-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          "codex-rs/core/tests/suite/completion_proof_gate.rs",
+          "codex-rs"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "worker:contributor-resume-authority-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "worker:direct-argv-shell-ownership-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    }
+  ],
+  "assignment_id": "worker:contributor-resume-regression-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+  },
+  "contract_claims": [
+    "real-session-contributor-public-resume-and-fork-regression"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902",
+    "worker:contributor-resume-authority-20260904"
+  ],
+  "expires_at": "2026-09-04T22:40:37.192142+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "d88e98054dbb73f9e43b363decc1ed4d39d2e73067c93ad68a874176c71a06cc",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-contributor-resume-regression-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-contributor-resume-regression-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/tests/suite/completion_proof_gate.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T21:40:37.192142+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "1d4337c3970332f5e3e3b7e14f94d7a7f32fa0252cb28669a3ef55085d304bcc"
+  },
+  "validation_commands": [
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::explicit_admission_not_session_source_selects_terminal_authority)'",
+    "rustfmt --edition 2024 --check codex-rs/core/tests/suite/completion_proof_gate.rs",
+    "git diff --check"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

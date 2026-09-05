@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:contributor-resume-authority-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    { "path": ".codex/harness/preflight/PREFLIGHT-contributor-resume-authority-20260904.json", "recursive": false },
+    { "path": ".codex/harness/preflight/PREFLIGHT-contributor-resume-authority-20260904.receipt.json", "recursive": false },
+    { "path": "codex-rs/core/src/completion_proof.rs", "recursive": false },
+    { "path": "codex-rs/core/src/thread_manager.rs", "recursive": false },
+    { "path": "codex-rs/core/src/session/session.rs", "recursive": false }
+  ],
+  "contract_claims": ["contributor-role-preserved-through-registered-public-resume-and-fork"],
+  "dependencies": ["root:completion-proof-migration-20260902"],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::explicit_admission_not_session_source_selects_terminal_authority)'",
+    "just core-test-fast core_cli_workspace -E 'test(=suite::completion_proof_gate::canonical_proof_survives_same_process_compact_resume_and_authorized_root_fork)'",
+    "rustfmt --edition 2024 --check codex-rs/core/src/completion_proof.rs codex-rs/core/src/thread_manager.rs codex-rs/core/src/session/session.rs codex-rs/core/tests/suite/completion_proof_gate.rs",
+    "git diff --check"
+  ],
+  "cargo_lane": { "target_dir": "codex-rs/target", "cargo_home": "C:/Users/kuh/.cargo" },
+  "workspace_strategy": "shared"
+}

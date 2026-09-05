@@ -1,3 +1,4 @@
+use crate::cap::refresh_cap_sids_cache_from_disk;
 use crate::dpapi;
 use crate::logging::debug_log;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
@@ -453,6 +454,10 @@ fn prepare_canonical_windows_sandbox_launch_with_credentials(
         anyhow::bail!("canonical Windows sandbox launch binding must not be empty");
     }
     let credentials = prepare_credentials()?;
+    // The setup helper runs out of process and may have persisted capability
+    // SIDs for a newly allowed per-attempt root. Refresh before the later spawn
+    // derives its token SIDs so they match the ACLs the helper just installed.
+    refresh_cap_sids_cache_from_disk(codex_home)?;
     // Resolve after setup succeeds so the capability is bound to the settled
     // marker and the exact effective roots the later launch will observe.
     let spec = resolve_canonical_windows_sandbox_launch_spec(

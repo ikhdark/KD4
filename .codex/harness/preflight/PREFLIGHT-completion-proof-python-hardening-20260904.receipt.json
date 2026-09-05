@@ -1,0 +1,90 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "worker:canonical-typed-v2-current-registration-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\none"
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-completion-proof-python-hardening-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-completion-proof-python-hardening-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          "scripts/completion_proof.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_completion_proof.py",
+          "scripts"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "worker:completion-proof-maintenance-registration-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\none"
+    }
+  ],
+  "assignment_id": "worker:completion-proof-python-hardening-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\none",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\none"
+  },
+  "contract_claims": [
+    "canonical-final-validation-id-closure",
+    "rust-doctest-structured-execution-evidence",
+    "confirmed-failure-late-supervision-exit-binding"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T13:52:28.288107+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "3b0f1f8df559ac8433b67ff9581a796d0afbf6f05ca94af813d6d433d7b01388",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-completion-proof-python-hardening-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-completion-proof-python-hardening-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/completion_proof.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_completion_proof.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T12:52:28.288107+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "ce7b648aa0159a8861e6ee5f1a1e9e6a5a0bbbcdbce8d8ffdb6237cccd8eeeec"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_canonical_doctest_accepts_fresh_libtest_json_lifecycle scripts.test_completion_proof.CompletionProofCliTest.test_canonical_doctest_rejects_pretty_stdout_pass_spoof scripts.test_completion_proof.CompletionProofCliTest.test_canonical_doctest_rejects_zero_structured_selection scripts.test_completion_proof.CompletionProofCliTest.test_canonical_doctest_rejects_duplicate_structured_lifecycle scripts.test_completion_proof.CompletionProofCliTest.test_canonical_doctest_preserves_failure_before_supervision_error",
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_focused_rust_gate_preserves_failure_before_supervision_error scripts.test_completion_proof.CompletionProofCliTest.test_focused_rust_gate_never_accepts_pass_with_supervision_error",
+    "python -m py_compile scripts/completion_proof.py scripts/test_completion_proof.py",
+    "git diff --check"
+  ],
+  "validation_owner": "worker:completion-proof-python-hardening-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

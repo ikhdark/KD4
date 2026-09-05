@@ -4,7 +4,9 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
+import py_compile
 import re
 import subprocess
 import sys
@@ -12,6 +14,9 @@ import tempfile
 import unittest
 import unicodedata
 
+from scripts.completion_proof_canonical import CanonicalJcsError
+from scripts.completion_proof_canonical import canonical_jcs as shared_canonical_jcs
+from scripts.completion_proof_canonical import proof_hash as shared_proof_hash
 from scripts.completion_proof_inventory_v2 import InventoryV2ContractError
 from scripts.completion_proof_inventory_v2 import ActiveHostApplicabilityIssuerV1
 from scripts.completion_proof_inventory_v2 import FROZEN_V1_BASELINE_ASSOCIATIONS_SHA256
@@ -19,14 +24,17 @@ from scripts.completion_proof_inventory_v2 import FROZEN_V1_BASELINE_IDS_SHA256
 from scripts.completion_proof_inventory_v2 import FROZEN_V1_INVENTORY_RAW_SHA256
 from scripts.completion_proof_inventory_v2 import FROZEN_V1_INVENTORY_SEMANTIC_SHA256
 from scripts.completion_proof_inventory_v2 import FROZEN_V1_LEDGER_RAW_SHA256
+from scripts.completion_proof_inventory_v2 import FROZEN_V1_HISTORICAL_REPLACEMENT_GRAPH_SHA256
 from scripts.completion_proof_inventory_v2 import FROZEN_V1_WORKSPACE_FINGERPRINT
 from scripts.completion_proof_inventory_v2 import INVENTORY_V2_SCHEMA_IDS
 from scripts.completion_proof_inventory_v2 import INVENTORY_V2_SCHEMA_PATHS
 from scripts.completion_proof_inventory_v2 import INVENTORY_V2_SCHEMA_RAW_SHA256S
 from scripts.completion_proof_inventory_v2 import canonical_jcs
 from scripts.completion_proof_inventory_v2 import decode_selection_request_v1
+from scripts.completion_proof_inventory_v2 import derive_frozen_v1_historical_replacement_graph_v1
 from scripts.completion_proof_inventory_v2 import doctest_recovered_child_sources_v1
 from scripts.completion_proof_inventory_v2 import encode_selection_request_v1
+from scripts.completion_proof_inventory_v2 import parse_canonical_jcs
 from scripts.completion_proof_inventory_v2 import proof_hash
 from scripts.completion_proof_inventory_v2 import inventory_declaration_id_v2
 from scripts.completion_proof_inventory_v2 import inventory_declaration_obligation_id_v2
@@ -344,7 +352,7 @@ def _full_scale_integration_fixture_v2() -> dict[str, object]:
             "target_name": "turn_latency",
         },
     ]
-    for spec in source_only_specs:
+    for spec_index, spec in enumerate(source_only_specs):
         context = context_by_target[(spec["package_name"], spec["target_name"])]
         identity = {
             "kind": "test",
@@ -404,7 +412,9 @@ def _full_scale_integration_fixture_v2() -> dict[str, object]:
         }
         declaration = {
             "entry": entry,
-            "kind": "missing-baseline",
+            "kind": (
+                "post-baseline-current" if spec_index == 0 else "missing-baseline"
+            ),
             "source_provenance": source_provenance,
         }
         declaration["declaration_id"] = inventory_declaration_id_v2(
@@ -695,22 +705,31 @@ def _full_scale_integration_fixture_v2() -> dict[str, object]:
     for declaration in declarations:
         baseline_id = declaration.get("baseline_id")
         if baseline_id is None:
-            exception_projection = {
-                "active_host_authority": active_host_authority,
-                "provenance_receipt": declaration["source_provenance"],
-                "tag": "platform-pending",
-            }
-            exception = {
-                **exception_projection,
-                "kind": "accepted",
-                "receipt_sha256": proof_hash(
-                    "kd4.accepted-exception-receipt.v1", exception_projection
-                ),
-            }
+            if declaration["kind"] == "post-baseline-current":
+                disposition = {
+                    "inventory_entry_semantic_sha256": proof_hash(
+                        "kd4.executable-inventory-entry.v2", declaration["entry"]
+                    ),
+                    "kind": "current",
+                }
+            else:
+                exception_projection = {
+                    "active_host_authority": active_host_authority,
+                    "provenance_receipt": declaration["source_provenance"],
+                    "tag": "platform-pending",
+                }
+                exception = {
+                    **exception_projection,
+                    "kind": "accepted",
+                    "receipt_sha256": proof_hash(
+                        "kd4.accepted-exception-receipt.v1", exception_projection
+                    ),
+                }
+                disposition = {"exception": exception, "kind": "exception"}
             ledger_rows.append(
                 {
                     "baseline_id": None,
-                    "disposition": {"exception": exception, "kind": "exception"},
+                    "disposition": disposition,
                     "obligation_id": declaration["obligation_id"],
                 }
             )
@@ -863,6 +882,64 @@ def _validate_schema_instance(
 
 
 class InventoryV2SharedContractTests(unittest.TestCase):
+    def _run_isolated_inventory_loader(
+        self,
+        source_directory: Path,
+        *,
+        environment: dict[str, str] | None = None,
+        preload_private_shadow: bool = False,
+    ) -> None:
+        script = r"""
+import hashlib
+import importlib.util
+import sys
+import types
+
+private_name = "_kd4_completion_proof_inventory_v2_canonical"
+shadow = None
+if sys.argv[2] == "preload":
+    shadow = types.ModuleType(private_name)
+    shadow.CanonicalJcsError = ValueError
+    shadow.canonical_jcs = lambda value: b'"private-shadow"'
+    shadow.proof_hash = lambda domain, value: "0" * 64
+    sys.modules[private_name] = shadow
+
+module_name = "isolated_completion_proof_inventory_v2"
+spec = importlib.util.spec_from_file_location(module_name, sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[module_name] = module
+spec.loader.exec_module(module)
+
+assert module.canonical_jcs({"b": 2, "a": 1}) == b'{"a":1,"b":2}'
+expected = hashlib.sha256(b'kd4.test.v1\0{"a":1}').hexdigest()
+assert module.proof_hash("kd4.test.v1", {"a": 1}) == expected
+if shadow is None:
+    assert private_name not in sys.modules
+else:
+    assert sys.modules[private_name] is shadow
+"""
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(source_directory / "completion_proof_inventory_v2.py"),
+                "preload" if preload_private_shadow else "clean",
+            ],
+            cwd=source_directory,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8", errors="replace"),
+        )
+
     def test_checked_in_v1_unittest_partition_is_893_executable_and_16_hidden(self) -> None:
         frozen_inventory = json.loads(
             (
@@ -966,6 +1043,115 @@ class InventoryV2SharedContractTests(unittest.TestCase):
                 ["python-unittest::" + entry["native_id"]],
             )
 
+    def test_frozen_v1_historical_replacement_graph_has_exact_closed_shape(self) -> None:
+        predecessor_ledger = json.loads(
+            (REPO_ROOT / ".codex/validation/test-replacements-v1.json").read_bytes()
+        )
+        graph = derive_frozen_v1_historical_replacement_graph_v1(predecessor_ledger)
+        self.assertEqual(len(graph["baseline_ids"]), 644)
+        self.assertEqual(len(graph["edges"]), 685)
+        self.assertEqual(len(graph["successor_ids"]), 572)
+        self.assertEqual(len(graph["components"]), 531)
+        self.assertEqual(
+            proof_hash("kd4.frozen-v1-historical-replacement-graph.v1", graph),
+            FROZEN_V1_HISTORICAL_REPLACEMENT_GRAPH_SHA256,
+        )
+
+    def test_non_unittest_legacy_replacement_edge_is_bound_to_frozen_v1(self) -> None:
+        validation_root = REPO_ROOT / ".codex/validation"
+        predecessor_ledger_raw = (
+            validation_root / "test-replacements-v1.json"
+        ).read_bytes()
+        predecessor_ledger = json.loads(predecessor_ledger_raw)
+        inventory = json.loads(
+            (validation_root / "frozen-test-inventory-v2.json").read_bytes()
+        )
+        recovery_raw = (
+            validation_root / "frozen-test-inventory-v2-recoveries.json"
+        ).read_bytes()
+        transition_receipts = json.loads(
+            (
+                validation_root
+                / "frozen-test-inventory-v2-recovery-transition-receipts.json"
+            ).read_bytes()
+        )
+        doctest_recapture_raw = (
+            validation_root / "frozen-test-inventory-v2-doctest-recapture.json"
+        ).read_bytes()
+        unittest_recapture_raw = (
+            validation_root / "frozen-test-inventory-v2-unittest-recapture.json"
+        ).read_bytes()
+        ledger = json.loads(
+            (validation_root / "test-replacements-v2.json").read_bytes()
+        )
+        issuer = ActiveHostApplicabilityIssuerV1(
+            "12345678-1234-1234-1234-123456789abc", b"K" * 32
+        )
+        validate_inventory_ledger_predecessor_closure(
+            inventory,
+            ledger,
+            recovery_raw,
+            transition_receipts,
+            issuer,
+            doctest_recapture_raw,
+            unittest_recapture_raw,
+            predecessor_ledger_raw,
+        )
+
+        predecessor_row = next(
+            row
+            for row in predecessor_ledger["rows"]
+            if row.get("resolution") == "replacement"
+            and not row["baseline_id"].startswith("python-unittest::")
+            and len(row["replacement_ids"]) == 1
+        )
+        baseline_id = predecessor_row["baseline_id"]
+        original_replacement_id = predecessor_row["replacement_ids"][0]
+        replacement_id = next(
+            successor_id
+            for successor_id in derive_frozen_v1_historical_replacement_graph_v1(
+                predecessor_ledger
+            )["successor_ids"]
+            if successor_id != original_replacement_id
+        )
+        tampered = json.loads(json.dumps(ledger))
+        tampered_row = next(
+            row for row in tampered["rows"] if row["baseline_id"] == baseline_id
+        )
+        predecessor_row_sha256 = proof_hash(
+            "kd4.frozen-v1-replacement-ledger-row.v1", predecessor_row
+        )
+        tampered_row["disposition"]["contract"]["legacy_replacement_hint"][
+            "replacement_ids"
+        ] = [replacement_id]
+        tampered_row["disposition"]["edge_ids"] = [
+            "replacement-edge-v2."
+            + proof_hash(
+                "kd4.legacy-replacement-edge.v1",
+                {
+                    "baseline_id": baseline_id,
+                    "predecessor_row_sha256": predecessor_row_sha256,
+                    "replacement_id": replacement_id,
+                },
+            )
+        ]
+        _refresh_full_scale_ledger_hashes(tampered)
+        validate_test_replacement_ledger_v2(tampered)
+        with self.assertRaisesRegex(
+            InventoryV2ContractError,
+            "historical replacement mapping changed from the exact frozen V1 graph",
+        ):
+            validate_inventory_ledger_predecessor_closure(
+                inventory,
+                tampered,
+                recovery_raw,
+                transition_receipts,
+                issuer,
+                doctest_recapture_raw,
+                unittest_recapture_raw,
+                predecessor_ledger_raw,
+            )
+
     def test_unittest_recapture_public_validator_and_cli_fail_closed(self) -> None:
         packet = _unittest_recapture_fail_closed_packet_v1()
         with self.assertRaisesRegex(
@@ -1053,18 +1239,18 @@ class InventoryV2SharedContractTests(unittest.TestCase):
         self.assertEqual(
             bundle["artifact_sha256"],
             {
-                "inventory": "e0ddc09c36fe346e511256a6fd1011f3892606e3150e2c045ccae14cdfb6807a",
-                "ledger": "651f98d60ca3e0c6755dfecf87c46e251494ad6f05397aa502ca1a4c4a000eb6",
+                "inventory": "ec3edb113e3c5957d52347426075278c7ff9de2e0524b839ce76406b4b400a96",
+                "ledger": "742d77d2043129bcbaf59635563d2b7210c2902082b7a82085fe9b0ef4b92b9d",
                 "recovery": "2d6e7ee1aa26ce1094f93f38152f63fc54e6db7c569a8e7acf51a709896a1712",
             },
         )
         self.assertEqual(
             bundle["inventory"]["authority"]["semantic_sha256"],
-            "46b2bde1834a893f7d9851a92cb10e3ac2b2348555288a873f14941040d79288",
+            "a04a903b720b3968a62fa5978eeefd08bfc8142214c267c9a270902ae4dcb55f",
         )
         self.assertEqual(
             bundle["ledger"]["semantic_sha256"],
-            "134ed74a5ac1ca9c4d3c5080ec441439b1081895f31f180214f2432dee490db8",
+            "5b0d96b4dcddea34d1fb6f2942d91accdc2c63585723774b0b22399f25016370",
         )
         self.assertEqual(
             bundle["recovery"]["semantic_sha256"],
@@ -1120,6 +1306,46 @@ class InventoryV2SharedContractTests(unittest.TestCase):
             bundle["inventory"], bundle["ledger"], recovery_raw,
             bundle["transition_receipts"], issuer, doctest_recapture_raw
         )
+        current_declaration = next(
+            declaration
+            for declaration in bundle["inventory"]["declaration_universe"]
+            if declaration["kind"] == "post-baseline-current"
+        )
+        current_row = next(
+            row
+            for row in bundle["ledger"]["rows"]
+            if row["obligation_id"] == current_declaration["obligation_id"]
+        )
+        self.assertEqual(
+            current_row["disposition"]["inventory_entry_semantic_sha256"],
+            proof_hash(
+                "kd4.executable-inventory-entry.v2", current_declaration["entry"]
+            ),
+        )
+        substituted_current = json.loads(json.dumps(bundle["ledger"]))
+        substituted_entry = next(
+            declaration["entry"]
+            for declaration in bundle["inventory"]["declaration_universe"]
+            if declaration.get("obligation_id") != current_declaration["obligation_id"]
+        )
+        substituted_current_row = next(
+            row
+            for row in substituted_current["rows"]
+            if row["obligation_id"] == current_declaration["obligation_id"]
+        )
+        substituted_current_row["disposition"][
+            "inventory_entry_semantic_sha256"
+        ] = proof_hash("kd4.executable-inventory-entry.v2", substituted_entry)
+        _refresh_full_scale_ledger_hashes(substituted_current)
+        validate_test_replacement_ledger_v2(substituted_current)
+        with self.assertRaisesRegex(
+            InventoryV2ContractError,
+            "current disposition does not bind its exact inventory declaration entry",
+        ):
+            validate_inventory_ledger_predecessor_closure(
+                bundle["inventory"], substituted_current, recovery_raw,
+                bundle["transition_receipts"], issuer, doctest_recapture_raw
+            )
         predecessor_ledger_raw = (
             REPO_ROOT / ".codex/validation/test-replacements-v1.json"
         ).read_bytes()
@@ -1202,9 +1428,9 @@ class InventoryV2SharedContractTests(unittest.TestCase):
 
         source_rows = [
             row for row in bundle["ledger"]["rows"]
-            if row["baseline_id"] is None
+            if row["disposition"]["kind"] == "exception"
         ]
-        self.assertEqual(len(source_rows), 3)
+        self.assertEqual(len(source_rows), 2)
 
         omitted = json.loads(json.dumps(bundle["ledger"]))
         omitted["rows"] = [
@@ -1289,6 +1515,7 @@ class InventoryV2SharedContractTests(unittest.TestCase):
         raw_vectors = VECTORS_PATH.read_bytes()
         vectors = json.loads(raw_vectors.decode("utf-8"))
         self.assertEqual(canonical_jcs(vectors), raw_vectors)
+        self.assertEqual(shared_canonical_jcs(vectors), raw_vectors)
         self.assertEqual(vectors["schema_version"], 1)
 
         for vector in vectors["canonical_parameter_negative_vectors"]:
@@ -1306,7 +1533,14 @@ class InventoryV2SharedContractTests(unittest.TestCase):
             self.assertEqual(
                 canonical_jcs(value).decode("utf-8"), vector["canonical_json"]
             )
+            self.assertEqual(
+                shared_canonical_jcs(value).decode("utf-8"),
+                vector["canonical_json"],
+            )
             self.assertEqual(proof_hash(vector["domain"], value), vector["sha256"])
+            self.assertEqual(
+                shared_proof_hash(vector["domain"], value), vector["sha256"]
+            )
 
         self.assertEqual(len(vectors["executable_identity_vectors"]), 8)
         for identity in vectors["executable_identity_vectors"]:
@@ -1508,6 +1742,179 @@ class InventoryV2SharedContractTests(unittest.TestCase):
                 resources,
                 "inventory-shared-types-v1.schema.json",
             )
+
+    def test_inventory_v2_wrappers_preserve_shared_canonical_errors(self) -> None:
+        invalid_values = (
+            (1.0, "canonical JSON does not permit floats"),
+            (2**53, "integer is outside the exact I-JSON range"),
+            ({"value": "e\u0301"}, "string is not NFC"),
+            ({1: "value"}, "JSON object key is not a string"),
+            ("\ud800", "string contains a Unicode surrogate"),
+            ({"\udfff": "value"}, "string contains a Unicode surrogate"),
+        )
+        for value, message in invalid_values:
+            with self.subTest(value=value, interface="shared"):
+                with self.assertRaisesRegex(CanonicalJcsError, message):
+                    shared_canonical_jcs(value)
+            with self.subTest(value=value, interface="inventory-v2"):
+                with self.assertRaisesRegex(InventoryV2ContractError, message):
+                    canonical_jcs(value)
+
+        for raw in (b'"\\ud800"', b'{"\\udfff":"value"}'):
+            with self.subTest(raw=raw, interface="inventory-v2-parser"):
+                with self.assertRaisesRegex(
+                    InventoryV2ContractError,
+                    "string contains a Unicode surrogate",
+                ):
+                    parse_canonical_jcs(raw)
+
+        for domain in ("", "not-ascii-\u00e9", "embedded\x00nul"):
+            with self.subTest(domain=domain, interface="shared"):
+                with self.assertRaisesRegex(
+                    CanonicalJcsError,
+                    "hash domain must be nonempty ASCII without NUL",
+                ):
+                    shared_proof_hash(domain, {})
+            with self.subTest(domain=domain, interface="inventory-v2"):
+                with self.assertRaisesRegex(
+                    InventoryV2ContractError,
+                    "hash domain must be nonempty ASCII without NUL",
+                ):
+                    proof_hash(domain, {})
+
+    def test_inventory_v2_loader_ignores_pythonpath_and_private_shadowing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_name:
+            temporary = Path(temporary_name)
+            source_directory = temporary / "source"
+            source_directory.mkdir()
+            for filename in (
+                "completion_proof_canonical.py",
+                "completion_proof_inventory_v2.py",
+            ):
+                (source_directory / filename).write_bytes(
+                    (REPO_ROOT / "scripts" / filename).read_bytes()
+                )
+
+            shadow_directory = temporary / "shadow"
+            shadow_directory.mkdir()
+            (shadow_directory / "_kd4_completion_proof_inventory_v2_canonical.py").write_text(
+                'raise AssertionError("PYTHONPATH shadow executed")\n',
+                encoding="utf-8",
+            )
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = str(shadow_directory)
+
+            for preload_private_shadow in (False, True):
+                with self.subTest(preload_private_shadow=preload_private_shadow):
+                    self._run_isolated_inventory_loader(
+                        source_directory,
+                        environment=environment,
+                        preload_private_shadow=preload_private_shadow,
+                    )
+
+    def test_inventory_v2_loader_ignores_timestamp_valid_forged_bytecode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_name:
+            source_directory = Path(temporary_name)
+            inventory_path = source_directory / "completion_proof_inventory_v2.py"
+            helper_path = source_directory / "completion_proof_canonical.py"
+            inventory_path.write_bytes(
+                (REPO_ROOT / "scripts/completion_proof_inventory_v2.py").read_bytes()
+            )
+            canonical_source = (
+                REPO_ROOT / "scripts/completion_proof_canonical.py"
+            ).read_bytes()
+            forged_prefix = b"""\
+class CanonicalJcsError(ValueError):
+    pass
+def canonical_jcs(value):
+    return b'\"forged-bytecode\"'
+def proof_hash(domain, value):
+    return "0" * 64
+#"""
+            self.assertLess(len(forged_prefix), len(canonical_source))
+            helper_path.write_bytes(
+                forged_prefix + b" " * (len(canonical_source) - len(forged_prefix))
+            )
+            fixed_timestamp = 1_700_000_000
+            os.utime(helper_path, (fixed_timestamp, fixed_timestamp))
+            cache_path = Path(
+                py_compile.compile(
+                    str(helper_path),
+                    doraise=True,
+                    invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+                )
+            )
+            self.assertTrue(cache_path.is_file())
+
+            helper_path.write_bytes(canonical_source)
+            os.utime(helper_path, (fixed_timestamp, fixed_timestamp))
+            self.assertEqual(helper_path.stat().st_size, len(canonical_source))
+            self.assertEqual(int(helper_path.stat().st_mtime), fixed_timestamp)
+
+            self._run_isolated_inventory_loader(source_directory)
+
+    def test_inventory_v2_loader_restores_private_module_after_source_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_name:
+            source_directory = Path(temporary_name)
+            inventory_path = source_directory / "completion_proof_inventory_v2.py"
+            inventory_path.write_bytes(
+                (REPO_ROOT / "scripts/completion_proof_inventory_v2.py").read_bytes()
+            )
+            (source_directory / "completion_proof_canonical.py").write_text(
+                'raise KeyboardInterrupt("source failure")\n',
+                encoding="utf-8",
+            )
+            script = r"""
+import importlib.util
+import sys
+import types
+
+private_name = "_kd4_completion_proof_inventory_v2_canonical"
+shadow = None
+if sys.argv[2] == "preload":
+    shadow = types.ModuleType(private_name)
+    sys.modules[private_name] = shadow
+spec = importlib.util.spec_from_file_location("isolated_inventory", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(module)
+except KeyboardInterrupt as error:
+    assert str(error) == "source failure"
+else:
+    raise AssertionError("canonical source failure did not propagate")
+if shadow is None:
+    assert private_name not in sys.modules
+else:
+    assert sys.modules[private_name] is shadow
+"""
+            for preload_private_shadow in (False, True):
+                with self.subTest(preload_private_shadow=preload_private_shadow):
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            script,
+                            str(inventory_path),
+                            "preload" if preload_private_shadow else "clean",
+                        ],
+                        cwd=source_directory,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        completed.returncode,
+                        0,
+                        completed.stderr.decode("utf-8", errors="replace"),
+                    )
 
     def test_rust_cfg_contract_vector_matches_hashes_and_runtime_shapes(self) -> None:
         vectors = json.loads(VECTORS_PATH.read_text(encoding="utf-8"))

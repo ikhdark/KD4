@@ -33,6 +33,17 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_validation_contracts::canonical::MustBeNullV1;
+use codex_validation_contracts::canonical::Sha256HexV1;
+use codex_validation_contracts::canonical::canonical_jcs_of;
+use codex_validation_contracts::canonical::proof_hash;
+use codex_validation_contracts::focused_live_successor::FocusedLiveSuccessorCatalogV1;
+use codex_validation_contracts::focused_replacement_approval::FocusedReplacementApprovalCurrentContextV1;
+use codex_validation_contracts::focused_replacement_approval::FocusedReplacementApprovalReceiptV1;
+use codex_validation_contracts::historical_replacement_acceptance::FocusedReplacementApprovalReceiptRefV1;
+use codex_validation_contracts::historical_replacement_acceptance::HistoricalReplacementAcceptanceProposalV1;
+use codex_validation_contracts::historical_replacement_acceptance::HistoricalReplacementScopeReviewDispositionV1;
+use codex_validation_contracts::historical_replacement_acceptance::HistoricalReplacementScopeReviewV1;
 use core_test_support::AcceptedCompletionProofFixture;
 use core_test_support::CanonicalAttemptMode;
 use core_test_support::CanonicalRunnerAttestation;
@@ -46,6 +57,7 @@ use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use core_test_support::completion_proof_script;
 use core_test_support::focused_completion_proof_script;
+use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -91,6 +103,781 @@ const REQUIRED_FAILURE_TOOL_NAME: &str = "completion_proof_required_failure";
 const MAX_REGULAR_LOGICAL_GENERATIONS: usize = 32;
 const TOTAL_GENERATIONS_WITH_FORCED_TERMINAL: usize = MAX_REGULAR_LOGICAL_GENERATIONS + 1;
 
+const QUALITY_TEST_ID: &str = "__main__.PriceContract.test_discount";
+const QUALITY_TEST_BODY: &str = r#"    def test_discount(self):
+        result = subprocess.run([sys.executable, '-B', 'src/product.py', '100'], capture_output=True, text=True, check=True)
+        with Path('.fixture-state/quality-executions').open('a') as marker:
+            marker.write(json.dumps({'execution': str(uuid.uuid4()), 'actual': result.stdout.strip()}) + '\n')
+        self.assertEqual(result.stdout.strip(), '95')
+"#;
+
+const QUALITY_RUST_TEST_BODY: &str = r#"#[test]
+fn test_discount() {
+    use std::io::Write;
+    let result = std::process::Command::new("python")
+        .args(["-B", "src/product.py", "100"]).output().unwrap();
+    assert!(result.status.success());
+    let actual = String::from_utf8(result.stdout).unwrap();
+    let mut marker = std::fs::OpenOptions::new().create(true).append(true)
+        .open(".fixture-state/quality-executions").unwrap();
+    let execution = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    writeln!(marker, "{{\"execution\":\"{execution}\",\"actual\":\"{}\"}}", actual.trim()).unwrap();
+    assert_eq!(actual.trim(), "95");
+}
+"#;
+
+fn install_rust_quality_test(fixture: &CompletionProofFixture) -> Result<()> {
+    fs::remove_file(fixture.repo_path.join("src/test_behavior.py"))?;
+    fs::write(
+        fixture.repo_path.join("src/test_behavior.rs"),
+        QUALITY_RUST_TEST_BODY,
+    )?;
+    let path = fixture.repo_path.join("focused.py");
+    let mut script = fs::read_to_string(&path)?;
+    let needle = "launch_target_identity = start_identity(sys.executable)";
+    let replacement = r#"if VALIDATION_ID != 'fixture.other':
+    build = subprocess.run(['rustc', '--edition=2024', '--test', 'src/test_behavior.rs', '-o', '.fixture-state/quality-test.exe'], capture_output=True)
+    if build.returncode:
+        sys.stderr.buffer.write(build.stderr)
+        raise SystemExit(build.returncode)
+launch_target_identity = start_identity(sys.executable if VALIDATION_ID == 'fixture.other' else '.fixture-state/quality-test.exe')"#;
+    anyhow::ensure!(
+        script.matches(needle).count() == 1,
+        "missing Rust fixture compile boundary"
+    );
+    script = script.replace(needle, replacement);
+    let start = script
+        .find("command = [")
+        .context("missing native fixture invocation")?;
+    let end = start
+        + script[start..]
+            .find("\nstarted_at =")
+            .context("missing native fixture timing boundary")?;
+    script.replace_range(start..end, "command = [launch_target_identity['resolved_path'], '-B', 'src/other/test_product.py'] if VALIDATION_ID == 'fixture.other' else [launch_target_identity['resolved_path'], '--exact', 'test_discount', '--nocapture']");
+    script = script.replace(QUALITY_TEST_ID, "test_discount");
+    fs::write(path, script)?;
+    run_git(&fixture.repo_path, &["add", "focused.py"])?;
+    run_git(
+        &fixture.repo_path,
+        &["commit", "--quiet", "--amend", "--no-edit"],
+    )?;
+    Ok(())
+}
+
+fn install_quality_behavior_fixture(
+    fixture: &CompletionProofFixture,
+    weak: bool,
+) -> Result<String> {
+    fs::write(
+        fixture.repo_path.join("src/runtime.rs"),
+        "pub const VALUE: u8 = 1;\n",
+    )?;
+    let focused_path = fixture.repo_path.join("focused.py");
+    let mut script = fs::read_to_string(&focused_path)?;
+    script = script.replace(
+        "    \"-c\",\n    \"raise SystemExit(7)\" if failure else \"raise SystemExit(0)\",",
+        "    \"-B\",\n    \"src/test_behavior.py\",",
+    );
+    script = script.replace(
+        "child.communicate()",
+        "child_stdout, child_stderr = child.communicate()\nfailure = child.returncode != 0",
+    );
+    script = script.replace(
+        "TEST_ID = \"fixture.test\"",
+        &format!("TEST_ID = {QUALITY_TEST_ID:?}"),
+    );
+    script = script.replace(
+        "\"fixture confirmed validation failure\" if failure else \"\"",
+        "child_stderr.decode('utf-8', errors='replace')",
+    );
+    let inventory_path = fixture
+        .repo_path
+        .join(".codex/validation/frozen-test-inventory-v1.json");
+    let inventory: serde_json::Value = serde_json::from_str(&fs::read_to_string(&inventory_path)?)?;
+    script = script.replace("inventory = json.loads(\n    Path(\".codex/validation/frozen-test-inventory-v1.json\").read_text(encoding=\"utf-8\")\n)", &format!("inventory = {{'inventory_hash': {}}}", inventory["inventory_hash"]));
+    script = script.replace("VALIDATION_ID = \"fixture.validation\"", "VALIDATION_ID = sys.argv[1]\nEXACT_COMMAND = EXACT_COMMAND.replace('fixture.validation', VALIDATION_ID)");
+    script = script.replace(&format!("TEST_ID = {QUALITY_TEST_ID:?}"), &format!("TEST_ID = '__main__.OtherContract.test_value' if VALIDATION_ID == 'fixture.other' else {QUALITY_TEST_ID:?}"));
+    script = script.replace("    \"src/test_behavior.py\",", "    \"src/other/test_product.py\" if VALIDATION_ID == 'fixture.other' else \"src/test_behavior.py\",");
+    script = script.replace("\"runner_selector\": \"fixture-gate\"", "\"runner_selector\": 'fixture-other-gate' if VALIDATION_ID == 'fixture.other' else 'fixture-gate'");
+    let config_path = fixture
+        .repo_path
+        .join(".codex/validation/completion-proof.toml");
+    let config = fs::read_to_string(&config_path)?;
+    fs::write(
+        &config_path,
+        format!(
+            "{config}\n[[validation]]\nid = \"fixture.other\"\nrunner = \"rust-gate\"\ngate = \"fixture-other-gate\"\nowned_paths = [\"src/other/**\"]\nconsumed_paths = [\"src/other/**\"]\ntimeout_seconds = 30\n"
+        ),
+    )?;
+    fs::create_dir_all(fixture.repo_path.join("src/other"))?;
+    fs::write(
+        fixture.repo_path.join("src/other/product.py"),
+        "print('baseline')\n",
+    )?;
+    fs::write(
+        fixture.repo_path.join("src/other/test_product.py"),
+        "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\nclass OtherContract(unittest.TestCase):\n    def test_value(self):\n        result = subprocess.run([sys.executable, '-B', 'src/other/product.py'], capture_output=True, text=True, check=True)\n        with Path('.fixture-state/other-executions').open('a') as marker:\n            marker.write(result.stdout)\n        self.assertEqual(result.stdout.strip(), 'updated')\nif __name__ == '__main__':\n    unittest.main()\n",
+    )?;
+    fs::write(
+        fixture.repo_path.join("change_other.py"),
+        "from pathlib import Path\nPath('src/other/product.py').write_text(\"print('updated')\\n\")\n",
+    )?;
+    fs::write(focused_path, script)?;
+    // This ordinary future task has no migration inventory or replacement ledger.
+    fs::remove_file(inventory_path)?;
+    fs::remove_file(
+        fixture
+            .repo_path
+            .join(".codex/validation/test-replacements-v1.json"),
+    )?;
+    fs::write(
+        fixture.repo_path.join("src/product.py"),
+        "import sys\nprint(int(sys.argv[1]))\n",
+    )?;
+    fs::write(
+        fixture.repo_path.join("fix_price.py"),
+        "from pathlib import Path\nPath('src/product.py').write_text('import sys\\nprint(int(sys.argv[1]) - 5)\\n')\n",
+    )?;
+    run_git(
+        &fixture.repo_path,
+        &[
+            "add",
+            "focused.py",
+            "src/product.py",
+            "src/other",
+            "change_other.py",
+            "fix_price.py",
+            ".codex/validation",
+        ],
+    )?;
+    run_git(
+        &fixture.repo_path,
+        &["commit", "--quiet", "--amend", "--no-edit"],
+    )?;
+    let body = if weak {
+        QUALITY_TEST_BODY.replace(
+            "self.assertEqual(result.stdout.strip(), '95')",
+            "self.assertTrue(result.stdout.strip())",
+        )
+    } else {
+        QUALITY_TEST_BODY.to_owned()
+    };
+    fs::write(
+        fixture.repo_path.join("src/test_behavior.py"),
+        format!(
+            "import json\nimport subprocess\nimport sys\nimport unittest\nimport uuid\nfrom pathlib import Path\n\nclass PriceContract(unittest.TestCase):\n{body}\nif __name__ == '__main__':\n    unittest.main()\n"
+        ),
+    )?;
+    Ok(format!("{} fix_price.py", available_python_command()?))
+}
+
+#[test]
+fn test_quality_weak_test_pass_cannot_complete_ordinary_task() -> Result<()> {
+    run_session_path_test(
+        "test_quality_weak_test_pass_cannot_complete_ordinary_task",
+        || async {
+            let fixture = CompletionProofFixture::new()?;
+            install_quality_behavior_fixture(&fixture, true)?;
+            let harness = fixture.harness_with_raw_response_items().await?;
+            let mut responses = vec![
+                exec_command_call_response(
+                    "weak-test-passes-broken-cli",
+                    &fixture.exact_focused_command(),
+                    &fixture.repo_path,
+                ),
+                sse(vec![
+                    ev_response_created("quality-review-request"),
+                    ev_function_call("quality-review", "review_test_quality", "{}"),
+                    ev_completed("quality-review-request"),
+                ]),
+            ];
+            responses.extend(repeated_terminal_candidates(
+                MAX_REGULAR_LOGICAL_GENERATIONS - 1,
+                "the weak test passed so the task is complete",
+            ));
+            mount_sse_sequence(harness.server(), responses).await;
+            let events = submit_and_collect(harness.test(), "Make the price CLI subtract five: input 100 must output 95. Add a regression test and validate this small change.").await?;
+            assert!(events.iter().any(|e| matches!(e, EventMsg::ExecCommandEnd(end) if end.call_id == "weak-test-passes-broken-cli" && end.exit_code == 0)));
+            assert_eq!(
+                function_call_output_success(&events, "quality-review"),
+                Some(false)
+            );
+            assert!(
+                function_call_output(&events, "quality-review")
+                    .context("missing quality rejection")?
+                    .contains("No trusted failing execution")
+            );
+            assert!(events.iter().all(|event| !is_assistant_output(event)));
+            assert!(events.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.is_some() && done.last_agent_message.is_none())));
+            assert!(!fixture.marker_path.exists());
+            let executions =
+                fs::read_to_string(fixture.repo_path.join(".fixture-state/quality-executions"))?;
+            assert_eq!(executions.lines().count(), 1);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(executions.trim())?["actual"],
+                "100"
+            );
+            Ok(())
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QualityScenario {
+    Accepted,
+    RustAccepted,
+    Recheck,
+    ChangedAssertions,
+    OmittedTest,
+    ForgedAttempt,
+}
+
+#[test]
+fn test_quality_observed_defect_and_independent_review_complete_ordinary_task() -> Result<()> {
+    run_session_path_test(
+        "test_quality_observed_defect_and_independent_review_complete_ordinary_task",
+        || run_quality_scenario(QualityScenario::Accepted),
+    )
+}
+
+#[test]
+fn test_quality_native_rust_assertion_protects_real_cli_behavior() -> Result<()> {
+    run_session_path_test(
+        "test_quality_native_rust_assertion_protects_real_cli_behavior",
+        || run_quality_scenario(QualityScenario::RustAccepted),
+    )
+}
+
+#[test]
+fn test_quality_rejects_changed_assertions_between_failed_and_passing_runs() -> Result<()> {
+    run_session_path_test(
+        "test_quality_rejects_changed_assertions_between_failed_and_passing_runs",
+        || run_quality_scenario(QualityScenario::ChangedAssertions),
+    )
+}
+
+#[test]
+fn test_quality_rejects_review_that_omits_another_changed_test() -> Result<()> {
+    run_session_path_test(
+        "test_quality_rejects_review_that_omits_another_changed_test",
+        || run_quality_scenario(QualityScenario::OmittedTest),
+    )
+}
+
+#[test]
+fn test_quality_rejects_reviewer_invented_execution() -> Result<()> {
+    run_session_path_test("test_quality_rejects_reviewer_invented_execution", || {
+        run_quality_scenario(QualityScenario::ForgedAttempt)
+    })
+}
+
+fn quality_review_result(
+    request: &wiremock::Request,
+    scenario: QualityScenario,
+    test_path: &str,
+    test_body: &str,
+    test_id: &str,
+) -> serde_json::Value {
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("review request JSON");
+    assert!(
+        body["instructions"]
+            .as_str()
+            .is_some_and(|s| s.contains("independently review test QUALITY"))
+    );
+    let packet = body["input"]
+        .as_array()
+        .expect("review input")
+        .iter()
+        .flat_map(|i| i["content"].as_array().into_iter().flatten())
+        .filter_map(|c| c["text"].as_str())
+        .filter_map(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+        .find(|v| v.get("changed_test_paths").is_some())
+        .expect("private quality packet");
+    assert!(
+        packet["user_requirements"]
+            .as_str()
+            .expect("requirements")
+            .contains("input 100 must output 95")
+    );
+    assert_eq!(
+        packet["failing_executions"][FIXTURE_VALIDATION_ID]["report"]["outcomes"][0]["outcome"],
+        "failed"
+    );
+    assert_eq!(
+        packet["passing_executions"][FIXTURE_VALIDATION_ID]["report"]["outcomes"][0]["outcome"],
+        "passed"
+    );
+    let review = json!({"approved":true,"explanation":"The actual CLI returns 100 in the broken run and 95 after the product correction. The same assertion checks the explicit user's 95 contract.",
+                        "evaluated_test_paths":[test_path],"input_paths":[test_path,"src/product.py"],"obligations":[{
+                            "validation_id":FIXTURE_VALIDATION_ID,"test_id":test_id,"test_path":test_path,"test_body":test_body,
+                            "oracle_source":"Current user request: input 100 must output 95","expected_behavior":"subtract five from the CLI input","runtime_path":"python src/product.py 100 subprocess stdout",
+                            "defect_explanation":"The product returned its input without applying the five-unit discount; the unchanged assertion failed on 100 and passed on 95.",
+                            "failed_attempt_id":if scenario == QualityScenario::ForgedAttempt { json!("author-invented-attempt") } else { packet["failing_executions"][FIXTURE_VALIDATION_ID]["attempt_id"].clone() },"product_paths":["src/product.py"]}]});
+    review
+}
+
+#[test]
+fn test_quality_rechecks_unchanged_test_after_later_regression() -> Result<()> {
+    run_session_path_test(
+        "test_quality_rechecks_unchanged_test_after_later_regression",
+        || run_quality_scenario(QualityScenario::Recheck),
+    )
+}
+
+async fn run_quality_scenario(scenario: QualityScenario) -> Result<()> {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    let fixture = CompletionProofFixture::new()?;
+    let fix = install_quality_behavior_fixture(&fixture, false)?;
+    let accepted = matches!(
+        scenario,
+        QualityScenario::Accepted | QualityScenario::RustAccepted | QualityScenario::Recheck
+    );
+    let (test_path, test_body, test_id) = if scenario == QualityScenario::RustAccepted {
+        install_rust_quality_test(&fixture)?;
+        (
+            "src/test_behavior.rs",
+            QUALITY_RUST_TEST_BODY,
+            "test_discount",
+        )
+    } else {
+        ("src/test_behavior.py", QUALITY_TEST_BODY, QUALITY_TEST_ID)
+    };
+    if scenario == QualityScenario::ChangedAssertions {
+        let path = fixture.repo_path.join("fix_price.py");
+        let fix_script = fs::read_to_string(&path)?;
+        fs::write(
+            &path,
+            format!(
+                "{fix_script}p = Path('src/test_behavior.py')\np.write_text(p.read_text().replace(\"self.assertEqual(result.stdout.strip(), '95')\", \"self.assertTrue(result.stdout.strip())\"))\n"
+            ),
+        )?;
+        run_git(&fixture.repo_path, &["add", "fix_price.py"])?;
+        run_git(
+            &fixture.repo_path,
+            &["commit", "--quiet", "--amend", "--no-edit"],
+        )?;
+    }
+    if scenario == QualityScenario::OmittedTest {
+        let path = fixture.repo_path.join("src/test_behavior.py");
+        let source = fs::read_to_string(&path)?;
+        fs::write(&path, source.replace("if __name__ == '__main__':", "    def test_missing_behavior(self):\n        self.assertTrue(True)\n\nif __name__ == '__main__':"))?;
+    }
+    let harness = fixture.harness_with_raw_response_items().await?;
+    let source_before = fs::read(fixture.repo_path.join(test_path))?;
+    let responses = [
+        exec_command_call_response(
+            "behavior-detects-broken-cli",
+            &fixture.exact_focused_command(),
+            &fixture.repo_path,
+        ),
+        exec_command_call_response("fix-product-behavior", &fix, &fixture.repo_path),
+        exec_command_call_response(
+            "same-test-passes-corrected-cli",
+            &fixture.exact_focused_command(),
+            &fixture.repo_path,
+        ),
+        sse(vec![
+            ev_response_created("quality-review-request"),
+            ev_function_call("quality-review", "review_test_quality", "{}"),
+            ev_completed("quality-review-request"),
+        ]),
+    ];
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path_regex(".*/responses"))
+            .respond_with(move |request: &wiremock::Request| {
+                let index = observed_calls.fetch_add(1, Ordering::SeqCst);
+                if index < 4 { return sse_response(responses[index].clone()); }
+                if index == 4 {
+                    let review = quality_review_result(request, scenario, test_path, test_body, test_id);
+                    return sse_response(terminal_candidate(4, &review.to_string()));
+                }
+                if accepted { assert_eq!(index, 5, "unexpected extra model/review generation"); }
+                sse_response(terminal_candidate(index, "The price CLI now subtracts five, and the regression test detects the original bug."))
+            }).up_to_n_times(if accepted { 6 } else { (MAX_REGULAR_LOGICAL_GENERATIONS + 2) as u64 })
+            .expect(if accepted { 6 } else { (MAX_REGULAR_LOGICAL_GENERATIONS + 2) as u64 }).mount(harness.server()).await;
+    let events = submit_and_collect(harness.test(), "Make the price CLI subtract five: input 100 must output 95. Add a regression test and validate this small change.").await?;
+    assert!(events.iter().any(|e| matches!(e, EventMsg::ExecCommandEnd(end) if end.call_id == "behavior-detects-broken-cli" && end.exit_code != 0)));
+    assert!(events.iter().any(|e| matches!(e, EventMsg::ExecCommandEnd(end) if end.call_id == "same-test-passes-corrected-cli" && end.exit_code == 0)));
+    assert_eq!(
+        function_call_output_success(&events, "quality-review"),
+        Some(accepted),
+        "quality tool output: {:?}",
+        function_call_output(&events, "quality-review")
+    );
+    assert!(events.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.is_none() == accepted && done.last_agent_message.is_some() == accepted)));
+    if !accepted {
+        assert!(events.iter().all(|event| !is_assistant_output(event)));
+    }
+    if scenario != QualityScenario::ChangedAssertions {
+        assert_eq!(fs::read(fixture.repo_path.join(test_path))?, source_before);
+    }
+    let executions =
+        fs::read_to_string(fixture.repo_path.join(".fixture-state/quality-executions"))?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(executions.len(), 2);
+    assert_eq!(executions[0]["actual"], "100");
+    assert_eq!(executions[1]["actual"], "95");
+    assert_ne!(executions[0]["execution"], executions[1]["execution"]);
+    assert!(!fixture.marker_path.exists());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        if accepted {
+            6
+        } else {
+            MAX_REGULAR_LOGICAL_GENERATIONS + 2
+        }
+    );
+    if scenario == QualityScenario::Recheck {
+        // A later task edits only the product. The existing test must stay
+        // an obligation after its old review is revoked by a real failure.
+        run_git(
+            &fixture.repo_path,
+            &["add", "src/product.py", "src/test_behavior.py"],
+        )?;
+        run_git(
+            &fixture.repo_path,
+            &[
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture completed price behavior",
+            ],
+        )?;
+        fs::write(
+            fixture.repo_path.join("src/product.py"),
+            "import sys\nprint(int(sys.argv[1]))\n",
+        )?;
+        let responses = [
+            exec_command_call_response(
+                "later-regression-detected",
+                &fixture.exact_focused_command(),
+                &fixture.repo_path,
+            ),
+            exec_command_call_response("later-product-corrected", &fix, &fixture.repo_path),
+            exec_command_call_response(
+                "existing-test-passes-again",
+                &fixture.exact_focused_command(),
+                &fixture.repo_path,
+            ),
+            sse(vec![
+                ev_response_created("renew-quality"),
+                ev_function_call("renew-quality", "review_test_quality", "{}"),
+                ev_completed("renew-quality"),
+            ]),
+        ];
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path_regex(".*/responses"))
+            .respond_with(move |request: &wiremock::Request| {
+                let index = observed.fetch_add(1, Ordering::SeqCst);
+                if index < 4 {
+                    return sse_response(responses[index].clone());
+                }
+                if index == 4 {
+                    let review =
+                        quality_review_result(request, scenario, test_path, test_body, test_id);
+                    return sse_response(terminal_candidate(40, &review.to_string()));
+                }
+                assert_eq!(index, 5);
+                sse_response(terminal_candidate(
+                    41,
+                    "The later regression is corrected and the unchanged test detects it.",
+                ))
+            })
+            .up_to_n_times(6)
+            .expect(6)
+            .mount(harness.server())
+            .await;
+        let renewed = submit_and_collect(harness.test(), "Correct the later price regression: input 100 must output 95. Validate with the existing test and renew its evidence.").await?;
+        assert_eq!(
+            function_call_output_success(&renewed, "renew-quality"),
+            Some(true),
+            "renewal failed: {:?}",
+            function_call_output(&renewed, "renew-quality")
+        );
+        assert!(renewed.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.is_none() && done.last_agent_message.is_some())));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            6,
+            "missing fresh independent review"
+        );
+        assert_eq!(fs::read(fixture.repo_path.join(test_path))?, source_before);
+        let executions =
+            fs::read_to_string(fixture.repo_path.join(".fixture-state/quality-executions"))?
+                .lines()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(
+            executions
+                .iter()
+                .map(|e| e["actual"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["100", "95", "100", "95"]
+        );
+        assert!(!fixture.marker_path.exists());
+    }
+    if scenario == QualityScenario::Accepted {
+        // An unrelated documentation edit runs only its existing doc check.
+        // The real behavior executions and independent review remain reusable.
+        mount_sse_sequence(
+            harness.server(),
+            vec![
+                exec_command_call_response(
+                    "unrelated-documentation-edit",
+                    &fixture.documentation_markdown_mutation_command,
+                    &fixture.repo_path,
+                ),
+                exec_command_call_response(
+                    "nearest-documentation-check",
+                    &fixture.documentation_command,
+                    &fixture.repo_path,
+                ),
+                sse(vec![
+                    ev_response_created("reuse-quality"),
+                    ev_function_call("reuse-quality", "review_test_quality", "{}"),
+                    ev_completed("reuse-quality"),
+                ]),
+                terminal_candidate(20, "The documentation change is checked."),
+            ],
+        )
+        .await;
+        let docs = submit_and_collect(harness.test(), "Update only the documentation, run its normal check, reuse current test evidence, and finish.").await?;
+        assert_eq!(
+            function_call_output_success(&docs, "reuse-quality"),
+            Some(true)
+        );
+        assert!(docs.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.is_none() && done.last_agent_message.is_some())));
+        assert_eq!(
+            fs::read_to_string(fixture.repo_path.join(".fixture-state/quality-executions"))?
+                .lines()
+                .count(),
+            2
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            6,
+            "unrelated edit repeated independent review"
+        );
+
+        // A second source change is inside the first validator's broad
+        // declared group but outside the reviewed price dependencies.
+        let change_other = format!("{} change_other.py", available_python_command()?);
+        let validate_other = fixture
+            .focused_command
+            .replace("{validation_id}", "fixture.other");
+        mount_sse_sequence(
+            harness.server(),
+            vec![
+                exec_command_call_response(
+                    "change-independent-product",
+                    &change_other,
+                    &fixture.repo_path,
+                ),
+                exec_command_call_response(
+                    "validate-only-independent-product",
+                    &validate_other,
+                    &fixture.repo_path,
+                ),
+                sse(vec![
+                    ev_response_created("reuse-price-quality"),
+                    ev_function_call("reuse-price-quality", "review_test_quality", "{}"),
+                    ev_completed("reuse-price-quality"),
+                ]),
+                terminal_candidate(22, "The independent product change is checked."),
+            ],
+        )
+        .await;
+        let independent = submit_and_collect(harness.test(), "Make the other CLI output updated, validate only that change, and retain the established price test evidence.").await?;
+        assert_eq!(
+            function_call_output_success(&independent, "reuse-price-quality"),
+            Some(true),
+            "unexpected quality rerun: {:?}",
+            function_call_output(&independent, "reuse-price-quality")
+        );
+        assert!(independent.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.is_none() && done.last_agent_message.is_some())), "independent task did not complete: {:?}", independent.iter().filter(|event| matches!(event, EventMsg::TurnComplete(_) | EventMsg::ExecCommandEnd(_))).collect::<Vec<_>>());
+        assert_eq!(
+            fs::read_to_string(fixture.repo_path.join(".fixture-state/quality-executions"))?
+                .lines()
+                .count(),
+            2
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.repo_path.join(".fixture-state/other-executions"))?
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["updated"]
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            6,
+            "unrelated source edit repeated independent review"
+        );
+
+        let home = Arc::clone(&harness.test().home);
+        let rollout = harness
+            .test()
+            .codex
+            .rollout_path()
+            .context("missing ordinary task rollout")?;
+        harness.test().codex.shutdown_and_wait().await?;
+        let cwd = fixture.repo_path.abs();
+        let mut builder = test_codex()
+            .with_raw_response_items()
+            .with_config(move |config| set_fixture_workspace(config, cwd));
+        let resumed = builder
+            .resume(harness.server(), Arc::clone(&home), rollout)
+            .await?;
+        mount_sse_sequence(
+            harness.server(),
+            vec![
+                sse(vec![
+                    ev_response_created("resume-quality"),
+                    ev_function_call("resume-quality", "review_test_quality", "{}"),
+                    ev_completed("resume-quality"),
+                ]),
+                terminal_candidate(21, "Current focused evidence survived the matching resume."),
+            ],
+        )
+        .await;
+        let resumed_events = submit_and_collect(
+            &resumed,
+            "Continue the same completed task with its current test evidence.",
+        )
+        .await?;
+        assert_eq!(
+            function_call_output_success(&resumed_events, "resume-quality"),
+            Some(true)
+        );
+        assert!(resumed_events.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.is_none() && done.last_agent_message.is_some())));
+
+        // A later assertion edit invalidates quality without launching tests.
+        let test_path = fixture.repo_path.join("src/test_behavior.py");
+        fs::write(
+            &test_path,
+            fs::read_to_string(&test_path)?.replace(
+                "self.assertEqual(result.stdout.strip(), '95')",
+                "self.assertTrue(result.stdout.strip())",
+            ),
+        )?;
+        mount_sse_sequence(
+            harness.server(),
+            repeated_terminal_candidates(
+                TOTAL_GENERATIONS_WITH_FORCED_TERMINAL,
+                "The old review still covers this changed assertion.",
+            ),
+        )
+        .await;
+        let stale = submit_and_collect(&resumed, "Finish after the latest test edit.").await?;
+        assert!(stale.iter().all(|event| !is_assistant_output(event)));
+        assert!(stale.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.is_some() && done.last_agent_message.is_none())));
+        let resumed_rollout = resumed
+            .codex
+            .rollout_path()
+            .context("missing resumed rollout")?;
+        resumed.codex.shutdown_and_wait().await?;
+
+        #[cfg(windows)]
+        {
+            let (state_path, mut forged) =
+                read_authenticated_completion_proof_state(home.path(), &fixture.repo_path)?;
+            forged["state"]["focused_completion"]["pending_paths"] = json!([]);
+            forged["state"]["requires_non_documentation_proof"] = json!(false);
+            fs::write(state_path, serde_json::to_vec(&forged)?)?;
+            let cwd = fixture.repo_path.abs();
+            let mut builder = test_codex()
+                .with_raw_response_items()
+                .with_config(move |config| set_fixture_workspace(config, cwd));
+            let forged_resume = builder
+                .resume(harness.server(), Arc::clone(&home), resumed_rollout)
+                .await?;
+            mount_sse_sequence(
+                harness.server(),
+                repeated_terminal_candidates(
+                    TOTAL_GENERATIONS_WITH_FORCED_TERMINAL,
+                    "The caller-edited quality state says this is complete.",
+                ),
+            )
+            .await;
+            let forged_events =
+                submit_and_collect(&forged_resume, "Finish using the retained evidence.").await?;
+            assert!(
+                forged_events
+                    .iter()
+                    .all(|event| !is_assistant_output(event))
+            );
+            assert!(forged_events.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.as_ref().is_some_and(|error| error.message.contains("authenticated")))));
+            forged_resume.codex.shutdown_and_wait().await?;
+        }
+        assert_eq!(
+            fs::read_to_string(fixture.repo_path.join(".fixture-state/quality-executions"))?
+                .lines()
+                .count(),
+            2
+        );
+        assert!(!fixture.marker_path.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn test_quality_changed_doctest_is_unsatisfied_without_remigrating_unchanged_docs() -> Result<()> {
+    run_session_path_test(
+        "test_quality_changed_doctest_is_unsatisfied_without_remigrating_unchanged_docs",
+        || async {
+            for changed_doctest in [true, false] {
+                let fixture = CompletionProofFixture::new()?;
+                let path = fixture.repo_path.join("src/inline_docs.rs");
+                let baseline =
+                    "//! ```\n//! assert_eq!(2 + 2, 4);\n//! ```\npub const VALUE: u8 = 1;\n";
+                fs::write(&path, baseline)?;
+                run_git(&fixture.repo_path, &["add", "src/inline_docs.rs"])?;
+                run_git(
+                    &fixture.repo_path,
+                    &["commit", "--quiet", "--amend", "--no-edit"],
+                )?;
+                fs::write(
+                    &path,
+                    if changed_doctest {
+                        baseline.replace("2 + 2, 4", "2 + 2, 5")
+                    } else {
+                        baseline.replace("VALUE: u8 = 1", "VALUE: u8 = 2")
+                    },
+                )?;
+                let harness = fixture.harness_with_raw_response_items().await?;
+                let mut responses = vec![exec_command_call_response(
+                    "scoped-pass",
+                    &fixture.exact_focused_command(),
+                    &fixture.repo_path,
+                )];
+                responses.extend(repeated_terminal_candidates(
+                    if changed_doctest {
+                        MAX_REGULAR_LOGICAL_GENERATIONS
+                    } else {
+                        1
+                    },
+                    "The focused check passed.",
+                ));
+                mount_sse_sequence(harness.server(), responses).await;
+                let events = submit_and_collect(harness.test(), "Validate the focused source change. Changed doctests need their own trustworthy quality evidence; retain unchanged legacy tests.").await?;
+                assert!(events.iter().any(|event| matches!(event, EventMsg::ExecCommandEnd(end) if end.call_id == "scoped-pass" && end.exit_code == 0)));
+                assert!(events.iter().any(|event| matches!(event, EventMsg::TurnComplete(done) if done.error.is_some() == changed_doctest && done.last_agent_message.is_none() == changed_doctest)));
+                if changed_doctest {
+                    assert!(events.iter().all(|event| !is_assistant_output(event)));
+                }
+                assert!(!fixture.marker_path.exists());
+            }
+            Ok(())
+        },
+    )
+}
+
 fn active_inventory_platform_name() -> &'static str {
     match std::env::consts::OS {
         "macos" => "darwin",
@@ -99,6 +886,19 @@ fn active_inventory_platform_name() -> &'static str {
 }
 
 fn set_fixture_workspace(config: &mut Config, cwd: AbsolutePathBuf) {
+    #[cfg(windows)]
+    {
+        // Every harness variant needs the same bounded sandbox temporary root,
+        // including raw-response, resumed-session, and extension fixtures.
+        let sandbox_temp = cwd.as_path().join(".fixture-state/sandbox-temp");
+        fs::create_dir_all(&sandbox_temp).expect("create fixture sandbox temporary directory");
+        for name in ["TEMP", "TMP"] {
+            config.permissions.shell_environment_policy.r#set.insert(
+                name.to_string(),
+                sandbox_temp.to_string_lossy().into_owned(),
+            );
+        }
+    }
     config.cwd = cwd.clone();
     let workspace_roots = vec![cwd];
     config.workspace_roots = workspace_roots.clone();
@@ -917,6 +1717,101 @@ subprocess.run(
         Ok(())
     }
 
+    fn install_trusted_helper_authority_probe(&self) -> Result<String> {
+        const TRUSTED_HELPER_SOURCE: &str = "VALUE = \"trusted\"\n";
+        const CHANGED_HELPER_SOURCE: &str = "VALUE = \"changed during validation\"\n";
+        const FOCUSED_INSERTION_POINT: &str =
+            "execution_id = str(uuid.uuid4())\nlaunch_target_identity";
+        const CANONICAL_INSERTION_POINT: &str =
+            "execution_id = str(uuid.uuid4())\nvalidation, child_report";
+
+        let config_path = self
+            .repo_path
+            .join(".codex/validation/completion-proof.toml");
+        let config = fs::read_to_string(&config_path)?;
+        let trusted_bundle_line = config
+            .lines()
+            .find(|line| line.starts_with("trusted_bundle_paths = ["))
+            .context("completion-proof fixture trusted bundle declaration is missing")?;
+        let trusted_bundle_prefix = trusted_bundle_line
+            .strip_suffix(']')
+            .context("completion-proof fixture trusted bundle declaration is malformed")?;
+        let expanded_trusted_bundle_line =
+            format!("{trusted_bundle_prefix}, \"trusted_helper.py\"]");
+        let config = config.replacen(trusted_bundle_line, &expanded_trusted_bundle_line, 1);
+        anyhow::ensure!(
+            !config
+                .lines()
+                .find(|line| line.starts_with("trusted_runner_entrypoints = ["))
+                .context("completion-proof fixture trusted entrypoint declaration is missing")?
+                .contains("trusted_helper.py"),
+            "source-only helper was added to executable entrypoints"
+        );
+        fs::write(&config_path, config)?;
+
+        let focused_path = self.repo_path.join("focused.py");
+        let focused = fs::read_to_string(&focused_path)?;
+        anyhow::ensure!(
+            focused.matches(FOCUSED_INSERTION_POINT).count() == 1,
+            "focused fixture helper-mutation insertion point is not unique"
+        );
+        let focused_mutation = format!(
+            "if failure:\n    Path(\"trusted_helper.py\").write_bytes({}.encode(\"utf-8\"))\n{FOCUSED_INSERTION_POINT}",
+            serde_json::to_string(CHANGED_HELPER_SOURCE)?
+        );
+        fs::write(
+            &focused_path,
+            focused.replacen(FOCUSED_INSERTION_POINT, &focused_mutation, 1),
+        )?;
+
+        let proof_path = self.repo_path.join("proof.py");
+        let proof = fs::read_to_string(&proof_path)?;
+        anyhow::ensure!(
+            proof.matches(CANONICAL_INSERTION_POINT).count() == 1,
+            "canonical fixture helper-mutation insertion point is not unique"
+        );
+        let canonical_mutation = format!(
+            "if primary_failure:\n    Path(\"trusted_helper.py\").write_bytes({}.encode(\"utf-8\"))\n{CANONICAL_INSERTION_POINT}",
+            serde_json::to_string(CHANGED_HELPER_SOURCE)?
+        );
+        fs::write(
+            &proof_path,
+            proof.replacen(CANONICAL_INSERTION_POINT, &canonical_mutation, 1),
+        )?;
+
+        fs::write(
+            self.repo_path.join("trusted_helper.py"),
+            TRUSTED_HELPER_SOURCE,
+        )?;
+        fs::write(
+            self.repo_path.join("restore_trusted_helper.py"),
+            format!(
+                "from pathlib import Path\nPath(\"trusted_helper.py\").write_bytes({}.encode(\"utf-8\"))\nfailure_marker = Path(\".fixture-state/focused-validation-fails\")\nif failure_marker.exists():\n    failure_marker.unlink()\n",
+                serde_json::to_string(TRUSTED_HELPER_SOURCE)?
+            ),
+        )?;
+        run_git(
+            &self.repo_path,
+            &[
+                "add",
+                "--",
+                ".codex/validation/completion-proof.toml",
+                "focused.py",
+                "proof.py",
+                "trusted_helper.py",
+                "restore_trusted_helper.py",
+            ],
+        )?;
+        run_git(
+            &self.repo_path,
+            &["commit", "--quiet", "--amend", "--no-edit"],
+        )?;
+        Ok(format!(
+            "{} restore_trusted_helper.py",
+            available_python_command()?
+        ))
+    }
+
     #[cfg(windows)]
     fn install_network_confinement_probe(
         &self,
@@ -936,6 +1831,7 @@ blocked_proxy_names = {
     "http_proxy", "https_proxy", "all_proxy", "ftp_proxy",
     "ws_proxy", "wss_proxy", "no_proxy", "codex_network_proxy_active",
 }
+
 surviving_proxy_names = sorted(
     name for name in os.environ if name.lower() in blocked_proxy_names
 )
@@ -1061,6 +1957,140 @@ sys.exit(97)
 
     fn enable_mutate_and_restore_after_first_canonical(&self) -> Result<()> {
         fs::write(&self.mutate_restore_marker_path, "after-first")?;
+        Ok(())
+    }
+
+    fn install_focused_failure_unrelated_workspace_drift(&self) -> Result<String> {
+        let focused_path = self.repo_path.join("focused.py");
+        let focused_script = fs::read_to_string(&focused_path)?;
+        let child_completion = "child.communicate()\nended_at = time.time_ns()";
+        anyhow::ensure!(focused_script.matches(child_completion).count() == 1);
+        fs::write(
+            &focused_path,
+            focused_script.replacen(
+                child_completion,
+                "child.communicate()\nif failure:\n    Path('notes.txt').write_text('changed note\\n', encoding='utf-8')\nended_at = time.time_ns()",
+                1,
+            ),
+        )?;
+        fs::write(self.repo_path.join("notes.txt"), "initial note\n")?;
+        fs::write(
+            self.repo_path.join("restore_unrelated_focused_drift.py"),
+            "from pathlib import Path\nPath('notes.txt').write_text('initial note\\n', encoding='utf-8')\nfailure_marker = Path('.fixture-state/focused-validation-fails')\nif failure_marker.exists():\n    failure_marker.unlink()\n",
+        )?;
+        run_git(
+            &self.repo_path,
+            &[
+                "add",
+                "focused.py",
+                "notes.txt",
+                "restore_unrelated_focused_drift.py",
+            ],
+        )?;
+        run_git(
+            &self.repo_path,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "install focused drift probe",
+            ],
+        )?;
+        Ok(format!(
+            "{} restore_unrelated_focused_drift.py",
+            available_python_command()?
+        ))
+    }
+
+    fn enable_mutate_and_restore_during_first_canonical(&self) -> Result<()> {
+        let proof_path = self.repo_path.join("proof.py");
+        let proof_script = fs::read_to_string(&proof_path)?;
+        let mutate_condition = r#"if mutate_restore_mode == "always" or (
+    mutate_restore_mode == "after-first" and prior_launch_count >= 1
+):"#;
+        anyhow::ensure!(proof_script.matches(mutate_condition).count() == 1);
+        anyhow::ensure!(proof_script.matches("time.sleep(0.2)").count() == 2);
+        let escaped_mutation =
+            r#"runtime_path.write_bytes(original + b"\\n// transient canonical mutation\\n")"#;
+        anyhow::ensure!(proof_script.matches(escaped_mutation).count() == 1);
+        let proof_script = proof_script
+            .replacen(
+                mutate_condition,
+                r#"if mutate_restore_mode == "always" or (
+    mutate_restore_mode == "first-only" and prior_launch_count == 0
+) or (
+    mutate_restore_mode == "after-first" and prior_launch_count >= 1
+):"#,
+                1,
+            )
+            .replace("time.sleep(0.2)", "time.sleep(2.0)")
+            .replacen(
+                escaped_mutation,
+                r#"runtime_path.write_bytes(original + b"\n// transient canonical mutation\n")"#,
+                1,
+            )
+            .replacen(
+                "runtime_path = Path(\"src/runtime.rs\")",
+                "runtime_path = Path(\"scratch/observer-probe.txt\") if mutate_restore_mode == \"first-only\" else Path(\"src/runtime.rs\")",
+                1,
+            )
+            .replacen(
+                "    runtime_path.write_bytes(original)\n    time.sleep(2.0)",
+                "    if mutate_restore_mode != \"first-only\":\n        runtime_path.write_bytes(original)\n    time.sleep(2.0)",
+                1,
+            );
+        fs::write(&proof_path, proof_script)?;
+        fs::create_dir_all(self.repo_path.join("scratch"))?;
+        fs::write(
+            self.repo_path.join("scratch/observer-probe.txt"),
+            "initial probe\n",
+        )?;
+        run_git(
+            &self.repo_path,
+            &["add", "proof.py", "scratch/observer-probe.txt"],
+        )?;
+        run_git(
+            &self.repo_path,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "install first-only canonical drift probe",
+            ],
+        )?;
+        fs::write(&self.mutate_restore_marker_path, "first-only")?;
+        Ok(())
+    }
+
+    fn make_later_infrastructure_result_a_malformed_claimed_failure(&self) -> Result<()> {
+        let proof_path = self.repo_path.join("proof.py");
+        let proof_script = fs::read_to_string(&proof_path)?;
+        let classification = r#""classification": "pre_result_error","#;
+        anyhow::ensure!(proof_script.matches(classification).count() == 1);
+        fs::write(
+            &proof_path,
+            proof_script.replacen(
+                classification,
+                r#""classification": "confirmed_validation_failure","#,
+                1,
+            ),
+        )?;
+        run_git(&self.repo_path, &["add", "proof.py"])?;
+        run_git(
+            &self.repo_path,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "install malformed claimed failure fixture",
+            ],
+        )?;
         Ok(())
     }
 
@@ -1229,6 +2259,20 @@ text = "the fixture exception remains explicitly quarantined"
         .await
     }
 
+    async fn harness_with_raw_response_items_and_extensions(
+        &self,
+        extensions: Arc<ExtensionRegistry<Config>>,
+    ) -> Result<TestCodexHarness> {
+        let cwd = self.repo_path.abs();
+        TestCodexHarness::with_builder(
+            test_codex()
+                .with_raw_response_items()
+                .with_extensions(extensions)
+                .with_config(move |config| set_fixture_workspace(config, cwd)),
+        )
+        .await
+    }
+
     async fn harness_with_home(&self, home: Arc<TempDir>) -> Result<TestCodexHarness> {
         let cwd = self.repo_path.abs();
         TestCodexHarness::with_builder(
@@ -1273,6 +2317,620 @@ text = "the fixture exception remains explicitly quarantined"
     }
 }
 
+#[cfg(windows)]
+struct CurrentEvidenceFixture {
+    _repo: TempDir,
+    _outside: TempDir,
+    repo_path: PathBuf,
+    outside_path: PathBuf,
+    exact_command: String,
+    reconciliation_command: String,
+    canonical_marker: PathBuf,
+    unit_marker: PathBuf,
+    pytest_marker: PathBuf,
+    control_path: PathBuf,
+    barrier_hold: PathBuf,
+    barrier_ready: PathBuf,
+    driver_started: PathBuf,
+    driver_diagnostic: PathBuf,
+    historical_review_plan: PathBuf,
+}
+
+#[cfg(windows)]
+impl CurrentEvidenceFixture {
+    fn new() -> Result<Self> {
+        Self::with_resolved_reconciliation(false)
+    }
+
+    fn new_resolved() -> Result<Self> {
+        Self::with_resolved_reconciliation(true)
+    }
+
+    fn new_historical_resolved() -> Result<Self> {
+        Self::with_materialization_mode("historical")
+    }
+
+    fn with_resolved_reconciliation(resolved: bool) -> Result<Self> {
+        Self::with_materialization_mode(if resolved { "resolved" } else { "unresolved" })
+    }
+
+    fn with_materialization_mode(mode: &str) -> Result<Self> {
+        let repo = TempDir::new().context("create current-evidence fixture repository")?;
+        let outside = TempDir::new().context("create current-evidence fixture control root")?;
+        let repo_path = repo.path().to_path_buf();
+        let outside_path = outside.path().to_path_buf();
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .context("resolve KD4 source root for current-evidence fixture")?;
+        let materializer = outside_path.join("materialize.py");
+        fs::write(&materializer, CURRENT_EVIDENCE_MATERIALIZER)?;
+        let output = Command::new(available_python_command()?)
+            .arg(&materializer)
+            .arg(&source_root)
+            .arg(&repo_path)
+            .arg(&outside_path)
+            .arg(mode)
+            .output()
+            .context("materialize bounded current-evidence fixture")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "current-evidence fixture materializer failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(Self {
+            _repo: repo,
+            _outside: outside,
+            repo_path: repo_path.clone(),
+            exact_command: "just completion-focused inventory.current-evidence".to_string(),
+            reconciliation_command: "just completion-focused inventory.frozen-reconciliation"
+                .to_string(),
+            canonical_marker: outside_path.join("canonical-launched.txt"),
+            unit_marker: outside_path.join("unittest-executions.txt"),
+            pytest_marker: outside_path.join("pytest-executions.txt"),
+            control_path: outside_path.join("control.txt"),
+            barrier_hold: outside_path.join("report.hold"),
+            barrier_ready: outside_path.join("report.ready"),
+            driver_started: outside_path.join("driver.started"),
+            driver_diagnostic: outside_path.join("driver.diagnostic"),
+            historical_review_plan: repo_path.join(".fixture-state/historical-review-plan.json"),
+            outside_path,
+        })
+    }
+
+    fn driver_diagnostics(&self) -> String {
+        let started = self.driver_started.exists();
+        let diagnostic = fs::read_to_string(&self.driver_diagnostic)
+            .unwrap_or_else(|error| format!("unavailable ({error})"));
+        format!("driver_started={started}; driver_diagnostic={diagnostic}")
+    }
+
+    async fn harness(&self) -> Result<TestCodexHarness> {
+        self.harness_with_home(Arc::new(TempDir::new()?)).await
+    }
+
+    async fn harness_with_home(&self, home: Arc<TempDir>) -> Result<TestCodexHarness> {
+        self.harness_with_home_and_features(home, false).await
+    }
+
+    async fn historical_harness_with_home(&self, home: Arc<TempDir>) -> Result<TestCodexHarness> {
+        self.harness_with_home_and_features(home, true).await
+    }
+
+    async fn harness_with_home_and_features(
+        &self,
+        home: Arc<TempDir>,
+        multi_agent_v2: bool,
+    ) -> Result<TestCodexHarness> {
+        let cwd = self.repo_path.abs();
+        let outside = self.outside_path.abs();
+        let fake_bin = self.repo_path.join(".fixture-bin");
+        let sandbox_temp = self.repo_path.join(".fixture-state/sandbox-temp");
+        let path = format!(
+            "{};{}",
+            fake_bin.to_string_lossy(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        TestCodexHarness::with_builder(
+            test_codex()
+                .with_home(home)
+                .with_raw_response_items()
+                .with_extensions(required_tool_failure_extensions())
+                .with_config(move |config| {
+                    if multi_agent_v2 {
+                        config
+                            .features
+                            .enable(Feature::Collab)
+                            .expect("historical fixture enables collaboration");
+                        config
+                            .features
+                            .enable(Feature::MultiAgentV2)
+                            .expect("historical fixture enables typed agents");
+                        config.multi_agent_v2.tool_namespace = Some("agents".to_string());
+                    }
+                    config.cwd = cwd.clone();
+                    let roots = vec![cwd.clone(), outside.clone()];
+                    config.workspace_roots = roots.clone();
+                    config.permissions.set_workspace_roots(roots);
+                    for (name, value) in [
+                        ("PATH", path.clone()),
+                        ("TEMP", sandbox_temp.to_string_lossy().into_owned()),
+                        ("TMP", sandbox_temp.to_string_lossy().into_owned()),
+                    ] {
+                        config
+                            .permissions
+                            .shell_environment_policy
+                            .r#set
+                            .insert(name.to_string(), value);
+                    }
+                }),
+        )
+        .await
+    }
+
+    fn historical_review_plan(&self) -> Result<serde_json::Value> {
+        serde_json::from_slice(&fs::read(&self.historical_review_plan)?)
+            .context("parse fixture historical review plan")
+    }
+
+    fn historical_scope_ids(&self) -> Result<Vec<String>> {
+        self.historical_review_plan()?["review_scopes"]
+            .as_array()
+            .context("historical review plan omitted review scopes")?
+            .iter()
+            .map(|scope| {
+                scope["review_scope_id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("historical review scope omitted its ID")
+            })
+            .collect()
+    }
+
+    fn write_historical_proposal(
+        &self,
+        relative_path: &str,
+        approval: &FocusedReplacementApprovalReceiptV1,
+        stale_receipt_ref: bool,
+    ) -> Result<HistoricalReplacementAcceptanceProposalV1> {
+        let plan = self.historical_review_plan()?;
+        let mut scope_reviews = plan["review_scopes"]
+            .as_array()
+            .context("historical review plan omitted review scopes")?
+            .iter()
+            .map(|scope| {
+                Ok(HistoricalReplacementScopeReviewV1 {
+                    review_scope_id: scope["review_scope_id"]
+                        .as_str()
+                        .context("historical review scope omitted its ID")?
+                        .to_owned(),
+                    review_scope_sha256: Sha256HexV1::parse(
+                        scope["review_scope_sha256"]
+                            .as_str()
+                            .context("historical review scope omitted its hash")?
+                            .to_owned(),
+                    )?,
+                    disposition:
+                        HistoricalReplacementScopeReviewDispositionV1::ReviewedNoIncorrectBehavior,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        scope_reviews.sort_by(|left, right| left.review_scope_id.cmp(&right.review_scope_id));
+        let mut proposal = HistoricalReplacementAcceptanceProposalV1 {
+            format_id: HistoricalReplacementAcceptanceProposalV1::FORMAT_ID.to_owned(),
+            schema_version: 1,
+            frozen_graph_sha256: Sha256HexV1::parse(
+                HistoricalReplacementAcceptanceProposalV1::FROZEN_GRAPH_SHA256.to_owned(),
+            )?,
+            review_plan_sha256: Sha256HexV1::parse(
+                plan["review_plan_sha256"]
+                    .as_str()
+                    .context("historical review plan omitted its hash")?
+                    .to_owned(),
+            )?,
+            baseline_count: HistoricalReplacementAcceptanceProposalV1::BASELINE_COUNT,
+            edge_count: HistoricalReplacementAcceptanceProposalV1::EDGE_COUNT,
+            successor_count: HistoricalReplacementAcceptanceProposalV1::SUCCESSOR_COUNT,
+            review_scope_count: HistoricalReplacementAcceptanceProposalV1::REVIEW_SCOPE_COUNT,
+            focused_replacement_approval_receipt_ref: FocusedReplacementApprovalReceiptRefV1 {
+                format_id: FocusedReplacementApprovalReceiptV1::FORMAT_ID.to_owned(),
+                schema_version: 1,
+                attempt_id: if stale_receipt_ref {
+                    "stale-focused-reconciliation-attempt".to_owned()
+                } else {
+                    approval.attempt_id.clone()
+                },
+                focused_validation_id: FocusedReplacementApprovalReceiptV1::FOCUSED_VALIDATION_ID
+                    .to_owned(),
+                receipt_sha256: approval.receipt_sha256.clone(),
+            },
+            scope_review_set_sha256: proof_hash(
+                HistoricalReplacementAcceptanceProposalV1::SCOPE_REVIEW_SET_HASH_DOMAIN,
+                &scope_reviews,
+            )?,
+            scope_reviews,
+            activation_authority: MustBeNullV1,
+            proposal_sha256: Sha256HexV1::parse("0".repeat(64))?,
+        };
+        proposal.proposal_sha256 = proposal.proposal_sha256()?;
+        if !stale_receipt_ref {
+            let predecessor: serde_json::Value = serde_json::from_slice(include_bytes!(
+                "../../../../.codex/validation/test-replacements-v1.json"
+            ))?;
+            proposal.validate(&predecessor, approval)?;
+        }
+        let path = self.repo_path.join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, canonical_jcs_of(&proposal)?)?;
+        Ok(proposal)
+    }
+}
+
+#[cfg(windows)]
+const CURRENT_EVIDENCE_MATERIALIZER: &str = r###"
+import hashlib
+import json
+import os
+import pathlib
+import runpy
+import shutil
+import subprocess
+import sys
+import tempfile
+
+source = pathlib.Path(sys.argv[1])
+repo = pathlib.Path(sys.argv[2])
+outside = pathlib.Path(sys.argv[3])
+mode = sys.argv[4]
+resolved = mode in {"resolved", "historical"}
+historical = mode == "historical"
+
+historical_rows = []
+historical_successor_rows = []
+historical_review_plan = None
+if historical:
+    source_ledger = json.loads(
+        (source / ".codex/validation/test-replacements-v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    historical_rows = [
+        dict(row)
+        for row in source_ledger["rows"]
+        if row.get("resolution") == "replacement"
+    ]
+    historical_successor_ids = sorted(
+        {
+            successor_id
+            for row in historical_rows
+            for successor_id in row["replacement_ids"]
+        }
+    )
+    if (
+        len(historical_rows) != 644
+        or sum(len(row["replacement_ids"]) for row in historical_rows) != 685
+        or len(historical_successor_ids) != 572
+    ):
+        raise RuntimeError("source historical replacement graph changed")
+    historical_successor_rows = [
+        {
+            "baseline_id": successor_id,
+            "framework": "rust-nextest",
+            "native_id": f"fixture-history::{successor_id}",
+            "source": "src/historical.rs",
+            "ignored": False,
+            "platforms": ["windows"],
+        }
+        for successor_id in historical_successor_ids
+    ]
+    original_sys_path = list(sys.path)
+    sys.path.insert(0, str(source / "scripts"))
+    try:
+        inventory_module = runpy.run_path(
+            str(source / "scripts/completion_proof_inventory_v2.py")
+        )
+        admission_module = runpy.run_path(
+            str(source / "scripts/replacement_admission.py")
+        )
+        graph = inventory_module[
+            "derive_frozen_v1_historical_replacement_graph_v1"
+        ](source_ledger)
+        historical_review_plan = admission_module[
+            "_historical_replacement_review_plan_v1"
+        ](graph)
+    finally:
+        sys.path[:] = original_sys_path
+
+def write(relative, content):
+    path = repo / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+def copy(relative):
+    path = repo / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / relative, path)
+
+for relative in (
+    "scripts/completion_proof.py",
+    "scripts/completion_proof_canonical.py",
+    "scripts/completion_proof_inventory_v2.py",
+    "scripts/current_evidence_successor_projection.py",
+    "scripts/completion_proof_unittest.py",
+    "scripts/completion_proof_pytest.py",
+    "scripts/focused_live_successor_catalog.py",
+    "scripts/bounded_process.py",
+    "scripts/child_validation_report.py",
+    "scripts/pyproject.toml",
+    "scripts/uv.lock",
+    "sdk/python/pyproject.toml",
+    "sdk/python/uv.lock",
+    "sdk/python/README.md",
+):
+    copy(relative)
+shutil.copytree(source / "sdk/python/src", repo / "sdk/python/src")
+
+write(".gitignore", "/.fixture-state/\n**/.venv/\n**/.pytest_cache/\n**/__pycache__/\n")
+(repo / ".fixture-state/sandbox-temp").mkdir(parents=True)
+write("scripts/root_maintenance.py", "def python_unittest_targets():\n    return ['scripts.test_runtime_path']\n")
+write("scripts/test_runtime_path.py", f'''import pathlib
+import unittest
+import uuid
+MARKER = pathlib.Path({str(outside / "unittest-executions.txt")!r})
+CONTROL = pathlib.Path({str(outside / "control.txt")!r})
+class RuntimePathTest(unittest.TestCase):
+    def test_runs(self):
+        with MARKER.open("a", encoding="utf-8") as output:
+            output.write(str(uuid.uuid4()) + "\\n")
+        if CONTROL.exists() and "unit-fail" in CONTROL.read_text(encoding="utf-8"):
+            self.fail("fixture unittest failure")
+''')
+write("sdk/python/tests/test_runtime_path.py", f'''import pathlib
+import uuid
+import pytest
+MARKER = pathlib.Path({str(outside / "pytest-executions.txt")!r})
+CONTROL = pathlib.Path({str(outside / "control.txt")!r})
+def skipped():
+    return CONTROL.exists() and "pytest-skip" in CONTROL.read_text(encoding="utf-8")
+@pytest.mark.skipif(skipped(), reason="fixture pre-result skip")
+def test_runs():
+    with MARKER.open("a", encoding="utf-8") as output:
+        output.write(str(uuid.uuid4()) + "\\n")
+''')
+write("sdk/typescript/tests/runtime_path.test.ts", 'test("inventory path", () => {});\n')
+write("codex-rs/Cargo.toml", '[workspace]\nmembers = ["fixture"]\nresolver = "2"\n')
+write("codex-rs/fixture/Cargo.toml", '[package]\nname = "fixture-package"\nversion = "0.1.0"\nedition = "2021"\n')
+write("codex-rs/fixture/src/lib.rs", '/// ```\n/// assert_eq!(2 + 2, 4);\n/// ```\npub fn fixture() {}\n#[cfg(test)] mod tests { #[test] fn runtime_path() {} }\n')
+write("tools/argument-comment-lint/src/comment_parser.rs", "// fixture inventory source\n")
+write("tools/argument-comment-lint/native_test_runner.py", '''import json
+print(json.dumps({"schema_version": 1, "report_type": "ArgumentCommentLintNativeTestInventoryV1", "count": 1, "tests": [{"id": "argument-comment-lint::rust-lib::comment_parser.parses_prefix_comment", "kind": "rust-lib", "cargo_target": ["--lib"], "native_id": "comment_parser::tests::parses_prefix_comment", "ui_case": None, "doctest_item": None, "doctest_ordinal": None}]}))
+''')
+write("codex-rs/windows-sandbox-rs/sandbox_smoketests.py", '''import json
+cases = [{"id": f"python-script-case::windows-sandbox-smoke::fixture-{index:02d}", "name": f"fixture {index:02d}"} for index in range(46)]
+print(json.dumps({"schema_version": 1, "report_type": "WindowsSandboxSmokeCaseListV1", "validation_id": "windows-sandbox-smoke", "host_platform": "windows", "cases": cases}))
+''')
+write(".fixture-bin/fake_cargo.py", f'''import json
+import pathlib
+import sys
+control = pathlib.Path({str(outside / "control.txt")!r})
+if control.exists() and "pre-result" in control.read_text(encoding="utf-8"):
+    raise SystemExit(17)
+if "nextest" in sys.argv:
+    print(json.dumps({{"test-count": 1, "rust-suites": {{"fixture": {{"package-name": "fixture-package", "binary-name": "fixture-test", "cwd": {str(repo / "codex-rs/fixture")!r}, "testcases": {{"runtime_path": {{"ignored": False}}}}}}}}}}))
+else:
+    print("fixture/src/lib.rs - fixture (line 1): test")
+''')
+write(".fixture-bin/cargo.cmd", f'@echo off\r\n"{sys.executable}" "%~dp0fake_cargo.py" %*\r\n')
+
+runner_environment = repo / ".fixture-state/runner-environment"
+subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(runner_environment)], check=True)
+# Exercise Windows venv forwarding: the reported executable must be the actual
+# interpreter authenticated by Core, even when sys.executable names a launcher.
+python = json.dumps(str(runner_environment / "Scripts/python.exe"))
+justfile_content = f'''[no-cd]
+completion-focused validation_id:
+    {python} runner_driver.py {{{{validation_id}}}}
+
+[no-cd]
+completion-proof:
+    {python} canonical_marker.py
+'''
+write("justfile", justfile_content)
+write("runner_driver.py", f'''import json
+import pathlib
+import runpy
+import sys
+import time
+import traceback
+started = pathlib.Path({str(outside / "driver.started")!r})
+diagnostic = pathlib.Path({str(outside / "driver.diagnostic")!r})
+started.write_text("started\\n", encoding="utf-8")
+module = runpy.run_path(str(pathlib.Path("scripts/completion_proof.py").resolve()))
+# Pin only the two fixture recipes as the reviewed command surface. All other
+# marker discovery and ownership checks still run through the real collector.
+module["TEST_SURFACE_REVIEWED_JUSTFILE_SHA256"]["justfile"] = {hashlib.sha256(justfile_content.encode("utf-8")).hexdigest()!r}
+historical_successor_rows = json.loads({json.dumps(historical_successor_rows)!r})
+if historical_successor_rows:
+    real_discover_inventory = module["discover_inventory"]
+    def fixture_discover_inventory(*args, **kwargs):
+        rows, jest_observation = real_discover_inventory(*args, **kwargs)
+        rows_by_id = {{row["baseline_id"]: row for row in rows}}
+        rows_by_id.update(
+            {{row["baseline_id"]: row for row in historical_successor_rows}}
+        )
+        return [rows_by_id[test_id] for test_id in sorted(rows_by_id)], jest_observation
+    module["_unittest_main"].__globals__["discover_inventory"] = fixture_discover_inventory
+try:
+    result = module["_unittest_main"](["--config", str(pathlib.Path(".codex/validation/runner.toml").resolve()), "focused", sys.argv[1]])
+except BaseException:
+    diagnostic.write_text(traceback.format_exc(), encoding="utf-8")
+    raise
+diagnostic.write_text(f"runner_result={{result}}\\n", encoding="utf-8")
+hold = pathlib.Path({str(outside / "report.hold")!r})
+ready = pathlib.Path({str(outside / "report.ready")!r})
+if hold.exists():
+    ready.write_text("ready\\n", encoding="utf-8")
+    while hold.exists():
+        time.sleep(0.005)
+raise SystemExit(result)
+''')
+write("canonical_marker.py", f'from pathlib import Path\nPath({str(outside / "canonical-launched.txt")!r}).write_text("launched\\n", encoding="utf-8")\n')
+
+if historical:
+    source_inventory = json.loads(
+        (source / ".codex/validation/frozen-test-inventory-v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    historical_baseline_ids = {row["baseline_id"] for row in historical_rows}
+    baseline = [
+        dict(row)
+        for row in source_inventory["tests"]
+        if row["baseline_id"] in historical_baseline_ids
+    ]
+    if len(baseline) != 644:
+        raise RuntimeError("source frozen inventory no longer contains the historical subset")
+else:
+    baseline = [{"baseline_id": "fixture-history::unresolved-source", "framework": "fixture-history", "native_id": "unresolved-source", "source": "src/historical.rs", "ignored": False, "platforms": ["windows"]}]
+canonical_inventory = json.dumps({"schema_version": 1, "tests": baseline}, sort_keys=True, separators=(",", ":")).encode()
+inventory_hash = hashlib.sha256(canonical_inventory).hexdigest()
+def write_json(relative, value):
+    write(relative, json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+write_json(".codex/validation/frozen-test-inventory-v1.json", {"schema_version": 1, "host_platform": "windows", "inventory_hash": inventory_hash, "tests": baseline})
+initial_ledger_rows = (
+    [dict(row, validation_id="maintenance.root-unittest") for row in historical_rows]
+    if historical
+    else [{"baseline_id": baseline[0]["baseline_id"], "resolution": "unresolved"}]
+)
+write_json(".codex/validation/test-replacements-v1.json", {"schema_version": 1, "frozen_inventory_hash": inventory_hash, "rows": initial_ledger_rows, "overrides": []})
+trusted = ["justfile", "runner_driver.py", ".codex/validation/runner.toml", "scripts/completion_proof.py", "scripts/completion_proof_canonical.py", "scripts/completion_proof_inventory_v2.py", "scripts/current_evidence_successor_projection.py", "scripts/completion_proof_unittest.py", "scripts/completion_proof_pytest.py", "scripts/focused_live_successor_catalog.py", "scripts/bounded_process.py", "scripts/child_validation_report.py", "scripts/root_maintenance.py", ".fixture-bin/cargo.cmd", ".fixture-bin/fake_cargo.py", "tools/argument-comment-lint/native_test_runner.py", "codex-rs/windows-sandbox-rs/sandbox_smoketests.py"]
+runner_config = f'''schema_version = 2
+policy_id = "fixture.current-evidence.v1"
+canonical_command = "just completion-proof"
+focused_command = "just completion-focused {{validation_id}}"
+documentation_command = "just source-map-check"
+frozen_inventory_hash = "{inventory_hash}"
+frozen_inventory = ".codex/validation/frozen-test-inventory-v1.json"
+replacement_ledger = ".codex/validation/test-replacements-v1.json"
+host_platform = "windows"
+[focused_inventory_evidence]
+validation_ids = ["maintenance.root-unittest", "sdk.python.pytest"]
+
+[[validation]]
+id = "inventory.frozen-reconciliation"
+runner = "inventory-reconciliation"
+owned_paths = [".codex/validation/**", "scripts/completion_proof*.py"]
+consumed_paths = ["justfile", "**/Cargo.toml", "codex-rs/**/*.rs", "tools/argument-comment-lint/**", "codex-rs/windows-sandbox-rs/sandbox_smoketests.py", "**/test_*.py", "**/*_test.py", "**/package.json", "**/pyproject.toml", "**/pytest.ini", "**/setup.cfg", "**/tox.ini", "**/jest.config.cjs", "**/*.test.ts"]
+timeout_seconds = 120
+
+[[validation]]
+id = "maintenance.root-unittest"
+runner = "python-unittest"
+owned_paths = ["scripts/test_runtime_path.py"]
+consumed_paths = ["scripts/test_runtime_path.py", "scripts/completion_proof_unittest.py", "scripts/root_maintenance.py", "scripts/pyproject.toml", "scripts/uv.lock"]
+timeout_seconds = 120
+
+[[validation]]
+id = "sdk.python.pytest"
+runner = "python-pytest"
+owned_paths = ["sdk/python/tests/**"]
+consumed_paths = ["sdk/python/tests/**", "scripts/completion_proof_pytest.py", "sdk/python/pyproject.toml", "sdk/python/uv.lock"]
+timeout_seconds = 120
+'''
+# Core's generic-repository trust metadata is separate from the KD4 runner policy.
+# Both configurations share the exact same validation declarations, and Core pins
+# the runner configuration as part of its trusted bundle.
+write(".codex/validation/runner.toml", runner_config)
+write(".codex/validation/completion-proof.toml", f'''trusted_bundle_paths = {json.dumps(trusted)}
+trusted_runner_entrypoints = ["scripts/completion_proof.py"]
+''' + runner_config)
+write("README.md", "fixture documentation\n")
+write("src/runtime.rs", "pub const VALUE: u8 = 1;\n")
+write("src/historical.rs", "// unresolved history\n")
+subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+subprocess.run(["git", "config", "user.email", "fixture@example.invalid"], cwd=repo, check=True)
+subprocess.run(["git", "config", "user.name", "Current Evidence Fixture"], cwd=repo, check=True)
+subprocess.run(["git", "add", "."], cwd=repo, check=True)
+subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture"], cwd=repo, check=True)
+if resolved:
+    original_path = os.environ.get("PATH", "")
+    original_sys_path = list(sys.path)
+    os.environ["PATH"] = str(repo / ".fixture-bin") + os.pathsep + original_path
+    sys.path.insert(0, str(repo / "scripts"))
+    try:
+        module = runpy.run_path(str(repo / "scripts/completion_proof.py"))
+        module["TEST_SURFACE_REVIEWED_JUSTFILE_SHA256"]["justfile"] = hashlib.sha256(
+            justfile_content.encode("utf-8")
+        ).hexdigest()
+        with tempfile.TemporaryDirectory(prefix="kd4-resolved-fixture-", dir=outside) as temp_name:
+            current_rows, _ = module["discover_inventory"](
+                repo,
+                temp_dir=pathlib.Path(temp_name),
+                jest_observation={},
+            )
+    finally:
+        os.environ["PATH"] = original_path
+        sys.path[:] = original_sys_path
+    if historical:
+        current_rows_by_id = {row["baseline_id"]: row for row in current_rows}
+        current_rows_by_id.update(
+            {row["baseline_id"]: row for row in historical_successor_rows}
+        )
+        current_rows = [
+            current_rows_by_id[test_id] for test_id in sorted(current_rows_by_id)
+        ]
+    replacement_ids = sorted(row["baseline_id"] for row in current_rows)
+    if not replacement_ids:
+        raise RuntimeError("resolved fixture discovered zero replacement IDs")
+    if historical:
+        successor_ids = {row["baseline_id"] for row in historical_successor_rows}
+        addition_ids = [test_id for test_id in replacement_ids if test_id not in successor_ids]
+        ledger_rows = [
+            dict(row, validation_id="maintenance.root-unittest")
+            for row in historical_rows
+        ]
+        ledger_additions = [
+            {
+                "test_id": test_id,
+                "preserved_behavior": "the bounded fixture's current runtime inventory remains executable",
+                "product_path": "the real current-evidence and frozen-reconciliation session path",
+                "validation_id": "maintenance.root-unittest",
+                "provenance": {
+                    "kind": "policy-addition",
+                    "source": "bounded completion-proof fixture",
+                    "text": "the test is discovered by the fixture's real inventory path",
+                },
+            }
+            for test_id in addition_ids
+        ]
+    else:
+        ledger_additions = []
+        ledger_rows = [{
+            "baseline_id": baseline[0]["baseline_id"],
+            "resolution": "replacement",
+            "replacement_ids": replacement_ids,
+            "preserved_behavior": "the configured runtime inventory remains executable",
+            "product_path": "the real current-evidence and frozen-reconciliation session path",
+            "validation_id": "maintenance.root-unittest",
+        }]
+    write_json(".codex/validation/test-replacements-v1.json", {
+        "schema_version": 1,
+        "frozen_inventory_hash": inventory_hash,
+        "rows": ledger_rows,
+        "additions": ledger_additions,
+        "overrides": [],
+    })
+    subprocess.run(["git", "add", ".codex/validation/test-replacements-v1.json"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "--quiet", "--amend", "--no-edit"], cwd=repo, check=True)
+if historical:
+    write_json(".fixture-state/historical-review-plan.json", historical_review_plan)
+write("src/runtime.rs", "pub const VALUE: u8 = 2;\n")
+"###;
+
 fn available_python_command() -> Result<&'static str> {
     for candidate in if cfg!(windows) {
         ["python", "python3"]
@@ -1306,6 +2964,16 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
 fn terminal_candidate(index: usize, text: &str) -> String {
     let response_id = format!("proof-response-{index}");
     let message_id = format!("proof-message-{index}");
@@ -1336,6 +3004,187 @@ fn exec_command_call_response(call_id: &str, command: &str, workdir: &Path) -> S
         ev_function_call(call_id, "exec_command", &arguments),
         ev_completed("proof-exec-response"),
     ])
+}
+
+fn shell_command_call_response(call_id: &str, command: &str) -> String {
+    let arguments = serde_json::to_string(&json!({
+        "kind": "script",
+        "command": command,
+        "timeout_ms": 180_000,
+        "login": false,
+    }))
+    .expect("serialize shell_command arguments");
+    sse(vec![
+        ev_response_created("proof-shell-response"),
+        ev_function_call(call_id, "shell_command", &arguments),
+        ev_completed("proof-shell-response"),
+    ])
+}
+
+fn required_failure_call_response(call_id: &str) -> String {
+    sse(vec![
+        ev_response_created("proof-required-failure-response"),
+        ev_function_call(call_id, REQUIRED_FAILURE_TOOL_NAME, "{}"),
+        ev_completed("proof-required-failure-response"),
+    ])
+}
+
+fn agent_tool_call_response(call_id: &str, tool_name: &str, arguments: &str) -> String {
+    let response_id = format!("agent-tool-response-{call_id}");
+    sse(vec![
+        ev_response_created(&response_id),
+        ev_function_call_with_namespace(call_id, "agents", tool_name, arguments),
+        ev_completed(&response_id),
+    ])
+}
+
+async fn wait_for_response_request(mock_response: &ResponseMock, label: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while mock_response.requests().is_empty() {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {label}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+fn tool_output_json(output: &str, pointer: &str) -> Result<serde_json::Value> {
+    serde_json::Deserializer::from_str(output)
+        .into_iter::<serde_json::Value>()
+        .collect::<serde_json::Result<Vec<_>>>()?
+        .into_iter()
+        .find(|value| value.pointer(pointer).is_some())
+        .with_context(|| format!("tool output omitted {pointer}: {output}"))
+}
+
+#[cfg(windows)]
+fn current_evidence_report_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            current_evidence_report_files(&entry.path(), files)?;
+        } else if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
+            files.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn current_evidence_report_barrier(
+    fixture: &CurrentEvidenceFixture,
+    codex_home: &Path,
+    replay: Option<Vec<u8>>,
+) -> Result<(
+    Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<Result<Vec<u8>>>,
+)> {
+    if fixture.barrier_ready.exists() {
+        fs::remove_file(&fixture.barrier_ready)?;
+    }
+    for diagnostic in [&fixture.driver_started, &fixture.driver_diagnostic] {
+        if diagnostic.exists() {
+            fs::remove_file(diagnostic)?;
+        }
+    }
+    fs::write(&fixture.barrier_hold, "hold\n")?;
+    let ready = fixture.barrier_ready.clone();
+    let hold = fixture.barrier_hold.clone();
+    let attempts = codex_home.join("completion-proof/attempts");
+    let tool_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let barrier_tool_completed = Arc::clone(&tool_completed);
+    let thread = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        while !ready.exists() {
+            if barrier_tool_completed.load(std::sync::atomic::Ordering::Acquire) && !ready.exists()
+            {
+                let _ = fs::remove_file(&hold);
+                anyhow::bail!(
+                    "tool call returned before the fixture runner reached its report barrier"
+                );
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for current-evidence report barrier"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut report_path = None;
+        while report_path.is_none() {
+            let mut candidates = Vec::new();
+            current_evidence_report_files(&attempts, &mut candidates)?;
+            candidates.sort();
+            report_path = candidates.into_iter().find(|path| {
+                fs::read(path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .is_some_and(|value| {
+                        value.get("report_type").and_then(serde_json::Value::as_str)
+                            == Some("FocusedValidationAttemptReportV2")
+                            && value
+                                .get("focused_validation_id")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("inventory.current-evidence")
+                    })
+            });
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "timed out locating private current-evidence report"
+            );
+            if report_path.is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let report_path = report_path.expect("report path checked above");
+        let captured = fs::read(&report_path)?;
+        if let Some(replay) = replay {
+            fs::write(&report_path, replay)?;
+        }
+        fs::remove_file(&hold)?;
+        let _ = fs::remove_file(&ready);
+        Ok(captured)
+    });
+    Ok((tool_completed, thread))
+}
+
+#[cfg(windows)]
+fn current_evidence_report_diagnostics(report: &Result<Vec<u8>>) -> String {
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => return error.to_string(),
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(report) else {
+        return "captured report was not valid JSON".to_string();
+    };
+    json!({
+        "attempt_classification": value.get("attempt_classification"),
+        "fatal_error": value.get("fatal_error"),
+        "runner_process_identity": value.get("runner_process_identity"),
+        "validations": value.get("validations"),
+    })
+    .to_string()
+}
+
+#[cfg(windows)]
+fn read_authenticated_completion_proof_state(
+    codex_home: &Path,
+    repository: &Path,
+) -> Result<(PathBuf, serde_json::Value)> {
+    let mut state_path =
+        codex_core::test_support::completion_proof_state_lock_path(codex_home, repository);
+    state_path.set_extension("json");
+    let state = serde_json::from_slice(&fs::read(&state_path).with_context(|| {
+        format!(
+            "read authenticated completion-proof state {}",
+            state_path.display()
+        )
+    })?)?;
+    Ok((state_path, state))
 }
 
 fn write_stdin_call_response(call_id: &str, process_id: u32) -> String {
@@ -1447,7 +3296,9 @@ async fn submit_and_collect(test: &TestCodex, prompt: &str) -> Result<Vec<EventM
         anyhow::ensure!(!remaining.is_zero(), "timed out waiting for TurnComplete");
         let event = tokio::time::timeout(remaining, test.codex.next_event())
             .await
-            .context("timed out waiting for completion-proof session event")??;
+            .with_context(|| {
+                format!("timed out waiting for completion-proof session event; observed events: {events:#?}")
+            })??;
         let terminal = matches!(event.msg, EventMsg::TurnComplete(_));
         events.push(event.msg);
         if terminal {
@@ -3241,6 +5092,9 @@ fn explicit_admission_not_session_source_selects_terminal_authority() -> Result<
 }
 
 async fn explicit_admission_not_session_source_selects_terminal_authority_impl() -> Result<()> {
+    const ROOT_ONLY_DIAGNOSTIC: &str =
+        "only the root Codex session may own and register whole-repository certification";
+
     let fixture = CompletionProofFixture::new()?;
     let cwd = fixture.repo_path.abs();
     let harness = TestCodexHarness::with_builder(
@@ -3254,8 +5108,14 @@ async fn explicit_admission_not_session_source_selects_terminal_authority_impl()
     .await?;
     let public_call_id = "public-root-with-non-root-session-source";
     let contributor_call_id = "explicit-memory-contributor-cannot-certify";
+    let resumed_contributor_call_id = "resumed-memory-contributor-cannot-certify";
+    let forked_contributor_call_id = "forked-memory-contributor-cannot-certify";
     let public_prompt = "certify through public admission with non-root display metadata";
     let contributor_prompt = "attempt certification through the memory-consolidation admission";
+    let resumed_contributor_prompt =
+        "attempt certification after publicly resuming the stopped memory contributor";
+    let forked_contributor_prompt =
+        "attempt certification after publicly forking the stopped memory contributor";
     mount_sse_once_match(
         harness.server(),
         move |request: &wiremock::Request| {
@@ -3294,6 +5154,50 @@ async fn explicit_admission_not_session_source_selects_terminal_authority_impl()
         terminal_candidate(2, "memory contributor returned evidence"),
     )
     .await;
+    mount_sse_once_match(
+        harness.server(),
+        move |request: &wiremock::Request| {
+            response_request_contains(request, resumed_contributor_prompt)
+                && !response_request_contains(request, resumed_contributor_call_id)
+        },
+        exec_command_call_response(
+            resumed_contributor_call_id,
+            &fixture.canonical_command,
+            &fixture.repo_path,
+        ),
+    )
+    .await;
+    let _resumed_contributor_continuation = mount_sse_once_match(
+        harness.server(),
+        move |request: &wiremock::Request| {
+            response_request_contains(request, resumed_contributor_prompt)
+                && response_request_contains(request, resumed_contributor_call_id)
+        },
+        terminal_candidate(3, "resumed memory contributor returned evidence"),
+    )
+    .await;
+    mount_sse_once_match(
+        harness.server(),
+        move |request: &wiremock::Request| {
+            response_request_contains(request, forked_contributor_prompt)
+                && !response_request_contains(request, forked_contributor_call_id)
+        },
+        exec_command_call_response(
+            forked_contributor_call_id,
+            &fixture.canonical_command,
+            &fixture.repo_path,
+        ),
+    )
+    .await;
+    let _forked_contributor_continuation = mount_sse_once_match(
+        harness.server(),
+        move |request: &wiremock::Request| {
+            response_request_contains(request, forked_contributor_prompt)
+                && response_request_contains(request, forked_contributor_call_id)
+        },
+        terminal_candidate(4, "forked memory contributor returned evidence"),
+    )
+    .await;
 
     let thread_manager = Arc::clone(&harness.test().thread_manager);
     let config = harness.test().config.clone();
@@ -3322,19 +5226,22 @@ async fn explicit_admission_not_session_source_selects_terminal_authority_impl()
     contributor_options.session_source = Some(SessionSource::Internal(
         InternalSessionSource::MemoryConsolidation,
     ));
-    let contributor_thread = thread_manager
+    let contributor = thread_manager
         .start_evidence_contributor_thread_with_options(contributor_options)
-        .await?
-        .thread;
-    contributor_thread.request_raw_response_items();
+        .await?;
+    contributor.thread.request_raw_response_items();
     let contributor_events =
-        submit_and_collect_thread(&contributor_thread, &config, contributor_prompt)
+        submit_and_collect_thread(&contributor.thread, &config, contributor_prompt)
             .await
             .context("evidence-contributor admission did not reach TurnComplete")?;
     let contributor_output = function_call_output(&contributor_events, contributor_call_id)
         .context("missing contributor canonical-command output in the model continuation")?;
+    assert_eq!(
+        function_call_output_success(&contributor_events, contributor_call_id),
+        Some(false)
+    );
     assert!(
-        contributor_output.contains("only the root Codex session may own and register"),
+        contributor_output.contains(ROOT_ONLY_DIAGNOSTIC),
         "explicit contributor admission did not reject terminal certification: {contributor_output}"
     );
     assert_eq!(
@@ -3342,31 +5249,120 @@ async fn explicit_admission_not_session_source_selects_terminal_authority_impl()
         1,
         "contributor rejection launched canonical certification"
     );
-    let contributor_rollout = contributor_thread
+    let contributor_rollout = contributor
+        .thread
         .rollout_path()
         .context("missing contributor rollout for public live-resume regression")?;
-    let public_resume_error = match thread_manager
+    let live_resume = thread_manager
         .resume_thread_from_rollout(
             config.clone(),
-            contributor_rollout,
+            contributor_rollout.clone(),
             thread_manager.auth_manager(),
             /*parent_trace*/ None,
             /*supports_openai_form_elicitation*/ false,
         )
-        .await
-    {
-        Ok(_) => anyhow::bail!(
-            "public resume reused a live evidence-contributor thread instead of consuming root authority"
-        ),
-        Err(err) => err,
-    };
+        .await?;
     assert!(
-        public_resume_error
-            .to_string()
-            .contains("different completion-proof authority"),
-        "unexpected public live-resume error: {public_resume_error}"
+        live_resume.was_already_running,
+        "public live resume did not safely reuse the registered evidence contributor"
     );
-    contributor_thread.shutdown_and_wait().await?;
+    assert!(Arc::ptr_eq(&live_resume.thread, &contributor.thread));
+    assert_eq!(fixture.canonical_launch_count()?, 1);
+    contributor.thread.shutdown_and_wait().await?;
+    let removed_contributor = thread_manager
+        .remove_thread(&contributor.thread_id)
+        .await
+        .context("stopped evidence contributor was missing from the thread manager")?;
+    assert!(Arc::ptr_eq(&removed_contributor, &contributor.thread));
+
+    let resumed_contributor = thread_manager
+        .resume_thread_from_rollout(
+            config.clone(),
+            contributor_rollout.clone(),
+            thread_manager.auth_manager(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await?;
+    assert!(!resumed_contributor.was_already_running);
+    assert_eq!(resumed_contributor.thread_id, contributor.thread_id);
+    assert!(!Arc::ptr_eq(
+        &resumed_contributor.thread,
+        &contributor.thread
+    ));
+    resumed_contributor.thread.request_raw_response_items();
+    let resumed_events = submit_and_collect_thread(
+        &resumed_contributor.thread,
+        &config,
+        resumed_contributor_prompt,
+    )
+    .await
+    .context("publicly resumed contributor admission did not reach TurnComplete")?;
+    let resumed_output = function_call_output(&resumed_events, resumed_contributor_call_id)
+        .context("missing resumed-contributor canonical-command output")?;
+    assert_eq!(
+        function_call_output_success(&resumed_events, resumed_contributor_call_id),
+        Some(false)
+    );
+    assert!(
+        resumed_output.contains(ROOT_ONLY_DIAGNOSTIC),
+        "public resume changed contributor certification authority: {resumed_output}"
+    );
+    assert_eq!(
+        fixture.canonical_launch_count()?,
+        1,
+        "resumed contributor rejection launched canonical certification"
+    );
+    resumed_contributor.thread.shutdown_and_wait().await?;
+    let removed_resumed_contributor = thread_manager
+        .remove_thread(&resumed_contributor.thread_id)
+        .await
+        .context("resumed evidence contributor was missing from the thread manager")?;
+    assert!(Arc::ptr_eq(
+        &removed_resumed_contributor,
+        &resumed_contributor.thread
+    ));
+
+    let forked_contributor = Box::pin(thread_manager.fork_thread(
+        2,
+        config.clone(),
+        contributor_rollout,
+        /*thread_source*/ None,
+        /*parent_trace*/ None,
+    ))
+    .await?;
+    assert!(!forked_contributor.was_already_running);
+    assert_ne!(forked_contributor.thread_id, contributor.thread_id);
+    forked_contributor.thread.request_raw_response_items();
+    let forked_events = submit_and_collect_thread(
+        &forked_contributor.thread,
+        &config,
+        forked_contributor_prompt,
+    )
+    .await
+    .context("publicly forked contributor admission did not reach TurnComplete")?;
+    let forked_output = function_call_output(&forked_events, forked_contributor_call_id)
+        .context("missing forked-contributor canonical-command output")?;
+    assert_eq!(
+        function_call_output_success(&forked_events, forked_contributor_call_id),
+        Some(false)
+    );
+    assert!(
+        forked_output.contains(ROOT_ONLY_DIAGNOSTIC),
+        "public fork changed contributor certification authority: {forked_output}"
+    );
+    assert_eq!(
+        fixture.canonical_launch_count()?,
+        1,
+        "forked contributor rejection launched canonical certification"
+    );
+    forked_contributor.thread.shutdown_and_wait().await?;
+    assert!(
+        thread_manager
+            .remove_thread(&forked_contributor.thread_id)
+            .await
+            .is_some()
+    );
 
     Ok(())
 }
@@ -3549,17 +5545,1263 @@ fn successful_focused_validation_does_not_satisfy_terminal_gate() -> Result<()> 
     )
 }
 
+#[cfg(windows)]
+#[test]
+fn current_evidence_real_session_executes_both_and_rejects_nonterminal_misuse() -> Result<()> {
+    run_session_path_test(
+        "current_evidence_real_session_executes_both_and_rejects_nonterminal_misuse",
+        current_evidence_real_session_executes_both_and_rejects_nonterminal_misuse_impl,
+    )
+}
+
+#[cfg(windows)]
+async fn current_evidence_real_session_executes_both_and_rejects_nonterminal_misuse_impl()
+-> Result<()> {
+    let fixture = CurrentEvidenceFixture::new()?;
+    let harness = fixture.harness().await?;
+
+    let unified_call = "current-evidence-unified-success";
+    let unified_poll = "await-current-evidence-unified-success";
+    let unified_stop = "stop-after-current-evidence-terminal-rejection";
+    let premature_answer = "focused current evidence is not terminal proof";
+    let (capture_tool_completed, capture) =
+        current_evidence_report_barrier(&fixture, harness.test().codex_home_path(), None)?;
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            exec_command_call_response(unified_call, &fixture.exact_command, &fixture.repo_path),
+            write_stdin_call_response(unified_poll, 1000),
+            terminal_candidate(1, premature_answer),
+            required_failure_call_response(unified_stop),
+        ],
+    )
+    .await;
+    let unified_events = submit_and_collect(
+        harness.test(),
+        "run exact current evidence through unified exec, then try to finish",
+    )
+    .await?;
+    capture_tool_completed.store(true, std::sync::atomic::Ordering::Release);
+    let captured_report = capture
+        .join()
+        .map_err(|_| anyhow::anyhow!("current-evidence report capture thread panicked"))?;
+    let initial_unified_output = function_call_output(&unified_events, unified_call)
+        .unwrap_or("<missing initial function-call output>");
+    let unified_success = function_call_output_success(&unified_events, unified_poll);
+    let unified_output = function_call_output(&unified_events, unified_poll)
+        .unwrap_or("<missing function-call output>");
+    let captured_report_diagnostics = current_evidence_report_diagnostics(&captured_report);
+    anyhow::ensure!(
+        unified_success == Some(true),
+        "initial current-evidence tool call failed before report capture: initial_output={initial_unified_output}; completion_success={unified_success:?}; completion_output={unified_output}; {}; report={}",
+        fixture.driver_diagnostics(),
+        captured_report_diagnostics,
+    );
+    let accepted_report = captured_report.with_context(|| {
+        format!(
+            "initial current-evidence report capture failed after tool output: {unified_output}; {}; report={}",
+            fixture.driver_diagnostics(),
+            captured_report_diagnostics,
+        )
+    })?;
+    assert!(initial_unified_output.contains("Process running with session ID 1000"));
+    assert!(
+        unified_output.contains("Historical successor mappings remain unresolved")
+            && unified_output
+                .contains("not completion certification, admission, or review approval"),
+        "accepted current evidence had the wrong nonterminal message: {unified_output}"
+    );
+    let completion = unified_events
+        .iter()
+        .find_map(|event| match event {
+            EventMsg::TurnComplete(completion) => Some(completion),
+            _ => None,
+        })
+        .context("missing TurnComplete after current-evidence terminal rejection")?;
+    let required_failure = format!("required tool `{REQUIRED_FAILURE_TOOL_NAME}` blocked");
+    assert_eq!(
+        completion
+            .error
+            .as_ref()
+            .map(|error| error.message.as_str()),
+        Some(required_failure.as_str())
+    );
+    assert_eq!(
+        completion.last_agent_message.as_deref(),
+        Some(required_failure.as_str())
+    );
+    assert!(
+        unified_events
+            .iter()
+            .all(|event| !assistant_output_contains(event, premature_answer)),
+        "current evidence released the uncertified terminal candidate"
+    );
+    assert!(!fixture.canonical_marker.exists());
+
+    let report: serde_json::Value = serde_json::from_slice(&accepted_report)?;
+    assert_eq!(
+        report["focused_validation_id"],
+        json!("inventory.current-evidence")
+    );
+    assert_eq!(report["attempt_classification"], json!("confirmed_pass"));
+    assert_eq!(
+        report["validations"]
+            .as_array()
+            .context("current-evidence report validations were not an array")?
+            .iter()
+            .map(|item| item["id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["maintenance.root-unittest", "sdk.python.pytest"]
+    );
+    assert_eq!(
+        report["child_processes"]
+            .as_array()
+            .context("current-evidence report children were not an array")?
+            .iter()
+            .map(|item| item["validation_id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["maintenance.root-unittest", "sdk.python.pytest"]
+    );
+    assert_fresh_current_evidence_markers(&fixture, 1, 1)?;
+
+    let shell_call = "current-evidence-direct-shell-success";
+    let shell_stop = "stop-after-current-evidence-direct-shell";
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response(shell_call, &fixture.exact_command),
+            required_failure_call_response(shell_stop),
+        ],
+    )
+    .await;
+    let shell_events = submit_and_collect(
+        harness.test(),
+        "run the same exact current evidence through the direct shell path",
+    )
+    .await?;
+    assert_eq!(
+        function_call_output_success(&shell_events, shell_call),
+        Some(true)
+    );
+    assert_fresh_current_evidence_markers(&fixture, 2, 2)?;
+    assert!(!fixture.canonical_marker.exists());
+
+    let replay_call = "current-evidence-replayed-private-report";
+    let replay_stop = "stop-after-current-evidence-replay";
+    let (replay_tool_completed, replay_barrier) = current_evidence_report_barrier(
+        &fixture,
+        harness.test().codex_home_path(),
+        Some(accepted_report),
+    )?;
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response(replay_call, &fixture.exact_command),
+            required_failure_call_response(replay_stop),
+        ],
+    )
+    .await;
+    let replay_events = submit_and_collect(
+        harness.test(),
+        "run fresh current evidence but replay the prior private top report",
+    )
+    .await?;
+    replay_tool_completed.store(true, std::sync::atomic::Ordering::Release);
+    let replay_barrier_result = replay_barrier
+        .join()
+        .map_err(|_| anyhow::anyhow!("current-evidence replay thread panicked"))?;
+    if let Err(error) = replay_barrier_result {
+        let output = function_call_output(&replay_events, replay_call)
+            .unwrap_or("<missing function-call output>");
+        anyhow::bail!(
+            "current-evidence replay barrier failed: {error}; output={output}; {}",
+            fixture.driver_diagnostics()
+        );
+    }
+    assert_eq!(
+        function_call_output_success(&replay_events, replay_call),
+        Some(false)
+    );
+    let replay_output = function_call_output(&replay_events, replay_call)
+        .context("missing replay rejection output")?;
+    assert!(
+        replay_output.contains("copied, replayed, or did not match this exact invocation")
+            || replay_output.contains("did not bind this exact focused attempt"),
+        "old current-evidence report was not rejected by invocation binding: {replay_output}"
+    );
+    assert_fresh_current_evidence_markers(&fixture, 3, 3)?;
+    assert!(!fixture.canonical_marker.exists());
+
+    fs::write(&fixture.control_path, "pre-result\n")?;
+    let pre_result_call = "current-evidence-discovery-pre-result";
+    let pre_result_stop = "stop-after-current-evidence-pre-result";
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response(pre_result_call, &fixture.exact_command),
+            required_failure_call_response(pre_result_stop),
+        ],
+    )
+    .await;
+    let pre_result_events = submit_and_collect(
+        harness.test(),
+        "run current evidence with a discovery pre-result",
+    )
+    .await?;
+    assert_eq!(
+        function_call_output_success(&pre_result_events, pre_result_call),
+        Some(false)
+    );
+    assert_fresh_current_evidence_markers(&fixture, 3, 3)?;
+    fs::remove_file(&fixture.control_path)?;
+
+    let after_pre_result_call = "current-evidence-pass-after-pre-result";
+    let after_pre_result_stop = "stop-after-current-evidence-pre-result-retry";
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response(after_pre_result_call, &fixture.exact_command),
+            required_failure_call_response(after_pre_result_stop),
+        ],
+    )
+    .await;
+    let after_pre_result_events = submit_and_collect(
+        harness.test(),
+        "retry unchanged after the current-evidence pre-result",
+    )
+    .await?;
+    assert_eq!(
+        function_call_output_success(&after_pre_result_events, after_pre_result_call),
+        Some(true),
+        "a failure before confirmed result incorrectly poisoned the retry"
+    );
+    assert_fresh_current_evidence_markers(&fixture, 4, 4)?;
+
+    fs::write(&fixture.control_path, "unit-fail\npytest-skip\n")?;
+    let mixed_failure_call = "current-evidence-confirmed-failure-plus-pre-result";
+    let mixed_failure_stop = "stop-after-current-evidence-mixed-failure";
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response(mixed_failure_call, &fixture.exact_command),
+            required_failure_call_response(mixed_failure_stop),
+        ],
+    )
+    .await;
+    let mixed_failure_events = submit_and_collect(
+        harness.test(),
+        "record the real unittest failure even though pytest has no confirmed result",
+    )
+    .await?;
+    assert_eq!(
+        function_call_output_success(&mixed_failure_events, mixed_failure_call),
+        Some(false)
+    );
+    let mixed_output = function_call_output(&mixed_failure_events, mixed_failure_call)
+        .context("missing mixed current-evidence failure output")?;
+    assert!(
+        mixed_output.contains("recorded confirmed failures for maintenance.root-unittest"),
+        "mixed current evidence lost the confirmed unittest failure: {mixed_output}"
+    );
+    assert!(
+        mixed_output.contains("No broader validation was started"),
+        "mixed current evidence had the wrong failure disposition: {mixed_output}"
+    );
+    assert!(!fixture.canonical_marker.exists());
+    assert_fresh_current_evidence_markers(&fixture, 5, 4)?;
+    fs::remove_file(&fixture.control_path)?;
+
+    let poisoned_retry_call = "current-evidence-unchanged-poisoned-retry";
+    let poisoned_retry_stop = "stop-after-current-evidence-poisoned-retry";
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response(poisoned_retry_call, &fixture.exact_command),
+            required_failure_call_response(poisoned_retry_stop),
+        ],
+    )
+    .await;
+    let poisoned_retry_events = submit_and_collect(
+        harness.test(),
+        "retry current evidence unchanged after its confirmed failure",
+    )
+    .await?;
+    assert_eq!(
+        function_call_output_success(&poisoned_retry_events, poisoned_retry_call),
+        Some(false),
+        "same-epoch successful execution retired current-evidence poison"
+    );
+    assert_fresh_current_evidence_markers(&fixture, 6, 5)?;
+    assert!(!fixture.canonical_marker.exists());
+
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn historical_acceptance_requires_live_reviewer_and_current_approval() -> Result<()> {
+    run_session_path_test(
+        "historical_acceptance_requires_live_reviewer_and_current_approval",
+        historical_acceptance_requires_live_reviewer_and_current_approval_impl,
+    )
+}
+
+#[cfg(windows)]
+fn historical_receipt_args(criterion: &str, proposal_path: Option<&str>) -> serde_json::Value {
+    let mut args = json!({
+        "status": "completed",
+        "summary": "Reviewed the complete pinned historical replacement plan",
+        "criterion_results": [{
+            "criterion_id": criterion,
+            "status": "passed",
+            "evidence": "All 531 exact scopes in the pinned plan were reviewed against their frozen behavior and current successor path."
+        }],
+        "declared_changes": [], "validation_call_ids": [], "blockers": [], "risks": [],
+        "next_action": null
+    });
+    if let Some(path) = proposal_path {
+        args["historical_acceptance_proposal_path"] = json!(path);
+    }
+    args
+}
+
+#[cfg(windows)]
+fn historical_agent_call(call_id: &str, name: &str, args: &serde_json::Value) -> String {
+    agent_tool_call_response(call_id, name, &args.to_string())
+}
+
+#[cfg(windows)]
+async fn spawn_historical_fixture_agent(
+    harness: &TestCodexHarness,
+    task_name: &'static str,
+    role: &str,
+    criterion: &str,
+    target_assignment: Option<&str>,
+    tamper_assignment: bool,
+    calls: Vec<(&'static str, serde_json::Value)>,
+) -> Result<(String, Arc<CodexThread>, Vec<EventMsg>)> {
+    let root_prompt = format!("Spawn an agent for gate11 fixture {task_name}");
+    let objective = format!("gate11 independent fixture work {task_name}");
+    let call_ids = calls.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let mut first_response = None;
+    for (index, (call_id, args)) in calls.into_iter().enumerate() {
+        let objective = objective.clone();
+        let previous = index.checked_sub(1).map(|previous| call_ids[previous]);
+        let response = sse_response(historical_agent_call(
+            call_id,
+            "submit_agent_receipt",
+            &args,
+        ));
+        let response_mock = mount_response_once_match(
+            harness.server(),
+            move |request: &wiremock::Request| {
+                response_request_contains(request, "<task_capsule_v1>")
+                    && response_request_contains(request, &objective)
+                    && previous.is_none_or(|previous| response_request_contains(request, previous))
+                    && !response_request_contains(request, call_id)
+            },
+            if index == 0 {
+                response.set_delay(Duration::from_secs(3))
+            } else {
+                response
+            },
+        )
+        .await;
+        if index == 0 {
+            first_response = Some(response_mock);
+        }
+    }
+    let last_call = *call_ids
+        .last()
+        .context("historical fixture needs a tool call")?;
+    mount_sse_once_match(
+        harness.server(),
+        move |request: &wiremock::Request| response_request_contains(request, last_call),
+        sse(vec![
+            ev_response_created("historical-child-finished"),
+            ev_assistant_message(
+                "historical-child-result",
+                "Independent fixture review finished",
+            ),
+            ev_completed("historical-child-finished"),
+        ]),
+    )
+    .await;
+    let args = json!({
+        "task_name": task_name, "agent_type": role, "fork_turns": "none",
+        "assignment": {
+            "objective": objective,
+            "acceptance_criteria": [{"id": criterion, "text": "Review the entire exact plan and seal the result"}],
+            "read_scope": [{"path": ".", "recursive": true}],
+            "write_scope": [],
+            "stop_condition": "Seal the exact requested receipt, then stop",
+            "dependencies": target_assignment.into_iter().collect::<Vec<_>>(),
+            "relation": target_assignment.map(|target| json!({"kind": "review", "target_assignment_ids": [target]}))
+        }
+    });
+    let root_start = root_prompt.clone();
+    let spawn_call = format!("spawn-{task_name}");
+    let spawn_match = spawn_call.clone();
+    mount_sse_once_match(
+        harness.server(),
+        move |request: &wiremock::Request| {
+            response_request_contains(request, &root_start)
+                && !response_request_contains(request, &spawn_match)
+        },
+        historical_agent_call(&spawn_call, "spawn_agent", &args),
+    )
+    .await;
+    let spawn_match = spawn_call.clone();
+    mount_sse_once_match(
+        harness.server(),
+        move |request: &wiremock::Request| response_request_contains(request, &spawn_match),
+        required_failure_call_response(&format!("stop-root-after-{task_name}")),
+    )
+    .await;
+    let before = harness.test().thread_manager.list_thread_ids().await;
+    let root_events = submit_and_collect(harness.test(), &root_prompt).await?;
+    let output = function_call_output(&root_events, &spawn_call)
+        .with_context(|| format!("missing {task_name} spawn output: {root_events:#?}"))?;
+    let spawn = tool_output_json(output, "/assignment_id")
+        .with_context(|| format!("{task_name} spawn failed: {output}"))?;
+    let assignment_id = spawn["assignment_id"]
+        .as_str()
+        .with_context(|| format!("{task_name} spawn did not admit an assignment: {output}"))?
+        .to_owned();
+    if tamper_assignment {
+        // Model the stated threat directly: ordinary SQLite bytes can be imported or edited.
+        // Only this test's temporary home is touched; the immutable trigger is restored before
+        // the real reviewer submits its proposal through the registered runtime tool.
+        let script = r#"
+import json, sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+with connection:
+    connection.execute('BEGIN IMMEDIATE')
+    trigger = connection.execute("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'assignments_immutable_update'").fetchone()[0]
+    body = json.loads(connection.execute('SELECT body_json FROM assignments WHERE assignment_id = ?', (sys.argv[2],)).fetchone()[0])
+    body['objective'] += ' - unauthenticated replacement contract'
+    connection.execute('DROP TRIGGER assignments_immutable_update')
+    connection.execute('UPDATE assignments SET body_json = ? WHERE assignment_id = ?', (json.dumps(body), sys.argv[2]))
+    connection.execute(trigger)
+"#;
+        let database_path = harness
+            .test()
+            .config
+            .sqlite_home
+            .join("agent-task-coordination/agent_tasks.sqlite");
+        anyhow::ensure!(
+            database_path.is_file(),
+            "missing fixture task database: {}",
+            database_path.display()
+        );
+        let output = Command::new(available_python_command()?)
+            .args(["-c", script])
+            .arg(&database_path)
+            .arg(&assignment_id)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "fixture task-store forgery failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let new_threads = harness
+        .test()
+        .thread_manager
+        .list_thread_ids()
+        .await
+        .into_iter()
+        .filter(|id| !before.contains(id))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        new_threads.len() == 1,
+        "expected one fresh child, found {new_threads:?}"
+    );
+    let thread = harness
+        .test()
+        .thread_manager
+        .get_thread(new_threads[0])
+        .await?;
+    thread.request_raw_response_items();
+    wait_for_response_request(
+        first_response.as_ref().context("missing child response")?,
+        task_name,
+    )
+    .await?;
+    let events = tokio::time::timeout(Duration::from_secs(60), async {
+        let mut events = Vec::new();
+        loop {
+            let event = thread.next_event().await?;
+            let complete = matches!(event.msg, EventMsg::TurnComplete(_));
+            events.push(event.msg);
+            if complete {
+                return Ok::<_, anyhow::Error>(events);
+            }
+        }
+    })
+    .await
+    .context("historical child did not complete")??;
+    Ok((assignment_id, thread, events))
+}
+
+#[cfg(windows)]
+async fn historical_acceptance_requires_live_reviewer_and_current_approval_impl() -> Result<()> {
+    let fixture = CurrentEvidenceFixture::new_historical_resolved()?;
+    let home = Arc::new(TempDir::new()?);
+    let harness = fixture
+        .historical_harness_with_home(Arc::clone(&home))
+        .await?;
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response("historical-current", &fixture.exact_command),
+            shell_command_call_response("historical-reconcile", &fixture.reconciliation_command),
+            required_failure_call_response("stop-after-historical-authority"),
+        ],
+    )
+    .await;
+    let authority_events =
+        submit_and_collect(harness.test(), "prepare exact historical review authority").await?;
+    for call in ["historical-current", "historical-reconcile"] {
+        assert_eq!(
+            function_call_output_success(&authority_events, call),
+            Some(true),
+            "{call} failed: {:?}; {}",
+            function_call_output(&authority_events, call),
+            fixture.driver_diagnostics()
+        );
+    }
+    assert_fresh_current_evidence_markers(&fixture, 1, 1)?;
+    let (_, envelope) = read_authenticated_completion_proof_state(home.path(), &fixture.repo_path)?;
+    let approval: FocusedReplacementApprovalReceiptV1 = serde_json::from_value(
+        envelope
+            .pointer("/state/current_evidence_catalog/approval_receipt/receipt")
+            .context("missing authenticated historical approval")?
+            .clone(),
+    )?;
+    let proposal_path = ".fixture-state/historical-proposal.json";
+    let proposal = fixture.write_historical_proposal(proposal_path, &approval, false)?;
+    assert_eq!(proposal.scope_reviews.len(), 531);
+    assert_eq!(fixture.historical_scope_ids()?.len(), 531);
+    let criterion = format!(
+        "historical-replacement-review-plan-v1.{}",
+        proposal.review_plan_sha256.as_str()
+    );
+    fixture.write_historical_proposal(".fixture-state/stale-proposal.json", &approval, true)?;
+    let mut forged = serde_json::to_value(&proposal)?;
+    forged["proposal_sha256"] = json!("0".repeat(64));
+    fs::write(
+        fixture
+            .repo_path
+            .join(".fixture-state/forged-proposal.json"),
+        canonical_jcs_of(&forged)?,
+    )?;
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            historical_agent_call(
+                "root-historical-misuse",
+                "submit_agent_receipt",
+                &historical_receipt_args(&criterion, Some(proposal_path)),
+            ),
+            required_failure_call_response("stop-root-historical-misuse"),
+        ],
+    )
+    .await;
+    let root_events = submit_and_collect(
+        harness.test(),
+        "try to claim review authority from the root",
+    )
+    .await?;
+    let root_rejection = function_call_output(&root_events, "root-historical-misuse")
+        .context("missing root historical rejection")?;
+    assert!(
+        root_rejection.contains("unsupported call:")
+            && root_rejection.contains("submit_agent_receipt"),
+        "{root_rejection}"
+    );
+    let (target, target_thread, target_events) = spawn_historical_fixture_agent(
+        &harness,
+        "historical_target",
+        "explorer",
+        "historical-target-complete",
+        None,
+        false,
+        vec![
+            (
+                "nonreviewer-historical-misuse",
+                historical_receipt_args("historical-target-complete", Some(proposal_path)),
+            ),
+            (
+                "target-historical-seal",
+                historical_receipt_args("historical-target-complete", None),
+            ),
+        ],
+    )
+    .await?;
+    assert!(
+        function_call_output(&target_events, "nonreviewer-historical-misuse")
+            .context("missing nonreviewer rejection")?
+            .contains("requires one declared review target")
+    );
+    let target_seal = function_call_output(&target_events, "target-historical-seal")
+        .context("missing successful target receipt")?;
+    assert!(target_seal.contains("\"completed\""), "{target_seal}");
+    let (_, forged_reviewer, forged_events) = spawn_historical_fixture_agent(
+        &harness,
+        "historical_imported_reviewer",
+        "reviewer",
+        &criterion,
+        Some(&target),
+        true,
+        vec![(
+            "review-historical-imported-contract",
+            historical_receipt_args(&criterion, Some(proposal_path)),
+        )],
+    )
+    .await?;
+    let rejected = function_call_output(&forged_events, "review-historical-imported-contract")
+        .context("missing imported reviewer contract rejection")?;
+    assert!(
+        rejected.contains("differs from its fresh typed admission"),
+        "{rejected}"
+    );
+    let (_, unreviewed) =
+        read_authenticated_completion_proof_state(home.path(), &fixture.repo_path)?;
+    assert!(
+        unreviewed
+            .pointer("/state/current_evidence_catalog/approval_receipt/reviewed_proposal")
+            .is_none()
+    );
+    forged_reviewer.shutdown_and_wait().await?;
+    let (reviewer_id, reviewer, review_events) = spawn_historical_fixture_agent(
+        &harness,
+        "historical_reviewer",
+        "reviewer",
+        &criterion,
+        Some(&target),
+        false,
+        vec![
+            (
+                "review-historical-path",
+                historical_receipt_args(&criterion, Some("../outside-proposal.json")),
+            ),
+            (
+                "review-historical-stale",
+                historical_receipt_args(&criterion, Some(".fixture-state/stale-proposal.json")),
+            ),
+            (
+                "review-historical-forged",
+                historical_receipt_args(&criterion, Some(".fixture-state/forged-proposal.json")),
+            ),
+            (
+                "review-historical-accept",
+                historical_receipt_args(&criterion, Some(proposal_path)),
+            ),
+        ],
+    )
+    .await?;
+    for call in [
+        "review-historical-path",
+        "review-historical-stale",
+        "review-historical-forged",
+    ] {
+        let output = function_call_output(&review_events, call)
+            .with_context(|| format!("missing {call} rejection"))?;
+        assert!(
+            !output.contains("reviewed_proposal_sha256"),
+            "invalid proposal accepted: {output}"
+        );
+    }
+    let accepted = function_call_output(&review_events, "review-historical-accept")
+        .with_context(|| format!("missing reviewed proposal result: {review_events:#?}"))?;
+    assert!(
+        accepted.contains(proposal.proposal_sha256.as_str()),
+        "review did not establish authority: {accepted}"
+    );
+    let (_, reviewed_envelope) =
+        read_authenticated_completion_proof_state(home.path(), &fixture.repo_path)?;
+    let reviewed = reviewed_envelope
+        .pointer("/state/current_evidence_catalog/approval_receipt/reviewed_proposal")
+        .context("review was not persisted in authenticated state")?
+        .clone();
+    assert_eq!(reviewed["reviewer_assignment_id"], json!(reviewer_id));
+    assert_eq!(reviewed["target_assignment_id"], json!(target));
+    assert_eq!(
+        reviewed["proposal"]["proposal_sha256"],
+        json!(proposal.proposal_sha256.as_str())
+    );
+    assert_eq!(
+        reviewed["proposal"]["activation_authority"],
+        serde_json::Value::Null
+    );
+    assert!(
+        reviewed_envelope
+            .pointer("/state/accepted_attempt")
+            .is_none_or(serde_json::Value::is_null)
+    );
+    assert!(!fixture.canonical_marker.exists());
+    assert!(
+        !fixture
+            .repo_path
+            .join(".codex/validation/replacement-admissions-v1.json")
+            .exists()
+    );
+    target_thread.shutdown_and_wait().await?;
+    reviewer.shutdown_and_wait().await?;
+    let rollout = harness
+        .test()
+        .codex
+        .rollout_path()
+        .context("missing root rollout")?;
+    harness.test().codex.shutdown_and_wait().await?;
+    let config = harness.test().config.clone();
+    let mut resumed_builder = test_codex()
+        .with_raw_response_items()
+        .with_extensions(required_tool_failure_extensions())
+        .with_config(move |resumed| {
+            *resumed = config.clone();
+        });
+    let resumed = resumed_builder
+        .resume(harness.server(), Arc::clone(&home), rollout)
+        .await?;
+    mount_sse_sequence(
+        harness.server(),
+        vec![required_failure_call_response("stop-historical-resume")],
+    )
+    .await;
+    submit_and_collect(&resumed, "check retained historical review").await?;
+    let (_, resumed_envelope) =
+        read_authenticated_completion_proof_state(home.path(), &fixture.repo_path)?;
+    assert_eq!(
+        resumed_envelope
+            .pointer("/state/current_evidence_catalog/approval_receipt/reviewed_proposal"),
+        Some(&reviewed)
+    );
+    fs::write(
+        fixture.repo_path.join("src/runtime.rs"),
+        "pub const VALUE: u8 = 3;\n",
+    )?;
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            terminal_candidate(1, "historical review must be revoked after source mutation"),
+            required_failure_call_response("stop-after-historical-revocation"),
+        ],
+    )
+    .await;
+    submit_and_collect(&resumed, "observe a source mutation after review").await?;
+    let (_, revoked) = read_authenticated_completion_proof_state(home.path(), &fixture.repo_path)?;
+    assert!(
+        revoked
+            .pointer("/state/current_evidence_catalog/approval_receipt/reviewed_proposal")
+            .is_none()
+    );
+    assert!(!fixture.canonical_marker.exists());
+    resumed.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn focused_replacement_approval_requires_current_catalog_and_real_reconciliation() -> Result<()> {
+    run_session_path_test(
+        "focused_replacement_approval_requires_current_catalog_and_real_reconciliation",
+        focused_replacement_approval_requires_current_catalog_and_real_reconciliation_impl,
+    )
+}
+
+#[cfg(windows)]
+async fn focused_replacement_approval_requires_current_catalog_and_real_reconciliation_impl()
+-> Result<()> {
+    const FORGED_TERMINAL: &str =
+        "a caller-authored focused replacement receipt must not publish terminal output";
+
+    let fixture = CurrentEvidenceFixture::new_resolved()?;
+    let fresh_home = Arc::new(TempDir::new()?);
+    let harness = fixture.harness_with_home(Arc::clone(&fresh_home)).await?;
+
+    let missing_catalog_call = "reconciliation-without-current-catalog";
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response(missing_catalog_call, &fixture.reconciliation_command),
+            required_failure_call_response("stop-after-missing-current-catalog"),
+        ],
+    )
+    .await;
+    let missing_catalog_events = submit_and_collect(
+        harness.test(),
+        "try the exact frozen reconciliation before collecting current evidence",
+    )
+    .await?;
+    assert_eq!(
+        function_call_output_success(&missing_catalog_events, missing_catalog_call),
+        Some(false)
+    );
+    let missing_catalog_output =
+        function_call_output(&missing_catalog_events, missing_catalog_call)
+            .context("missing focused reconciliation prerequisite rejection")?;
+    assert!(
+        missing_catalog_output.contains("current authenticated inventory catalog"),
+        "missing current catalog had the wrong rejection: {missing_catalog_output}"
+    );
+    assert_fresh_current_evidence_markers(&fixture, 0, 0)?;
+    assert!(!fixture.canonical_marker.exists());
+
+    let current_evidence_call = "current-evidence-before-real-reconciliation";
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response(current_evidence_call, &fixture.exact_command),
+            required_failure_call_response("stop-after-current-catalog"),
+        ],
+    )
+    .await;
+    let current_evidence_events = submit_and_collect(
+        harness.test(),
+        "collect the exact current catalog before frozen reconciliation",
+    )
+    .await?;
+    assert_eq!(
+        function_call_output_success(&current_evidence_events, current_evidence_call),
+        Some(true)
+    );
+    assert_fresh_current_evidence_markers(&fixture, 1, 1)?;
+    let (_, catalog_only_envelope) =
+        read_authenticated_completion_proof_state(fresh_home.path(), &fixture.repo_path)?;
+    let catalog_only = catalog_only_envelope
+        .pointer("/state/current_evidence_catalog")
+        .filter(|value| !value.is_null())
+        .context("real current evidence did not persist its authenticated catalog")?;
+    assert!(
+        catalog_only.get("approval_receipt").is_none(),
+        "current evidence issued replacement approval before reconciliation"
+    );
+
+    let reconciliation_call = "real-focused-frozen-reconciliation";
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            shell_command_call_response(reconciliation_call, &fixture.reconciliation_command),
+            terminal_candidate(
+                1,
+                "focused replacement approval is still not terminal certification",
+            ),
+            required_failure_call_response("stop-after-real-focused-reconciliation"),
+        ],
+    )
+    .await;
+    let reconciliation_events = submit_and_collect(
+        harness.test(),
+        "run the real frozen reconciliation worker and then try to finish",
+    )
+    .await?;
+    assert_eq!(
+        function_call_output_success(&reconciliation_events, reconciliation_call),
+        Some(true)
+    );
+    let reconciliation_output = function_call_output(&reconciliation_events, reconciliation_call)
+        .context("missing accepted focused reconciliation output")?;
+    assert!(
+        reconciliation_output.contains(
+            "Focused frozen-inventory reconciliation was authenticated and retained for replacement review"
+        ),
+        "focused reconciliation did not return its distinct accepted result: {reconciliation_output}"
+    );
+    assert!(
+        reconciliation_events
+            .iter()
+            .all(|event| !assistant_output_contains(
+                event,
+                "focused replacement approval is still not terminal certification"
+            )),
+        "focused replacement approval was mistaken for terminal certification"
+    );
+    assert_fresh_current_evidence_markers(&fixture, 1, 1)?;
+    assert!(!fixture.canonical_marker.exists());
+
+    let (state_path, approved_envelope) =
+        read_authenticated_completion_proof_state(fresh_home.path(), &fixture.repo_path)?;
+    let approved_catalog = approved_envelope
+        .pointer("/state/current_evidence_catalog")
+        .filter(|value| !value.is_null())
+        .context("focused reconciliation discarded the authenticated current catalog")?;
+    let approval = approved_catalog
+        .get("approval_receipt")
+        .filter(|value| value.is_object())
+        .context("focused reconciliation did not persist its approval wrapper")?;
+    let receipt = approval
+        .get("receipt")
+        .filter(|value| value.is_object())
+        .context("focused reconciliation approval wrapper omitted its typed receipt")?;
+    assert_eq!(
+        receipt["format_id"],
+        json!("kd4.focused-replacement-approval-receipt.v1")
+    );
+    assert_eq!(receipt["schema_version"], json!(1));
+    assert_eq!(
+        receipt["focused_validation_id"],
+        json!("inventory.frozen-reconciliation")
+    );
+    assert_eq!(receipt["classification"], json!("confirmed-pass"));
+    let receipt_sha256 = receipt["receipt_sha256"]
+        .as_str()
+        .context("typed focused reconciliation receipt omitted its SHA-256")?
+        .to_string();
+    assert!(
+        reconciliation_output.contains(&format!("receipt {receipt_sha256}")),
+        "accepted model text did not name the persisted receipt: {reconciliation_output}"
+    );
+    assert_eq!(approval["attempt_id"], receipt["attempt_id"]);
+    assert_eq!(
+        approval["exact_command"],
+        json!(fixture.reconciliation_command)
+    );
+    assert_eq!(approval["policy_id"], receipt["policy_id"]);
+    assert!(
+        approval["runner_process_id"]
+            .as_u64()
+            .is_some_and(|id| id > 0)
+    );
+    for field in ["runner_executable_path", "runner_entrypoint_path"] {
+        let path = approval[field]
+            .as_str()
+            .with_context(|| format!("approval wrapper omitted {field}"))?;
+        assert!(
+            Path::new(path).is_absolute(),
+            "{field} was not absolute: {path}"
+        );
+    }
+    assert_eq!(
+        approval["session_lineage_id"],
+        approved_catalog["session_lineage_id"]
+    );
+    assert!(
+        approval["recorded_at_unix_ms"]
+            .as_u64()
+            .is_some_and(|timestamp| timestamp > 0)
+    );
+    assert_ne!(approval["attempt_id"], approved_catalog["attempt_id"]);
+    assert_eq!(
+        receipt["frozen_inventory_hash"],
+        approved_catalog["catalog"]["frozen_inventory_hash"]
+    );
+    assert_eq!(
+        receipt["focused_inventory_catalog_semantic_sha256"],
+        approved_catalog["catalog"]["semantic_sha256"]
+    );
+    assert_eq!(
+        receipt["inventory_discovery_processes_sha256"],
+        approved_catalog["catalog"]["inventory_discovery_processes_sha256"]
+    );
+    assert_eq!(
+        receipt["policy_runner_bundle_sha256"],
+        approved_catalog["policy_runner_bundle_sha256"]
+    );
+    assert_eq!(
+        receipt["workspace_fingerprint"],
+        approved_catalog["workspace_fingerprint"]
+    );
+    assert_eq!(
+        receipt["mutation_epoch"],
+        approved_catalog["mutation_epoch"]
+    );
+    let approved_catalog = approved_catalog.clone();
+
+    let rollout = harness
+        .test()
+        .codex
+        .rollout_path()
+        .context("missing rollout path for same-home approval resume")?;
+    harness.test().codex.shutdown_and_wait().await?;
+
+    let cwd = fixture.repo_path.abs();
+    let outside = fixture.outside_path.abs();
+    let fake_bin = fixture.repo_path.join(".fixture-bin");
+    let sandbox_temp = fixture.repo_path.join(".fixture-state/sandbox-temp");
+    let path = format!(
+        "{};{}",
+        fake_bin.to_string_lossy(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut resume_builder = test_codex()
+        .with_raw_response_items()
+        .with_extensions(required_tool_failure_extensions())
+        .with_config(move |config| {
+            config.cwd = cwd.clone();
+            let roots = vec![cwd.clone(), outside.clone()];
+            config.workspace_roots = roots.clone();
+            config.permissions.set_workspace_roots(roots);
+            for (name, value) in [
+                ("PATH", path.clone()),
+                ("TEMP", sandbox_temp.to_string_lossy().into_owned()),
+                ("TMP", sandbox_temp.to_string_lossy().into_owned()),
+            ] {
+                config
+                    .permissions
+                    .shell_environment_policy
+                    .r#set
+                    .insert(name.to_string(), value);
+            }
+        });
+    mount_sse_once_match(
+        harness.server(),
+        |request: &wiremock::Request| {
+            response_request_contains(request, "verify the persisted approval after resume")
+        },
+        required_failure_call_response("stop-after-same-home-approval-resume"),
+    )
+    .await;
+    let resumed = resume_builder
+        .resume(harness.server(), Arc::clone(&fresh_home), rollout)
+        .await?;
+    submit_and_collect(&resumed, "verify the persisted approval after resume").await?;
+    let (_, resumed_envelope) =
+        read_authenticated_completion_proof_state(fresh_home.path(), &fixture.repo_path)?;
+    assert_eq!(
+        resumed_envelope.pointer("/state/current_evidence_catalog"),
+        Some(&approved_catalog),
+        "same-home rollout resume did not retain the authenticated approval"
+    );
+
+    fs::write(
+        fixture.repo_path.join("README.md"),
+        "updated fixture documentation\n",
+    )?;
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            terminal_candidate(2, "documentation drift must revoke focused approval"),
+            required_failure_call_response("stop-after-documentation-approval-revocation"),
+        ],
+    )
+    .await;
+    let documentation_events = submit_and_collect(
+        &resumed,
+        "observe the documentation-only mutation and try to reuse the focused approval",
+    )
+    .await?;
+    assert!(
+        documentation_events.iter().all(|event| {
+            !assistant_output_contains(event, "documentation drift must revoke focused approval")
+        }),
+        "documentation-only mutation did not revoke terminal use of focused approval"
+    );
+    let (_, documentation_envelope) =
+        read_authenticated_completion_proof_state(fresh_home.path(), &fixture.repo_path)?;
+    let documentation_catalog = documentation_envelope
+        .pointer("/state/current_evidence_catalog")
+        .filter(|value| value.is_object())
+        .context("documentation-only mutation discarded the authenticated current catalog")?;
+    let mut expected_documentation_catalog = approved_catalog.clone();
+    let removed_approval = expected_documentation_catalog
+        .as_object_mut()
+        .context("approved current catalog was not an object")?
+        .remove("approval_receipt");
+    anyhow::ensure!(
+        removed_approval.is_some(),
+        "approved current catalog did not contain the receipt being revoked"
+    );
+    assert_eq!(
+        documentation_catalog, &expected_documentation_catalog,
+        "documentation-only mutation changed current evidence beyond revoking approval"
+    );
+    resumed.codex.shutdown_and_wait().await?;
+
+    let reloaded_harness = fixture.harness_with_home(Arc::clone(&fresh_home)).await?;
+    let (_, reloaded_envelope) =
+        read_authenticated_completion_proof_state(fresh_home.path(), &fixture.repo_path)?;
+    assert_eq!(
+        reloaded_envelope.pointer("/state/current_evidence_catalog"),
+        Some(&expected_documentation_catalog),
+        "authenticated catalog with a revoked approval did not survive state reload"
+    );
+
+    fs::write(
+        fixture.repo_path.join("src/runtime.rs"),
+        "pub const VALUE: u8 = 3;\n",
+    )?;
+    mount_sse_sequence(
+        reloaded_harness.server(),
+        vec![
+            terminal_candidate(3, "stale focused approval must remain private"),
+            required_failure_call_response("stop-after-approval-revocation"),
+        ],
+    )
+    .await;
+    let mutation_events = submit_and_collect(
+        reloaded_harness.test(),
+        "observe the workspace mutation and try to reuse the focused approval",
+    )
+    .await?;
+    assert!(
+        mutation_events.iter().all(|event| {
+            !assistant_output_contains(event, "stale focused approval must remain private")
+        }),
+        "workspace mutation did not revoke terminal use of stale evidence"
+    );
+    let (_, cleared_envelope) =
+        read_authenticated_completion_proof_state(fresh_home.path(), &fixture.repo_path)?;
+    assert!(
+        cleared_envelope
+            .pointer("/state/current_evidence_catalog")
+            .is_none_or(serde_json::Value::is_null),
+        "workspace mutation did not revoke both the catalog and its approval receipt"
+    );
+    reloaded_harness.test().codex.shutdown_and_wait().await?;
+
+    let current_fingerprint = cleared_envelope["state"]["last_observed_fingerprint"]
+        .as_str()
+        .context("cleared state omitted its current workspace fingerprint")?
+        .to_string();
+    let current_mutation_epoch = cleared_envelope["state"]["mutation_epoch"]
+        .as_u64()
+        .context("cleared state omitted its current mutation epoch")?;
+    let current_fingerprint_hash = Sha256HexV1::parse(current_fingerprint.clone())?;
+    let mut forged_catalog = approved_catalog;
+    let mut typed_catalog: FocusedLiveSuccessorCatalogV1 =
+        serde_json::from_value(forged_catalog["catalog"].clone())?;
+    typed_catalog.start_fingerprint = current_fingerprint_hash.clone();
+    typed_catalog.start_mutation_epoch = current_mutation_epoch;
+    typed_catalog.semantic_sha256 = typed_catalog.semantic_sha256()?;
+    typed_catalog.validate()?;
+    forged_catalog["catalog_sha256"] = json!(format!(
+        "{:x}",
+        Sha256::digest(canonical_jcs_of(&typed_catalog)?)
+    ));
+    forged_catalog["workspace_fingerprint"] = json!(current_fingerprint);
+    forged_catalog["mutation_epoch"] = json!(current_mutation_epoch);
+    forged_catalog["catalog"] = serde_json::to_value(&typed_catalog)?;
+
+    let mut typed_receipt: FocusedReplacementApprovalReceiptV1 =
+        serde_json::from_value(forged_catalog["approval_receipt"]["receipt"].clone())?;
+    typed_receipt.focused_inventory_catalog_semantic_sha256 = typed_catalog.semantic_sha256.clone();
+    typed_receipt.workspace_fingerprint = current_fingerprint_hash;
+    typed_receipt.mutation_epoch = current_mutation_epoch;
+    typed_receipt.receipt_sha256 = typed_receipt.receipt_sha256()?;
+    typed_receipt.validate()?;
+    let caller_context = FocusedReplacementApprovalCurrentContextV1 {
+        format_id: typed_receipt.format_id.clone(),
+        schema_version: typed_receipt.schema_version,
+        attempt_id: typed_receipt.attempt_id.clone(),
+        focused_validation_id: typed_receipt.focused_validation_id.clone(),
+        classification: typed_receipt.classification.clone(),
+        frozen_inventory_hash: typed_receipt.frozen_inventory_hash.clone(),
+        focused_inventory_catalog_semantic_sha256: typed_receipt
+            .focused_inventory_catalog_semantic_sha256
+            .clone(),
+        inventory_discovery_processes_sha256: typed_receipt
+            .inventory_discovery_processes_sha256
+            .clone(),
+        policy_id: typed_receipt.policy_id.clone(),
+        policy_runner_bundle_sha256: typed_receipt.policy_runner_bundle_sha256.clone(),
+        workspace_fingerprint: typed_receipt.workspace_fingerprint.clone(),
+        mutation_epoch: typed_receipt.mutation_epoch,
+    };
+    typed_receipt.validate_current_context(&caller_context)?;
+    forged_catalog["approval_receipt"]["receipt"] = serde_json::to_value(typed_receipt)?;
+
+    let mut forged_envelope = cleared_envelope;
+    forged_envelope["state"]["current_evidence_catalog"] = forged_catalog;
+    fs::write(&state_path, serde_json::to_vec_pretty(&forged_envelope)?)?;
+
+    let forged_harness = fixture.harness_with_home(Arc::clone(&fresh_home)).await?;
+    let forged_reconciliation_call = "reconciliation-with-caller-authored-old-receipt";
+    mount_sse_sequence(
+        forged_harness.server(),
+        vec![
+            shell_command_call_response(
+                forged_reconciliation_call,
+                &fixture.reconciliation_command,
+            ),
+            terminal_candidate(4, FORGED_TERMINAL),
+            required_failure_call_response("stop-after-caller-authored-old-receipt"),
+        ],
+    )
+    .await;
+    let forged_events = submit_and_collect(
+        forged_harness.test(),
+        "try to reuse a caller-authored copy of the old focused approval",
+    )
+    .await?;
+    assert_eq!(
+        function_call_output_success(&forged_events, forged_reconciliation_call),
+        Some(false)
+    );
+    let forged_output = function_call_output(&forged_events, forged_reconciliation_call)
+        .context("missing caller-authored receipt rejection")?;
+    assert!(
+        forged_output.contains(
+            "completion-proof state authentication failed; repository or tool rewriting cannot establish proof"
+        ),
+        "caller-authored old receipt had the wrong rejection: {forged_output}"
+    );
+    assert!(
+        forged_events
+            .iter()
+            .all(|event| !assistant_output_contains(event, FORGED_TERMINAL)),
+        "caller-authored old receipt minted terminal authority"
+    );
+    assert_fresh_current_evidence_markers(&fixture, 1, 1)?;
+    assert!(!fixture.canonical_marker.exists());
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn assert_fresh_current_evidence_markers(
+    fixture: &CurrentEvidenceFixture,
+    unittest_count: usize,
+    pytest_count: usize,
+) -> Result<()> {
+    for (path, expected) in [
+        (&fixture.unit_marker, unittest_count),
+        (&fixture.pytest_marker, pytest_count),
+    ] {
+        let lines = if path.exists() {
+            fs::read_to_string(path)?
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(lines.len(), expected, "unexpected marker count at {path:?}");
+        assert_eq!(
+            lines
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            expected,
+            "current-evidence wrapper reused a prior execution marker at {path:?}"
+        );
+        for line in lines {
+            uuid::Uuid::parse_str(&line)
+                .with_context(|| format!("invalid execution UUID in {path:?}"))?;
+        }
+    }
+    Ok(())
+}
+
 async fn successful_focused_validation_does_not_satisfy_terminal_gate_impl() -> Result<()> {
-    let fixture = CompletionProofFixture::new()?;
+    let fixture = CompletionProofFixture::with_transient_canonical_pre_result()?;
     let harness = fixture.harness().await?;
     let call_id = "trusted-focused-pass";
-    let mut responses = vec![exec_command_call_response(
-        call_id,
-        &fixture.exact_focused_command(),
-        &fixture.repo_path,
-    )];
+    let mut responses = vec![
+        exec_command_call_response(
+            "explicit-canonical-request",
+            &fixture.canonical_command,
+            &fixture.repo_path,
+        ),
+        exec_command_call_response(
+            call_id,
+            &fixture.exact_focused_command(),
+            &fixture.repo_path,
+        ),
+    ];
     responses.extend(repeated_terminal_candidates(
-        MAX_REGULAR_LOGICAL_GENERATIONS,
+        MAX_REGULAR_LOGICAL_GENERATIONS - 1,
         "a focused pass is not whole-repository certification",
     ));
     mount_sse_sequence(harness.server(), responses).await;
@@ -3584,10 +6826,104 @@ async fn successful_focused_validation_does_not_satisfy_terminal_gate_impl() -> 
     assert!(completion.error.is_some());
     assert!(completion.last_agent_message.is_none());
     assert!(
-        !fixture.marker_path.exists(),
-        "a focused pass caused the canonical command to launch"
+        fs::read_to_string(&fixture.marker_path)?.lines().count() == 1,
+        "focused evidence caused an additional canonical launch"
     );
 
+    Ok(())
+}
+
+#[test]
+fn focused_completion_accepts_current_scope_without_certification() -> Result<()> {
+    run_session_path_test(
+        "focused_completion_accepts_current_scope_without_certification",
+        focused_completion_accepts_current_scope_without_certification_impl,
+    )
+}
+
+async fn focused_completion_accepts_current_scope_without_certification_impl() -> Result<()> {
+    let fixture = CompletionProofFixture::new()?;
+    let harness = fixture.harness().await?;
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            exec_command_call_response(
+                "focused-task-check",
+                &fixture.exact_focused_command(),
+                &fixture.repo_path,
+            ),
+            terminal_candidate(1, "the requested scoped change is complete"),
+        ],
+    )
+    .await;
+    let events = submit_and_collect(harness.test(), "validate this change and finish").await?;
+    let completion = events
+        .iter()
+        .find_map(|event| match event {
+            EventMsg::TurnComplete(value) => Some(value),
+            _ => None,
+        })
+        .context("missing ordinary task completion")?;
+    assert!(
+        completion.error.is_none(),
+        "focused completion rejected: {completion:#?}"
+    );
+    assert_eq!(
+        completion.last_agent_message.as_deref(),
+        Some("the requested scoped change is complete")
+    );
+    assert!(
+        !fixture.marker_path.exists(),
+        "ordinary completion launched certification"
+    );
+    assert_eq!(harness.request_bodies().await.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn focused_completion_rejects_relevant_change_without_rerunning_tests() -> Result<()> {
+    run_session_path_test(
+        "focused_completion_rejects_relevant_change_without_rerunning_tests",
+        focused_completion_rejects_relevant_change_without_rerunning_tests_impl,
+    )
+}
+
+async fn focused_completion_rejects_relevant_change_without_rerunning_tests_impl() -> Result<()> {
+    let fixture = CompletionProofFixture::new()?;
+    let harness = fixture.harness().await?;
+    let mut responses = vec![
+        exec_command_call_response(
+            "scoped-pass-before-edit",
+            &fixture.exact_focused_command(),
+            &fixture.repo_path,
+        ),
+        exec_command_call_response(
+            "edit-scoped-input",
+            &fixture.mutation_command,
+            &fixture.repo_path,
+        ),
+    ];
+    responses.extend(repeated_terminal_candidates(
+        MAX_REGULAR_LOGICAL_GENERATIONS - 1,
+        "stale focused evidence is insufficient",
+    ));
+    mount_sse_sequence(harness.server(), responses).await;
+    let events =
+        submit_and_collect(harness.test(), "check, edit the behavior, then finish").await?;
+    let completion = events
+        .iter()
+        .find_map(|event| match event {
+            EventMsg::TurnComplete(value) => Some(value),
+            _ => None,
+        })
+        .context("missing completion after relevant edit")?;
+    assert!(completion.error.is_some());
+    assert!(completion.last_agent_message.is_none());
+    assert!(
+        !fixture.marker_path.exists(),
+        "staleness launched certification"
+    );
+    assert_eq!(events.iter().filter(|event| matches!(event, EventMsg::ExecCommandEnd(end) if end.call_id == "scoped-pass-before-edit")).count(), 1);
     Ok(())
 }
 
@@ -3944,7 +7280,28 @@ fn source_map_projection_fixture(
     )?;
     fs::write(
         fixture.repo_path.join("source_owners.toml"),
-        "[[owner]]\nid = \"fixture\"\n[[owner.symbols]]\nsymbol = \"owned_symbol\"\npath = \"src/evidence.rs\"\n",
+        r#"schema_version = 2
+[[owners]]
+id = "fixture"
+roots = ["src"]
+primary_entries = [{ path = "src/evidence.rs", symbol = "owned_symbol" }]
+generated_mirrors = ["SOURCEMAP.md"]
+tests = ["src/owner_test.rs"]
+
+[[owners.relationships]]
+category = "tests_contracts"
+kind = "validated_by"
+target = "path:src/no_symbol_evidence.rs"
+confidence = "declared"
+evidence = [{ path = "src/no_symbol_evidence.rs" }]
+
+[[owners.invariants]]
+id = "fixture-contract"
+kind = "semantic"
+statement = "fixture source-map inputs remain current"
+evidence = [{ path = "src/invariant_evidence.rs" }]
+tests = ["src/invariant_test.rs"]
+"#,
     )?;
     fs::write(
         fixture.repo_path.join("scripts/source_map_check.py"),
@@ -3954,10 +7311,30 @@ fn source_map_projection_fixture(
         fixture.repo_path.join("scripts/source_owners.py"),
         "# fixture owner resolver\n",
     )?;
+    fs::write(
+        fixture.repo_path.join("scripts/generated_output_lock.py"),
+        "# fixture generated-output lock\n",
+    )?;
     fs::write(fixture.repo_path.join("justfile"), "source-map-check:\n")?;
     fs::write(
         fixture.repo_path.join("src/evidence.rs"),
         "pub fn owned_symbol() {}\n",
+    )?;
+    fs::write(
+        fixture.repo_path.join("src/no_symbol_evidence.rs"),
+        "pub fn relationship_evidence() {}\n",
+    )?;
+    fs::write(
+        fixture.repo_path.join("src/invariant_evidence.rs"),
+        "pub fn invariant_evidence() {}\n",
+    )?;
+    fs::write(
+        fixture.repo_path.join("src/owner_test.rs"),
+        "#[test]\nfn owner_test() {}\n",
+    )?;
+    fs::write(
+        fixture.repo_path.join("src/invariant_test.rs"),
+        "#[test]\nfn invariant_test() {}\n",
     )?;
     fs::write(fixture.repo_path.join("notes.txt"), "initial note\n")?;
     fs::write(
@@ -3973,6 +7350,7 @@ fn source_map_projection_fixture(
         &[
             "scripts/source_map_check.py",
             "scripts/source_owners.py",
+            "scripts/generated_output_lock.py",
             "justfile",
         ],
         &["**"],
@@ -3980,6 +7358,70 @@ fn source_map_projection_fixture(
         mutation_script,
     )?;
     Ok((fixture, command))
+}
+
+fn add_tracked_symlink_to_untracked_regular_file(
+    fixture: &CompletionProofFixture,
+    target_relative_path: &str,
+    symlink_relative_path: &str,
+) -> Result<()> {
+    let target_path = fixture.repo_path.join(target_relative_path);
+    fs::write(&target_path, "untracked symlink target\n")?;
+    let symlink_path = fixture.repo_path.join(symlink_relative_path);
+    let target_file_name = target_path
+        .file_name()
+        .context("symlink target path has no file name")?;
+    create_file_symlink(Path::new(target_file_name), &symlink_path)
+        .context("create tracked symlink to untracked regular file")?;
+    run_git(&fixture.repo_path, &["add", "--", symlink_relative_path])?;
+    run_git(
+        &fixture.repo_path,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "track symlink without its target",
+        ],
+    )?;
+    let index = Command::new("git")
+        .args([
+            "ls-files",
+            "--stage",
+            "--",
+            symlink_relative_path,
+            target_relative_path,
+        ])
+        .current_dir(&fixture.repo_path)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .context("inspect tracked symlink fixture index")?;
+    anyhow::ensure!(
+        index.status.success(),
+        "inspect tracked symlink fixture index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    let index = String::from_utf8(index.stdout).context("decode tracked symlink fixture index")?;
+    anyhow::ensure!(
+        index.lines().any(|line| {
+            line.starts_with("120000 ") && line.ends_with(&format!("\t{symlink_relative_path}"))
+        }),
+        "fixture symlink is not tracked as a symlink: {index}"
+    );
+    anyhow::ensure!(
+        !index
+            .lines()
+            .any(|line| line.ends_with(&format!("\t{target_relative_path}"))),
+        "fixture symlink target unexpectedly became tracked: {index}"
+    );
+    anyhow::ensure!(
+        fs::symlink_metadata(&symlink_path)?
+            .file_type()
+            .is_symlink(),
+        "fixture path is not a symlink"
+    );
+    Ok(())
 }
 
 #[test]
@@ -4002,10 +7444,10 @@ fn source_map_projection_ignores_unrelated_content_through_real_session_path() -
 }
 
 #[test]
-fn source_map_projection_tracks_owned_and_manifest_evidence_inputs_through_real_session_path()
+fn source_map_projection_tracks_owned_and_all_revision_inputs_through_real_session_path()
 -> Result<()> {
     run_session_path_test(
-        "source_map_projection_tracks_owned_and_manifest_evidence_inputs_through_real_session_path",
+        "source_map_projection_tracks_owned_and_all_revision_inputs_through_real_session_path",
         || async {
             let (owned_fixture, owned_command) = source_map_projection_fixture(
                 "from pathlib import Path\nPath('SOURCEMAP.md').write_text('# Corrected source map\\n', encoding='utf-8')\n",
@@ -4027,24 +7469,81 @@ fn source_map_projection_tracks_owned_and_manifest_evidence_inputs_through_real_
                 true,
                 "source-map-manifest-evidence-input",
             )
+            .await?;
+
+            let (relationship_fixture, relationship_command) = source_map_projection_fixture(
+                "from pathlib import Path\nPath('src/no_symbol_evidence.rs').write_text('pub fn relationship_evidence() { let _ = 1; }\\n', encoding='utf-8')\n",
+            )?;
+            assert_projection_mutation_outcome(
+                &relationship_fixture,
+                &relationship_command,
+                true,
+                "source-map-relationship-evidence-without-symbol",
+            )
+            .await?;
+
+            let (owner_test_fixture, owner_test_command) = source_map_projection_fixture(
+                "from pathlib import Path\nPath('src/owner_test.rs').write_text('#[test]\\nfn owner_test() { let _ = 1; }\\n', encoding='utf-8')\n",
+            )?;
+            assert_projection_mutation_outcome(
+                &owner_test_fixture,
+                &owner_test_command,
+                true,
+                "source-map-owner-test-input",
+            )
+            .await?;
+
+            let (invariant_evidence_fixture, invariant_evidence_command) =
+                source_map_projection_fixture(
+                    "from pathlib import Path\nPath('src/invariant_evidence.rs').write_text('pub fn invariant_evidence() { let _ = 1; }\\n', encoding='utf-8')\n",
+                )?;
+            assert_projection_mutation_outcome(
+                &invariant_evidence_fixture,
+                &invariant_evidence_command,
+                true,
+                "source-map-invariant-evidence-input",
+            )
+            .await?;
+
+            let (invariant_test_fixture, invariant_test_command) = source_map_projection_fixture(
+                "from pathlib import Path\nPath('src/invariant_test.rs').write_text('#[test]\\nfn invariant_test() { let _ = 1; }\\n', encoding='utf-8')\n",
+            )?;
+            assert_projection_mutation_outcome(
+                &invariant_test_fixture,
+                &invariant_test_command,
+                true,
+                "source-map-invariant-test-input",
+            )
             .await
         },
     )
 }
 
 #[test]
-fn source_map_projection_tracks_topology_add_and_remove_through_real_session_path() -> Result<()> {
+fn source_map_projection_tracks_only_tracked_present_file_topology_through_real_session_path()
+-> Result<()> {
     run_session_path_test(
-        "source_map_projection_tracks_topology_add_and_remove_through_real_session_path",
+        "source_map_projection_tracks_only_tracked_present_file_topology_through_real_session_path",
         || async {
-            let (add_fixture, add_command) = source_map_projection_fixture(
+            let (untracked_fixture, untracked_command) = source_map_projection_fixture(
                 "from pathlib import Path\nPath('src/topology_added.rs').write_text('pub fn added() {}\\n', encoding='utf-8')\n",
             )?;
             assert_projection_mutation_outcome(
-                &add_fixture,
-                &add_command,
+                &untracked_fixture,
+                &untracked_command,
+                false,
+                "source-map-untracked-topology-add",
+            )
+            .await?;
+
+            let (staged_fixture, staged_command) = source_map_projection_fixture(
+                "from pathlib import Path\nimport subprocess\nPath('src/topology_added.rs').write_text('pub fn added() {}\\n', encoding='utf-8')\nsubprocess.run(['git', 'add', '--', 'src/topology_added.rs'], check=True)\n",
+            )?;
+            assert_projection_mutation_outcome(
+                &staged_fixture,
+                &staged_command,
                 true,
-                "source-map-topology-add",
+                "source-map-staged-topology-add",
             )
             .await?;
 
@@ -4056,6 +7555,50 @@ fn source_map_projection_tracks_topology_add_and_remove_through_real_session_pat
                 &remove_command,
                 true,
                 "source-map-topology-remove",
+            )
+            .await
+        },
+    )
+}
+
+#[test]
+fn source_map_projection_excludes_tracked_symlink_targets_through_real_session_path() -> Result<()>
+{
+    run_session_path_test(
+        "source_map_projection_excludes_tracked_symlink_targets_through_real_session_path",
+        || async {
+            let target_relative_path = "src/untracked_symlink_target.rs";
+            let symlink_relative_path = "src/tracked_symlink.rs";
+
+            let (change_fixture, change_command) = source_map_projection_fixture(
+                "from pathlib import Path\nPath('src/untracked_symlink_target.rs').write_text('changed untracked target\\n', encoding='utf-8')\n",
+            )?;
+            add_tracked_symlink_to_untracked_regular_file(
+                &change_fixture,
+                target_relative_path,
+                symlink_relative_path,
+            )?;
+            assert_projection_mutation_outcome(
+                &change_fixture,
+                &change_command,
+                false,
+                "source-map-tracked-symlink-target-change",
+            )
+            .await?;
+
+            let (remove_fixture, remove_command) = source_map_projection_fixture(
+                "from pathlib import Path\nPath('src/untracked_symlink_target.rs').unlink()\n",
+            )?;
+            add_tracked_symlink_to_untracked_regular_file(
+                &remove_fixture,
+                target_relative_path,
+                symlink_relative_path,
+            )?;
+            assert_projection_mutation_outcome(
+                &remove_fixture,
+                &remove_command,
+                false,
+                "source-map-tracked-symlink-target-remove",
             )
             .await
         },
@@ -4552,13 +8095,17 @@ async fn mutate_and_restore_invalidates_canonical_attempt_through_real_shell_pat
     fixture.enable_mutate_and_restore_during_canonical()?;
     let harness = fixture.harness().await?;
     let canonical_call_id = "canonical-that-mutates-and-restores";
-    let mut responses = vec![exec_command_call_response(
-        canonical_call_id,
-        &fixture.canonical_command,
-        &fixture.repo_path,
-    )];
+    let canonical_poll_call_id = "await-canonical-that-mutates-and-restores";
+    let mut responses = vec![
+        exec_command_call_response(
+            canonical_call_id,
+            &fixture.canonical_command,
+            &fixture.repo_path,
+        ),
+        write_stdin_call_response(canonical_poll_call_id, 1000),
+    ];
     responses.extend(repeated_terminal_candidates(
-        TOTAL_GENERATIONS_WITH_FORCED_TERMINAL - 1,
+        TOTAL_GENERATIONS_WITH_FORCED_TERMINAL - 2,
         "mutate-and-restore must keep this output private",
     ));
     mount_sse_sequence(harness.server(), responses).await;
@@ -4592,12 +8139,23 @@ async fn mutate_and_restore_invalidates_canonical_attempt_through_real_shell_pat
     assert!(completion.error.is_some());
     assert!(completion.last_agent_message.is_none());
     let request_bodies = harness.request_bodies().await;
+    let canonical_outputs = request_bodies
+        .iter()
+        .flat_map(|body| body["input"].as_array().into_iter().flatten())
+        .filter(|item| {
+            item["type"] == "function_call_output"
+                && (item["call_id"] == canonical_call_id
+                    || item["call_id"] == canonical_poll_call_id)
+        })
+        .map(|item| item["output"].clone())
+        .collect::<Vec<_>>();
     assert!(
-        request_bodies.iter().any(|body| {
-            body.to_string()
+        canonical_outputs.iter().any(|output| {
+            output
+                .to_string()
                 .contains("restoring the ending bytes does not make that attempt valid")
         }),
-        "the real shell path did not report the transient mutation: {request_bodies:#?}"
+        "the real shell path did not report the transient mutation in the canonical tool results: {canonical_outputs:#?}"
     );
 
     Ok(())
@@ -6285,7 +9843,13 @@ async fn yielded_missing_runner_attestation_is_rejected_through_write_stdin_impl
         harness.test(),
         "yield certification, await it, and reject missing process attestation",
     )
-    .await?;
+    .await;
+    if events.is_err() {
+        // Preserve the session failure instead of masking it with a mock-drop
+        // panic about the responses that the stalled session never requested.
+        harness.server().reset().await;
+    }
+    let events = events?;
 
     assert_eq!(fixture.canonical_launch_count()?, 1);
     assert!(events.iter().any(|event| {
@@ -6408,6 +9972,507 @@ async fn transient_pre_result_allows_unchanged_fresh_canonical_retry_through_rea
     assert_eq!(
         completion.last_agent_message.as_deref(),
         Some("unchanged retry received fresh canonical proof")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn focused_pre_result_workspace_drift_does_not_poison_unchanged_retry() -> Result<()> {
+    run_session_path_test(
+        "focused_pre_result_workspace_drift_does_not_poison_unchanged_retry",
+        focused_pre_result_workspace_drift_does_not_poison_unchanged_retry_impl,
+    )
+}
+
+async fn focused_pre_result_workspace_drift_does_not_poison_unchanged_retry_impl() -> Result<()> {
+    let fixture = CompletionProofFixture::with_failed_focused_validation()?;
+    let restore_command = fixture.install_focused_failure_unrelated_workspace_drift()?;
+    let harness = fixture
+        .harness_with_raw_response_items_and_extensions(required_tool_failure_extensions())
+        .await?;
+    let drifting_failure_call_id = "focused-failure-with-unrelated-workspace-drift";
+    let restore_call_id = "restore-unrelated-workspace-drift";
+    let retry_call_id = "focused-pass-after-workspace-drift-restoration";
+    let required_failure_call_id = "stop-after-focused-workspace-drift-proof";
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            exec_command_call_response(
+                drifting_failure_call_id,
+                &fixture.exact_focused_command(),
+                &fixture.repo_path,
+            ),
+            exec_command_call_response(restore_call_id, &restore_command, &fixture.repo_path),
+            exec_command_call_response(
+                retry_call_id,
+                &fixture.exact_focused_command(),
+                &fixture.repo_path,
+            ),
+            sse(vec![
+                ev_response_created("stop-after-focused-workspace-drift-proof-response"),
+                ev_function_call(required_failure_call_id, REQUIRED_FAILURE_TOOL_NAME, "{}"),
+                ev_completed("stop-after-focused-workspace-drift-proof-response"),
+            ]),
+        ],
+    )
+    .await;
+
+    let events = submit_and_collect(
+        harness.test(),
+        "run a focused failure that drifts unrelated workspace content, restore that content, prove the unchanged validation retry is not poisoned, then stop through the registered required operation",
+    )
+    .await?;
+
+    let failure_output = function_call_output(&events, drifting_failure_call_id)
+        .context("missing model-visible focused workspace-drift output")?;
+    assert_eq!(
+        function_call_output_success(&events, drifting_failure_call_id),
+        Some(false)
+    );
+    assert!(
+        failure_output.contains(
+            "repository changed before the confirmed validation failure could be recorded"
+        ),
+        "focused workspace drift was not classified as a pre-result error: {failure_output}"
+    );
+    for call_id in [restore_call_id, retry_call_id] {
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                EventMsg::ExecCommandEnd(end)
+                    if end.call_id == call_id && end.exit_code == 0
+            )
+        }));
+    }
+    assert_eq!(
+        function_call_output_success(&events, retry_call_id),
+        Some(true),
+        "the focused pre-result error incorrectly poisoned the unchanged validation retry"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo_path.join("notes.txt"))?.trim(),
+        "initial note"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn canonical_transient_workspace_drift_does_not_poison_unchanged_retry() -> Result<()> {
+    run_session_path_test(
+        "canonical_transient_workspace_drift_does_not_poison_unchanged_retry",
+        canonical_transient_workspace_drift_does_not_poison_unchanged_retry_impl,
+    )
+}
+
+async fn canonical_transient_workspace_drift_does_not_poison_unchanged_retry_impl() -> Result<()> {
+    let fixture = CompletionProofFixture::with_confirmed_canonical_failure_then_pass()?;
+    fixture.enable_mutate_and_restore_during_first_canonical()?;
+    let harness = fixture.harness().await?;
+    let drifting_failure_call_id = "canonical-failure-with-transient-workspace-drift";
+    let drifting_failure_poll_call_id = "await-canonical-failure-with-transient-workspace-drift";
+    let retry_call_id = "canonical-pass-after-transient-workspace-drift";
+    let mut failure_responses = vec![
+        exec_command_call_response(
+            drifting_failure_call_id,
+            &fixture.canonical_command,
+            &fixture.repo_path,
+        ),
+        write_stdin_call_response(drifting_failure_poll_call_id, 1000),
+    ];
+    failure_responses.extend(repeated_terminal_candidates(
+        TOTAL_GENERATIONS_WITH_FORCED_TERMINAL - 2,
+        "transient canonical failure must keep this output private",
+    ));
+    mount_sse_sequence(harness.server(), failure_responses).await;
+
+    let first_events = submit_and_collect(
+        harness.test(),
+        "run a failing canonical attempt with transient workspace drift, then finish this turn",
+    )
+    .await?;
+
+    assert!(first_events.iter().any(|event| {
+        matches!(
+            event,
+            EventMsg::ExecCommandEnd(end)
+                if end.call_id == drifting_failure_call_id && end.exit_code != 0
+        )
+    }));
+    let first_completion = first_events
+        .iter()
+        .find_map(|event| match event {
+            EventMsg::TurnComplete(completion) => Some(completion),
+            _ => None,
+        })
+        .context("missing first TurnComplete")?;
+    assert!(first_completion.error.is_some());
+    assert!(first_completion.last_agent_message.is_none());
+    assert_eq!(fixture.canonical_launch_count()?, 1);
+    assert_eq!(
+        fs::read_to_string(fixture.repo_path.join("scratch/observer-probe.txt"))?.trim(),
+        "initial probe\n\n// transient canonical mutation"
+    );
+    let request_bodies = harness.request_bodies().await;
+    let function_outputs = request_bodies
+        .iter()
+        .filter_map(|body| body.get("input").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("function_call_output")
+        })
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>();
+    assert!(
+        function_outputs
+            .iter()
+            .any(|output| output
+                .contains("restoring the ending bytes does not make that attempt valid")),
+        "the first canonical attempt did not reach the observed-path pre-result branch: {function_outputs:#?}"
+    );
+    fs::write(
+        fixture.repo_path.join("scratch/observer-probe.txt"),
+        "initial probe\n",
+    )?;
+
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            exec_command_call_response(
+                retry_call_id,
+                &fixture.canonical_command,
+                &fixture.repo_path,
+            ),
+            terminal_candidate(1, "transient canonical pre-result did not poison retry"),
+        ],
+    )
+    .await;
+    let retry_events = submit_and_collect(
+        harness.test(),
+        "retry the canonical command unchanged without transient workspace drift, then finish",
+    )
+    .await?;
+
+    let retry_exit_code = retry_events.iter().find_map(|event| match event {
+        EventMsg::ExecCommandEnd(end) if end.call_id == retry_call_id => Some(end.exit_code),
+        _ => None,
+    });
+    let retry_output = function_call_output(&retry_events, retry_call_id);
+    assert_eq!(
+        fixture.canonical_launch_count()?,
+        2,
+        "the unchanged canonical retry did not launch; exit={retry_exit_code:?}, output={retry_output:?}"
+    );
+    assert_eq!(
+        retry_exit_code,
+        Some(0),
+        "the unchanged canonical retry did not exit successfully; output={retry_output:?}"
+    );
+    let completion = retry_events
+        .iter()
+        .find_map(|event| match event {
+            EventMsg::TurnComplete(completion) => Some(completion),
+            _ => None,
+        })
+        .context("missing TurnComplete")?;
+    assert!(
+        completion.error.is_none(),
+        "the canonical pre-result error incorrectly poisoned the unchanged retry: {completion:#?}"
+    );
+    assert_eq!(
+        completion.last_agent_message.as_deref(),
+        Some("transient canonical pre-result did not poison retry")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn snapshotless_poison_survives_observed_relevant_edit_and_revert() -> Result<()> {
+    run_session_path_test(
+        "snapshotless_poison_survives_observed_relevant_edit_and_revert",
+        snapshotless_poison_survives_observed_relevant_edit_and_revert_impl,
+    )
+}
+
+async fn snapshotless_poison_survives_observed_relevant_edit_and_revert_impl() -> Result<()> {
+    let fixture = CompletionProofFixture::with_failed_focused_validation()?;
+    fs::write(
+        fixture.repo_path.join("source_owners.toml"),
+        "schema_version = [\n",
+    )?;
+    let mutation_command = fixture.configure_validation_projection(
+        &["src/**"],
+        &["src/**"],
+        &[],
+        &["source_owners.toml"],
+        "from pathlib import Path\nPath('src/runtime.rs').write_text('pub const VALUE: u8 = 3;\\n', encoding='utf-8')\nfailure_marker = Path('.fixture-state/focused-validation-fails')\nif failure_marker.exists():\n    failure_marker.unlink()\n",
+    )?;
+    let harness = fixture.harness().await?;
+    let failure_call_id = "focused-failure-with-unavailable-input-snapshot";
+    let mutation_call_id = "relevant-edit-after-snapshotless-poison";
+    let restore_call_id = "restore-relevant-input-after-observation";
+    let retry_call_id = "passing-focused-retry-after-relevant-edit-revert";
+    let mut responses = vec![
+        exec_command_call_response(
+            failure_call_id,
+            &fixture.exact_focused_command(),
+            &fixture.repo_path,
+        ),
+        exec_command_call_response(mutation_call_id, &mutation_command, &fixture.repo_path),
+        exec_command_call_response(
+            restore_call_id,
+            &fixture.restore_failed_input_command,
+            &fixture.repo_path,
+        ),
+        exec_command_call_response(
+            retry_call_id,
+            &fixture.exact_focused_command(),
+            &fixture.repo_path,
+        ),
+    ];
+    responses.extend(repeated_terminal_candidates(
+        MAX_REGULAR_LOGICAL_GENERATIONS - 3,
+        "snapshotless poison must survive an observed relevant edit and revert",
+    ));
+    mount_sse_sequence(harness.server(), responses).await;
+
+    let events = submit_and_collect(
+        harness.test(),
+        "record a confirmed failure when its input snapshot cannot be established, edit and observe its input, restore the failed bytes, run a passing unchanged retry, then finish",
+    )
+    .await?;
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            EventMsg::ExecCommandEnd(end)
+                if end.call_id == failure_call_id && end.exit_code != 0
+        )
+    }));
+    for call_id in [mutation_call_id, restore_call_id, retry_call_id] {
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                EventMsg::ExecCommandEnd(end)
+                    if end.call_id == call_id && end.exit_code == 0
+            )
+        }));
+    }
+    assert_eq!(
+        fs::read_to_string(fixture.repo_path.join("src/runtime.rs"))?,
+        "pub const VALUE: u8 = 2;\n",
+        "the relevant validation input was not restored to its failure-time bytes"
+    );
+    assert!(events.iter().all(|event| !is_assistant_output(event)));
+    let completion = events
+        .iter()
+        .find_map(|event| match event {
+            EventMsg::TurnComplete(completion) => Some(completion),
+            _ => None,
+        })
+        .context("missing TurnComplete")?;
+    assert!(completion.error.is_some());
+    assert!(completion.last_agent_message.is_none());
+    let request_bodies = harness.request_bodies().await;
+    assert!(
+        request_bodies.iter().any(|body| {
+            body.to_string()
+                .contains("fixture.validation is poisoned at this mutation epoch")
+        }),
+        "snapshotless poison was cleared by a historical relevant-path observation: {request_bodies:#?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn changed_trusted_helper_is_rejected_before_focused_failure_can_poison() -> Result<()> {
+    run_session_path_test(
+        "changed_trusted_helper_is_rejected_before_focused_failure_can_poison",
+        changed_trusted_helper_is_rejected_before_focused_failure_can_poison_impl,
+    )
+}
+
+async fn changed_trusted_helper_is_rejected_before_focused_failure_can_poison_impl() -> Result<()> {
+    let fixture = CompletionProofFixture::with_failed_focused_validation()?;
+    let restore_helper_command = fixture.install_trusted_helper_authority_probe()?;
+    let trusted_helper_source = fs::read(fixture.repo_path.join("trusted_helper.py"))?;
+    let harness = fixture
+        .harness_with_raw_response_items_and_extensions(required_tool_failure_extensions())
+        .await?;
+    let focused_failure_call_id = "focused-failure-after-helper-change";
+    let restore_call_id = "restore-helper-after-focused-attempt";
+    let focused_retry_call_id = "focused-pass-after-helper-restoration";
+    let required_failure_call_id = "stop-after-focused-helper-authority-proof";
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            exec_command_call_response(
+                focused_failure_call_id,
+                &fixture.exact_focused_command(),
+                &fixture.repo_path,
+            ),
+            exec_command_call_response(
+                restore_call_id,
+                &restore_helper_command,
+                &fixture.repo_path,
+            ),
+            exec_command_call_response(
+                focused_retry_call_id,
+                &fixture.exact_focused_command(),
+                &fixture.repo_path,
+            ),
+            sse(vec![
+                ev_response_created("stop-after-focused-helper-authority-proof-response"),
+                ev_function_call(required_failure_call_id, REQUIRED_FAILURE_TOOL_NAME, "{}"),
+                ev_completed("stop-after-focused-helper-authority-proof-response"),
+            ]),
+        ],
+    )
+    .await;
+
+    let events = submit_and_collect(
+        harness.test(),
+        "run a failing focused validation that changes a trusted helper, restore it, prove a passing focused retry is not poisoned, then stop through the registered required operation",
+    )
+    .await?;
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            EventMsg::ExecCommandEnd(end)
+                if end.call_id == focused_failure_call_id && end.exit_code != 0
+        )
+    }));
+    let output = function_call_output(&events, focused_failure_call_id)
+        .context("missing model-visible focused helper-authority output")?;
+    assert_eq!(
+        function_call_output_success(&events, focused_failure_call_id),
+        Some(false)
+    );
+    assert!(
+        output.contains(
+            "trusted repository policy member trusted_helper.py differs from the version explicitly trusted at HEAD"
+        ),
+        "trusted helper change was not classified as an authority pre-result error: {output}"
+    );
+    for call_id in [restore_call_id, focused_retry_call_id] {
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                EventMsg::ExecCommandEnd(end)
+                    if end.call_id == call_id && end.exit_code == 0
+            )
+        }));
+    }
+    assert_eq!(
+        function_call_output_success(&events, focused_retry_call_id),
+        Some(true),
+        "the authority pre-result error incorrectly poisoned the focused validation"
+    );
+    assert_eq!(fixture.canonical_launch_count()?, 0);
+    assert_eq!(
+        fs::read(fixture.repo_path.join("trusted_helper.py"))?,
+        trusted_helper_source,
+        "the source-only helper was not restored to its committed authority"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn changed_trusted_helper_is_rejected_before_canonical_failure_can_poison() -> Result<()> {
+    run_session_path_test(
+        "changed_trusted_helper_is_rejected_before_canonical_failure_can_poison",
+        changed_trusted_helper_is_rejected_before_canonical_failure_can_poison_impl,
+    )
+}
+
+async fn changed_trusted_helper_is_rejected_before_canonical_failure_can_poison_impl() -> Result<()>
+{
+    let fixture = CompletionProofFixture::with_confirmed_canonical_failure_then_pass()?;
+    let restore_helper_command = fixture.install_trusted_helper_authority_probe()?;
+    let trusted_helper_source = fs::read(fixture.repo_path.join("trusted_helper.py"))?;
+    let harness = fixture
+        .harness_with_raw_response_items_and_extensions(required_tool_failure_extensions())
+        .await?;
+    let canonical_failure_call_id = "canonical-failure-after-helper-change";
+    let restore_call_id = "restore-helper-after-canonical-attempt";
+    let focused_retry_call_id = "focused-pass-after-canonical-helper-restoration";
+    let required_failure_call_id = "stop-after-canonical-helper-authority-proof";
+    mount_sse_sequence(
+        harness.server(),
+        vec![
+            exec_command_call_response(
+                canonical_failure_call_id,
+                &fixture.canonical_command,
+                &fixture.repo_path,
+            ),
+            exec_command_call_response(
+                restore_call_id,
+                &restore_helper_command,
+                &fixture.repo_path,
+            ),
+            exec_command_call_response(
+                focused_retry_call_id,
+                &fixture.exact_focused_command(),
+                &fixture.repo_path,
+            ),
+            sse(vec![
+                ev_response_created("stop-after-canonical-helper-authority-proof-response"),
+                ev_function_call(required_failure_call_id, REQUIRED_FAILURE_TOOL_NAME, "{}"),
+                ev_completed("stop-after-canonical-helper-authority-proof-response"),
+            ]),
+        ],
+    )
+    .await;
+
+    let events = submit_and_collect(
+        harness.test(),
+        "run a failing canonical validation that changes a trusted helper, restore it, prove a passing focused validation is not poisoned, then stop through the registered required operation",
+    )
+    .await?;
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            EventMsg::ExecCommandEnd(end)
+                if end.call_id == canonical_failure_call_id && end.exit_code != 0
+        )
+    }));
+    let output = function_call_output(&events, canonical_failure_call_id)
+        .context("missing model-visible canonical helper-authority output")?;
+    assert_eq!(
+        function_call_output_success(&events, canonical_failure_call_id),
+        Some(false)
+    );
+    assert!(
+        output.contains(
+            "trusted repository policy member trusted_helper.py differs from the version explicitly trusted at HEAD"
+        ),
+        "trusted helper change was not classified as an authority pre-result error: {output}"
+    );
+    for call_id in [restore_call_id, focused_retry_call_id] {
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                EventMsg::ExecCommandEnd(end)
+                    if end.call_id == call_id && end.exit_code == 0
+            )
+        }));
+    }
+    assert_eq!(
+        function_call_output_success(&events, focused_retry_call_id),
+        Some(true),
+        "the authority pre-result error incorrectly poisoned the canonical validation"
+    );
+    assert_eq!(fixture.canonical_launch_count()?, 1);
+    assert_eq!(
+        fs::read(fixture.repo_path.join("trusted_helper.py"))?,
+        trusted_helper_source,
+        "the source-only helper was not restored to its committed authority"
     );
 
     Ok(())
@@ -6580,6 +10645,82 @@ async fn canonical_failure_before_infrastructure_error_still_poisons_unchanged_r
                 .contains("fixture.validation is poisoned at this mutation epoch")
         }),
         "the later infrastructure error discarded validation A's poison: {request_bodies:#?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn confirmed_sibling_failure_survives_malformed_claim_through_real_shell_path() -> Result<()> {
+    run_session_path_test(
+        "confirmed_sibling_failure_survives_malformed_claim_through_real_shell_path",
+        confirmed_sibling_failure_survives_malformed_claim_through_real_shell_path_impl,
+    )
+}
+
+async fn confirmed_sibling_failure_survives_malformed_claim_through_real_shell_path_impl()
+-> Result<()> {
+    let fixture =
+        CompletionProofFixture::with_confirmed_canonical_failure_then_infrastructure_error()?;
+    fixture.make_later_infrastructure_result_a_malformed_claimed_failure()?;
+    let harness = fixture.harness().await?;
+    let failure_call_id = "canonical-valid-failure-with-malformed-sibling-claim";
+    let retry_call_id = "focused-unchanged-retry-after-malformed-sibling-claim";
+    let mut responses = vec![
+        exec_command_call_response(
+            failure_call_id,
+            &fixture.canonical_command,
+            &fixture.repo_path,
+        ),
+        exec_command_call_response(
+            retry_call_id,
+            &fixture.exact_focused_command(),
+            &fixture.repo_path,
+        ),
+    ];
+    responses.extend(repeated_terminal_candidates(
+        MAX_REGULAR_LOGICAL_GENERATIONS - 1,
+        "a malformed sibling claim cannot erase an independently confirmed failure",
+    ));
+    mount_sse_sequence(harness.server(), responses).await;
+
+    let events = submit_and_collect(
+        harness.test(),
+        "run one valid confirmed failure beside a malformed failure claim, retry unchanged, and finish",
+    )
+    .await?;
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            EventMsg::ExecCommandEnd(end)
+                if end.call_id == failure_call_id && end.exit_code != 0
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            EventMsg::ExecCommandEnd(end)
+                if end.call_id == retry_call_id && end.exit_code == 0
+        )
+    }));
+    assert_eq!(fixture.canonical_launch_count()?, 1);
+    let completion = events
+        .iter()
+        .find_map(|event| match event {
+            EventMsg::TurnComplete(completion) => Some(completion),
+            _ => None,
+        })
+        .context("missing TurnComplete")?;
+    assert!(completion.error.is_some());
+    assert!(completion.last_agent_message.is_none());
+    let request_bodies = harness.request_bodies().await;
+    assert!(
+        request_bodies.iter().any(|body| {
+            body.to_string()
+                .contains("fixture.validation is poisoned at this mutation epoch")
+        }),
+        "the malformed sibling claim discarded the independently confirmed failure: {request_bodies:#?}"
     );
 
     Ok(())

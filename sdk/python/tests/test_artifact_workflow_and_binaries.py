@@ -115,9 +115,21 @@ def test_root_fmt_recipes_use_shared_formatter_driver() -> None:
     expected = {
         "working_directory": 'set working-directory := "codex-rs"',
         "fmt_comment": "# Format the justfile and Rust code for the high-frequency local edit path.",
-        "fmt_commands": ["{{ python }} ../scripts/format.py --fast-local"],
+        "fmt_commands": [
+            "import runpy",
+            "import sys",
+            'script = r"{{ justfile_directory() }}/scripts/format.py"',
+            'sys.argv = [script, "--fast-local"]',
+            'runpy.run_path(script, run_name="__main__")',
+        ],
         "fmt_check_comment": "# Check formatting without modifying files.",
-        "fmt_check_commands": ["{{ python }} ../scripts/format.py --check"],
+        "fmt_check_commands": [
+            "import runpy",
+            "import sys",
+            'script = r"{{ justfile_directory() }}/scripts/format.py"',
+            'sys.argv = [script, "--check"]',
+            'runpy.run_path(script, run_name="__main__")',
+        ],
     }
 
     assert actual == expected, (
@@ -188,13 +200,17 @@ def test_root_format_driver_covers_all_formatter_groups() -> None:
     assert formatters[0].commands[-1].args == ("just", "--unstable", "--fmt")
     assert checks[0].commands[-1].args == ("just", "--unstable", "--fmt", "--check")
     assert formatters[1].commands[-1].args == (
+        "rustup",
+        "run",
+        script.RUSTFMT_TOOLCHAIN,
         "cargo",
-        f"+{script.RUSTFMT_TOOLCHAIN}",
         "fmt",
     )
     assert checks[1].commands[-1].args == (
+        "rustup",
+        "run",
+        script.RUSTFMT_TOOLCHAIN,
         "cargo",
-        f"+{script.RUSTFMT_TOOLCHAIN}",
         "fmt",
         "--check",
     )
@@ -240,7 +256,9 @@ def test_root_format_driver_reports_progress_when_all_formatters_succeed(
     monkeypatch.setattr(
         script,
         "formatter_groups",
-        lambda *, check, fast_local=False, selected_groups=None: groups,
+        lambda *, check, fast_local=False, selected_groups=None, python_script_targets=("scripts",): (
+            groups
+        ),
     )
     monkeypatch.setattr(
         script,
@@ -269,7 +287,9 @@ def test_root_format_driver_reports_all_formatter_results(
     monkeypatch.setattr(
         script,
         "formatter_groups",
-        lambda *, check, fast_local=False, selected_groups=None: groups,
+        lambda *, check, fast_local=False, selected_groups=None, python_script_targets=("scripts",): (
+            groups
+        ),
     )
 
     def fake_run(group):

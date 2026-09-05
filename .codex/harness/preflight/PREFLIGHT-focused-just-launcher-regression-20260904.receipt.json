@@ -1,0 +1,56 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts/test_completion_proof_current_evidence.py",
+          "scripts"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    }
+  ],
+  "assignment_id": "worker:focused-just-launcher-regression-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+  },
+  "contract_claims": [
+    "actual-just-focused-runpy-import-bootstrap"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-05T02:18:05.729839+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "4bb952c4125fb28684634161ef3726aa3b204ef2c1595562722ffa753158da1f",
+  "path_claims": [
+    {
+      "path": "scripts/test_completion_proof_current_evidence.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-05T01:18:05.729839+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "06a7e370b2a0ce6a85cf23a0773073f358e7cdd35234df2bd9feca8ee1f93e2f"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof_current_evidence"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

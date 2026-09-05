@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tarfile
@@ -33,8 +34,10 @@ from scripts.completion_proof_inventory_v2 import FROZEN_V1_WORKSPACE_FINGERPRIN
 from scripts.completion_proof_inventory_v2 import INVENTORY_V2_SCHEMA_IDS
 from scripts.completion_proof_inventory_v2 import INVENTORY_V2_SCHEMA_PATHS
 from scripts.completion_proof_inventory_v2 import INVENTORY_V2_SCHEMA_RAW_SHA256S
+from scripts.completion_proof_inventory_v2 import InventoryV2ContractError
 from scripts.completion_proof_inventory_v2 import canonical_jcs
 from scripts.completion_proof_inventory_v2 import doctest_recovered_child_sources_v1
+from scripts.completion_proof_inventory_v2 import derive_frozen_v1_historical_replacement_graph_v1
 from scripts.completion_proof_inventory_v2 import frozen_baseline_obligation_id_v2
 from scripts.completion_proof_inventory_v2 import inventory_declaration_id_v2
 from scripts.completion_proof_inventory_v2 import inventory_declaration_obligation_id_v2
@@ -44,7 +47,13 @@ from scripts.completion_proof_inventory_v2 import validate_doctest_recapture_pac
 from scripts.completion_proof_inventory_v2 import validate_inventory_ledger_predecessor_closure
 from scripts.completion_proof_inventory_v2 import validate_inventory_recovery_authority_v1
 from scripts.completion_proof_inventory_v2 import validate_recovery_transition_receipt_v1
+from scripts.completion_proof_inventory_v2 import validate_runner_selector_v1
 from scripts.completion_proof_inventory_v2 import validate_test_replacement_ledger_v2
+from scripts.completion_proof_inventory_v2 import validate_unittest_recapture_packet_v1
+from scripts.completion_proof_inventory_v2 import validate_unittest_source_provenance_exception_v1
+from scripts.completion_proof_inventory_v2 import unittest_executable_parent_records_v1
+from scripts.completion_proof_inventory_v2 import unittest_recovered_child_sources_v1
+from scripts.completion_proof_inventory_v2 import unittest_subtest_manifests_v1
 from scripts.rust_test_runner import Manifest
 from scripts.rust_test_runner import RunnerError
 from scripts.rust_test_runner import Target
@@ -60,6 +69,7 @@ V2_DOCTEST_RECAPTURE_PATH = (
 V2_UNITTEST_RECAPTURE_PATH = (
     ".codex/validation/frozen-test-inventory-v2-unittest-recapture.json"
 )
+V2_UNITTEST_SOURCE_EXCEPTIONS_PATH = ".codex/validation/frozen-test-inventory-v2-unittest-source-exceptions.json"
 V2_RECOVERY_TRANSITION_RECEIPTS_PATH = (
     ".codex/validation/frozen-test-inventory-v2-recovery-transition-receipts.json"
 )
@@ -67,7 +77,7 @@ V2_LEDGER_PATH = ".codex/validation/test-replacements-v2.json"
 RUST_TEST_MANIFEST_PATH = "codex-rs/.config/kd4-rust-tests.toml"
 BASELINE_COMMIT = "60bb133fa0a4f25e83851ab16d8c462e5f42ff95"
 EXPECTED_BASELINE_COUNT = 15_544
-EXPECTED_DECLARATION_COUNT = 15_547
+EXPECTED_DECLARATION_COUNT = 15_548
 EXPECTED_SOURCE_TREE_SHA256 = (
     "654591dd1ddda7a77312172ec7c70e60e80990590c7c74a7c3b08a445279d90e"
 )
@@ -100,6 +110,17 @@ V1_TO_V2_RUNNER_KIND = {
     "rust-doctest": "rust-doctest",
     "rust-nextest": "rust-nextest",
     "windows-sandbox-smoke": "windows-sandbox-smoke-native",
+}
+ARGUMENT_COMMENT_LINT_UI_CONSUMED_PATHS = {
+    "tools/argument-comment-lint/ui/comment_mismatch.rs": (
+        "tools/argument-comment-lint/ui/comment_mismatch.stderr"
+    ),
+    "tools/argument-comment-lint/ui/multiple_method_arguments.rs": (
+        "tools/argument-comment-lint/ui/multiple_method_arguments.stderr"
+    ),
+    "tools/argument-comment-lint/ui/uncommented_literal.rs": (
+        "tools/argument-comment-lint/ui/uncommented_literal.stderr"
+    ),
 }
 
 SOURCE_ONLY_SPECS = (
@@ -144,6 +165,24 @@ SOURCE_ONLY_SPECS = (
     },
 )
 
+POST_BASELINE_CURRENT_SPECS = (
+    {
+        "canonical_id": (
+            "python-unittest::scripts.test_completion_proof_typed_canonical."
+            "CanonicalTypedJournalIntegrationTest."
+            "test_canonical_attempt_consumes_real_broker_journal"
+        ),
+        "line": 59,
+        "native_id": (
+            "scripts.test_completion_proof_typed_canonical."
+            "CanonicalTypedJournalIntegrationTest."
+            "test_canonical_attempt_consumes_real_broker_journal"
+        ),
+        "required_hosts": ["darwin", "linux", "windows"],
+        "source_path": "scripts/test_completion_proof_typed_canonical.py",
+    },
+)
+
 UNITTEST_RUNNER_SITES = [
     {
         "column": 18,
@@ -182,10 +221,31 @@ OWNED_ARTIFACT_PATTERNS = (
     "test-replacements-v2*.json",
 )
 
-_DESCRIBE_RE = re.compile(r'^\s*describe\s*\(\s*(["\'])(.*?)\1\s*,.*?\{\s*$')
-_TEST_RE = re.compile(
-    r'^\s*(it|test)(\.[A-Za-z_][A-Za-z0-9_]*)?\s*\(\s*(["\'])(.*?)\3\s*,'
+_JEST_CONFIG_PATH = "sdk/typescript/jest.config.cjs"
+_JEST_OBSERVATION_FIELDS = frozenset(
+    {
+        "ancestor_titles",
+        "column",
+        "config_path",
+        "file_path",
+        "full_title",
+        "line",
+        "registration_ordinal",
+    }
 )
+_JEST_REPORT_FIELDS = frozenset(
+    {
+        "complete",
+        "num_failed_tests",
+        "num_passed_tests",
+        "num_pending_tests",
+        "num_total_tests",
+        "observations",
+        "schema_version",
+    }
+)
+_JEST_OBSERVER_TIMEOUT_SECONDS = 180
+_JEST_DIAGNOSTIC_LIMIT = 4_000
 
 
 class MaterializationError(RuntimeError):
@@ -393,64 +453,357 @@ def _manifest_feature_contexts(
     return raw, feature_contexts, resolved_targets
 
 
-def _brace_delta(line: str) -> int:
-    delta = 0
-    quote: str | None = None
-    escaped = False
-    index = 0
-    while index < len(line):
-        char = line[index]
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = None
-        elif char in {"'", '"', "`"}:
-            quote = char
-        elif char == "/" and index + 1 < len(line) and line[index + 1] == "/":
-            break
-        elif char == "{":
-            delta += 1
-        elif char == "}":
-            delta -= 1
-        index += 1
-    return delta
+def _bounded_jest_diagnostic(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    text = text.strip()
+    if len(text) <= _JEST_DIAGNOSTIC_LIMIT:
+        return text
+    return f"<truncated> {text[-_JEST_DIAGNOSTIC_LIMIT:]}"
+
+
+def _write_jest_observer_modules(
+    stage: Path, repo_root: Path, config_path: Path
+) -> tuple[Path, Path, Path]:
+    journal_path = stage / "observations.jsonl"
+    report_path = stage / "report.json"
+    environment_path = stage / "environment.cjs"
+    reporter_path = stage / "reporter.cjs"
+
+    environment_source = r'''"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { createRequire } = require("node:module");
+const { fileURLToPath } = require("node:url");
+
+const configPath = __CONFIG_PATH__;
+const repoRoot = __REPO_ROOT__;
+const journalPath = __JOURNAL_PATH__;
+const repoRequire = createRequire(configPath);
+const environmentModule = repoRequire("jest-environment-node");
+const NodeEnvironment =
+  environmentModule.TestEnvironment ?? environmentModule.default ?? environmentModule;
+const StackUtils = repoRequire("stack-utils");
+
+function canonicalPath(value) {
+  let candidate = value;
+  if (candidate.startsWith("file://")) {
+    candidate = fileURLToPath(candidate);
+  }
+  const resolved = path.resolve(candidate);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+class Kd4JestObservationEnvironment extends NodeEnvironment {
+  constructor(config, context) {
+    super(config, context);
+    this.testPath = path.resolve(context.testPath);
+    this.stackUtils = new StackUtils({ cwd: path.dirname(configPath) });
+    this.ordinals = new Map();
+  }
+
+  handleTestEvent(event, state) {
+    if (event.name === "test_fn_start" || event.name === "hook_start") {
+      throw new Error(`Jest observer attempted to execute ${event.name}`);
+    }
+    if (event.name !== "add_test") {
+      return;
+    }
+
+    const tests = state.currentDescribeBlock.tests;
+    const testEntry = tests[tests.length - 1];
+    if (!testEntry || testEntry.name !== event.testName) {
+      throw new Error(`Circus add_test state mismatch for ${event.testName}`);
+    }
+
+    // The Circus state handler runs before the environment handler. Rewriting
+    // the registered entry here observes real registration while ensuring that
+    // no test body or before/after hook can run.
+    testEntry.mode = "skip";
+
+    const expectedPath = canonicalPath(this.testPath);
+    let location = null;
+    const stack = event.asyncError && event.asyncError.stack;
+    for (const line of typeof stack === "string" ? stack.split(/\r?\n/) : []) {
+      const frame = this.stackUtils.parseLine(line);
+      if (!frame || typeof frame.file !== "string") {
+        continue;
+      }
+      if (canonicalPath(frame.file) === expectedPath) {
+        location = frame;
+        break;
+      }
+    }
+    if (
+      !location ||
+      !Number.isInteger(location.line) ||
+      location.line < 1 ||
+      !Number.isInteger(location.column) ||
+      location.column < 1
+    ) {
+      throw new Error(`Jest registration location is unavailable for ${this.testPath}`);
+    }
+
+    const ancestorTitles = [];
+    for (let block = testEntry.parent; block && block.parent; block = block.parent) {
+      ancestorTitles.unshift(block.name);
+    }
+    const filePath = path.relative(repoRoot, this.testPath).split(path.sep).join("/");
+    const fullTitle = [...ancestorTitles, testEntry.name].join(" ");
+    const nativeId = `${filePath}\u0000${fullTitle}`;
+    const registrationOrdinal = this.ordinals.get(nativeId) ?? 0;
+    this.ordinals.set(nativeId, registrationOrdinal + 1);
+
+    fs.appendFileSync(
+      journalPath,
+      `${JSON.stringify({
+        ancestor_titles: ancestorTitles,
+        column: location.column,
+        config_path: "sdk/typescript/jest.config.cjs",
+        file_path: filePath,
+        full_title: fullTitle,
+        line: location.line,
+        registration_ordinal: registrationOrdinal,
+      })}\n`,
+      "utf8",
+    );
+  }
+}
+
+module.exports = Kd4JestObservationEnvironment;
+'''
+    environment_source = (
+        environment_source.replace("__CONFIG_PATH__", json.dumps(str(config_path)))
+        .replace("__REPO_ROOT__", json.dumps(str(repo_root)))
+        .replace("__JOURNAL_PATH__", json.dumps(str(journal_path)))
+    )
+
+    reporter_source = r'''"use strict";
+
+const fs = require("node:fs");
+
+const journalPath = __JOURNAL_PATH__;
+const reportPath = __REPORT_PATH__;
+
+class Kd4JestObservationReporter {
+  onRunStart() {
+    fs.writeFileSync(journalPath, "", "utf8");
+  }
+
+  onRunComplete(_contexts, results) {
+    const raw = fs.readFileSync(journalPath, "utf8");
+    const observations = raw.trim()
+      ? raw.trim().split(/\r?\n/).map((line) => JSON.parse(line))
+      : [];
+    const report = {
+      complete: true,
+      num_failed_tests: results.numFailedTests,
+      num_passed_tests: results.numPassedTests,
+      num_pending_tests: results.numPendingTests,
+      num_total_tests: results.numTotalTests,
+      observations,
+      schema_version: 1,
+    };
+    const temporaryPath = `${reportPath}.${process.pid}.tmp`;
+    fs.writeFileSync(
+      temporaryPath,
+      JSON.stringify(report),
+      { encoding: "utf8", flag: "wx" },
+    );
+    fs.renameSync(temporaryPath, reportPath);
+  }
+}
+
+module.exports = Kd4JestObservationReporter;
+'''
+    reporter_source = reporter_source.replace(
+        "__JOURNAL_PATH__", json.dumps(str(journal_path))
+    ).replace("__REPORT_PATH__", json.dumps(str(report_path)))
+
+    environment_path.write_text(environment_source, encoding="utf-8", newline="\n")
+    reporter_path.write_text(reporter_source, encoding="utf-8", newline="\n")
+    return environment_path, reporter_path, report_path
+
+
+def _run_jest_observer(repo_root: Path) -> dict[str, Any]:
+    repo_root = repo_root.resolve()
+    config_path = repo_root / _JEST_CONFIG_PATH
+    jest_path = repo_root / "node_modules/jest/bin/jest.js"
+    for label, path in (("Jest config", config_path), ("Jest CLI", jest_path)):
+        if not path.is_file():
+            raise MaterializationError(f"{label} is unavailable: {path}")
+
+    with tempfile.TemporaryDirectory(prefix="kd4-jest-observer-") as temp:
+        stage = Path(temp)
+        environment_path, reporter_path, report_path = _write_jest_observer_modules(
+            stage, repo_root, config_path
+        )
+        command = [
+            "node",
+            str(jest_path),
+            "--config",
+            str(config_path),
+            "--runInBand",
+            "--no-cache",
+            "--env",
+            str(environment_path),
+            "--reporters",
+            "default",
+            "--reporters",
+            str(reporter_path),
+        ]
+        environment = os.environ.copy()
+        environment["CI"] = "1"
+        environment["RUN_REAL_CODEX_TESTS"] = "0"
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=config_path.parent,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_JEST_OBSERVER_TIMEOUT_SECONDS,
+                env=environment,
+            )
+        except subprocess.TimeoutExpired as error:
+            diagnostic = _bounded_jest_diagnostic(error.stderr or error.stdout)
+            suffix = f": {diagnostic}" if diagnostic else ""
+            raise MaterializationError(
+                "Jest observation timed out after "
+                f"{_JEST_OBSERVER_TIMEOUT_SECONDS} seconds{suffix}"
+            ) from error
+        except OSError as error:
+            raise MaterializationError(
+                f"Jest observation could not start: {error}"
+            ) from error
+
+        if completed.returncode != 0:
+            diagnostic = _bounded_jest_diagnostic(completed.stderr or completed.stdout)
+            suffix = f": {diagnostic}" if diagnostic else ""
+            raise MaterializationError(
+                f"Jest observation failed with exit code {completed.returncode}{suffix}"
+            )
+        try:
+            raw_report = report_path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise MaterializationError(
+                "Jest observation completed without a finalized report"
+            ) from error
+        try:
+            report = json.loads(raw_report)
+        except json.JSONDecodeError as error:
+            raise MaterializationError(
+                "Jest observation report is not valid JSON"
+            ) from error
+    if not isinstance(report, dict):
+        raise MaterializationError("Jest observation report must be an object")
+    return report
 
 
 def _jest_selector_index(repo_root: Path) -> dict[str, dict[str, Any]]:
+    repo_root = repo_root.resolve()
+    report = _run_jest_observer(repo_root)
+    if set(report) != _JEST_REPORT_FIELDS:
+        raise MaterializationError(
+            "Jest observation report fields mismatch: "
+            f"expected {sorted(_JEST_REPORT_FIELDS)!r}, got {sorted(report)!r}"
+        )
+    schema_version = report["schema_version"]
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 1
+        or report["complete"] is not True
+    ):
+        raise MaterializationError("Jest observation report is not finalized")
+    for field in (
+        "num_failed_tests",
+        "num_passed_tests",
+        "num_pending_tests",
+        "num_total_tests",
+    ):
+        value = report[field]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise MaterializationError(f"Jest observation report {field} is invalid")
+    observations = report["observations"]
+    if not isinstance(observations, list):
+        raise MaterializationError(
+            "Jest observation report observations must be an array"
+        )
+    total = report["num_total_tests"]
+    if total == 0:
+        raise MaterializationError("Jest observation discovered no tests")
+    if len(observations) != total:
+        raise MaterializationError(
+            "Jest observation count mismatch: "
+            f"observed {len(observations)}, Jest reported {total}"
+        )
+    if (
+        report["num_pending_tests"] != total
+        or report["num_passed_tests"] != 0
+        or report["num_failed_tests"] != 0
+    ):
+        raise MaterializationError(
+            "Jest observation executed a test body or hook instead of skipping all "
+            "tests"
+        )
+
     result: dict[str, dict[str, Any]] = {}
-    ordinals: Counter[str] = Counter()
-    for path in sorted((repo_root / "sdk/typescript/tests").rglob("*.test.ts")):
-        depth = 0
-        describes: list[tuple[int, str]] = []
-        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            while describes and describes[-1][0] > depth:
-                describes.pop()
-            describe = _DESCRIBE_RE.match(line)
-            test = _TEST_RE.match(line)
-            if describe is not None:
-                describes.append((depth + max(1, _brace_delta(line)), describe.group(2)))
-            elif test is not None:
-                ancestors = [item[1] for item in describes]
-                full_title = " ".join([*ancestors, test.group(4)])
-                file_path = path.relative_to(repo_root).as_posix()
-                native_id = f"{file_path}::{full_title}"
-                if native_id in result:
-                    raise MaterializationError(f"ambiguous Jest selector: {native_id}")
-                result[native_id] = {
-                    "ancestor_titles": ancestors,
-                    "column": line.index(test.group(1)) + 1,
-                    "config_path": "sdk/typescript/jest.config.cjs",
-                    "file_path": file_path,
-                    "full_title": full_title,
-                    "kind": "javascript-jest",
-                    "line": line_number,
-                    "registration_ordinal": ordinals[native_id],
-                }
-                ordinals[native_id] += 1
-            depth += _brace_delta(line)
+    seen_selectors: set[tuple[str, str, int]] = set()
+    for index, observation in enumerate(observations):
+        if not isinstance(observation, dict):
+            raise MaterializationError(
+                f"Jest observation {index} must be an object"
+            )
+        if set(observation) != _JEST_OBSERVATION_FIELDS:
+            raise MaterializationError(
+                f"Jest observation {index} fields mismatch: "
+                f"expected {sorted(_JEST_OBSERVATION_FIELDS)!r}, "
+                f"got {sorted(observation)!r}"
+            )
+        selector = {"kind": "javascript-jest", **observation}
+        try:
+            validate_runner_selector_v1(selector)
+        except InventoryV2ContractError as error:
+            raise MaterializationError(
+                f"Jest observation {index} violates RunnerSelectorV1: {error}"
+            ) from error
+        if selector["config_path"] != _JEST_CONFIG_PATH:
+            raise MaterializationError(
+                f"Jest observation {index} used unexpected config_path"
+            )
+        test_path = (repo_root / selector["file_path"]).resolve()
+        try:
+            test_path.relative_to(repo_root)
+        except ValueError as error:
+            raise MaterializationError(
+                f"Jest observation {index} resolves outside the repository"
+            ) from error
+        if not test_path.is_file():
+            raise MaterializationError(
+                f"Jest observation {index} source does not exist: "
+                f"{selector['file_path']}"
+            )
+
+        native_id = f"{selector['file_path']}::{selector['full_title']}"
+        selector_identity = (
+            selector["file_path"],
+            selector["full_title"],
+            selector["registration_ordinal"],
+        )
+        if selector_identity in seen_selectors:
+            raise MaterializationError(f"duplicate Jest selector: {native_id}")
+        seen_selectors.add(selector_identity)
+        if native_id in result:
+            raise MaterializationError(f"ambiguous Jest selector: {native_id}")
+        result[native_id] = selector
     return result
 
 
@@ -588,6 +941,78 @@ def _source_only_declaration(
     declaration = {
         "entry": entry,
         "kind": "missing-baseline",
+        "source_provenance": provenance,
+    }
+    declaration["declaration_id"] = inventory_declaration_id_v2(
+        declaration["kind"], entry, provenance
+    )
+    declaration["obligation_id"] = inventory_declaration_obligation_id_v2(
+        declaration["kind"], entry, provenance
+    )
+    return declaration
+
+
+def _post_baseline_current_declaration(
+    spec: dict[str, Any], contract_sha256: str
+) -> dict[str, Any]:
+    identity = {
+        "kind": "test",
+        "route_id": "test-route.python-unittest.v1",
+        "test_id": spec["canonical_id"],
+        "validation_id": ROUTE_VALIDATION_IDS["python-unittest"],
+    }
+    subtest_manifest_sha256 = proof_hash(
+        "kd4.python-unittest-subtest-manifest.source-declared.v1",
+        {
+            "declared_subtests": [],
+            "parent_test_id": spec["native_id"],
+            "source_path": spec["source_path"],
+        },
+    )
+    selector = {
+        "kind": "python-unittest",
+        "parent_test_id": spec["native_id"],
+        "selection_unit": "parent-with-all-declared-subtests",
+        "subtest_manifest_sha256": subtest_manifest_sha256,
+    }
+    applicability = {"kind": "host-set", "required_hosts": spec["required_hosts"]}
+    entry = {
+        "cargo_target_context_spec_sha256": None,
+        "executable_identity": identity,
+        "executable_identity_sha256": proof_hash("kd4.executable-identity.v1", identity),
+        "execution_input_contract_sha256": contract_sha256,
+        "platform_applicability": applicability,
+        "platform_applicability_sha256": proof_hash(
+            "kd4.platform-applicability.v1", applicability
+        ),
+        "runner_selector": selector,
+        "runner_selector_sha256": proof_hash("kd4.runner-selector.v1", selector),
+        "test_route_id": "test-route.python-unittest.v1",
+        "validation_id": ROUTE_VALIDATION_IDS["python-unittest"],
+    }
+    evidence = {
+        "line": spec["line"],
+        "native_id": spec["native_id"],
+        "source_path": spec["source_path"],
+        "subtest_manifest_sha256": subtest_manifest_sha256,
+    }
+    provenance_projection = {
+        "evidence_paths": [spec["source_path"]],
+        "evidence_sha256": proof_hash(
+            "kd4.post-baseline-current-declaration-evidence.v1", evidence
+        ),
+        "kind": "source-declaration",
+        "schema_version": 1,
+    }
+    provenance = {
+        **provenance_projection,
+        "receipt_sha256": proof_hash(
+            "kd4.provenance-receipt.v1", provenance_projection
+        ),
+    }
+    declaration = {
+        "entry": entry,
+        "kind": "post-baseline-current",
         "source_provenance": provenance,
     }
     declaration["declaration_id"] = inventory_declaration_id_v2(
@@ -913,6 +1338,7 @@ def _recovery_authority(
     doctest_contexts: list[dict[str, Any]],
     doctest_recapture: dict[str, Any] | None,
     repo_root: Path,
+    unittest_recapture: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     unittest_ledger_identities = sorted(
         row["baseline_id"]
@@ -1111,6 +1537,33 @@ def _recovery_authority(
         transition_receipts.append(transition)
         recovery = finalize_recovery()
 
+    if unittest_recapture is not None:
+        validate_unittest_recapture_packet_v1(unittest_recapture)
+        children = unittest_recovered_child_sources_v1(unittest_recapture)
+        parents = unittest_executable_parent_records_v1(unittest_recapture)
+        parent_container_ids = [parent["baseline_id"] for parent in parents]
+        transition = transition_for(
+            authority_before_semantic_sha256=recovery["semantic_sha256"],
+            children=children,
+            parent_container_ids=parent_container_ids,
+            recapture_receipt_sha256=unittest_recapture["receipt_sha256"],
+        )
+        records[1] = {
+            **records[1],
+            "legacy_evidence": {**records[1]["legacy_evidence"], "historical_subtest_call_count": unittest_recapture["total_counts"]["subtest_occurrence_count"]},
+            "pending_requirement": None,
+            "resolution": {
+                "child_sources": children,
+                "parent_container_ids": parent_container_ids,
+                "parent_recapture_outputs": [{"output_sha256": parent["predecessor_entry_sha256"], "parent_id": parent["baseline_id"]} for parent in parents],
+                "recapture_receipt_sha256": unittest_recapture["receipt_sha256"],
+            },
+            "state": "resolved",
+            "transition_receipt_sha256": transition["receipt_sha256"],
+        }
+        transition_receipts.append(transition)
+        recovery = finalize_recovery()
+
     return recovery, transition_receipts
 
 
@@ -1140,8 +1593,26 @@ def build_materialized_bundle(
     unittest_recapture_raw: bytes | None = None,
 ) -> dict[str, Any]:
     repo_root = repo_root.resolve()
+    source_exceptions = None
+    source_exception_path = repo_root / V2_UNITTEST_SOURCE_EXCEPTIONS_PATH
+    if source_exception_path.is_file():
+        source_exception_raw = source_exception_path.read_bytes()
+        source_exceptions = json.loads(source_exception_raw)
+        validate_unittest_source_provenance_exception_v1(source_exceptions)
+        if canonical_jcs(source_exceptions) != source_exception_raw:
+            raise MaterializationError("unittest source exception must be exact canonical JSON")
+    unittest_recapture = None
     if unittest_recapture_raw is not None:
-        raise MaterializationError(UNITTEST_RECAPTURE_UNAVAILABLE)
+        try:
+            unittest_recapture = json.loads(unittest_recapture_raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise MaterializationError("unittest recapture artifact is invalid JSON") from exc
+        if canonical_jcs(unittest_recapture) != unittest_recapture_raw:
+            raise MaterializationError("unittest recapture artifact must be exact canonical JSON bytes")
+        try:
+            validate_unittest_recapture_packet_v1(unittest_recapture)
+        except InventoryV2ContractError as exc:
+            raise MaterializationError(f"unittest recapture artifact is invalid: {exc}") from exc
     doctest_recapture: dict[str, Any] | None = None
     if doctest_recapture_raw is not None:
         try:
@@ -1156,9 +1627,20 @@ def build_materialized_bundle(
     _, frozen_inventory = _read_frozen_json(
         repo_root / V1_INVENTORY_PATH, FROZEN_V1_INVENTORY_RAW_SHA256
     )
-    _, frozen_ledger = _read_frozen_json(
+    frozen_ledger_raw, frozen_ledger = _read_frozen_json(
         repo_root / V1_LEDGER_PATH, FROZEN_V1_LEDGER_RAW_SHA256
     )
+    historical_replacement_graph = derive_frozen_v1_historical_replacement_graph_v1(
+        frozen_ledger
+    )
+    historical_replacement_ids_by_baseline = {
+        baseline_id: []
+        for baseline_id in historical_replacement_graph["baseline_ids"]
+    }
+    for edge in historical_replacement_graph["edges"]:
+        historical_replacement_ids_by_baseline[edge["baseline_id"]].append(
+            edge["replacement_id"]
+        )
     predecessor_entries = {row["baseline_id"]: row for row in frozen_inventory["tests"]}
     predecessor_rows = {row["baseline_id"]: row for row in frozen_ledger["rows"]}
     baseline_ids = sorted(predecessor_entries)
@@ -1199,9 +1681,22 @@ def build_materialized_bundle(
     source_paths = sorted(
         {row["source"] for row in frozen_inventory["tests"]}
         | {spec["source_path"] for spec in SOURCE_ONLY_SPECS}
+        | {spec["source_path"] for spec in POST_BASELINE_CURRENT_SPECS}
     )
     contracts_by_source = {
-        source: _execution_input_contract(owned=[{"kind": "exact", "path": source}])
+        source: _execution_input_contract(
+            owned=[{"kind": "exact", "path": source}],
+            consumed=(
+                [
+                    {
+                        "kind": "exact",
+                        "path": ARGUMENT_COMMENT_LINT_UI_CONSUMED_PATHS[source],
+                    }
+                ]
+                if source in ARGUMENT_COMMENT_LINT_UI_CONSUMED_PATHS
+                else None
+            ),
+        )
         for source in source_paths
     }
     documentation_contract = _execution_input_contract(
@@ -1306,6 +1801,10 @@ def build_materialized_bundle(
     doctest_ordinals: Counter[tuple[str, str]] = Counter()
     declarations: list[dict[str, Any]] = []
     declarations_by_baseline: dict[str, dict[str, Any]] = {}
+    unittest_manifests = {} if unittest_recapture is None else {
+        item["parent_baseline_id"]: item["manifest_sha256"]
+        for item in unittest_subtest_manifests_v1(unittest_recapture)
+    }
     for baseline_id in baseline_ids:
         baseline = predecessor_entries[baseline_id]
         entry = _build_entry(
@@ -1315,6 +1814,11 @@ def build_materialized_bundle(
             jest_selectors=jest_selectors,
             doctest_ordinals=doctest_ordinals,
         )
+        if baseline_id in unittest_manifests:
+            entry["runner_selector"]["subtest_manifest_sha256"] = unittest_manifests[baseline_id]
+            entry["runner_selector_sha256"] = proof_hash(
+                "kd4.runner-selector.v1", entry["runner_selector"]
+            )
         declaration = {
             "baseline_id": baseline_id,
             "entry": entry,
@@ -1333,9 +1837,18 @@ def build_materialized_bundle(
                 context_by_binary[(package_name, binary_name)],
             )
         )
+    for spec in POST_BASELINE_CURRENT_SPECS:
+        declarations.append(
+            _post_baseline_current_declaration(
+                spec,
+                contracts_by_source[spec["source_path"]]["contract_sha256"],
+            )
+        )
     declarations.sort(key=canonical_jcs)
     if len(declarations) != EXPECTED_DECLARATION_COUNT:
-        raise MaterializationError(f"expected 15,547 V2 declarations, got {len(declarations)}")
+        raise MaterializationError(
+            f"expected {EXPECTED_DECLARATION_COUNT:,} V2 declarations, got {len(declarations)}"
+        )
 
     recovery, transition_receipts = _recovery_authority(
         frozen_inventory=frozen_inventory,
@@ -1343,6 +1856,7 @@ def build_materialized_bundle(
         doctest_contexts=doctest_contexts,
         doctest_recapture=doctest_recapture,
         repo_root=repo_root,
+        unittest_recapture=unittest_recapture,
     )
     for transition_receipt in transition_receipts:
         validate_recovery_transition_receipt_v1(transition_receipt)
@@ -1385,6 +1899,7 @@ def build_materialized_bundle(
             "path": RUST_TEST_MANIFEST_PATH,
             "raw_sha256": hashlib.sha256(rust_test_manifest_raw).hexdigest(),
         },
+        "post_baseline_current_specs": list(POST_BASELINE_CURRENT_SPECS),
         "source_only_specs": list(SOURCE_ONLY_SPECS),
     }
     if doctest_recapture is not None:
@@ -1392,6 +1907,12 @@ def build_materialized_bundle(
             "path": V2_DOCTEST_RECAPTURE_PATH,
             "raw_sha256": hashlib.sha256(doctest_recapture_raw).hexdigest(),
             "receipt_sha256": doctest_recapture["receipt_sha256"],
+        }
+    if unittest_recapture is not None:
+        materialization_source_projection["unittest_recapture"] = {
+            "path": V2_UNITTEST_RECAPTURE_PATH,
+            "raw_sha256": hashlib.sha256(unittest_recapture_raw).hexdigest(),
+            "receipt_sha256": unittest_recapture["receipt_sha256"],
         }
     inventory = {
         "action_routes": action_routes,
@@ -1477,6 +1998,11 @@ def build_materialized_bundle(
         elif resolution == "unresolved":
             disposition: dict[str, Any] = {"kind": "unresolved"}
         elif resolution == "replacement":
+            replacement_ids = historical_replacement_ids_by_baseline.get(baseline_id)
+            if replacement_ids is None:
+                raise MaterializationError(
+                    "V1 replacement row is absent from the frozen historical graph"
+                )
             predecessor_row_sha256 = proof_hash(
                 "kd4.frozen-v1-replacement-ledger-row.v1", predecessor_row
             )
@@ -1486,7 +2012,7 @@ def build_materialized_bundle(
                     "candidate": None,
                     "legacy_replacement_hint": {
                         "predecessor_row_sha256": predecessor_row_sha256,
-                        "replacement_ids": sorted(predecessor_row["replacement_ids"]),
+                        "replacement_ids": replacement_ids,
                     },
                     "state": "pending-review",
                 },
@@ -1500,7 +2026,7 @@ def build_materialized_bundle(
                             "replacement_id": replacement_id,
                         },
                     )
-                    for replacement_id in sorted(predecessor_row["replacement_ids"])
+                    for replacement_id in replacement_ids
                 ]),
                 "kind": "replacement",
                 "stage2_incorrect_behavior_ids": None,
@@ -1528,20 +2054,40 @@ def build_materialized_bundle(
     for declaration in declarations:
         if declaration["kind"] == "frozen-baseline":
             continue
+        if declaration["kind"] == "post-baseline-current":
+            disposition = {
+                "inventory_entry_semantic_sha256": proof_hash(
+                    "kd4.executable-inventory-entry.v2", declaration["entry"]
+                ),
+                "kind": "current",
+            }
+        elif declaration["kind"] == "missing-baseline":
+            disposition = {
+                "exception": {
+                    "kind": "pending-legacy",
+                    "provenance_receipt": declaration["source_provenance"],
+                    "tag": "platform-pending",
+                },
+                "kind": "exception",
+            }
+        else:
+            raise MaterializationError(
+                f"unknown nonbaseline declaration kind: {declaration['kind']}"
+            )
         ledger_rows.append(
             {
                 "baseline_id": None,
-                "disposition": {
-                    "exception": {
-                        "kind": "pending-legacy",
-                        "provenance_receipt": declaration["source_provenance"],
-                        "tag": "platform-pending",
-                    },
-                    "kind": "exception",
-                },
+                "disposition": disposition,
                 "obligation_id": declaration["obligation_id"],
             }
         )
+    if unittest_recapture is not None:
+        for child in recovery["records"][1]["resolution"]["child_sources"]:
+            ledger_rows.append({
+                "baseline_id": None,
+                "disposition": {"kind": "unresolved"},
+                "obligation_id": "inventory-v2-recovered." + proof_hash("kd4.recovered-child-identity.v1", child),
+            })
     ledger_rows.sort(key=canonical_jcs)
     ledger = {
         "format_id": "kd4.test-replacement-ledger.v2",
@@ -1571,8 +2117,8 @@ def build_materialized_bundle(
         transition_receipts,
         issuer,
         doctest_recapture_raw,
-        None,
-        None,
+        unittest_recapture_raw,
+        frozen_ledger_raw,
     )
 
     documents = {
@@ -1582,9 +2128,17 @@ def build_materialized_bundle(
         V2_LEDGER_PATH: ledger,
     }
     raw_documents = {path: canonical_jcs(document) for path, document in documents.items()}
+    if source_exceptions is not None:
+        documents[V2_UNITTEST_SOURCE_EXCEPTIONS_PATH] = source_exceptions
+        raw_documents[V2_UNITTEST_SOURCE_EXCEPTIONS_PATH] = source_exception_raw
     if doctest_recapture is not None:
         documents[V2_DOCTEST_RECAPTURE_PATH] = doctest_recapture
         raw_documents[V2_DOCTEST_RECAPTURE_PATH] = doctest_recapture_raw
+    if unittest_recapture is not None:
+        documents[V2_UNITTEST_RECAPTURE_PATH] = unittest_recapture
+        raw_documents[V2_UNITTEST_RECAPTURE_PATH] = unittest_recapture_raw
+        documents[V2_UNITTEST_SOURCE_EXCEPTIONS_PATH] = unittest_recapture["source_provenance_exception"]
+        raw_documents[V2_UNITTEST_SOURCE_EXCEPTIONS_PATH] = canonical_jcs(unittest_recapture["source_provenance_exception"])
     framework_counts = Counter(
         declaration["entry"]["runner_selector"]["kind"] for declaration in declarations
     )
@@ -1609,6 +2163,9 @@ def build_materialized_bundle(
                 "frozen_baseline_declarations": EXPECTED_BASELINE_COUNT,
                 "inventory_declarations": len(declarations),
                 "ledger_rows": len(ledger_rows),
+                "post_baseline_current_declarations": len(
+                    POST_BASELINE_CURRENT_SPECS
+                ),
                 "recovery_records": len(recovery["records"]),
                 "recovery_transition_receipts": len(transition_receipts),
                 "source_only_declarations": len(SOURCE_ONLY_SPECS),
@@ -1618,7 +2175,11 @@ def build_materialized_bundle(
             "executed_test_count": 0,
             "materialized_declaration_count": len(declarations),
             "mode": (
-                "doctest-recovery-materialization"
+                "unittest-and-doctest-recovery-materialization"
+                if unittest_recapture is not None and doctest_recapture is not None
+                else "unittest-recovery-materialization"
+                if unittest_recapture is not None
+                else "doctest-recovery-materialization"
                 if doctest_recapture is not None
                 else "dormant-materialization"
             ),
@@ -1626,14 +2187,63 @@ def build_materialized_bundle(
     }
 
 
-def recapture_unittests(repo_root: Path) -> dict[str, Any]:
-    del repo_root
-    raise MaterializationError(UNITTEST_RECAPTURE_UNAVAILABLE)
+def recapture_unittests(
+    repo_root: Path, *, source_exceptions: Path | None = None,
+    codex_executable: Path | None = None, output: Path | None = None,
+) -> dict[str, Any]:
+    if source_exceptions is None or codex_executable is None or output is None:
+        raise MaterializationError(UNITTEST_RECAPTURE_UNAVAILABLE)
+    if output.exists():
+        raise MaterializationError("unittest recapture output already exists")
+    _, inventory = _read_frozen_json(repo_root / V1_INVENTORY_PATH, FROZEN_V1_INVENTORY_RAW_SHA256)
+    records = sorted([
+        {"baseline_id": row["baseline_id"], "native_id": row["native_id"], "predecessor_entry_sha256": proof_hash("kd4.frozen-v1-inventory-entry.v1", row)}
+        for row in inventory["tests"]
+        if row["framework"] == "python-unittest" and not row["baseline_id"].startswith("hidden-at-freeze-v1::")
+    ], key=lambda row: row["baseline_id"])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    manifest = output.parent / ("unittest-parent-manifest-" + str(uuid.uuid4()) + ".json")
+    manifest.write_bytes(canonical_jcs({
+        "baseline_commit": BASELINE_COMMIT, "format_id": "kd4.unittest-parent-manifest.v1",
+        "frozen_inventory_raw_sha256": FROZEN_V1_INVENTORY_RAW_SHA256,
+        "parent_records": records, "schema_version": 1,
+        "source_tree_sha256": EXPECTED_SOURCE_TREE_SHA256,
+    }))
+    completed = subprocess.run([
+        sys.executable, str(Path(__file__).with_name("completion_proof_unittest_recapture.py")),
+        "controller", "--repo-root", str(repo_root), "--manifest", str(manifest),
+        "--output", str(output), "--source-exceptions", str(source_exceptions),
+        "--codex-executable", str(codex_executable),
+    ], stdin=subprocess.DEVNULL, check=False)
+    if completed.returncode:
+        raise MaterializationError(f"unittest recapture controller failed with exit {completed.returncode}")
+    packet = json.loads(output.read_bytes())
+    validate_unittest_recapture_packet_v1(packet)
+    return packet
+
+
+def _require_output_kind(path: Path, *, directory: bool) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    correct_kind = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
+    reparse_point = getattr(metadata, "st_file_attributes", 0) & getattr(
+        stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0
+    )
+    if not correct_kind or reparse_point:
+        expected = "directory" if directory else "regular file"
+        raise MaterializationError(f"V2 output destination must be a {expected}: {path}")
 
 
 def _write_or_check(bundle: dict[str, Any], output_root: Path, *, write: bool) -> None:
     expected_paths = set(bundle["raw_documents"])
     validation_root = output_root / ".codex/validation"
+    if write:
+        for parent in (output_root, output_root / ".codex", validation_root):
+            _require_output_kind(parent, directory=True)
+        for relative in bundle["raw_documents"]:
+            _require_output_kind(output_root / relative, directory=False)
     unexpected: set[str] = set()
     if validation_root.is_dir():
         for pattern in OWNED_ARTIFACT_PATTERNS:
@@ -1646,13 +2256,30 @@ def _write_or_check(bundle: dict[str, Any], output_root: Path, *, write: bool) -
             "unexpected owned V2 artifacts: " + ", ".join(sorted(unexpected))
         )
 
+    if write:
+        validation_root.mkdir(parents=True, exist_ok=True)
+        # Finish preparing every artifact before replacing any existing bytes.
+        # Individual replacements are atomic; this does not activate V2 or
+        # provide a transaction across all output files.
+        with tempfile.TemporaryDirectory(
+            prefix=".inventory-v2-stage-", dir=validation_root
+        ) as stage_name:
+            staged: list[tuple[Path, Path]] = []
+            for index, (relative, raw) in enumerate(bundle["raw_documents"].items()):
+                staged_path = Path(stage_name) / str(index)
+                with staged_path.open("xb") as handle:
+                    handle.write(raw)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                staged.append((staged_path, output_root / relative))
+            for staged_path, destination in staged:
+                staged_path.replace(destination)
+        return
+
     mismatches: list[str] = []
     for relative, raw in bundle["raw_documents"].items():
         destination = output_root / relative
-        if write:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(raw)
-        elif not destination.is_file() or destination.read_bytes() != raw:
+        if not destination.is_file() or destination.read_bytes() != raw:
             mismatches.append(relative)
     if mismatches:
         raise MaterializationError(
@@ -1694,6 +2321,8 @@ def main(argv: list[str] | None = None) -> int:
         help="serialized Cargo target directory for direct doctest recapture",
     )
     mode = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument("--unittest-source-exceptions", type=Path)
+    parser.add_argument("--codex-executable", type=Path)
     mode.add_argument("--write", action="store_true")
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--recapture-doctests", action="store_true")
@@ -1732,7 +2361,22 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.recapture_unittests:
-            recapture_unittests(args.repo_root)
+            packet = recapture_unittests(
+                args.repo_root, source_exceptions=args.unittest_source_exceptions,
+                codex_executable=args.codex_executable,
+                output=output_root / V2_UNITTEST_RECAPTURE_PATH,
+            )
+            exception = packet["source_provenance_exception"]
+            print(json.dumps({
+                "operation": "recapture-unittests",
+                "attempt_id": packet["attempt_id"],
+                "selected_count": packet["total_counts"]["selected_parent_count"],
+                "excepted_source_count": len(exception["baseline_ids"]),
+                "excepted_historical_execution_count": len(
+                    exception["historical_execution_extension"]["baseline_ids"]
+                ),
+            }, sort_keys=True))
+            return 0
         if args.without_doctest_recapture_packet:
             recapture_raw = None
         elif args.doctest_recapture_packet is not None:
@@ -1755,12 +2399,10 @@ def main(argv: list[str] | None = None) -> int:
                     "explicit --unittest-recapture-packet does not exist or is not a file: "
                     f"{unittest_packet_path}"
                 )
-            raise MaterializationError(UNITTEST_RECAPTURE_UNAVAILABLE)
+            unittest_recapture_raw = unittest_packet_path.read_bytes()
         else:
             unittest_packet_path = args.repo_root / V2_UNITTEST_RECAPTURE_PATH
-            if unittest_packet_path.is_file():
-                raise MaterializationError(UNITTEST_RECAPTURE_UNAVAILABLE)
-            unittest_recapture_raw = None
+            unittest_recapture_raw = unittest_packet_path.read_bytes() if unittest_packet_path.is_file() else None
         bundle = build_materialized_bundle(
             args.repo_root, recapture_raw, unittest_recapture_raw
         )

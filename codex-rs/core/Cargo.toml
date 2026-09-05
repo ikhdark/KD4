@@ -20,6 +20,8 @@ path = "src/bin/config_schema.rs"
 workspace = true
 
 [dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { workspace = true, features = ["full", "visit"] }
 codex-client = { workspace = true }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
@@ -83,6 +85,7 @@ codex-utils-path-uri = { workspace = true }
 codex-utils-pty = { workspace = true }
 codex-utils-string = { workspace = true }
 codex-utils-stream-parser = { workspace = true }
+codex-validation-contracts = { workspace = true }
 codex-windows-sandbox = { workspace = true }
 csv = { workspace = true }
 dunce = { workspace = true }

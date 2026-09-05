@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:replacement-source-owner-v2-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "source_owners.toml",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_source_owners.py",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "replacement-admission-v2-owner-and-untrusted-receipt-provenance"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "worker:replacement-source-owner-v2-20260904",
+  "validation_commands": [
+    "python scripts/source_owners.py validate",
+    "python -m unittest -q scripts.test_source_owners"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\replacement-source-owner-v2",
+    "cargo_home": "C:\\Users\\kuh\\.cargo"
+  },
+  "workspace_strategy": "shared"
+}

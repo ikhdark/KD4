@@ -367,8 +367,6 @@ async fn turn_start_sends_nested_subagent_lineage_after_cold_thread_resume_v2() 
 #[tokio::test]
 async fn cold_resume_of_legacy_internal_source_still_requires_root_completion_proof_v2()
 -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
     let fixture = BlockedCompletionProofFixture::new()?;
     let server = responses::start_mock_server().await;
     Mock::given(method("POST"))
@@ -499,8 +497,6 @@ async fn cold_resume_of_legacy_internal_source_still_requires_root_completion_pr
 
 #[tokio::test]
 async fn same_process_resume_reuses_completion_proof_but_restart_does_not_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
     let fixture = AcceptedCompletionProofFixture::new()?;
     let server = responses::start_mock_server().await;
     let exec_arguments = serde_json::to_string(&serde_json::json!({

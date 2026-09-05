@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:canonical-jcs-helper-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "scripts/completion_proof_canonical.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/completion_proof_inventory_v2.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_completion_proof_inventory_v2.py",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "shared-cross-language-canonical-jcs"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof_inventory_v2",
+    "python -m unittest scripts.test_materialize_completion_proof_inventory_v2",
+    "cargo test --locked --manifest-path codex-rs/Cargo.toml -p codex-validation-contracts --test cross_language_vectors"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target",
+    "cargo_home": "C:\\Users\\kuh\\.cargo"
+  },
+  "workspace_strategy": "shared"
+}

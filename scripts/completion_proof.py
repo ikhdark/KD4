@@ -26,13 +26,43 @@ import tempfile
 import threading
 import time
 import tomllib
+import unicodedata
 import uuid
 from dataclasses import dataclass
+from multiprocessing.connection import Listener
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Mapping, Sequence
 
+try:
+    from scripts import focused_live_successor_catalog as _focused_catalog
+    from scripts.completion_proof_canonical import canonical_jcs as _canonical_jcs
+    from scripts.current_evidence_successor_projection import (
+        build_current_successor_projection_v1 as _build_current_successor_projection,
+    )
+except ImportError:  # pragma: no cover - direct script execution
+    # Just executes focused recipes from a temporary Python launcher. runpy
+    # preserves that launcher's import path, so anchor sibling imports here.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import focused_live_successor_catalog as _focused_catalog
+    from completion_proof_canonical import canonical_jcs as _canonical_jcs
+    from current_evidence_successor_projection import (
+        build_current_successor_projection_v1 as _build_current_successor_projection,
+    )
+
 _BOUNDED_PROCESS_MODULE_NAME = "_kd4_completion_proof_bounded_process"
 _BOUNDED_PROCESS_PATH = Path(__file__).resolve().with_name("bounded_process.py")
+_TRUSTED_BOUNDED_PROCESS_SHA256 = (
+    "01b48baabc3131089e23810341ccb694c3097809e03d08df6454ff8b9f741182"
+)
+_BOUNDED_PROCESS_SOURCE_BYTES = _BOUNDED_PROCESS_PATH.read_bytes()
+if (
+    hashlib.sha256(_BOUNDED_PROCESS_SOURCE_BYTES).hexdigest()
+    != _TRUSTED_BOUNDED_PROCESS_SHA256
+):
+    raise RuntimeError(
+        "bounded process helper differs from the identity embedded in the trusted "
+        "completion-proof runner"
+    )
 _bounded_process_spec = importlib.util.spec_from_file_location(
     _BOUNDED_PROCESS_MODULE_NAME,
     _BOUNDED_PROCESS_PATH,
@@ -43,10 +73,79 @@ if _bounded_process_spec is None or _bounded_process_spec.loader is None:
     )
 _bounded_process_module = importlib.util.module_from_spec(_bounded_process_spec)
 sys.modules[_BOUNDED_PROCESS_MODULE_NAME] = _bounded_process_module
-_bounded_process_spec.loader.exec_module(_bounded_process_module)
+exec(  # noqa: S102 - execute the exact parent-captured helper bytes
+    compile(
+        _BOUNDED_PROCESS_SOURCE_BYTES,
+        str(_BOUNDED_PROCESS_PATH),
+        "exec",
+    ),
+    _bounded_process_module.__dict__,
+)
 DEFAULT_STDERR_LIMIT_BYTES = _bounded_process_module.DEFAULT_STDERR_LIMIT_BYTES
 DEFAULT_STDOUT_LIMIT_BYTES = _bounded_process_module.DEFAULT_STDOUT_LIMIT_BYTES
 run_bounded_process = _bounded_process_module.run_bounded_process
+
+_CHILD_VALIDATION_MODULE_NAME = "_kd4_completion_proof_child_validation_report"
+_CHILD_VALIDATION_PATH = Path(__file__).resolve().with_name(
+    "child_validation_report.py"
+)
+_TRUSTED_CHILD_VALIDATION_SHA256 = (
+    "5d4d64d228846046efb53133a8c6a8e928625a3e34673e5ce66458924c4ae244"
+)
+_CHILD_VALIDATION_SOURCE_BYTES = _CHILD_VALIDATION_PATH.read_bytes()
+if hashlib.sha256(_CHILD_VALIDATION_SOURCE_BYTES).hexdigest() != (
+    _TRUSTED_CHILD_VALIDATION_SHA256
+):
+    raise RuntimeError(
+        "child-validation helper differs from the identity embedded in the trusted "
+        "completion-proof runner"
+    )
+_child_validation_spec = importlib.util.spec_from_file_location(
+    _CHILD_VALIDATION_MODULE_NAME,
+    _CHILD_VALIDATION_PATH,
+)
+if _child_validation_spec is None or _child_validation_spec.loader is None:
+    raise RuntimeError(
+        f"cannot load trusted child-validation broker {_CHILD_VALIDATION_PATH}"
+    )
+_child_validation_module = importlib.util.module_from_spec(_child_validation_spec)
+sys.modules[_CHILD_VALIDATION_MODULE_NAME] = _child_validation_module
+_CHILD_BOUNDED_PROCESS_MODULE_NAME = "_kd4_child_validation_bounded_process"
+_child_bounded_process_spec = importlib.util.spec_from_file_location(
+    _CHILD_BOUNDED_PROCESS_MODULE_NAME,
+    _BOUNDED_PROCESS_PATH,
+)
+if _child_bounded_process_spec is None or _child_bounded_process_spec.loader is None:
+    raise RuntimeError(
+        f"cannot load child process supervisor {_BOUNDED_PROCESS_PATH}"
+    )
+_child_bounded_process_module = importlib.util.module_from_spec(
+    _child_bounded_process_spec
+)
+sys.modules[_CHILD_BOUNDED_PROCESS_MODULE_NAME] = _child_bounded_process_module
+exec(  # noqa: S102 - child parser and broker share the captured supervisor bytes
+    compile(
+        _BOUNDED_PROCESS_SOURCE_BYTES,
+        str(_BOUNDED_PROCESS_PATH),
+        "exec",
+    ),
+    _child_bounded_process_module.__dict__,
+)
+exec(  # noqa: S102 - execute the exact bytes later supplied to the broker
+    compile(
+        _CHILD_VALIDATION_SOURCE_BYTES,
+        str(_CHILD_VALIDATION_PATH),
+        "exec",
+    ),
+    _child_validation_module.__dict__,
+)
+ActionProcessObservation = _child_validation_module.ActionProcessObservation
+JournalInvocationBinding = _child_validation_module.JournalInvocationBinding
+JournalContractError = _child_validation_module.JournalContractError
+ProcessIdentity = _child_validation_module.ProcessIdentity
+parse_child_validation_journal = (
+    _child_validation_module.parse_child_validation_journal
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +154,11 @@ EXACT_COMMAND = "just completion-proof"
 REPORT_TYPE = "CompletionProofAttemptReportV2"
 FOCUSED_COMMAND_TEMPLATE = "just completion-focused {validation_id}"
 FOCUSED_REPORT_TYPE = "FocusedValidationAttemptReportV2"
+CURRENT_EVIDENCE_VALIDATION_ID = "inventory.current-evidence"
+CURRENT_EVIDENCE_VALIDATION_IDS = (
+    "maintenance.root-unittest",
+    "sdk.python.pytest",
+)
 VALIDATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 KD4_POLICY_ID = "kd4"
@@ -82,8 +186,65 @@ TEST_SURFACE_MAX_GITIGNORE_BYTES = 64 * 1024 * 1024
 PROCESS_STDOUT_LIMIT_BYTES = DEFAULT_STDOUT_LIMIT_BYTES
 PROCESS_STDERR_LIMIT_BYTES = DEFAULT_STDERR_LIMIT_BYTES
 GIT_PROCESS_TIMEOUT_SECONDS = 5.0
+# Ignored-marker discovery traverses generated trees even with narrow pathspecs.
+GIT_IGNORED_TEST_SURFACE_TIMEOUT_SECONDS = 30.0
 RUNNER_ATTESTATION_TIMEOUT_SECONDS = 5.0
 RUNNER_ATTESTATION_RESPONSE_LIMIT_BYTES = 16
+FOCUSED_EVIDENCE_EXCHANGE_TIMEOUT_SECONDS = 30.0
+FOCUSED_EVIDENCE_ACK_LEN = 48
+FOCUSED_EVIDENCE_MEMBER_NAMES = (
+    "catalog",
+    "process",
+    "unittest_collect",
+    "unittest_exec",
+    "pytest_collect",
+    "pytest_exec",
+)
+TYPED_VALIDATION_BROKER_RESPONSE_LIMIT_BYTES = 64 * 1024 * 1024
+TYPED_VALIDATION_BROKER_SHUTDOWN_GRACE_SECONDS = 15
+_TYPED_VALIDATION_BROKER_BOOTSTRAP = """\
+import hashlib
+import pathlib
+import sys
+import types
+
+payload = sys.stdin.buffer.read()
+if hashlib.sha256(payload).hexdigest() != sys.argv[2]:
+    raise SystemExit("parent-staged broker payload digest mismatch")
+if len(payload) < 8:
+    raise SystemExit("parent-staged broker payload is truncated")
+bounded_size = int.from_bytes(payload[:8], "big")
+bounded_end = 8 + bounded_size
+if bounded_size <= 0 or bounded_end >= len(payload):
+    raise SystemExit("parent-staged broker payload framing is invalid")
+bounded_source = payload[8:bounded_end]
+broker_source = payload[bounded_end:]
+bounded_name = "_kd4_child_validation_bounded_process"
+bounded_module = types.ModuleType(bounded_name)
+bounded_module.__file__ = "<parent-staged-bounded-process>"
+sys.modules[bounded_name] = bounded_module
+exec(
+    compile(bounded_source, bounded_module.__file__, "exec"),
+    bounded_module.__dict__,
+)
+launch_arguments = [
+    str(pathlib.Path(sys.executable).resolve()),
+    "-I",
+    "-c",
+    sys.argv[1],
+    *sys.argv[1:],
+]
+sys.argv = ["<parent-staged-child-validation>", *sys.argv[3:]]
+broker_globals = {
+    "__name__": "__main__",
+    "__file__": "<parent-staged-child-validation>",
+    "_BROKER_LAUNCH_ARGUMENTS": launch_arguments,
+}
+exec(
+    compile(broker_source, broker_globals["__file__"], "exec"),
+    broker_globals,
+)
+"""
 CACHED_INDEX_ARGS = (
     "ls-files",
     "--cached",
@@ -153,6 +314,12 @@ KD4_RUST_GATES = {
     ),
     "windows.process-coverage": "windows-process-coverage",
 }
+KD4_VALIDATION_IDS = frozenset(
+    {*BUILTIN_VALIDATIONS.values(), *KD4_TYPED_VALIDATIONS, *KD4_RUST_GATES}
+)
+KD4_VALIDATION_COUNT = 28
+if len(KD4_VALIDATION_IDS) != KD4_VALIDATION_COUNT:
+    raise RuntimeError("KD4 completion-proof policy must contain exactly 28 validations")
 EVIDENCE_KINDS = frozenset(
     {"structured_test", "typed_non_test", "inventory_reconciliation", "infrastructure"}
 )
@@ -422,6 +589,7 @@ def _run_bounded_git_process(
     *,
     env: Mapping[str, str],
     input_bytes: bytes | None = None,
+    timeout_seconds: float | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     command = [
         "git",
@@ -435,7 +603,9 @@ def _run_bounded_git_process(
         command,
         cwd=repo_root,
         env=env,
-        timeout_seconds=GIT_PROCESS_TIMEOUT_SECONDS,
+        timeout_seconds=(
+            GIT_PROCESS_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+        ),
         stdin_bytes=input_bytes,
         stdout_limit_bytes=TEST_SURFACE_MAX_LISTING_BYTES,
         stderr_limit_bytes=PROCESS_STDERR_LIMIT_BYTES,
@@ -453,13 +623,19 @@ def _run_bounded_git_process(
     )
 
 
-def _git(repo_root: Path, args: Sequence[str]) -> bytes:
+def _git(
+    repo_root: Path,
+    args: Sequence[str],
+    *,
+    timeout_seconds: float | None = None,
+) -> bytes:
     env = _strip_completion_proof_env(os.environ)
     env["GIT_OPTIONAL_LOCKS"] = "0"
     result = _run_bounded_git_process(
         repo_root,
         args,
         env=env,
+        timeout_seconds=timeout_seconds,
     )
     if result.returncode != 0:
         raise ProofError(
@@ -1070,6 +1246,7 @@ def _test_surface_paths(repo_root: Path) -> list[_TestSurfacePath]:
             "--",
             *TEST_SURFACE_IGNORED_PATHSPECS,
         ],
+        timeout_seconds=GIT_IGNORED_TEST_SURFACE_TIMEOUT_SECONDS,
     )
     by_path: dict[str, _TestSurfacePath] = {}
     for entry in cached_entries:
@@ -1731,6 +1908,7 @@ def load_config(
         "frozen_inventory",
         "replacement_ledger",
         "host_platform",
+        "focused_inventory_evidence",
         "baseline_exception",
         "validation",
     }
@@ -1778,6 +1956,18 @@ def load_config(
         raise ProofError(
             "KD4 documentation_command must be exactly 'just source-map-check'"
         )
+    focused_inventory_evidence = config.get("focused_inventory_evidence")
+    if focused_inventory_evidence is not None:
+        if (
+            not isinstance(focused_inventory_evidence, dict)
+            or set(focused_inventory_evidence) != {"validation_ids"}
+            or focused_inventory_evidence.get("validation_ids")
+            != list(CURRENT_EVIDENCE_VALIDATION_IDS)
+        ):
+            raise ProofError(
+                "focused_inventory_evidence must contain only the exact ordered "
+                f"validation_ids {list(CURRENT_EVIDENCE_VALIDATION_IDS)!r}"
+            )
     configured_root = config.get("repository_root")
     repo_root = (
         _resolve_path(resolved.parent, str(configured_root)).resolve()
@@ -1807,6 +1997,11 @@ def validation_configs(
         runner = str(item.get("runner", ""))
         if not validation_id or validation_id in ids:
             raise ProofError(f"duplicate or empty validation ID {validation_id!r}")
+        if validation_id == CURRENT_EVIDENCE_VALIDATION_ID:
+            raise ProofError(
+                "inventory.current-evidence is a focused preparatory mode and cannot "
+                "be declared as a required validation"
+            )
         if runner not in VALIDATION_RUNNERS:
             raise ProofError(
                 f"validation {validation_id} has unknown runner {runner!r}"
@@ -2008,6 +2203,11 @@ def validation_configs(
                 "KD4 completion-proof validation policy mismatch: "
                 f"missing={missing}, unexpected={unexpected}, mismatched={mismatched}"
             )
+        if set(actual_by_id) != KD4_VALIDATION_IDS:
+            raise ProofError(
+                "KD4 completion-proof accepted validation set must contain exactly "
+                f"{KD4_VALIDATION_COUNT} policy IDs"
+            )
         typed_types = {
             validation_id: str(
                 next(
@@ -2129,6 +2329,37 @@ class RunnerProcessIdentityStart:
         )
 
 
+def _runner_executable_path() -> Path:
+    if os.name != "nt":
+        return Path(sys.executable)
+
+    import ctypes
+    from ctypes import wintypes
+
+    # A Windows venv redirector keeps its launcher in sys.executable, while the
+    # authenticated pipe peer runs the base interpreter. Bind the actual image.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    buffer = ctypes.create_unicode_buffer(32768)
+    size = wintypes.DWORD(len(buffer))
+    if not kernel32.QueryFullProcessImageNameW(
+        kernel32.GetCurrentProcess(), 0, buffer, ctypes.byref(size)
+    ):
+        raise ProofError(
+            "cannot query runner process executable identity: "
+            f"{ctypes.WinError(ctypes.get_last_error())}"
+        )
+    return Path(buffer.value)
+
+
 def _capture_runner_process_identity() -> RunnerProcessIdentityStart:
     started_at = time.time_ns()
     return RunnerProcessIdentityStart(
@@ -2136,14 +2367,130 @@ def _capture_runner_process_identity() -> RunnerProcessIdentityStart:
         parent_pid=os.getppid(),
         started_at=started_at,
         args_hash=sha256_bytes(canonical_json(sys.argv)),
-        executable=_capture_file_identity(sys.executable, Path(sys.executable)),
+        executable=_capture_file_identity(sys.executable, _runner_executable_path()),
         entrypoint=_capture_file_identity(str(Path(__file__)), Path(__file__)),
     )
 
 
+class _RunnerAttestationChannel:
+    def __init__(self, channel: Any) -> None:
+        self._channel = channel
+
+    def close(self) -> None:
+        try:
+            self._channel.close()
+        except OSError:
+            pass
+
+    def _write_all(self, value: bytes) -> None:
+        if hasattr(self._channel, "sendall"):
+            self._channel.sendall(value)
+        else:
+            view = memoryview(value)
+            while view:
+                written = self._channel.write(view)
+                if written is None or written <= 0:
+                    raise OSError("focused evidence channel write made no progress")
+                view = view[written:]
+
+    def _read_exact(self, count: int) -> bytes:
+        value = bytearray()
+        while len(value) < count:
+            if hasattr(self._channel, "recv"):
+                chunk = self._channel.recv(count - len(value))
+            else:
+                chunk = self._channel.read(count - len(value))
+            if not chunk:
+                break
+            value.extend(chunk)
+        return bytes(value)
+
+    def exchange_focused_evidence(
+        self, members: Sequence[tuple[str, bytes]]
+    ) -> str:
+        if tuple(name for name, _ in members) != FOCUSED_EVIDENCE_MEMBER_NAMES:
+            raise ProofError("focused evidence members are not the exact ordered set")
+        if any(not value for _, value in members):
+            raise ProofError("focused evidence members must be nonempty")
+        payload = b"".join(value for _, value in members)
+        manifest = _canonical_jcs(
+            {
+                "schema_version": 1,
+                "members": [
+                    {
+                        "name": name,
+                        "length": len(value),
+                        "sha256": sha256_bytes(value),
+                    }
+                    for name, value in members
+                ],
+            }
+        )
+        if not 0 < len(manifest) <= 16 * 1024:
+            raise ProofError("focused evidence manifest length is out of bounds")
+        if len(payload) > 128 * 1024 * 1024:
+            raise ProofError("focused evidence payload exceeds its limit")
+        header = b"".join(
+            (
+                b"KD4EVID1",
+                bytes((1, 0)),
+                len(members).to_bytes(2, "big"),
+                (0).to_bytes(4, "big"),
+                len(manifest).to_bytes(4, "big"),
+                len(payload).to_bytes(8, "big"),
+            )
+        )
+        frame = header + manifest + payload
+        digest = hashlib.sha256(frame).digest()
+        result: list[bytes] = []
+        errors: list[BaseException] = []
+        completed = threading.Event()
+
+        def exchange() -> None:
+            try:
+                if hasattr(self._channel, "settimeout"):
+                    self._channel.settimeout(FOCUSED_EVIDENCE_EXCHANGE_TIMEOUT_SECONDS)
+                self._write_all(frame)
+                result.append(self._read_exact(FOCUSED_EVIDENCE_ACK_LEN))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                completed.set()
+
+        worker = threading.Thread(
+            target=exchange,
+            name="completion-proof-focused-evidence",
+            daemon=True,
+        )
+        worker.start()
+        completed.wait(FOCUSED_EVIDENCE_EXCHANGE_TIMEOUT_SECONDS)
+        if not completed.is_set():
+            self.close()
+            raise ProofError("focused evidence acknowledgement timed out")
+        if errors:
+            raise ProofError(
+                f"focused evidence exchange failed: {errors[0]}"
+            ) from errors[0]
+        acknowledgement = result[0] if result else b""
+        if len(acknowledgement) != FOCUSED_EVIDENCE_ACK_LEN:
+            raise ProofError("focused evidence acknowledgement was truncated")
+        if (
+            acknowledgement[:8] != b"KD4EVACK"
+            or acknowledgement[8:10] != bytes((1, 0))
+            or acknowledgement[10:12] != (0).to_bytes(2, "big")
+            or acknowledgement[12:16] != (0).to_bytes(4, "big")
+            or acknowledgement[16:] != digest
+        ):
+            raise ProofError("focused evidence acknowledgement was rejected or invalid")
+        return digest.hex()
+
+
 def _attest_runner_process(
-    runtime: Mapping[str, str], runner_identity: RunnerProcessIdentityStart
-) -> None:
+    runtime: Mapping[str, str],
+    runner_identity: RunnerProcessIdentityStart,
+    *,
+    retain_channel: bool = False,
+) -> _RunnerAttestationChannel | None:
     endpoint = runtime["CODEX_COMPLETION_PROOF_RUNNER_ATTESTATION_ENDPOINT"]
     payload = (
         canonical_json(
@@ -2161,44 +2508,56 @@ def _attest_runner_process(
     completed = threading.Event()
     lock = threading.Lock()
     response_holder: list[bytes] = []
+    retained_holder: list[_RunnerAttestationChannel] = []
     error_holder: list[BaseException] = []
     channel_holder: list[Any] = []
 
     def exchange() -> None:
+        channel: Any | None = None
         try:
             if os.name == "nt":
-                with open(endpoint, "r+b", buffering=0) as channel:
-                    with lock:
-                        channel_holder.append(channel)
-                    channel.write(payload)
-                    response = channel.readline(
-                        RUNNER_ATTESTATION_RESPONSE_LIMIT_BYTES + 1
-                    )
+                channel = open(endpoint, "r+b", buffering=0)
+                with lock:
+                    channel_holder.append(channel)
+                channel.write(payload)
+                response = channel.readline(
+                    RUNNER_ATTESTATION_RESPONSE_LIMIT_BYTES + 1
+                )
             else:
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
-                    with lock:
-                        channel_holder.append(channel)
+                channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                with lock:
+                    channel_holder.append(channel)
+                channel.settimeout(max(0.001, deadline - time.monotonic()))
+                channel.connect(endpoint)
+                channel.settimeout(max(0.001, deadline - time.monotonic()))
+                channel.sendall(payload)
+                response = b""
+                while not response.endswith(b"\n"):
+                    if len(response) > RUNNER_ATTESTATION_RESPONSE_LIMIT_BYTES:
+                        break
                     channel.settimeout(max(0.001, deadline - time.monotonic()))
-                    channel.connect(endpoint)
-                    channel.settimeout(max(0.001, deadline - time.monotonic()))
-                    channel.sendall(payload)
-                    response = b""
-                    while not response.endswith(b"\n"):
-                        if len(response) > RUNNER_ATTESTATION_RESPONSE_LIMIT_BYTES:
-                            break
-                        channel.settimeout(max(0.001, deadline - time.monotonic()))
-                        chunk = channel.recv(
-                            RUNNER_ATTESTATION_RESPONSE_LIMIT_BYTES + 1 - len(response)
-                        )
-                        if not chunk:
-                            break
-                        response += chunk
+                    chunk = channel.recv(
+                        RUNNER_ATTESTATION_RESPONSE_LIMIT_BYTES + 1 - len(response)
+                    )
+                    if not chunk:
+                        break
+                    response += chunk
             with lock:
                 response_holder.append(response)
+                if retain_channel and response == b"ok\n":
+                    if hasattr(channel, "settimeout"):
+                        channel.settimeout(None)
+                    retained_holder.append(_RunnerAttestationChannel(channel))
+                    channel = None
         except BaseException as error:
             with lock:
                 error_holder.append(error)
         finally:
+            if channel is not None:
+                try:
+                    channel.close()
+                except OSError:
+                    pass
             completed.set()
 
     worker = threading.Thread(
@@ -2235,6 +2594,13 @@ def _attest_runner_process(
         )
     if response != b"ok\n":
         raise ProofError("private runner process attestation was rejected")
+    if retain_channel:
+        with lock:
+            retained = list(retained_holder)
+        if len(retained) != 1:
+            raise ProofError("private runner attestation channel was not retained")
+        return retained[0]
+    return None
 
 
 def _capture_file_identity(requested: str, path: Path) -> FileIdentityStart:
@@ -2297,6 +2663,9 @@ class ChildProcess:
     ended_at: int
     exit_code: int | None
     launch_target_identity: Mapping[str, str]
+    launched_argv: tuple[str, ...] = ()
+    launched_cwd: str = ""
+    stdout_bytes: bytes = b""
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -2350,6 +2719,7 @@ def run_process(
     cwd: Path,
     env: Mapping[str, str],
     timeout_seconds: int,
+    stdin_bytes: bytes | None = None,
 ) -> ProcessResult:
     requested = str(command[0]) if command else ""
     child_env = _strip_completion_proof_env(env)
@@ -2388,6 +2758,7 @@ def run_process(
         cwd=cwd,
         env=child_env,
         timeout_seconds=timeout_seconds,
+        stdin_bytes=stdin_bytes,
         stdout_limit_bytes=PROCESS_STDOUT_LIMIT_BYTES,
         stderr_limit_bytes=PROCESS_STDERR_LIMIT_BYTES,
     )
@@ -2420,6 +2791,9 @@ def run_process(
         ended_at=time.time_ns(),
         exit_code=returncode,
         launch_target_identity=launch_target_identity,
+        launched_argv=tuple(launched_command),
+        launched_cwd=str(cwd.resolve()),
+        stdout_bytes=bounded.stdout,
     )
     return ProcessResult(
         returncode=returncode,
@@ -2500,6 +2874,206 @@ def _load_report(path: Path, *, label: str) -> dict[str, Any]:
     return value
 
 
+def _load_unittest_collection_report(path: Path) -> dict[str, Any]:
+    label = "root unittest discovery"
+
+    def object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ProofError(f"{label} report contains duplicate JSON keys")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> None:
+        raise ProofError(f"{label} report contains invalid JSON constant {value}")
+
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=object_from_pairs,
+            parse_constant=reject_constant,
+        )
+    except ProofError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ProofError(f"{label} did not produce a valid report: {error}") from error
+    if not isinstance(value, dict):
+        raise ProofError(f"{label} report must be an object")
+    return value
+
+
+def _valid_unittest_collection_string(value: object, *, nonempty: bool = True) -> bool:
+    return (
+        isinstance(value, str)
+        and (bool(value) or not nonempty)
+        and unicodedata.normalize("NFC", value) == value
+        and not any(
+            ord(character) < 0x20 or ord(character) == 0x7F for character in value
+        )
+    )
+
+
+def _unittest_collection_source(repo_root: Path, value: object) -> str:
+    if not _valid_unittest_collection_string(value):
+        raise ProofError("root unittest discovery test has invalid source path")
+    assert isinstance(value, str)
+    parsed = PurePosixPath(value)
+    if (
+        "\\" in value
+        or ":" in value
+        or parsed.is_absolute()
+        or parsed.suffix != ".py"
+        or not parsed.parts
+        or any(part in {"", ".", ".."} for part in parsed.parts)
+        or parsed.as_posix() != value
+    ):
+        raise ProofError("root unittest discovery test has invalid source path")
+    repository = repo_root.resolve()
+    resolved = (repository / Path(*parsed.parts)).resolve()
+    try:
+        resolved.relative_to(repository)
+    except ValueError as error:
+        raise ProofError(
+            "root unittest discovery test source escapes repository"
+        ) from error
+    if not resolved.is_file():
+        raise ProofError("root unittest discovery test source is not a file")
+    return value
+
+
+def _parse_unittest_collection_v2(
+    report: dict[str, Any], repo_root: Path
+) -> list[tuple[str, str, bool]]:
+    expected_report_keys = {
+        "schema_version",
+        "report_type",
+        "framework",
+        "classification",
+        "tests",
+        "selected_count",
+        "discovery_errors",
+        "duplicate_ids",
+        "metadata_errors",
+    }
+    if set(report) != expected_report_keys:
+        raise ProofError("root unittest discovery report has invalid keys")
+    if type(report["schema_version"]) is not int or report["schema_version"] != 2:
+        raise ProofError("root unittest discovery report has invalid schema version")
+    if report["report_type"] != "CompletionProofUnittestCollectionV2":
+        raise ProofError("root unittest discovery report has invalid report type")
+    if report["framework"] != "python-unittest":
+        raise ProofError("root unittest discovery report has invalid framework")
+    if report["classification"] != "discovered":
+        raise ProofError("root unittest discovery report is not discovered")
+
+    tests = report["tests"]
+    selected_count = report["selected_count"]
+    discovery_errors = report["discovery_errors"]
+    duplicate_ids = report["duplicate_ids"]
+    metadata_errors = report["metadata_errors"]
+    if not isinstance(tests, list):
+        raise ProofError("root unittest discovery report tests must be a list")
+    if type(selected_count) is not int or selected_count != len(tests):
+        raise ProofError("root unittest discovery selected count is inconsistent")
+    for values, label in (
+        (discovery_errors, "discovery errors"),
+        (duplicate_ids, "duplicate IDs"),
+        (metadata_errors, "metadata errors"),
+    ):
+        if not isinstance(values, list) or not all(
+            _valid_unittest_collection_string(item) for item in values
+        ):
+            raise ProofError(f"root unittest discovery {label} must be valid strings")
+        if values != sorted(set(values)):
+            raise ProofError(f"root unittest discovery {label} are not canonical")
+
+    seen_native_ids: set[str] = set()
+    observed_duplicate_ids: set[str] = set()
+    parsed_tests: list[tuple[str, str, bool]] = []
+    expected_test_keys = {
+        "id",
+        "source_path",
+        "declared_subtest_sites",
+        "skipped_at_discovery",
+        "skip_reason",
+    }
+    for item in tests:
+        if not isinstance(item, dict) or set(item) != expected_test_keys:
+            raise ProofError("root unittest discovery test has invalid keys")
+        native_id = item["id"]
+        if not _valid_unittest_collection_string(native_id):
+            raise ProofError("root unittest discovery test has invalid ID")
+        assert isinstance(native_id, str)
+        source_path = _unittest_collection_source(repo_root, item["source_path"])
+        source_module = ".".join(
+            PurePosixPath(source_path).with_suffix("").parts
+        )
+        if not native_id.startswith(f"{source_module}."):
+            raise ProofError(
+                "root unittest discovery test source path does not match ID module"
+            )
+        declared_sites = item["declared_subtest_sites"]
+        if not isinstance(declared_sites, list):
+            raise ProofError(
+                "root unittest discovery declared subtest sites must be a list"
+            )
+        parsed_sites: list[tuple[str, int, int]] = []
+        for site in declared_sites:
+            if not isinstance(site, dict) or set(site) != {"path", "line", "column"}:
+                raise ProofError(
+                    "root unittest discovery declared subtest site has invalid keys"
+                )
+            if site["path"] != source_path:
+                raise ProofError(
+                    "root unittest discovery declared subtest site path is inconsistent"
+                )
+            line = site["line"]
+            column = site["column"]
+            if (
+                type(line) is not int
+                or line <= 0
+                or type(column) is not int
+                or column <= 0
+            ):
+                raise ProofError(
+                    "root unittest discovery declared subtest site location is invalid"
+                )
+            parsed_sites.append((source_path, line, column))
+        if parsed_sites != sorted(set(parsed_sites)):
+            raise ProofError(
+                "root unittest discovery declared subtest sites are not canonical"
+            )
+
+        skipped = item["skipped_at_discovery"]
+        skip_reason = item["skip_reason"]
+        if type(skipped) is not bool:
+            raise ProofError("root unittest discovery skip state is invalid")
+        if not _valid_unittest_collection_string(skip_reason, nonempty=False):
+            raise ProofError("root unittest discovery skip reason is invalid")
+        if skipped != bool(skip_reason):
+            raise ProofError(
+                "root unittest discovery skip state and reason are inconsistent"
+            )
+        if native_id in seen_native_ids:
+            observed_duplicate_ids.add(native_id)
+        seen_native_ids.add(native_id)
+        parsed_tests.append((native_id, source_path, skipped))
+
+    observed_duplicates = sorted(observed_duplicate_ids)
+    if duplicate_ids != observed_duplicates:
+        raise ProofError("root unittest discovery duplicate IDs are inconsistent")
+    if observed_duplicates:
+        raise ProofError("root unittest discovery contains duplicate IDs")
+    if discovery_errors:
+        raise ProofError("root unittest discovery contains discovery errors")
+    if metadata_errors:
+        raise ProofError("root unittest discovery contains metadata errors")
+    if not parsed_tests:
+        raise ProofError("root unittest discovery selected zero tests")
+    return parsed_tests
+
+
 def _unittest_inventory(
     repo_root: Path, env: Mapping[str, str], temp_dir: Path
 ) -> tuple[list[dict[str, object]], ChildProcess]:
@@ -2525,29 +3099,24 @@ def _unittest_inventory(
         env=env,
         timeout_seconds=600,
     )
-    report = _load_report(output, label="root unittest discovery")
-    if (
-        result.invocation_error
-        or result.returncode != 0
-        or report.get("classification") != "discovered"
-    ):
+    report = _load_unittest_collection_report(output)
+    if result.invocation_error or result.returncode != 0:
         raise ProofError(
             result.invocation_error
             or f"root unittest discovery failed: {json.dumps(report)[:4000]}"
         )
+    parsed_tests = _parse_unittest_collection_v2(report, repo_root)
     rows = [
         {
-            "baseline_id": f"python-unittest::{item['id']}",
+            "baseline_id": f"python-unittest::{native_id}",
             "framework": "python-unittest",
-            "native_id": str(item["id"]),
-            "source": str(item["id"]).split(".", 1)[0].replace(".", "/"),
-            "ignored": bool(item.get("skipped_at_discovery", False)),
+            "native_id": native_id,
+            "source": source_path,
+            "ignored": ignored,
             "platforms": ["windows"],
         }
-        for item in report.get("tests", [])
+        for native_id, source_path, ignored in parsed_tests
     ]
-    if not rows:
-        raise ProofError("root unittest discovery selected zero tests")
     return rows, result.child
 
 
@@ -2600,6 +3169,194 @@ def _doctest_inventory(
     return rows, result.child
 
 
+def _load_pytest_collection_report(
+    path: Path, repo_root: Path
+) -> tuple[dict[str, Any], list[dict[str, object]]]:
+    label = "Python SDK pytest discovery"
+
+    def object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ProofError(f"{label} report contains duplicate JSON keys")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> None:
+        raise ProofError(f"{label} report contains invalid JSON constant {value}")
+
+    try:
+        report = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=object_from_pairs,
+            parse_constant=reject_constant,
+        )
+    except ProofError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ProofError(f"{label} did not produce a valid report: {error}") from error
+    if not isinstance(report, dict):
+        raise ProofError(f"{label} report must be an object")
+
+    expected_report_keys = {
+        "schema_version",
+        "framework",
+        "classification",
+        "tests",
+        "selected_count",
+        "duplicate_ids",
+        "collection_errors",
+        "pytest_exit_code",
+    }
+    if set(report) != expected_report_keys:
+        raise ProofError("Python SDK pytest discovery report has invalid keys")
+    if type(report["schema_version"]) is not int or report["schema_version"] != 1:
+        raise ProofError(
+            "Python SDK pytest discovery report has invalid schema version"
+        )
+    if report["framework"] != "python-pytest":
+        raise ProofError("Python SDK pytest discovery report has invalid framework")
+    if report["classification"] != "discovered":
+        raise ProofError("Python SDK pytest discovery report is not discovered")
+    if (
+        type(report["pytest_exit_code"]) is not int
+        or report["pytest_exit_code"] != 0
+    ):
+        raise ProofError(
+            "Python SDK pytest discovery report has invalid pytest exit code"
+        )
+
+    tests = report["tests"]
+    selected_count = report["selected_count"]
+    duplicate_ids = report["duplicate_ids"]
+    collection_errors = report["collection_errors"]
+    if not isinstance(tests, list):
+        raise ProofError("Python SDK pytest discovery report tests must be a list")
+    if type(selected_count) is not int or selected_count != len(tests):
+        raise ProofError("Python SDK pytest discovery selected count is inconsistent")
+    if not isinstance(duplicate_ids, list) or not all(
+        isinstance(item, str)
+        and bool(item)
+        and unicodedata.normalize("NFC", item) == item
+        and not any(
+            ord(character) < 0x20 or ord(character) == 0x7F for character in item
+        )
+        for item in duplicate_ids
+    ):
+        raise ProofError("Python SDK pytest discovery duplicate IDs are invalid")
+    if duplicate_ids != sorted(set(duplicate_ids)):
+        raise ProofError("Python SDK pytest discovery duplicate IDs are not canonical")
+    if not isinstance(collection_errors, list) or not all(
+        isinstance(item, str)
+        and bool(item)
+        and unicodedata.normalize("NFC", item) == item
+        and not any(
+            ord(character) < 0x20 or ord(character) == 0x7F for character in item
+        )
+        for item in collection_errors
+    ):
+        raise ProofError("Python SDK pytest discovery collection errors are invalid")
+    if collection_errors != sorted(set(collection_errors)):
+        raise ProofError(
+            "Python SDK pytest discovery collection errors are not canonical"
+        )
+
+    seen_native_ids: set[str] = set()
+    observed_duplicate_ids: set[str] = set()
+    parsed_tests: list[tuple[str, str, bool]] = []
+    sdk_root = (repo_root / "sdk" / "python").resolve()
+    tests_root = (sdk_root / "tests").resolve()
+    try:
+        tests_root.relative_to(sdk_root)
+    except ValueError as error:
+        raise ProofError("Python SDK pytest tests root escapes sdk/python") from error
+    for item in tests:
+        if not isinstance(item, dict) or set(item) != {"id", "skip_markers"}:
+            raise ProofError("Python SDK pytest discovery test has invalid keys")
+        native_id = item["id"]
+        skip_markers = item["skip_markers"]
+        if (
+            not isinstance(native_id, str)
+            or not native_id
+            or unicodedata.normalize("NFC", native_id) != native_id
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in native_id
+            )
+        ):
+            raise ProofError("Python SDK pytest discovery test has invalid ID")
+        if not isinstance(skip_markers, list):
+            raise ProofError("Python SDK pytest discovery skip markers must be a list")
+        for marker in skip_markers:
+            if not isinstance(marker, dict) or set(marker) != {"name", "reason"}:
+                raise ProofError("Python SDK pytest discovery skip marker has invalid keys")
+            if (
+                not isinstance(marker["name"], str)
+                or marker["name"] not in {"skip", "skipif"}
+                or not isinstance(marker["reason"], str)
+                or unicodedata.normalize("NFC", marker["reason"])
+                != marker["reason"]
+                or any(
+                    ord(character) < 0x20 or ord(character) == 0x7F
+                    for character in marker["reason"]
+                )
+            ):
+                raise ProofError("Python SDK pytest discovery skip marker is invalid")
+
+        node_path, separator, selector = native_id.partition("::")
+        parsed_path = PurePosixPath(node_path)
+        if (
+            not separator
+            or not selector
+            or "\\" in node_path
+            or ":" in node_path
+            or parsed_path.is_absolute()
+            or parsed_path.suffix != ".py"
+            or not parsed_path.parts
+            or parsed_path.parts[0] != "tests"
+            or any(part in {"", ".", ".."} for part in parsed_path.parts)
+            or parsed_path.as_posix() != node_path
+        ):
+            raise ProofError("Python SDK pytest discovery test has invalid source path")
+        resolved_source = (sdk_root / Path(*parsed_path.parts)).resolve()
+        try:
+            resolved_source.relative_to(tests_root)
+        except ValueError as error:
+            raise ProofError(
+                "Python SDK pytest discovery test source escapes sdk/python/tests"
+            ) from error
+        if not resolved_source.is_file():
+            raise ProofError("Python SDK pytest discovery test source is not a file")
+        if native_id in seen_native_ids:
+            observed_duplicate_ids.add(native_id)
+        seen_native_ids.add(native_id)
+        parsed_tests.append((native_id, node_path, bool(skip_markers)))
+
+    observed_duplicates = sorted(observed_duplicate_ids)
+    if duplicate_ids != observed_duplicates:
+        raise ProofError("Python SDK pytest discovery duplicate IDs are inconsistent")
+    if observed_duplicates:
+        raise ProofError("Python SDK pytest discovery contains duplicate IDs")
+    if collection_errors:
+        raise ProofError("Python SDK pytest discovery contains collection errors")
+    if not parsed_tests:
+        raise ProofError("Python SDK pytest discovery selected zero tests")
+
+    rows = [
+        {
+            "baseline_id": f"python-pytest::{native_id}",
+            "framework": "python-pytest",
+            "native_id": native_id,
+            "source": f"sdk/python/{node_path}",
+            "ignored": ignored,
+            "platforms": ["windows"],
+        }
+        for native_id, node_path, ignored in parsed_tests
+    ]
+    rows.sort(key=lambda row: str(row["baseline_id"]))
+    return report, rows
+
+
 def _pytest_inventory(
     repo_root: Path, env: Mapping[str, str], temp_dir: Path
 ) -> tuple[list[dict[str, object]], ChildProcess]:
@@ -2627,31 +3384,12 @@ def _pytest_inventory(
         env=env,
         timeout_seconds=900,
     )
-    report = _load_report(output, label="Python SDK pytest discovery")
-    if (
-        result.invocation_error
-        or result.returncode != 0
-        or report.get("classification") != "discovered"
-    ):
+    report, rows = _load_pytest_collection_report(output, repo_root)
+    if result.invocation_error or result.returncode != 0:
         raise ProofError(
             result.invocation_error
             or f"Python SDK pytest discovery failed: {json.dumps(report)[:4000]}"
         )
-    rows = []
-    for item in report.get("tests", []):
-        native_id = str(item["id"])
-        rows.append(
-            {
-                "baseline_id": f"python-pytest::{native_id}",
-                "framework": "python-pytest",
-                "native_id": native_id,
-                "source": f"sdk/python/{native_id.split('::', 1)[0]}",
-                "ignored": bool(item.get("skip_markers")),
-                "platforms": ["windows"],
-            }
-        )
-    if not rows:
-        raise ProofError("Python SDK pytest discovery selected zero tests")
     return rows, result.child
 
 
@@ -2986,6 +3724,7 @@ def discover_inventory(
     repo_root: Path,
     *,
     temp_dir: Path,
+    jest_observation: dict[str, object] | None = None,
 ) -> tuple[list[dict[str, object]], list[ChildProcess]]:
     _audit_test_system_surface(repo_root)
     env = _network_disabled_env()
@@ -3003,7 +3742,25 @@ def discover_inventory(
     pytest_rows, pytest_child = _pytest_inventory(repo_root, env, temp_dir)
     rows.extend(pytest_rows)
     children.append(pytest_child)
-    rows.extend(_jest_inventory(repo_root))
+    jest_started_at = time.time_ns()
+    jest_rows = _jest_inventory(repo_root)
+    jest_ended_at = time.time_ns()
+    rows.extend(jest_rows)
+    if jest_observation is not None:
+        jest_ids = sorted(str(row["baseline_id"]) for row in jest_rows)
+        jest_observation.update(
+            {
+                "observation_id": "inventory.sdk.typescript.jest",
+                "execution_id": str(uuid.uuid4()),
+                "runner_pid": os.getpid(),
+                "started_at": str(jest_started_at),
+                "ended_at": str(jest_ended_at),
+                "discovered_count": len(jest_ids),
+                "discovered_test_ids_sha256": hashlib.sha256(
+                    _canonical_jcs(jest_ids)
+                ).hexdigest(),
+            }
+        )
     for runner in ("argument-comment-lint-native", "windows-sandbox-smoke"):
         native_rows, native_child = _native_adapter_inventory(repo_root, env, runner)
         rows.extend(native_rows)
@@ -3049,6 +3806,24 @@ def _manifest_paths(repo_root: Path, config: Mapping[str, Any]) -> tuple[Path, P
     if not isinstance(frozen, str) or not isinstance(ledger, str):
         raise ProofError("config must name frozen_inventory and replacement_ledger")
     return _resolve_path(repo_root, frozen), _resolve_path(repo_root, ledger)
+
+
+def _current_reconciliation_status(
+    repo_root: Path, config: Mapping[str, Any]
+) -> tuple[int, int]:
+    _, ledger_path = _manifest_paths(repo_root, config)
+    ledger = _load_json_object(ledger_path, label="configured replacement ledger")
+    if ledger.get("schema_version") != 1 or not isinstance(ledger.get("rows"), list):
+        raise ProofError("configured replacement ledger has an invalid envelope")
+    unresolved = 0
+    pending_replacement_review = 0
+    for row in ledger["rows"]:
+        resolution = row.get("resolution")
+        if resolution == "unresolved":
+            unresolved += 1
+        elif resolution == "replacement":
+            pending_replacement_review += 1
+    return unresolved, pending_replacement_review
 
 
 def load_frozen_inventory(
@@ -3545,9 +4320,12 @@ def _run_structured_wrapper(
     temp_dir: Path,
     proof_attempt_id: str,
     proof_scope: str,
+    raw_report_bytes: list[bytes] | None = None,
 ) -> tuple[dict[str, object], ChildProcess]:
     execution_id = str(uuid.uuid4())
     if not intended:
+        if raw_report_bytes is not None:
+            raw_report_bytes.append(b"null")
         child = _unlaunched_child(
             validation_id=validation_id,
             execution_id=execution_id,
@@ -3600,6 +4378,8 @@ def _run_structured_wrapper(
         timeout_seconds=timeout_seconds,
     )
     if not report_path.exists():
+        if raw_report_bytes is not None:
+            raw_report_bytes.append(b"null")
         report = _validation_report(
             validation_id=validation_id,
             execution_id=execution_id,
@@ -3615,7 +4395,30 @@ def _run_structured_wrapper(
             or "runner omitted structured report",
         )
         return report, result.child
-    raw = _load_report(report_path, label=validation_id)
+    retained_report: bytes | None = None
+    try:
+        retained_report = report_path.read_bytes()
+        raw = _load_report(report_path, label=validation_id)
+    except (OSError, ProofError) as error:
+        if raw_report_bytes is not None:
+            raw_report_bytes.append(retained_report or b"null")
+        return (
+            _validation_report(
+                validation_id=validation_id,
+                execution_id=execution_id,
+                runner=framework,
+                classification="pre_result_error",
+                intended=intended,
+                selected=[],
+                executed=[],
+                outcomes=[],
+                exit_code=result.returncode,
+                diagnostic=f"structured report could not be retained: {error}",
+            ),
+            result.child,
+        )
+    if raw_report_bytes is not None:
+        raw_report_bytes.append(retained_report)
     classification = str(raw.get("classification", "pre_result_error"))
     if classification not in RESULT_CLASSES:
         classification = "pre_result_error"
@@ -4484,7 +5287,149 @@ def _run_rust_nextest(
     )
 
 
-_DOCTEST_RESULT_RE = re.compile(r"^test (.+) \.\.\. (ok|FAILED|ignored)$")
+def _parse_doctest_libtest_events(
+    output: str,
+) -> tuple[list[str], list[dict[str, str]], list[str]]:
+    started: list[str] = []
+    started_ids: set[str] = set()
+    terminal: dict[str, str] = {}
+    errors: list[str] = []
+    suite_count = 0
+    suite_declared_total = 0
+    active_suite_count: int | None = None
+    active_suite_started: list[str] = []
+    active_suite_terminal_outcomes: list[str] = []
+
+    def object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ProofError("Rust doctest libtest JSON contains duplicate keys")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> None:
+        raise ProofError(f"Rust doctest libtest JSON contains invalid constant {value}")
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(
+                line,
+                object_pairs_hook=object_from_pairs,
+                parse_constant=reject_constant,
+            )
+        except (ProofError, json.JSONDecodeError) as error:
+            errors.append(f"invalid Rust doctest libtest JSON event: {error}")
+            continue
+        if not isinstance(event, dict):
+            errors.append("Rust doctest libtest JSON event was not an object")
+            continue
+        event_type = event.get("type")
+        event_name = event.get("event")
+        if event_type == "suite":
+            if event_name == "started":
+                test_count = event.get("test_count")
+                if (
+                    active_suite_count is not None
+                    or isinstance(test_count, bool)
+                    or not isinstance(test_count, int)
+                    or test_count < 0
+                ):
+                    errors.append("Rust doctest suite start was duplicate or invalid")
+                    continue
+                suite_count += 1
+                suite_declared_total += test_count
+                active_suite_count = test_count
+                active_suite_started = []
+                active_suite_terminal_outcomes = []
+                continue
+            if event_name not in {"ok", "failed"} or active_suite_count is None:
+                errors.append("Rust doctest suite terminal was missing its suite start")
+                continue
+            count_fields = ("passed", "failed", "ignored", "measured", "filtered_out")
+            counts = [event.get(field) for field in count_fields]
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in counts
+            ):
+                errors.append("Rust doctest suite terminal counts were invalid")
+            else:
+                passed, failed, ignored, measured, filtered_out = counts
+                observed_passed = active_suite_terminal_outcomes.count("passed")
+                observed_failed = active_suite_terminal_outcomes.count("failed")
+                observed_ignored = active_suite_terminal_outcomes.count("skipped")
+                if (
+                    len(active_suite_started) != active_suite_count
+                    or len(active_suite_terminal_outcomes) != active_suite_count
+                    or passed + failed + ignored + measured != active_suite_count
+                    or passed != observed_passed
+                    or failed != observed_failed
+                    or ignored != observed_ignored
+                    or measured != 0
+                    or filtered_out != 0
+                    or (event_name == "ok" and failed != 0)
+                    or (event_name == "failed" and failed == 0)
+                ):
+                    errors.append(
+                        "Rust doctest suite lifecycle did not match its declared count"
+                    )
+            active_suite_count = None
+            active_suite_started = []
+            active_suite_terminal_outcomes = []
+            continue
+        if event_type != "test" or event_name not in {
+            "started",
+            "ok",
+            "failed",
+            "ignored",
+        }:
+            errors.append("Rust doctest stdout contained a non-libtest lifecycle event")
+            continue
+        test_id = event.get("name")
+        if not isinstance(test_id, str) or not test_id:
+            errors.append("Rust doctest test event omitted its nonempty name")
+            continue
+        if active_suite_count is None:
+            errors.append(f"Rust doctest test event preceded suite start for {test_id}")
+            continue
+        if event_name == "started":
+            if test_id in started_ids:
+                errors.append(f"Rust doctest emitted duplicate start for {test_id}")
+                continue
+            started.append(test_id)
+            started_ids.add(test_id)
+            active_suite_started.append(test_id)
+            continue
+        if test_id not in started_ids or test_id not in active_suite_started:
+            errors.append(
+                f"Rust doctest emitted terminal {event_name} before start for {test_id}"
+            )
+            continue
+        if test_id in terminal:
+            errors.append(f"Rust doctest emitted duplicate terminal for {test_id}")
+            continue
+        outcome = {"ok": "passed", "failed": "failed", "ignored": "skipped"}[
+            event_name
+        ]
+        terminal[test_id] = outcome
+        active_suite_terminal_outcomes.append(outcome)
+
+    if active_suite_count is not None:
+        errors.append("Rust doctest libtest JSON omitted a suite terminal event")
+    if suite_count == 0:
+        errors.append("Rust doctest libtest JSON omitted a suite start event")
+    if suite_declared_total == 0:
+        errors.append("Rust doctest libtest JSON selected zero tests")
+    if len(started) != suite_declared_total or len(terminal) != suite_declared_total:
+        errors.append("Rust doctest lifecycle count did not match suite selection")
+    outcomes = [
+        {"id": test_id, "outcome": terminal.get(test_id, "unknown")}
+        for test_id in started
+    ]
+    return started, outcomes, errors
 
 
 def _run_rust_doctests(
@@ -4503,8 +5448,10 @@ def _run_rust_doctests(
         "--doc",
         "--",
         "--include-ignored",
+        "-Z",
+        "unstable-options",
         "--format",
-        "pretty",
+        "json",
     ]
     if not intended:
         child = _unlaunched_child(
@@ -4527,34 +5474,39 @@ def _run_rust_doctests(
             ),
             child,
         )
+    doctest_env = dict(env)
+    doctest_env["RUST_TEST_NOCAPTURE"] = "0"
+    doctest_env["RUSTC_BOOTSTRAP"] = "-1"
     result = run_process(
         validation_id=validation_id,
         execution_id=execution_id,
         command=command,
         cwd=repo_root / "codex-rs",
-        env=env,
+        env=doctest_env,
         timeout_seconds=timeout_seconds,
     )
-    observed: dict[str, str] = {}
-    for line in result.stdout.splitlines():
-        match = _DOCTEST_RESULT_RE.match(line.strip())
-        if match is None:
-            continue
-        outcome = {"ok": "passed", "FAILED": "failed", "ignored": "skipped"}[
-            match.group(2)
-        ]
-        observed[match.group(1)] = outcome
-    executed = [test_id for test_id in intended if test_id in observed]
-    outcomes = [{"id": test_id, "outcome": observed[test_id]} for test_id in executed]
+    executed, outcomes, lifecycle_errors = _parse_doctest_libtest_events(result.stdout)
+    executed, outcomes, observation_errors = _normalize_complete_observed_results(
+        intended=intended,
+        executed=executed,
+        outcomes=outcomes,
+        label="Rust doctest",
+    )
+    evidence_errors = [*lifecycle_errors, *observation_errors]
     classification, executed, outcomes = _classify_observed_results(
         intended=intended,
         selected=intended,
         executed=executed,
         outcomes=outcomes,
         returncode=result.returncode,
-        invocation_error=result.invocation_error,
+        invocation_error=result.invocation_error
+        or ("Rust doctest libtest evidence was invalid" if evidence_errors else None),
         validation_failure_exit_codes=frozenset({101}),
     )
+    if evidence_errors:
+        classification = "pre_result_error"
+        executed = []
+        outcomes = []
     return (
         _validation_report(
             validation_id=validation_id,
@@ -4566,7 +5518,8 @@ def _run_rust_doctests(
             executed=executed,
             outcomes=outcomes,
             exit_code=result.returncode,
-            diagnostic=result.invocation_error or result.stderr,
+            diagnostic=result.invocation_error
+            or "\n".join([*evidence_errors, result.stderr[-6000:]]),
         ),
         result.child,
     )
@@ -5023,12 +5976,304 @@ def _production_typed_validation_spec(
     )
 
 
+@dataclass(frozen=True)
+class _TypedValidationLaunchPrecommit:
+    request_payload: bytes
+    request_sha256: str
+    command: tuple[str, ...]
+    executable_sha256: str
+    journal_path: Path
+    binding: JournalInvocationBinding
+    action_execution_id: str
+
+
+def _typed_validation_precommit(
+    *,
+    validation_id: str,
+    validation_type: str,
+    execution_id: str,
+    input_contract_digest: str,
+    proof_attempt_id: str,
+    proof_receipt_nonce: str,
+    proof_scope: str,
+    command: Sequence[str],
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout_seconds: int,
+    allowed_failures: frozenset[int],
+    journal_path: Path,
+) -> _TypedValidationLaunchPrecommit:
+    child_env = {
+        key: value
+        for key, value in _strip_completion_proof_env(env).items()
+        if key.casefold()
+        != _child_validation_module.BROKER_AUTHKEY_ENV.casefold()
+    }
+    identity = _resolve_launch_target(
+        str(command[0]) if command else "",
+        cwd=cwd,
+        env=child_env,
+    )
+    launched_command = (identity.resolved_path, *map(str, command[1:]))
+    action_execution_id = str(uuid.uuid4())
+    binding = JournalInvocationBinding(
+        proof_attempt_id=proof_attempt_id,
+        proof_execution_id=execution_id,
+        proof_receipt_nonce=proof_receipt_nonce,
+        proof_scope=proof_scope,
+        validation_id=validation_id,
+        validation_type=validation_type,
+        input_contract_digest=input_contract_digest,
+    )
+    request = {
+        "protocol": _child_validation_module.BROKER_PROTOCOL,
+        "binding": binding.as_record_fields(),
+        "action_id": validation_id,
+        "action_execution_id": action_execution_id,
+        "subjects": [validation_id],
+        "command": list(launched_command),
+        "cwd": str(cwd.resolve()),
+        "env": child_env,
+        "timeout_seconds": timeout_seconds,
+        "stdout_limit_bytes": PROCESS_STDOUT_LIMIT_BYTES,
+        "stderr_limit_bytes": PROCESS_STDERR_LIMIT_BYTES,
+        "validation_failure_exit_codes": sorted(allowed_failures),
+        "journal_path": str(journal_path.resolve()),
+        "launch_target_identity": {
+            "requested": identity.requested,
+            "resolved_path": identity.resolved_path,
+            "sha256_before": identity.sha256_before,
+        },
+    }
+    payload = canonical_json(request)
+    return _TypedValidationLaunchPrecommit(
+        request_payload=payload,
+        request_sha256=sha256_bytes(payload),
+        command=launched_command,
+        executable_sha256=identity.sha256_before,
+        journal_path=journal_path.resolve(),
+        binding=binding,
+        action_execution_id=action_execution_id,
+    )
+
+
+def _typed_validation_broker_exchange(
+    *,
+    validation_id: str,
+    execution_id: str,
+    precommit: _TypedValidationLaunchPrecommit,
+    env: Mapping[str, str],
+    timeout_seconds: int,
+) -> tuple[
+    ProcessResult,
+    bytes | None,
+    bytes | None,
+    str | None,
+    tuple[str, ...],
+]:
+    authkey = secrets.token_bytes(32)
+    listener = Listener(("127.0.0.1", 0), family="AF_INET", authkey=authkey)
+    address = listener.address
+    if not isinstance(address, tuple) or len(address) != 2:
+        listener.close()
+        raise ProofError("typed-validation broker returned an invalid IPC address")
+    host, port = address
+    response: list[bytes] = []
+    completion: list[bytes] = []
+    exchange_errors: list[str] = []
+
+    def exchange() -> None:
+        try:
+            with listener.accept() as connection:
+                connection.send_bytes(precommit.request_payload)
+                response.append(
+                    connection.recv_bytes(TYPED_VALIDATION_BROKER_RESPONSE_LIMIT_BYTES)
+                )
+                completion.append(
+                    connection.recv_bytes(TYPED_VALIDATION_BROKER_RESPONSE_LIMIT_BYTES)
+                )
+        except Exception as error:  # noqa: BLE001 - authenticated IPC fails closed
+            exchange_errors.append(f"{type(error).__name__}: {error}")
+
+    exchange_thread = threading.Thread(
+        target=exchange,
+        name="typed-validation-broker-exchange",
+        daemon=True,
+    )
+    exchange_thread.start()
+    broker_env = {
+        key: value
+        for key, value in _strip_completion_proof_env(env).items()
+        if key.casefold()
+        != _child_validation_module.BROKER_AUTHKEY_ENV.casefold()
+    }
+    broker_env[_child_validation_module.BROKER_AUTHKEY_ENV] = authkey.hex()
+    broker_payload = (
+        len(_BOUNDED_PROCESS_SOURCE_BYTES).to_bytes(8, "big")
+        + _BOUNDED_PROCESS_SOURCE_BYTES
+        + _CHILD_VALIDATION_SOURCE_BYTES
+    )
+    broker_payload_sha256 = sha256_bytes(broker_payload)
+    broker_command = [
+        # A Windows venv launcher spawns another PID. The isolated, stdlib-only
+        # broker must be the process observed by its parent, so launch the
+        # actual interpreter image used by this runner.
+        str(_runner_executable_path()),
+        "-I",
+        "-c",
+        _TYPED_VALIDATION_BROKER_BOOTSTRAP,
+        _TYPED_VALIDATION_BROKER_BOOTSTRAP,
+        broker_payload_sha256,
+        "typed-validation-broker",
+        "--host",
+        str(host),
+        "--port",
+        str(port),
+    ]
+    try:
+        result = run_process(
+            validation_id=validation_id,
+            execution_id=execution_id,
+            command=broker_command,
+            cwd=REPO_ROOT,
+            env=broker_env,
+            timeout_seconds=(
+                timeout_seconds + TYPED_VALIDATION_BROKER_SHUTDOWN_GRACE_SECONDS
+            ),
+            stdin_bytes=broker_payload,
+        )
+    finally:
+        listener.close()
+    exchange_thread.join(TYPED_VALIDATION_BROKER_SHUTDOWN_GRACE_SECONDS)
+    if exchange_thread.is_alive():
+        exchange_errors.append("authenticated broker exchange did not stop")
+    return (
+        result,
+        response[0] if len(response) == 1 else None,
+        completion[0] if len(completion) == 1 else None,
+        "; ".join(exchange_errors) if exchange_errors else None,
+        tuple(broker_command),
+    )
+
+
+def _typed_validation_broker_observation(
+    *,
+    response_payload: bytes,
+    precommit: _TypedValidationLaunchPrecommit,
+    outer: ProcessResult,
+    broker_command: Sequence[str],
+) -> tuple[ProcessIdentity, ActionProcessObservation]:
+    try:
+        raw = json.loads(response_payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProofError("typed-validation broker response is not valid JSON") from error
+    if not isinstance(raw, dict) or canonical_json(raw) != response_payload:
+        raise ProofError("typed-validation broker response is not canonical JSON")
+    observed_keys = {
+        "protocol",
+        "request_sha256",
+        "status",
+        "producer",
+        "observation",
+    }
+    if set(raw) != observed_keys or raw.get("status") != "observed":
+        diagnostic = raw.get("diagnostic") if isinstance(raw, dict) else None
+        raise ProofError(
+            "typed-validation broker did not return an action observation"
+            + (f": {diagnostic}" if isinstance(diagnostic, str) else "")
+        )
+    if raw["protocol"] != _child_validation_module.BROKER_PROTOCOL:
+        raise ProofError("typed-validation broker response protocol mismatch")
+    if raw["request_sha256"] != precommit.request_sha256:
+        raise ProofError("typed-validation broker response request binding mismatch")
+    producer_raw = raw["producer"]
+    observation_raw = raw["observation"]
+    if not isinstance(producer_raw, dict) or not isinstance(observation_raw, dict):
+        raise ProofError("typed-validation broker response identities are invalid")
+    try:
+        producer = ProcessIdentity.from_mapping(producer_raw)
+        observation = ActionProcessObservation.from_mapping(observation_raw)
+    except JournalContractError as error:
+        raise ProofError(f"typed-validation broker observation is invalid: {error}") from error
+    outer_identity = outer.child.launch_target_identity
+    expected_outer_hash = outer_identity.get("sha256_before")
+    expected_outer_argv = [outer.child.executable, *map(str, broker_command[1:])]
+    if (
+        producer.pid != outer.child.pid
+        or os.path.normcase(producer.executable_path)
+        != os.path.normcase(outer.child.executable)
+        or producer.executable_sha256 != expected_outer_hash
+        or producer.argv_sha256
+        != _child_validation_module.hash_arguments(expected_outer_argv)
+        or producer.started_at_unix_ns < outer.child.started_at
+        or producer.started_at_unix_ns > outer.child.ended_at
+    ):
+        raise ProofError("typed-validation broker producer identity mismatch")
+    if (
+        observation.action_id != precommit.binding.validation_id
+        or observation.action_execution_id != precommit.action_execution_id
+        or observation.subjects != (precommit.binding.validation_id,)
+        or os.path.normcase(observation.process.executable_path)
+        != os.path.normcase(precommit.command[0])
+        or observation.process.executable_sha256 != precommit.executable_sha256
+        or observation.process.argv_sha256
+        != _child_validation_module.hash_arguments(precommit.command)
+    ):
+        raise ProofError("typed-validation broker action observation mismatch")
+    return producer, observation
+
+
+def _typed_validation_broker_completion(
+    *,
+    completion_payload: bytes,
+    precommit: _TypedValidationLaunchPrecommit,
+    outer: ProcessResult,
+    producer: ProcessIdentity,
+) -> None:
+    try:
+        raw = json.loads(completion_payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProofError(
+            "typed-validation broker completion is not valid JSON"
+        ) from error
+    if not isinstance(raw, dict) or canonical_json(raw) != completion_payload:
+        raise ProofError("typed-validation broker completion is not canonical JSON")
+    if set(raw) != {
+        "protocol",
+        "request_sha256",
+        "status",
+        "producer_ended_at_unix_ns",
+        "producer_executable_sha256_after",
+    } or raw.get("status") != "completed":
+        raise ProofError("typed-validation broker did not return completion evidence")
+    if raw["protocol"] != _child_validation_module.BROKER_PROTOCOL:
+        raise ProofError("typed-validation broker completion protocol mismatch")
+    if raw["request_sha256"] != precommit.request_sha256:
+        raise ProofError("typed-validation broker completion request binding mismatch")
+    producer_ended_at = raw["producer_ended_at_unix_ns"]
+    producer_after = raw["producer_executable_sha256_after"]
+    if (
+        isinstance(producer_ended_at, bool)
+        or not isinstance(producer_ended_at, int)
+        or producer_ended_at < producer.started_at_unix_ns
+        or producer_ended_at > outer.child.ended_at
+        or not isinstance(producer_after, str)
+        or SHA256_RE.fullmatch(producer_after) is None
+    ):
+        raise ProofError("typed-validation broker completion lifetime is invalid")
+    if producer_after != outer.child.launch_target_identity.get("sha256_after"):
+        raise ProofError("typed-validation broker completion identity mismatch")
+
+
 def _run_typed_validation(
     repo_root: Path,
     config: Mapping[str, Any],
     env: Mapping[str, str],
     *,
     allow_test_config: bool,
+    proof_attempt_id: str,
+    proof_receipt_nonce: str,
+    proof_scope: str,
 ) -> tuple[dict[str, object], ChildProcess]:
     validation_id = str(config["id"])
     validation_type = str(config["validation_type"])
@@ -5044,22 +6289,131 @@ def _run_typed_validation(
             repo_root,
             validation_type,
         )
-    result = run_process(
-        validation_id=validation_id,
-        execution_id=execution_id,
-        command=command,
-        cwd=cwd,
-        env=env,
-        timeout_seconds=int(config.get("timeout_seconds", 3600)),
-    )
-    if result.invocation_error:
+    timeout_seconds = int(config.get("timeout_seconds", 3600))
+    input_contract_digest = _validation_input_contract_digest(config)
+    with tempfile.TemporaryDirectory(prefix="kd4-typed-validation-broker-") as temp:
+        journal_path = Path(temp) / "child-validation.ndjson"
+        try:
+            precommit = _typed_validation_precommit(
+                validation_id=validation_id,
+                validation_type=validation_type,
+                execution_id=execution_id,
+                input_contract_digest=input_contract_digest,
+                proof_attempt_id=proof_attempt_id,
+                proof_receipt_nonce=proof_receipt_nonce,
+                proof_scope=proof_scope,
+                command=command,
+                cwd=cwd,
+                env=env,
+                timeout_seconds=timeout_seconds,
+                allowed_failures=allowed_failures,
+                journal_path=journal_path,
+            )
+        except (ProofError, JournalContractError, OSError, ValueError) as error:
+            child = _unlaunched_child(
+                validation_id=validation_id,
+                execution_id=execution_id,
+                command=command,
+            )
+            classification = "pre_result_error"
+            diagnostic = str(error)
+            return (
+                _validation_report(
+                    validation_id=validation_id,
+                    execution_id=execution_id,
+                    runner="typed-validation",
+                    evidence_kind="typed_non_test",
+                    validation_type=validation_type,
+                    input_contract_digest=input_contract_digest,
+                    classification=classification,
+                    intended=[validation_id],
+                    selected=[],
+                    executed=[],
+                    outcomes=[],
+                    exit_code=None,
+                    diagnostic=diagnostic,
+                ),
+                child,
+            )
+        (
+            result,
+            response_payload,
+            completion_payload,
+            exchange_error,
+            broker_command,
+        ) = (
+            _typed_validation_broker_exchange(
+                validation_id=validation_id,
+                execution_id=execution_id,
+                precommit=precommit,
+                env=env,
+                timeout_seconds=timeout_seconds,
+            )
+        )
         classification = "pre_result_error"
-    elif result.returncode == 0:
-        classification = "confirmed_pass"
-    elif result.returncode in allowed_failures:
-        classification = "confirmed_validation_failure"
-    else:
-        classification = "pre_result_error"
+        diagnostic_parts = [
+            part for part in (result.invocation_error, exchange_error) if part
+        ]
+        observation = None
+        producer = None
+        completion_valid = False
+        if response_payload is None:
+            diagnostic_parts.append("typed-validation broker returned no response")
+        else:
+            try:
+                producer, observation = _typed_validation_broker_observation(
+                    response_payload=response_payload,
+                    precommit=precommit,
+                    outer=result,
+                    broker_command=broker_command,
+                )
+            except (ProofError, JournalContractError, OSError, ValueError) as error:
+                diagnostic_parts.append(str(error))
+        if producer is not None and observation is not None:
+            if completion_payload is None:
+                diagnostic_parts.append(
+                    "typed-validation broker returned no completion response"
+                )
+            else:
+                try:
+                    _typed_validation_broker_completion(
+                        completion_payload=completion_payload,
+                        precommit=precommit,
+                        outer=result,
+                        producer=producer,
+                    )
+                    completion_valid = True
+                except (ProofError, JournalContractError, OSError, ValueError) as error:
+                    diagnostic_parts.append(str(error))
+            try:
+                verdict = parse_child_validation_journal(
+                    journal_path,
+                    expected_journal_path=precommit.journal_path,
+                    expected_binding=precommit.binding,
+                    expected_intended_ids=[validation_id],
+                    expected_selected_ids=[validation_id],
+                    expected_producer=producer,
+                    expected_action_processes={validation_id: observation.process},
+                    expected_action_observations={validation_id: observation},
+                    outer_ended_at_unix_ns=result.child.ended_at,
+                    outer_executable_sha256_after=str(
+                        result.child.launch_target_identity.get("sha256_after", "")
+                    ),
+                    outer_exit_code=result.returncode,
+                )
+                classification = verdict.classification
+                diagnostic_parts.extend(verdict.diagnostics)
+                if classification == "confirmed_pass" and (
+                    not completion_valid
+                    or result.invocation_error is not None
+                    or exchange_error is not None
+                ):
+                    classification = "pre_result_error"
+            except (ProofError, JournalContractError, OSError, ValueError) as error:
+                diagnostic_parts.append(str(error))
+        if observation is not None:
+            diagnostic_parts.insert(0, observation.diagnostic)
+        diagnostic = "; ".join(part for part in diagnostic_parts if part)
     executed_action = classification in {
         "confirmed_pass",
         "confirmed_validation_failure",
@@ -5084,14 +6438,14 @@ def _run_typed_validation(
             runner="typed-validation",
             evidence_kind="typed_non_test",
             validation_type=validation_type,
-            input_contract_digest=_validation_input_contract_digest(config),
+            input_contract_digest=input_contract_digest,
             classification=classification,
             intended=[validation_id],
             selected=action_ids,
             executed=action_ids,
             outcomes=outcomes,
-            exit_code=result.returncode,
-            diagnostic=result.invocation_error or result.stderr,
+            exit_code=(observation.exit_code if observation is not None else None),
+            diagnostic=diagnostic,
         ),
         result.child,
     )
@@ -5255,9 +6609,14 @@ def _run_rust_named_gate(
         elif (
             exact_envelope
             and raw.get("classification") == "confirmed_validation_failure"
-            and (result.returncode == 100 or result.invocation_error is not None)
+            and result.child.exit_code == 100
+            and (
+                (result.returncode == 100 and result.invocation_error is None)
+                or (result.returncode is None and result.invocation_error is not None)
+            )
             and has_confirmed_failure
             and confirmed_executed
+            and confirmed_executed == raw_executed
         ):
             # A later runner fault cannot erase a test failure that already
             # produced a trusted terminal event. Only completed test outcomes
@@ -5661,6 +7020,27 @@ def _attempt_classification(validations: Sequence[Mapping[str, object]]) -> str:
     return "pre_result_error"
 
 
+def _canonical_validation_id_closure(
+    accepted_ids: Iterable[str], validations: Sequence[Mapping[str, object]]
+) -> list[str]:
+    expected = frozenset(accepted_ids)
+    observed = [str(item.get("id", "")) for item in validations]
+    observed_set = set(observed)
+    missing = sorted(expected - observed_set)
+    unexpected = sorted(observed_set - expected)
+    duplicated = sorted(
+        validation_id
+        for validation_id in observed_set
+        if observed.count(validation_id) > 1
+    )
+    if not missing and not unexpected and not duplicated:
+        return []
+    return [
+        "canonical final validation ID closure mismatch: "
+        f"missing={missing}, unexpected={unexpected}, duplicated={duplicated}"
+    ]
+
+
 def _launched_child_error(
     validation: Mapping[str, object], child: ChildProcess
 ) -> str | None:
@@ -5979,6 +7359,7 @@ def _run_focused_validation(
     temp_dir: Path,
     allow_test_config: bool,
     proof_attempt_id: str,
+    proof_receipt_nonce: str,
 ) -> tuple[dict[str, object], ChildProcess]:
     runner = str(item["runner"])
     env = _network_disabled_env()
@@ -5988,6 +7369,9 @@ def _run_focused_validation(
             item,
             env,
             allow_test_config=allow_test_config,
+            proof_attempt_id=proof_attempt_id,
+            proof_receipt_nonce=proof_receipt_nonce,
+            proof_scope="focused",
         )
     if runner == "rust-gate":
         return _run_rust_named_gate(
@@ -6131,12 +7515,405 @@ def _run_focused_validation(
     raise AssertionError(runner)
 
 
+def _current_evidence_process_contract(
+    children: Sequence[ChildProcess], *, temp_dir: Path
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    expected_roles = (
+        "inventory.rust-nextest",
+        "inventory.rust-doctest",
+        "inventory.root-unittest",
+        "inventory.sdk-python-pytest",
+        "inventory.tools.argument-comment-lint.native",
+        "inventory.windows.sandbox-smoke",
+    )
+    if tuple(child.validation_id for child in children) != expected_roles:
+        raise ProofError("current-evidence discovery did not retain the exact process set")
+    report_paths = {
+        "inventory.root-unittest": temp_dir / "unittest-collection.json",
+        "inventory.sdk-python-pytest": temp_dir / "pytest-collection.json",
+    }
+    processes: list[dict[str, object]] = []
+    authority: list[dict[str, object]] = []
+    for child in children:
+        if not child.launched_argv or not child.launched_cwd:
+            raise ProofError(
+                f"current-evidence discovery {child.validation_id} omitted launch authority"
+            )
+        child_json = child.as_json()
+        child_json["started_at"] = str(child.started_at)
+        child_json["ended_at"] = str(child.ended_at)
+        argv = list(child.launched_argv)
+        report_path = report_paths.get(child.validation_id)
+        if report_path is None:
+            output: dict[str, object] = {
+                "kind": "stdout",
+                "stdout_sha256": sha256_bytes(child.stdout_bytes),
+            }
+            output_kind = "stdout"
+            authority_report_path: str | None = None
+        else:
+            try:
+                raw_report = report_path.read_bytes()
+            except OSError as error:
+                raise ProofError(
+                    f"cannot retain {child.validation_id} collection report: {error}"
+                ) from error
+            report_text = str(report_path.resolve())
+            output = {
+                "kind": "report-file",
+                "report_path": report_text,
+                "report_identity": _focused_catalog._current_windows_file_identity(
+                    report_text,
+                    f"{child.validation_id} collection report",
+                ),
+                "report_sha256": sha256_bytes(raw_report),
+            }
+            output_kind = "report-file"
+            authority_report_path = report_text
+        process = {
+            "role": child.validation_id,
+            "child_process": child_json,
+            "argv": argv,
+            "cwd": child.launched_cwd,
+            "output": output,
+        }
+        processes.append(process)
+        authority.append(
+            {
+                "role": child.validation_id,
+                "executable": child.executable,
+                "argv": argv,
+                "cwd": child.launched_cwd,
+                "output_kind": output_kind,
+                "report_path": authority_report_path,
+            }
+        )
+    return processes, {"expected_processes": authority}
+
+
+def _run_current_evidence_validation(
+    *,
+    repo_root: Path,
+    config: Mapping[str, Any],
+    item: Mapping[str, Any],
+    current_rows: Sequence[Mapping[str, object]],
+    temp_dir: Path,
+    proof_attempt_id: str,
+    raw_report_bytes: list[bytes],
+) -> tuple[dict[str, object], ChildProcess]:
+    runner = str(item["runner"])
+    if runner not in {"python-unittest", "python-pytest"}:
+        raise ProofError(f"current-evidence validation has invalid runner {runner!r}")
+    framework = runner
+    intended = _focused_framework_ids(config, current_rows, framework)
+    if runner == "python-unittest":
+        command = [
+            "uv", "run", "--offline", "--frozen", "--project", "scripts",
+            "python", str(repo_root / "scripts" / "completion_proof_unittest.py"),
+            "run", "--expected-file", "{expected_file}", "--output", "{report_file}",
+        ]
+        report_path = temp_dir / "current-evidence-root-unittest-results.json"
+    else:
+        command = [
+            "uv", "run", "--offline", "--frozen", "--directory",
+            str(repo_root / "sdk" / "python"), "--group", "dev", "python",
+            str(repo_root / "scripts" / "completion_proof_pytest.py"), "run",
+            "--expected-file", "{expected_file}", "--output", "{report_file}",
+        ]
+        report_path = temp_dir / "current-evidence-sdk-python-pytest-results.json"
+    return _run_structured_wrapper(
+        validation_id=str(item["id"]),
+        framework=framework,
+        intended=intended,
+        command=command,
+        report_path=report_path,
+        cwd=repo_root,
+        env=_network_disabled_env(),
+        timeout_seconds=int(item["timeout_seconds"]),
+        temp_dir=temp_dir,
+        proof_attempt_id=proof_attempt_id,
+        proof_scope="focused",
+        raw_report_bytes=raw_report_bytes,
+    )
+
+
+def _run_current_evidence_attempt(
+    config_path: Path, *, allow_test_config: bool
+) -> int:
+    runtime = _runtime_inputs()
+    runner_identity = _capture_runner_process_identity()
+    report_path = Path(runtime["CODEX_COMPLETION_PROOF_REPORT"]).resolve()
+    _reserve_report(report_path)
+    channel: _RunnerAttestationChannel | None = None
+    lock_descriptor: int | None = None
+    validations: list[dict[str, object]] = []
+    children: list[ChildProcess] = []
+    inventory_digest = ""
+    observed_start = ""
+    observed_end = ""
+    repo_root = REPO_ROOT.resolve()
+    policy_id = KD4_POLICY_ID
+    fatal_error = ""
+    unresolved_baseline_count: int | None = None
+    pending_replacement_review_count: int | None = None
+    unresolved_projection: Mapping[str, object] | None = None
+    frame_members: list[tuple[str, bytes]] | None = None
+    final_runner_identity: tuple[dict[str, object], str | None] | None = None
+
+    def report(classification: str, diagnostic: str) -> dict[str, object]:
+        return _attempt_report(
+            runtime=runtime,
+            policy_id=policy_id,
+            runner_identity=runner_identity,
+            repo_root=repo_root,
+            inventory_digest=inventory_digest,
+            observed_start=observed_start,
+            observed_end=observed_end,
+            validations=validations,
+            children=children,
+            exceptions=[],
+            overrides=[],
+            fatal_error=diagnostic,
+            classification=classification,
+            report_type=FOCUSED_REPORT_TYPE,
+            exact_command=f"just completion-focused {CURRENT_EVIDENCE_VALIDATION_ID}",
+            focused_validation_id=CURRENT_EVIDENCE_VALIDATION_ID,
+            runner_identity_result=final_runner_identity,
+        )
+
+    try:
+        channel = _attest_runner_process(
+            runtime, runner_identity, retain_channel=True
+        )
+        assert channel is not None
+        repo_root, config = load_config(
+            config_path, allow_test_config=allow_test_config
+        )
+        policy_id = str(config["policy_id"])
+        configured = validation_configs(config, allow_test_config=allow_test_config)
+        focused = config.get("focused_inventory_evidence")
+        if (
+            not isinstance(focused, dict)
+            or focused.get("validation_ids") != list(CURRENT_EVIDENCE_VALIDATION_IDS)
+        ):
+            raise ProofError("inventory.current-evidence is not declared by policy")
+        selected_by_id = {
+            str(item["id"]): item for item in configured.values()
+            if str(item["id"]) in CURRENT_EVIDENCE_VALIDATION_IDS
+        }
+        if tuple(selected_by_id) != CURRENT_EVIDENCE_VALIDATION_IDS:
+            selected_by_id = {
+                validation_id: next(
+                    item for item in configured.values()
+                    if str(item["id"]) == validation_id
+                )
+                for validation_id in CURRENT_EVIDENCE_VALIDATION_IDS
+            }
+        if tuple(str(selected_by_id[item]["runner"]) for item in CURRENT_EVIDENCE_VALIDATION_IDS) != (
+            "python-unittest", "python-pytest"
+        ):
+            raise ProofError("inventory.current-evidence component runner mapping changed")
+        active_platform = platform.system().casefold()
+        if str(config.get("host_platform", "")).casefold() != active_platform:
+            raise ProofError("current-evidence host does not match configured host")
+        runtime_repo = Path(runtime["CODEX_COMPLETION_PROOF_REPOSITORY"]).resolve()
+        if os.path.normcase(str(runtime_repo)) != os.path.normcase(str(repo_root)):
+            raise ProofError("runtime repository does not match configured repository")
+        try:
+            report_path.relative_to(repo_root)
+        except ValueError:
+            pass
+        else:
+            raise ProofError("private current-evidence reports must be outside repository")
+        lock_descriptor = _acquire_lock(
+            _lock_path(report_path, repo_root),
+            runtime["CODEX_COMPLETION_PROOF_ATTEMPT_ID"],
+        )
+        observed_start = workspace_fingerprint(repo_root)
+        if observed_start != runtime["CODEX_COMPLETION_PROOF_START_FINGERPRINT"]:
+            raise ProofError("workspace changed before current-evidence startup")
+        _, _, inventory_digest = load_frozen_inventory(repo_root, config)
+        (
+            unresolved_baseline_count,
+            pending_replacement_review_count,
+        ) = _current_reconciliation_status(repo_root, config)
+        with tempfile.TemporaryDirectory(prefix="kd4-current-evidence-") as temp_name:
+            temp_dir = Path(temp_name)
+            jest_observation: dict[str, object] = {}
+            current_rows, discovery_children = discover_inventory(
+                repo_root,
+                temp_dir=temp_dir,
+                jest_observation=jest_observation,
+            )
+            discovery_cutoff = time.time_ns()
+            raw_exec_reports: list[bytes] = []
+            for validation_id in CURRENT_EVIDENCE_VALIDATION_IDS:
+                validation, child = _run_current_evidence_validation(
+                    repo_root=repo_root,
+                    config=config,
+                    item=selected_by_id[validation_id],
+                    current_rows=current_rows,
+                    temp_dir=temp_dir,
+                    proof_attempt_id=runtime["CODEX_COMPLETION_PROOF_ATTEMPT_ID"],
+                    raw_report_bytes=raw_exec_reports,
+                )
+                validations.append(validation)
+                children.append(child)
+                _write_report(
+                    report_path,
+                    report("pre_result_error", "current-evidence attempt is incomplete"),
+                )
+            observed_end = workspace_fingerprint(repo_root)
+            if observed_end != observed_start:
+                raise ProofError("workspace changed during current-evidence attempt")
+            processes, invocation_authority = _current_evidence_process_contract(
+                discovery_children, temp_dir=temp_dir
+            )
+            attempt_bounds = {
+                "attempt_id": runtime["CODEX_COMPLETION_PROOF_ATTEMPT_ID"],
+                "runner_pid": os.getpid(),
+                "started_at": str(runner_identity.started_at),
+                "reconciliation_started_at": str(discovery_cutoff),
+                "ended_at": str(time.time_ns()),
+            }
+            jest_ids = sorted(
+                str(row["baseline_id"])
+                for row in current_rows
+                if row["framework"] == "javascript-jest"
+            )
+            frozen_inventory_path, replacement_ledger_path = _manifest_paths(
+                repo_root, config
+            )
+            successor_projection = _build_current_successor_projection(
+                repo_root=repo_root,
+                current_inventory=current_rows,
+                frozen_inventory_path=frozen_inventory_path,
+                replacement_ledger_path=replacement_ledger_path,
+                unittest_collection_report=temp_dir / "unittest-collection.json",
+                pytest_collection_report=temp_dir / "pytest-collection.json",
+            )
+            unresolved_projection = successor_projection["unresolved_projection"]
+            catalog = _focused_catalog.build_focused_live_successor_catalog_v1(
+                attempt_id=runtime["CODEX_COMPLETION_PROOF_ATTEMPT_ID"],
+                focused_validation_id=CURRENT_EVIDENCE_VALIDATION_ID,
+                frozen_inventory_hash=inventory_digest,
+                start_fingerprint=observed_start,
+                start_mutation_epoch=int(runtime["CODEX_COMPLETION_PROOF_MUTATION_EPOCH"]),
+                replacement_baseline_row_count=successor_projection[
+                    "replacement_baseline_row_count"
+                ],
+                current_inventory=current_rows,
+                resolved_successor_entries=successor_projection[
+                    "resolved_successor_entries"
+                ],
+                execution_input_contracts=successor_projection[
+                    "execution_input_contracts"
+                ],
+                cargo_target_context_specs=successor_projection[
+                    "cargo_target_context_specs"
+                ],
+                replacement_successor_catalog=successor_projection[
+                    "replacement_successor_catalog"
+                ],
+                successor_owner_map=successor_projection["successor_owner_map"],
+                inventory_discovery_processes=processes,
+                invocation_authority=invocation_authority,
+                attempt_bounds=attempt_bounds,
+                jest_observation=jest_observation,
+                jest_discovered_ids=jest_ids,
+            )
+            frame_members = [
+                ("catalog", _canonical_jcs(catalog)),
+                ("process", _canonical_jcs(processes)),
+                ("unittest_collect", (temp_dir / "unittest-collection.json").read_bytes()),
+                ("unittest_exec", raw_exec_reports[0]),
+                ("pytest_collect", (temp_dir / "pytest-collection.json").read_bytes()),
+                ("pytest_exec", raw_exec_reports[1]),
+            ]
+            child_errors = _enforce_child_evidence_contract(validations, children)
+            if child_errors:
+                raise ProofError("; ".join(child_errors))
+            attempt_classification = _attempt_classification(validations)
+            final_runner_identity = runner_identity.finish()
+            if final_runner_identity[1]:
+                raise ProofError(final_runner_identity[1])
+            _write_report(report_path, report(attempt_classification, ""))
+            channel.exchange_focused_evidence(frame_members)
+    except ProofError as error:
+        fatal_error = str(error)
+    except Exception as error:  # noqa: BLE001 - trusted runner fails closed
+        fatal_error = f"unexpected current-evidence runner error: {type(error).__name__}: {error}"
+
+    if fatal_error:
+        known = {str(item.get("id", "")) for item in validations}
+        for validation_id in CURRENT_EVIDENCE_VALIDATION_IDS:
+            if validation_id not in known:
+                validations.append(_focused_pre_result(validation_id, fatal_error))
+        attempt_classification = "pre_result_error"
+        if not observed_end and repo_root.exists():
+            try:
+                observed_end = workspace_fingerprint(repo_root)
+            except ProofError:
+                observed_end = ""
+        if final_runner_identity is None:
+            final_runner_identity = runner_identity.finish()
+        _write_report(report_path, report(attempt_classification, fatal_error))
+    else:
+        attempt_classification = _attempt_classification(validations)
+    if channel is not None:
+        channel.close()
+    if lock_descriptor is not None:
+        _release_lock(lock_descriptor)
+    authority_status = (
+        f"authority ledger unresolved={unresolved_baseline_count}, "
+        f"pending-replacement-review={pending_replacement_review_count}"
+        if unresolved_baseline_count is not None
+        and pending_replacement_review_count is not None
+        else "authority ledger status unavailable"
+    )
+    if attempt_classification == "confirmed_pass":
+        assert unresolved_projection is not None
+        unresolved_replacement_baselines = unresolved_projection[
+            "unresolved_replacement_baseline_row_count"
+        ]
+        unresolved_replacement_edges = unresolved_projection[
+            "unresolved_replacement_edge_count"
+        ]
+        unresolved_successors = unresolved_projection["unresolved_successor_count"]
+        status = (
+            f"{authority_status}; "
+            "fresh replacement projection unresolved-baselines="
+            f"{unresolved_replacement_baselines}, "
+            f"unresolved-edges={unresolved_replacement_edges}, "
+            f"unresolved-successors={unresolved_successors}"
+        )
+        print(
+            "CURRENT INVENTORY EVIDENCE CAPTURED: reconciliation was not performed; "
+            f"{status}; this is not completion proof; report {report_path}",
+            flush=True,
+        )
+        return 0
+    print(
+        f"CURRENT INVENTORY EVIDENCE {attempt_classification.upper()} "
+        "(reconciliation was not performed; "
+        f"{authority_status}; not completion proof): "
+        f"{fatal_error or 'see structured report'}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return 1 if attempt_classification == "confirmed_validation_failure" else 2
+
+
 def _run_focused_attempt(
     config_path: Path,
     requested_id: str,
     *,
     allow_test_config: bool = False,
 ) -> int:
+    if requested_id == CURRENT_EVIDENCE_VALIDATION_ID:
+        return _run_current_evidence_attempt(
+            config_path, allow_test_config=allow_test_config
+        )
     runtime = _runtime_inputs()
     runner_identity = _capture_runner_process_identity()
     report_path = Path(runtime["CODEX_COMPLETION_PROOF_REPORT"]).resolve()
@@ -6229,7 +8006,12 @@ def _run_focused_attempt(
             raise ProofError(
                 "workspace changed between runtime authorization and focused runner startup"
             )
-        _, _, inventory_digest = load_frozen_inventory(repo_root, config)
+        if selected[0]["runner"] == "inventory-reconciliation":
+            _, _, inventory_digest = load_frozen_inventory(repo_root, config)
+        else:
+            # The focused envelope binds the trusted policy identifier; ordinary
+            # tests do not need this migration's inventory or replacement ledger.
+            inventory_digest = str(config["frozen_inventory_hash"])
 
         with tempfile.TemporaryDirectory(prefix="kd4-completion-focused-") as temp_name:
             validation, child = _run_focused_validation(
@@ -6242,6 +8024,9 @@ def _run_focused_attempt(
                 temp_dir=Path(temp_name),
                 allow_test_config=allow_test_config,
                 proof_attempt_id=runtime["CODEX_COMPLETION_PROOF_ATTEMPT_ID"],
+                proof_receipt_nonce=sha256_bytes(
+                    runtime["CODEX_COMPLETION_PROOF_NONCE"].encode("utf-8")
+                ),
             )
             validations.append(validation)
             children.append(child)
@@ -6337,6 +8122,7 @@ def _run_attempt(
     repo_root = REPO_ROOT.resolve()
     policy_id = KD4_POLICY_ID
     fatal_error = ""
+    accepted_configured_validation_ids: frozenset[str] | None = None
 
     def checkpoint() -> None:
         _write_report(
@@ -6375,6 +8161,9 @@ def _run_attempt(
         configured_validations = validation_configs(
             config,
             allow_test_config=allow_test_config,
+        )
+        accepted_configured_validation_ids = frozenset(
+            str(item["id"]) for item in configured_validations.values()
         )
         configured_platform = str(config.get("host_platform", "")).casefold()
         active_platform = platform.system().casefold()
@@ -6621,6 +8410,13 @@ def _run_attempt(
                     item,
                     _network_disabled_env(),
                     allow_test_config=allow_test_config,
+                    proof_attempt_id=runtime[
+                        "CODEX_COMPLETION_PROOF_ATTEMPT_ID"
+                    ],
+                    proof_receipt_nonce=sha256_bytes(
+                        runtime["CODEX_COMPLETION_PROOF_NONCE"].encode("utf-8")
+                    ),
+                    proof_scope="canonical",
                 )
                 record(report, child)
 
@@ -6697,8 +8493,22 @@ def _run_attempt(
             for part in (fatal_error, *child_evidence_errors)
             if part
         )
+    final_id_errors = (
+        _canonical_validation_id_closure(
+            accepted_configured_validation_ids,
+            validations,
+        )
+        if accepted_configured_validation_ids is not None
+        else []
+    )
+    if final_id_errors:
+        fatal_error = "; ".join(
+            part for part in (fatal_error, *final_id_errors) if part
+        )
     attempt_classification = (
-        "pre_result_error" if child_evidence_errors else _attempt_classification(validations)
+        "pre_result_error"
+        if child_evidence_errors or final_id_errors
+        else _attempt_classification(validations)
     )
     final_runner_identity = runner_identity.finish()
     if final_runner_identity[1]:

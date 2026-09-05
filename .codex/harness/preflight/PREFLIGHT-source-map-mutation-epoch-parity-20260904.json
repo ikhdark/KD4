@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:source-map-mutation-epoch-parity-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-source-map-mutation-epoch-parity-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-source-map-mutation-epoch-parity-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/validation/completion-proof.toml",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/src/completion_proof.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/tests/suite/completion_proof_gate.rs",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_completion_proof.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_source_owners.py",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "source-map-mutation-epoch-input-parity"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "python -m unittest scripts.test_source_owners",
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_production_config_uses_exact_code_owned_typed_policy",
+    "just core-test-fast core_cli_workspace -E 'test(~source_map_projection)'"
+  ],
+  "cargo_lane": {
+    "target_dir": "codex-rs/target/lanes/core_cli_workspace",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

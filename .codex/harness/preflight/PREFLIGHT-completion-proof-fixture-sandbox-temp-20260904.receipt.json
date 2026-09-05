@@ -1,0 +1,74 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "worker:app-server-proof-resume-loopback-execution-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\root-owned-serialized"
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-completion-proof-fixture-sandbox-temp-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-completion-proof-fixture-sandbox-temp-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          "codex-rs/core/tests/suite/completion_proof_gate.rs",
+          "codex-rs"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:completion-proof-fixture-sandbox-temp-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\default",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\root-owned-serialized"
+  },
+  "contract_claims": [
+    "completion-proof-real-session-fixtures-use-isolated-temporary-storage"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T14:03:53.443868+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "3e6505113cb1d07f189ab0be21c78c3d5ad9a0268aaa9883694bbea1dc79548d",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-completion-proof-fixture-sandbox-temp-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-completion-proof-fixture-sandbox-temp-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/tests/suite/completion_proof_gate.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T13:03:53.443868+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "aabb4f5d7f02d1652b6125251dfbefd4622394d53dfc462cebc9618dd1e409ad"
+  },
+  "validation_commands": [
+    "just core-test-fast core_cli_workspace -E 'test(~source_map_projection_excludes_tracked_symlink_targets_through_real_session_path)'",
+    "cargo fmt -- codex-rs/core/tests/suite/completion_proof_gate.rs",
+    "git diff --check"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

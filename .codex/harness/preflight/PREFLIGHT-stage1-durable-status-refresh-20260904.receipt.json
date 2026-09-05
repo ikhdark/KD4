@@ -1,0 +1,65 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/runs/2026-09-02-completion-proof-migration/PLAN.md",
+          ".codex"
+        ],
+        [
+          ".codex/harness/runs/2026-09-02-completion-proof-migration/ORCHESTRATOR.md",
+          ".codex"
+        ],
+        [
+          ".codex/harness/runs/2026-09-02-completion-proof-migration/EVAL.md",
+          ".codex"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "root:stage1-durable-status-refresh-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-stage1-durable-status-refresh"
+  },
+  "contract_claims": [
+    "completion-proof-migration-stage1-durable-status"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-04T11:14:27.321051+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "a2f63c1fa9de9ce8b022ea14aee9d38dc699337cd925f7217129147a48aadcd6",
+  "path_claims": [
+    {
+      "path": ".codex/harness/runs/2026-09-02-completion-proof-migration/PLAN.md",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/runs/2026-09-02-completion-proof-migration/ORCHESTRATOR.md",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/runs/2026-09-02-completion-proof-migration/EVAL.md",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T10:14:27.321051+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "264a848cac5d7900e20fd35f51655b072609660a40d95a4cbdc0a95706b1a345"
+  },
+  "validation_commands": [
+    "pnpm exec markdownlint-cli2 .codex/harness/runs/2026-09-02-completion-proof-migration/PLAN.md .codex/harness/runs/2026-09-02-completion-proof-migration/ORCHESTRATOR.md .codex/harness/runs/2026-09-02-completion-proof-migration/EVAL.md"
+  ],
+  "validation_owner": "root:stage1-durable-status-refresh-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

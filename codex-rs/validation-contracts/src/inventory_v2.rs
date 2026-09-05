@@ -28,6 +28,12 @@ const UNITTEST_V1_EXECUTABLE_PARENT_COUNT: usize = 893;
 const UNITTEST_V1_HIDDEN_PARENT_COUNT: usize = 16;
 const UNITTEST_V1_REPLACEMENT_PARENT_COUNT: usize = 536;
 const UNITTEST_V1_EXECUTABLE_REPLACEMENT_PARENT_COUNT: usize = 520;
+pub(crate) const FROZEN_V1_HISTORICAL_REPLACEMENT_BASELINE_COUNT: usize = 644;
+pub(crate) const FROZEN_V1_HISTORICAL_REPLACEMENT_EDGE_COUNT: usize = 685;
+pub(crate) const FROZEN_V1_HISTORICAL_REPLACEMENT_SUCCESSOR_COUNT: usize = 572;
+pub(crate) const FROZEN_V1_HISTORICAL_REPLACEMENT_COMPONENT_COUNT: usize = 531;
+pub(crate) const FROZEN_V1_HISTORICAL_REPLACEMENT_GRAPH_SHA256: &str =
+    "137ab36ace74657f218d2cc66918ac8261decae44376073299a570cbbc0b0882";
 const UNITTEST_V1_UNRESOLVED_PARENT_COUNT: usize = 373;
 const UNITTEST_V1_HIDDEN_PARENT_IDS_SHA256: &str =
     "936330f9e9a23c8d628f651a1ed31b3f4ea836a06cf152a6acf09cff898ebc40";
@@ -1120,7 +1126,7 @@ impl FrozenTestInventoryV2 {
         const EXPECTED: [(&str, &str, &str); 5] = [
             (
                 ".codex/validation/frozen-test-inventory-v2-recoveries.schema.json",
-                "8412a18a13ae6f93b8efd18552e0be1422e957ebde5bde24512e8ce87d8bc09f",
+                "a3ef6ec3486368c3e3c1bc468ba2a16255d75dbe250aa4681cbef696d923a6f4",
                 "kd4://validation/frozen-test-inventory-v2-recoveries.schema.json",
             ),
             (
@@ -1946,6 +1952,237 @@ impl TestReplacementLedgerV2 {
     }
 }
 
+pub(crate) struct FrozenV1HistoricalReplacementGraphV1 {
+    pub(crate) bindings: BTreeMap<String, (Sha256HexV1, Vec<String>)>,
+    pub(crate) projection: serde_json::Value,
+}
+
+pub(crate) fn derive_frozen_v1_historical_replacement_graph_v1(
+    predecessor_ledger: &serde_json::Value,
+) -> Result<FrozenV1HistoricalReplacementGraphV1, ContractError> {
+    let rows = predecessor_ledger
+        .get("rows")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            ContractError::InvalidContract(
+                "predecessor ledger has no canonical row array".to_owned(),
+            )
+        })?;
+    let mut bindings = BTreeMap::new();
+    for row in rows {
+        if row.get("resolution").and_then(serde_json::Value::as_str) != Some("replacement") {
+            continue;
+        }
+        let baseline_id = row
+            .get("baseline_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ContractError::InvalidContract(
+                    "historical replacement row requires a nonempty baseline ID".to_owned(),
+                )
+            })?;
+        validate_nonempty_nfc(baseline_id, "historical replacement baseline ID")?;
+        let replacement_values = row
+            .get("replacement_ids")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                ContractError::InvalidContract(
+                    "historical replacement IDs must be nonempty and unique".to_owned(),
+                )
+            })?;
+        let mut replacement_ids = replacement_values
+            .iter()
+            .map(|value| {
+                let replacement_id = value.as_str().ok_or_else(|| {
+                    ContractError::InvalidContract(
+                        "historical replacement IDs must be nonempty and unique".to_owned(),
+                    )
+                })?;
+                validate_nonempty_nfc(replacement_id, "historical replacement ID")?;
+                Ok(replacement_id.to_owned())
+            })
+            .collect::<Result<Vec<_>, ContractError>>()?;
+        if replacement_ids.is_empty()
+            || replacement_ids.iter().collect::<BTreeSet<_>>().len() != replacement_ids.len()
+        {
+            return Err(ContractError::InvalidContract(
+                "historical replacement IDs must be nonempty and unique".to_owned(),
+            ));
+        }
+        replacement_ids.sort();
+        let predecessor_row_sha256 = proof_hash("kd4.frozen-v1-replacement-ledger-row.v1", row)?;
+        if bindings
+            .insert(
+                baseline_id.to_owned(),
+                (predecessor_row_sha256, replacement_ids),
+            )
+            .is_some()
+        {
+            return Err(ContractError::InvalidContract(
+                "predecessor ledger repeats a historical replacement baseline".to_owned(),
+            ));
+        }
+    }
+
+    let baseline_ids = bindings.keys().cloned().collect::<Vec<_>>();
+    let edges = bindings
+        .iter()
+        .flat_map(|(baseline_id, (_, replacement_ids))| {
+            replacement_ids
+                .iter()
+                .map(|replacement_id| (baseline_id.clone(), replacement_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    let successor_ids = edges
+        .iter()
+        .map(|(_, replacement_id)| replacement_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut successor_owners = BTreeMap::<String, BTreeSet<String>>::new();
+    for (baseline_id, replacement_id) in &edges {
+        successor_owners
+            .entry(replacement_id.clone())
+            .or_default()
+            .insert(baseline_id.clone());
+    }
+
+    let mut components = Vec::new();
+    let mut visited_baselines = BTreeSet::new();
+    for initial_baseline in &baseline_ids {
+        if visited_baselines.contains(initial_baseline) {
+            continue;
+        }
+        let mut pending_baselines = vec![initial_baseline.clone()];
+        let mut component_baselines = BTreeSet::new();
+        let mut component_successors = BTreeSet::new();
+        while let Some(baseline_id) = pending_baselines.pop() {
+            if !component_baselines.insert(baseline_id.clone()) {
+                continue;
+            }
+            visited_baselines.insert(baseline_id.clone());
+            let (_, replacement_ids) = bindings
+                .get(&baseline_id)
+                .expect("graph traversal begins from frozen replacement baselines");
+            for replacement_id in replacement_ids {
+                if component_successors.insert(replacement_id.clone()) {
+                    pending_baselines.extend(
+                        successor_owners
+                            .get(replacement_id)
+                            .expect("every successor was indexed")
+                            .iter()
+                            .cloned(),
+                    );
+                }
+            }
+        }
+        let component_edges = edges
+            .iter()
+            .filter(|(baseline_id, _)| component_baselines.contains(baseline_id))
+            .map(|(baseline_id, replacement_id)| {
+                serde_json::json!({
+                    "baseline_id": baseline_id,
+                    "replacement_id": replacement_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        components.push(serde_json::json!({
+            "baseline_ids": component_baselines.into_iter().collect::<Vec<_>>(),
+            "edges": component_edges,
+            "successor_ids": component_successors.into_iter().collect::<Vec<_>>(),
+        }));
+    }
+    let edge_projection = edges
+        .iter()
+        .map(|(baseline_id, replacement_id)| {
+            serde_json::json!({
+                "baseline_id": baseline_id,
+                "replacement_id": replacement_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let projection = serde_json::json!({
+        "baseline_ids": baseline_ids,
+        "components": components,
+        "edges": edge_projection,
+        "successor_ids": successor_ids,
+    });
+    if bindings.len() != FROZEN_V1_HISTORICAL_REPLACEMENT_BASELINE_COUNT
+        || edges.len() != FROZEN_V1_HISTORICAL_REPLACEMENT_EDGE_COUNT
+        || successor_owners.len() != FROZEN_V1_HISTORICAL_REPLACEMENT_SUCCESSOR_COUNT
+        || projection["components"].as_array().map(Vec::len)
+            != Some(FROZEN_V1_HISTORICAL_REPLACEMENT_COMPONENT_COUNT)
+        || proof_hash("kd4.frozen-v1-historical-replacement-graph.v1", &projection)?.as_str()
+            != FROZEN_V1_HISTORICAL_REPLACEMENT_GRAPH_SHA256
+    {
+        return Err(ContractError::InvalidContract(
+            "historical replacement graph does not match the exact frozen V1 graph".to_owned(),
+        ));
+    }
+    Ok(FrozenV1HistoricalReplacementGraphV1 {
+        bindings,
+        projection,
+    })
+}
+
+fn validate_v2_historical_replacement_graph_closure_v1(
+    ledger: &TestReplacementLedgerV2,
+    predecessor_ledger: &serde_json::Value,
+) -> Result<(), ContractError> {
+    let graph = derive_frozen_v1_historical_replacement_graph_v1(predecessor_ledger)?;
+    let mut rows_by_baseline = BTreeMap::new();
+    for row in &ledger.rows {
+        let Some(baseline_id) = &row.baseline_id else {
+            continue;
+        };
+        if rows_by_baseline.insert(baseline_id, row).is_some() {
+            return Err(ContractError::InvalidContract(
+                "replacement ledger repeats a baseline ID".to_owned(),
+            ));
+        }
+    }
+    for (baseline_id, (predecessor_row_sha256, replacement_ids)) in graph.bindings {
+        let row = rows_by_baseline.get(&baseline_id).ok_or_else(|| {
+            ContractError::InvalidContract(
+                "historical replacement mapping changed from the exact frozen V1 graph".to_owned(),
+            )
+        })?;
+        let ReplacementLedgerDispositionV2::Replacement {
+            contract, edge_ids, ..
+        } = &row.disposition
+        else {
+            return Err(ContractError::InvalidContract(
+                "historical replacement mapping changed from the exact frozen V1 graph".to_owned(),
+            ));
+        };
+        let expected_hint = LegacyReplacementHintV1 {
+            predecessor_row_sha256: predecessor_row_sha256.clone(),
+            replacement_ids: replacement_ids.clone(),
+        };
+        let mut expected_edge_ids = replacement_ids
+            .iter()
+            .map(|replacement_id| {
+                proof_hash(
+                    "kd4.legacy-replacement-edge.v1",
+                    &serde_json::json!({
+                        "baseline_id": baseline_id,
+                        "predecessor_row_sha256": predecessor_row_sha256,
+                        "replacement_id": replacement_id,
+                    }),
+                )
+                .map(|digest| format!("replacement-edge-v2.{digest}"))
+            })
+            .collect::<Result<Vec<_>, ContractError>>()?;
+        expected_edge_ids.sort();
+        if contract.legacy_replacement_hint() != &expected_hint || edge_ids != &expected_edge_ids {
+            return Err(ContractError::InvalidContract(
+                "historical replacement mapping changed from the exact frozen V1 graph".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_inventory_ledger_predecessor_closure(
     inventory: &FrozenTestInventoryV2,
     ledger: &TestReplacementLedgerV2,
@@ -2085,13 +2322,27 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recaptures(
             "ledger rows do not cover every inventory declaration obligation".to_owned(),
         ));
     }
-    for (obligation_id, expected_baseline) in &expected_baseline_by_obligation {
+    for (obligation_id, declaration) in &declarations_by_obligation {
+        let expected_baseline = expected_baseline_by_obligation
+            .get(obligation_id)
+            .expect("declaration baselines were indexed above");
         let row = rows_by_obligation
             .get(obligation_id)
             .expect("declaration obligations were checked above");
         if &row.baseline_id != expected_baseline {
             return Err(ContractError::InvalidContract(
                 "ledger baseline identity does not match its exact inventory declaration"
+                    .to_owned(),
+            ));
+        }
+        if let InventoryDeclarationV2::PostBaselineCurrent { entry, .. } = declaration
+            && let ReplacementLedgerDispositionV2::Current {
+                inventory_entry_semantic_sha256,
+            } = &row.disposition
+            && entry.semantic_sha256()? != *inventory_entry_semantic_sha256
+        {
+            return Err(ContractError::InvalidContract(
+                "current disposition does not bind its exact inventory declaration entry"
                     .to_owned(),
             ));
         }
@@ -2164,6 +2415,9 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recaptures(
                 .map_err(|error| ContractError::InvalidJson(error.to_string()))
         })
         .transpose()?;
+    if let Some(predecessor_ledger) = &predecessor_ledger {
+        validate_v2_historical_replacement_graph_closure_v1(ledger, predecessor_ledger)?;
+    }
 
     let mut authority_state_records = recovery.records.clone();
     for record in &mut authority_state_records {
@@ -2219,7 +2473,14 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recaptures(
                 record.pending_requirement =
                     Some(crate::recovery::RecoveryPendingRequirementV1::Unittest {
                         baseline_commit: recovery.frozen_source_authority.baseline_commit.clone(),
-                        expected_parent_output_sha256s: packet.parent_recapture_outputs()?,
+                        expected_parent_output_sha256s: packet
+                            .parent_records
+                            .iter()
+                            .map(|parent| crate::recovery::ParentRecaptureOutputV1 {
+                                output_sha256: parent.predecessor_entry_sha256.clone(),
+                                parent_id: parent.baseline_id.clone(),
+                            })
+                            .collect(),
                         reasons: vec![
                             "historical-subtest-count-unknown".to_owned(),
                             "parent-output-recapture-required".to_owned(),
@@ -2359,7 +2620,7 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recaptures(
             })?;
             let expected_children = packet.recovered_child_sources()?;
             let expected_parents = packet
-                .parent_records
+                .executable_parent_records()?
                 .iter()
                 .map(|parent| parent.baseline_id.clone())
                 .collect::<Vec<_>>();
@@ -2532,6 +2793,8 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recaptures(
             .collect::<BTreeSet<_>>();
         let packet_parent_ids = packet_parents.keys().cloned().collect::<BTreeSet<_>>();
         let manifest_parent_ids = parent_manifests.keys().cloned().collect::<BTreeSet<_>>();
+        let authenticated_parent_ids = packet.executable_parent_records()?.iter()
+            .map(|parent| parent.baseline_id.clone()).collect::<BTreeSet<_>>();
         let hidden_parent_ids_for_hash = hidden_parent_ids.iter().cloned().collect::<Vec<_>>();
         if unittest_parent_ids.len() != UNITTEST_V1_LEDGER_PARENT_COUNT
             || executable_parent_ids.len() != UNITTEST_V1_EXECUTABLE_PARENT_COUNT
@@ -2543,7 +2806,7 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recaptures(
             .as_str()
                 != UNITTEST_V1_HIDDEN_PARENT_IDS_SHA256
             || packet_parent_ids != executable_parent_ids
-            || manifest_parent_ids != executable_parent_ids
+            || manifest_parent_ids != authenticated_parent_ids
         {
             return Err(ContractError::InvalidContract(
                 "unittest predecessor partition must preserve 909 ledger parents, 893 executable parents, and 16 hidden replacement-only parents"
@@ -2616,7 +2879,7 @@ pub fn validate_inventory_ledger_predecessor_closure_with_recaptures(
                         .to_owned(),
                 ));
             }
-            if executable_parent_ids.contains(baseline_id) {
+            if authenticated_parent_ids.contains(baseline_id) {
                 let parent_record = packet_parents
                     .get(baseline_id)
                     .expect("packet parent set was checked above");

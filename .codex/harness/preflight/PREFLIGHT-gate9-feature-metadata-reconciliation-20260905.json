@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "assignment_id": "gate9:feature-metadata-reconciliation-20260905",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "kd4_features.toml",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "gate9-actual-manifest-seven-stale-references"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "gate9:feature-metadata-reconciliation-20260905",
+  "validation_owner": "gate9:feature-metadata-reconciliation-20260905",
+  "validation_commands": [
+    "python -c \"from pathlib import Path; from scripts.check_kd4_features import validate_manifest; result = validate_manifest(Path('kd4_features.toml'), repo_root=Path.cwd(), strict=False); print(result.to_json()); raise SystemExit(not result.ok)\""
+  ],
+  "cargo_lane": {
+    "target_dir": ".codex/harness/runs/2026-09-02-completion-proof-migration/gate9-execution/no-cargo-feature-metadata",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

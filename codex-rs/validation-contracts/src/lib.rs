@@ -6,6 +6,10 @@
 
 pub mod applicability;
 pub mod canonical;
+pub mod focused_evidence_frame;
+pub mod focused_live_successor;
+pub mod focused_replacement_approval;
+pub mod historical_replacement_acceptance;
 pub mod inventory_v2;
 pub mod path;
 pub mod receipts;

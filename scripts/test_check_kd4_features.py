@@ -598,27 +598,116 @@ class CheckKd4FeaturesTest(unittest.TestCase):
     def test_performance_sensitive_completion_requires_comparable_evidence_through_cli(
         self,
     ) -> None:
-        policy_path = self.repo_checkout / "AGENTS.md"
-        body = (
-            f"policy = Path({str(policy_path)!r}).read_text(encoding='utf-8'); "
-            "self.assertIn('real integration or runtime path', policy)"
-        )
         (self.repo_root / "tests" / "test_feature.py").write_text(
             textwrap.dedent(
-                f"""
+                """
+                import copy
+                import sys
                 import unittest
-                from pathlib import Path
+
+                sys.path.insert(0, __KD4_REPOSITORY__)
+                from scripts import kd4_live_agent_benchmark as benchmark
+
+
+                def run():
+                    return {
+                        "success": True,
+                        "outcomeCorrect": True,
+                        "taskContractCompliant": True,
+                        "terminalEvent": "turn.completed",
+                        "completionMs": 100.0,
+                        "modelWaitMs": 75.0,
+                        "actualCommandCount": 4,
+                        "duplicateCommandCount": 0,
+                        "taskContract": {"successfulTestObserved": True},
+                        "latencyExplanation": {
+                            "observed": {
+                                "postFirstOutputMs": 90.0,
+                                "firstWorkspaceMutationObservedMs": 20.0,
+                                "firstRequiredTestCompletedObservedMs": 80.0,
+                                "requiredTestToTerminalMs": 20.0,
+                            },
+                            "instrumentedRuntime": {
+                                "available": True,
+                                "counters": {"logicalGenerationCount": 2},
+                                "tokenTotalsAcrossRequests": {"totalTokens": 100},
+                            },
+                        },
+                    }
 
                 class FeatureRegistrationTest(unittest.TestCase):
                     def test_feature_is_live(self):
-                        {body}
+                        pairs = [
+                            {
+                                "taskId": task.task_id,
+                                "taskShape": task.shape,
+                                "repetition": repetition,
+                                "currentFork": run(),
+                                "upstreamC": run(),
+                            }
+                            for task in benchmark.BENCHMARK_TASKS
+                            for repetition in range(
+                                1, benchmark.MIN_GATE_REPETITIONS_PER_TASK + 1
+                            )
+                        ]
+                        passing = benchmark.build_regression_gate(
+                            pairs,
+                            fork_label="candidate",
+                            upstream_label="baseline",
+                            experiment_feature="terminalization",
+                        )
+                        self.assertTrue(passing["passed"], passing)
+                        self.assertEqual(
+                            passing["thresholds"]["completionMs"],
+                            {"maxCandidateToControlRatio": 1.05},
+                        )
+                        task_id = benchmark.BENCHMARK_TASKS[0].task_id
+                        completion = passing["taskGates"][task_id]["metrics"][
+                            "completionMs"
+                        ]
+                        self.assertEqual(
+                            passing["taskGates"][task_id]["candidate"], "candidate"
+                        )
+                        self.assertEqual(
+                            passing["taskGates"][task_id]["control"], "baseline"
+                        )
+                        self.assertEqual(
+                            completion["median"],
+                            {"candidate": 100.0, "control": 100.0, "passed": True},
+                        )
+                        self.assertEqual(
+                            completion["p90"],
+                            {"candidate": 100.0, "control": 100.0, "passed": True},
+                        )
+
+                        regressed = copy.deepcopy(pairs)
+                        regressed_pair = next(
+                            pair
+                            for pair in regressed
+                            if pair["taskId"] == task_id and pair["repetition"] == 6
+                        )
+                        regressed_pair["currentFork"]["completionMs"] = 106.0
+                        failing = benchmark.build_regression_gate(
+                            regressed,
+                            fork_label="candidate",
+                            upstream_label="baseline",
+                            experiment_feature="terminalization",
+                        )
+                        failed_completion = failing["taskGates"][task_id]["metrics"][
+                            "completionMs"
+                        ]
+                        self.assertFalse(failing["passed"])
+                        self.assertTrue(failed_completion["median"]["passed"])
+                        self.assertFalse(failed_completion["p90"]["passed"])
+                        self.assertTrue(failing["aggregateDiagnosticOnly"]["passed"])
                 """
-            ),
+            ).replace("__KD4_REPOSITORY__", repr(str(self.repo_checkout))),
             encoding="utf-8",
         )
         completed, payload = self.run_json(self.write_manifest())
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertTrue(payload["ok"])
+        self.assertEqual(payload["runtimeVerificationExitCode"], 0)
 
     def test_planned_feature_cannot_retain_live_route_evidence_through_cli(
         self,
@@ -745,15 +834,25 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertEqual(payload["statusCounts"], {"enabled": 1})
 
     def test_repository_manifest_passes_non_strict_through_cli(self) -> None:
-        manifest = self.write_manifest()
+        manifest = self.repo_checkout / "kd4_features.toml"
+        env, log = self.install_fake("just")
         completed, payload = self.run_json(
             manifest,
             "--no-strict",
+            "--run-runtime-verification",
+            "structured-command-execution",
+            repo_root=self.repo_checkout,
+            env=env,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["featureCount"], 1)
+        self.assertEqual(payload["findings"], [])
+        self.assertGreater(payload["featureCount"], 1)
         self.assertEqual(payload["runtimeVerificationExitCode"], 0)
+        self.assertEqual(
+            log.read_text(encoding="utf-8").strip().split("\t")[:2],
+            ["core-test-fast", "core_lib"],
+        )
 
     def test_retired_parallel_implementation_fails_if_it_reappears_through_cli(
         self,

@@ -1,0 +1,61 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/validation/focused-live-successor-catalog-v1.schema.json",
+          ".codex"
+        ],
+        [
+          "scripts/fixtures/focused_live_successor_catalog_v1_vectors.json",
+          "scripts"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:focused-catalog-schema-vectors-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\focused-catalog-schema-vectors"
+  },
+  "contract_claims": [
+    "focused-live-successor-catalog-schema-vectors"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T13:41:56.724589+00:00",
+  "generated_output_owner": "worker:focused-catalog-schema-vectors-20260904",
+  "generated_outputs": [
+    "scripts/fixtures/focused_live_successor_catalog_v1_vectors.json"
+  ],
+  "manifest_fingerprint": "2b6b998d9684a1517c14ff372e900d116bffcbb485b555b4adbf3d3e4da45c3a",
+  "path_claims": [
+    {
+      "path": ".codex/validation/focused-live-successor-catalog-v1.schema.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/fixtures/focused_live_successor_catalog_v1_vectors.json",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T12:41:56.724589+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "a0fca864b7cd9a713eb5f0c9895fc0a5b126a6958ff495cf9027eb5d3a71cdad"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_focused_live_successor_catalog"
+  ],
+  "validation_owner": "worker:focused-catalog-python-contract-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

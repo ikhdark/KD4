@@ -1,0 +1,471 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kd4://validation/focused-live-successor-catalog-v1.schema.json",
+  "title": "KD4 FocusedLiveSuccessorCatalogV1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "format_id": { "const": "kd4.focused-live-successor-catalog.v1" },
+    "schema_version": { "const": 1 },
+    "attempt_id": { "$ref": "#/$defs/uuid_v7" },
+    "focused_validation_id": { "const": "inventory.current-evidence" },
+    "frozen_inventory_hash": { "$ref": "#/$defs/sha256" },
+    "start_fingerprint": { "$ref": "#/$defs/sha256" },
+    "start_mutation_epoch": { "$ref": "#/$defs/safe_unsigned_integer" },
+    "replacement_baseline_row_count": { "$ref": "#/$defs/safe_unsigned_integer" },
+    "distinct_successor_count": { "$ref": "#/$defs/safe_unsigned_integer" },
+    "successor_ids_sha256": { "$ref": "#/$defs/sha256" },
+    "successor_owner_map_sha256": { "$ref": "#/$defs/sha256" },
+    "current_inventory_count": { "$ref": "#/$defs/safe_unsigned_integer" },
+    "current_inventory_hash": { "$ref": "#/$defs/sha256" },
+    "current_inventory": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/current_inventory_row" },
+      "uniqueItems": true
+    },
+    "resolved_successor_entries": {
+      "type": "array",
+      "items": { "$ref": "inventory-shared-types-v1.schema.json#/$defs/resolved_executable_entry" },
+      "uniqueItems": true
+    },
+    "resolved_successor_entries_sha256": { "$ref": "#/$defs/sha256" },
+    "execution_input_contracts": {
+      "type": "array",
+      "items": { "$ref": "inventory-shared-types-v1.schema.json#/$defs/execution_input_contract" },
+      "uniqueItems": true
+    },
+    "cargo_target_context_specs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/cargo_target_context_spec" },
+      "uniqueItems": true
+    },
+    "replacement_successor_catalog": { "$ref": "#/$defs/replacement_successor_catalog" },
+    "in_process_jest_discovery": { "$ref": "#/$defs/in_process_jest_discovery" },
+    "inventory_discovery_processes_sha256": { "$ref": "#/$defs/sha256" },
+    "semantic_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "required": [
+    "format_id",
+    "schema_version",
+    "attempt_id",
+    "focused_validation_id",
+    "frozen_inventory_hash",
+    "start_fingerprint",
+    "start_mutation_epoch",
+    "replacement_baseline_row_count",
+    "distinct_successor_count",
+    "successor_ids_sha256",
+    "successor_owner_map_sha256",
+    "current_inventory_count",
+    "current_inventory_hash",
+    "current_inventory",
+    "resolved_successor_entries",
+    "resolved_successor_entries_sha256",
+    "execution_input_contracts",
+    "cargo_target_context_specs",
+    "replacement_successor_catalog",
+    "in_process_jest_discovery",
+    "inventory_discovery_processes_sha256",
+    "semantic_sha256"
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nfc_nonempty_string": {
+      "type": "string",
+      "format": "kd4-nfc-string",
+      "minLength": 1
+    },
+    "windows_absolute_path": {
+      "type": "string",
+      "format": "kd4-nfc-string",
+      "minLength": 3,
+      "pattern": "^[A-Za-z]:\\\\(?:[^\\u0000-\\u001f\\u007f<>:\"/\\\\|?*]+(?:\\\\[^\\u0000-\\u001f\\u007f<>:\"/\\\\|?*]+)*)?$",
+      "allOf": [
+        { "not": { "pattern": "(?:^|\\\\)\\.{1,2}(?:\\\\|$)" } },
+        { "not": { "pattern": "[ .](?:\\\\|$)" } },
+        {
+          "not": {
+            "pattern": "^[A-Za-z]:\\\\(?:[^\\\\]+\\\\)*(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Ll][Oo][Cc][Kk]\\$|[Cc][Oo][Nn](?:[Ii][Nn]|[Oo][Uu][Tt])\\$|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.[^\\\\]*)?(?:\\\\|$)"
+          }
+        }
+      ]
+    },
+    "windows_absolute_file_path": {
+      "allOf": [
+        { "$ref": "#/$defs/windows_absolute_path" },
+        { "minLength": 4 }
+      ]
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "strict_repository_path": {
+      "type": "string",
+      "format": "kd4-nfc-string",
+      "minLength": 1,
+      "pattern": "^(?![A-Za-z]:)(?!/)(?!.*:)(?!.*\\\\)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//).+$"
+    },
+    "safe_unsigned_integer": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "u64_decimal_string": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 20,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "uuid_v4": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "uuid_v7": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "current_inventory_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "baseline_id": { "$ref": "#/$defs/nfc_nonempty_string" },
+        "framework": {
+          "enum": [
+            "argument-comment-lint-native",
+            "javascript-jest",
+            "python-pytest",
+            "python-unittest",
+            "rust-doctest",
+            "rust-nextest",
+            "windows-sandbox-smoke"
+          ]
+        },
+        "native_id": { "$ref": "#/$defs/nfc_nonempty_string" },
+        "source": { "$ref": "#/$defs/strict_repository_path" },
+        "ignored": { "type": "boolean" },
+        "platforms": {
+          "type": "array",
+          "items": { "enum": ["darwin", "linux", "windows"] },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "required": ["baseline_id", "framework", "native_id", "source", "ignored", "platforms"]
+    },
+    "replacement_successor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "test_id": { "$ref": "#/$defs/nfc_nonempty_string" },
+        "framework": { "$ref": "#/$defs/nfc_nonempty_string" },
+        "native_id": { "$ref": "#/$defs/nfc_nonempty_string" },
+        "source_path": { "$ref": "#/$defs/strict_repository_path" },
+        "test_route_id": { "$ref": "#/$defs/identifier" },
+        "validation_id": { "$ref": "#/$defs/identifier" },
+        "runner_selector_sha256": { "$ref": "#/$defs/sha256" },
+        "executable_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "execution_input_contract_sha256": { "$ref": "#/$defs/sha256" },
+        "platform_applicability_sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": [
+        "test_id",
+        "framework",
+        "native_id",
+        "source_path",
+        "test_route_id",
+        "validation_id",
+        "runner_selector_sha256",
+        "executable_identity_sha256",
+        "execution_input_contract_sha256",
+        "platform_applicability_sha256"
+      ]
+    },
+    "replacement_successor_catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "format_id": { "const": "kd4.replacement-successor-catalog.v1" },
+        "schema_version": { "const": 1 },
+        "successors": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/replacement_successor" },
+          "uniqueItems": true
+        }
+      },
+      "required": ["format_id", "schema_version", "successors"]
+    },
+    "cargo_feature_selection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "additional_features": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/nfc_nonempty_string" },
+              "uniqueItems": true
+            },
+            "kind": { "const": "default" }
+          },
+          "required": ["additional_features", "kind"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "features": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/nfc_nonempty_string" },
+              "uniqueItems": true
+            },
+            "kind": { "const": "no-default" }
+          },
+          "required": ["features", "kind"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "all" } },
+          "required": ["kind"]
+        }
+      ]
+    },
+    "cargo_target_context_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cargo_profile": { "const": "test" },
+        "context_sha256": { "$ref": "#/$defs/sha256" },
+        "feature_selection": { "$ref": "#/$defs/cargo_feature_selection" },
+        "package_manifest_path": { "$ref": "#/$defs/strict_repository_path" },
+        "package_name": { "$ref": "#/$defs/nfc_nonempty_string" },
+        "schema_version": { "const": 1 },
+        "target_kind": { "enum": ["lib", "proc-macro", "bin", "example", "test", "bench"] },
+        "target_name": { "$ref": "#/$defs/nfc_nonempty_string" },
+        "target_source_path": { "$ref": "#/$defs/strict_repository_path" },
+        "workspace_manifest_path": { "$ref": "#/$defs/strict_repository_path" }
+      },
+      "required": [
+        "cargo_profile",
+        "context_sha256",
+        "feature_selection",
+        "package_manifest_path",
+        "package_name",
+        "schema_version",
+        "target_kind",
+        "target_name",
+        "target_source_path",
+        "workspace_manifest_path"
+      ]
+    },
+    "in_process_jest_discovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "observation_id": { "const": "inventory.sdk.typescript.jest" },
+        "execution_id": { "$ref": "#/$defs/uuid_v4" },
+        "runner_pid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "started_at": { "$ref": "#/$defs/u64_decimal_string" },
+        "ended_at": { "$ref": "#/$defs/u64_decimal_string" },
+        "discovered_count": { "$ref": "#/$defs/safe_unsigned_integer" },
+        "discovered_test_ids_sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": [
+        "observation_id",
+        "execution_id",
+        "runner_pid",
+        "started_at",
+        "ended_at",
+        "discovered_count",
+        "discovered_test_ids_sha256"
+      ]
+    },
+    "stable_file_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "windows-file-id-info-v1" },
+        "volume_serial_number_hex": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 16,
+          "pattern": "^[0-9a-f]{16}$"
+        },
+        "file_id_hex": {
+          "type": "string",
+          "minLength": 32,
+          "maxLength": 32,
+          "pattern": "^[0-9a-f]{32}$"
+        }
+      },
+      "required": ["kind", "volume_serial_number_hex", "file_id_hex"],
+      "allOf": [
+        {
+          "not": {
+            "properties": { "file_id_hex": { "const": "00000000000000000000000000000000" } },
+            "required": ["file_id_hex"]
+          }
+        },
+        {
+          "not": {
+            "properties": { "file_id_hex": { "const": "ffffffffffffffffffffffffffffffff" } },
+            "required": ["file_id_hex"]
+          }
+        }
+      ]
+    },
+    "launch_target_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requested": { "$ref": "#/$defs/nfc_nonempty_string" },
+        "resolved_path": { "$ref": "#/$defs/windows_absolute_file_path" },
+        "sha256_before": { "$ref": "#/$defs/sha256" },
+        "sha256_after": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["requested", "resolved_path", "sha256_before", "sha256_after"]
+    },
+    "inventory_discovery_child_process": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "validation_id": { "$ref": "#/$defs/identifier" },
+        "execution_id": { "$ref": "#/$defs/uuid_v4" },
+        "pid": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "executable": { "$ref": "#/$defs/windows_absolute_file_path" },
+        "launch_target_identity": { "$ref": "#/$defs/launch_target_identity" },
+        "args_hash": { "$ref": "#/$defs/sha256" },
+        "started_at": { "$ref": "#/$defs/u64_decimal_string" },
+        "ended_at": { "$ref": "#/$defs/u64_decimal_string" },
+        "exit_code": { "const": 0 }
+      },
+      "required": [
+        "validation_id",
+        "execution_id",
+        "pid",
+        "executable",
+        "launch_target_identity",
+        "args_hash",
+        "started_at",
+        "ended_at",
+        "exit_code"
+      ]
+    },
+    "stdout_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "stdout" },
+        "stdout_sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["kind", "stdout_sha256"]
+    },
+    "report_file_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "report-file" },
+        "report_path": { "$ref": "#/$defs/windows_absolute_file_path" },
+        "report_identity": { "$ref": "#/$defs/stable_file_identity" },
+        "report_sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["kind", "report_path", "report_identity", "report_sha256"]
+    },
+    "inventory_discovery_process": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "role": {
+          "enum": [
+            "inventory.root-unittest",
+            "inventory.rust-doctest",
+            "inventory.rust-nextest",
+            "inventory.sdk-python-pytest",
+            "inventory.tools.argument-comment-lint.native",
+            "inventory.windows.sandbox-smoke"
+          ]
+        },
+        "child_process": { "$ref": "#/$defs/inventory_discovery_child_process" },
+        "argv": {
+          "type": "array",
+          "items": { "type": "string", "format": "kd4-nfc-string" },
+          "minItems": 1
+        },
+        "cwd": { "$ref": "#/$defs/windows_absolute_path" },
+        "output": {
+          "oneOf": [
+            { "$ref": "#/$defs/stdout_output" },
+            { "$ref": "#/$defs/report_file_output" }
+          ]
+        }
+      },
+      "required": ["role", "child_process", "argv", "cwd", "output"]
+    },
+    "inventory_discovery_processes": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/inventory_discovery_process",
+          "properties": {
+            "role": { "const": "inventory.rust-nextest" },
+            "child_process": { "properties": { "validation_id": { "const": "inventory.rust-nextest" } } },
+            "output": { "$ref": "#/$defs/stdout_output" }
+          }
+        },
+        {
+          "$ref": "#/$defs/inventory_discovery_process",
+          "properties": {
+            "role": { "const": "inventory.rust-doctest" },
+            "child_process": { "properties": { "validation_id": { "const": "inventory.rust-doctest" } } },
+            "output": { "$ref": "#/$defs/stdout_output" }
+          }
+        },
+        {
+          "$ref": "#/$defs/inventory_discovery_process",
+          "properties": {
+            "role": { "const": "inventory.root-unittest" },
+            "child_process": { "properties": { "validation_id": { "const": "inventory.root-unittest" } } },
+            "output": { "$ref": "#/$defs/report_file_output" }
+          }
+        },
+        {
+          "$ref": "#/$defs/inventory_discovery_process",
+          "properties": {
+            "role": { "const": "inventory.sdk-python-pytest" },
+            "child_process": { "properties": { "validation_id": { "const": "inventory.sdk-python-pytest" } } },
+            "output": { "$ref": "#/$defs/report_file_output" }
+          }
+        },
+        {
+          "$ref": "#/$defs/inventory_discovery_process",
+          "properties": {
+            "role": { "const": "inventory.tools.argument-comment-lint.native" },
+            "child_process": { "properties": { "validation_id": { "const": "inventory.tools.argument-comment-lint.native" } } },
+            "output": { "$ref": "#/$defs/stdout_output" }
+          }
+        },
+        {
+          "$ref": "#/$defs/inventory_discovery_process",
+          "properties": {
+            "role": { "const": "inventory.windows.sandbox-smoke" },
+            "child_process": { "properties": { "validation_id": { "const": "inventory.windows.sandbox-smoke" } } },
+            "output": { "$ref": "#/$defs/stdout_output" }
+          }
+        }
+      ],
+      "items": false
+    }
+  }
+}

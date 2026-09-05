@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:direct-argv-shell-ownership-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/src/unified_exec/process_manager.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/src/tools/runtimes/unified_exec.rs",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-direct-argv-shell-ownership-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-direct-argv-shell-ownership-20260904.receipt.json",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "unified-exec-direct-argv-shell-ownership"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902",
+    "worker:cli-app-server-direct-argv-proof-20260904"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "just core-test-fast cli_completion_proof -E 'test(=real_cli_app_server_accepts_canonical_completion_proof_via_direct_argv)'",
+    "just core-test-fast core_lib -E 'test(=tools::runtimes::unified_exec::tests::sandbox_shell_type_tracks_owned_shell_wrapper)'"
+  ],
+  "cargo_lane": {
+    "target_dir": "codex-rs/target",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

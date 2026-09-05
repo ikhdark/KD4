@@ -121,11 +121,40 @@ fn cached_cap_sids<'a>(
         .ok_or_else(|| anyhow::anyhow!("capability SID cache insertion failed"))
 }
 
+/// Refreshes this process's capability SID cache after the setup helper has
+/// updated the shared `cap_sid` file in a separate process.
+///
+/// Per-root capability SIDs must match the ACLs installed by that helper. A
+/// long-lived parent process cannot keep using the cache it populated before a
+/// newly allowed root was added on disk.
+pub(crate) fn refresh_cap_sids_cache_from_disk(codex_home: &Path) -> Result<()> {
+    let key = canonical_path_key(&cap_sid_file(codex_home));
+    let mut cache = cap_sids_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let caps = load_or_create_cap_sids_from_disk(codex_home)?;
+    #[cfg(test)]
+    let disk_load_count = cache
+        .get(&key)
+        .map_or(1, |cached| cached.disk_load_count + 1);
+    cache.insert(
+        key,
+        CachedCapSids {
+            caps,
+            #[cfg(test)]
+            disk_load_count,
+        },
+    );
+    Ok(())
+}
+
 /// Loads the process-stable capability SID set once per Codex home.
 ///
-/// The file is mutated only through the helpers in this module, which update the
-/// cached value while holding the same lock. This avoids reopening and parsing
-/// the SID file for every sandboxed command without changing SID persistence.
+/// In-process mutations use the helpers in this module and update the cached
+/// value while holding the same lock. The Windows setup helper runs in a
+/// separate process, so its caller must refresh this cache after the helper
+/// exits successfully. This avoids reopening and parsing the SID file for every
+/// sandboxed command without changing SID persistence.
 pub fn load_or_create_cap_sids(codex_home: &Path) -> Result<CapSids> {
     let mut cache = cap_sids_cache()
         .lock()
@@ -222,9 +251,14 @@ pub fn workspace_write_root_specificity(root: &Path) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::canonical_path_key;
     use super::cap_sid_disk_load_count;
+    use super::cap_sid_file;
     use super::load_or_create_cap_sids;
+    use super::load_or_create_cap_sids_from_disk;
     use super::make_random_cap_sid_string;
+    use super::persist_caps;
+    use super::refresh_cap_sids_cache_from_disk;
     use super::workspace_cap_sid_for_cwd;
     use super::workspace_write_cap_sid_for_root;
     use super::workspace_write_cap_sid_for_root_keys;
@@ -243,6 +277,37 @@ mod tests {
         assert_eq!(first.workspace, second.workspace);
         assert_eq!(first.readonly, second.readonly);
         assert_eq!(cap_sid_disk_load_count(home.path()), 1);
+    }
+
+    #[test]
+    fn external_cap_sid_rewrite_refreshes_process_cache() {
+        let temp = TempDir::new().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let workspace = temp.path().join("workspace");
+        let report_root = temp.path().join("report-root");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&report_root).expect("create report root");
+
+        load_or_create_cap_sids(&codex_home).expect("warm parent process cache");
+        let helper_sid = make_random_cap_sid_string();
+        let mut helper_caps = load_or_create_cap_sids_from_disk(&codex_home)
+            .expect("load setup helper capability SIDs");
+        helper_caps
+            .writable_root_by_path
+            .insert(canonical_path_key(&report_root), helper_sid.clone());
+        persist_caps(&cap_sid_file(&codex_home), &helper_caps)
+            .expect("persist setup helper capability SIDs");
+
+        refresh_cap_sids_cache_from_disk(&codex_home)
+            .expect("refresh parent process cache after setup helper");
+
+        assert_eq!(
+            workspace_write_cap_sid_for_root(&codex_home, &workspace, &report_root)
+                .expect("look up refreshed report-root SID"),
+            helper_sid
+        );
+        assert_eq!(cap_sid_disk_load_count(&codex_home), 2);
     }
 
     #[test]

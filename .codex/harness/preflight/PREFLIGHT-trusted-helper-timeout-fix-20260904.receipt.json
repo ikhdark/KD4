@@ -1,0 +1,99 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "worker:canonical-jcs-helper-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "worker:nextest-live-parser-n1-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/core/tests/suite/completion_proof_gate.rs",
+          "codex-rs"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-trusted-helper-timeout-fix-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-trusted-helper-timeout-fix-20260904.receipt.json",
+          ".codex"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "worker:trusted-helper-authority-order-20260904",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "codex-rs/core/tests/suite/completion_proof_gate.rs",
+          "codex-rs/core/tests/suite/completion_proof_gate.rs"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "worker:trusted-helper-authority-order-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    }
+  ],
+  "assignment_id": "worker:trusted-helper-timeout-fix-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+  },
+  "contract_claims": [
+    "trusted-helper-authority-order-regression-bounded-real-path"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T11:13:39.332012+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "ebdf33a110597d719bbf46edfab9f85a34697106ca2f27187c9169c8102e3de0",
+  "path_claims": [
+    {
+      "path": "codex-rs/core/tests/suite/completion_proof_gate.rs",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-trusted-helper-timeout-fix-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-trusted-helper-timeout-fix-20260904.receipt.json",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T10:13:39.332012+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "c30a5aa9a374f5b241c8eaa982dbb0f4e1a0fd2540a5a151d0277606abf5e745"
+  },
+  "validation_commands": [
+    "cargo test --locked --manifest-path codex-rs/Cargo.toml -p codex-core --test core_cli_workspace changed_trusted_helper_is_rejected_before_focused_failure_can_poison",
+    "cargo test --locked --manifest-path codex-rs/Cargo.toml -p codex-core --test core_cli_workspace changed_trusted_helper_is_rejected_before_canonical_failure_can_poison"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

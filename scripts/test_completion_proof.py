@@ -130,7 +130,8 @@ class CompletionProofCliTest(unittest.TestCase):
                         return;
                     }
 
-                    let arguments = env::args().skip(1).collect::<Vec<_>>().join(" ");
+                    let argument_list = env::args().skip(1).collect::<Vec<_>>();
+                    let arguments = argument_list.join(" ");
                     let selected = env::var("KD4_FAKE_GIT_HANG_MATCH")
                         .map(|value| arguments.contains(&value))
                         .unwrap_or(false);
@@ -150,6 +151,31 @@ class CompletionProofCliTest(unittest.TestCase):
                         .unwrap();
                         thread::sleep(Duration::from_secs(30));
                         return;
+                    }
+
+                    let delay_selected = env::var("KD4_FAKE_GIT_DELAY_MATCH")
+                        .map(|value| arguments.contains(&value))
+                        .unwrap_or(false);
+                    if delay_selected {
+                        if let Some(marker) = env::var_os("KD4_FAKE_GIT_DELAY_MARKER") {
+                            fs::write(&marker, "started\n").unwrap();
+                        }
+                        let delay_millis = env::var("KD4_FAKE_GIT_DELAY_MILLIS")
+                            .unwrap()
+                            .parse::<u64>()
+                            .unwrap();
+                        thread::sleep(Duration::from_millis(delay_millis));
+                        if let Some(marker) = env::var_os("KD4_FAKE_GIT_DELAY_MARKER") {
+                            fs::write(marker, "finished\n").unwrap();
+                        }
+                    }
+
+                    if let Some(real_git) = env::var_os("KD4_FAKE_GIT_REAL_PATH") {
+                        let status = Command::new(real_git)
+                            .args(&argument_list)
+                            .status()
+                            .unwrap();
+                        std::process::exit(status.code().unwrap_or(2));
                     }
 
                     if arguments.contains("rev-parse --verify HEAD^{tree}") {
@@ -306,6 +332,10 @@ class CompletionProofCliTest(unittest.TestCase):
         child_pid_file: Path,
         hang_trigger: Path | None = None,
         report_ignored: bool = False,
+        real_git_passthrough: bool = False,
+        delay_match: str | None = None,
+        delay_millis: int | None = None,
+        delay_marker: Path | None = None,
     ) -> dict[str, str]:
         fake_bin = self.base / f"fake-git-bin-{uuid.uuid4()}"
         fake_bin.mkdir()
@@ -313,6 +343,7 @@ class CompletionProofCliTest(unittest.TestCase):
         shutil.copy2(self._native_fake_git_launcher(), fake_git)
         fake_git.chmod(fake_git.stat().st_mode | 0o111)
         env = self._base_env()
+        real_git = shutil.which("git", path=env.get("PATH"))
         env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
         env["KD4_FAKE_GIT_HANG_MATCH"] = hang_match
         env["KD4_FAKE_GIT_CHILD_PID"] = str(child_pid_file)
@@ -320,6 +351,17 @@ class CompletionProofCliTest(unittest.TestCase):
             env["KD4_FAKE_GIT_HANG_TRIGGER"] = str(hang_trigger)
         if report_ignored:
             env["KD4_FAKE_GIT_REPORT_IGNORED"] = "1"
+        if real_git_passthrough:
+            if real_git is None:
+                self.fail("real Git executable is unavailable for fake-Git passthrough")
+            env["KD4_FAKE_GIT_REAL_PATH"] = str(Path(real_git).resolve())
+        if (delay_match is None) != (delay_millis is None):
+            self.fail("fake-Git delay match and duration must be supplied together")
+        if delay_match is not None and delay_millis is not None:
+            env["KD4_FAKE_GIT_DELAY_MATCH"] = delay_match
+            env["KD4_FAKE_GIT_DELAY_MILLIS"] = str(delay_millis)
+        if delay_marker is not None:
+            env["KD4_FAKE_GIT_DELAY_MARKER"] = str(delay_marker)
         return env
 
     def _run_fake_git_cli(
@@ -343,6 +385,36 @@ class CompletionProofCliTest(unittest.TestCase):
             timeout=15,
             check=False,
         )
+
+    def _run_fake_git_canonical(
+        self,
+        *,
+        env: Mapping[str, str],
+        patch_source: str,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        report = self.base / f"report-{uuid.uuid4()}.json"
+        command, runtime_env = self._canonical_invocation(
+            report,
+            patch_source=patch_source,
+        )
+        runtime_env["PATH"] = env["PATH"]
+        runtime_env.update(
+            (name, value)
+            for name, value in env.items()
+            if name.startswith("KD4_FAKE_GIT_")
+        )
+        result = subprocess.run(
+            command,
+            cwd=self.repository,
+            env=runtime_env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        return result, report
 
     def _write_json(self, path: Path, value: object) -> None:
         path.write_text(
@@ -795,7 +867,7 @@ class CompletionProofCliTest(unittest.TestCase):
         output: str,
         *,
         child_returncode: int,
-        later_supervision_error: str,
+        later_supervision_error: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, object], dict[str, object]]:
         fixture_id = uuid.uuid4().hex
         output_path = self.base / f"doctest-output-{fixture_id}.txt"
@@ -813,7 +885,12 @@ class CompletionProofCliTest(unittest.TestCase):
                 log_path = pathlib.Path(sys.argv[1])
                 output_path = pathlib.Path(sys.argv[2])
                 log_path.write_text(
-                    json.dumps({{"pid": os.getpid(), "argv": sys.argv[3:]}}) + "\\n",
+                    json.dumps({{
+                        "pid": os.getpid(),
+                        "argv": sys.argv[3:],
+                        "RUST_TEST_NOCAPTURE": os.environ.get("RUST_TEST_NOCAPTURE"),
+                        "RUSTC_BOOTSTRAP": os.environ.get("RUSTC_BOOTSTRAP"),
+                    }}) + "\\n",
                     encoding="utf-8",
                 )
                 sys.stdout.write(output_path.read_text(encoding="utf-8"))
@@ -847,7 +924,7 @@ class CompletionProofCliTest(unittest.TestCase):
                     env=env,
                     timeout_seconds=timeout_seconds,
                 )
-                if validation_id == "rust.doctest.workspace":
+                if validation_id == "rust.doctest.workspace" and {later_supervision_error!r}:
                     result.returncode = None
                     result.child.exit_code = None
                     result.invocation_error = {later_supervision_error!r}
@@ -1305,12 +1382,216 @@ class CompletionProofCliTest(unittest.TestCase):
                 self.assertGreater(child["pid"], 0)
                 self.assertEqual(launch["pid"], child["pid"])
 
-    def test_canonical_doctest_preserves_failure_before_supervision_error(self) -> None:
+    def test_canonical_doctest_accepts_fresh_libtest_json_lifecycle(self) -> None:
+        native_id = "fixture::runtime_path (line 1)"
+        self._write_rust_doctest_workspace_fixture(native_id)
+        output = "\n".join(
+            [
+                json.dumps({"type": "suite", "event": "started", "test_count": 1}),
+                json.dumps({"type": "test", "event": "started", "name": native_id}),
+                json.dumps({"type": "test", "event": "ok", "name": native_id}),
+                json.dumps(
+                    {
+                        "type": "suite",
+                        "event": "ok",
+                        "passed": 1,
+                        "failed": 0,
+                        "ignored": 0,
+                        "measured": 0,
+                        "filtered_out": 0,
+                    }
+                ),
+            ]
+        )
+
+        result, report, launch = self._run_rust_doctest_output(
+            output,
+            child_returncode=0,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(report["attempt_classification"], "confirmed_pass")
+        validation = next(
+            item
+            for item in report["validations"]
+            if item["id"] == "rust.doctest.workspace"
+        )
+        self.assertEqual(validation["classification"], "confirmed_pass")
+        self.assertEqual(validation["executed_ids"], [native_id])
+        self.assertEqual(validation["outcomes"], [{"id": native_id, "outcome": "passed"}])
+        self.assertEqual(
+            launch["argv"],
+            [
+                "cargo",
+                "test",
+                "--workspace",
+                "--doc",
+                "--",
+                "--include-ignored",
+                "-Z",
+                "unstable-options",
+                "--format",
+                "json",
+            ],
+        )
+        self.assertEqual(launch["RUST_TEST_NOCAPTURE"], "0")
+        self.assertEqual(launch["RUSTC_BOOTSTRAP"], "-1")
+
+    def test_canonical_doctest_rejects_pretty_stdout_pass_spoof(self) -> None:
         native_id = "fixture::runtime_path (line 1)"
         self._write_rust_doctest_workspace_fixture(native_id)
 
+        result, report, _ = self._run_rust_doctest_output(
+            f"test {native_id} ... ok",
+            child_returncode=0,
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        validation = next(
+            item
+            for item in report["validations"]
+            if item["id"] == "rust.doctest.workspace"
+        )
+        self.assertEqual(validation["classification"], "pre_result_error")
+        self.assertEqual(validation["executed_ids"], [])
+        self.assertIn("invalid Rust doctest libtest JSON event", validation["diagnostic"])
+
+    def test_canonical_doctest_rejects_zero_structured_selection(self) -> None:
+        native_id = "fixture::runtime_path (line 1)"
+        self._write_rust_doctest_workspace_fixture(native_id)
+        output = "\n".join(
+            [
+                json.dumps({"type": "suite", "event": "started", "test_count": 0}),
+                json.dumps(
+                    {
+                        "type": "suite",
+                        "event": "ok",
+                        "passed": 0,
+                        "failed": 0,
+                        "ignored": 0,
+                        "measured": 0,
+                        "filtered_out": 0,
+                    }
+                ),
+            ]
+        )
+
+        result, report, _ = self._run_rust_doctest_output(
+            output,
+            child_returncode=0,
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        validation = next(
+            item
+            for item in report["validations"]
+            if item["id"] == "rust.doctest.workspace"
+        )
+        self.assertEqual(validation["classification"], "pre_result_error")
+        self.assertEqual(validation["executed_ids"], [])
+        self.assertIn("selected zero tests", validation["diagnostic"])
+
+    def test_canonical_doctest_rejects_duplicate_structured_lifecycle(self) -> None:
+        native_id = "fixture::runtime_path (line 1)"
+        self._write_rust_doctest_workspace_fixture(native_id)
+        output = "\n".join(
+            [
+                '{"type":"suite","event":"started","event":"started","test_count":1}',
+                json.dumps({"type": "test", "event": "started", "name": native_id}),
+                json.dumps({"type": "test", "event": "ok", "name": native_id}),
+                json.dumps(
+                    {
+                        "type": "suite",
+                        "event": "ok",
+                        "passed": 1,
+                        "failed": 0,
+                        "ignored": 0,
+                        "measured": 0,
+                        "filtered_out": 0,
+                    }
+                ),
+            ]
+        )
+
+        result, report, _ = self._run_rust_doctest_output(
+            output,
+            child_returncode=0,
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        validation = next(
+            item
+            for item in report["validations"]
+            if item["id"] == "rust.doctest.workspace"
+        )
+        self.assertEqual(validation["classification"], "pre_result_error")
+        self.assertIn("duplicate keys", validation["diagnostic"])
+
+    def test_canonical_doctest_rejects_contradictory_suite_counts(self) -> None:
+        native_id = "fixture::runtime_path (line 1)"
+        self._write_rust_doctest_workspace_fixture(native_id)
+        output = "\n".join(
+            [
+                json.dumps({"type": "suite", "event": "started", "test_count": 1}),
+                json.dumps({"type": "test", "event": "started", "name": native_id}),
+                json.dumps({"type": "test", "event": "ok", "name": native_id}),
+                json.dumps(
+                    {
+                        "type": "suite",
+                        "event": "failed",
+                        "passed": 0,
+                        "failed": 1,
+                        "ignored": 0,
+                        "measured": 0,
+                        "filtered_out": 0,
+                    }
+                ),
+            ]
+        )
+
+        result, report, _ = self._run_rust_doctest_output(
+            output,
+            child_returncode=0,
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        validation = next(
+            item
+            for item in report["validations"]
+            if item["id"] == "rust.doctest.workspace"
+        )
+        self.assertEqual(validation["classification"], "pre_result_error")
+        self.assertEqual(validation["executed_ids"], [])
+        self.assertEqual(validation["outcomes"], [])
+        self.assertIn(
+            "suite lifecycle did not match its declared count",
+            validation["diagnostic"],
+        )
+
+    def test_canonical_doctest_preserves_failure_before_supervision_error(self) -> None:
+        native_id = "fixture::runtime_path (line 1)"
+        self._write_rust_doctest_workspace_fixture(native_id)
+        output = "\n".join(
+            [
+                json.dumps({"type": "suite", "event": "started", "test_count": 1}),
+                json.dumps({"type": "test", "event": "started", "name": native_id}),
+                json.dumps({"type": "test", "event": "failed", "name": native_id}),
+                json.dumps(
+                    {
+                        "type": "suite",
+                        "event": "failed",
+                        "passed": 0,
+                        "failed": 1,
+                        "ignored": 0,
+                        "measured": 0,
+                        "filtered_out": 0,
+                    }
+                ),
+            ]
+        )
+
         result, report, launch = self._run_rust_doctest_output(
-            f"test {native_id} ... FAILED",
+            output,
             child_returncode=101,
             later_supervision_error="fixture supervision failed after validation",
         )
@@ -1333,6 +1614,48 @@ class CompletionProofCliTest(unittest.TestCase):
         )
         self.assertEqual(child["pid"], launch["pid"])
         self.assertIsNone(child["exit_code"])
+
+    def test_canonical_final_validation_id_closure_reports_table_mismatches(
+        self,
+    ) -> None:
+        cases = {
+            "missing": (
+                "validations.pop()",
+                "missing=['fixture.command'], unexpected=[], duplicated=[]",
+            ),
+            "unexpected": (
+                "extra = dict(validations[0]); "
+                "extra['id'] = 'fixture.unexpected'; validations.append(extra)",
+                "missing=[], unexpected=['fixture.unexpected'], duplicated=[]",
+            ),
+            "duplicated": (
+                "validations.append(dict(validations[0]))",
+                "missing=[], unexpected=[], "
+                "duplicated=['inventory.frozen-reconciliation']",
+            ),
+        }
+        for case, (mutation, expected) in cases.items():
+            with self.subTest(case=case):
+                patch_source = textwrap.dedent(
+                    f"""\
+                    _fixture_original_child_evidence = _enforce_child_evidence_contract
+                    def _fixture_child_evidence(validations, children):
+                        errors = _fixture_original_child_evidence(validations, children)
+                        {mutation}
+                        return errors
+                    _enforce_child_evidence_contract = _fixture_child_evidence
+                    """
+                )
+                result, report_path = self._run(patch_source=patch_source)
+                report = self._load_report(report_path)
+
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(report["attempt_classification"], "pre_result_error")
+                self.assertIn(
+                    "canonical final validation ID closure mismatch",
+                    report["fatal_error"],
+                )
+                self.assertIn(expected, report["fatal_error"])
 
     def _write_jest_workspace_fixture(self, native_ids: list[str]) -> None:
         source = "sdk/typescript/tests/order.test.ts"
@@ -2076,7 +2399,9 @@ class CompletionProofCliTest(unittest.TestCase):
             else ""
         )
         return [
-            sys.executable,
+            # Fixture children must report the same PID that their parent
+            # observes, including when this suite runs inside a Windows venv.
+            str(COMPLETION_PROOF._runner_executable_path()),
             "-c",
             (
                 "import runpy,sys; module=runpy.run_path(sys.argv[1]); "
@@ -2240,6 +2565,293 @@ class CompletionProofCliTest(unittest.TestCase):
             check=False,
         )
         return result, report
+
+    def _write_pytest_focused_fixture(self) -> str:
+        self._write_config(mode="pass", use_testing_inventory=False)
+        with self.config.open("a", encoding="utf-8") as stream:
+            stream.write(
+                textwrap.dedent(
+                    """\
+
+                    [[validation]]
+                    id = "sdk.python.pytest"
+                    runner = "python-pytest"
+                    owned_paths = ["sdk/python/tests/**"]
+                    consumed_paths = [
+                        "sdk/python/tests/**",
+                        "scripts/completion_proof_pytest.py",
+                    ]
+                    timeout_seconds = 30
+                    """
+                )
+            )
+        test_file = (
+            self.repository / "sdk" / "python" / "tests" / "test_runtime_path.py"
+        )
+        test_file.parent.mkdir(parents=True)
+        test_file.write_text("def test_runs():\n    assert True\n", encoding="utf-8")
+        return "tests/test_runtime_path.py::test_runs"
+
+    def _pytest_focused_patch(
+        self,
+        payload: dict[str, object] | str,
+        *,
+        collection_marker: Path,
+        execution_marker: Path,
+    ) -> str:
+        payload_text = (
+            payload
+            if isinstance(payload, str)
+            else json.dumps(payload, ensure_ascii=False)
+        )
+        collection_child = textwrap.dedent(
+            """\
+            import pathlib
+            import sys
+
+            pathlib.Path(sys.argv[2]).write_text("collected", encoding="utf-8")
+            pathlib.Path(sys.argv[1]).write_text(sys.argv[3], encoding="utf-8")
+            """
+        )
+        execution_child = textwrap.dedent(
+            """\
+            import json
+            import pathlib
+            import sys
+
+            intended = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+            report = {
+                "schema_version": 2,
+                "report_type": "CompletionProofStructuredTestReportV2",
+                "framework": "python-pytest",
+                "proof_attempt_id": sys.argv[3],
+                "proof_execution_id": sys.argv[4],
+                "proof_receipt_nonce": sys.argv[5],
+                "proof_scope": sys.argv[6],
+                "classification": "confirmed_pass",
+                "selection_confirmed": True,
+                "intended_ids": intended,
+                "selected_ids": intended,
+                "started_ids": intended,
+                "terminal_ids": intended,
+                "executed_ids": intended,
+                "outcomes": [
+                    {"id": test_id, "outcome": "passed"} for test_id in intended
+                ],
+            }
+            pathlib.Path(sys.argv[7]).write_text("executed", encoding="utf-8")
+            pathlib.Path(sys.argv[2]).write_text(json.dumps(report), encoding="utf-8")
+            """
+        )
+        return textwrap.dedent(
+            f"""\
+            _fixture_original_run_process = run_process
+            _fixture_collection_payload = {payload_text!r}
+            _fixture_collection_marker = {str(collection_marker)!r}
+            _fixture_execution_marker = {str(execution_marker)!r}
+            _fixture_collection_child = {collection_child!r}
+            _fixture_execution_child = {execution_child!r}
+
+            def _fixture_command_value(command, flag):
+                return command[command.index(flag) + 1]
+
+            def _fixture_run_process(**kwargs):
+                command = list(kwargs["command"])
+                if kwargs["validation_id"] == "inventory.sdk-python-pytest":
+                    kwargs["command"] = [
+                        sys.executable,
+                        "-c",
+                        _fixture_collection_child,
+                        _fixture_command_value(command, "--output"),
+                        _fixture_collection_marker,
+                        _fixture_collection_payload,
+                    ]
+                elif kwargs["validation_id"] == "sdk.python.pytest":
+                    kwargs["command"] = [
+                        sys.executable,
+                        "-c",
+                        _fixture_execution_child,
+                        _fixture_command_value(command, "--expected-file"),
+                        _fixture_command_value(command, "--output"),
+                        _fixture_command_value(command, "--proof-attempt-id"),
+                        _fixture_command_value(command, "--proof-execution-id"),
+                        _fixture_command_value(command, "--proof-receipt-nonce"),
+                        _fixture_command_value(command, "--proof-scope"),
+                        _fixture_execution_marker,
+                    ]
+                return _fixture_original_run_process(**kwargs)
+
+            run_process = _fixture_run_process
+            """
+        )
+
+    def _valid_pytest_collection_payload(
+        self, test_id: str
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "framework": "python-pytest",
+            "classification": "discovered",
+            "tests": [{"id": test_id, "skip_markers": []}],
+            "selected_count": 1,
+            "duplicate_ids": [],
+            "collection_errors": [],
+            "pytest_exit_code": 0,
+        }
+
+    def _write_unittest_focused_fixture(self) -> tuple[str, str]:
+        self._write_config(mode="pass", use_testing_inventory=False)
+        with self.config.open("a", encoding="utf-8") as stream:
+            stream.write(
+                textwrap.dedent(
+                    """\
+
+                    [[validation]]
+                    id = "maintenance.root-unittest"
+                    runner = "python-unittest"
+                    owned_paths = ["fixture_unit_test.py"]
+                    consumed_paths = [
+                        "fixture_unit_test.py",
+                        "scripts/completion_proof_unittest.py",
+                    ]
+                    timeout_seconds = 30
+                    """
+                )
+            )
+        source_path = "fixture_unit_test.py"
+        test_module = self.repository / source_path
+        test_module.write_text(
+            textwrap.dedent(
+                """\
+                import unittest
+
+                class RuntimePathTest(unittest.TestCase):
+                    def test_runs(self):
+                        with self.subTest(value=1):
+                            self.assertEqual(1, 1)
+                """
+            ),
+            encoding="utf-8",
+        )
+        return "fixture_unit_test.RuntimePathTest.test_runs", source_path
+
+    def _unittest_focused_patch(
+        self,
+        payload: dict[str, object] | str,
+        *,
+        collection_marker: Path,
+        execution_marker: Path,
+    ) -> str:
+        payload_text = (
+            payload
+            if isinstance(payload, str)
+            else json.dumps(payload, ensure_ascii=False)
+        )
+        collection_child = textwrap.dedent(
+            """\
+            import pathlib
+            import sys
+
+            pathlib.Path(sys.argv[2]).write_text("collected", encoding="utf-8")
+            pathlib.Path(sys.argv[1]).write_text(sys.argv[3], encoding="utf-8")
+            """
+        )
+        execution_child = textwrap.dedent(
+            """\
+            import json
+            import pathlib
+            import sys
+
+            intended = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+            report = {
+                "schema_version": 2,
+                "report_type": "CompletionProofStructuredTestReportV2",
+                "framework": "python-unittest",
+                "proof_attempt_id": sys.argv[3],
+                "proof_execution_id": sys.argv[4],
+                "proof_receipt_nonce": sys.argv[5],
+                "proof_scope": sys.argv[6],
+                "classification": "confirmed_pass",
+                "selection_confirmed": True,
+                "intended_ids": intended,
+                "selected_ids": intended,
+                "started_ids": intended,
+                "terminal_ids": intended,
+                "executed_ids": intended,
+                "outcomes": [
+                    {"id": test_id, "outcome": "passed"} for test_id in intended
+                ],
+            }
+            pathlib.Path(sys.argv[7]).write_text("executed", encoding="utf-8")
+            pathlib.Path(sys.argv[2]).write_text(json.dumps(report), encoding="utf-8")
+            """
+        )
+        return textwrap.dedent(
+            f"""\
+            _fixture_original_run_process = run_process
+            _fixture_collection_payload = {payload_text!r}
+            _fixture_collection_marker = {str(collection_marker)!r}
+            _fixture_execution_marker = {str(execution_marker)!r}
+            _fixture_collection_child = {collection_child!r}
+            _fixture_execution_child = {execution_child!r}
+
+            def _fixture_command_value(command, flag):
+                return command[command.index(flag) + 1]
+
+            def _fixture_run_process(**kwargs):
+                command = list(kwargs["command"])
+                if kwargs["validation_id"] == "inventory.root-unittest":
+                    kwargs["command"] = [
+                        sys.executable,
+                        "-c",
+                        _fixture_collection_child,
+                        _fixture_command_value(command, "--output"),
+                        _fixture_collection_marker,
+                        _fixture_collection_payload,
+                    ]
+                elif kwargs["validation_id"] == "maintenance.root-unittest":
+                    kwargs["command"] = [
+                        sys.executable,
+                        "-c",
+                        _fixture_execution_child,
+                        _fixture_command_value(command, "--expected-file"),
+                        _fixture_command_value(command, "--output"),
+                        _fixture_command_value(command, "--proof-attempt-id"),
+                        _fixture_command_value(command, "--proof-execution-id"),
+                        _fixture_command_value(command, "--proof-receipt-nonce"),
+                        _fixture_command_value(command, "--proof-scope"),
+                        _fixture_execution_marker,
+                    ]
+                return _fixture_original_run_process(**kwargs)
+
+            run_process = _fixture_run_process
+            """
+        )
+
+    def _valid_unittest_collection_v2_payload(
+        self, test_id: str, source_path: str
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "report_type": "CompletionProofUnittestCollectionV2",
+            "framework": "python-unittest",
+            "classification": "discovered",
+            "tests": [
+                {
+                    "id": test_id,
+                    "source_path": source_path,
+                    "declared_subtest_sites": [
+                        {"path": source_path, "line": 5, "column": 14}
+                    ],
+                    "skipped_at_discovery": False,
+                    "skip_reason": "",
+                }
+            ],
+            "selected_count": 1,
+            "discovery_errors": [],
+            "duplicate_ids": [],
+            "metadata_errors": [],
+        }
 
     def _load_report(self, path: Path) -> dict[str, object]:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -2760,6 +3372,239 @@ class CompletionProofCliTest(unittest.TestCase):
         self.assertEqual(report["child_processes"][0]["pid"], 0)
         self.assertFalse(self.marker.exists())
 
+    def test_pytest_inventory_accepts_valid_v1_collection_through_focused_cli(
+        self,
+    ) -> None:
+        test_id = self._write_pytest_focused_fixture()
+        collection_marker = self.base / "pytest-valid-collected.txt"
+        execution_marker = self.base / "pytest-valid-executed.txt"
+
+        result, report_path = self._run_focused(
+            "sdk.python.pytest",
+            patch_source=self._pytest_focused_patch(
+                self._valid_pytest_collection_payload(test_id),
+                collection_marker=collection_marker,
+                execution_marker=execution_marker,
+            ),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self._load_report(report_path)
+        self.assertEqual(report["attempt_classification"], "confirmed_pass")
+        validation = report["validations"][0]
+        self.assertEqual(validation["id"], "sdk.python.pytest")
+        self.assertEqual(validation["intended_ids"], [test_id])
+        self.assertEqual(validation["selected_ids"], [test_id])
+        self.assertEqual(validation["executed_ids"], [test_id])
+        self.assertTrue(collection_marker.is_file())
+        self.assertTrue(execution_marker.is_file())
+        self.assertEqual(len(report["child_processes"]), 1)
+        self.assertGreater(report["child_processes"][0]["pid"], 0)
+
+    def test_pytest_inventory_rejects_duplicate_json_keys(self) -> None:
+        test_id = self._write_pytest_focused_fixture()
+        payload = json.dumps(self._valid_pytest_collection_payload(test_id))
+        payload = payload.replace(
+            '"schema_version": 1',
+            '"schema_version": 1, "schema_version": 1',
+            1,
+        )
+        collection_marker = self.base / "pytest-duplicate-key-collected.txt"
+        execution_marker = self.base / "pytest-duplicate-key-executed.txt"
+
+        result, report_path = self._run_focused(
+            "sdk.python.pytest",
+            patch_source=self._pytest_focused_patch(
+                payload,
+                collection_marker=collection_marker,
+                execution_marker=execution_marker,
+            ),
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        report = self._load_report(report_path)
+        self.assertEqual(report["attempt_classification"], "pre_result_error")
+        self.assertIn("duplicate JSON keys", report["fatal_error"])
+        self.assertTrue(collection_marker.is_file())
+        self.assertFalse(execution_marker.exists())
+
+    def test_pytest_inventory_rejects_nonfinite_json_constants(self) -> None:
+        test_id = self._write_pytest_focused_fixture()
+        payload = json.dumps(self._valid_pytest_collection_payload(test_id))
+        payload = payload.replace('"selected_count": 1', '"selected_count": NaN', 1)
+        collection_marker = self.base / "pytest-nonfinite-collected.txt"
+        execution_marker = self.base / "pytest-nonfinite-executed.txt"
+
+        result, report_path = self._run_focused(
+            "sdk.python.pytest",
+            patch_source=self._pytest_focused_patch(
+                payload,
+                collection_marker=collection_marker,
+                execution_marker=execution_marker,
+            ),
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        report = self._load_report(report_path)
+        self.assertEqual(report["attempt_classification"], "pre_result_error")
+        self.assertIn("invalid JSON constant NaN", report["fatal_error"])
+        self.assertTrue(collection_marker.is_file())
+        self.assertFalse(execution_marker.exists())
+
+    def test_focused_pytest_inventory_uses_strict_six_field_projection(self) -> None:
+        test_id = self._write_pytest_focused_fixture()
+        payload = self._valid_pytest_collection_payload(test_id)
+        payload["tests"] = [
+            {
+                "id": test_id,
+                "skip_markers": [{"name": "skip", "reason": "fixture"}],
+            }
+        ]
+        collection_marker = self.base / "pytest-projection-collected.txt"
+        execution_marker = self.base / "pytest-projection-executed.txt"
+        projection_marker = self.base / "pytest-six-field-projection.json"
+        patch_source = self._pytest_focused_patch(
+            payload,
+            collection_marker=collection_marker,
+            execution_marker=execution_marker,
+        ) + textwrap.dedent(
+            f"""\
+
+            _fixture_original_pytest_inventory = _pytest_inventory
+
+            def _fixture_recording_pytest_inventory(repo_root, env, temp_dir):
+                rows, child = _fixture_original_pytest_inventory(
+                    repo_root, env, temp_dir
+                )
+                Path({str(projection_marker)!r}).write_bytes(canonical_json(rows))
+                return rows, child
+
+            _pytest_inventory = _fixture_recording_pytest_inventory
+            """
+        )
+
+        result, report_path = self._run_focused(
+            "sdk.python.pytest",
+            patch_source=patch_source,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self._load_report(report_path)
+        self.assertEqual(report["attempt_classification"], "confirmed_pass")
+        expected = [
+            {
+                "baseline_id": f"python-pytest::{test_id}",
+                "framework": "python-pytest",
+                "native_id": test_id,
+                "source": "sdk/python/tests/test_runtime_path.py",
+                "ignored": True,
+                "platforms": ["windows"],
+            }
+        ]
+        self.assertEqual(
+            projection_marker.read_bytes(),
+            _canonical_json(expected),
+        )
+        self.assertTrue(collection_marker.is_file())
+        self.assertTrue(execution_marker.is_file())
+
+    def test_pytest_inventory_rejects_invalid_v1_collection_through_focused_cli(
+        self,
+    ) -> None:
+        test_id = self._write_pytest_focused_fixture()
+
+        cases: list[tuple[str, dict[str, object], str]] = []
+        extra_key = self._valid_pytest_collection_payload(test_id)
+        extra_key["unexpected"] = None
+        cases.append(("extra-key", extra_key, "invalid keys"))
+
+        coerced_count = self._valid_pytest_collection_payload(test_id)
+        coerced_count["selected_count"] = "1"
+        cases.append(("coerced-count", coerced_count, "count is inconsistent"))
+
+        boolean_count = self._valid_pytest_collection_payload(test_id)
+        boolean_count["selected_count"] = True
+        cases.append(("boolean-count", boolean_count, "count is inconsistent"))
+
+        non_nfc = self._valid_pytest_collection_payload(test_id)
+        non_nfc["tests"] = [
+            {"id": "tests/test_cafe\u0301.py::test_runs", "skip_markers": []}
+        ]
+        cases.append(("non-nfc", non_nfc, "invalid ID"))
+
+        escaped_path = self._valid_pytest_collection_payload(test_id)
+        escaped_path["tests"] = [
+            {"id": "tests/../outside.py::test_runs", "skip_markers": []}
+        ]
+        cases.append(("escaped-path", escaped_path, "invalid source path"))
+
+        control_selector = self._valid_pytest_collection_payload(test_id)
+        control_selector["tests"] = [
+            {"id": "tests/test_runtime_path.py::test_\x00runs", "skip_markers": []}
+        ]
+        cases.append(("control-selector", control_selector, "invalid ID"))
+
+        unhashable_marker_name = self._valid_pytest_collection_payload(test_id)
+        unhashable_marker_name["tests"] = [
+            {
+                "id": test_id,
+                "skip_markers": [{"name": [], "reason": "fixture"}],
+            }
+        ]
+        cases.append(
+            ("unhashable-marker", unhashable_marker_name, "skip marker is invalid")
+        )
+
+        duplicate = self._valid_pytest_collection_payload(test_id)
+        duplicate["tests"] = [
+            {"id": test_id, "skip_markers": []},
+            {"id": test_id, "skip_markers": []},
+        ]
+        duplicate["selected_count"] = 2
+        duplicate["duplicate_ids"] = [test_id]
+        cases.append(("duplicate", duplicate, "contains duplicate IDs"))
+
+        collection_error = self._valid_pytest_collection_payload(test_id)
+        collection_error["collection_errors"] = ["fixture collection error"]
+        cases.append(
+            ("collection-error", collection_error, "contains collection errors")
+        )
+
+        nonzero_exit = self._valid_pytest_collection_payload(test_id)
+        nonzero_exit["pytest_exit_code"] = 5
+        cases.append(("nonzero-exit", nonzero_exit, "invalid pytest exit code"))
+
+        boolean_exit = self._valid_pytest_collection_payload(test_id)
+        boolean_exit["pytest_exit_code"] = False
+        cases.append(("boolean-exit", boolean_exit, "invalid pytest exit code"))
+
+        zero = self._valid_pytest_collection_payload(test_id)
+        zero["tests"] = []
+        zero["selected_count"] = 0
+        cases.append(("zero", zero, "selected zero tests"))
+
+        for name, payload, diagnostic in cases:
+            with self.subTest(case=name):
+                collection_marker = self.base / f"pytest-{name}-collected.txt"
+                execution_marker = self.base / f"pytest-{name}-executed.txt"
+                result, report_path = self._run_focused(
+                    "sdk.python.pytest",
+                    patch_source=self._pytest_focused_patch(
+                        payload,
+                        collection_marker=collection_marker,
+                        execution_marker=execution_marker,
+                    ),
+                )
+
+                self.assertEqual(result.returncode, 2, result.stderr)
+                report = self._load_report(report_path)
+                self.assertEqual(
+                    report["attempt_classification"], "pre_result_error"
+                )
+                self.assertIn(diagnostic, report["fatal_error"])
+                self.assertTrue(collection_marker.is_file())
+                self.assertFalse(execution_marker.exists())
+
     def test_unittest_wrapper_reports_attempt_bound_start_and_terminal_ids(
         self,
     ) -> None:
@@ -2830,6 +3675,376 @@ class CompletionProofCliTest(unittest.TestCase):
         self.assertEqual(report["executed_ids"], [test_id])
         for key, value in binding.items():
             self.assertEqual(report[key], value)
+
+    def test_unittest_wrapper_collect_v2_reports_exact_source_and_declared_subtest_sites(
+        self,
+    ) -> None:
+        test_id, source_path = self._write_unittest_focused_fixture()
+        output = self.base / "unittest-collection-v2.json"
+        wrapper = REPO_ROOT / "scripts" / "completion_proof_unittest.py"
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,runpy,sys; module=runpy.run_path(sys.argv[1]); "
+                "namespace=module['_collect'].__globals__; "
+                "namespace['REPO_ROOT']=pathlib.Path(sys.argv[2]); "
+                "namespace['_targets']=lambda:[sys.argv[3]]; "
+                "raise SystemExit(module['main'](sys.argv[4:]))"
+            ),
+            str(wrapper),
+            str(self.repository),
+            test_id,
+            "collect",
+            "--output",
+            str(output),
+        ]
+
+        result = subprocess.run(
+            command,
+            cwd=self.repository,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(report),
+            {
+                "schema_version",
+                "report_type",
+                "framework",
+                "classification",
+                "tests",
+                "selected_count",
+                "discovery_errors",
+                "duplicate_ids",
+                "metadata_errors",
+            },
+        )
+        self.assertEqual(report["schema_version"], 2)
+        self.assertEqual(
+            report["report_type"], "CompletionProofUnittestCollectionV2"
+        )
+        self.assertEqual(report["framework"], "python-unittest")
+        self.assertEqual(report["classification"], "discovered")
+        self.assertEqual(report["selected_count"], 1)
+        self.assertEqual(report["discovery_errors"], [])
+        self.assertEqual(report["duplicate_ids"], [])
+        self.assertEqual(report["metadata_errors"], [])
+        self.assertEqual(
+            report["tests"],
+            [
+                {
+                    "id": test_id,
+                    "source_path": source_path,
+                    "declared_subtest_sites": [
+                        {"path": source_path, "line": 5, "column": 14}
+                    ],
+                    "skipped_at_discovery": False,
+                    "skip_reason": "",
+                }
+            ],
+        )
+
+    def test_unittest_inventory_preserves_legacy_projection_from_valid_skipped_v2(
+        self,
+    ) -> None:
+        native_id = "legacy_module.RuntimePathTest.test_skipped"
+        source_path = "legacy_module.py"
+        (self.repository / source_path).write_text(
+            "# exact transient collection source\n",
+            encoding="utf-8",
+        )
+        payload = self._valid_unittest_collection_v2_payload(
+            native_id, source_path
+        )
+        payload["tests"][0]["declared_subtest_sites"] = []
+        payload["tests"][0]["skipped_at_discovery"] = True
+        payload["tests"][0]["skip_reason"] = "fixture skip"
+
+        def fake_run_process(**kwargs):
+            command = list(kwargs["command"])
+            output = Path(command[command.index("--output") + 1])
+            output.write_text(json.dumps(payload), encoding="utf-8")
+            child = COMPLETION_PROOF._unlaunched_child(
+                validation_id=kwargs["validation_id"],
+                execution_id=kwargs["execution_id"],
+                command=command,
+            )
+            child.pid = 127
+            child.executable = sys.executable
+            child.exit_code = 0
+            return COMPLETION_PROOF.ProcessResult(
+                returncode=0,
+                stdout="",
+                stderr="",
+                child=child,
+            )
+
+        with mock.patch.object(
+            COMPLETION_PROOF,
+            "run_process",
+            side_effect=fake_run_process,
+        ):
+            rows, child = COMPLETION_PROOF._unittest_inventory(
+                self.repository,
+                COMPLETION_PROOF._network_disabled_env(),
+                self.base,
+            )
+
+        self.assertEqual(
+            rows,
+            [
+                {
+                    "baseline_id": f"python-unittest::{native_id}",
+                    "framework": "python-unittest",
+                    "native_id": native_id,
+                    "source": source_path,
+                    "ignored": True,
+                    "platforms": ["windows"],
+                }
+            ],
+        )
+        self.assertEqual(child.exit_code, 0)
+
+    def test_unittest_inventory_accepts_valid_v2_collection_through_focused_cli(
+        self,
+    ) -> None:
+        test_id, source_path = self._write_unittest_focused_fixture()
+        collection_marker = self.base / "unittest-valid-collected.txt"
+        execution_marker = self.base / "unittest-valid-executed.txt"
+
+        result, report_path = self._run_focused(
+            "maintenance.root-unittest",
+            patch_source=self._unittest_focused_patch(
+                self._valid_unittest_collection_v2_payload(test_id, source_path),
+                collection_marker=collection_marker,
+                execution_marker=execution_marker,
+            ),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self._load_report(report_path)
+        self.assertEqual(report["attempt_classification"], "confirmed_pass")
+        validation = report["validations"][0]
+        self.assertEqual(validation["id"], "maintenance.root-unittest")
+        self.assertEqual(validation["intended_ids"], [test_id])
+        self.assertEqual(validation["selected_ids"], [test_id])
+        self.assertEqual(validation["executed_ids"], [test_id])
+        self.assertTrue(collection_marker.is_file())
+        self.assertTrue(execution_marker.is_file())
+        self.assertEqual(len(report["child_processes"]), 1)
+        self.assertGreater(report["child_processes"][0]["pid"], 0)
+
+    def test_unittest_inventory_rejects_invalid_v2_collection_through_focused_cli(
+        self,
+    ) -> None:
+        test_id, source_path = self._write_unittest_focused_fixture()
+
+        cases: list[tuple[str, dict[str, object] | str, str]] = []
+        extra_key = self._valid_unittest_collection_v2_payload(test_id, source_path)
+        extra_key["unexpected"] = None
+        cases.append(("extra-key", extra_key, "invalid keys"))
+
+        boolean_schema = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        boolean_schema["schema_version"] = True
+        cases.append(("boolean-schema", boolean_schema, "invalid schema version"))
+
+        bad_report_type = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        bad_report_type["report_type"] = "CompletionProofUnittestCollectionV1"
+        cases.append(("report-type", bad_report_type, "invalid report type"))
+
+        boolean_count = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        boolean_count["selected_count"] = True
+        cases.append(("boolean-count", boolean_count, "count is inconsistent"))
+
+        non_nfc_id = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        non_nfc_id["tests"][0]["id"] = "fixture_cafe\u0301.test_runs"
+        cases.append(("non-nfc-id", non_nfc_id, "invalid ID"))
+
+        escaped_source = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        escaped_source["tests"][0]["source_path"] = "../fixture_unit_test.py"
+        cases.append(("escaped-source", escaped_source, "invalid source path"))
+
+        missing_source = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        missing_source["tests"][0]["source_path"] = "missing_test.py"
+        cases.append(("missing-source", missing_source, "source is not a file"))
+
+        unrelated_source_path = "unrelated_unit_test.py"
+        (self.repository / unrelated_source_path).write_text(
+            "# unrelated transient collection source\n",
+            encoding="utf-8",
+        )
+        mismatched_source = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        mismatched_source["tests"][0]["source_path"] = unrelated_source_path
+        mismatched_source["tests"][0]["declared_subtest_sites"][0]["path"] = (
+            unrelated_source_path
+        )
+        cases.append(
+            (
+                "mismatched-source-module",
+                mismatched_source,
+                "source path does not match ID module",
+            )
+        )
+
+        extra_test_key = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        extra_test_key["tests"][0]["unexpected"] = None
+        cases.append(("extra-test-key", extra_test_key, "test has invalid keys"))
+
+        sites_not_list = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        sites_not_list["tests"][0]["declared_subtest_sites"] = "line 5"
+        cases.append(("sites-not-list", sites_not_list, "sites must be a list"))
+
+        mismatched_site = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        mismatched_site["tests"][0]["declared_subtest_sites"][0]["path"] = (
+            "other_test.py"
+        )
+        cases.append(
+            ("mismatched-site", mismatched_site, "site path is inconsistent")
+        )
+
+        boolean_line = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        boolean_line["tests"][0]["declared_subtest_sites"][0]["line"] = True
+        cases.append(("boolean-line", boolean_line, "site location is invalid"))
+
+        unsorted_sites = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        unsorted_sites["tests"][0]["declared_subtest_sites"] = [
+            {"path": source_path, "line": 6, "column": 14},
+            {"path": source_path, "line": 5, "column": 14},
+        ]
+        cases.append(("unsorted-sites", unsorted_sites, "sites are not canonical"))
+
+        coerced_skip = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        coerced_skip["tests"][0]["skipped_at_discovery"] = 0
+        cases.append(("coerced-skip", coerced_skip, "skip state is invalid"))
+
+        skipped_without_reason = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        skipped_without_reason["tests"][0]["skipped_at_discovery"] = True
+        cases.append(
+            (
+                "skipped-without-reason",
+                skipped_without_reason,
+                "skip state and reason are inconsistent",
+            )
+        )
+
+        unskipped_with_reason = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        unskipped_with_reason["tests"][0]["skip_reason"] = "fixture skip"
+        cases.append(
+            (
+                "unskipped-with-reason",
+                unskipped_with_reason,
+                "skip state and reason are inconsistent",
+            )
+        )
+
+        non_nfc_reason = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        non_nfc_reason["tests"][0]["skip_reason"] = "cafe\u0301"
+        cases.append(("non-nfc-reason", non_nfc_reason, "skip reason is invalid"))
+
+        noncanonical_errors = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        noncanonical_errors["discovery_errors"] = ["z", "a"]
+        cases.append(
+            ("noncanonical-errors", noncanonical_errors, "are not canonical")
+        )
+
+        duplicate = self._valid_unittest_collection_v2_payload(test_id, source_path)
+        duplicate["tests"] = [duplicate["tests"][0], dict(duplicate["tests"][0])]
+        duplicate["selected_count"] = 2
+        duplicate["duplicate_ids"] = [test_id]
+        cases.append(("duplicate", duplicate, "contains duplicate IDs"))
+
+        discovery_error = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        discovery_error["discovery_errors"] = ["fixture discovery error"]
+        cases.append(
+            ("discovery-error", discovery_error, "contains discovery errors")
+        )
+
+        metadata_error = self._valid_unittest_collection_v2_payload(
+            test_id, source_path
+        )
+        metadata_error["metadata_errors"] = ["fixture metadata error"]
+        cases.append(("metadata-error", metadata_error, "contains metadata errors"))
+
+        zero = self._valid_unittest_collection_v2_payload(test_id, source_path)
+        zero["tests"] = []
+        zero["selected_count"] = 0
+        cases.append(("zero", zero, "selected zero tests"))
+
+        raw_report = json.dumps(
+            self._valid_unittest_collection_v2_payload(test_id, source_path),
+            ensure_ascii=False,
+        )
+        duplicate_json_key = raw_report.replace(
+            '"schema_version": 2',
+            '"schema_version": 2, "schema_version": 2',
+            1,
+        )
+        cases.append(("duplicate-json-key", duplicate_json_key, "duplicate JSON keys"))
+
+        for name, payload, diagnostic in cases:
+            with self.subTest(case=name):
+                collection_marker = self.base / f"unittest-{name}-collected.txt"
+                execution_marker = self.base / f"unittest-{name}-executed.txt"
+                result, report_path = self._run_focused(
+                    "maintenance.root-unittest",
+                    patch_source=self._unittest_focused_patch(
+                        payload,
+                        collection_marker=collection_marker,
+                        execution_marker=execution_marker,
+                    ),
+                )
+
+                self.assertEqual(result.returncode, 2, result.stderr)
+                report = self._load_report(report_path)
+                self.assertEqual(
+                    report["attempt_classification"], "pre_result_error"
+                )
+                self.assertIn(diagnostic, report["fatal_error"])
+                self.assertTrue(collection_marker.is_file())
+                self.assertFalse(execution_marker.exists())
 
     def test_pytest_wrapper_reports_attempt_bound_start_and_terminal_ids(self) -> None:
         tests_dir = self.repository / "tests"
@@ -3158,6 +4373,27 @@ class CompletionProofCliTest(unittest.TestCase):
         self.assertEqual(report["child_processes"], [])
         self.assertFalse(self.marker.exists())
 
+    def test_focused_cli_is_independent_of_migration_inventory_and_ledger(self) -> None:
+        self.frozen_inventory.unlink()
+        self.ledger.unlink()
+        result, report_path = self._run_focused("fixture.command")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = self._load_report(report_path)
+        self.assertEqual(report["attempt_classification"], "confirmed_pass")
+        self.assertEqual(report["focused_validation_id"], "fixture.command")
+        self.assertEqual(len(report["child_processes"]), 1)
+        self.assertGreater(report["child_processes"][0]["pid"], 0)
+        executions = self.marker.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(executions), 1)
+
+        # Explicit certification still needs its whole-repository contract and
+        # cannot substitute the focused result when that contract is absent.
+        canonical, canonical_path = self._run()
+        self.assertEqual(canonical.returncode, 2, canonical.stderr)
+        canonical_report = self._load_report(canonical_path)
+        self.assertEqual(canonical_report["attempt_classification"], "pre_result_error")
+        self.assertEqual(self.marker.read_text(encoding="utf-8").splitlines(), executions)
+
     def test_focused_cli_records_one_fresh_non_certifying_pass(self) -> None:
         result, report_path = self._run_focused("fixture.command")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -3206,6 +4442,118 @@ class CompletionProofCliTest(unittest.TestCase):
         self.assertNotIn(
             "CompletionProofArtifactV1", report_path.read_text(encoding="utf-8")
         )
+
+    def test_focused_typed_validation_rejects_tampered_parent_observation(
+        self,
+    ) -> None:
+        patch_source = textwrap.dedent(
+            """\
+            _fixture_original_broker_exchange = _typed_validation_broker_exchange
+
+            def _fixture_tampered_broker_exchange(**kwargs):
+                result, payload, completion, error, command = (
+                    _fixture_original_broker_exchange(**kwargs)
+                )
+                assert payload is not None
+                response = json.loads(payload)
+                response["observation"]["diagnostic"] = "tampered observation"
+                return result, canonical_json(response), completion, error, command
+
+            _typed_validation_broker_exchange = _fixture_tampered_broker_exchange
+            """
+        )
+
+        result, report_path = self._run_focused(
+            "fixture.command", patch_source=patch_source
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        report = self._load_report(report_path)
+        validation = report["validations"][0]
+        self.assertEqual(validation["classification"], "pre_result_error")
+        self.assertEqual(validation["executed_ids"], [])
+        self.assertIn(
+            "action result diagnostic does not match the parent observation",
+            validation["diagnostic"],
+        )
+        self.assertTrue(self.marker.is_file())
+        self.assertEqual(report["child_processes"][0]["exit_code"], 0)
+
+    def test_focused_typed_validation_preserves_failure_after_late_response_error(
+        self,
+    ) -> None:
+        self._write_config(mode="fail")
+        patch_source = textwrap.dedent(
+            """\
+            _fixture_original_broker_exchange = _typed_validation_broker_exchange
+
+            def _fixture_tampered_broker_exchange(**kwargs):
+                result, payload, completion, error, command = (
+                    _fixture_original_broker_exchange(**kwargs)
+                )
+                assert payload is not None
+                assert completion is not None
+                terminal = json.loads(completion)
+                terminal["request_sha256"] = "0" * 64
+                return result, payload, canonical_json(terminal), error, command
+
+            _typed_validation_broker_exchange = _fixture_tampered_broker_exchange
+            """
+        )
+
+        result, report_path = self._run_focused(
+            "fixture.command", patch_source=patch_source
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = self._load_report(report_path)
+        validation = report["validations"][0]
+        self.assertEqual(validation["classification"], "confirmed_validation_failure")
+        self.assertEqual(validation["confirmed_failure_ids"], ["fixture.command"])
+        self.assertEqual(validation["executed_ids"], ["fixture.command"])
+        self.assertIn(
+            "typed-validation broker completion request binding mismatch",
+            validation["diagnostic"],
+        )
+        self.assertTrue(self.marker.is_file())
+        self.assertEqual(report["child_processes"][0]["exit_code"], 1)
+
+    def test_focused_typed_validation_rejects_late_response_error_after_pass(
+        self,
+    ) -> None:
+        patch_source = textwrap.dedent(
+            """\
+            _fixture_original_broker_exchange = _typed_validation_broker_exchange
+
+            def _fixture_tampered_broker_exchange(**kwargs):
+                result, payload, completion, error, command = (
+                    _fixture_original_broker_exchange(**kwargs)
+                )
+                assert payload is not None
+                assert completion is not None
+                terminal = json.loads(completion)
+                terminal["request_sha256"] = "0" * 64
+                return result, payload, canonical_json(terminal), error, command
+
+            _typed_validation_broker_exchange = _fixture_tampered_broker_exchange
+            """
+        )
+
+        result, report_path = self._run_focused(
+            "fixture.command", patch_source=patch_source
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        report = self._load_report(report_path)
+        validation = report["validations"][0]
+        self.assertEqual(validation["classification"], "pre_result_error")
+        self.assertEqual(validation["executed_ids"], [])
+        self.assertIn(
+            "typed-validation broker completion request binding mismatch",
+            validation["diagnostic"],
+        )
+        self.assertTrue(self.marker.is_file())
+        self.assertEqual(report["child_processes"][0]["exit_code"], 0)
 
     def test_focused_cli_reports_declared_validation_failure(self) -> None:
         self._write_config(mode="fail")
@@ -3270,7 +4618,12 @@ class CompletionProofCliTest(unittest.TestCase):
                     if item["id"] == "fixture.command"
                 )
                 self.assertEqual(validation["classification"], "pre_result_error")
-                self.assertIn("child", validation["diagnostic"])
+                expected_diagnostic = (
+                    "typed-validation broker producer identity mismatch"
+                    if name in {"unlaunched", "fake-positive-pid"}
+                    else "child"
+                )
+                self.assertIn(expected_diagnostic, validation["diagnostic"])
 
     def test_canonical_rust_gate_accepts_exact_nonzero_structured_pass(self) -> None:
         self._write_rust_gate_fixture(mode="pass")
@@ -3408,6 +4761,28 @@ class CompletionProofCliTest(unittest.TestCase):
         )
 
     def test_focused_rust_gate_rejects_success_without_terminal_evidence(self) -> None:
+        # This selector also replaces the frozen zero-selection parent. Preserve
+        # its no-launch assertion before exercising missing terminal evidence.
+        with self.config.open("a", encoding="utf-8") as stream:
+            stream.write(
+                '\n[[validation]]\n'
+                'id = "maintenance.root-unittest"\n'
+                'runner = "python-unittest"\n'
+                'owned_paths = ["validator.py"]\n'
+                'consumed_paths = ["validator.py"]\n'
+                'timeout_seconds = 30\n'
+            )
+        empty_result, empty_report_path = self._run_focused("maintenance.root-unittest")
+        self.assertEqual(empty_result.returncode, 2, empty_result.stderr)
+        empty_report = self._load_report(empty_report_path)
+        self.assertEqual(empty_report["attempt_classification"], "pre_result_error")
+        empty_validation = empty_report["validations"][0]
+        self.assertEqual(empty_validation["classification"], "pre_result_error")
+        self.assertEqual(empty_validation["intended_count"], 0)
+        self.assertEqual(empty_validation["executed_count"], 0)
+        self.assertEqual(empty_report["child_processes"][0]["pid"], 0)
+        self.assertFalse(self.marker.exists())
+        self._write_config(mode="pass")
         self._write_rust_gate_fixture(mode="missing-evidence")
         result, report_path = self._run_focused(RUST_GATE_VALIDATION_ID)
         self.assertEqual(result.returncode, 2)
@@ -3522,6 +4897,35 @@ class CompletionProofCliTest(unittest.TestCase):
         self.assertEqual(validation["classification"], "pre_result_error")
         self.assertEqual(validation["executed_count"], 0)
         self.assertIn("output drain failed", validation["diagnostic"])
+
+    def test_focused_rust_gate_never_infers_failure_from_report_without_child_exit_100(
+        self,
+    ) -> None:
+        self._write_rust_gate_fixture(mode="failure-then-infrastructure")
+        patch_source = textwrap.dedent(
+            """\
+            _original_run_process = run_process
+            def _run_process_with_unbound_failure_report(**kwargs):
+                result = _original_run_process(**kwargs)
+                result.returncode = None
+                result.child.exit_code = 0
+                result.invocation_error = "runner output drain failed after report write"
+                return result
+            run_process = _run_process_with_unbound_failure_report
+            """
+        )
+        result, report_path = self._run_focused(
+            RUST_GATE_VALIDATION_ID,
+            patch_source=patch_source,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        report = self._load_report(report_path)
+        validation = report["validations"][0]
+        self.assertEqual(validation["classification"], "pre_result_error")
+        self.assertEqual(validation["executed_count"], 0)
+        self.assertEqual(report["child_processes"][0]["exit_code"], 0)
+        self.assertIn("report write", validation["diagnostic"])
 
     def test_git_supervision_errors_use_five_second_budget_and_fail_closed(
         self,
@@ -3699,7 +5103,7 @@ class CompletionProofCliTest(unittest.TestCase):
         self.assertEqual(validation["classification"], "pre_result_error")
         self.assertEqual(validation["executed_count"], 0)
         self.assertIn("timed out", validation["diagnostic"])
-        self.assertIsNone(report["child_processes"][0]["exit_code"])
+        self.assertEqual(report["child_processes"][0]["exit_code"], 2)
         _wait_for_pid_exit(self, int(pid_file.read_text(encoding="utf-8")))
 
     def test_focused_output_overflow_is_pre_result_and_kills_validation_tree(
@@ -3737,7 +5141,7 @@ class CompletionProofCliTest(unittest.TestCase):
         self.assertEqual(validation["classification"], "pre_result_error")
         self.assertEqual(validation["executed_count"], 0)
         self.assertIn("stdout exceeded", validation["diagnostic"])
-        self.assertIsNone(report["child_processes"][0]["exit_code"])
+        self.assertEqual(report["child_processes"][0]["exit_code"], 2)
         _wait_for_pid_exit(self, int(pid_file.read_text(encoding="utf-8")))
 
     def test_canonical_validation_sweeps_descendant_holding_output_pipes(
@@ -4190,6 +5594,99 @@ class CompletionProofCliTest(unittest.TestCase):
             len(self.marker.read_text(encoding="utf-8").splitlines()),
             1,
         )
+
+    def test_ignored_marker_listing_uses_separate_budget_through_canonical_cli(
+        self,
+    ) -> None:
+        self._git("config", "core.ignoreCase", "true")
+        (self.repository / ".gitignore").write_text(
+            "ROGUE_TEST.GO\n",
+            encoding="utf-8",
+        )
+        self._git("add", ".gitignore")
+        self._git("commit", "--quiet", "-m", "own ignored fixture marker")
+        (self.repository / "rogue_test.go").write_text(
+            "package rogue\n",
+            encoding="utf-8",
+        )
+        delay_marker = self.base / "ignored-listing-delay.txt"
+        env = self._fake_git_environment(
+            hang_match="selector-that-never-matches",
+            child_pid_file=self.base / "unused-fake-git-child.pid",
+            real_git_passthrough=True,
+            delay_match="ls-files --others --ignored",
+            delay_millis=900,
+            delay_marker=delay_marker,
+        )
+
+        started = time.monotonic()
+        result, report_path = self._run_fake_git_canonical(
+            env=env,
+            patch_source=textwrap.dedent(
+                """\
+                GIT_PROCESS_TIMEOUT_SECONDS = 0.5
+                GIT_IGNORED_TEST_SURFACE_TIMEOUT_SECONDS = 3.0
+                """
+            ),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreater(time.monotonic() - started, 0.75)
+        self.assertEqual(delay_marker.read_text(encoding="utf-8"), "finished\n")
+        report = self._load_report(report_path)
+        self.assertEqual(report["attempt_classification"], "confirmed_pass")
+        fixture_child = next(
+            child
+            for child in report["child_processes"]
+            if child["validation_id"] == "fixture.command"
+        )
+        self.assertEqual(fixture_child["exit_code"], 0)
+        self.assertEqual(
+            len(self.marker.read_text(encoding="utf-8").splitlines()),
+            1,
+        )
+
+    def test_ignored_marker_listing_timeout_is_bounded_and_cleans_descendant(
+        self,
+    ) -> None:
+        self._git("config", "core.ignoreCase", "true")
+        (self.repository / ".gitignore").write_text(
+            "ROGUE_TEST.GO\n",
+            encoding="utf-8",
+        )
+        self._git("add", ".gitignore")
+        self._git("commit", "--quiet", "-m", "own ignored fixture marker")
+        (self.repository / "rogue_test.go").write_text(
+            "package rogue\n",
+            encoding="utf-8",
+        )
+        child_pid_file = self.base / "ignored-listing-child.pid"
+        env = self._fake_git_environment(
+            hang_match="ls-files --others --ignored",
+            child_pid_file=child_pid_file,
+            real_git_passthrough=True,
+        )
+
+        started = time.monotonic()
+        result, report_path = self._run_fake_git_canonical(
+            env=env,
+            patch_source=textwrap.dedent(
+                """\
+                GIT_PROCESS_TIMEOUT_SECONDS = 0.35
+                GIT_IGNORED_TEST_SURFACE_TIMEOUT_SECONDS = 0.8
+                """
+            ),
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertLess(time.monotonic() - started, 10)
+        report = self._load_report(report_path)
+        self.assertEqual(report["attempt_classification"], "pre_result_error")
+        self.assertIn("timed out after 0.8 seconds", report["fatal_error"])
+        self.assertEqual(report["child_processes"], [])
+        self.assertFalse(self.marker.exists())
+        self.assertTrue(child_pid_file.is_file())
+        _wait_for_pid_exit(self, int(child_pid_file.read_text(encoding="utf-8")))
 
     def test_canonical_testing_inventory_cannot_bypass_test_system_surface_audit(
         self,
@@ -5888,6 +7385,7 @@ class CompletionProofCliTest(unittest.TestCase):
             [
                 "scripts/source_map_check.py",
                 "scripts/source_owners.py",
+                "scripts/generated_output_lock.py",
                 "scripts/asciicheck.py",
                 "scripts/readme_toc.py",
                 "justfile",
@@ -6180,8 +7678,279 @@ class CompletionProofCliTest(unittest.TestCase):
             self.assertNotIn("validation_failure_exit_codes", configured)
 
 
+class TypedValidationBrokerTest(unittest.TestCase):
+    def test_parent_precommits_exact_inner_launch_for_real_broker(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="typed-validation-broker-") as temp:
+            root = Path(temp)
+            cwd = root / "selected-cwd"
+            cwd.mkdir()
+            marker = root / "inner-observation.json"
+            validator = root / "validator.py"
+            validator.write_text(
+                textwrap.dedent(
+                    """\
+                    import json
+                    import os
+                    import pathlib
+                    import sys
+
+                    pathlib.Path(sys.argv[1]).write_text(
+                        json.dumps(
+                            {
+                                "argv": sys.argv[2:],
+                                "cwd": str(pathlib.Path.cwd()),
+                                "pid": os.getpid(),
+                                "selected_env": os.environ.get("KD4_PARENT_SELECTED"),
+                                "proof_env": sorted(
+                                    key
+                                    for key in os.environ
+                                    if key.casefold().startswith(
+                                        "codex_completion_proof_"
+                                    )
+                                ),
+                                "broker_auth_env": sorted(
+                                    key
+                                    for key in os.environ
+                                    if key.casefold()
+                                    == "kd4_typed_validation_broker_authkey"
+                                ),
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    """
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["KD4_PARENT_SELECTED"] = "exact-value"
+            env["CODEX_COMPLETION_PROOF_TEST_SECRET"] = "must-not-leak"
+            env["kD4_tYpEd_VaLiDaTiOn_BrOkEr_AuThKeY"] = "must-not-leak"
+            config = {
+                "id": "fixture.typed-broker",
+                "validation_type": "fixture-command",
+                "command": [sys.executable, str(validator), str(marker), "exact-arg"],
+                "cwd": "selected-cwd",
+                "validation_failure_exit_codes": [1],
+                "owned_paths": ["validator.py"],
+                "consumed_paths": ["validator.py"],
+                "timeout_seconds": 10,
+            }
+
+            report, wrapper = COMPLETION_PROOF._run_typed_validation(
+                root,
+                config,
+                env,
+                allow_test_config=True,
+                proof_attempt_id=str(uuid.uuid4()),
+                proof_receipt_nonce=hashlib.sha256(b"receipt").hexdigest(),
+                proof_scope="focused",
+            )
+
+            self.assertEqual(report["classification"], "confirmed_pass")
+            self.assertEqual(report["executed_ids"], ["fixture.typed-broker"])
+            observed = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(observed["argv"], ["exact-arg"])
+            self.assertEqual(
+                os.path.normcase(observed["cwd"]), os.path.normcase(str(cwd.resolve()))
+            )
+            self.assertEqual(observed["selected_env"], "exact-value")
+            self.assertEqual(observed["proof_env"], [])
+            self.assertEqual(observed["broker_auth_env"], [])
+            self.assertNotEqual(observed["pid"], wrapper.pid)
+            self.assertEqual(wrapper.exit_code, 0)
+            self.assertEqual(
+                os.path.normcase(wrapper.executable),
+                os.path.normcase(
+                    str(COMPLETION_PROOF._runner_executable_path().resolve())
+                ),
+            )
+
+
 class ChildValidationJournalFoundationTest(unittest.TestCase):
     ACTION_ID = "fixture.child-validation"
+
+    def test_real_broker_does_not_forward_private_or_completion_proof_environment(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="typed-validation-broker-env-") as temp:
+            root = Path(temp)
+            marker = root / "inner-observation.json"
+            validator = root / "validator.py"
+            validator.write_text(
+                textwrap.dedent(
+                    """\
+                    import json
+                    import os
+                    import pathlib
+                    import sys
+
+                    pathlib.Path(sys.argv[1]).write_text(
+                        json.dumps(
+                            {
+                                "broker_auth_env": sorted(
+                                    key
+                                    for key in os.environ
+                                    if key.casefold()
+                                    == "kd4_typed_validation_broker_authkey"
+                                ),
+                                "completion_proof_env": sorted(
+                                    key
+                                    for key in os.environ
+                                    if key.casefold().startswith(
+                                        "codex_completion_proof_"
+                                    )
+                                ),
+                                "selected_env": os.environ.get(
+                                    "KD4_PARENT_SELECTED"
+                                ),
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    """
+                ),
+                encoding="utf-8",
+            )
+            replacement_child = root / "replacement-child-validation.py"
+            replacement_child.write_bytes(
+                COMPLETION_PROOF._CHILD_VALIDATION_SOURCE_BYTES
+            )
+            replacement_bounded = root / "replacement-bounded-process.py"
+            replacement_bounded.write_bytes(
+                COMPLETION_PROOF._BOUNDED_PROCESS_SOURCE_BYTES
+            )
+            env = os.environ.copy()
+            env["KD4_PARENT_SELECTED"] = "retained"
+            env["kD4_TyPeD_VaLiDaTiOn_BrOkEr_AuThKeY"] = "must-not-leak"
+            env["cOdEx_CoMpLeTiOn_PrOoF_TeSt_SeCrEt"] = "must-not-leak"
+            config = {
+                "id": "fixture.real-broker-env",
+                "validation_type": "fixture-command",
+                "command": [sys.executable, str(validator), str(marker)],
+                "cwd": ".",
+                "validation_failure_exit_codes": [1],
+                "owned_paths": ["validator.py"],
+                "consumed_paths": ["validator.py"],
+                "timeout_seconds": 10,
+            }
+
+            with (
+                mock.patch.object(
+                    COMPLETION_PROOF,
+                    "_CHILD_VALIDATION_PATH",
+                    replacement_child,
+                ),
+                mock.patch.object(
+                    COMPLETION_PROOF,
+                    "_BOUNDED_PROCESS_PATH",
+                    replacement_bounded,
+                ),
+            ):
+                replacement_child.write_text(
+                    "raise SystemExit('replacement child helper executed')\n",
+                    encoding="utf-8",
+                )
+                replacement_bounded.write_text(
+                    "raise SystemExit('replacement bounded helper executed')\n",
+                    encoding="utf-8",
+                )
+                report, wrapper = COMPLETION_PROOF._run_typed_validation(
+                    root,
+                    config,
+                    env,
+                    allow_test_config=True,
+                    proof_attempt_id=str(uuid.uuid4()),
+                    proof_receipt_nonce=hashlib.sha256(b"receipt-env").hexdigest(),
+                    proof_scope="focused",
+                )
+
+            self.assertEqual(report["classification"], "confirmed_pass")
+            self.assertEqual(report["executed_ids"], ["fixture.real-broker-env"])
+            observed = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(observed["broker_auth_env"], [])
+            self.assertEqual(observed["completion_proof_env"], [])
+            self.assertEqual(observed["selected_env"], "retained")
+            self.assertEqual(wrapper.exit_code, 0)
+
+    def test_real_broker_preserves_confirmed_failure_before_later_infrastructure_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="typed-validation-broker-failure-") as temp:
+            root = Path(temp)
+            marker = root / "inner-ran.txt"
+            validator = root / "validator.py"
+            validator.write_text(
+                textwrap.dedent(
+                    """\
+                    import pathlib
+                    import sys
+
+                    pathlib.Path(sys.argv[1]).write_text("ran", encoding="utf-8")
+                    raise SystemExit(1)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            source = COMPLETION_PROOF._CHILD_VALIDATION_SOURCE_BYTES
+            terminal_send = (
+                b"        if completion is not None:\n"
+                b"            connection.send_bytes(canonical_json(completion))\n"
+            )
+            missing_terminal = (
+                b"        if completion is not None:\n"
+                b"            raise OSError('fixture omitted second broker frame')\n"
+            )
+            self.assertEqual(source.count(terminal_send), 1)
+            broker_without_terminal = source.replace(
+                terminal_send,
+                missing_terminal,
+                1,
+            )
+            config = {
+                "id": "fixture.real-broker-failure",
+                "validation_type": "fixture-command",
+                "command": [sys.executable, str(validator), str(marker)],
+                "cwd": ".",
+                "validation_failure_exit_codes": [1],
+                "owned_paths": ["validator.py"],
+                "consumed_paths": ["validator.py"],
+                "timeout_seconds": 10,
+            }
+
+            with mock.patch.object(
+                COMPLETION_PROOF,
+                "_CHILD_VALIDATION_SOURCE_BYTES",
+                broker_without_terminal,
+            ):
+                report, wrapper = COMPLETION_PROOF._run_typed_validation(
+                    root,
+                    config,
+                    os.environ.copy(),
+                    allow_test_config=True,
+                    proof_attempt_id=str(uuid.uuid4()),
+                    proof_receipt_nonce=hashlib.sha256(
+                        b"receipt-failure"
+                    ).hexdigest(),
+                    proof_scope="focused",
+                )
+
+            self.assertEqual(
+                report["classification"], "confirmed_validation_failure"
+            )
+            self.assertEqual(
+                report["confirmed_failure_ids"],
+                ["fixture.real-broker-failure"],
+            )
+            self.assertEqual(report["executed_ids"], ["fixture.real-broker-failure"])
+            self.assertIn("EOFError", report["diagnostic"])
+            self.assertIn(
+                "typed-validation broker returned no completion response",
+                report["diagnostic"],
+            )
+            self.assertEqual(marker.read_text(encoding="utf-8"), "ran")
+            self.assertGreater(wrapper.pid, 0)
+            self.assertEqual(wrapper.exit_code, 2)
 
     def _binding(self) -> object:
         return CHILD_REPORT.JournalInvocationBinding(
@@ -6291,8 +8060,9 @@ class ChildValidationJournalFoundationTest(unittest.TestCase):
                 "KD4_SEAL": "1" if seal else "0",
             }
         )
+        producer_executable = COMPLETION_PROOF._runner_executable_path().resolve()
         process = subprocess.Popen(
-            [sys.executable, "-c", script],
+            [str(producer_executable), "-c", script],
             cwd=REPO_ROOT,
             env=environment,
             stdout=subprocess.PIPE,
@@ -6306,8 +8076,8 @@ class ChildValidationJournalFoundationTest(unittest.TestCase):
         self.assertEqual(process.returncode, expected_exit, stdout)
         producer = CHILD_REPORT.ProcessIdentity(
             pid=process.pid,
-            executable_path=str(Path(sys.executable).resolve()),
-            executable_sha256=CHILD_REPORT.hash_file(Path(sys.executable).resolve()),
+            executable_path=str(producer_executable),
+            executable_sha256=CHILD_REPORT.hash_file(producer_executable),
             argv_sha256=CHILD_REPORT.hash_arguments(["-c"]),
             started_at_unix_ns=started_at,
         )
@@ -6326,6 +8096,7 @@ class ChildValidationJournalFoundationTest(unittest.TestCase):
         intended_ids: list[str] | None = None,
         selected_ids: list[str] | None = None,
         action_processes: Mapping[str, object] | None = None,
+        action_observations: Mapping[str, object] | None = None,
         outer_executable_sha256_after: str | None = None,
     ) -> object:
         return CHILD_REPORT.parse_child_validation_journal(
@@ -6337,11 +8108,32 @@ class ChildValidationJournalFoundationTest(unittest.TestCase):
             expected_producer=producer,
             expected_action_processes=action_processes
             or {self.ACTION_ID: producer},
+            expected_action_observations=action_observations,
             outer_ended_at_unix_ns=ended_at,
             outer_executable_sha256_after=(
                 outer_executable_sha256_after or producer.executable_sha256
             ),
             outer_exit_code=outer_exit,
+        )
+
+    def _action_observation(self, journal_path: Path) -> object:
+        records = self._read_records(journal_path)
+        started = records[1]
+        result = records[2]
+        return CHILD_REPORT.ActionProcessObservation(
+            action_id=str(started["action_id"]),
+            action_execution_id=str(started["action_execution_id"]),
+            subjects=("fixture.subject",),
+            process=CHILD_REPORT.ProcessIdentity.from_mapping(started["process"]),
+            classification=result["classification"],
+            actually_executed=result["actually_executed"],
+            result_code=result["result_code"],
+            exit_code=result["exit_code"],
+            diagnostic=result["diagnostic"],
+            ended_at_unix_ns=result["ended_at_unix_ns"],
+            process_executable_sha256_after=result[
+                "process_executable_sha256_after"
+            ],
         )
 
     def _read_records(self, journal_path: Path) -> list[dict[str, object]]:
@@ -6364,6 +8156,53 @@ class ChildValidationJournalFoundationTest(unittest.TestCase):
             previous_hash = str(record["record_sha256"])
             encoded.append(CHILD_REPORT.canonical_json(record))
         journal_path.write_bytes(b"\n".join(encoded) + b"\n")
+
+    def test_parent_observation_rejects_rechained_start_and_result_tampering(
+        self,
+    ) -> None:
+        for field in ("subject_count", "diagnostic"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory(
+                prefix="child-validation-observation-"
+            ) as temp:
+                binding = self._binding()
+                journal, producer, ended_at, outer_exit = self._emit_subprocess(
+                    Path(temp),
+                    binding=binding,
+                    classification="confirmed_pass",
+                )
+                observation = self._action_observation(journal)
+                accepted = self._parse(
+                    journal,
+                    binding=binding,
+                    producer=producer,
+                    ended_at=ended_at,
+                    outer_exit=outer_exit,
+                    action_observations={self.ACTION_ID: observation},
+                )
+                self.assertEqual(accepted.classification, "confirmed_pass")
+
+                records = self._read_records(journal)
+                if field == "subject_count":
+                    records[1][field] = 2
+                    records[2][field] = 2
+                else:
+                    records[2][field] = "journal-only tamper"
+                self._write_rechained(journal, records)
+
+                rejected = self._parse(
+                    journal,
+                    binding=binding,
+                    producer=producer,
+                    ended_at=ended_at,
+                    outer_exit=outer_exit,
+                    action_observations={self.ACTION_ID: observation},
+                )
+                self.assertEqual(rejected.classification, "pre_result_error")
+                self.assertEqual(rejected.executed_ids, ())
+                self.assertIn(
+                    "does not match the parent observation",
+                    "\n".join(rejected.diagnostics),
+                )
 
     def test_subprocess_emits_and_parser_accepts_fresh_sealed_pass(self) -> None:
         with tempfile.TemporaryDirectory(prefix="child-validation-journal-") as temp:

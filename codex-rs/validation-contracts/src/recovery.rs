@@ -54,6 +54,60 @@ pub const UNITTEST_HIDDEN_AT_FREEZE_PARENT_COUNT: usize = 16;
 // Keep this authority absent until that provenance is independently recovered;
 // recapture packets must fail closed in the meantime.
 pub const UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256: Option<&str> = None;
+pub const UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT: usize = 859;
+pub const UNITTEST_SOURCE_EXCEPTIONS_SHA256: &str =
+    "63fd50f8f5838408cf19b9b18abdc5353cc52412dbf36a275eb77f31c8a452f9";
+pub const UNITTEST_APPROVED_SOURCE_SITE_MANIFEST_SHA256: &str =
+    "ea2d3175afe632a4347d182d2dd045d28b11d58afda62d1848d0729356aba2c2";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestSourceExceptionAuthorityV1 {
+    pub approval: String,
+    pub question: String,
+    pub source_kind: String,
+    pub source_task_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestSourceProvenanceExceptionV1 {
+    pub historical_execution_extension: UnittestHistoricalExecutionExceptionV1,
+    pub authority: UnittestSourceExceptionAuthorityV1,
+    pub baseline_commit: String,
+    pub baseline_ids: Vec<String>,
+    pub candidate_git_blobs: Vec<String>,
+    pub format_id: String,
+    pub frozen_inventory_raw_sha256: Sha256HexV1,
+    pub provenance_status: String,
+    pub requirements: Vec<String>,
+    pub schema_version: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnittestHistoricalExecutionExceptionV1 {
+    pub authority: UnittestSourceExceptionAuthorityV1,
+    pub baseline_ids: Vec<String>,
+    pub historical_attempt_id: String,
+    pub historical_failure_report_sha256: Sha256HexV1,
+    pub historical_stderr_sha256: Sha256HexV1,
+    pub prior_exception_sha256: Sha256HexV1,
+    pub provenance_status: String,
+    pub requirements: Vec<String>,
+}
+
+impl UnittestSourceProvenanceExceptionV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let raw = crate::canonical::canonical_jcs_of(self)?;
+        if format!("{:x}", Sha256::digest(raw)) != UNITTEST_SOURCE_EXCEPTIONS_SHA256 {
+            return Err(ContractError::InvalidContract(
+                "unittest source exception is not the exact approved five-source and 29-parent amendments".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -256,6 +310,7 @@ pub struct UnittestSourceSiteV1 {
 pub struct UnittestSourceAuditV1 {
     pub embedded_non_ast_marker_count: u64,
     pub executable_ast_site_count: u64,
+    pub excepted_ast_site_count: u64,
     pub source_file_count: u64,
     pub source_site_manifest_sha256: Sha256HexV1,
     pub textual_marker_count: u64,
@@ -346,7 +401,6 @@ pub struct UnittestExecutionReportV1 {
     pub parent_results: Vec<UnittestParentResultV1>,
     pub schema_version: u8,
     pub selection: UnittestExecutionSelectionV1,
-    pub socket_policy: String,
     pub source_site_manifest: Vec<UnittestSourceSiteV1>,
     pub subtest_occurrences: Vec<UnittestSubtestOccurrenceV1>,
     pub total_counts: UnittestExecutionCountsV1,
@@ -400,6 +454,7 @@ pub struct UnittestUntrustedProcessObservationV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnittestUntrustedObservationsV1 {
+    pub socket_policy: String,
     pub checkout: UnittestUntrustedCheckoutObservationV1,
     pub environment: UnittestUntrustedEnvironmentObservationV1,
     pub process: UnittestUntrustedProcessObservationV1,
@@ -424,6 +479,8 @@ pub struct UnittestRecapturePacketV1 {
     pub schema_version: u8,
     pub source_audit: UnittestSourceAuditV1,
     pub source_isolation: UnittestSourceIsolationV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_provenance_exception: Option<UnittestSourceProvenanceExceptionV1>,
     pub source_site_manifest: Vec<UnittestSourceSiteV1>,
     pub source_tree_sha256: Sha256HexV1,
     pub subtest_occurrences: Vec<UnittestSubtestOccurrenceV1>,
@@ -511,6 +568,9 @@ pub enum CanonicalParameterProjectionV1 {
     Integer {
         value: i64,
     },
+    Float64 {
+        bits: String,
+    },
     String {
         value: String,
     },
@@ -549,6 +609,26 @@ impl CanonicalParameterProjectionV1 {
     pub fn validate(&self) -> Result<(), ContractError> {
         match self {
             Self::Null | Self::Boolean { .. } | Self::Integer { .. } => Ok(()),
+            Self::Float64 { bits } => {
+                if bits.len() != 16
+                    || !bits
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(ContractError::InvalidContract(
+                        "float64 parameter must use 16 lowercase hexadecimal digits".to_owned(),
+                    ));
+                }
+                let raw = u64::from_str_radix(bits, 16).map_err(|_| {
+                    ContractError::InvalidContract("invalid float64 bits".to_owned())
+                })?;
+                if !f64::from_bits(raw).is_finite() {
+                    return Err(ContractError::InvalidContract(
+                        "non-finite float64 parameter is unsupported".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
             Self::String { value } => crate::canonical::validate_nfc(value),
             Self::RepositoryPath { .. } => Ok(()),
             Self::Bytes { base64url } => {
@@ -722,12 +802,8 @@ impl UnittestRecapturePacketV1 {
                 "unittest recapture frozen authority mismatch".to_owned(),
             ));
         }
-        let frozen_source_site_manifest_sha256 = UNITTEST_RECAPTURE_SOURCE_SITE_MANIFEST_SHA256
-            .ok_or_else(|| {
-                ContractError::InvalidContract(
-                    "unittest recapture freeze-overlay source authority is unavailable".to_owned(),
-                )
-            })?;
+        let executable_parents = self.executable_parent_records()?;
+        let frozen_source_site_manifest_sha256 = UNITTEST_APPROVED_SOURCE_SITE_MANIFEST_SHA256;
 
         validate_nonempty_nfc(
             &self.source_isolation.clone_source_path,
@@ -833,21 +909,23 @@ impl UnittestRecapturePacketV1 {
             || network.profile != ":workspace"
             || !network.sandbox_available
             || !network.fail_closed
-            || network.command_argv.len() < 8
-            || network.command_argv.iter().take(5).map(String::as_str).ne([
+            || network.command_argv.len() < 10
+            || network.command_argv.iter().take(7).map(String::as_str).ne([
                 network.codex_executable_path.as_str(),
+                "-c",
+                "windows.sandbox=\"elevated\"",
                 "sandbox",
                 "-P",
                 ":workspace",
                 "-C",
             ])
-            || network.command_argv.get(5).map(String::as_str)
+            || network.command_argv.get(7).map(String::as_str)
                 != Some(self.source_isolation.isolated_checkout_path.as_str())
-            || network.command_argv.get(6).map(String::as_str) != Some("--")
+            || network.command_argv.get(8).map(String::as_str) != Some("--")
             || network
                 .command_argv
                 .iter()
-                .skip(7)
+                .skip(9)
                 .ne(self.worker_identity.command_argv.iter())
             || self
                 .worker_identity
@@ -910,6 +988,15 @@ impl UnittestRecapturePacketV1 {
             ));
         }
 
+        let parent_ids = executable_parents
+            .iter()
+            .map(|record| record.baseline_id.clone())
+            .collect::<Vec<_>>();
+        if parent_ids.len() != UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT {
+            return Err(ContractError::InvalidContract(
+                "unittest approved source exception must leave 859 executable parents".to_owned(),
+            ));
+        }
         let parent_set = parent_ids
             .iter()
             .map(String::as_str)
@@ -944,14 +1031,15 @@ impl UnittestRecapturePacketV1 {
             .collect::<std::collections::BTreeSet<_>>()
             .len();
         if self.source_audit.embedded_non_ast_marker_count != 1
-            || self.source_audit.executable_ast_site_count != 68
-            || self.source_audit.source_file_count != 22
+            || self.source_audit.executable_ast_site_count != 59
+            || self.source_audit.excepted_ast_site_count != 9
+            || self.source_audit.source_file_count != 21
             || self.source_audit.source_site_manifest_sha256.as_str()
                 != frozen_source_site_manifest_sha256
             || self.source_audit.textual_marker_count != 69
             || source_site_manifest_sha256.as_str() != frozen_source_site_manifest_sha256
-            || self.source_site_manifest.len() != 68
-            || distinct_source_paths != 22
+            || self.source_site_manifest.len() != 59
+            || distinct_source_paths != 21
         {
             return Err(ContractError::InvalidContract(
                 "unittest recapture source audit mismatch".to_owned(),
@@ -1043,7 +1131,10 @@ impl UnittestRecapturePacketV1 {
                 baseline_commit: UNITTEST_RECAPTURE_BASELINE_COMMIT.to_owned(),
                 format_id: "kd4.unittest-parent-manifest.v1".to_owned(),
                 frozen_inventory_raw_sha256: self.frozen_inventory_raw_sha256.clone(),
-                parent_records: self.parent_records.clone(),
+                parent_records: executable_parents
+                    .iter()
+                    .map(|record| (*record).clone())
+                    .collect(),
                 schema_version: 1,
                 source_tree_sha256: self.source_tree_sha256.clone(),
             })
@@ -1052,11 +1143,11 @@ impl UnittestRecapturePacketV1 {
                 "unittest parent manifest does not bind the frozen parent records".to_owned(),
             ));
         }
-        if self.parent_results.len() != UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT
-            || self.output_bindings.len() != UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT
+        if self.parent_results.len() != UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT
+            || self.output_bindings.len() != UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT
         {
             return Err(ContractError::InvalidContract(
-                "unittest results/output bindings must cover 893 executable parents".to_owned(),
+                "unittest results/output bindings must cover 859 authenticated parents".to_owned(),
             ));
         }
         let mut binding_ids = Vec::with_capacity(self.output_bindings.len());
@@ -1132,29 +1223,27 @@ impl UnittestRecapturePacketV1 {
             parent_results: self.parent_results.clone(),
             schema_version: 1,
             selection: UnittestExecutionSelectionV1 {
-                intended_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
-                intended_native_ids: self
-                    .parent_records
+                intended_count: UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT as u64,
+                intended_native_ids: executable_parents
                     .iter()
                     .map(|record| record.native_id.clone())
                     .collect(),
-                selected_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
-                selected_native_ids: self
-                    .parent_records
+                selected_count: UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT as u64,
+                selected_native_ids: executable_parents
                     .iter()
                     .map(|record| record.native_id.clone())
                     .collect(),
             },
-            socket_policy: "loopback-only".to_owned(),
             source_site_manifest: self.source_site_manifest.clone(),
             subtest_occurrences: self.subtest_occurrences.clone(),
             total_counts: UnittestExecutionCountsV1 {
-                selected_parent_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
-                started_parent_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
+                selected_parent_count: UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT as u64,
+                started_parent_count: UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT as u64,
                 subtest_occurrence_count: self.subtest_occurrences.len() as u64,
                 terminal_parent_count: terminal_count,
             },
             untrusted_observations: UnittestUntrustedObservationsV1 {
+                socket_policy: "loopback-only".to_owned(),
                 checkout: UnittestUntrustedCheckoutObservationV1 {
                     clean_after: self.source_isolation.clean_after,
                     clean_before: self.source_isolation.clean_before,
@@ -1188,12 +1277,12 @@ impl UnittestRecapturePacketV1 {
 
         let subtest_occurrence_count = self.subtest_occurrences.len() as u64;
         let expected_counts = UnittestTotalCountsV1 {
-            method_body_child_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
+            method_body_child_count: UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT as u64,
             parent_record_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
-            recovered_child_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64
+            recovered_child_count: UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT as u64
                 + subtest_occurrence_count,
-            selected_parent_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
-            started_parent_count: UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT as u64,
+            selected_parent_count: UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT as u64,
+            started_parent_count: UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT as u64,
             subtest_occurrence_count,
             terminal_parent_count: terminal_count,
         };
@@ -1220,6 +1309,7 @@ impl UnittestRecapturePacketV1 {
                 schema_version: self.schema_version,
                 source_audit: &self.source_audit,
                 source_isolation: &self.source_isolation,
+                source_provenance_exception: &self.source_provenance_exception,
                 source_site_manifest: &self.source_site_manifest,
                 source_tree_sha256: &self.source_tree_sha256,
                 subtest_occurrences: &self.subtest_occurrences,
@@ -1238,7 +1328,7 @@ impl UnittestRecapturePacketV1 {
     pub fn subtest_manifests(&self) -> Result<Vec<UnittestParentManifestV1>, ContractError> {
         self.validate()?;
         let parent_ids = self
-            .parent_records
+            .executable_parent_records()?
             .iter()
             .map(|record| record.baseline_id.clone())
             .collect::<Vec<_>>();
@@ -1263,7 +1353,7 @@ impl UnittestRecapturePacketV1 {
                 .len()
                 .saturating_add(self.subtest_occurrences.len()),
         );
-        for record in &self.parent_records {
+        for record in self.executable_parent_records()? {
             children.push(RecoveredChildSourceV1 {
                 canonical_parameter_projection: None,
                 child_kind: RecoveredChildKindV1::UnittestMethodBody,
@@ -1306,11 +1396,31 @@ impl UnittestRecapturePacketV1 {
     pub fn parent_recapture_outputs(&self) -> Result<Vec<ParentRecaptureOutputV1>, ContractError> {
         self.validate()?;
         Ok(self
-            .parent_records
+            .executable_parent_records()?
             .iter()
             .map(|record| ParentRecaptureOutputV1 {
                 output_sha256: record.predecessor_entry_sha256.clone(),
                 parent_id: record.baseline_id.clone(),
+            })
+            .collect())
+    }
+
+    pub fn executable_parent_records(&self) -> Result<Vec<&UnittestParentRecordV1>, ContractError> {
+        let exception = self.source_provenance_exception.as_ref().ok_or_else(|| {
+            ContractError::InvalidContract(
+                "unittest recapture freeze-overlay source authority is unavailable".to_owned(),
+            )
+        })?;
+        exception.validate()?;
+        Ok(self
+            .parent_records
+            .iter()
+            .filter(|record| {
+                !exception.baseline_ids.contains(&record.baseline_id)
+                    && !exception
+                        .historical_execution_extension
+                        .baseline_ids
+                        .contains(&record.baseline_id)
             })
             .collect())
     }
@@ -1413,6 +1523,8 @@ struct UnittestRecaptureReceiptProjectionV1<'a> {
     schema_version: u8,
     source_audit: &'a UnittestSourceAuditV1,
     source_isolation: &'a UnittestSourceIsolationV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_provenance_exception: &'a Option<UnittestSourceProvenanceExceptionV1>,
     source_site_manifest: &'a [UnittestSourceSiteV1],
     source_tree_sha256: &'a Sha256HexV1,
     subtest_occurrences: &'a [UnittestSubtestOccurrenceV1],
@@ -2016,10 +2128,10 @@ impl InventoryRecoveryRecordV1 {
         ensure_sorted_unique(&resolution.parent_container_ids, "parent container IDs")?;
         if self.kind == RecoveryKindV1::Unittest {
             if resolution.parent_recapture_outputs.len()
-                != UNITTEST_EXECUTABLE_RECAPTURE_PARENT_COUNT
+                != UNITTEST_AUTHENTICATED_RECAPTURE_PARENT_COUNT
             {
                 return Err(ContractError::InvalidContract(
-                    "resolved unittest recovery must prove all 893 executable parent outputs"
+                    "resolved unittest recovery must prove all 859 authenticated parent outputs"
                         .to_owned(),
                 ));
             }
@@ -2047,7 +2159,7 @@ impl InventoryRecoveryRecordV1 {
                 })
             {
                 return Err(ContractError::InvalidContract(
-                    "resolved unittest recovery must cover exactly the 893 executable parents with one method-body child; hidden-at-freeze ledger identities must not be included"
+                    "resolved unittest recovery must cover exactly the 859 authenticated parents with one method-body child; excepted and hidden-at-freeze identities must not be included"
                         .to_owned(),
                 ));
             }

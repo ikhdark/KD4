@@ -115,6 +115,7 @@ pub struct UnifiedExecRequest {
     pub approved_powershell_direct_argv: Option<Vec<String>>,
     pub raw_output_artifact: RawOutputArtifact,
     pub shell_type: ShellType,
+    pub shell_wrapper_is_owned: bool,
     pub hook_command: String,
     pub process_id: u32,
     pub cwd: PathUri,
@@ -139,6 +140,12 @@ pub struct UnifiedExecRequest {
     pub(crate) canonical_proof_report_write_root: Option<std::path::PathBuf>,
     pub(crate) prepared_canonical_windows_sandbox_launch:
         Option<codex_windows_sandbox::PreparedCanonicalWindowsSandboxLaunch>,
+}
+
+impl UnifiedExecRequest {
+    fn sandbox_shell_type(&self) -> Option<&ShellType> {
+        self.shell_wrapper_is_owned.then_some(&self.shell_type)
+    }
 }
 
 #[derive(Debug)]
@@ -600,7 +607,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecLaunch> for UnifiedExecRunti
             explicit_env_overrides: &explicit_env_overrides,
             env: &mut env,
             shell_type: &req.shell_type,
-            sandbox_shell_type: Some(&req.shell_type),
+            sandbox_shell_type: req.sandbox_shell_type(),
             sandbox: attempt.sandbox,
             windows_sandbox_level: attempt.windows_sandbox_level,
             enforce_managed_network: attempt.enforce_managed_network,
@@ -812,6 +819,7 @@ mod tests {
                 bytes: 0,
             },
             shell_type: ShellType::Sh,
+            shell_wrapper_is_owned: true,
             hook_command: "pwd".to_string(),
             process_id: 1000,
             cwd: cwd.into(),
@@ -925,6 +933,7 @@ mod tests {
                 bytes: 0,
             },
             shell_type: ShellType::Zsh,
+            shell_wrapper_is_owned: true,
             hook_command: "echo hi".to_string(),
             process_id: 1000,
             cwd: cwd.clone().into(),
@@ -948,5 +957,23 @@ mod tests {
             canonical_proof_report_write_root: None,
             prepared_canonical_windows_sandbox_launch: None,
         }
+    }
+
+    #[tokio::test]
+    async fn sandbox_shell_type_tracks_owned_shell_wrapper() {
+        let mut request = test_request(
+            SandboxPermissions::UseDefault,
+            ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: None,
+            },
+        );
+        request.shell_type = ShellType::PowerShell;
+        request.shell_wrapper_is_owned = false;
+
+        assert_eq!(request.sandbox_shell_type(), None);
+
+        request.shell_wrapper_is_owned = true;
+        assert_eq!(request.sandbox_shell_type(), Some(&ShellType::PowerShell));
     }
 }

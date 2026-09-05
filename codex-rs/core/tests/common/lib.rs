@@ -286,6 +286,13 @@ timeout_seconds = 30
     pub fn canonical_runner_launched(&self) -> bool {
         self.marker_path.exists()
     }
+
+    pub fn canonical_launch_count(&self) -> anyhow::Result<usize> {
+        if !self.marker_path.exists() {
+            return Ok(0);
+        }
+        Ok(std::fs::read_to_string(&self.marker_path)?.lines().count())
+    }
 }
 
 /// A dirty generic repository whose terminal completion policy names a

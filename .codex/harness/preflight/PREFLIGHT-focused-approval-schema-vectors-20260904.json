@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:focused-approval-schema-vectors-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    { "path": ".codex/validation/focused-replacement-approval-receipt-v1.schema.json", "recursive": false },
+    { "path": "scripts/fixtures/focused_replacement_approval_receipt_v1_vectors.json", "recursive": false }
+  ],
+  "contract_claims": ["focused-replacement-approval-receipt-schema-vectors"],
+  "dependencies": ["root:completion-proof-migration-20260902"],
+  "generated_outputs": ["scripts/fixtures/focused_replacement_approval_receipt_v1_vectors.json"],
+  "generated_output_owner": "worker:focused-approval-schema-vectors-20260904",
+  "validation_owner": "worker:focused-approval-python-contract-20260904",
+  "validation_commands": ["python -m unittest scripts.test_focused_replacement_approval_receipt"],
+  "cargo_lane": {
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\focused-approval-schema-vectors",
+    "cargo_home": "C:\\Users\\kuh\\.cargo"
+  },
+  "workspace_strategy": "shared"
+}

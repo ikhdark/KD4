@@ -1,0 +1,91 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "worker:canonical-typed-v2-current-registration-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\none"
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-completion-proof-maintenance-registration-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-completion-proof-maintenance-registration-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          "scripts/root_maintenance.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_build_tooling_policy.py",
+          "scripts"
+        ],
+        [
+          "source_owners.toml",
+          "source_owners.toml"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:completion-proof-maintenance-registration-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\none",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\none"
+  },
+  "contract_claims": [
+    "completion-proof-maintenance-routing-focused",
+    "completion-proof-focused-contract-owner-registration"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T13:41:40.339826+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "12564b80344d13f58757ed46b28082769d20719ac03f8873c3767b6ba27fedc3",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-completion-proof-maintenance-registration-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-completion-proof-maintenance-registration-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/root_maintenance.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_build_tooling_policy.py",
+      "recursive": false
+    },
+    {
+      "path": "source_owners.toml",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T12:41:40.339826+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "3fa06a2cd99631d70de2bfc1fd1ca6590ddd50dc24f33917939268dfe3d37052"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_build_tooling_policy.BuildToolingPolicyTest.test_root_maintenance_routes_completion_proof_contract_tests",
+    "python scripts/source_owners.py slice --owner completion-proof-certification --focus completion-proof focused contracts --max-relationships 32",
+    "git diff --check"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

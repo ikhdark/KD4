@@ -41,6 +41,21 @@ pub(crate) struct ConsumedTypedSpawn {
     session_source: SessionSource,
     agent_metadata: AgentMetadata,
     residency_slot: Option<super::residency::V2ResidencySlot>,
+    fresh_assignment: Option<(
+        codex_agent_task_store::Assignment,
+        codex_agent_task_store::AttemptId,
+    )>,
+}
+
+impl ConsumedTypedSpawn {
+    /// Called only with the result of this spawn's fresh durable admission, before launch.
+    pub(crate) fn capture_fresh_assignment(
+        &mut self,
+        assignment: codex_agent_task_store::Assignment,
+        attempt_id: codex_agent_task_store::AttemptId,
+    ) {
+        self.fresh_assignment = Some((assignment, attempt_id));
+    }
 }
 
 impl PreparedTypedSpawn {
@@ -82,6 +97,7 @@ impl PreparedTypedSpawn {
             session_source: self.session_source,
             agent_metadata: self.agent_metadata,
             residency_slot: self.residency_slot,
+            fresh_assignment: None,
         })
     }
 }
@@ -901,6 +917,9 @@ impl AgentControl {
         consumed_typed_spawn: Option<ConsumedTypedSpawn>,
     ) -> CodexResult<LiveAgent> {
         let state = self.upgrade()?;
+        let fresh_assignment = consumed_typed_spawn
+            .as_ref()
+            .and_then(|consumed| consumed.fresh_assignment.clone());
         let (
             multi_agent_version,
             execution_guard,
@@ -1067,6 +1086,29 @@ impl AgentControl {
             None
         };
         if let Some(binding) = typed_task_binding {
+            if let Some((assignment, attempt_id)) = fresh_assignment
+                && assignment.role == codex_agent_task_store::AgentRole::Reviewer
+                && assignment.admission_origin
+                    == codex_agent_task_store::AssignmentAdmissionOrigin::Typed
+                && notification_source
+                    .as_ref()
+                    .is_some_and(crate::agent::task_capabilities::is_independent_review_source)
+                && assignment.assignment_id == binding.assignment_id
+                && attempt_id == binding.attempt_id
+                && assignment.root_session_id == self.task_lineage_id
+            {
+                self.fresh_typed_reviews
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        attempt_id,
+                        FreshTypedReviewAdmission {
+                            assignment,
+                            binding: binding.clone(),
+                            runtime_session_id: self.session_id,
+                        },
+                    );
+            }
             self.start_typed_actor_heartbeat_watcher(binding, new_thread.thread_id);
         }
 

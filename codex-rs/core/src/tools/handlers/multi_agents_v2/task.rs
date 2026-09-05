@@ -210,7 +210,8 @@ async fn handle_submit_agent_receipt(
     } = invocation;
     let turn = Arc::clone(&step_context.turn);
     let arguments = function_arguments(payload)?;
-    let args: SubmitAgentReceiptArgs = parse_arguments(&arguments)?;
+    let mut args: SubmitAgentReceiptArgs = parse_arguments(&arguments)?;
+    let historical_proposal_path = args.historical_acceptance_proposal_path.take();
     let coordinator = session.services.agent_control.task_coordinator();
     let binding = turn.typed_agent_task_binding().ok_or_else(|| {
         FunctionCallError::RespondToModel(format!(
@@ -249,6 +250,49 @@ async fn handle_submit_agent_receipt(
         .list_mutation_evidence(binding.attempt_id, Some(MAX_MUTATION_EVIDENCE_LIMIT))
         .await
         .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
+    let historical_review = if let Some(path) = historical_proposal_path.as_deref() {
+        let target_id = task.assignment.relation.as_ref()
+            .filter(|relation| relation.kind == RelationKind::Review && relation.target_assignment_ids.len() == 1)
+            .and_then(|relation| relation.target_assignment_ids.first()).copied()
+            .ok_or_else(|| FunctionCallError::RespondToModel(
+                "submit_agent_receipt: historical acceptance requires one declared review target".to_string()
+            ))?;
+        let target = coordinator
+            .get_agent_task(target_id, Some(0))
+            .await
+            .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
+        let live_agent_path = turn
+            .session_source
+            .get_agent_path()
+            .map(|path| path.to_string())
+            .unwrap_or_else(|| "/root".to_string());
+        Some(
+            session
+                .services
+                .completion_proof
+                .prepare_historical_acceptance_review(
+                    path,
+                    crate::completion_proof::HistoricalAcceptanceReviewInput {
+                        agent_control: &session.services.agent_control,
+                        source: &turn.session_source,
+                        binding: &binding,
+                        reviewer: &task,
+                        target: &target,
+                        draft: &draft,
+                        live_thread_id: session.thread_id(),
+                        live_agent_path: &live_agent_path,
+                        session_lineage_id: session.services.agent_control.task_lineage_id(),
+                        observed_writes: &observed_writes,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!("submit_agent_receipt: {error}"))
+                })?,
+        )
+    } else {
+        None
+    };
     let review_reason = derive_review_reason(
         store.as_ref(),
         turn.config.cwd.as_path(),
@@ -257,20 +301,45 @@ async fn handle_submit_agent_receipt(
         &observed_writes,
     )
     .await?;
-    let receipt = match review_reason {
-        Some(review_reason) => {
-            store
-                .submit_agent_receipt_with_review(binding.attempt_id, draft, review_reason)
-                .await
+    let receipt = if let Some(pending) = historical_review.as_ref() {
+        let (target_assignment_id, target_attempt_id) = pending.review_target();
+        store
+            .submit_agent_receipt_for_review_target(
+                binding.attempt_id,
+                draft,
+                review_reason,
+                pending.reviewer_assignment(),
+                target_assignment_id,
+                target_attempt_id,
+            )
+            .await
+    } else {
+        match review_reason {
+            Some(review_reason) => {
+                store
+                    .submit_agent_receipt_with_review(binding.attempt_id, draft, review_reason)
+                    .await
+            }
+            None => store.submit_agent_receipt(binding.attempt_id, draft).await,
         }
-        None => store.submit_agent_receipt(binding.attempt_id, draft).await,
     }
     .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
     coordinator.mark_task_inactive(binding.assignment_id);
     coordinator
         .maybe_emit_terminal_metrics(binding.assignment_id, &turn.session_telemetry)
         .await;
-    Ok(boxed_tool_output(SubmitAgentReceiptResult { receipt }))
+    let reviewed_proposal_sha256 = if let Some(pending) = historical_review {
+        Some(session.services.completion_proof.finish_historical_acceptance_review(pending, &receipt)
+            .await.map_err(|error| FunctionCallError::RespondToModel(format!(
+                "submit_agent_receipt: the reviewer receipt was sealed, but no historical acceptance authority was recorded: {error}. The root must start a fresh independent review attempt; replaying the sealed receipt is not authority."
+            )))?)
+    } else {
+        None
+    };
+    Ok(boxed_tool_output(SubmitAgentReceiptResult {
+        receipt,
+        reviewed_proposal_sha256,
+    }))
 }
 
 #[derive(Default)]
@@ -973,6 +1042,8 @@ struct SubmitAgentReceiptArgs {
     next_action: Option<String>,
     #[serde(default)]
     architecture_contract: Option<ArchitectureContractV1>,
+    #[serde(default)]
+    historical_acceptance_proposal_path: Option<String>,
 }
 
 impl SubmitAgentReceiptArgs {
@@ -1125,6 +1196,9 @@ struct GetAgentTaskResult {
 #[derive(Debug, Serialize)]
 struct SubmitAgentReceiptResult {
     receipt: AgentReceipt,
+    /// This records review provenance only; it neither materializes admissions nor certifies completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reviewed_proposal_sha256: Option<String>,
 }
 
 const TASK_OUTPUT_INLINE_LIMIT_BYTES: usize = 8 * 1024;
@@ -1817,9 +1891,14 @@ impl ToolOutput for SubmitAgentReceiptResult {
     }
 
     fn projection_metadata(&self) -> Option<codex_tools::ToolOutputProjectionMetadata> {
+        let mut projection = bounded_receipt_projection(&self.receipt);
+        if let Some(digest) = &self.reviewed_proposal_sha256 {
+            projection["reviewed_proposal_sha256"] = json!(digest);
+            projection["review_authority"] = json!("nonterminal-review-only");
+        }
         bounded_task_projection_metadata(
             self,
-            bounded_receipt_projection(&self.receipt),
+            projection,
             receipt_projection_json_pointers(&self.receipt),
         )
     }
@@ -2070,6 +2149,12 @@ fn submit_agent_receipt_spec() -> ToolSpec {
                     )),
                 ),
                 ("architecture_contract", architecture_contract),
+                (
+                    "historical_acceptance_proposal_path",
+                    JsonSchema::string(Some(
+                        "Optional repository-relative canonical JSON historical replacement proposal. Requires a fresh independent typed reviewer whose sole immutable criterion is historical-replacement-review-plan-v1.<review_plan_sha256>, passing evidence for that complete plan, and a current authenticated reconciliation receipt. Records review provenance; does not materialize admissions or certify completion.".to_string(),
+                    )),
+                ),
             ],
             &[
                 "status",
@@ -2310,6 +2395,7 @@ mod projection_tests {
         };
         let result = SubmitAgentReceiptResult {
             receipt: receipt.clone(),
+            reviewed_proposal_sha256: None,
         };
         let metadata = bounded_task_projection_metadata(
             &result,

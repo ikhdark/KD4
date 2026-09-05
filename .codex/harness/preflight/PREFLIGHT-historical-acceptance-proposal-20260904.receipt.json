@@ -1,0 +1,95 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "worker:focused-evidence-frame-contract-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\root-owned-serialized"
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-historical-acceptance-proposal-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-historical-acceptance-proposal-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          ".codex/validation/replacement-admissions-v1.schema.json",
+          ".codex"
+        ],
+        [
+          "scripts/replacement_admission.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_replacement_admission.py",
+          "scripts"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "worker:cli-app-server-direct-argv-proof-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\root-owned-serialized"
+    }
+  ],
+  "assignment_id": "worker:historical-acceptance-proposal-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\default",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\root-owned-serialized"
+  },
+  "contract_claims": [
+    "historical-replacement-review-scope-proposal",
+    "historical-replacement-attempt-level-approval-binding",
+    "stage2-unresolved-only-admission-preservation"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T20:29:56.018531+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "b8efd25f16549d90aa9fce10109781033af88c3bb169832c6f7062153492a79a",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-historical-acceptance-proposal-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-historical-acceptance-proposal-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/validation/replacement-admissions-v1.schema.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/replacement_admission.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_replacement_admission.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T19:29:56.018531+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "eb0402d4487647be7ad801eea73137e94a2afbbf07a68dd41bc5be5012a1cf06"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_replacement_admission"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

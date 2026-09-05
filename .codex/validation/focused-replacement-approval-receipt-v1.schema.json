@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kd4://validation/focused-replacement-approval-receipt-v1.schema.json",
+  "title": "KD4 Focused Replacement Approval Receipt V1",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uuid_v7": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    }
+  },
+  "properties": {
+    "format_id": {
+      "const": "kd4.focused-replacement-approval-receipt.v1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "attempt_id": {
+      "$ref": "#/$defs/uuid_v7"
+    },
+    "focused_validation_id": {
+      "const": "inventory.frozen-reconciliation"
+    },
+    "classification": {
+      "const": "confirmed-pass"
+    },
+    "frozen_inventory_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "focused_inventory_catalog_semantic_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "inventory_discovery_processes_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "policy_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "policy_runner_bundle_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "workspace_fingerprint": {
+      "$ref": "#/$defs/sha256"
+    },
+    "mutation_epoch": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "receipt_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "required": [
+    "format_id",
+    "schema_version",
+    "attempt_id",
+    "focused_validation_id",
+    "classification",
+    "frozen_inventory_hash",
+    "focused_inventory_catalog_semantic_sha256",
+    "inventory_discovery_processes_sha256",
+    "policy_id",
+    "policy_runner_bundle_sha256",
+    "workspace_fingerprint",
+    "mutation_epoch",
+    "receipt_sha256"
+  ]
+}

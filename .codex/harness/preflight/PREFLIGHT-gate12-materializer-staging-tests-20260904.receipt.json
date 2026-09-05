@@ -1,0 +1,57 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts/test_materialize_completion_proof_inventory_v2.py",
+          "scripts"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "gate12:materializer-staging-20260904",
+      "contracts": [
+        "gate12-materializer-preparation-before-replacement"
+      ],
+      "kind": "claim_overlap",
+      "paths": []
+    }
+  ],
+  "assignment_id": "worker:gate12-materializer-staging-tests-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\none",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\worker-gate12-materializer-staging-tests-20260904-no-cargo"
+  },
+  "contract_claims": [
+    "gate12-materializer-preparation-before-replacement"
+  ],
+  "dependencies": [],
+  "expires_at": "2026-09-05T02:44:28.367865+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "a0ffb780fab8c946abf0b0093a00f81f107f37c0e8a08eb87699d504d6f0f687",
+  "path_claims": [
+    {
+      "path": "scripts/test_materialize_completion_proof_inventory_v2.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-05T01:44:28.367865+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "9031d4f9f696bd521d7909f9036177bbb1f46fdbc3e5aefb5c024735e69f099f"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_materialize_completion_proof_inventory_v2.InventoryV2MaterializationTests.test_real_cli_rejects_nonregular_output_before_changing_bundle scripts.test_materialize_completion_proof_inventory_v2.InventoryV2MaterializationTests.test_real_cli_staging_failure_preserves_existing_bundle"
+  ],
+  "validation_owner": "worker:gate12-materializer-staging-tests-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

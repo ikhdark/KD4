@@ -7,6 +7,22 @@ use codex_keyring_store::KeyringStore;
 #[cfg(all(feature = "completion-proof-test-store", debug_assertions))]
 use codex_keyring_store::tests::MockKeyringStore;
 use codex_protocol::ThreadId;
+use codex_validation_contracts::canonical::Sha256HexV1;
+use codex_validation_contracts::canonical::canonical_jcs_of;
+use codex_validation_contracts::focused_evidence_frame::FOCUSED_EVIDENCE_HEADER_LEN;
+use codex_validation_contracts::focused_evidence_frame::FocusedEvidenceAckV1;
+use codex_validation_contracts::focused_evidence_frame::FocusedEvidenceFrameV1;
+use codex_validation_contracts::focused_evidence_frame::FocusedEvidenceHeaderV1;
+use codex_validation_contracts::focused_evidence_frame::FocusedEvidenceMemberV1;
+use codex_validation_contracts::focused_live_successor::FocusedInventoryFrameworkV1;
+use codex_validation_contracts::focused_live_successor::FocusedInventoryPlatformV1;
+use codex_validation_contracts::focused_live_successor::FocusedLiveSuccessorCatalogV1;
+use codex_validation_contracts::focused_live_successor::InventoryDiscoveryOutputV1;
+use codex_validation_contracts::focused_live_successor::InventoryDiscoveryProcessV1;
+use codex_validation_contracts::focused_live_successor::parse_inventory_discovery_process_set_canonical_v1;
+use codex_validation_contracts::focused_replacement_approval::FocusedReplacementApprovalCurrentContextV1;
+use codex_validation_contracts::focused_replacement_approval::FocusedReplacementApprovalReceiptV1;
+use codex_validation_contracts::historical_replacement_acceptance::HistoricalReplacementAcceptanceProposalV1;
 use hmac::Hmac;
 use hmac::Mac;
 use rand::RngCore;
@@ -40,6 +56,11 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+mod focused_completion;
+mod test_declarations;
+mod test_quality;
+use focused_completion::FocusedCompletionState;
+
 const STATE_SCHEMA_VERSION: u32 = 1;
 const AUTHENTICATED_STATE_SCHEMA_VERSION: u32 = 1;
 const TRUST_ANCHOR_SCHEMA_VERSION: u32 = 1;
@@ -71,10 +92,14 @@ const ENV_RUNNER_ATTESTATION_ENDPOINT: &str = "CODEX_COMPLETION_PROOF_RUNNER_ATT
 const RUNNER_ATTESTATION_SCHEMA_VERSION: u32 = 1;
 const MAX_RUNNER_ATTESTATION_BYTES: usize = 16 * 1024;
 const RUNNER_ATTESTATION_WAIT: Duration = Duration::from_secs(2);
+const CURRENT_EVIDENCE_EXCHANGE_WAIT: Duration = Duration::from_secs(30);
+const CURRENT_EVIDENCE_VALIDATION_ID: &str = "inventory.current-evidence";
+const CURRENT_EVIDENCE_COMPONENT_IDS: [&str; 2] =
+    ["maintenance.root-unittest", "sdk.python.pytest"];
 const PRIVATE_STATE_LOCK_WAIT: Duration = Duration::from_secs(10);
 const PRIVATE_STATE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const VALIDATION_INPUT_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
-const VALIDATION_INPUT_SNAPSHOT_ALGORITHM: &str = "content-and-path-set-v2";
+const VALIDATION_INPUT_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+const VALIDATION_INPUT_SNAPSHOT_ALGORITHM: &str = "content-and-tracked-file-path-set-v3";
 const VALIDATION_INPUT_SNAPSHOT_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Copy)]
@@ -115,6 +140,22 @@ const KD4_TRUSTED_BUNDLE_MEMBERS: &[TrustedBundleMember] = &[
     TrustedBundleMember {
         relative_path: "scripts/completion_proof.py",
         bytes: include_bytes!("../../../scripts/completion_proof.py"),
+    },
+    TrustedBundleMember {
+        relative_path: "scripts/completion_proof_canonical.py",
+        bytes: include_bytes!("../../../scripts/completion_proof_canonical.py"),
+    },
+    TrustedBundleMember {
+        relative_path: "scripts/completion_proof_inventory_v2.py",
+        bytes: include_bytes!("../../../scripts/completion_proof_inventory_v2.py"),
+    },
+    TrustedBundleMember {
+        relative_path: "scripts/focused_live_successor_catalog.py",
+        bytes: include_bytes!("../../../scripts/focused_live_successor_catalog.py"),
+    },
+    TrustedBundleMember {
+        relative_path: "scripts/current_evidence_successor_projection.py",
+        bytes: include_bytes!("../../../scripts/current_evidence_successor_projection.py"),
     },
     TrustedBundleMember {
         relative_path: "scripts/bounded_process.py",
@@ -189,6 +230,176 @@ struct RunnerProcessAttestation {
     entrypoint_path: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+enum RunnerAttestationProtocol {
+    AttestationOnly,
+    CurrentEvidence(CurrentEvidenceChannelExpectation),
+}
+
+#[derive(Clone, Debug)]
+struct CurrentEvidenceChannelExpectation {
+    repository_root: PathBuf,
+    start_fingerprint: String,
+    start_mutation_epoch: u64,
+    frozen_inventory_hash: String,
+    baseline_exception_rules: BTreeSet<BaselineExceptionRule>,
+}
+
+#[derive(Debug)]
+struct RunnerAttestationReceipt {
+    process: RunnerProcessAttestation,
+    current_evidence: Option<CurrentEvidenceExchangeReceipt>,
+}
+
+#[derive(Debug)]
+struct CurrentEvidenceExchangeReceipt {
+    evidence: Option<ValidatedCurrentEvidence>,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
+struct ValidatedCurrentEvidence {
+    catalog: FocusedLiveSuccessorCatalogV1,
+    processes: Vec<InventoryDiscoveryProcessV1>,
+    catalog_sha256: String,
+    frame_sha256: String,
+    unittest: RawStructuredTestEvidence,
+    pytest: RawStructuredTestEvidence,
+}
+
+#[derive(Clone, Debug)]
+struct RawStructuredTestEvidence {
+    framework: String,
+    proof_attempt_id: String,
+    proof_execution_id: String,
+    proof_receipt_nonce: String,
+    classification: ValidationClassification,
+    intended_ids: Vec<String>,
+    selected_ids: Vec<String>,
+    started_ids: Vec<String>,
+    terminal_ids: Vec<String>,
+    executed_ids: Vec<String>,
+    outcomes: Vec<RawStructuredTestOutcome>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStructuredTestOutcome {
+    id: String,
+    outcome: String,
+    #[serde(default)]
+    duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUnittestCollectionV2 {
+    schema_version: u32,
+    report_type: String,
+    framework: String,
+    classification: String,
+    tests: Vec<RawUnittestCollectionTestV2>,
+    selected_count: usize,
+    discovery_errors: Vec<String>,
+    duplicate_ids: Vec<String>,
+    metadata_errors: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUnittestCollectionTestV2 {
+    id: String,
+    source_path: String,
+    declared_subtest_sites: Vec<RawUnittestSubtestSiteV2>,
+    skipped_at_discovery: bool,
+    skip_reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUnittestSubtestSiteV2 {
+    path: String,
+    line: u64,
+    column: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPytestCollectionV1 {
+    schema_version: u32,
+    framework: String,
+    classification: String,
+    tests: Vec<RawPytestCollectionTestV1>,
+    selected_count: usize,
+    duplicate_ids: Vec<String>,
+    collection_errors: Vec<String>,
+    pytest_exit_code: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPytestCollectionTestV1 {
+    id: String,
+    skip_markers: Vec<RawPytestSkipMarkerV1>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPytestSkipMarkerV1 {
+    name: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUnittestExecutionV2 {
+    schema_version: u32,
+    report_type: String,
+    framework: String,
+    proof_attempt_id: String,
+    proof_execution_id: String,
+    proof_receipt_nonce: String,
+    proof_scope: String,
+    classification: ValidationClassification,
+    intended_ids: Vec<String>,
+    selected_ids: Vec<String>,
+    started_ids: Vec<String>,
+    terminal_ids: Vec<String>,
+    executed_ids: Vec<String>,
+    outcomes: Vec<RawStructuredTestOutcome>,
+    selection_confirmed: bool,
+    intended_count: usize,
+    selected_count: usize,
+    executed_count: usize,
+    fixture_problem_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPytestExecutionV2 {
+    schema_version: u32,
+    report_type: String,
+    framework: String,
+    proof_attempt_id: String,
+    proof_execution_id: String,
+    proof_receipt_nonce: String,
+    proof_scope: String,
+    classification: ValidationClassification,
+    intended_ids: Vec<String>,
+    selected_ids: Vec<String>,
+    started_ids: Vec<String>,
+    terminal_ids: Vec<String>,
+    executed_ids: Vec<String>,
+    outcomes: Vec<RawStructuredTestOutcome>,
+    selection_confirmed: bool,
+    intended_count: usize,
+    selected_count: usize,
+    executed_count: usize,
+    collection_errors: Vec<String>,
+    pytest_exit_code: i32,
+    phase_error_ids: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunnerAttestationMessageV1 {
@@ -202,13 +413,13 @@ struct RunnerAttestationMessageV1 {
 #[derive(Debug)]
 struct RunnerAttestationWaiter {
     endpoint: String,
-    receiver: Option<oneshot::Receiver<Result<RunnerProcessAttestation, String>>>,
+    receiver: Option<oneshot::Receiver<Result<RunnerAttestationReceipt, String>>>,
     task: tokio::task::JoinHandle<()>,
     cleanup_path: Option<PathBuf>,
 }
 
 impl RunnerAttestationWaiter {
-    async fn receive(&mut self) -> Result<RunnerProcessAttestation, String> {
+    async fn receive(&mut self) -> Result<RunnerAttestationReceipt, String> {
         let receiver = self
             .receiver
             .take()
@@ -221,6 +432,535 @@ impl RunnerAttestationWaiter {
             }
         }
     }
+}
+
+async fn receive_current_evidence_exchange<S>(
+    stream: &mut S,
+    expected_attempt_id: &str,
+    expectation: &CurrentEvidenceChannelExpectation,
+    runner_process_id: u32,
+) -> CurrentEvidenceExchangeReceipt
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut header_bytes = [0_u8; FOCUSED_EVIDENCE_HEADER_LEN];
+    match stream.read(&mut header_bytes[..1]).await {
+        Ok(1) => {}
+        Ok(_) => {
+            return CurrentEvidenceExchangeReceipt {
+                evidence: None,
+                error: Some(
+                    "the current-evidence channel ended before its final frame".to_string(),
+                ),
+            };
+        }
+        Err(error) => {
+            return CurrentEvidenceExchangeReceipt {
+                evidence: None,
+                error: Some(format!(
+                    "could not read the current-evidence final frame: {error}"
+                )),
+            };
+        }
+    }
+
+    let exchange = async {
+        stream
+            .read_exact(&mut header_bytes[1..])
+            .await
+            .map_err(|error| format!("the current-evidence frame header was truncated: {error}"))?;
+        let header =
+            FocusedEvidenceHeaderV1::parse(&header_bytes).map_err(|error| error.to_string())?;
+        let mut body = vec![0_u8; header.body_len()];
+        stream
+            .read_exact(&mut body)
+            .await
+            .map_err(|error| format!("the current-evidence frame body was truncated: {error}"))?;
+        let expected_attempt_id = expected_attempt_id.to_string();
+        let expectation = expectation.clone();
+        let parsed = tokio::task::spawn_blocking(move || {
+            let frame = FocusedEvidenceFrameV1::parse_complete(header, body)
+                .map_err(|error| (error.complete_digest(), error.to_string()))?;
+            let digest = frame.digest();
+            let evidence = validate_current_evidence_frame(
+                &frame,
+                &expected_attempt_id,
+                &expectation,
+                runner_process_id,
+            )
+            .map_err(|error| (Some(digest), error))?;
+            Ok::<_, (Option<_>, String)>((digest, evidence))
+        })
+        .await
+        .map_err(|error| format!("the current-evidence frame validator stopped: {error}"));
+        let (digest, evidence) = match parsed {
+            Ok(Ok(accepted)) => accepted,
+            Ok(Err((digest, error))) => {
+                if let Some(digest) = digest {
+                    let acknowledgement = FocusedEvidenceAckV1::rejected_complete(digest).encode();
+                    let _ = stream.write_all(&acknowledgement).await;
+                    let _ = stream.flush().await;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let acknowledgement = FocusedEvidenceAckV1::accepted(digest).encode();
+        let acknowledgement_result = async {
+            stream.write_all(&acknowledgement).await?;
+            stream.flush().await
+        }
+        .await
+        .map_err(|error| format!("could not write the current-evidence acknowledgement: {error}"));
+        match acknowledgement_result {
+            Ok(()) => Ok(evidence),
+            Err(error) => Err(error),
+        }
+    };
+
+    match tokio::time::timeout(CURRENT_EVIDENCE_EXCHANGE_WAIT, exchange).await {
+        Ok(Ok(evidence)) => CurrentEvidenceExchangeReceipt {
+            evidence: Some(evidence),
+            error: None,
+        },
+        Ok(Err(error)) => CurrentEvidenceExchangeReceipt {
+            evidence: None,
+            error: Some(error),
+        },
+        Err(_) => CurrentEvidenceExchangeReceipt {
+            evidence: None,
+            error: Some(
+                "the current-evidence final-frame exchange exceeded 30 seconds".to_string(),
+            ),
+        },
+    }
+}
+
+fn validate_current_evidence_frame(
+    frame: &FocusedEvidenceFrameV1,
+    expected_attempt_id: &str,
+    expectation: &CurrentEvidenceChannelExpectation,
+    runner_process_id: u32,
+) -> Result<ValidatedCurrentEvidence, String> {
+    let catalog_bytes = frame.member(FocusedEvidenceMemberV1::Catalog);
+    let process_bytes = frame.member(FocusedEvidenceMemberV1::Process);
+    let unittest_collection_bytes = frame.member(FocusedEvidenceMemberV1::UnittestCollect);
+    let unittest_execution_bytes = frame.member(FocusedEvidenceMemberV1::UnittestExec);
+    let pytest_collection_bytes = frame.member(FocusedEvidenceMemberV1::PytestCollect);
+    let pytest_execution_bytes = frame.member(FocusedEvidenceMemberV1::PytestExec);
+
+    let catalog = FocusedLiveSuccessorCatalogV1::parse_canonical(catalog_bytes)
+        .map_err(|error| format!("the current-evidence catalog was rejected: {error}"))?;
+    let processes = parse_inventory_discovery_process_set_canonical_v1(process_bytes)
+        .map_err(|error| format!("the current-evidence process set was rejected: {error}"))?;
+    catalog
+        .validate_with_inventory_discovery_processes(&processes)
+        .map_err(|error| format!("the current-evidence catalog/process binding failed: {error}"))?;
+    if catalog.attempt_id != expected_attempt_id
+        || catalog.focused_validation_id != CURRENT_EVIDENCE_VALIDATION_ID
+        || catalog.frozen_inventory_hash.as_str() != expectation.frozen_inventory_hash
+        || catalog.start_fingerprint.as_str() != expectation.start_fingerprint
+        || catalog.start_mutation_epoch != expectation.start_mutation_epoch
+        || catalog.in_process_jest_discovery.runner_pid != runner_process_id
+    {
+        return Err(
+            "the current-evidence catalog did not bind this exact focused attempt".to_string(),
+        );
+    }
+    validate_collection_process_hash(
+        &processes,
+        "inventory.root-unittest",
+        unittest_collection_bytes,
+    )?;
+    validate_collection_process_hash(
+        &processes,
+        "inventory.sdk-python-pytest",
+        pytest_collection_bytes,
+    )?;
+
+    let unittest_collection =
+        serde_json::from_slice::<RawUnittestCollectionV2>(unittest_collection_bytes)
+            .map_err(|error| format!("the raw unittest collection report was invalid: {error}"))?;
+    let pytest_collection =
+        serde_json::from_slice::<RawPytestCollectionV1>(pytest_collection_bytes)
+            .map_err(|error| format!("the raw pytest collection report was invalid: {error}"))?;
+    let unittest_ids = validate_unittest_collection(&catalog, &unittest_collection)?;
+    let pytest_ids = validate_pytest_collection(&catalog, &pytest_collection)?;
+    let unittest = parse_unittest_execution(unittest_execution_bytes, expected_attempt_id)?;
+    let pytest = parse_pytest_execution(pytest_execution_bytes, expected_attempt_id)?;
+    validate_execution_is_selected_from_collection(&unittest, &unittest_ids)?;
+    validate_execution_is_selected_from_collection(&pytest, &pytest_ids)?;
+    validate_current_evidence_expected_selections(
+        &catalog,
+        &unittest,
+        &pytest,
+        &expectation.baseline_exception_rules,
+    )?;
+    for process in &processes {
+        if !same_completion_proof_path(
+            &canonical_repository_root(Path::new(&process.cwd)),
+            &expectation.repository_root,
+        ) {
+            return Err(
+                "a current-evidence discovery process escaped the authenticated repository"
+                    .to_string(),
+            );
+        }
+    }
+    if unittest.classification != ValidationClassification::ConfirmedPass
+        || pytest.classification != ValidationClassification::ConfirmedPass
+    {
+        return Err(
+            "the current-evidence frame contained a component that did not confirm pass"
+                .to_string(),
+        );
+    }
+    if unittest.proof_receipt_nonce == pytest.proof_receipt_nonce {
+        return Err("the current-evidence component reports reused one receipt nonce".to_string());
+    }
+
+    Ok(ValidatedCurrentEvidence {
+        catalog,
+        processes,
+        catalog_sha256: format!("{:x}", Sha256::digest(catalog_bytes)),
+        frame_sha256: frame
+            .digest()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        unittest,
+        pytest,
+    })
+}
+
+fn validate_collection_process_hash(
+    processes: &[InventoryDiscoveryProcessV1],
+    role: &str,
+    report_bytes: &[u8],
+) -> Result<(), String> {
+    let process = processes
+        .iter()
+        .find(|process| process.role == role)
+        .ok_or_else(|| format!("the current-evidence process set omitted {role}"))?;
+    let InventoryDiscoveryOutputV1::ReportFile { report_sha256, .. } = &process.output else {
+        return Err(format!(
+            "the current-evidence process {role} did not retain a report file"
+        ));
+    };
+    let actual = format!("{:x}", Sha256::digest(report_bytes));
+    if report_sha256.as_str() != actual {
+        return Err(format!(
+            "the current-evidence process {role} did not bind the transmitted collection report"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unittest_collection(
+    catalog: &FocusedLiveSuccessorCatalogV1,
+    report: &RawUnittestCollectionV2,
+) -> Result<BTreeSet<String>, String> {
+    if report.schema_version != 2
+        || report.report_type != "CompletionProofUnittestCollectionV2"
+        || report.framework != "python-unittest"
+        || report.classification != "discovered"
+        || report.tests.is_empty()
+        || report.selected_count != report.tests.len()
+        || !report.discovery_errors.is_empty()
+        || !report.duplicate_ids.is_empty()
+        || !report.metadata_errors.is_empty()
+    {
+        return Err("the raw unittest collection did not prove complete discovery".to_string());
+    }
+    let mut ids = BTreeSet::new();
+    let mut projected = BTreeMap::new();
+    for test in &report.tests {
+        if !exact_nonempty(&test.id)
+            || !safe_repository_relative_path(Path::new(&test.source_path))
+            || test.skipped_at_discovery != !test.skip_reason.is_empty()
+            || !ids.insert(test.id.clone())
+        {
+            return Err("the raw unittest collection contained an invalid test row".to_string());
+        }
+        let mut sites = BTreeSet::new();
+        for site in &test.declared_subtest_sites {
+            if site.path != test.source_path
+                || site.line == 0
+                || site.column == 0
+                || !sites.insert((site.path.as_str(), site.line, site.column))
+            {
+                return Err(
+                    "the raw unittest collection contained invalid subtest metadata".to_string(),
+                );
+            }
+        }
+        projected.insert(
+            test.id.as_str(),
+            (test.source_path.as_str(), test.skipped_at_discovery),
+        );
+    }
+    let catalog_projection = catalog
+        .current_inventory
+        .iter()
+        .filter(|row| row.framework == FocusedInventoryFrameworkV1::PythonUnittest)
+        .map(|row| (row.native_id.as_str(), (row.source.as_str(), row.ignored)))
+        .collect::<BTreeMap<_, _>>();
+    if projected != catalog_projection {
+        return Err(
+            "the raw unittest collection did not exactly project the retained current inventory"
+                .to_string(),
+        );
+    }
+    Ok(ids)
+}
+
+fn validate_pytest_collection(
+    catalog: &FocusedLiveSuccessorCatalogV1,
+    report: &RawPytestCollectionV1,
+) -> Result<BTreeSet<String>, String> {
+    if report.schema_version != 1
+        || report.framework != "python-pytest"
+        || report.classification != "discovered"
+        || report.pytest_exit_code != 0
+        || report.tests.is_empty()
+        || report.selected_count != report.tests.len()
+        || !report.duplicate_ids.is_empty()
+        || !report.collection_errors.is_empty()
+    {
+        return Err("the raw pytest collection did not prove complete discovery".to_string());
+    }
+    let mut ids = BTreeSet::new();
+    for test in &report.tests {
+        if !exact_nonempty(&test.id) || !ids.insert(test.id.clone()) {
+            return Err("the raw pytest collection contained an invalid test row".to_string());
+        }
+        let mut markers = BTreeSet::new();
+        for marker in &test.skip_markers {
+            if !matches!(marker.name.as_str(), "skip" | "skipif")
+                || marker.reason.trim() != marker.reason
+                || !markers.insert((marker.name.as_str(), marker.reason.as_str()))
+            {
+                return Err("the raw pytest collection contained invalid skip metadata".to_string());
+            }
+        }
+    }
+    let catalog_ids = catalog
+        .current_inventory
+        .iter()
+        .filter(|row| row.framework == FocusedInventoryFrameworkV1::PythonPytest)
+        .map(|row| row.native_id.clone())
+        .collect::<BTreeSet<_>>();
+    if ids != catalog_ids {
+        return Err(
+            "the raw pytest collection did not exactly project the retained current inventory"
+                .to_string(),
+        );
+    }
+    Ok(ids)
+}
+
+fn parse_unittest_execution(
+    bytes: &[u8],
+    expected_attempt_id: &str,
+) -> Result<RawStructuredTestEvidence, String> {
+    let report = serde_json::from_slice::<RawUnittestExecutionV2>(bytes)
+        .map_err(|error| format!("the raw unittest execution report was invalid: {error}"))?;
+    if !report.fixture_problem_ids.is_empty()
+        || report
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.duration_ms.is_none())
+    {
+        return Err("the raw unittest execution report had incomplete result metadata".to_string());
+    }
+    normalize_raw_execution(
+        report.schema_version,
+        report.report_type,
+        report.framework,
+        report.proof_attempt_id,
+        report.proof_execution_id,
+        report.proof_receipt_nonce,
+        report.proof_scope,
+        report.classification,
+        report.intended_ids,
+        report.selected_ids,
+        report.started_ids,
+        report.terminal_ids,
+        report.executed_ids,
+        report.outcomes,
+        report.selection_confirmed,
+        report.intended_count,
+        report.selected_count,
+        report.executed_count,
+        "python-unittest",
+        expected_attempt_id,
+        None,
+    )
+}
+
+fn parse_pytest_execution(
+    bytes: &[u8],
+    expected_attempt_id: &str,
+) -> Result<RawStructuredTestEvidence, String> {
+    let report = serde_json::from_slice::<RawPytestExecutionV2>(bytes)
+        .map_err(|error| format!("the raw pytest execution report was invalid: {error}"))?;
+    if !report.collection_errors.is_empty()
+        || !report.phase_error_ids.is_empty()
+        || report
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.duration_ms.is_some())
+    {
+        return Err("the raw pytest execution report had incomplete result metadata".to_string());
+    }
+    let exit_code = report.pytest_exit_code;
+    normalize_raw_execution(
+        report.schema_version,
+        report.report_type,
+        report.framework,
+        report.proof_attempt_id,
+        report.proof_execution_id,
+        report.proof_receipt_nonce,
+        report.proof_scope,
+        report.classification,
+        report.intended_ids,
+        report.selected_ids,
+        report.started_ids,
+        report.terminal_ids,
+        report.executed_ids,
+        report.outcomes,
+        report.selection_confirmed,
+        report.intended_count,
+        report.selected_count,
+        report.executed_count,
+        "python-pytest",
+        expected_attempt_id,
+        Some(exit_code),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_raw_execution(
+    schema_version: u32,
+    report_type: String,
+    framework: String,
+    proof_attempt_id: String,
+    proof_execution_id: String,
+    proof_receipt_nonce: String,
+    proof_scope: String,
+    classification: ValidationClassification,
+    intended_ids: Vec<String>,
+    selected_ids: Vec<String>,
+    started_ids: Vec<String>,
+    terminal_ids: Vec<String>,
+    executed_ids: Vec<String>,
+    outcomes: Vec<RawStructuredTestOutcome>,
+    selection_confirmed: bool,
+    intended_count: usize,
+    selected_count: usize,
+    executed_count: usize,
+    expected_framework: &str,
+    expected_attempt_id: &str,
+    framework_exit_code: Option<i32>,
+) -> Result<RawStructuredTestEvidence, String> {
+    let expected_exit = match classification {
+        ValidationClassification::ConfirmedPass => 0,
+        ValidationClassification::ConfirmedValidationFailure => 1,
+        ValidationClassification::PreResultError => {
+            return Err(format!(
+                "the raw {expected_framework} execution report was a pre-result error"
+            ));
+        }
+    };
+    if schema_version != 2
+        || report_type != "CompletionProofStructuredTestReportV2"
+        || framework != expected_framework
+        || proof_attempt_id != expected_attempt_id
+        || Uuid::parse_str(&proof_attempt_id).is_err()
+        || Uuid::parse_str(&proof_execution_id).is_err()
+        || !is_sha256(&proof_receipt_nonce)
+        || proof_scope != "focused"
+        || !selection_confirmed
+        || intended_ids.is_empty()
+        || intended_ids != selected_ids
+        || intended_ids != started_ids
+        || intended_ids != terminal_ids
+        || intended_ids != executed_ids
+        || intended_count != intended_ids.len()
+        || selected_count != selected_ids.len()
+        || executed_count != executed_ids.len()
+        || framework_exit_code.is_some_and(|exit_code| exit_code != expected_exit)
+    {
+        return Err(format!(
+            "the raw {expected_framework} execution report did not prove one complete fresh selection"
+        ));
+    }
+    let mut intended_set = BTreeSet::new();
+    if intended_ids
+        .iter()
+        .any(|id| !exact_nonempty(id) || !intended_set.insert(id.clone()))
+        || outcomes.len() != intended_ids.len()
+    {
+        return Err(format!(
+            "the raw {expected_framework} execution report had invalid identities"
+        ));
+    }
+    let mut outcome_ids = BTreeSet::new();
+    let mut failed = 0_usize;
+    for outcome in &outcomes {
+        if !intended_set.contains(&outcome.id)
+            || !outcome_ids.insert(outcome.id.clone())
+            || !matches!(outcome.outcome.as_str(), "passed" | "failed")
+        {
+            return Err(format!(
+                "the raw {expected_framework} execution report had invalid outcomes"
+            ));
+        }
+        failed += usize::from(outcome.outcome == "failed");
+    }
+    if outcome_ids != intended_set
+        || (classification == ValidationClassification::ConfirmedPass && failed != 0)
+        || (classification == ValidationClassification::ConfirmedValidationFailure && failed == 0)
+    {
+        return Err(format!(
+            "the raw {expected_framework} classification did not match its outcomes"
+        ));
+    }
+    Ok(RawStructuredTestEvidence {
+        framework,
+        proof_attempt_id,
+        proof_execution_id,
+        proof_receipt_nonce,
+        classification,
+        intended_ids,
+        selected_ids,
+        started_ids,
+        terminal_ids,
+        executed_ids,
+        outcomes,
+    })
+}
+
+fn validate_execution_is_selected_from_collection(
+    execution: &RawStructuredTestEvidence,
+    collected_ids: &BTreeSet<String>,
+) -> Result<(), String> {
+    if execution
+        .intended_ids
+        .iter()
+        .any(|id| !collected_ids.contains(id))
+    {
+        return Err(format!(
+            "the raw {} execution selected an ID absent from fresh collection",
+            execution.framework
+        ));
+    }
+    Ok(())
+}
+
+fn exact_nonempty(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value
 }
 
 impl Drop for RunnerAttestationWaiter {
@@ -294,6 +1034,7 @@ where
 async fn prepare_runner_attestation(
     attempt_id: &str,
     nonce: &str,
+    protocol: RunnerAttestationProtocol,
 ) -> Result<RunnerAttestationWaiter, String> {
     use std::ffi::c_void;
     use std::os::windows::io::AsRawHandle;
@@ -368,14 +1109,30 @@ async fn prepare_runner_attestation(
                 ));
             }
             let executable_path = windows_process_executable(peer_process_id)?;
-            receive_runner_attestation(
+            let process = receive_runner_attestation(
                 &mut server,
                 &expected_attempt_id,
                 &expected_nonce,
                 peer_process_id,
                 executable_path,
             )
-            .await
+            .await?;
+            let current_evidence = match &protocol {
+                RunnerAttestationProtocol::CurrentEvidence(expectation) => Some(
+                    receive_current_evidence_exchange(
+                        &mut server,
+                        &expected_attempt_id,
+                        expectation,
+                        process.process_id,
+                    )
+                    .await,
+                ),
+                RunnerAttestationProtocol::AttestationOnly => None,
+            };
+            Ok(RunnerAttestationReceipt {
+                process,
+                current_evidence,
+            })
         }
         .await;
         let _ = sender.send(result);
@@ -424,6 +1181,7 @@ fn windows_process_executable(process_id: u32) -> Result<PathBuf, String> {
 async fn prepare_runner_attestation(
     attempt_id: &str,
     nonce: &str,
+    protocol: RunnerAttestationProtocol,
 ) -> Result<RunnerAttestationWaiter, String> {
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
@@ -456,14 +1214,30 @@ async fn prepare_runner_attestation(
                         .to_string()
                 })?;
             let executable_path = unix_process_executable(peer_process_id).await?;
-            receive_runner_attestation(
+            let process = receive_runner_attestation(
                 &mut stream,
                 &expected_attempt_id,
                 &expected_nonce,
                 peer_process_id,
                 executable_path,
             )
-            .await
+            .await?;
+            let current_evidence = match &protocol {
+                RunnerAttestationProtocol::CurrentEvidence(expectation) => Some(
+                    receive_current_evidence_exchange(
+                        &mut stream,
+                        &expected_attempt_id,
+                        expectation,
+                        process.process_id,
+                    )
+                    .await,
+                ),
+                RunnerAttestationProtocol::AttestationOnly => None,
+            };
+            Ok(RunnerAttestationReceipt {
+                process,
+                current_evidence,
+            })
         }
         .await;
         let _ = std::fs::remove_file(task_socket_path);
@@ -536,6 +1310,7 @@ async fn unix_process_executable(process_id: u32) -> Result<PathBuf, String> {
 async fn prepare_runner_attestation(
     _attempt_id: &str,
     _nonce: &str,
+    _protocol: RunnerAttestationProtocol,
 ) -> Result<RunnerAttestationWaiter, String> {
     Err("this host does not support private runner process attestation".to_string())
 }
@@ -576,6 +1351,61 @@ pub(crate) struct CompletionProofAttempt {
 pub(crate) struct FocusedValidationAttempt {
     inner: CompletionProofAttempt,
     validation_id: String,
+    current_evidence: bool,
+    approval_expectation: Option<FocusedReplacementApprovalExpectation>,
+}
+
+#[derive(Clone, Debug)]
+struct FocusedReplacementApprovalExpectation {
+    catalog_sha256: String,
+    channel_frame_sha256: String,
+    catalog_attempt_id: String,
+    session_lineage_id: String,
+    context: FocusedReplacementApprovalCurrentContextV1,
+}
+
+/// These references come from the admitted tool turn, never from proposal JSON.
+pub(crate) struct HistoricalAcceptanceReviewInput<'a> {
+    pub agent_control: &'a crate::agent::control::AgentControl,
+    pub source: &'a codex_protocol::protocol::SessionSource,
+    pub binding: &'a codex_agent_task_store::AgentTaskBinding,
+    pub reviewer: &'a codex_agent_task_store::AgentTask,
+    pub target: &'a codex_agent_task_store::AgentTask,
+    pub draft: &'a codex_agent_task_store::ReceiptDraft,
+    pub live_thread_id: ThreadId,
+    pub live_agent_path: &'a str,
+    pub session_lineage_id: &'a str,
+    pub observed_writes: &'a [codex_agent_task_store::MutationEvidence],
+}
+
+/// Process-private preparation is consumed only by the same live submission.
+/// A deserialized task-store receipt cannot reconstruct this capability.
+pub(crate) struct PendingHistoricalAcceptanceReview {
+    fresh_admission: crate::agent::control::FreshTypedReviewAdmission,
+    proposal: HistoricalReplacementAcceptanceProposalV1,
+    binding: codex_agent_task_store::AgentTaskBinding,
+    target_assignment_id: codex_agent_task_store::AssignmentId,
+    target_attempt_id: codex_agent_task_store::AttemptId,
+    review_start_epoch: u64,
+    draft: codex_agent_task_store::ReceiptDraft,
+    approval_receipt_sha256: String,
+    start_fingerprint: String,
+    start_mutation_epoch: u64,
+}
+
+impl PendingHistoricalAcceptanceReview {
+    pub(crate) fn reviewer_assignment(&self) -> codex_agent_task_store::Assignment {
+        self.fresh_admission.assignment().clone()
+    }
+
+    pub(crate) fn review_target(
+        &self,
+    ) -> (
+        codex_agent_task_store::AssignmentId,
+        codex_agent_task_store::AttemptId,
+    ) {
+        (self.target_assignment_id, self.target_attempt_id)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -721,12 +1551,37 @@ pub(crate) enum CompletionProofAttemptOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FocusedValidationOutcome {
-    ConfirmedPass { validation_id: String },
-    ConfirmedValidationFailure { validation_id: String },
-    PreResultError { message: String },
+    ConfirmedPass {
+        validation_id: String,
+    },
+    ConfirmedValidationFailure {
+        validation_id: String,
+    },
+    CurrentEvidenceAccepted {
+        current_inventory_count: usize,
+    },
+    FocusedReplacementApprovalAccepted {
+        receipt_sha256: String,
+    },
+    CurrentEvidenceValidationFailure {
+        validation_ids: Vec<String>,
+        post_result_error: Option<String>,
+    },
+    PreResultError {
+        message: String,
+    },
 }
 
 impl FocusedValidationOutcome {
+    pub(crate) fn accepted(&self) -> bool {
+        matches!(
+            self,
+            Self::ConfirmedPass { .. }
+                | Self::CurrentEvidenceAccepted { .. }
+                | Self::FocusedReplacementApprovalAccepted { .. }
+        )
+    }
+
     pub(crate) fn render_for_model(&self) -> String {
         match self {
             Self::ConfirmedPass { validation_id } => format!(
@@ -734,6 +1589,25 @@ impl FocusedValidationOutcome {
             ),
             Self::ConfirmedValidationFailure { validation_id } => format!(
                 "Focused validation {validation_id} actually ran and failed. A relevant corrective repository mutation is required before a later pass can count; no broader validation was started."
+            ),
+            Self::CurrentEvidenceAccepted {
+                current_inventory_count,
+            } => format!(
+                "Focused current-inventory evidence was authenticated and retained for {current_inventory_count} discovered tests. Historical successor mappings remain unresolved; this evidence is not completion certification, admission, or review approval."
+            ),
+            Self::FocusedReplacementApprovalAccepted { receipt_sha256 } => format!(
+                "Focused frozen-inventory reconciliation was authenticated and retained for replacement review (receipt {receipt_sha256}). This evidence does not approve mappings or establish whole-repository certification."
+            ),
+            Self::CurrentEvidenceValidationFailure {
+                validation_ids,
+                post_result_error,
+            } => format!(
+                "Focused current-inventory evidence recorded confirmed failures for {}. No broader validation was started and no current catalog was accepted.{}",
+                validation_ids.join(", "),
+                post_result_error
+                    .as_ref()
+                    .map(|error| format!(" A later evidence exchange also failed: {error}."))
+                    .unwrap_or_default()
             ),
             Self::PreResultError { message } => format!(
                 "The focused validation produced no usable pass or failure evidence: {message}. Correct the invocation or runner problem and rerun it; no broader validation was started."
@@ -795,12 +1669,15 @@ pub(crate) enum UnifiedExecCompletionProofOutcome {
 
 impl UnifiedExecCompletionProofOutcome {
     pub(crate) fn accepted(&self) -> bool {
-        matches!(
-            self,
-            Self::Canonical(CompletionProofAttemptOutcome::ConfirmedPass)
-                | Self::Focused(FocusedValidationOutcome::ConfirmedPass { .. })
-                | Self::Documentation(DocumentationValidationOutcome::ConfirmedPass)
-        )
+        match self {
+            Self::Canonical(outcome) => {
+                matches!(outcome, CompletionProofAttemptOutcome::ConfirmedPass)
+            }
+            Self::Focused(outcome) => outcome.accepted(),
+            Self::Documentation(outcome) => {
+                matches!(outcome, DocumentationValidationOutcome::ConfirmedPass)
+            }
+        }
     }
 
     pub(crate) fn render_for_model(&self) -> String {
@@ -1310,6 +2187,63 @@ struct AppliedCompletionProofRelaxation {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct PersistedCurrentEvidenceCatalogV1 {
+    schema_version: u32,
+    catalog: FocusedLiveSuccessorCatalogV1,
+    catalog_sha256: String,
+    channel_frame_sha256: String,
+    attempt_id: String,
+    invocation_nonce: String,
+    exact_command: String,
+    repository_root: String,
+    workspace_fingerprint: String,
+    mutation_epoch: u64,
+    policy_runner_bundle_sha256: String,
+    runner_process_id: u32,
+    runner_executable_path: PathBuf,
+    runner_entrypoint_path: PathBuf,
+    session_lineage_id: String,
+    recorded_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approval_receipt: Option<PersistedFocusedReplacementApprovalV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedFocusedReplacementApprovalV1 {
+    receipt: FocusedReplacementApprovalReceiptV1,
+    attempt_id: String,
+    invocation_nonce: String,
+    exact_command: String,
+    policy_id: String,
+    runner_process_id: u32,
+    runner_executable_path: PathBuf,
+    runner_entrypoint_path: PathBuf,
+    session_lineage_id: String,
+    recorded_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reviewed_proposal: Option<PersistedHistoricalAcceptanceReviewV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedHistoricalAcceptanceReviewV1 {
+    proposal: HistoricalReplacementAcceptanceProposalV1,
+    reviewer_assignment_id: String,
+    reviewer_attempt_id: String,
+    reviewer_thread_id: String,
+    reviewer_agent_path: String,
+    target_assignment_id: String,
+    target_attempt_id: String,
+    session_lineage_id: String,
+    review_evidence_epoch: u64,
+    sealed_review_sha256: String,
+    sealed_review: codex_agent_task_store::AgentReceipt,
+    recorded_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PersistentCompletionProofState {
     schema_version: u32,
     repository_root: String,
@@ -1324,6 +2258,13 @@ struct PersistentCompletionProofState {
     requires_non_documentation_proof: bool,
     requires_documentation_validation: bool,
     registered_proof: Option<CompletionProofArtifactV1>,
+    #[serde(
+        default,
+        skip_serializing_if = "FocusedCompletionState::is_legacy_default"
+    )]
+    focused_completion: FocusedCompletionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current_evidence_catalog: Option<PersistedCurrentEvidenceCatalogV1>,
     #[serde(default)]
     poisoned_validations: BTreeMap<String, PoisonedValidation>,
     #[serde(default)]
@@ -1401,9 +2342,10 @@ struct LiveCompletionProofIssuance {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RegisteredRootRollout {
+struct RegisteredRolloutAuthority {
     issuance_key: LiveIssuanceKey,
-    terminal_quiescence_root_thread_id: ThreadId,
+    role: CompletionProofSessionRole,
+    terminal_quiescence_root_thread_id: Option<ThreadId>,
 }
 
 /// Process-private authority and live proof state shared by every session admitted by one
@@ -1411,7 +2353,7 @@ struct RegisteredRootRollout {
 /// loses issuance even when the authenticated diagnostic state remains on disk.
 pub(crate) struct CompletionProofRuntimeRegistry {
     root_lineages: Mutex<HashSet<LiveIssuanceKey>>,
-    root_rollout_lineages: Mutex<HashMap<PathBuf, RegisteredRootRollout>>,
+    rollout_authorities: Mutex<HashMap<PathBuf, RegisteredRolloutAuthority>>,
     live_issuances: Mutex<HashMap<LiveIssuanceKey, LiveCompletionProofIssuance>>,
     post_proof_source_observations:
         Mutex<HashMap<LiveIssuanceKey, BoundPostProofSourceObservation>>,
@@ -1437,7 +2379,7 @@ impl CompletionProofRuntimeRegistry {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             root_lineages: Mutex::new(HashSet::new()),
-            root_rollout_lineages: Mutex::new(HashMap::new()),
+            rollout_authorities: Mutex::new(HashMap::new()),
             live_issuances: Mutex::new(HashMap::new()),
             post_proof_source_observations: Mutex::new(HashMap::new()),
             post_proof_source_transition: Mutex::new(()),
@@ -1473,23 +2415,20 @@ impl CompletionProofSessionAuthority {
         }
     }
 
-    /// Requests reuse of a lineage from persisted history, but authorizes it only when this
-    /// manager's private registry issued that exact root lineage earlier in this process.
-    pub(crate) fn root_terminal_owner_for_existing_lineage(
+    fn for_registered_rollout(
         runtime_registry: Arc<CompletionProofRuntimeRegistry>,
         cwd: &Path,
-        requested_existing_lineage_id: Option<String>,
-        terminal_quiescence_root_thread_id: ThreadId,
+        registration: RegisteredRolloutAuthority,
     ) -> Self {
         Self {
-            role: CompletionProofSessionRole::RootTerminalOwner,
+            role: registration.role,
             runtime_registry,
             repository_authority_eligible_at_admission: codex_git_utils::get_git_repo_root(cwd)
                 .is_some(),
             repository_root: Some(canonical_repository_root(cwd)),
-            requested_existing_lineage_id: requested_existing_lineage_id
-                .and_then(valid_exact_identity),
-            requested_terminal_quiescence_root_thread_id: Some(terminal_quiescence_root_thread_id),
+            requested_existing_lineage_id: Some(registration.issuance_key.session_lineage_id),
+            requested_terminal_quiescence_root_thread_id: registration
+                .terminal_quiescence_root_thread_id,
         }
     }
 
@@ -1535,11 +2474,16 @@ impl CompletionProofSessionAuthority {
         )
     }
 
-    /// Binds the non-Serde admission capability to one process-private root lineage. Serialized
-    /// session metadata can nominate a lineage, but it cannot create or recover membership.
+    /// Binds root authority to one process-private lineage. Contributors keep the trusted
+    /// `AgentControl` fallback unchanged unless this capability came from an exact rollout
+    /// registration, in which case the private registration supplies the prior contributor
+    /// lineage. Serialized session metadata cannot create or recover either authority.
     pub(crate) async fn bind_session_lineage_id(&self, fallback_lineage_id: String) -> String {
         if !self.is_terminal_owner() {
-            return fallback_lineage_id;
+            return self
+                .requested_existing_lineage_id
+                .clone()
+                .unwrap_or(fallback_lineage_id);
         }
         let Some(repository_root) = self.repository_root.as_ref() else {
             return fallback_lineage_id;
@@ -1569,18 +2513,15 @@ impl CompletionProofSessionAuthority {
         resolved.session_lineage_id
     }
 
-    /// Binds the exact stored rollout admitted by this manager to its process-private root
-    /// lineage. A copied rollout at another path therefore cannot replay serialized metadata to
-    /// inherit a live issuance, and a new manager starts with no reusable rollout bindings.
-    pub(crate) async fn register_root_rollout(
+    /// Binds the exact stored rollout admitted by this manager to its process-private lineage and
+    /// role. A copied rollout at another path therefore cannot replay serialized metadata to
+    /// inherit authority or live issuance, and a new manager starts with no reusable bindings.
+    pub(crate) async fn register_rollout_authority(
         &self,
         rollout_path: &Path,
         session_lineage_id: &str,
-        terminal_quiescence_root_thread_id: ThreadId,
+        terminal_quiescence_root_thread_id: Option<ThreadId>,
     ) {
-        if !self.is_terminal_owner() {
-            return;
-        }
         let (Some(repository_root), Some(rollout_path), Some(session_lineage_id)) = (
             self.repository_root.as_ref(),
             canonical_rollout_path(rollout_path),
@@ -1589,21 +2530,30 @@ impl CompletionProofSessionAuthority {
             return;
         };
         let key = LiveIssuanceKey::new(repository_root, session_lineage_id);
-        if self
-            .runtime_registry
-            .root_lineages
-            .lock()
-            .await
-            .contains(&key)
-        {
+        let registration_is_consistent = match self.role {
+            CompletionProofSessionRole::RootTerminalOwner => {
+                terminal_quiescence_root_thread_id.is_some()
+                    && self
+                        .runtime_registry
+                        .root_lineages
+                        .lock()
+                        .await
+                        .contains(&key)
+            }
+            CompletionProofSessionRole::EvidenceContributor => {
+                terminal_quiescence_root_thread_id.is_none()
+            }
+        };
+        if registration_is_consistent {
             self.runtime_registry
-                .root_rollout_lineages
+                .rollout_authorities
                 .lock()
                 .await
                 .insert(
                     rollout_path,
-                    RegisteredRootRollout {
+                    RegisteredRolloutAuthority {
                         issuance_key: key,
+                        role: self.role,
                         terminal_quiescence_root_thread_id,
                     },
                 );
@@ -1612,24 +2562,25 @@ impl CompletionProofSessionAuthority {
 }
 
 impl CompletionProofRuntimeRegistry {
-    pub(crate) async fn registered_root_lineage_for_rollout(
-        &self,
+    pub(crate) async fn registered_authority_for_rollout(
+        self: &Arc<Self>,
         cwd: &Path,
         rollout_path: &Path,
-    ) -> Option<(String, ThreadId)> {
+    ) -> Option<CompletionProofSessionAuthority> {
         let rollout_path = canonical_rollout_path(rollout_path)?;
         let repository_root = completion_proof_path_identity(&canonical_repository_root(cwd));
-        self.root_rollout_lineages
+        let registration = self
+            .rollout_authorities
             .lock()
             .await
             .get(&rollout_path)
             .filter(|registration| registration.issuance_key.repository_root == repository_root)
-            .map(|registration| {
-                (
-                    registration.issuance_key.session_lineage_id.clone(),
-                    registration.terminal_quiescence_root_thread_id,
-                )
-            })
+            .cloned()?;
+        Some(CompletionProofSessionAuthority::for_registered_rollout(
+            Arc::clone(self),
+            cwd,
+            registration,
+        ))
     }
 }
 
@@ -1718,6 +2669,8 @@ impl PersistentCompletionProofState {
             requires_non_documentation_proof: false,
             requires_documentation_validation: false,
             registered_proof: None,
+            focused_completion: FocusedCompletionState::new(),
+            current_evidence_catalog: None,
             poisoned_validations: BTreeMap::new(),
             current_user_relaxation: None,
             current_user_relaxations_by_lineage: BTreeMap::new(),
@@ -1728,6 +2681,7 @@ impl PersistentCompletionProofState {
     fn fail_closed(repository_root: &Path) -> Self {
         let mut state = Self::new(repository_root);
         state.requires_non_documentation_proof = true;
+        state.focused_completion.coverage_known = false;
         state
     }
 }
@@ -2276,14 +3230,25 @@ impl CompletionProofLedger {
                 Some(start_observation),
             )
             .await;
+            if let Some(lineage) = &self.session_lineage_id {
+                state
+                    .persistent
+                    .focused_completion
+                    .certification_requests
+                    .insert(lineage.clone());
+            }
             state.persistent.mutation_epoch
         };
         self.persist().await?;
 
         let nonce = Uuid::new_v4().as_simple().to_string();
         let report_path = reservation.report_write_root.join("report.json");
-        let runner_attestation =
-            prepare_runner_attestation(&reservation.attempt_id, &nonce).await?;
+        let runner_attestation = prepare_runner_attestation(
+            &reservation.attempt_id,
+            &nonce,
+            RunnerAttestationProtocol::AttestationOnly,
+        )
+        .await?;
         let pending = CompletionProofAttempt {
             attempt_id: reservation.attempt_id.clone(),
             nonce,
@@ -2333,7 +3298,7 @@ impl CompletionProofLedger {
             Ok(authority) => authority,
             Err(_) => return Ok(None),
         };
-        let recognition_matches = recognition_authority
+        let generic_recognition_matches = recognition_authority
             .config
             .validation_ids
             .iter()
@@ -2345,7 +3310,16 @@ impl CompletionProofLedger {
                     == displayed_command
             })
             .count();
-        if recognition_matches == 0 {
+        let current_evidence_recognition_matches = recognition_authority
+            .config
+            .focused_inventory_evidence_validation_ids
+            .is_some()
+            && recognition_authority
+                .config
+                .focused_command
+                .replace("{validation_id}", CURRENT_EVIDENCE_VALIDATION_ID)
+                == displayed_command;
+        if generic_recognition_matches == 0 && !current_evidence_recognition_matches {
             return Ok(None);
         }
         let authority = self.verified_authority().await?;
@@ -2361,9 +3335,15 @@ impl CompletionProofLedger {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let validation_id = match matching_validation_ids.as_slice() {
-            [validation_id] => validation_id.clone(),
-            [] => {
+        let current_evidence = config.focused_inventory_evidence_validation_ids.is_some()
+            && config
+                .focused_command
+                .replace("{validation_id}", CURRENT_EVIDENCE_VALIDATION_ID)
+                == displayed_command;
+        let validation_id = match (matching_validation_ids.as_slice(), current_evidence) {
+            ([validation_id], false) => validation_id.clone(),
+            ([], true) => CURRENT_EVIDENCE_VALIDATION_ID.to_string(),
+            ([], false) => {
                 return Err(
                     "the trusted focused command changed while validation was being prepared"
                         .to_string(),
@@ -2399,10 +3379,25 @@ impl CompletionProofLedger {
                 Some(start_observation),
             )
             .await;
+            if current_evidence {
+                state.persistent.current_evidence_catalog = None;
+            }
             state.persistent.mutation_epoch
         };
         self.persist().await?;
-        let expected_inventory_hash = load_inventory_hash(&self.repository_root, &config).await?;
+        // Ordinary focused execution is independent of migration bookkeeping.
+        // Only inventory/replacement operations require the frozen universe.
+        let expected_inventory_hash = if current_evidence
+            || config
+                .validation_evidence_contracts
+                .get(&validation_id)
+                .is_some_and(|value| {
+                    value.evidence_kind == ValidationEvidenceKind::InventoryReconciliation
+                }) {
+            load_inventory_hash(&self.repository_root, &config).await?
+        } else {
+            config.frozen_inventory_hash.clone()
+        };
         let attempt_id = Uuid::now_v7().to_string();
         let nonce = Uuid::new_v4().as_simple().to_string();
         let report_path = self
@@ -2412,30 +3407,64 @@ impl CompletionProofLedger {
         if tokio::fs::try_exists(&report_path).await.unwrap_or(true) {
             return Err("the private focused-validation report path was not fresh".to_string());
         }
-        let runner_attestation = prepare_runner_attestation(&attempt_id, &nonce).await?;
-        let expected_validation_ids = BTreeSet::from([validation_id.clone()]);
-        let validation_evidence_contracts = BTreeMap::from([(
-            validation_id.clone(),
+        let runner_attestation = prepare_runner_attestation(
+            &attempt_id,
+            &nonce,
+            if current_evidence {
+                RunnerAttestationProtocol::CurrentEvidence(CurrentEvidenceChannelExpectation {
+                    repository_root: self.repository_root.clone(),
+                    start_fingerprint: start_fingerprint.clone(),
+                    start_mutation_epoch,
+                    frozen_inventory_hash: expected_inventory_hash.clone(),
+                    baseline_exception_rules: config.baseline_exception_rules.clone(),
+                })
+            } else {
+                RunnerAttestationProtocol::AttestationOnly
+            },
+        )
+        .await?;
+        let component_ids = if current_evidence {
             config
-                .validation_evidence_contracts
-                .get(&validation_id)
-                .cloned()
+                .focused_inventory_evidence_validation_ids
+                .clone()
                 .ok_or_else(|| {
-                    format!("focused validation {validation_id} has no evidence contract")
-                })?,
-        )]);
-        let validation_path_patterns = BTreeMap::from([(
-            validation_id.clone(),
-            config
-                .validation_path_patterns
-                .get(&validation_id)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "focused validation {validation_id} has no owned or consumed path mapping"
-                    )
-                })?,
-        )]);
+                    "the current-evidence component authorization disappeared".to_string()
+                })?
+        } else {
+            vec![validation_id.clone()]
+        };
+        let expected_validation_ids = component_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let validation_evidence_contracts = component_ids
+            .iter()
+            .map(|component_id| {
+                config
+                    .validation_evidence_contracts
+                    .get(component_id)
+                    .cloned()
+                    .map(|contract| (component_id.clone(), contract))
+                    .ok_or_else(|| {
+                        format!("focused validation {component_id} has no evidence contract")
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let validation_path_patterns = component_ids
+            .iter()
+            .map(|component_id| {
+                config
+                    .validation_path_patterns
+                    .get(component_id)
+                    .cloned()
+                    .map(|patterns| (component_id.clone(), patterns))
+                    .ok_or_else(|| {
+                        format!(
+                            "focused validation {component_id} has no owned or consumed path mapping"
+                        )
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let requires_approval_catalog = validation_id
+            == FocusedReplacementApprovalReceiptV1::FOCUSED_VALIDATION_ID
+            && config.focused_inventory_evidence_validation_ids.is_some();
         let inner = CompletionProofAttempt {
             attempt_id,
             nonce,
@@ -2458,14 +3487,41 @@ impl CompletionProofLedger {
             expected_overrides: BTreeSet::new(),
             runner_attestation,
         };
+        let pending = inner.persisted_pending();
+        let approval_expectation = if requires_approval_catalog {
+            let mut state = self.state.lock().await;
+            let catalog = state
+                .persistent
+                .current_evidence_catalog
+                .as_mut()
+                .ok_or_else(|| {
+                    "frozen reconciliation requires a current authenticated inventory catalog"
+                        .to_string()
+                })?;
+            let expectation = focused_replacement_approval_expectation(
+                &pending,
+                catalog,
+                self.session_lineage_id.as_deref(),
+            )?;
+            // A new reconciliation attempt must never reuse the previous receipt,
+            // including when the child later fails before returning a result.
+            catalog.approval_receipt = None;
+            drop(state);
+            self.persist().await?;
+            Some(expectation)
+        } else {
+            None
+        };
         self.state
             .lock()
             .await
             .pending_attempts
-            .insert(inner.attempt_id.clone(), inner.persisted_pending());
+            .insert(inner.attempt_id.clone(), pending);
         Ok(Some(FocusedValidationAttempt {
             inner,
             validation_id,
+            current_evidence,
+            approval_expectation,
         }))
     }
 
@@ -2624,7 +3680,7 @@ impl CompletionProofLedger {
         &self,
         pending: &PendingAttempt,
         validation_ids: &[String],
-    ) {
+    ) -> Result<(), String> {
         let validation_patterns = validation_ids
             .iter()
             .filter_map(|validation_id| {
@@ -2635,8 +3691,17 @@ impl CompletionProofLedger {
                     .map(|patterns| (validation_id.clone(), patterns))
             })
             .collect::<BTreeMap<_, _>>();
+        if validation_patterns.len() != validation_ids.len() {
+            return Err(
+                "the runtime could not bind every confirmed failure to its trusted input contract"
+                    .to_string(),
+            );
+        }
         let (failure_observation, failure_snapshots) =
             stable_validation_input_snapshots(&self.repository_root, &validation_patterns).await;
+        let failure_fingerprint = failure_observation
+            .as_ref()
+            .map(|observation| observation.fingerprint.clone());
         let mut state = self.state.lock().await;
         reconcile_external_workspace_change(
             &self.repository_root,
@@ -2644,8 +3709,25 @@ impl CompletionProofLedger {
             failure_observation,
         )
         .await;
+        if failure_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| fingerprint != pending.start_fingerprint)
+            || state.persistent.mutation_epoch != pending.start_mutation_epoch
+        {
+            drop(state);
+            let _ = self.persist().await;
+            return Err(
+                "the repository changed before the confirmed validation failure could be recorded"
+                    .to_string(),
+            );
+        }
         let failed_at_mutation_epoch = state.persistent.mutation_epoch;
         for validation_id in validation_ids {
+            state
+                .persistent
+                .focused_completion
+                .passes
+                .remove(validation_id);
             state.persistent.poisoned_validations.insert(
                 validation_id.clone(),
                 PoisonedValidation {
@@ -2664,8 +3746,10 @@ impl CompletionProofLedger {
             );
         }
         state.persistent.registered_proof = None;
+        state.persistent.current_evidence_catalog = None;
         state.persistent.requires_non_documentation_proof = true;
         state.persistent.requires_documentation_validation = false;
+        Ok(())
     }
 
     pub(crate) async fn finish_focused_attempt(
@@ -2686,8 +3770,8 @@ impl CompletionProofLedger {
                     .to_string(),
             };
         };
-        let runner_attestation = match attempt.inner.runner_attestation.receive().await {
-            Ok(attestation) => attestation,
+        let mut runner_receipt = match attempt.inner.runner_attestation.receive().await {
+            Ok(receipt) => receipt,
             Err(message) => {
                 let _ = tokio::fs::remove_file(&pending.report_path).await;
                 return FocusedValidationOutcome::PreResultError { message };
@@ -2744,11 +3828,28 @@ impl CompletionProofLedger {
             &pending,
             &report,
             FOCUSED_REPORT_TYPE,
-            &runner_attestation,
+            &runner_receipt.process,
         )
         .await
         {
             return FocusedValidationOutcome::PreResultError { message };
+        }
+        if let Err(message) = self.verify_pending_authority(&pending).await {
+            return FocusedValidationOutcome::PreResultError { message };
+        }
+        if let Err(message) = validate_attempt_completion_envelope(&pending, &report) {
+            return FocusedValidationOutcome::PreResultError { message };
+        }
+        if attempt.current_evidence {
+            return self
+                .finish_current_evidence_report(
+                    &pending,
+                    &attempt,
+                    process_exit_code,
+                    &mut runner_receipt,
+                    &report,
+                )
+                .await;
         }
         if report.focused_validation_id.as_deref() != Some(attempt.validation_id.as_str())
             || report.validations.len() != 1
@@ -2773,24 +3874,23 @@ impl CompletionProofLedger {
                             .to_string(),
                 };
             }
-            self.record_confirmed_validation_failures(
-                &pending,
-                std::slice::from_ref(&attempt.validation_id),
-            )
-            .await;
+            if let Err(message) = self
+                .record_confirmed_validation_failures(
+                    &pending,
+                    std::slice::from_ref(&attempt.validation_id),
+                )
+                .await
+            {
+                return FocusedValidationOutcome::PreResultError { message };
+            }
+            // Sensitivity evidence never clears ordinary failure poisoning.
+            let _ = self.record_scoped_focused_pass(&pending, validation).await;
             let _ = self.persist().await;
             return FocusedValidationOutcome::ConfirmedValidationFailure {
                 validation_id: attempt.validation_id,
             };
         }
 
-        if let Err(message) = self.verify_pending_authority(&pending).await {
-            return FocusedValidationOutcome::PreResultError { message };
-        }
-
-        if let Err(message) = validate_attempt_completion_envelope(&pending, &report) {
-            return FocusedValidationOutcome::PreResultError { message };
-        }
         if report.attempt_classification != AttemptClassification::ConfirmedPass
             || validation.classification != ValidationClassification::ConfirmedPass
         {
@@ -2869,8 +3969,611 @@ impl CompletionProofLedger {
                 }
             }
         }
+        if let Some(expectation) = attempt.approval_expectation.as_ref() {
+            return self
+                .finish_focused_replacement_approval(&pending, expectation, &runner_receipt.process)
+                .await;
+        }
+        if let Err(message) = self.record_scoped_focused_pass(&pending, validation).await {
+            return FocusedValidationOutcome::PreResultError { message };
+        }
         FocusedValidationOutcome::ConfirmedPass {
             validation_id: attempt.validation_id,
+        }
+    }
+
+    async fn finish_focused_replacement_approval(
+        &self,
+        pending: &PendingAttempt,
+        expectation: &FocusedReplacementApprovalExpectation,
+        process: &RunnerProcessAttestation,
+    ) -> FocusedValidationOutcome {
+        let receipt = match focused_replacement_approval_receipt(&expectation.context) {
+            Ok(receipt) => receipt,
+            Err(message) => return FocusedValidationOutcome::PreResultError { message },
+        };
+        let receipt_sha256 = receipt.receipt_sha256.as_str().to_string();
+        {
+            let mut state = self.state.lock().await;
+            if state.persistent.mutation_epoch != pending.start_mutation_epoch {
+                return FocusedValidationOutcome::PreResultError {
+                    message:
+                        "the repository mutation epoch changed before focused approval storage"
+                            .to_string(),
+                };
+            }
+            let Some(catalog) = state.persistent.current_evidence_catalog.as_mut() else {
+                return FocusedValidationOutcome::PreResultError {
+                    message: "focused approval lost its current authenticated inventory catalog"
+                        .to_string(),
+                };
+            };
+            let current = match focused_replacement_approval_expectation(
+                pending,
+                catalog,
+                self.session_lineage_id.as_deref(),
+            ) {
+                Ok(current) => current,
+                Err(message) => return FocusedValidationOutcome::PreResultError { message },
+            };
+            if current.catalog_sha256 != expectation.catalog_sha256
+                || current.channel_frame_sha256 != expectation.channel_frame_sha256
+                || current.catalog_attempt_id != expectation.catalog_attempt_id
+                || current.session_lineage_id != expectation.session_lineage_id
+                || current.context != expectation.context
+            {
+                return FocusedValidationOutcome::PreResultError {
+                    message:
+                        "the authenticated inventory catalog changed during frozen reconciliation"
+                            .to_string(),
+                };
+            }
+            catalog.approval_receipt = Some(PersistedFocusedReplacementApprovalV1 {
+                receipt,
+                attempt_id: pending.attempt_id.clone(),
+                invocation_nonce: pending.nonce.clone(),
+                exact_command: pending.exact_command.clone(),
+                policy_id: pending.expected_policy_id.clone(),
+                runner_process_id: process.process_id,
+                runner_executable_path: process.executable_path.clone(),
+                runner_entrypoint_path: process.entrypoint_path.clone(),
+                session_lineage_id: expectation.session_lineage_id.clone(),
+                recorded_at_unix_ms: unix_time_ms(),
+                reviewed_proposal: None,
+            });
+        }
+        if let Err(message) = self.persist().await {
+            if let Some(catalog) = self
+                .state
+                .lock()
+                .await
+                .persistent
+                .current_evidence_catalog
+                .as_mut()
+            {
+                catalog.approval_receipt = None;
+            }
+            return FocusedValidationOutcome::PreResultError { message };
+        }
+        FocusedValidationOutcome::FocusedReplacementApprovalAccepted { receipt_sha256 }
+    }
+
+    pub(crate) async fn prepare_historical_acceptance_review(
+        &self,
+        proposal_path: &str,
+        input: HistoricalAcceptanceReviewInput<'_>,
+    ) -> Result<PendingHistoricalAcceptanceReview, String> {
+        use codex_agent_task_store::AgentRole;
+        use codex_agent_task_store::AssignmentAdmissionOrigin;
+        use codex_agent_task_store::AttemptState;
+        use codex_agent_task_store::CapabilityProfile;
+        use codex_agent_task_store::RelationKind;
+
+        let reviewer = &input.reviewer.assignment;
+        let target = &input.target.assignment;
+        let repository_id = codex_agent_task_store::repository_lineage_id(&self.repository_root)
+            .map_err(|error| error.to_string())?;
+        let workspace_id = codex_agent_task_store::repository_workspace_id(&self.repository_root)
+            .map_err(|error| error.to_string())?;
+        if self.is_terminal_owner()
+            || !crate::agent::task_capabilities::is_independent_review_source(input.source)
+            || reviewer.role != AgentRole::Reviewer
+            || reviewer.capability_profile != CapabilityProfile::ReadSearchDiff
+            || reviewer.admission_origin != AssignmentAdmissionOrigin::Typed
+            || !reviewer.write_scope.is_empty()
+            || !input.observed_writes.is_empty()
+            || input.binding.assignment_id != reviewer.assignment_id
+            || input.binding.attempt_id != input.reviewer.current_attempt.attempt_id
+            || input.reviewer.current_attempt.state != AttemptState::Active
+            || input.reviewer.receipt.is_some()
+            || input.binding.thread_id.as_deref() != Some(input.live_thread_id.to_string().as_str())
+            || input.binding.agent_path != input.live_agent_path
+            || input.live_agent_path == "/root"
+            || self.session_lineage_id.as_deref() != Some(input.session_lineage_id)
+            || input.binding.root_session_id != input.session_lineage_id
+            || reviewer.root_session_id != input.session_lineage_id
+            || target.root_session_id != input.session_lineage_id
+            || reviewer.repository_id != target.repository_id
+            || reviewer.workspace_id != target.workspace_id
+            || reviewer.repository_id != repository_id
+            || reviewer.workspace_id != workspace_id
+            || reviewer.assignment_id == target.assignment_id
+            || reviewer.dependencies.as_slice() != [target.assignment_id]
+            || !reviewer.relation.as_ref().is_some_and(|relation| {
+                relation.kind == RelationKind::Review
+                    && relation.target_assignment_ids.as_slice() == [target.assignment_id]
+            })
+            || input.target.current_attempt.state != AttemptState::Completed
+            || !input.target.receipt.as_ref().is_some_and(|receipt| {
+                receipt.status.is_success()
+                    && receipt.assignment_id == target.assignment_id
+                    && receipt.attempt_id == input.target.current_attempt.attempt_id
+            })
+        {
+            return Err("historical acceptance requires the live independent typed reviewer for its exact completed target and repository lineage".to_string());
+        }
+        let proposal =
+            read_historical_acceptance_proposal(&self.repository_root, proposal_path).await?;
+        validate_historical_review_criteria(&proposal, input.draft)?;
+        let expected_criterion = historical_review_criterion_id(&proposal);
+        // Amendments must not turn a formerly different review into this approval.
+        if input.reviewer.current_attempt.amendment.is_some()
+            || reviewer.acceptance_criteria.len() != 1
+            || reviewer.acceptance_criteria[0].id != expected_criterion
+        {
+            return Err("historical acceptance requires the exact complete review-plan hash in the immutable reviewer assignment".to_string());
+        }
+
+        let authority = self.verified_authority().await?;
+        let _operation = self.operation.lock().await;
+        let _state_file_lock = acquire_private_state_lock(self.persistence.lock_path.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        self.refresh_persistent_state_from_disk().await?;
+        let observation = workspace_observation(&self.repository_root)
+            .await
+            .ok_or_else(|| {
+                "historical acceptance cannot observe the current workspace".to_string()
+            })?;
+        let fingerprint = observation.fingerprint.clone();
+        {
+            let mut state = self.state.lock().await;
+            reconcile_external_workspace_change(
+                &self.repository_root,
+                &mut state.persistent,
+                Some(observation),
+            )
+            .await;
+        }
+        self.persist().await?;
+        let state = self.state.lock().await;
+        state
+            .persistent
+            .focused_completion
+            .check_quality(
+                &self.repository_root,
+                &authority.policy_runner_bundle_sha256,
+            )
+            .await?;
+        let catalog = state
+            .persistent
+            .current_evidence_catalog
+            .as_ref()
+            .ok_or_else(|| {
+                "historical acceptance requires a current authenticated inventory catalog"
+                    .to_string()
+            })?;
+        let approval = catalog.approval_receipt.as_ref()
+            .ok_or_else(|| "historical acceptance requires a current authenticated frozen-reconciliation receipt".to_string())?;
+        if catalog.session_lineage_id != input.session_lineage_id
+            || catalog.workspace_fingerprint != fingerprint
+            || catalog.mutation_epoch != state.persistent.mutation_epoch
+            || catalog.policy_runner_bundle_sha256 != authority.policy_runner_bundle_sha256
+            || approval.policy_id != authority.config.policy_id
+            || approval.reviewed_proposal.is_some()
+        {
+            return Err("historical acceptance has stale, mismatched, or already consumed approval authority".to_string());
+        }
+        let context = focused_replacement_approval_context(
+            catalog,
+            &approval.attempt_id,
+            &approval.policy_id,
+        )?;
+        approval
+            .receipt
+            .validate_current_context(&context)
+            .map_err(|error| error.to_string())?;
+        validate_historical_proposal_against_approval(&proposal, &approval.receipt)?;
+        let fresh_admission = input.agent_control.take_fresh_historical_review_admission(
+            input.binding,
+            input.reviewer,
+            input.live_thread_id,
+        )?;
+        Ok(PendingHistoricalAcceptanceReview {
+            fresh_admission,
+            proposal,
+            binding: input.binding.clone(),
+            target_assignment_id: target.assignment_id,
+            target_attempt_id: input.target.current_attempt.attempt_id,
+            review_start_epoch: reviewer.start_epoch,
+            draft: input.draft.clone(),
+            approval_receipt_sha256: approval.receipt.receipt_sha256.as_str().to_string(),
+            start_fingerprint: fingerprint,
+            start_mutation_epoch: catalog.mutation_epoch,
+        })
+    }
+
+    pub(crate) async fn finish_historical_acceptance_review(
+        &self,
+        pending: PendingHistoricalAcceptanceReview,
+        receipt: &codex_agent_task_store::AgentReceipt,
+    ) -> Result<String, String> {
+        if receipt.assignment_id != pending.binding.assignment_id
+            || receipt.attempt_id != pending.binding.attempt_id
+            || receipt.evidence_epoch != pending.review_start_epoch
+            || receipt.status != pending.draft.status
+            || receipt.summary != pending.draft.summary
+            || receipt.criterion_results != pending.draft.criterion_results
+            || receipt.declared_changes != pending.draft.declared_changes
+            || receipt.validation_call_ids != pending.draft.validation_call_ids
+            || receipt.blockers != pending.draft.blockers
+            || receipt.risks != pending.draft.risks
+            || receipt.next_action != pending.draft.next_action
+            || receipt.architecture_contract.is_some()
+        {
+            return Err("the server-sealed review does not match this live proposal submission or review epoch".to_string());
+        }
+        let authority = self.verified_authority().await?;
+        let _operation = self.operation.lock().await;
+        let _state_file_lock = acquire_private_state_lock(self.persistence.lock_path.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        self.refresh_persistent_state_from_disk().await?;
+        let observation = workspace_observation(&self.repository_root)
+            .await
+            .ok_or_else(|| {
+                "historical acceptance cannot observe the sealed review workspace".to_string()
+            })?;
+        let fingerprint = observation.fingerprint.clone();
+        {
+            let mut state = self.state.lock().await;
+            reconcile_external_workspace_change(
+                &self.repository_root,
+                &mut state.persistent,
+                Some(observation),
+            )
+            .await;
+        }
+        self.persist().await?;
+        let proposal_sha256 = pending.proposal.proposal_sha256.as_str().to_string();
+        {
+            let mut state = self.state.lock().await;
+            if state.persistent.mutation_epoch != pending.start_mutation_epoch
+                || fingerprint != pending.start_fingerprint
+            {
+                return Err(
+                    "the workspace changed while the independent review was sealed".to_string(),
+                );
+            }
+            let catalog = state
+                .persistent
+                .current_evidence_catalog
+                .as_mut()
+                .ok_or_else(|| "the sealed review lost its authenticated catalog".to_string())?;
+            let approval = catalog
+                .approval_receipt
+                .as_mut()
+                .ok_or_else(|| "the sealed review lost its reconciliation receipt".to_string())?;
+            if catalog.session_lineage_id != pending.binding.root_session_id
+                || catalog.policy_runner_bundle_sha256 != authority.policy_runner_bundle_sha256
+                || approval.policy_id != authority.config.policy_id
+                || approval.receipt.receipt_sha256.as_str() != pending.approval_receipt_sha256
+                || approval.reviewed_proposal.is_some()
+            {
+                return Err(
+                    "the reconciliation authority changed before reviewed-proposal storage"
+                        .to_string(),
+                );
+            }
+            validate_historical_proposal_against_approval(&pending.proposal, &approval.receipt)?;
+            approval.reviewed_proposal = Some(PersistedHistoricalAcceptanceReviewV1 {
+                proposal: pending.proposal,
+                reviewer_assignment_id: pending.binding.assignment_id.to_string(),
+                reviewer_attempt_id: pending.binding.attempt_id.to_string(),
+                reviewer_thread_id: pending.binding.thread_id.unwrap_or_default(),
+                reviewer_agent_path: pending.binding.agent_path,
+                target_assignment_id: pending.target_assignment_id.to_string(),
+                target_attempt_id: pending.target_attempt_id.to_string(),
+                session_lineage_id: pending.binding.root_session_id,
+                review_evidence_epoch: receipt.evidence_epoch,
+                sealed_review_sha256: sealed_historical_review_hash(receipt)?,
+                sealed_review: receipt.clone(),
+                recorded_at_unix_ms: unix_time_ms().max(approval.recorded_at_unix_ms),
+            });
+        }
+        if let Err(error) = self.persist().await {
+            if let Some(approval) = self
+                .state
+                .lock()
+                .await
+                .persistent
+                .current_evidence_catalog
+                .as_mut()
+                .and_then(|catalog| catalog.approval_receipt.as_mut())
+            {
+                approval.reviewed_proposal = None;
+            }
+            return Err(error);
+        }
+        Ok(proposal_sha256)
+    }
+
+    async fn finish_current_evidence_report(
+        &self,
+        pending: &PendingAttempt,
+        attempt: &FocusedValidationAttempt,
+        process_exit_code: Option<i32>,
+        runner_receipt: &mut RunnerAttestationReceipt,
+        report: &CompletionProofAttemptReportV1,
+    ) -> FocusedValidationOutcome {
+        let expected_ids = CURRENT_EVIDENCE_COMPONENT_IDS
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect::<Vec<_>>();
+        let reported_ids = report
+            .validations
+            .iter()
+            .map(|validation| validation.id.clone())
+            .collect::<Vec<_>>();
+        if attempt.validation_id != CURRENT_EVIDENCE_VALIDATION_ID
+            || report.focused_validation_id.as_deref() != Some(CURRENT_EVIDENCE_VALIDATION_ID)
+            || reported_ids != expected_ids
+        {
+            return FocusedValidationOutcome::PreResultError {
+                message: "the current-evidence report did not contain the exact ordered authorized component set"
+                    .to_string(),
+            };
+        }
+
+        let mut confirmed_failures = Vec::new();
+        let mut component_error = None;
+        let mut has_pre_result = false;
+        for validation in &report.validations {
+            let result = match validation.classification {
+                ValidationClassification::ConfirmedPass => {
+                    validate_current_component_pass(pending, report, validation).await
+                }
+                ValidationClassification::ConfirmedValidationFailure => {
+                    let result = validate_confirmed_failure(pending, report, validation).await;
+                    if result.is_ok() {
+                        confirmed_failures.push(validation.id.clone());
+                    }
+                    result
+                }
+                ValidationClassification::PreResultError => {
+                    has_pre_result = true;
+                    Ok(())
+                }
+            };
+            if let Err(error) = result {
+                component_error.get_or_insert(error);
+            }
+        }
+        let reported_child_ids = report
+            .child_processes
+            .iter()
+            .map(|child| child.validation_id.clone())
+            .collect::<Vec<_>>();
+        if reported_child_ids != expected_ids {
+            component_error.get_or_insert_with(|| {
+                "the current-evidence report did not contain the exact ordered component child identities"
+                    .to_string()
+            });
+        }
+        let expected_attempt_classification = if has_pre_result {
+            AttemptClassification::PreResultError
+        } else if confirmed_failures.is_empty() {
+            AttemptClassification::ConfirmedPass
+        } else {
+            AttemptClassification::ConfirmedValidationFailure
+        };
+        let expected_process_exit_code = match expected_attempt_classification {
+            AttemptClassification::ConfirmedPass => Some(0),
+            AttemptClassification::ConfirmedValidationFailure => Some(1),
+            AttemptClassification::PreResultError => Some(2),
+        };
+        if report.attempt_classification != expected_attempt_classification
+            || process_exit_code != expected_process_exit_code
+            || (expected_attempt_classification != AttemptClassification::PreResultError
+                && !report.fatal_error.is_empty())
+        {
+            component_error.get_or_insert_with(|| {
+                "the current-evidence outer result did not match its component results".to_string()
+            });
+        }
+
+        if !confirmed_failures.is_empty() {
+            if let Err(error) = self
+                .record_confirmed_validation_failures(pending, &confirmed_failures)
+                .await
+            {
+                return FocusedValidationOutcome::PreResultError { message: error };
+            }
+            if let Err(error) = self.persist().await {
+                return FocusedValidationOutcome::CurrentEvidenceValidationFailure {
+                    validation_ids: confirmed_failures,
+                    post_result_error: Some(error),
+                };
+            }
+        }
+
+        let exchange = runner_receipt.current_evidence.take();
+        let exchange_error = match exchange.as_ref() {
+            Some(exchange) => exchange.error.clone(),
+            None => Some(
+                "the authenticated runner did not use the current-evidence channel".to_string(),
+            ),
+        };
+        let evidence = exchange.and_then(|exchange| exchange.evidence);
+        let post_result_error = component_error.or(exchange_error).or_else(|| {
+            evidence.as_ref().and_then(|evidence| {
+                validate_current_evidence_against_report(evidence, report).err()
+            })
+        });
+        if let Some(error) = post_result_error {
+            return if confirmed_failures.is_empty() {
+                FocusedValidationOutcome::PreResultError { message: error }
+            } else {
+                FocusedValidationOutcome::CurrentEvidenceValidationFailure {
+                    validation_ids: confirmed_failures,
+                    post_result_error: Some(error),
+                }
+            };
+        }
+        let Some(evidence) = evidence else {
+            let message = "the authenticated current-evidence frame was unavailable".to_string();
+            return if confirmed_failures.is_empty() {
+                FocusedValidationOutcome::PreResultError { message }
+            } else {
+                FocusedValidationOutcome::CurrentEvidenceValidationFailure {
+                    validation_ids: confirmed_failures,
+                    post_result_error: Some(message),
+                }
+            };
+        };
+
+        if !confirmed_failures.is_empty() {
+            return FocusedValidationOutcome::CurrentEvidenceValidationFailure {
+                validation_ids: confirmed_failures,
+                post_result_error: None,
+            };
+        }
+        if has_pre_result
+            || report.attempt_classification != AttemptClassification::ConfirmedPass
+            || !report.fatal_error.is_empty()
+        {
+            return FocusedValidationOutcome::PreResultError {
+                message: if report.fatal_error.is_empty() {
+                    "the current-evidence attempt contained a component pre-result error"
+                        .to_string()
+                } else {
+                    report.fatal_error.clone()
+                },
+            };
+        }
+        if process_exit_code != Some(0) {
+            return FocusedValidationOutcome::PreResultError {
+                message: format!(
+                    "the exact current-evidence process exited with {:?} instead of success",
+                    process_exit_code
+                ),
+            };
+        }
+
+        let current_observation = workspace_observation(&self.repository_root).await;
+        let current_fingerprint = current_observation
+            .as_ref()
+            .map(|observation| observation.fingerprint.clone());
+        if current_fingerprint.as_deref() != Some(report.end_fingerprint.as_str()) {
+            self.note_external_non_documentation_mutation(current_fingerprint)
+                .await;
+            return FocusedValidationOutcome::PreResultError {
+                message:
+                    "the repository changed after current-evidence recorded its ending fingerprint"
+                        .to_string(),
+            };
+        }
+        if evidence.catalog.frozen_inventory_hash.as_str() != pending.expected_inventory_hash
+            || evidence.catalog.start_fingerprint.as_str() != pending.start_fingerprint
+            || evidence.catalog.start_mutation_epoch != pending.start_mutation_epoch
+        {
+            return FocusedValidationOutcome::PreResultError {
+                message: "the current-evidence catalog did not match the authenticated inventory or workspace start"
+                    .to_string(),
+            };
+        }
+
+        for validation_id in &expected_ids {
+            let poisoned_validation = {
+                let state = self.state.lock().await;
+                if state.persistent.mutation_epoch != pending.start_mutation_epoch {
+                    return FocusedValidationOutcome::PreResultError {
+                        message: "the repository mutation epoch changed during current-evidence"
+                            .to_string(),
+                    };
+                }
+                state
+                    .persistent
+                    .poisoned_validations
+                    .get(validation_id)
+                    .cloned()
+            };
+            if let Some(poisoned_validation) = poisoned_validation {
+                match poisoned_validation_is_eligible_at_snapshot(
+                    &self.repository_root,
+                    &poisoned_validation,
+                    pending.start_mutation_epoch,
+                    &report.end_fingerprint,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return FocusedValidationOutcome::PreResultError {
+                            message: format!(
+                                "validation {validation_id} is poisoned at this mutation epoch; current-evidence cannot bypass the required corrective mutation"
+                            ),
+                        };
+                    }
+                    Err(message) => {
+                        return FocusedValidationOutcome::PreResultError { message };
+                    }
+                }
+            }
+        }
+
+        let Some(session_lineage_id) = self.session_lineage_id.clone() else {
+            return FocusedValidationOutcome::PreResultError {
+                message: "current-evidence could not bind the authenticated session lineage"
+                    .to_string(),
+            };
+        };
+        let current_inventory_count = evidence.catalog.current_inventory.len();
+        {
+            let mut state = self.state.lock().await;
+            if state.persistent.mutation_epoch != pending.start_mutation_epoch {
+                return FocusedValidationOutcome::PreResultError {
+                    message:
+                        "the repository mutation epoch changed before current-evidence storage"
+                            .to_string(),
+                };
+            }
+            state.persistent.current_evidence_catalog = Some(PersistedCurrentEvidenceCatalogV1 {
+                schema_version: 1,
+                catalog: evidence.catalog,
+                catalog_sha256: evidence.catalog_sha256,
+                channel_frame_sha256: evidence.frame_sha256,
+                attempt_id: pending.attempt_id.clone(),
+                invocation_nonce: pending.nonce.clone(),
+                exact_command: pending.exact_command.clone(),
+                repository_root: pending.repository_root.to_string_lossy().into_owned(),
+                workspace_fingerprint: pending.start_fingerprint.clone(),
+                mutation_epoch: pending.start_mutation_epoch,
+                policy_runner_bundle_sha256: pending.policy_runner_bundle_sha256.clone(),
+                runner_process_id: runner_receipt.process.process_id,
+                runner_executable_path: runner_receipt.process.executable_path.clone(),
+                runner_entrypoint_path: runner_receipt.process.entrypoint_path.clone(),
+                session_lineage_id,
+                recorded_at_unix_ms: unix_time_ms(),
+                approval_receipt: None,
+            });
+        }
+        if let Err(message) = self.persist().await {
+            self.state.lock().await.persistent.current_evidence_catalog = None;
+            return FocusedValidationOutcome::PreResultError { message };
+        }
+        FocusedValidationOutcome::CurrentEvidenceAccepted {
+            current_inventory_count,
         }
     }
 
@@ -2892,8 +4595,8 @@ impl CompletionProofLedger {
                 message: "the runtime no longer owned the private invocation nonce".to_string(),
             };
         };
-        let runner_attestation = match attempt.runner_attestation.receive().await {
-            Ok(attestation) => attestation,
+        let runner_receipt = match attempt.runner_attestation.receive().await {
+            Ok(receipt) => receipt,
             Err(message) => {
                 let _ = tokio::fs::remove_file(&pending.report_path).await;
                 return CompletionProofAttemptOutcome::PreResultError { message };
@@ -2950,11 +4653,43 @@ impl CompletionProofLedger {
             &pending,
             &report,
             ATTEMPT_REPORT_TYPE,
-            &runner_attestation,
+            &runner_receipt.process,
         )
         .await
         {
             return CompletionProofAttemptOutcome::PreResultError { message };
+        }
+        if let Err(message) = self.verify_pending_authority(&pending).await {
+            return CompletionProofAttemptOutcome::PreResultError { message };
+        }
+        if let Err(message) = validate_attempt_completion_envelope(&pending, &report) {
+            return CompletionProofAttemptOutcome::PreResultError { message };
+        }
+        let Some(observed_workspace_change_paths) = observed_workspace_change_paths.as_ref() else {
+            return CompletionProofAttemptOutcome::PreResultError {
+                message: "the trusted workspace watcher could not establish that the repository remained unchanged during certification"
+                    .to_string(),
+            };
+        };
+        match canonical_attempt_observed_relevant_change(
+            &self.repository_root,
+            observed_workspace_change_paths,
+        )
+        .await
+        {
+            Some(false) => {}
+            Some(true) => {
+                return CompletionProofAttemptOutcome::PreResultError {
+                    message: "the trusted workspace watcher observed repository content or existence change during certification; restoring the ending bytes does not make that attempt valid"
+                        .to_string(),
+                };
+            }
+            None => {
+                return CompletionProofAttemptOutcome::PreResultError {
+                    message: "the trusted workspace watcher could not classify repository changes observed during certification"
+                        .to_string(),
+                };
+            }
         }
 
         let mut confirmed_failures = Vec::new();
@@ -2970,23 +4705,21 @@ impl CompletionProofLedger {
             }
         }
         if !confirmed_failures.is_empty() {
-            self.record_confirmed_validation_failures(&pending, &confirmed_failures)
-                .await;
+            if let Err(message) = self
+                .record_confirmed_validation_failures(&pending, &confirmed_failures)
+                .await
+            {
+                return CompletionProofAttemptOutcome::PreResultError { message };
+            }
             let _ = self.persist().await;
-            return CompletionProofAttemptOutcome::ConfirmedValidationFailure {
-                validation_ids: confirmed_failures,
-            };
         }
         if let Some(message) = malformed_failure {
             return CompletionProofAttemptOutcome::PreResultError { message };
         }
-
-        if let Err(message) = self.verify_pending_authority(&pending).await {
-            return CompletionProofAttemptOutcome::PreResultError { message };
-        }
-
-        if let Err(message) = validate_attempt_completion_envelope(&pending, &report) {
-            return CompletionProofAttemptOutcome::PreResultError { message };
+        if !confirmed_failures.is_empty() {
+            return CompletionProofAttemptOutcome::ConfirmedValidationFailure {
+                validation_ids: confirmed_failures,
+            };
         }
 
         if report.attempt_classification != AttemptClassification::ConfirmedPass {
@@ -3005,32 +4738,6 @@ impl CompletionProofLedger {
         }
         if let Err(message) = validate_confirmed_pass(&pending, &report).await {
             return CompletionProofAttemptOutcome::PreResultError { message };
-        }
-        let Some(observed_workspace_change_paths) = observed_workspace_change_paths else {
-            return CompletionProofAttemptOutcome::PreResultError {
-                message: "the trusted workspace watcher could not establish that the repository remained unchanged during certification"
-                    .to_string(),
-            };
-        };
-        match canonical_attempt_observed_relevant_change(
-            &self.repository_root,
-            &observed_workspace_change_paths,
-        )
-        .await
-        {
-            Some(false) => {}
-            Some(true) => {
-                return CompletionProofAttemptOutcome::PreResultError {
-                    message: "the trusted workspace watcher observed repository content or existence change during certification; restoring the ending bytes does not make that attempt valid"
-                        .to_string(),
-                };
-            }
-            None => {
-                return CompletionProofAttemptOutcome::PreResultError {
-                    message: "the trusted workspace watcher could not classify repository changes observed during certification"
-                        .to_string(),
-                };
-            }
         }
         let current_observation = workspace_observation(&self.repository_root).await;
         let current_fingerprint = current_observation
@@ -3416,10 +5123,17 @@ impl CompletionProofLedger {
             if !token_is_current {
                 None
             } else {
+                state
+                    .persistent
+                    .focused_completion
+                    .observe_changes(relevant_paths.as_deref());
                 match relevant_paths {
                     Some(paths) if paths.is_empty() => None,
                     Some(paths) if paths.iter().all(|path| is_documentation(path)) => {
                         state.persistent.requires_documentation_validation = true;
+                        if let Some(catalog) = state.persistent.current_evidence_catalog.as_mut() {
+                            catalog.approval_receipt = None;
+                        }
                         if let (Some(proof), Some(current_observation)) = (
                             state.persistent.registered_proof.as_mut(),
                             current_observation.as_ref(),
@@ -3435,6 +5149,7 @@ impl CompletionProofLedger {
                         state.persistent.requires_non_documentation_proof = true;
                         state.persistent.requires_documentation_validation = false;
                         state.persistent.registered_proof = None;
+                        state.persistent.current_evidence_catalog = None;
                         Some(false)
                     }
                 }
@@ -3531,6 +5246,19 @@ impl CompletionProofLedger {
                 current_observation,
             )
             .await;
+            let quality_result = match repository_authority.as_ref() {
+                Ok(authority) => {
+                    state
+                        .persistent
+                        .focused_completion
+                        .check_quality(
+                            &self.repository_root,
+                            &authority.policy_runner_bundle_sha256,
+                        )
+                        .await
+                }
+                Err(_) => Ok(()),
+            };
             let proof_is_current = if let (Some(proof), Some(fingerprint), Some(inventory_hash)) = (
                 state.persistent.registered_proof.as_ref(),
                 current_fingerprint.as_ref(),
@@ -3588,6 +5316,30 @@ impl CompletionProofLedger {
             let requires_non_documentation_proof =
                 state.persistent.requires_non_documentation_proof
                     || (state.persistent.registered_proof.is_some() && !proof_is_current);
+            let certification_requested = state
+                .persistent
+                .focused_completion
+                .certification_requested(self.session_lineage_id.as_deref());
+            let focused_result = if requires_non_documentation_proof && !certification_requested {
+                match repository_authority.as_ref() {
+                    Ok(authority) => {
+                        state
+                            .persistent
+                            .focused_completion
+                            .check(
+                                &self.repository_root,
+                                &authority.config,
+                                &authority.policy_runner_bundle_sha256,
+                                current_fingerprint.as_deref().unwrap_or_default(),
+                                &state.persistent.poisoned_validations,
+                            )
+                            .await
+                    }
+                    Err(message) => Err(message.clone()),
+                }
+            } else {
+                Err("whole-repository certification was explicitly requested".to_owned())
+            };
             let configured_documentation_command = requires_documentation_validation
                 .then(|| {
                     repository_authority
@@ -3609,7 +5361,9 @@ impl CompletionProofLedger {
                 .map(|reason| format!(" {reason}"))
                 .unwrap_or_default();
 
-            if let Some(documentation_command) = configured_documentation_command {
+            if let Err(message) = quality_result {
+                CompletionProofGateDecision::Blocked { message }
+            } else if let Some(documentation_command) = configured_documentation_command {
                 CompletionProofGateDecision::Blocked {
                     message: format!(
                         "Documentation changed. Run the repository's exact configured documentation validation from its root: `{documentation_command}`. A completion-proof relaxation cannot replace a configured documentation validation. The CompletionProofGate will not run validation for you.{rejection_suffix}"
@@ -3624,15 +5378,39 @@ impl CompletionProofLedger {
                     ),
                 }
             } else if proof_is_current {
+                state
+                    .persistent
+                    .focused_completion
+                    .completed(self.session_lineage_id.as_deref());
+                CompletionProofGateDecision::Accepted
+            } else if requires_non_documentation_proof && focused_result.is_ok() {
+                state
+                    .persistent
+                    .focused_completion
+                    .completed(self.session_lineage_id.as_deref());
+                state.persistent.requires_non_documentation_proof = false;
+                // The scoped check established a relevant correction and fresh
+                // pass for every poisoned validation. Retire those resolved
+                // failures so later unrelated work does not have to repeat them.
+                state.persistent.poisoned_validations.clear();
+                state.persistent.registered_proof = None;
                 CompletionProofGateDecision::Accepted
             } else if !requires_non_documentation_proof {
                 CompletionProofGateDecision::Accepted
             } else if let Ok(authority) = repository_authority.as_ref() {
                 CompletionProofGateDecision::Blocked {
-                    message: format!(
-                        "Successful completion is blocked until you explicitly run the repository's exact canonical proof command from its root: `{}`. Focused checks and separately run constituent commands do not count. The CompletionProofGate only verifies the private result and will not launch tests.{rejection_suffix}",
-                        authority.config.canonical_command,
-                    ),
+                    message: if certification_requested {
+                        format!(
+                            "Whole-repository certification was requested. Run the exact canonical command `{}` successfully; focused evidence cannot substitute. The CompletionProofGate will not launch tests.{rejection_suffix}",
+                            authority.config.canonical_command,
+                        )
+                    } else {
+                        format!(
+                            "Ordinary completion needs trustworthy focused evidence for the affected behavior: {}. Run the relevant focused checks; whole-repository certification `{}` is a separate explicit operation. The CompletionProofGate will not launch tests.{rejection_suffix}",
+                            focused_result.err().unwrap_or_default(),
+                            authority.config.canonical_command,
+                        )
+                    },
                 }
             } else {
                 let config_error = repository_authority
@@ -3662,7 +5440,16 @@ impl CompletionProofLedger {
         let current_observation = workspace_observation(&self.repository_root).await;
         {
             let mut state = self.state.lock().await;
-            state.persistent.mutation_epoch = state.persistent.mutation_epoch.saturating_add(1);
+            let before_epoch = state.persistent.mutation_epoch;
+            reconcile_external_workspace_change(
+                &self.repository_root,
+                &mut state.persistent,
+                current_observation.clone(),
+            )
+            .await;
+            if state.persistent.mutation_epoch == before_epoch {
+                state.persistent.mutation_epoch = before_epoch.saturating_add(1);
+            }
             state.persistent.last_observed_fingerprint = current_observation
                 .as_ref()
                 .map(|observation| observation.fingerprint.clone())
@@ -3679,6 +5466,7 @@ impl CompletionProofLedger {
             state.persistent.requires_non_documentation_proof = true;
             state.persistent.requires_documentation_validation = false;
             state.persistent.registered_proof = None;
+            state.persistent.current_evidence_catalog = None;
         }
         let _ = self.persist().await;
     }
@@ -3734,6 +5522,7 @@ impl CompletionProofLedger {
         state.persistent.requires_non_documentation_proof = true;
         state.persistent.requires_documentation_validation = false;
         state.persistent.registered_proof = None;
+        state.persistent.current_evidence_catalog = None;
         state.integrity = ProofStateIntegrity::Blocked(error);
     }
 }
@@ -4202,8 +5991,11 @@ struct RepositoryCompletionProofConfig {
     policy_id: String,
     canonical_command: String,
     focused_command: String,
+    focused_inventory_evidence_validation_ids: Option<Vec<String>>,
     documentation_command: Option<String>,
     frozen_inventory_hash: String,
+    frozen_inventory_path: String,
+    replacement_ledger_path: String,
     validation_ids: BTreeSet<String>,
     validation_evidence_contracts: BTreeMap<String, ValidationEvidenceContract>,
     validation_path_patterns: BTreeMap<String, ValidationInputContract>,
@@ -4518,6 +6310,7 @@ fn parse_repository_config_bytes(
         "canonical_command",
         "command",
         "focused_command",
+        "focused_inventory_evidence",
         "documentation_command",
         "frozen_inventory_hash",
         "repository_root",
@@ -4556,6 +6349,32 @@ fn parse_repository_config_bytes(
     let frozen_inventory_hash = exact_nonempty_config_string(&value, "frozen_inventory_hash")?;
     if !is_sha256(&frozen_inventory_hash) {
         return Err("completion-proof frozen_inventory_hash must be lowercase SHA-256".to_string());
+    }
+    let (frozen_inventory_path, replacement_ledger_path) =
+        match (table.get("frozen_inventory"), table.get("replacement_ledger")) {
+            (None, None) => (
+                INVENTORY_RELATIVE_PATH.to_string(),
+                REPLACEMENT_LEDGER_RELATIVE_PATH.to_string(),
+            ),
+            (Some(_), Some(_)) => (
+                normalize_trusted_repository_path(&exact_nonempty_config_string(
+                    &value,
+                    "frozen_inventory",
+                )?)?,
+                normalize_trusted_repository_path(&exact_nonempty_config_string(
+                    &value,
+                    "replacement_ledger",
+                )?)?,
+            ),
+            _ => {
+                return Err(
+                    "completion-proof configuration must select frozen_inventory and replacement_ledger together"
+                        .to_string(),
+                );
+            }
+        };
+    if frozen_inventory_path.eq_ignore_ascii_case(&replacement_ledger_path) {
+        return Err("completion-proof inventory and ledger must use distinct paths".to_string());
     }
     if policy_id == KD4_POLICY_ID && frozen_inventory_hash != KD4_FROZEN_INVENTORY_HASH {
         return Err(
@@ -4596,6 +6415,8 @@ fn parse_repository_config_bytes(
                 .to_string(),
         );
     }
+    let focused_inventory_evidence_validation_ids =
+        extract_focused_inventory_evidence_validation_ids(&value)?;
     if value
         .get("schema_version")
         .and_then(toml::Value::as_integer)
@@ -4607,6 +6428,29 @@ fn parse_repository_config_bytes(
         extract_validations(&value)?;
     if validation_ids.is_empty() {
         return Err("completion-proof configuration declares no required validations".to_string());
+    }
+    if validation_ids.contains(CURRENT_EVIDENCE_VALIDATION_ID) {
+        return Err(
+            "inventory.current-evidence must remain a focused composite, not a canonical validation"
+                .to_string(),
+        );
+    }
+    if let Some(component_ids) = focused_inventory_evidence_validation_ids.as_ref() {
+        let expected_runners = ["python-unittest", "python-pytest"];
+        for (component_id, expected_runner) in component_ids.iter().zip(expected_runners) {
+            if !validation_ids.contains(component_id)
+                || validation_evidence_contracts
+                    .get(component_id)
+                    .is_none_or(|contract| {
+                        contract.runner != expected_runner
+                            || contract.evidence_kind != ValidationEvidenceKind::StructuredTest
+                    })
+            {
+                return Err(format!(
+                    "completion-proof current-evidence component {component_id} must retain its declared {expected_runner} structured-test contract"
+                ));
+            }
+        }
     }
     let baseline_exception_rules = extract_baseline_exception_rules(&value)?;
     let trusted_bundle_paths = extract_trusted_repository_paths(&value, "trusted_bundle_paths")?;
@@ -4633,8 +6477,11 @@ fn parse_repository_config_bytes(
         policy_id,
         canonical_command,
         focused_command,
+        focused_inventory_evidence_validation_ids,
         documentation_command,
         frozen_inventory_hash,
+        frozen_inventory_path,
+        replacement_ledger_path,
         validation_ids,
         validation_evidence_contracts,
         validation_path_patterns,
@@ -4642,6 +6489,55 @@ fn parse_repository_config_bytes(
         trusted_bundle_paths,
         trusted_runner_entrypoint_paths,
     })
+}
+
+fn extract_focused_inventory_evidence_validation_ids(
+    value: &toml::Value,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(raw) = value.get("focused_inventory_evidence") else {
+        return Ok(None);
+    };
+    let table = raw
+        .as_table()
+        .ok_or_else(|| "completion-proof focused_inventory_evidence must be a table".to_string())?;
+    if table.keys().map(String::as_str).collect::<BTreeSet<_>>()
+        != BTreeSet::from(["validation_ids"])
+    {
+        return Err(
+            "completion-proof focused_inventory_evidence must contain only validation_ids"
+                .to_string(),
+        );
+    }
+    let ids = table
+        .get("validation_ids")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| {
+            "completion-proof focused_inventory_evidence validation_ids must be an array"
+                .to_string()
+        })?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|id| exact_nonempty(id) && is_validation_id(id))
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    "completion-proof focused_inventory_evidence contains an invalid validation ID"
+                        .to_string()
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if ids
+        .iter()
+        .map(String::as_str)
+        .ne(CURRENT_EVIDENCE_COMPONENT_IDS)
+    {
+        return Err(format!(
+            "completion-proof focused_inventory_evidence must declare the exact ordered component set {:?}",
+            CURRENT_EVIDENCE_COMPONENT_IDS
+        ));
+    }
+    Ok(Some(ids))
 }
 
 fn extract_trusted_repository_paths(
@@ -5014,7 +6910,7 @@ async fn load_inventory_hash(
     repository_root: &Path,
     config: &RepositoryCompletionProofConfig,
 ) -> Result<String, String> {
-    let path = repository_root.join(INVENTORY_RELATIVE_PATH);
+    let path = repository_root.join(&config.frozen_inventory_path);
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
@@ -5226,7 +7122,7 @@ async fn load_expected_provenance(
     ),
     String,
 > {
-    let inventory_path = repository_root.join(INVENTORY_RELATIVE_PATH);
+    let inventory_path = repository_root.join(&config.frozen_inventory_path);
     let inventory_bytes = tokio::fs::read(&inventory_path)
         .await
         .map_err(|error| format!("could not read {}: {error}", inventory_path.display()))?;
@@ -5241,7 +7137,7 @@ async fn load_expected_provenance(
         .map(|row| (row.baseline_id.clone(), row))
         .collect::<BTreeMap<_, _>>();
 
-    let ledger_path = repository_root.join(REPLACEMENT_LEDGER_RELATIVE_PATH);
+    let ledger_path = repository_root.join(&config.replacement_ledger_path);
     let ledger_bytes = tokio::fs::read(&ledger_path)
         .await
         .map_err(|error| format!("could not read {}: {error}", ledger_path.display()))?;
@@ -5838,6 +7734,9 @@ fn validate_embedded_hash(
         .as_object_mut()
         .ok_or_else(|| format!("{label} was not a JSON object"))?;
     object.remove(field);
+    // The runner hashes recursively sorted JSON. CLI feature unification enables
+    // serde_json/preserve_order, so parsing alone must not choose the hash order.
+    canonical.sort_all_objects();
     let bytes = serde_json::to_vec(&canonical)
         .map_err(|error| format!("{label} could not be hashed: {error}"))?;
     let actual = format!("{:x}", Sha256::digest(bytes));
@@ -5854,6 +7753,7 @@ fn completion_artifact_hash(artifact: &CompletionProofArtifactV1) -> Result<Stri
         .as_object_mut()
         .ok_or_else(|| "the completion artifact was not an object".to_string())?
         .remove("artifact_hash");
+    value.sort_all_objects();
     let bytes = serde_json::to_vec(&value)
         .map_err(|error| format!("the completion artifact could not be hashed: {error}"))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -6048,6 +7948,209 @@ async fn validate_confirmed_pass(
             "the confirmed attempt reported extra, duplicate, or missing child runner identities"
                 .to_string(),
         );
+    }
+    Ok(())
+}
+
+async fn validate_current_component_pass(
+    pending: &PendingAttempt,
+    report: &CompletionProofAttemptReportV1,
+    validation: &ValidationAttemptReport,
+) -> Result<(), String> {
+    let Some(contract) = pending.validation_evidence_contracts.get(&validation.id) else {
+        return Err(format!(
+            "current-evidence validation {} had no trusted evidence contract",
+            validation.id
+        ));
+    };
+    if !pending.expected_validation_ids.contains(&validation.id)
+        || validation.classification != ValidationClassification::ConfirmedPass
+        || validation.exit_code != Some(0)
+        || !validation_evidence_contract_matches(validation, contract)
+        || !confirmed_pass_evidence_shape_matches(validation)
+        || validation.diagnostic.len() > 8_000
+        || !is_sha256(&validation.report_hash)
+        || validation.execution_id.trim().is_empty()
+        || report
+            .validations
+            .iter()
+            .any(|other| other.id != validation.id && other.execution_id == validation.execution_id)
+    {
+        return Err(format!(
+            "current-evidence validation {} did not prove a fresh complete pass",
+            validation.id
+        ));
+    }
+    let matching_children = report
+        .child_processes
+        .iter()
+        .filter(|child| {
+            child.validation_id == validation.id && child.execution_id == validation.execution_id
+        })
+        .collect::<Vec<_>>();
+    if matching_children.len() != 1 {
+        return Err(format!(
+            "current-evidence validation {} did not have exactly one matching child",
+            validation.id
+        ));
+    }
+    validate_child_identity(pending, matching_children[0], Some(0)).await
+}
+
+fn validate_current_evidence_against_report(
+    evidence: &ValidatedCurrentEvidence,
+    report: &CompletionProofAttemptReportV1,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let expected_system = "Windows";
+    #[cfg(target_os = "macos")]
+    let expected_system = "Darwin";
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let expected_system = "Linux";
+    if report.host_identity.system != expected_system {
+        return Err("the current-evidence report host did not match this runtime".to_string());
+    }
+    for process in &evidence.processes {
+        let started_at = process
+            .child_process
+            .started_at
+            .parse::<u64>()
+            .map_err(|_| "a current-evidence discovery start timestamp was invalid".to_string())?;
+        let ended_at =
+            process.child_process.ended_at.parse::<u64>().map_err(|_| {
+                "a current-evidence discovery end timestamp was invalid".to_string()
+            })?;
+        if !same_completion_proof_path(
+            &canonical_repository_root(Path::new(&process.cwd)),
+            &canonical_repository_root(Path::new(&report.repository_root)),
+        ) || started_at < report.runner_process_identity.started_at
+            || ended_at > report.runner_process_identity.ended_at
+        {
+            return Err(
+                "a current-evidence discovery process escaped the authenticated repository or runner lifetime"
+                    .to_string(),
+            );
+        }
+    }
+    for (validation_id, raw) in [
+        (CURRENT_EVIDENCE_COMPONENT_IDS[0], &evidence.unittest),
+        (CURRENT_EVIDENCE_COMPONENT_IDS[1], &evidence.pytest),
+    ] {
+        let validation = report
+            .validations
+            .iter()
+            .find(|validation| validation.id == validation_id)
+            .ok_or_else(|| {
+                format!("the current-evidence report omitted component {validation_id}")
+            })?;
+        let expected_framework = if validation_id == CURRENT_EVIDENCE_COMPONENT_IDS[0] {
+            "python-unittest"
+        } else {
+            "python-pytest"
+        };
+        if raw.framework != expected_framework
+            || raw.proof_attempt_id != report.attempt_id
+            || raw.proof_execution_id != validation.execution_id
+            || raw.classification != validation.classification
+            || raw.intended_ids != validation.intended_ids
+            || raw.selected_ids != validation.selected_ids
+            || raw.started_ids != validation.executed_ids
+            || raw.terminal_ids != validation.executed_ids
+            || raw.executed_ids != validation.executed_ids
+        {
+            return Err(format!(
+                "the raw {validation_id} execution report did not exactly match its authenticated top-level component"
+            ));
+        }
+        let raw_outcomes = raw
+            .outcomes
+            .iter()
+            .map(|outcome| (outcome.id.as_str(), outcome.outcome.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let top_outcomes = validation
+            .outcomes
+            .iter()
+            .filter_map(|outcome| {
+                Some((
+                    outcome.get("id")?.as_str()?,
+                    outcome.get("outcome")?.as_str()?,
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if raw_outcomes.len() != raw.outcomes.len()
+            || top_outcomes.len() != validation.outcomes.len()
+            || raw_outcomes != top_outcomes
+        {
+            return Err(format!(
+                "the raw {validation_id} outcomes did not match the authenticated top-level component"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_current_evidence_expected_selections(
+    catalog: &FocusedLiveSuccessorCatalogV1,
+    unittest: &RawStructuredTestEvidence,
+    pytest: &RawStructuredTestEvidence,
+    baseline_exception_rules: &BTreeSet<BaselineExceptionRule>,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let active_platform = FocusedInventoryPlatformV1::Windows;
+    #[cfg(target_os = "macos")]
+    let active_platform = FocusedInventoryPlatformV1::Darwin;
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let active_platform = FocusedInventoryPlatformV1::Linux;
+
+    for (framework, raw) in [
+        (FocusedInventoryFrameworkV1::PythonUnittest, unittest),
+        (FocusedInventoryFrameworkV1::PythonPytest, pytest),
+    ] {
+        let mut expected = Vec::new();
+        for row in catalog
+            .current_inventory
+            .iter()
+            .filter(|row| row.framework == framework)
+        {
+            if !row.platforms.contains(&active_platform) {
+                continue;
+            }
+            let matching_rules = baseline_exception_rules
+                .iter()
+                .filter(|rule| {
+                    rule.id_prefix
+                        .as_ref()
+                        .is_some_and(|prefix| row.baseline_id.starts_with(prefix))
+                        || rule
+                            .source_prefix
+                            .as_ref()
+                            .is_some_and(|prefix| row.source.as_str().starts_with(prefix))
+                })
+                .collect::<Vec<_>>();
+            if matching_rules.len() > 1 {
+                return Err(format!(
+                    "current-inventory row {} matched more than one configured exception",
+                    row.baseline_id
+                ));
+            }
+            if matching_rules
+                .first()
+                .is_some_and(|rule| !matches!(rule.kind.as_str(), "protected" | "generated"))
+            {
+                continue;
+            }
+            expected.push(row.native_id.clone());
+        }
+        expected.sort();
+        if expected.is_empty()
+            || expected.windows(2).any(|pair| pair[0] >= pair[1])
+            || raw.intended_ids != expected
+        {
+            return Err(format!(
+                "the raw {} intended selection did not exactly match the authorized current-inventory projection",
+                raw.framework
+            ));
+        }
     }
     Ok(())
 }
@@ -6487,7 +8590,21 @@ async fn poisoned_validation_is_eligible_at_snapshot(
             poisoned_validation.validation_id
         ));
     };
-    Ok(&current_snapshot != failure_input_snapshot)
+    Ok(compatible_validation_input_snapshot_changed(
+        failure_input_snapshot,
+        &current_snapshot,
+    ))
+}
+
+fn compatible_validation_input_snapshot_changed(
+    failure: &ValidationInputSnapshotV1,
+    current: &ValidationInputSnapshotV1,
+) -> bool {
+    // A runtime upgrade must not reinterpret an older failure snapshot under
+    // different input-selection rules and accidentally clear poison.
+    failure.schema_version == current.schema_version
+        && failure.algorithm == current.algorithm
+        && failure.sha256 != current.sha256
 }
 
 fn normalized_validation_pattern(pattern: &str) -> String {
@@ -6603,7 +8720,7 @@ async fn validation_input_snapshot(
         let manifest = repository_root.join(Path::new(&manifest_path));
         let manifest_contents = tokio::fs::read_to_string(&manifest).await.ok()?;
         let manifest_value = toml::from_str::<toml::Value>(&manifest_contents).ok()?;
-        collect_symbol_evidence_paths(&manifest_value, &mut normalized_content_patterns)?;
+        collect_source_owner_revision_paths(&manifest_value, &mut normalized_content_patterns)?;
     }
     let compiled_content_patterns = normalized_content_patterns
         .iter()
@@ -6621,6 +8738,7 @@ async fn validation_input_snapshot(
             "-c",
             "core.fsmonitor=false",
             "ls-files",
+            "-t",
             "--cached",
             "--others",
             "--exclude-standard",
@@ -6639,11 +8757,8 @@ async fn validation_input_snapshot(
     if !output.status.success() {
         return None;
     }
-    let mut candidates = strict_nul_separated_paths(&output.stdout)?;
-    for pattern in normalized_content_patterns
-        .iter()
-        .chain(normalized_path_set_patterns.iter())
-    {
+    let (mut candidates, tracked_candidates) = strict_tagged_nul_separated_paths(&output.stdout)?;
+    for pattern in &normalized_content_patterns {
         if !pattern
             .bytes()
             .any(|byte| matches!(byte, b'*' | b'?' | b'['))
@@ -6664,7 +8779,7 @@ async fn validation_input_snapshot(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let matching_path_set_paths = candidates
+    let matching_path_set_paths = tracked_candidates
         .into_iter()
         .filter(|path| {
             compiled_path_set_patterns
@@ -6675,7 +8790,7 @@ async fn validation_input_snapshot(
     let repository_root = repository_root.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut snapshot = Sha256::new();
-        snapshot.update(b"KD4_VALIDATION_INPUT_SNAPSHOT_V2\0");
+        snapshot.update(b"KD4_VALIDATION_INPUT_SNAPSHOT_V3\0");
         for pattern in normalized_content_patterns {
             update_snapshot_frame(&mut snapshot, pattern.as_bytes());
         }
@@ -6692,12 +8807,16 @@ async fn validation_input_snapshot(
             update_snapshot_frame(&mut snapshot, &length.to_be_bytes());
             update_snapshot_frame(&mut snapshot, content_sha256.as_bytes());
         }
-        update_snapshot_frame(&mut snapshot, b"PATH_SET");
+        update_snapshot_frame(&mut snapshot, b"TRACKED_REGULAR_FILE_PATH_SET");
         for path in matching_path_set_paths {
             let absolute = repository_root.join(Path::new(&path));
-            let (kind, _, _) = validation_path_identity(&absolute)?;
+            if !std::fs::symlink_metadata(&absolute)
+                .ok()
+                .is_some_and(|metadata| metadata.file_type().is_file())
+            {
+                continue;
+            }
             update_snapshot_frame(&mut snapshot, path.as_bytes());
-            update_snapshot_frame(&mut snapshot, kind);
         }
         Some(ValidationInputSnapshotV1 {
             schema_version: VALIDATION_INPUT_SNAPSHOT_SCHEMA_VERSION,
@@ -6710,36 +8829,86 @@ async fn validation_input_snapshot(
     .flatten()
 }
 
-fn collect_symbol_evidence_paths(value: &toml::Value, paths: &mut BTreeSet<String>) -> Option<()> {
-    match value {
-        toml::Value::Array(values) => {
-            for value in values {
-                collect_symbol_evidence_paths(value, paths)?;
-            }
-        }
-        toml::Value::Table(table) => {
-            if table
-                .get("symbol")
-                .and_then(toml::Value::as_str)
-                .is_some_and(|symbol| !symbol.is_empty())
-            {
-                let path = table.get("path").and_then(toml::Value::as_str)?;
-                let normalized = normalized_validation_pattern(path);
-                if !safe_repository_relative_path(Path::new(&normalized))
-                    || normalized
-                        .bytes()
-                        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
-                {
-                    return None;
-                }
-                paths.insert(normalized);
-            }
-            for value in table.values() {
-                collect_symbol_evidence_paths(value, paths)?;
-            }
-        }
-        _ => {}
+fn collect_source_owner_revision_paths(
+    value: &toml::Value,
+    paths: &mut BTreeSet<String>,
+) -> Option<()> {
+    let root = value.as_table()?;
+    if root.get("schema_version")?.as_integer()? != 2 {
+        return None;
     }
+    let owners = root.get("owners")?.as_array()?;
+    let mut generated_mirrors = BTreeSet::new();
+    let mut revision_paths = BTreeSet::new();
+    for owner in owners {
+        let owner = owner.as_table()?;
+        collect_source_owner_string_paths(owner, "generated_mirrors", &mut generated_mirrors)?;
+    }
+    for owner in owners {
+        let owner = owner.as_table()?;
+        collect_source_owner_string_paths(owner, "tests", &mut revision_paths)?;
+        for entry in optional_toml_array(owner, "primary_entries")? {
+            collect_source_owner_path(
+                entry.as_table()?.get("path")?.as_str()?,
+                &mut revision_paths,
+            )?;
+        }
+        for relationship in optional_toml_array(owner, "relationships")? {
+            let relationship = relationship.as_table()?;
+            for evidence in relationship.get("evidence")?.as_array()? {
+                collect_source_owner_path(
+                    evidence.as_table()?.get("path")?.as_str()?,
+                    &mut revision_paths,
+                )?;
+            }
+        }
+        for invariant in optional_toml_array(owner, "invariants")? {
+            let invariant = invariant.as_table()?;
+            for evidence in invariant.get("evidence")?.as_array()? {
+                collect_source_owner_path(
+                    evidence.as_table()?.get("path")?.as_str()?,
+                    &mut revision_paths,
+                )?;
+            }
+            collect_source_owner_string_paths(invariant, "tests", &mut revision_paths)?;
+        }
+    }
+    revision_paths.retain(|path| !generated_mirrors.contains(path));
+    paths.extend(revision_paths);
+    Some(())
+}
+
+fn optional_toml_array<'a>(
+    table: &'a toml::map::Map<String, toml::Value>,
+    field: &str,
+) -> Option<&'a [toml::Value]> {
+    match table.get(field) {
+        Some(value) => Some(value.as_array()?.as_slice()),
+        None => Some(&[]),
+    }
+}
+
+fn collect_source_owner_string_paths(
+    table: &toml::map::Map<String, toml::Value>,
+    field: &str,
+    paths: &mut BTreeSet<String>,
+) -> Option<()> {
+    for value in optional_toml_array(table, field)? {
+        collect_source_owner_path(value.as_str()?, paths)?;
+    }
+    Some(())
+}
+
+fn collect_source_owner_path(raw_path: &str, paths: &mut BTreeSet<String>) -> Option<()> {
+    let normalized = normalized_validation_pattern(raw_path);
+    if !safe_repository_relative_path(Path::new(&normalized))
+        || normalized
+            .bytes()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+    {
+        return None;
+    }
+    paths.insert(normalized);
     Some(())
 }
 
@@ -6815,6 +8984,34 @@ fn strict_nul_separated_paths(bytes: &[u8]) -> Option<BTreeSet<String>> {
         }
     }
     Some(paths)
+}
+
+fn strict_tagged_nul_separated_paths(bytes: &[u8]) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
+    if bytes.is_empty() {
+        return Some((BTreeSet::new(), BTreeSet::new()));
+    }
+    if bytes.last() != Some(&0) {
+        return None;
+    }
+
+    let mut all_paths = BTreeSet::new();
+    let mut tracked_paths = BTreeSet::new();
+    for raw in bytes[..bytes.len().saturating_sub(1)].split(|byte| *byte == 0) {
+        let (&tag, raw_path) = raw.split_first()?;
+        if !matches!(tag, b'H' | b'S' | b'M' | b'R' | b'C' | b'K' | b'?')
+            || raw_path.first() != Some(&b' ')
+        {
+            return None;
+        }
+        let path = strict_git_output_path(&raw_path[1..])?;
+        if !all_paths.insert(path.clone()) {
+            return None;
+        }
+        if tag != b'?' {
+            tracked_paths.insert(path);
+        }
+    }
+    Some((all_paths, tracked_paths))
 }
 
 fn strict_git_output_path(raw_path: &[u8]) -> Option<String> {
@@ -7006,9 +9203,17 @@ async fn reconcile_external_workspace_change(
         state.requires_non_documentation_proof = true;
         state.requires_documentation_validation = false;
         state.registered_proof = None;
+        state.current_evidence_catalog = None;
+        state.focused_completion.observe_changes(None);
         return;
     };
     let had_observed_fingerprint = state.last_observed_fingerprint.is_some();
+    if state.focused_completion.baseline_head.is_none() {
+        state.focused_completion.baseline_head = state
+            .last_observed_head_identity
+            .clone()
+            .or_else(|| current_observation.head_identity.clone());
+    }
     let current_fingerprint = current_observation.fingerprint.clone();
     if state.last_observed_fingerprint.as_deref() == Some(current_fingerprint.as_str()) {
         state.last_observed_head_identity = current_observation.head_identity;
@@ -7053,7 +9258,13 @@ async fn reconcile_external_workspace_change(
     let documentation_only = changed_paths
         .as_ref()
         .is_some_and(|paths| !paths.is_empty() && paths.iter().all(|path| is_documentation(path)));
+    state
+        .focused_completion
+        .observe_changes(changed_paths.as_deref());
     if documentation_only {
+        if let Some(catalog) = state.current_evidence_catalog.as_mut() {
+            catalog.approval_receipt = None;
+        }
         if !state.requires_non_documentation_proof {
             state.requires_documentation_validation = true;
             if let Some(proof) = state.registered_proof.as_mut() {
@@ -7071,6 +9282,7 @@ async fn reconcile_external_workspace_change(
         state.requires_non_documentation_proof = true;
         state.requires_documentation_validation = false;
         state.registered_proof = None;
+        state.current_evidence_catalog = None;
     }
     state.last_observed_fingerprint = Some(current_fingerprint);
     state.last_observed_head_identity = current_observation.head_identity;
@@ -7661,6 +9873,7 @@ fn validate_authenticated_state_envelope(
             repository_root,
         )
         || !persistent_relaxation_state_is_valid(&envelope.state)
+        || !persistent_current_evidence_state_is_valid(&envelope.state, repository_root)
     {
         return Err(
             "the authenticated completion-proof state envelope had the wrong identity or schema"
@@ -7668,6 +9881,330 @@ fn validate_authenticated_state_envelope(
         );
     }
     verify_authenticated_state_tag(envelope, authentication_key)
+}
+
+async fn read_historical_acceptance_proposal(
+    repository_root: &Path,
+    relative: &str,
+) -> Result<HistoricalReplacementAcceptanceProposalV1, String> {
+    const MAX_PROPOSAL_BYTES: u64 = 2 * 1024 * 1024;
+    let path = Path::new(relative);
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(
+            "historical proposal path must be repository-relative without traversal".to_string(),
+        );
+    }
+    let mut absolute = repository_root.to_path_buf();
+    for part in path.components() {
+        absolute.push(part);
+        let metadata = tokio::fs::symlink_metadata(&absolute)
+            .await
+            .map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err("historical proposal path must not traverse symlinks".to_string());
+        }
+    }
+    let resolved = tokio::fs::canonicalize(&absolute)
+        .await
+        .map_err(|error| error.to_string())?;
+    let root = tokio::fs::canonicalize(repository_root)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !resolved.starts_with(root) {
+        return Err("historical proposal path escaped the repository".to_string());
+    }
+    let file = tokio::fs::File::open(resolved)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !file
+        .metadata()
+        .await
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("historical proposal must be a regular file".to_string());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PROPOSAL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_PROPOSAL_BYTES {
+        return Err("historical proposal exceeded its bounded input size".to_string());
+    }
+    let value = codex_validation_contracts::canonical::parse_canonical_jcs(&bytes)
+        .map_err(|error| error.to_string())?;
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+fn validate_historical_proposal_against_approval(
+    proposal: &HistoricalReplacementAcceptanceProposalV1,
+    approval: &FocusedReplacementApprovalReceiptV1,
+) -> Result<(), String> {
+    // This is the same immutable predecessor already compiled into the trusted runner bundle.
+    // Runtime state, rather than the proposal's self-hash or an exported SQLite row, supplies approval.
+    let predecessor = serde_json::from_slice(include_bytes!(
+        "../../../.codex/validation/test-replacements-v1.json"
+    ))
+    .map_err(|error| format!("compiled historical predecessor is invalid: {error}"))?;
+    proposal
+        .validate(&predecessor, approval)
+        .map_err(|error| error.to_string())
+}
+
+fn historical_review_criterion_id(proposal: &HistoricalReplacementAcceptanceProposalV1) -> String {
+    format!(
+        "historical-replacement-review-plan-v1.{}",
+        proposal.review_plan_sha256.as_str()
+    )
+}
+
+fn validate_historical_review_criteria(
+    proposal: &HistoricalReplacementAcceptanceProposalV1,
+    draft: &codex_agent_task_store::ReceiptDraft,
+) -> Result<(), String> {
+    if !draft.status.is_success()
+        || !draft.declared_changes.is_empty()
+        || !draft.validation_call_ids.is_empty()
+        || !draft.blockers.is_empty()
+        || !draft.risks.is_empty()
+        || draft.architecture_contract.is_some()
+        || draft.criterion_results.len() != 1
+        || draft.criterion_results.iter().any(|criterion| {
+            criterion.criterion_id != historical_review_criterion_id(proposal)
+                || criterion.status != codex_agent_task_store::CriterionStatus::Passed
+                || !criterion
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|text| exact_nonempty(text))
+        })
+    {
+        return Err("historical acceptance requires a successful read-only review with explicit passing evidence for the exact complete review plan".to_string());
+    }
+    Ok(())
+}
+
+fn sealed_historical_review_hash(
+    receipt: &codex_agent_task_store::AgentReceipt,
+) -> Result<String, String> {
+    let bytes = canonical_jcs_of(receipt).map_err(|error| error.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn persistent_historical_acceptance_review_is_valid(
+    approval: &PersistedFocusedReplacementApprovalV1,
+) -> bool {
+    let Some(review) = &approval.reviewed_proposal else {
+        return true;
+    };
+    let receipt = &review.sealed_review;
+    let draft = codex_agent_task_store::ReceiptDraft {
+        status: receipt.status,
+        summary: receipt.summary.clone(),
+        criterion_results: receipt.criterion_results.clone(),
+        declared_changes: receipt.declared_changes.clone(),
+        validation_call_ids: receipt.validation_call_ids.clone(),
+        blockers: receipt.blockers.clone(),
+        risks: receipt.risks.clone(),
+        next_action: receipt.next_action.clone(),
+        architecture_contract: None,
+    };
+    validate_historical_proposal_against_approval(&review.proposal, &approval.receipt).is_ok()
+        && validate_historical_review_criteria(&review.proposal, &draft).is_ok()
+        && receipt.architecture_contract.is_none()
+        && review.reviewer_assignment_id == receipt.assignment_id.to_string()
+        && review.reviewer_attempt_id == receipt.attempt_id.to_string()
+        && review.review_evidence_epoch == receipt.evidence_epoch
+        && review.session_lineage_id == approval.session_lineage_id
+        && review.reviewer_assignment_id != review.target_assignment_id
+        && review.reviewer_agent_path.starts_with("/root/")
+        && [
+            &review.reviewer_assignment_id,
+            &review.reviewer_attempt_id,
+            &review.reviewer_thread_id,
+            &review.target_assignment_id,
+            &review.target_attempt_id,
+        ]
+        .iter()
+        .all(|value| Uuid::parse_str(value).is_ok_and(|id| id.to_string() == **value))
+        && sealed_historical_review_hash(receipt)
+            .is_ok_and(|hash| hash == review.sealed_review_sha256)
+        && review.recorded_at_unix_ms >= approval.recorded_at_unix_ms
+}
+
+fn focused_replacement_approval_context(
+    catalog: &PersistedCurrentEvidenceCatalogV1,
+    attempt_id: &str,
+    policy_id: &str,
+) -> Result<FocusedReplacementApprovalCurrentContextV1, String> {
+    Ok(FocusedReplacementApprovalCurrentContextV1 {
+        format_id: FocusedReplacementApprovalReceiptV1::FORMAT_ID.to_string(),
+        schema_version: 1,
+        attempt_id: attempt_id.to_string(),
+        focused_validation_id: FocusedReplacementApprovalReceiptV1::FOCUSED_VALIDATION_ID
+            .to_string(),
+        classification: FocusedReplacementApprovalReceiptV1::CLASSIFICATION.to_string(),
+        frozen_inventory_hash: catalog.catalog.frozen_inventory_hash.clone(),
+        focused_inventory_catalog_semantic_sha256: catalog.catalog.semantic_sha256.clone(),
+        inventory_discovery_processes_sha256: catalog
+            .catalog
+            .inventory_discovery_processes_sha256
+            .clone(),
+        policy_id: policy_id.to_string(),
+        policy_runner_bundle_sha256: Sha256HexV1::parse(
+            catalog.policy_runner_bundle_sha256.clone(),
+        )
+        .map_err(|error| error.to_string())?,
+        workspace_fingerprint: Sha256HexV1::parse(catalog.workspace_fingerprint.clone())
+            .map_err(|error| error.to_string())?,
+        mutation_epoch: catalog.mutation_epoch,
+    })
+}
+
+fn focused_replacement_approval_expectation(
+    pending: &PendingAttempt,
+    catalog: &PersistedCurrentEvidenceCatalogV1,
+    session_lineage_id: Option<&str>,
+) -> Result<FocusedReplacementApprovalExpectation, String> {
+    if !same_completion_proof_path(
+        &canonical_repository_root(Path::new(&catalog.repository_root)),
+        &pending.repository_root,
+    ) || catalog.catalog.frozen_inventory_hash.as_str() != pending.expected_inventory_hash
+        || catalog.workspace_fingerprint != pending.start_fingerprint
+        || catalog.mutation_epoch != pending.start_mutation_epoch
+        || catalog.policy_runner_bundle_sha256 != pending.policy_runner_bundle_sha256
+        || session_lineage_id != Some(catalog.session_lineage_id.as_str())
+    {
+        return Err(
+            "frozen reconciliation requires a current authenticated inventory catalog matching this repository, session lineage, policy, and workspace"
+                .to_string(),
+        );
+    }
+    Ok(FocusedReplacementApprovalExpectation {
+        catalog_sha256: catalog.catalog_sha256.clone(),
+        channel_frame_sha256: catalog.channel_frame_sha256.clone(),
+        catalog_attempt_id: catalog.attempt_id.clone(),
+        session_lineage_id: catalog.session_lineage_id.clone(),
+        context: focused_replacement_approval_context(
+            catalog,
+            &pending.attempt_id,
+            &pending.expected_policy_id,
+        )?,
+    })
+}
+
+fn focused_replacement_approval_receipt(
+    context: &FocusedReplacementApprovalCurrentContextV1,
+) -> Result<FocusedReplacementApprovalReceiptV1, String> {
+    let mut receipt = FocusedReplacementApprovalReceiptV1 {
+        format_id: context.format_id.clone(),
+        schema_version: context.schema_version,
+        attempt_id: context.attempt_id.clone(),
+        focused_validation_id: context.focused_validation_id.clone(),
+        classification: context.classification.clone(),
+        frozen_inventory_hash: context.frozen_inventory_hash.clone(),
+        focused_inventory_catalog_semantic_sha256: context
+            .focused_inventory_catalog_semantic_sha256
+            .clone(),
+        inventory_discovery_processes_sha256: context.inventory_discovery_processes_sha256.clone(),
+        policy_id: context.policy_id.clone(),
+        policy_runner_bundle_sha256: context.policy_runner_bundle_sha256.clone(),
+        workspace_fingerprint: context.workspace_fingerprint.clone(),
+        mutation_epoch: context.mutation_epoch,
+        // The typed hash projection excludes this field. Replace the placeholder
+        // before validation or publication.
+        receipt_sha256: context.workspace_fingerprint.clone(),
+    };
+    receipt.receipt_sha256 = receipt
+        .receipt_sha256()
+        .map_err(|error| error.to_string())?;
+    receipt
+        .validate_current_context(context)
+        .map_err(|error| error.to_string())?;
+    Ok(receipt)
+}
+
+fn persistent_focused_replacement_approval_is_valid(
+    state: &PersistentCompletionProofState,
+    catalog: &PersistedCurrentEvidenceCatalogV1,
+) -> bool {
+    let Some(approval) = catalog.approval_receipt.as_ref() else {
+        return true;
+    };
+    let context = match focused_replacement_approval_context(
+        catalog,
+        &approval.attempt_id,
+        &approval.policy_id,
+    ) {
+        Ok(context) => context,
+        Err(_) => return false,
+    };
+    approval.receipt.validate_current_context(&context).is_ok()
+        && persistent_historical_acceptance_review_is_valid(approval)
+        && state.last_observed_fingerprint.as_deref()
+            == Some(catalog.workspace_fingerprint.as_str())
+        && approval.session_lineage_id == catalog.session_lineage_id
+        && approval.invocation_nonce.len() == 32
+        && approval
+            .invocation_nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && exact_nonempty(&approval.exact_command)
+        && approval
+            .exact_command
+            .contains(FocusedReplacementApprovalReceiptV1::FOCUSED_VALIDATION_ID)
+        && approval.runner_process_id > 0
+        && approval.runner_executable_path.is_absolute()
+        && approval.runner_entrypoint_path.is_absolute()
+        && approval.recorded_at_unix_ms > 0
+}
+
+fn persistent_current_evidence_state_is_valid(
+    state: &PersistentCompletionProofState,
+    repository_root: &Path,
+) -> bool {
+    let Some(evidence) = state.current_evidence_catalog.as_ref() else {
+        return true;
+    };
+    let catalog_bytes = match canonical_jcs_of(&evidence.catalog) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    evidence.schema_version == 1
+        && evidence.catalog.validate().is_ok()
+        && evidence.catalog_sha256 == format!("{:x}", Sha256::digest(catalog_bytes))
+        && is_sha256(&evidence.catalog_sha256)
+        && is_sha256(&evidence.channel_frame_sha256)
+        && evidence.attempt_id == evidence.catalog.attempt_id
+        && Uuid::parse_str(&evidence.attempt_id).is_ok_and(|id| id.get_version_num() == 7)
+        && evidence.invocation_nonce.len() == 32
+        && evidence
+            .invocation_nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && exact_nonempty(&evidence.exact_command)
+        && evidence
+            .exact_command
+            .contains(CURRENT_EVIDENCE_VALIDATION_ID)
+        && same_completion_proof_path(
+            &canonical_repository_root(Path::new(&evidence.repository_root)),
+            repository_root,
+        )
+        && evidence.workspace_fingerprint == evidence.catalog.start_fingerprint.as_str()
+        && is_sha256(&evidence.workspace_fingerprint)
+        && evidence.mutation_epoch == evidence.catalog.start_mutation_epoch
+        && evidence.mutation_epoch == state.mutation_epoch
+        && is_sha256(&evidence.policy_runner_bundle_sha256)
+        && evidence.runner_process_id > 0
+        && evidence.runner_executable_path.is_absolute()
+        && evidence.runner_entrypoint_path.is_absolute()
+        && valid_exact_identity(evidence.session_lineage_id.clone()).is_some()
+        && evidence.recorded_at_unix_ms > 0
+        && persistent_focused_replacement_approval_is_valid(state, evidence)
 }
 
 fn persisted_current_user_relaxation_is_valid(relaxation: &PersistedCurrentUserRelaxation) -> bool {
@@ -8092,6 +10629,82 @@ mod tests {
     }
 
     #[test]
+    fn compiled_kd4_authority_trusts_source_helpers_without_making_them_entrypoints() {
+        let authority = compiled_kd4_authority().expect("load compiled KD4 authority");
+        let trusted_paths = KD4_TRUSTED_BUNDLE_MEMBERS
+            .iter()
+            .map(|member| member.relative_path)
+            .collect::<BTreeSet<_>>();
+        let entrypoint_paths = authority
+            .trusted_runner_entrypoints
+            .iter()
+            .map(|entrypoint| entrypoint.relative_path.as_str())
+            .collect::<BTreeSet<_>>();
+
+        for helper in [
+            "scripts/completion_proof_canonical.py",
+            "scripts/completion_proof_inventory_v2.py",
+        ] {
+            assert!(
+                trusted_paths.contains(helper),
+                "missing trusted helper {helper}"
+            );
+            assert!(
+                !entrypoint_paths.contains(helper),
+                "source-only helper became an executable entrypoint: {helper}"
+            );
+        }
+        assert_eq!(
+            entrypoint_paths,
+            BTreeSet::from(["scripts/completion_proof.py"]),
+            "KD4 must attest only its canonical runner entrypoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn compiled_kd4_authority_rejects_changed_source_helpers() {
+        let repository = tempfile::tempdir().expect("temporary KD4 repository");
+        for member in KD4_TRUSTED_BUNDLE_MEMBERS {
+            let path = repository.path().join(member.relative_path);
+            std::fs::create_dir_all(path.parent().expect("trusted member parent"))
+                .expect("create trusted member parent");
+            std::fs::write(path, member.bytes).expect("materialize compiled trusted member");
+        }
+        load_completion_proof_authority(repository.path(), true)
+            .await
+            .expect("materialized compiled KD4 authority is accepted");
+
+        for helper in [
+            "scripts/completion_proof_canonical.py",
+            "scripts/completion_proof_inventory_v2.py",
+        ] {
+            let member = KD4_TRUSTED_BUNDLE_MEMBERS
+                .iter()
+                .find(|member| member.relative_path == helper)
+                .unwrap_or_else(|| panic!("missing compiled trusted helper {helper}"));
+            let path = repository.path().join(helper);
+            std::fs::write(&path, b"changed after compilation\n")
+                .expect("change compiled trusted helper");
+
+            let error = load_completion_proof_authority(repository.path(), true)
+                .await
+                .expect_err("changed helper must invalidate compiled KD4 authority");
+            assert_eq!(
+                error,
+                format!(
+                    "trusted KD4 bundle member {} differs from the policy compiled into this runtime; rebuild and reactivate KD4 before certification",
+                    path.display()
+                )
+            );
+
+            std::fs::write(&path, member.bytes).expect("restore compiled trusted helper");
+            load_completion_proof_authority(repository.path(), true)
+                .await
+                .unwrap_or_else(|error| panic!("restored helper {helper} was rejected: {error}"));
+        }
+    }
+
+    #[test]
     fn compiled_kd4_rust_workspace_validation_consumes_investigation_evidence_schema() {
         let authority = compiled_kd4_authority().expect("load compiled KD4 authority");
         let input_contract = authority
@@ -8193,6 +10806,29 @@ mod tests {
             assert_eq!(strict_nul_separated_paths(malformed), None);
         }
 
+        assert_eq!(
+            strict_tagged_nul_separated_paths(
+                b"H docs/readme.md\0? scratch.txt\0S src/runtime.rs\0"
+            ),
+            Some((
+                BTreeSet::from([
+                    "docs/readme.md".to_string(),
+                    "scratch.txt".to_string(),
+                    "src/runtime.rs".to_string(),
+                ]),
+                BTreeSet::from(["docs/readme.md".to_string(), "src/runtime.rs".to_string(),]),
+            ))
+        );
+        for malformed in [
+            b"H src/runtime.rs".as_slice(),
+            b"Hsrc/runtime.rs\0".as_slice(),
+            b"X src/runtime.rs\0".as_slice(),
+            b"? ./scratch.txt\0".as_slice(),
+            b"H src/runtime.rs\0? src/runtime.rs\0".as_slice(),
+        ] {
+            assert_eq!(strict_tagged_nul_separated_paths(malformed), None);
+        }
+
         let status = format!(
             "2 R. N... 100644 100644 100644 {} {} R100 docs/runtime.rs\0src/runtime.rs\0",
             "a".repeat(40),
@@ -8218,6 +10854,86 @@ mod tests {
         ] {
             assert_eq!(workspace_generation_paths(malformed), None);
         }
+    }
+
+    #[test]
+    fn input_snapshot_algorithm_or_schema_mismatch_fails_closed() {
+        let failure = ValidationInputSnapshotV1 {
+            schema_version: 2,
+            algorithm: "content-and-path-set-v2".to_string(),
+            sha256: "a".repeat(64),
+        };
+        let changed_legacy = ValidationInputSnapshotV1 {
+            sha256: "b".repeat(64),
+            ..failure.clone()
+        };
+        assert!(compatible_validation_input_snapshot_changed(
+            &failure,
+            &changed_legacy
+        ));
+
+        let current_schema = ValidationInputSnapshotV1 {
+            schema_version: VALIDATION_INPUT_SNAPSHOT_SCHEMA_VERSION,
+            algorithm: VALIDATION_INPUT_SNAPSHOT_ALGORITHM.to_string(),
+            sha256: "b".repeat(64),
+        };
+        assert!(!compatible_validation_input_snapshot_changed(
+            &failure,
+            &current_schema
+        ));
+        let incompatible_algorithm = ValidationInputSnapshotV1 {
+            schema_version: failure.schema_version,
+            algorithm: "different-algorithm".to_string(),
+            sha256: "b".repeat(64),
+        };
+        assert!(!compatible_validation_input_snapshot_changed(
+            &failure,
+            &incompatible_algorithm
+        ));
+    }
+
+    #[test]
+    fn source_owner_revision_projection_is_strict_and_complete() {
+        let value = toml::from_str::<toml::Value>(
+            r#"
+schema_version = 2
+[[owners]]
+id = "fixture"
+primary_entries = [{ path = "src/primary.rs", symbol = "primary" }]
+generated_mirrors = ["generated/output.rs"]
+tests = ["tests/owner.rs", "generated/output.rs"]
+[[owners.relationships]]
+evidence = [{ path = "src/relationship.rs" }]
+[[owners.invariants]]
+evidence = [{ path = "src/invariant.rs" }]
+tests = ["tests/invariant.rs"]
+"#,
+        )
+        .expect("source-owner fixture parses");
+        let mut paths = BTreeSet::from(["SOURCEMAP.md".to_string()]);
+        assert_eq!(
+            collect_source_owner_revision_paths(&value, &mut paths),
+            Some(())
+        );
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                "SOURCEMAP.md".to_string(),
+                "src/invariant.rs".to_string(),
+                "src/primary.rs".to_string(),
+                "src/relationship.rs".to_string(),
+                "tests/invariant.rs".to_string(),
+                "tests/owner.rs".to_string(),
+            ])
+        );
+
+        let incompatible =
+            toml::from_str::<toml::Value>("schema_version = 3\n[[owners]]\nid = \"fixture\"\n")
+                .expect("incompatible source-owner fixture parses");
+        assert_eq!(
+            collect_source_owner_revision_paths(&incompatible, &mut BTreeSet::new()),
+            None
+        );
     }
 
     #[tokio::test]

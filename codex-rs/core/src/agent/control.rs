@@ -201,8 +201,27 @@ pub(crate) struct AgentControl {
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Durable typed-task state shared by the root thread and all of its sub-agents.
     task_coordinator: AgentTaskCoordinator,
+    /// Fresh typed reviewer admissions exist only in this live control tree. Durable task rows
+    /// and resumed session-source strings cannot reconstruct this authority.
+    fresh_typed_reviews: Arc<
+        std::sync::Mutex<HashMap<codex_agent_task_store::AttemptId, FreshTypedReviewAdmission>>,
+    >,
     #[cfg(test)]
     test_hooks: Arc<AgentControlTestHooks>,
+}
+
+/// A single-use, process-private proof of the exact freshly admitted reviewer contract.
+/// It is deliberately neither serializable nor cloneable.
+pub(crate) struct FreshTypedReviewAdmission {
+    assignment: codex_agent_task_store::Assignment,
+    binding: AgentTaskBinding,
+    runtime_session_id: SessionId,
+}
+
+impl FreshTypedReviewAdmission {
+    pub(crate) fn assignment(&self) -> &codex_agent_task_store::Assignment {
+        &self.assignment
+    }
 }
 
 impl AgentControl {
@@ -252,6 +271,43 @@ impl AgentControl {
 
     pub(crate) fn task_coordinator(&self) -> &AgentTaskCoordinator {
         &self.task_coordinator
+    }
+
+    pub(crate) fn take_fresh_historical_review_admission(
+        &self,
+        binding: &AgentTaskBinding,
+        reviewer: &codex_agent_task_store::AgentTask,
+        live_thread_id: ThreadId,
+    ) -> Result<FreshTypedReviewAdmission, String> {
+        let mut admissions = self
+            .fresh_typed_reviews
+            .lock()
+            .map_err(|_| "fresh reviewer admission state is unavailable".to_string())?;
+        let admission = admissions.get(&binding.attempt_id).ok_or_else(|| {
+            "historical acceptance requires a fresh live typed reviewer admission; restored task rows and replayed bindings are not authority".to_string()
+        })?;
+        let admitted = &admission.binding;
+        if admission.runtime_session_id != self.session_id
+            || admission.assignment != reviewer.assignment
+            || reviewer.current_attempt.attempt_id != admitted.attempt_id
+            || reviewer.current_attempt.amendment.is_some()
+            || binding.assignment_id != admitted.assignment_id
+            || binding.attempt_id != admitted.attempt_id
+            || binding.root_session_id != admitted.root_session_id
+            || binding.root_session_id != self.task_lineage_id
+            || binding.agent_path != admitted.agent_path
+            || binding.task_name != admitted.task_name
+            || binding.thread_id != admitted.thread_id
+            || admitted.thread_id.as_deref() != Some(live_thread_id.to_string().as_str())
+        {
+            return Err(
+                "the live reviewer binding or assignment differs from its fresh typed admission"
+                    .to_string(),
+            );
+        }
+        admissions
+            .remove(&binding.attempt_id)
+            .ok_or_else(|| "the fresh reviewer admission was already consumed".to_string())
     }
 
     pub(crate) fn has_live_agents(&self) -> bool {

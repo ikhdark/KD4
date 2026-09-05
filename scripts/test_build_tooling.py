@@ -19,6 +19,32 @@ from scripts.build_tooling_test_support import load_toml
 
 
 class BuildToolingEnvironmentTest(unittest.TestCase):
+    def run_supported_command(
+        self,
+        command: list[str],
+        *,
+        cwd: Path = REPO_ROOT,
+        env: dict[str, str] | None = None,
+        timeout: int = 30,
+    ) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=timeout,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"command: {command!r}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        return result
+
     def test_shared_support_loads_hyphenated_repo_script(self) -> None:
         just_shell = load_just_shell_module()
 
@@ -1120,20 +1146,6 @@ with mock.patch.object(os, "cpu_count", return_value=None):
         ).read_text()
         self.assertNotIn("codex-execpolicy-legacy", execpolicy_readme)
 
-    def test_rust_workspace_uses_upstream_profiles(self) -> None:
-        manifest = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
-        profiles = manifest["profile"]
-
-        self.assertEqual(profiles["dev"]["debug"], "limited")
-        self.assertEqual(profiles["ci-test"]["debug"], "limited")
-        self.assertEqual(profiles["release"]["lto"], "thin")
-        self.assertEqual(profiles["release"]["debug"], "line-tables-only")
-        self.assertEqual(profiles["release"]["split-debuginfo"], "off")
-        self.assertFalse(profiles["release"]["strip"])
-        self.assertEqual(profiles["release"]["codegen-units"], 4)
-        self.assertNotIn("local-test", profiles)
-        self.assertNotIn("release-fast", profiles)
-
     def test_rust_cargo_config_lets_rustc_discover_msvc_linker(self) -> None:
         config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
         targets = config["target"]
@@ -1141,16 +1153,60 @@ with mock.patch.object(os, "cpu_count", return_value=None):
         for target_config in targets.values():
             self.assertNotIn("linker", target_config)
 
-    def test_rust_workspace_uses_upstream_dependency_features(self) -> None:
-        manifest = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
-        workspace_deps = manifest["workspace"]["dependencies"]
+    def test_workspace_contracts_through_cargo_metadata(self) -> None:
+        result = self.run_supported_command(
+            [
+                "cargo",
+                "metadata",
+                "--offline",
+                "--locked",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--manifest-path",
+                "codex-rs/Cargo.toml",
+            ],
+            timeout=120,
+        )
+        metadata = json.loads(result.stdout)
+        self.assertEqual(
+            Path(metadata["workspace_root"]).resolve(),
+            (REPO_ROOT / "codex-rs").resolve(),
+        )
 
-        reqwest = workspace_deps["reqwest"]
-        self.assertEqual(reqwest["features"], ["cookies"])
-        self.assertNotIn("default-features", reqwest)
+        packages = {package["name"]: package for package in metadata["packages"]}
 
-        sqlx = workspace_deps["sqlx"]
-        self.assertFalse(sqlx["default-features"])
+        def dependency(package_name: str, dependency_name: str) -> dict[str, object]:
+            matches = [
+                item
+                for item in packages[package_name]["dependencies"]
+                if item["name"] == dependency_name
+            ]
+            self.assertEqual(
+                len(matches),
+                1,
+                f"{package_name} metadata dependency {dependency_name!r}",
+            )
+            return matches[0]
+
+        reqwest = dependency("codex-http-client", "reqwest")
+        self.assertFalse(reqwest["uses_default_features"])
+        self.assertEqual(
+            sorted(reqwest["features"]),
+            [
+                "blocking",
+                "charset",
+                "cookies",
+                "http2",
+                "json",
+                "query",
+                "rustls",
+                "stream",
+                "system-proxy",
+            ],
+        )
+        sqlx = dependency("codex-state", "sqlx")
+        self.assertFalse(sqlx["uses_default_features"])
         self.assertEqual(
             sorted(sqlx["features"]),
             [
@@ -1160,29 +1216,175 @@ with mock.patch.object(os, "cpu_count", return_value=None):
                 "migrate",
                 "runtime-tokio",
                 "sqlite-bundled",
-                "time",
-                "tls-rustls",
                 "uuid",
             ],
         )
-
-        tokio_tungstenite = workspace_deps["tokio-tungstenite"]
+        tokio_tungstenite = dependency("codex-api", "tokio-tungstenite")
+        self.assertTrue(tokio_tungstenite["uses_default_features"])
         self.assertEqual(
             sorted(tokio_tungstenite["features"]),
             ["proxy", "rustls-tls-native-roots"],
         )
-
-        tungstenite = workspace_deps["tungstenite"]
-        self.assertEqual(sorted(tungstenite["features"]), ["deflate", "proxy"])
-
-        codex_api = load_toml(REPO_ROOT / "codex-rs" / "codex-api" / "Cargo.toml")
+        tungstenite = dependency("codex-api", "tungstenite")
+        self.assertTrue(tungstenite["uses_default_features"])
         self.assertEqual(
-            codex_api["dependencies"]["tokio-tungstenite"], {"workspace": True}
+            sorted(tungstenite["features"]),
+            ["deflate", "proxy"],
         )
-        # Extension configuration is imported from tungstenite directly while
-        # stream/message types continue to use tokio-tungstenite's re-export.
-        self.assertEqual(codex_api["dependencies"]["tungstenite"], {"workspace": True})
-        self.assertNotIn("features", codex_api)
+
+        manifest = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
+        profiles = manifest["profile"]
+        self.assertEqual(profiles["dev"]["debug"], "limited")
+        self.assertEqual(profiles["ci-test"]["debug"], "limited")
+        self.assertEqual(profiles["release"]["lto"], "thin")
+        self.assertEqual(profiles["release"]["debug"], "line-tables-only")
+        self.assertEqual(profiles["release"]["split-debuginfo"], "off")
+        self.assertEqual(profiles["release"]["strip"], "symbols")
+        self.assertEqual(profiles["release"]["codegen-units"], 4)
+        self.assertNotIn("local-test", profiles)
+        self.assertNotIn("release-fast", profiles)
+
+        def toml_scalar(value: object) -> str:
+            if isinstance(value, bool):
+                return str(value).lower()
+            if isinstance(value, (int, str)):
+                return json.dumps(value)
+            raise AssertionError(f"unsupported fixture profile value: {value!r}")
+
+        fixture_profile_lines: list[str] = []
+        for profile_name in ("dev", "release", "ci-test"):
+            fixture_profile_lines.append(f"[profile.{profile_name}]")
+            fixture_profile_lines.extend(
+                f"{key} = {toml_scalar(value)}"
+                for key, value in profiles[profile_name].items()
+            )
+            fixture_profile_lines.append("")
+
+        with tempfile.TemporaryDirectory(prefix="cargo-profile-contract-") as temp_dir:
+            fixture_root = Path(temp_dir)
+            (fixture_root / "src").mkdir()
+            (fixture_root / "src" / "main.rs").write_text(
+                'fn main() { println!("profile probe"); }\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+            manifest_path = fixture_root / "Cargo.toml"
+            manifest_path.write_text(
+                "[package]\n"
+                'name = "profile-probe"\n'
+                'version = "0.0.0"\n'
+                'edition = "2024"\n\n'
+                "[workspace]\n"
+                'resolver = "2"\n\n'
+                + "\n".join(fixture_profile_lines),
+                encoding="utf-8",
+                newline="\n",
+            )
+            fixture_env = {
+                key: value
+                for key, value in os.environ.items()
+                if key
+                not in {
+                    "CARGO_ENCODED_RUSTFLAGS",
+                    "CARGO_INCREMENTAL",
+                    "CARGO_TARGET_DIR",
+                    "RUSTC_WRAPPER",
+                    "RUSTFLAGS",
+                }
+            }
+            fixture_env["CARGO_INCREMENTAL"] = "0"
+            fixture_env["CARGO_TARGET_DIR"] = str(fixture_root / "target")
+
+            profile_runs: dict[str, subprocess.CompletedProcess[str]] = {}
+            for profile_name, cargo_action in (
+                ("dev", "build"),
+                ("release", "build"),
+                ("ci-test", "test"),
+            ):
+                command = [
+                    "cargo",
+                    cargo_action,
+                    "--offline",
+                    "--manifest-path",
+                    str(manifest_path),
+                    "--profile",
+                    profile_name,
+                    "--message-format=json-render-diagnostics",
+                    "-vv",
+                ]
+                if cargo_action == "test":
+                    command.insert(2, "--no-run")
+                profile_runs[profile_name] = self.run_supported_command(
+                    command,
+                    cwd=fixture_root,
+                    env=fixture_env,
+                    timeout=120,
+                )
+
+            artifacts: dict[str, dict[str, object]] = {}
+            for profile_name, run in profile_runs.items():
+                candidates = []
+                for line in run.stdout.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        event.get("reason") == "compiler-artifact"
+                        and event.get("target", {}).get("name") == "profile-probe"
+                        and event.get("executable")
+                    ):
+                        candidates.append(event)
+                expected_test = profile_name == "ci-test"
+                candidates = [
+                    event
+                    for event in candidates
+                    if event["profile"]["test"] is expected_test
+                ]
+                self.assertEqual(len(candidates), 1, (profile_name, candidates))
+                artifacts[profile_name] = candidates[0]
+                self.assertTrue(Path(candidates[0]["executable"]).is_file())
+
+            self.assertEqual(
+                artifacts["dev"]["profile"],
+                {
+                    "opt_level": "0",
+                    "debuginfo": 1,
+                    "debug_assertions": True,
+                    "overflow_checks": True,
+                    "test": False,
+                },
+            )
+            self.assertEqual(
+                artifacts["release"]["profile"],
+                {
+                    "opt_level": "3",
+                    "debuginfo": "line-tables-only",
+                    "debug_assertions": False,
+                    "overflow_checks": False,
+                    "test": False,
+                },
+            )
+            self.assertEqual(
+                artifacts["ci-test"]["profile"],
+                {
+                    "opt_level": "0",
+                    "debuginfo": 1,
+                    "debug_assertions": True,
+                    "overflow_checks": True,
+                    "test": True,
+                },
+            )
+
+            release_trace = profile_runs["release"].stdout + profile_runs["release"].stderr
+            for rustc_flag in (
+                "codegen-units=4",
+                "strip=symbols",
+            ):
+                self.assertIn(rustc_flag, release_trace)
+            # Cargo omits the explicit off value when it is rustc's default.
+            self.assertNotRegex(release_trace, r"split-debuginfo=(?:packed|unpacked)")
+            self.assertRegex(release_trace, r"(?:lto=thin|linker-plugin-lto)")
 
     def test_sqlx_workspace_features_are_shared_by_sqlite_crates(self) -> None:
         state_manifest = load_toml(REPO_ROOT / "codex-rs" / "state" / "Cargo.toml")
@@ -1237,58 +1439,81 @@ with mock.patch.object(os, "cpu_count", return_value=None):
         )
         self.assertNotIn("changed-validation", justfile)
 
-    def test_default_fmt_recipe_uses_fast_local_with_full_escape_hatch(self) -> None:
-        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+    def test_format_recipes_through_just_cli(self) -> None:
+        expected_argv = {
+            "fmt": 'sys.argv = [script, "--fast-local"]',
+            "fmt-full": "sys.argv = [script]",
+            "fmt-check": 'sys.argv = [script, "--check"]',
+            "fmt-check-fast": 'sys.argv = [script, "--check", "--fast-local"]',
+        }
+        for recipe, expected in expected_argv.items():
+            with self.subTest(recipe=recipe):
+                rendered = self.run_supported_command(["just", "--dry-run", recipe])
+                output = rendered.stdout + rendered.stderr
+                self.assertIn(expected, output)
+                self.assertIn('runpy.run_path(script, run_name="__main__")', output)
 
-        self.assertIn(
-            "fmt:\n    {{ python }} ../scripts/format.py --fast-local",
-            justfile,
-        )
-        self.assertIn("fmt-full:\n    {{ python }} ../scripts/format.py", justfile)
-        self.assertIn(
-            "fmt-check:\n    {{ python }} ../scripts/format.py --check",
-            justfile,
-        )
-        self.assertIn(
-            "validate-crate crate:\n    just fmt-check-fast\n    just test-fast -p {{ crate }}",
-            justfile,
-        )
-        self.assertIn(
-            "validate-crate-full crate:\n    just fmt-check\n    just test-fast -p {{ crate }}",
-            justfile,
-        )
+        for recipe, expected_lines in {
+            "validate-crate": [
+                "just fmt-check-fast",
+                "just test-fast -p codex-core",
+            ],
+            "validate-crate-full": [
+                "just fmt-check",
+                "just test-fast -p codex-core",
+            ],
+        }.items():
+            with self.subTest(recipe=recipe):
+                rendered = self.run_supported_command(
+                    ["just", "--dry-run", recipe, "codex-core"]
+                )
+                self.assertEqual(
+                    (rendered.stdout + rendered.stderr).splitlines(), expected_lines
+                )
 
-    def test_cargo_config_caps_parallelism_and_nonduplicated_windows_flags(
-        self,
-    ) -> None:
+    def test_parallelism_and_windows_flags_through_just_cli(self) -> None:
+        inherited_env = {
+            key: value
+            for key, value in os.environ.items()
+            if key
+            not in {
+                "CARGO_BUILD_JOBS",
+                "RUST_TEST_THREADS",
+                "NEXTEST_TEST_THREADS",
+            }
+        }
+        expressions = {
+            "cargo_build_jobs": "CARGO_BUILD_JOBS",
+            "rust_test_threads": "RUST_TEST_THREADS",
+            "nextest_test_threads": "NEXTEST_TEST_THREADS",
+        }
+        parallelism = self.run_supported_command(
+            ["just", "--evaluate", "rust_parallelism"], env=inherited_env
+        ).stdout.strip()
+        self.assertEqual(parallelism, "8")
+        for expression, environment_name in expressions.items():
+            with self.subTest(expression=expression, source="default"):
+                evaluated = self.run_supported_command(
+                    ["just", "--evaluate", expression], env=inherited_env
+                )
+                self.assertEqual(evaluated.stdout.strip(), parallelism)
+            with self.subTest(expression=expression, source="environment"):
+                evaluated = self.run_supported_command(
+                    ["just", "--evaluate", expression],
+                    env={**inherited_env, environment_name: "3"},
+                )
+                self.assertEqual(evaluated.stdout.strip(), "3")
+
         cargo_config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
-        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-
         self.assertEqual(cargo_config["build"]["jobs"], 8)
         self.assertEqual(
             cargo_config["env"]["RUST_TEST_THREADS"],
             {"value": "16", "force": False},
         )
-        self.assertIn('rust_parallelism := "16"', justfile)
-        self.assertIn(
-            'env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)',
-            justfile,
-        )
-        self.assertIn(
-            'env_var_or_default("RUST_TEST_THREADS", rust_parallelism)',
-            justfile,
-        )
-        self.assertIn(
-            'env_var_or_default("NEXTEST_TEST_THREADS", rust_parallelism)',
-            justfile,
-        )
-        self.assertIn("export CARGO_BUILD_JOBS := cargo_build_jobs", justfile)
-        self.assertIn("export RUST_TEST_THREADS := rust_test_threads", justfile)
-        self.assertIn("export NEXTEST_TEST_THREADS := nextest_test_threads", justfile)
-
         targets = cargo_config["target"]
         msvc_flags = targets['cfg(all(windows, target_env = "msvc"))']["rustflags"]
         arm64_flags = targets["aarch64-pc-windows-msvc"]["rustflags"]
+        effective_arm64_flags = [*msvc_flags, *arm64_flags]
         self.assertEqual(
             msvc_flags,
             [
@@ -1299,26 +1524,31 @@ with mock.patch.object(os, "cpu_count", return_value=None):
             ],
         )
         self.assertEqual(arm64_flags, ["-C", "link-arg=/arm64hazardfree"])
+        for flag in (
+            "link-arg=/STACK:8388608",
+            "target-feature=+crt-static",
+            "link-arg=/arm64hazardfree",
+        ):
+            self.assertEqual(effective_arm64_flags.count(flag), 1)
 
-        effective_arm64_flags = [*msvc_flags, *arm64_flags]
-        self.assertEqual(effective_arm64_flags.count("link-arg=/STACK:8388608"), 1)
-        self.assertEqual(effective_arm64_flags.count("target-feature=+crt-static"), 1)
-        self.assertEqual(effective_arm64_flags.count("link-arg=/arm64hazardfree"), 1)
+    def test_deps_audit_route_and_policy_through_just_cli(self) -> None:
+        rendered = self.run_supported_command(["just", "--dry-run", "deps-audit"])
+        self.assertEqual(
+            (rendered.stdout + rendered.stderr).splitlines(), ["cargo audit"]
+        )
 
-    def test_cargo_audit_policy_is_wired_and_synchronized(self) -> None:
         audit = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "audit.toml")
         deny = load_toml(REPO_ROOT / "codex-rs" / "deny.toml")
-        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-
         audit_ignores = audit["advisories"]["ignore"]
         deny_ignores = [entry["id"] for entry in deny["advisories"]["ignore"]]
         self.assertEqual(len(audit_ignores), len(set(audit_ignores)))
         self.assertEqual(set(audit_ignores), set(deny_ignores))
         self.assertEqual(audit["output"]["deny"], ["yanked"])
         self.assertFalse(audit["output"]["quiet"])
-        self.assertFalse(audit["output"]["show_tree"])
-        self.assertIn("deps-audit:\n    cargo audit", justfile)
-        self.assertNotIn(".github/workflows/cargo-audit.yml", justfile)
+        self.assertTrue(audit["output"]["show_tree"])
+        self.assertFalse(
+            (REPO_ROOT / ".github" / "workflows" / "cargo-audit.yml").exists()
+        )
 
     def test_rust_toolchain_manifest_stays_lean_for_local_bootstrap(self) -> None:
         toolchain = load_toml(REPO_ROOT / "codex-rs" / "rust-toolchain.toml")[
@@ -1565,35 +1795,6 @@ fn main() {
             "--fast-local excludes formatter groups selected by --only: prettier",
             result.stderr,
         )
-
-    def test_ci_formatter_jobs_install_and_use_pinned_nightly_rustfmt(self) -> None:
-        workflow_paths = [
-            REPO_ROOT / ".github" / "workflows" / workflow_name
-            for workflow_name in ("rust-ci.yml", "rust-ci-full.yml")
-        ]
-        if not any(path.exists() for path in workflow_paths):
-            # Skip visibly instead of passing vacuously when the fork carries
-            # no rust CI workflows at all.
-            self.skipTest("no rust CI workflows are present in this fork")
-        for workflow_path in workflow_paths:
-            if not workflow_path.exists():
-                continue
-
-            workflow = workflow_path.read_text(encoding="utf-8")
-
-            self.assertIn(
-                f"rustup toolchain install {tool_versions.RUSTFMT_TOOLCHAIN}",
-                workflow,
-            )
-            self.assertIn("--component rustfmt", workflow)
-            self.assertIn(
-                f"cargo +{tool_versions.RUSTFMT_TOOLCHAIN} fmt -- --config imports_granularity=Item --check",
-                workflow,
-            )
-            self.assertNotIn(
-                "run: cargo fmt -- --config imports_granularity=Item --check",
-                workflow,
-            )
 
     def test_windows_setup_uses_toolchain_manifest_for_rustup_options(self) -> None:
         setup_windows = (

@@ -504,6 +504,11 @@ async fn handle_spawn_agent(
         } else {
             None
         };
+        if let Some(consumed) = consumed_typed_spawn.as_mut() {
+            let mut fresh_assignment = assignment.clone();
+            fresh_assignment.task_capsule = task_capsule.clone();
+            consumed.capture_fresh_assignment(fresh_assignment, attempt.attempt_id);
+        }
         Some((assignment, attempt, task_capsule))
     } else {
         None

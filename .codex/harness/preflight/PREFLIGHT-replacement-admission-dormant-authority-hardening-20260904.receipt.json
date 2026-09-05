@@ -1,0 +1,66 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          "scripts/replacement_admission.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_replacement_admission.py",
+          "scripts"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:replacement-admission-dormant-authority-hardening-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-replacement-admission-authority-unused"
+  },
+  "contract_claims": [
+    "replacement-admission-current-v2-unresolved-only",
+    "replacement-admission-current-v2-obligation-binding",
+    "replacement-admission-nonempty-materialization-fail-closed"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T11:33:28.497995+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "4c26f7ff3352acbc6f23b60a7b32a478e482c22f7969cb3b43f5ee4907ea702c",
+  "path_claims": [
+    {
+      "path": "scripts/replacement_admission.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_replacement_admission.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T10:33:28.497995+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "d3a30ed3e7e7c30cf493de94c27818b7d85ff6a0a8fc4c87b70a1ab598a26f0e"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_replacement_admission.ReplacementAdmissionCliTests.test_real_cli_structurally_checks_unresolved_one_to_many_and_many_to_one_candidates",
+    "python -m unittest scripts.test_replacement_admission.ReplacementAdmissionCliTests.test_real_cli_rejects_nonempty_materialization_without_runtime_authority",
+    "python -m unittest scripts.test_replacement_admission.ReplacementAdmissionCliTests.test_real_cli_rejects_non_unresolved_v2_baselines",
+    "python -m unittest scripts.test_replacement_admission.ReplacementAdmissionCliTests.test_real_cli_rejects_forged_v2_obligation",
+    "python -m unittest scripts.test_replacement_admission.ReplacementAdmissionCliTests.test_real_cli_accepts_empty_repository_manifest",
+    "python -m unittest scripts.test_replacement_admission"
+  ],
+  "validation_owner": "worker:replacement-admission-dormant-authority-hardening-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

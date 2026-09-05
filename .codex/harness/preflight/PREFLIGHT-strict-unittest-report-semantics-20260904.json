@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:strict-unittest-report-semantics-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    { "path": "scripts/completion_proof.py", "recursive": false },
+    { "path": "scripts/test_completion_proof.py", "recursive": false }
+  ],
+  "contract_claims": ["strict-unittest-discovery-report-semantics"],
+  "dependencies": ["root:completion-proof-migration-20260902"],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "worker:strict-unittest-report-semantics-20260904",
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_root_unittest_inventory_rejects_inconsistent_source_and_skip_metadata",
+    "python -m py_compile scripts/completion_proof.py scripts/test_completion_proof.py"
+  ],
+  "cargo_lane": {
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\strict-unittest-report-semantics",
+    "cargo_home": "C:\\Users\\kuh\\.cargo"
+  },
+  "workspace_strategy": "shared"
+}

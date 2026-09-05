@@ -1,0 +1,131 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "worker:current-evidence-python-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-current-evidence-contracts-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-current-evidence-contracts-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          ".codex/validation/focused-live-successor-catalog-v1.schema.json",
+          ".codex"
+        ],
+        [
+          "scripts/focused_live_successor_catalog.py",
+          "scripts"
+        ],
+        [
+          "codex-rs/validation-contracts/src/focused_live_successor.rs",
+          "codex-rs"
+        ],
+        [
+          "scripts/fixtures/focused_live_successor_catalog_v1_vectors.json",
+          "scripts"
+        ],
+        [
+          "scripts/test_focused_live_successor_catalog.py",
+          "scripts"
+        ],
+        [
+          "codex-rs/validation-contracts/tests/focused_evidence_frame.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/validation-contracts/tests/focused_live_successor_catalog.rs",
+          "codex-rs"
+        ]
+      ]
+    },
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    },
+    {
+      "assignment_id": "worker:current-evidence-python-tests-20260904",
+      "kind": "cargo_lane_overlap",
+      "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+    }
+  ],
+  "assignment_id": "worker:current-evidence-contracts-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target"
+  },
+  "contract_claims": [
+    "focused-current-evidence-catalog-identity-parity"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T23:49:16.194451+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "e9e4daf6b4d6b09bf9104cacc8ed9e0f4c812cb79b93afc4c0b2902928c04496",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-current-evidence-contracts-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-current-evidence-contracts-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/validation/focused-live-successor-catalog-v1.schema.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/focused_live_successor_catalog.py",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/src/focused_live_successor.rs",
+      "recursive": false
+    },
+    {
+      "path": "scripts/fixtures/focused_live_successor_catalog_v1_vectors.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_focused_live_successor_catalog.py",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/tests/focused_evidence_frame.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/tests/focused_live_successor_catalog.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T22:49:16.194451+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "0a5ee39f9a778c6e94456edfbcb8dafc984ef20ca3357553ea2acd54739fc8e5"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_focused_live_successor_catalog",
+    "git diff --check"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

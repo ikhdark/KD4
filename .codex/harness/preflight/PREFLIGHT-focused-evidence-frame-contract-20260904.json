@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:focused-evidence-frame-contract-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-focused-evidence-frame-contract-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-focused-evidence-frame-contract-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/src/focused_evidence_frame.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/src/lib.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/src/focused_live_successor.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/validation-contracts/tests/focused_evidence_frame.rs",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "focused-evidence-frame-v1-binary-contract",
+    "focused-evidence-ack-v1-binary-contract",
+    "focused-process-set-canonical-parser"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "cargo test --manifest-path codex-rs/Cargo.toml -p codex-validation-contracts --test focused_evidence_frame"
+  ],
+  "cargo_lane": {
+    "target_dir": "root-owned-serialized",
+    "cargo_home": "default"
+  },
+  "workspace_strategy": "shared"
+}

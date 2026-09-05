@@ -1,0 +1,69 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-app-server-proof-resume-loopback-execution-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-app-server-proof-resume-loopback-execution-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          "codex-rs/app-server/tests/suite/v2/client_metadata.rs",
+          "codex-rs"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:app-server-proof-resume-loopback-execution-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\Desktop\\kd4\\default",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\root-owned-serialized"
+  },
+  "contract_claims": [
+    "app-server-proof-resume-tests-must-execute-offline"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T14:01:29.186999+00:00",
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "generated_outputs": [],
+  "manifest_fingerprint": "2a47bf12330dfbf8332910a91ca98901883a4c5cd57141f50ec98d7ae326c325",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-app-server-proof-resume-loopback-execution-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-app-server-proof-resume-loopback-execution-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/app-server/tests/suite/v2/client_metadata.rs",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T13:01:29.186999+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "9c67b512799bc6f4358d2ca192ed8128463434873712b37dcd4b223dad57171f"
+  },
+  "validation_commands": [
+    "just core-test-fast app_server_all -E 'test(=suite::v2::client_metadata::cold_resume_of_legacy_internal_source_still_requires_root_completion_proof_v2) | test(=suite::v2::client_metadata::same_process_resume_reuses_completion_proof_but_restart_does_not_v2)'",
+    "cargo fmt -- codex-rs/app-server/tests/suite/v2/client_metadata.rs",
+    "git diff --check"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

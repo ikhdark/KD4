@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:cli-app-server-direct-argv-proof-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-cli-app-server-direct-argv-proof-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-cli-app-server-direct-argv-proof-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/cli/tests/completion_proof.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/app-server/tests/common/lib.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/tests/common/lib.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/.config/kd4-rust-tests.toml",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/.config/nextest.toml",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "real-codex-app-server-direct-argv-completion-proof-integration",
+    "accepted-completion-proof-fixture-physical-launch-line-count"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "just core-test-fast cli_completion_proof -E 'test(=real_cli_app_server_accepts_canonical_completion_proof_via_direct_argv)'",
+    "rustfmt --edition 2024 --check codex-rs/cli/tests/completion_proof.rs codex-rs/app-server/tests/common/lib.rs",
+    "git diff --check"
+  ],
+  "cargo_lane": {
+    "target_dir": "codex-rs/target",
+    "cargo_home": "C:/Users/kuh/.cargo"
+  },
+  "workspace_strategy": "shared"
+}

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import inspect
 import json
 import os
 import sys
@@ -53,6 +55,83 @@ def _load() -> tuple[list[unittest.TestCase], list[str]]:
         or test.__class__.__module__ == "unittest.loader"
     ]
     return tests, discovery_errors
+
+
+def _is_subtest_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "subTest"
+    )
+
+
+class _CollectionMetadata:
+    def __init__(self, repository_root: Path) -> None:
+        self.repository_root = repository_root.resolve(strict=True)
+        self._trees: dict[Path, ast.Module] = {}
+
+    def _source_path(self, filename: str) -> tuple[Path, str]:
+        path = Path(filename).resolve(strict=True)
+        try:
+            relative = path.relative_to(self.repository_root)
+        except ValueError as error:
+            raise ValueError("selected unittest source escapes the repository") from error
+        return path, relative.as_posix()
+
+    def _tree(self, path: Path) -> ast.Module:
+        tree = self._trees.get(path)
+        if tree is None:
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(path))
+            self._trees[path] = tree
+        return tree
+
+    def for_test(self, test: unittest.TestCase) -> tuple[str, list[dict[str, object]]]:
+        method_name = getattr(test, "_testMethodName", "")
+        method = getattr(test, method_name, None)
+        code = getattr(method, "__code__", None)
+        if not method_name or code is None:
+            raise ValueError("selected unittest is not a source-backed method")
+        filename = inspect.getsourcefile(method)
+        if filename is None:
+            raise ValueError("selected unittest method has no source file")
+        path, relative = self._source_path(filename)
+        candidates: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+        for node in ast.walk(self._tree(path)):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name != method_name or node.end_lineno is None:
+                continue
+            earliest = min(
+                [node.lineno, *[item.lineno for item in node.decorator_list]]
+            )
+            if earliest <= code.co_firstlineno <= node.end_lineno:
+                candidates.append(node)
+        if len(candidates) != 1:
+            raise ValueError("cannot uniquely locate selected unittest method AST")
+        sites = [
+            {
+                "path": relative,
+                "line": node.lineno,
+                "column": node.col_offset + 1,
+            }
+            for node in ast.walk(candidates[0])
+            if _is_subtest_call(node)
+        ]
+        unique_sites = {
+            (str(item["path"]), int(item["line"]), int(item["column"]))
+            for item in sites
+        }
+        if len(unique_sites) != len(sites):
+            raise ValueError("selected unittest has duplicate declared subtest sites")
+        sites.sort(
+            key=lambda item: (
+                str(item["path"]),
+                int(item["line"]),
+                int(item["column"]),
+            )
+        )
+        return relative, sites
 
 
 def _write(path: Path, value: object) -> None:
@@ -179,18 +258,30 @@ class ProofResult(unittest.TextTestResult):
 
 def _collect(output: Path) -> int:
     tests, discovery_errors = _load()
-    rows = []
+    metadata = _CollectionMetadata(REPO_ROOT)
+    rows: list[dict[str, object]] = []
     seen: set[str] = set()
     duplicates: list[str] = []
+    metadata_errors: list[str] = []
+    discovery_error_ids = set(discovery_errors)
     for test in tests:
         test_id = test.id()
         if test_id in seen:
             duplicates.append(test_id)
         seen.add(test_id)
         test_method = getattr(test, getattr(test, "_testMethodName", ""), None)
+        if test_id in discovery_error_ids:
+            continue
+        try:
+            source_path, declared_subtest_sites = metadata.for_test(test)
+        except (OSError, SyntaxError, TypeError, UnicodeError, ValueError) as error:
+            metadata_errors.append(f"{test_id}: {error}")
+            continue
         rows.append(
             {
                 "id": test_id,
+                "source_path": source_path,
+                "declared_subtest_sites": declared_subtest_sites,
                 "skipped_at_discovery": bool(
                     getattr(test.__class__, "__unittest_skip__", False)
                     or getattr(test, "__unittest_skip__", False)
@@ -205,19 +296,21 @@ def _collect(output: Path) -> int:
         )
     classification = (
         "pre_result_error"
-        if not rows or discovery_errors or duplicates
+        if not rows or discovery_errors or duplicates or metadata_errors
         else "discovered"
     )
     _write(
         output,
         {
-            "schema_version": 1,
+            "schema_version": 2,
+            "report_type": "CompletionProofUnittestCollectionV2",
             "framework": "python-unittest",
             "classification": classification,
             "tests": rows,
             "selected_count": len(rows),
-            "discovery_errors": discovery_errors,
+            "discovery_errors": sorted(set(discovery_errors)),
             "duplicate_ids": sorted(set(duplicates)),
+            "metadata_errors": sorted(set(metadata_errors)),
         },
     )
     return 0 if classification == "discovered" else 2

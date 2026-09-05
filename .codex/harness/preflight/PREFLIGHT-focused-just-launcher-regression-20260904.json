@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:focused-just-launcher-regression-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [{"path": "scripts/test_completion_proof_current_evidence.py", "recursive": false}],
+  "contract_claims": ["actual-just-focused-runpy-import-bootstrap"],
+  "dependencies": ["root:completion-proof-migration-20260902"],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": ["python -m unittest scripts.test_completion_proof_current_evidence"],
+  "cargo_lane": {"target_dir": "codex-rs/target", "cargo_home": "C:/Users/kuh/.cargo"},
+  "workspace_strategy": "shared"
+}

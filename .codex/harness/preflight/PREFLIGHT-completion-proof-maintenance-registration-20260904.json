@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:completion-proof-maintenance-registration-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-completion-proof-maintenance-registration-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-completion-proof-maintenance-registration-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/root_maintenance.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_build_tooling_policy.py",
+      "recursive": false
+    },
+    {
+      "path": "source_owners.toml",
+      "recursive": false
+    }
+  ],
+  "contract_claims": [
+    "completion-proof-maintenance-routing-focused",
+    "completion-proof-focused-contract-owner-registration"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "python -m unittest scripts.test_build_tooling_policy.BuildToolingPolicyTest.test_root_maintenance_routes_completion_proof_contract_tests",
+    "python scripts/source_owners.py slice --owner completion-proof-certification --focus completion-proof focused contracts --max-relationships 32",
+    "git diff --check"
+  ],
+  "cargo_lane": {
+    "target_dir": "none",
+    "cargo_home": "none"
+  },
+  "workspace_strategy": "shared"
+}

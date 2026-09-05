@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:app-server-proof-resume-loopback-execution-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    { "path": ".codex/harness/preflight/PREFLIGHT-app-server-proof-resume-loopback-execution-20260904.json", "recursive": false },
+    { "path": ".codex/harness/preflight/PREFLIGHT-app-server-proof-resume-loopback-execution-20260904.receipt.json", "recursive": false },
+    { "path": "codex-rs/app-server/tests/suite/v2/client_metadata.rs", "recursive": false }
+  ],
+  "contract_claims": [
+    "app-server-proof-resume-tests-must-execute-offline"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "validation_commands": [
+    "just core-test-fast app_server_all -E 'test(=suite::v2::client_metadata::cold_resume_of_legacy_internal_source_still_requires_root_completion_proof_v2) | test(=suite::v2::client_metadata::same_process_resume_reuses_completion_proof_but_restart_does_not_v2)'",
+    "cargo fmt -- codex-rs/app-server/tests/suite/v2/client_metadata.rs",
+    "git diff --check"
+  ],
+  "cargo_lane": {
+    "target_dir": "root-owned-serialized",
+    "cargo_home": "default"
+  },
+  "workspace_strategy": "shared"
+}

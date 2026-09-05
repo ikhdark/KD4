@@ -1,0 +1,101 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-source-map-mutation-epoch-parity-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-source-map-mutation-epoch-parity-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          ".codex/validation/completion-proof.toml",
+          ".codex"
+        ],
+        [
+          "codex-rs/core/src/completion_proof.rs",
+          "codex-rs"
+        ],
+        [
+          "codex-rs/core/tests/suite/completion_proof_gate.rs",
+          "codex-rs"
+        ],
+        [
+          "scripts/test_completion_proof.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_source_owners.py",
+          "scripts"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:source-map-mutation-epoch-parity-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target\\lanes\\core_cli_workspace"
+  },
+  "contract_claims": [
+    "source-map-mutation-epoch-input-parity"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T13:40:59.978407+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "361d07385101a63d83ec0f83edcbd9e12fef6aad06b442ab4fd379d8d985b7d6",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-source-map-mutation-epoch-parity-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-source-map-mutation-epoch-parity-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/validation/completion-proof.toml",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/src/completion_proof.rs",
+      "recursive": false
+    },
+    {
+      "path": "codex-rs/core/tests/suite/completion_proof_gate.rs",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_completion_proof.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_source_owners.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T12:40:59.978407+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "e7643b7a13bdabf81cb5cd82853efb411c56eeca4cba94bc68fe2cd4222075de"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_source_owners",
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_production_config_uses_exact_code_owned_typed_policy",
+    "just core-test-fast core_cli_workspace -E 'test(~source_map_projection)'"
+  ],
+  "validation_owner": "root:completion-proof-migration-20260902",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

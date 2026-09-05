@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "assignment_id": "worker:gate10-ignored-listing-runtime-tests-20260904",
+  "root_task_id": "completion-proof-migration-20260902",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [{"path": "scripts/test_completion_proof.py", "recursive": false}],
+  "contract_claims": ["ignored-test-surface-runtime-budget-regressions"],
+  "dependencies": ["gate10:ignored-listing-budget-20260904"],
+  "generated_outputs": [],
+  "generated_output_owner": "root:completion-proof-migration-20260902",
+  "validation_owner": "gate10:ignored-listing-budget-20260904",
+  "validation_commands": ["python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_ignored_marker_listing_uses_separate_budget_through_canonical_cli scripts.test_completion_proof.CompletionProofCliTest.test_ignored_marker_listing_timeout_is_bounded_and_cleans_descendant"],
+  "cargo_lane": {"target_dir": "codex-rs/target", "cargo_home": "C:/Users/kuh/.cargo"},
+  "workspace_strategy": "shared"
+}

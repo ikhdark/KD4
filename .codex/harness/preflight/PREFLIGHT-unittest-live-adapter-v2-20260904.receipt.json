@@ -1,0 +1,85 @@
+{
+  "advisories": [
+    {
+      "assignment_id": "root:completion-proof-migration-20260902",
+      "contracts": [],
+      "kind": "claim_overlap",
+      "paths": [
+        [
+          ".codex/harness/preflight/PREFLIGHT-unittest-live-adapter-v2-20260904.json",
+          ".codex"
+        ],
+        [
+          ".codex/harness/preflight/PREFLIGHT-unittest-live-adapter-v2-20260904.receipt.json",
+          ".codex"
+        ],
+        [
+          "scripts/completion_proof_unittest.py",
+          "scripts"
+        ],
+        [
+          "scripts/completion_proof.py",
+          "scripts"
+        ],
+        [
+          "scripts/test_completion_proof.py",
+          "scripts"
+        ]
+      ]
+    }
+  ],
+  "assignment_id": "worker:unittest-live-adapter-v2-20260904",
+  "cargo_lane": {
+    "cargo_home": "C:\\Users\\kuh\\.cargo",
+    "target_dir": "C:\\Users\\kuh\\Desktop\\kd4\\codex-rs\\target-unittest-live-adapter-v2-unused"
+  },
+  "contract_claims": [
+    "strict-transient-unittest-collection-v2",
+    "legacy-unittest-live-inventory-projection"
+  ],
+  "dependencies": [
+    "root:completion-proof-migration-20260902"
+  ],
+  "expires_at": "2026-09-04T11:26:22.436360+00:00",
+  "generated_output_owner": "none",
+  "generated_outputs": [],
+  "manifest_fingerprint": "dc5ce5fedf6b9a5aea2c8e0bee52f22c58e9cf3579da7fa99985f7796ca4b2f5",
+  "path_claims": [
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-unittest-live-adapter-v2-20260904.json",
+      "recursive": false
+    },
+    {
+      "path": ".codex/harness/preflight/PREFLIGHT-unittest-live-adapter-v2-20260904.receipt.json",
+      "recursive": false
+    },
+    {
+      "path": "scripts/completion_proof_unittest.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/completion_proof.py",
+      "recursive": false
+    },
+    {
+      "path": "scripts/test_completion_proof.py",
+      "recursive": false
+    }
+  ],
+  "recorded_at": "2026-09-04T10:26:22.436360+00:00",
+  "repository_id": "c883e38d339c4d8a9d3273a07bd893fe",
+  "repository_root": "C:\\Users\\kuh\\Desktop\\kd4",
+  "root_task_id": "completion-proof-migration-20260902",
+  "schema_version": 1,
+  "starting_revision": {
+    "commit": "9a8bf17918647113ef9e1142ade5c7c464aa05c2",
+    "workspace_fingerprint": "fc9f9302476882e58ec3ce2b91269b0f1ddc4a1bee67bc84c80f2f2913d11ab5"
+  },
+  "validation_commands": [
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_unittest_inventory_accepts_valid_v2_collection_through_focused_cli scripts.test_completion_proof.CompletionProofCliTest.test_unittest_inventory_rejects_invalid_v2_collection_through_focused_cli",
+    "python -m unittest scripts.test_completion_proof.CompletionProofCliTest.test_unittest_wrapper_collect_v2_reports_exact_source_and_declared_subtest_sites scripts.test_completion_proof.CompletionProofCliTest.test_unittest_wrapper_reports_attempt_bound_start_and_terminal_ids"
+  ],
+  "validation_owner": "worker:unittest-live-adapter-v2-20260904",
+  "workspace_id": "5cf5196d5f964bd5bd2ba0076290aa02",
+  "workspace_strategy": "shared"
+}

@@ -327,9 +327,21 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/cargo-lane.ps1": ("scripts.test_cargo_lane",),
     "scripts/bounded_process.py": ("scripts.test_bounded_process",),
     "scripts/common-rust-env.ps1": ("scripts.test_build_tooling_performance",),
-    "scripts/completion_proof.py": ("scripts.test_completion_proof",),
+    "scripts/completion_proof.py": (
+        "scripts.test_completion_proof",
+        "scripts.test_completion_proof_typed_canonical",
+        "scripts.test_completion_proof_current_evidence",
+    ),
+    "scripts/completion_proof_canonical.py": (
+        "scripts.test_completion_proof_inventory_v2",
+        "scripts.test_focused_live_successor_catalog",
+        "scripts.test_focused_replacement_approval_receipt",
+    ),
     "scripts/completion_proof_pytest.py": ("scripts.test_completion_proof",),
     "scripts/completion_proof_unittest.py": ("scripts.test_completion_proof",),
+    "scripts/current_evidence_successor_projection.py": (
+        "scripts.test_completion_proof_current_evidence",
+    ),
     "scripts/codex_package/rg": (
         "scripts.codex_package.test_dotslash",
         "scripts.codex_package.test_ripgrep",
